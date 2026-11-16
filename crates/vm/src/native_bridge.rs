@@ -1088,7 +1088,11 @@ pub fn run_native(
     // interpreter allocates up to the stack pointer; entering native code arms the redzone
     // first so the check below leaves it free.
     process.heap.arm_native_redzone();
-    process.ensure_entry(0, live)?;
+    let objv = registers
+        .x_reg_array
+        .get_mut(..live)
+        .ok_or_else(|| VmError::Unsupported("live X register count".into()))?;
+    process.ensure_entry(0, objv)?;
     // Port of erts/emulator/beam/jit/arm/instr_call.cpp:256-261 (emit_i_apply_only),
     // OTP-29.1.1: a call the scheduler performs for native code (fun/apply, BIF traps,
     // breakpoint handlers) pops the caller's continuation into LR, so the callee's frame
@@ -1398,7 +1402,11 @@ pub fn run_native_resume(
     registers.tmp_mem[6] = 0;
     let arity = process.heap.abi.arity;
     process.heap.arm_native_redzone();
-    process.ensure_entry(0, usize::from(arity))?;
+    let objv = registers
+        .x_reg_array
+        .get_mut(..usize::from(arity))
+        .ok_or_else(|| VmError::Unsupported("live X register count".into()))?;
+    process.ensure_entry(0, objv)?;
     registers.entry_return = 0;
     let code_ptr = code_address as *const std::ffi::c_void;
     process.clear_native_resume();

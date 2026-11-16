@@ -175,7 +175,10 @@ impl Executor {
                     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:276-292
                     // (emit_i_line_breakpoint_trampoline_shared), OTP-29.1.1:
                     // collect when the spilled registers and S_RESERVED do not fit.
-                    process.ensure(live + 2 + arinsal_term::S_RESERVED, live)?;
+                    process.ensure_objv(
+                        live + 2 + arinsal_term::S_RESERVED,
+                        &mut self.native_registers.x_reg_array[..live],
+                    )?;
                     if !process.heap.reserve_stack(1)
                         || !process
                             .heap
@@ -273,7 +276,12 @@ impl Executor {
                         &function,
                         true,
                     )?;
-                    crate::trace::push_native_trace_frame(process, resume_pc, &actions, arity)?;
+                    crate::trace::push_native_trace_frame(
+                        process,
+                        resume_pc,
+                        &actions,
+                        &mut self.native_registers.x_reg_array[..arity],
+                    )?;
                     if crate::trace_bp::debug_breakpoint_enabled(
                         process,
                         function.module,
@@ -1101,7 +1109,7 @@ impl Executor {
                             process,
                             function.start,
                             &actions,
-                            usize::from(function.arity),
+                            &mut self.native_registers.x_reg_array[..usize::from(function.arity)],
                         )?;
                         process.gc_live = usize::from(export.arity);
                         process.set_native_pc(Some(function.start));

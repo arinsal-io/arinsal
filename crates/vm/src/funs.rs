@@ -943,12 +943,16 @@ impl Vm {
             )
         {
             let actions = crate::trace::executor_native_call_event(self, p, run, &native, false)?;
-            crate::trace::push_native_trace_frame(
+            // XREG-1: the executor's call path does not hold `reg` yet.
+            let mut x = p.take_x_for_gc();
+            let pushed = crate::trace::push_native_trace_frame(
                 p,
                 native.start,
                 &actions,
-                usize::from(native.arity),
-            )?;
+                &mut x[..usize::from(native.arity)],
+            );
+            p.x = x;
+            pushed?;
         }
         self.set_position(p, module_id, target)?;
         // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3098-3116 (emit_i_test_yield),

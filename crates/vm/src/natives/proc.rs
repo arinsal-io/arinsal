@@ -1809,7 +1809,7 @@ pub(crate) fn fun_info_arity_light(
     };
     // Port of erts/emulator/beam/erl_bif_info.c:3976 (`HAlloc(p, 3)`), OTP-29.1.1:
     // release the inspected fun before a possible collection and reserve the result tuple.
-    if let Err(error) = process.ensure_entry(3, 0) {
+    if let Err(error) = process.ensure_entry(3, &mut []) {
         return Some(Err(match error {
             VmError::Trap(trap) => trap,
             _ => crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT)),

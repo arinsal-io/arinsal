@@ -2152,23 +2152,26 @@ impl Process {
     // Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED), OTP-29.1.1: the
     // entry check only reads the heap cursors unless a collection is wanted.
     #[inline]
-    pub(crate) fn ensure_entry(&mut self, words: usize, live: usize) -> Result<(), VmError> {
-        if live <= self.x.len()
-            && self.heap.free_words() >= words + self.heap.check_reserve()
+    pub(crate) fn ensure_entry(&mut self, words: usize, objv: &mut [Term]) -> Result<(), VmError> {
+        if self.heap.free_words() >= words + self.heap.check_reserve()
             && !self.heap.bin_vheap_gc_due()
             && !crate::interp::gc_stress_enabled()
         {
-            self.gc_live = live;
+            self.gc_live = objv.len();
             return Ok(());
         }
-        self.ensure(words, live)
+        self.ensure_objv(words, objv)
     }
     /// [`Process::ensure`] that returns the collection's reduction cost instead of charging it,
     /// for `arinsal_beamasm_gc_sync`, whose generated code subtracts the cost from FCALLS.
     #[cold]
     #[inline(never)]
-    pub(crate) fn ensure_uncharged(&mut self, words: usize, live: usize) -> Result<u32, VmError> {
-        self.ensure_roots_cost(words, live)
+    pub(crate) fn ensure_uncharged(
+        &mut self,
+        words: usize,
+        objv: &mut [Term],
+    ) -> Result<u32, VmError> {
+        self.ensure_objv_cost(words, objv)
     }
     /// Charge `cost` reductions for a collection against FCALLS, which stops at zero.
     // Port of erts/emulator/beam/bif.h (BUMP_REDS) as used by erl_gc.c
@@ -2193,18 +2196,15 @@ impl Process {
         }
         self.bump_gc_reds(stats.reductions);
     }
-    /// Ensure with `live` roots in `self.x`, the scheduler's X register array, without a
-    /// collection when the heap has room.
+    /// Ensure with `objv` (the register array prefix the caller holds) as the roots, without
+    /// a collection when the heap has room.
     ///
     /// Port of erts/emulator/beam/erl_bits.c:1769-1840 (`erts_bs_append_checked`), OTP-29.1.1.
     pub(crate) fn ensure_native_roots(
         &mut self,
         words: usize,
-        live: usize,
+        objv: &mut [Term],
     ) -> Result<bool, VmError> {
-        if live > self.x.len() {
-            return Err(VmError::Unsupported("live X register count".into()));
-        }
         let allocation_words = words + self.heap.check_reserve();
         if self.heap.free_words() >= allocation_words
             && !self.heap.bin_vheap_gc_due()
@@ -2212,7 +2212,7 @@ impl Process {
         {
             return Ok(false);
         }
-        self.ensure(words, live).map(|()| true)
+        self.ensure_objv(words, objv).map(|()| true)
     }
     /// Collect with `live` X roots; the registers above them are left as they are.
     #[cold]

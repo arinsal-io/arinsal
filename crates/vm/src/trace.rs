@@ -2985,7 +2985,7 @@ pub(crate) fn push_native_trace_frame(
     process: &mut Process,
     function_pc: usize,
     actions: &[NativeTraceAction],
-    live: usize,
+    objv: &mut [Term],
 ) -> Result<(), VmError> {
     let mut frames: SmallVec<[(TraceFrameKind, [Term; 3]); 2]> = SmallVec::new();
     let small = |value: u64| Term::small(value as i64).unwrap_or(Term::NIL);
@@ -3037,7 +3037,7 @@ pub(crate) fn push_native_trace_frame(
         // the need is satisfied in a fresh heap fragment and the collection is left for later.
         process.delay_heap_collection(frame_words);
     } else {
-        process.ensure(frame_words, live)?;
+        process.ensure_objv(frame_words, objv)?;
     }
     if !process.heap.reserve_stack(frame_words) {
         return Err(VmError::Unsupported("native trace stack limit".into()));

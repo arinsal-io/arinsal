@@ -3,7 +3,7 @@
 //! Port of erts/emulator/beam/erl_bits.c:1725 (`erts_bs_append_checked`) for the
 //! `<<Bin/binary, Bin2/binary>>` shape the compiler lowers to append + one binary.
 
-use crate::native_hooks::{enter_runtime, raw, set_error};
+use crate::native_hooks::{raw, set_error};
 use arinsal_beamasm::ProcessHeader;
 use arinsal_bits::{BitsError, SegFlags, SegSize, SegType, Segment, SegmentValue};
 use arinsal_term::Term;
@@ -18,8 +18,9 @@ pub extern "C" fn append_binary(
     extra_index: u64,
     live: u64,
     alloc: u64,
+    reg: *mut u64,
 ) -> u64 {
-    let Some(process) = enter_runtime(header) else {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
         return 0;
     };
     let (Ok(src_index), Ok(extra_index), Ok(live), Ok(alloc)) = (
@@ -65,9 +66,11 @@ pub extern "C" fn append_binary(
     // The call site stores FCALLS and reloads it (`Update::eReductions`), so the charge goes
     // through `process.reductions`, which `enter_runtime` started from the stored FCALLS. BUMP_REDS
     // clamps FCALLS at zero.
-    let copy_reductions =
-        arinsal_bits::create_bin_reductions(&build(process.x[src_index], process.x[extra_index]))
-            .unwrap_or(0);
+    let copy_reductions = arinsal_bits::create_bin_reductions(&build(
+        registers.x_reg_array[src_index],
+        registers.x_reg_array[extra_index],
+    ))
+    .unwrap_or(0);
     let charge = |process: &mut crate::Process| {
         process.heap.abi.fcalls = process
             .heap
@@ -81,30 +84,41 @@ pub extern "C" fn append_binary(
     // The heap bitstring of a result up to 64 bytes takes up to 10 words, more than a BinRef plus
     // SubBits, so the request follows what the builder writes. `Alloc` is the heap the
     // instruction's following stores use without their own test (`extra_words` in erts).
-    if let Some(words) =
-        arinsal_bits::concat_byte_binary_heap_words(process.x[src_index], process.x[extra_index])
-            .and_then(|words| words.checked_add(alloc))
-        && let Ok(_) = process.ensure_native_roots(words, root_live)
+    if let Some(words) = arinsal_bits::concat_byte_binary_heap_words(
+        registers.x_reg_array[src_index],
+        registers.x_reg_array[extra_index],
+    )
+    .and_then(|words| words.checked_add(alloc))
+        && let Ok(_) = process.ensure_native_roots(words, &mut registers.x_reg_array[..root_live])
         && let Ok(Some(term)) = arinsal_bits::concat_byte_binary(
-            process.x[src_index],
-            process.x[extra_index],
+            registers.x_reg_array[src_index],
+            registers.x_reg_array[extra_index],
             &mut process.heap,
         )
     {
         charge(process);
         return raw(term);
     }
-    let initial = build(process.x[src_index], process.x[extra_index]);
+    let initial = build(
+        registers.x_reg_array[src_index],
+        registers.x_reg_array[extra_index],
+    );
     let mut request = match arinsal_bits::create_bin_size(&initial) {
         Ok(size) => size.heap_words.saturating_add(alloc),
         Err(error) => return fail(process, error),
     };
     let result = loop {
-        if process.ensure(request, root_live).is_err() {
+        if process
+            .ensure_objv(request, &mut registers.x_reg_array[..root_live])
+            .is_err()
+        {
             set_error(process, "system_limit");
             return 0;
         }
-        let segments = build(process.x[src_index], process.x[extra_index]);
+        let segments = build(
+            registers.x_reg_array[src_index],
+            registers.x_reg_array[extra_index],
+        );
         match arinsal_bits::create_bin(&segments, &mut process.heap) {
             Err(BitsError::HeapFull { need_words }) => {
                 request = need_words

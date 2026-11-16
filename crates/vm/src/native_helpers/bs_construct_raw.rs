@@ -20,11 +20,11 @@ pub(crate) extern "C" fn append_checked(
         return 0;
     }
     debug_assert_eq!(source_index, live, "append source is reg[live]");
-    // SAFETY: native code passes its scheduler register area. Only `erl_bits_state` is
-    // borrowed: the X registers are reached through the process's attached X file, the array
-    // the collection inside the helper rewrites.
-    let ebs = unsafe { &mut *std::ptr::addr_of_mut!((*registers).erl_bits_state) };
-    crate::native_helpers::bs_append_checked(header, ebs, extra_bits, unit, live, alloc)
+    // SAFETY: native code passes its scheduler register area, which only this scheduler
+    // touches while the helper runs.
+    let registers = unsafe { &mut *registers };
+    let (ebs, x) = (&mut registers.erl_bits_state, &mut registers.x_reg_array);
+    crate::native_helpers::bs_append_checked(header, ebs, x, extra_bits, unit, live, alloc)
 }
 
 /// Runs the checked private append against the scheduler's live write cursor.
@@ -81,7 +81,11 @@ pub(crate) extern "C" fn init_bits(
     } else {
         8
     };
-    let ensured = process.ensure_native_roots(heap_words.saturating_add(alloc), live);
+    let Some(objv) = registers.x_reg_array.get_mut(..live) else {
+        crate::native_hooks::set_error(process, "system_limit");
+        return 0;
+    };
+    let ensured = process.ensure_native_roots(heap_words.saturating_add(alloc), objv);
     if ensured.is_err() {
         crate::native_hooks::set_error(process, "system_limit");
         return 0;

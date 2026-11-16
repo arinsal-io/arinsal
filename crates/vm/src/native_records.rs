@@ -88,20 +88,20 @@ fn field_value(
 }
 
 /// Make the live X registers and the staged operands collector roots; the registers between
-/// the live prefix and the staged words are dead and must not be roots. `process.x` is the
-/// scheduler's array, so the collector moves the roots in place.
-fn stage_roots(process: &mut Process, live: usize, base: usize, top: usize) -> Option<()> {
-    if top > crate::proc_create::ATTACHED_X_REGS {
+/// the live prefix and the staged words are dead and must not be roots. `x` is the register
+/// array the fragment passed, so the collector moves the roots in place.
+fn stage_roots(x: &mut [Term], live: usize, base: usize, top: usize) -> Option<()> {
+    if top > x.len() {
         return None;
     }
-    process.x[live..base].fill(Term::NIL);
+    x[live..base].fill(Term::NIL);
     Some(())
 }
 
 /// Merge the sorted staged `(key, value)` words with a record's sorted keys.
-fn staged_pairs(process: &Process, base: usize, count: usize) -> Vec<(Term, Term)> {
+fn staged_pairs(x: &[Term], base: usize, count: usize) -> Vec<(Term, Term)> {
     (0..count / 2)
-        .map(|pair| (process.x[base + 2 * pair], process.x[base + 2 * pair + 1]))
+        .map(|pair| (x[base + 2 * pair], x[base + 2 * pair + 1]))
         .collect()
 }
 
@@ -120,13 +120,16 @@ fn exported_definition(id: Term) -> Option<Term> {
 /// erl_create_native_record), OTP-29.1.1.
 fn create(
     header: *mut ProcessHeader,
+    registers: *mut SchedulerRegisters,
     id: u64,
     live: u64,
     count: u64,
     base: u64,
     external: bool,
 ) -> u64 {
-    let Some(process) = enter_runtime(header) else {
+    let Some((process, registers)) =
+        native_hooks::enter_runtime_reg(header, registers.cast::<u64>())
+    else {
         return 0;
     };
     let (Ok(live), Ok(count), Ok(base)) = (
@@ -138,6 +141,7 @@ fn create(
     };
     let result = create_record(
         process,
+        &mut registers.x_reg_array,
         native_hooks::from_raw(id),
         (live, count, base),
         external,
@@ -153,6 +157,7 @@ fn create(
 
 fn create_record(
     process: &mut Process,
+    x: &mut [Term],
     id: Term,
     (live, count, base): (usize, usize, usize),
     external: bool,
@@ -166,11 +171,11 @@ fn create_record(
     let definition = Definition::parse(definition_term).ok_or(Failure::SystemLimit)?;
     let defaults = term_sequence(defaults).ok_or(Failure::SystemLimit)?;
     let top = base + count;
-    stage_roots(process, live, base, top).ok_or(Failure::SystemLimit)?;
+    stage_roots(x, live, base, top).ok_or(Failure::SystemLimit)?;
     process
-        .ensure(2 + definition.keys.len(), top)
+        .ensure_objv(2 + definition.keys.len(), &mut x[..top])
         .map_err(|_| Failure::SystemLimit)?;
-    let pairs = staged_pairs(process, base, count);
+    let pairs = staged_pairs(x, base, count);
     let mut values = Vec::with_capacity(definition.keys.len());
     let mut next = 0;
     let mut missing = None;
@@ -204,37 +209,39 @@ fn create_record(
 /// Runtime helper of `i_create_local_native_record`.
 pub extern "C" fn arinsal_beamasm_create_local_record(
     header: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    registers: *mut SchedulerRegisters,
     definition: u64,
     live: u64,
     count: u64,
     base: u64,
 ) -> u64 {
-    create(header, definition, live, count, base, false)
+    create(header, registers, definition, live, count, base, false)
 }
 
 /// Runtime helper of `i_create_native_record`.
 pub extern "C" fn arinsal_beamasm_create_record(
     header: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    registers: *mut SchedulerRegisters,
     id: u64,
     live: u64,
     count: u64,
     base: u64,
 ) -> u64 {
-    create(header, id, live, count, base, true)
+    create(header, registers, id, live, count, base, true)
 }
 
 /// Port of erts/emulator/beam/erl_record.c:381-468 (erl_update_native_record), OTP-29.1.1.
 pub extern "C" fn arinsal_beamasm_update_record(
     header: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    registers: *mut SchedulerRegisters,
     source: u64,
     live: u64,
     count: u64,
     base: u64,
 ) -> u64 {
-    let Some(process) = enter_runtime(header) else {
+    let Some((process, registers)) =
+        native_hooks::enter_runtime_reg(header, registers.cast::<u64>())
+    else {
         return 0;
     };
     let (Ok(live), Ok(count), Ok(base)) = (
@@ -244,7 +251,12 @@ pub extern "C" fn arinsal_beamasm_update_record(
     ) else {
         return 0;
     };
-    let result = update_record(process, native_hooks::from_raw(source), (live, count, base));
+    let result = update_record(
+        process,
+        &mut registers.x_reg_array,
+        native_hooks::from_raw(source),
+        (live, count, base),
+    );
     match result {
         Ok(record) => native_hooks::raw(record),
         Err(failure) => {
@@ -256,6 +268,7 @@ pub extern "C" fn arinsal_beamasm_update_record(
 
 fn update_record(
     process: &mut Process,
+    x: &mut [Term],
     source: Term,
     (live, count, base): (usize, usize, usize),
 ) -> Result<Term, Failure> {
@@ -264,18 +277,18 @@ fn update_record(
     // staged words.
     let source_slot = base + count;
     let top = source_slot + 1;
-    if top > crate::proc_create::ATTACHED_X_REGS {
+    if top > x.len() {
         return Err(Failure::SystemLimit);
     }
-    process.x[source_slot] = source;
-    stage_roots(process, live, base, top).ok_or(Failure::SystemLimit)?;
+    x[source_slot] = source;
+    stage_roots(x, live, base, top).ok_or(Failure::SystemLimit)?;
     process
-        .ensure(2 + snapshot.fields.len(), top)
+        .ensure_objv(2 + snapshot.fields.len(), &mut x[..top])
         .map_err(|_| Failure::SystemLimit)?;
-    let source = process.x[source_slot];
+    let source = x[source_slot];
     let snapshot = source.record_snapshot().ok_or(Failure::BadRecord(source))?;
     let definition = Definition::parse(snapshot.definition).ok_or(Failure::SystemLimit)?;
-    let pairs = staged_pairs(process, base, count);
+    let pairs = staged_pairs(x, base, count);
     let mut values = snapshot.values.clone();
     let mut next = 0;
     for (index, key) in definition.keys.iter().enumerate() {
