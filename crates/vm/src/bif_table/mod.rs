@@ -167,8 +167,9 @@ use crate::native_helpers::{
     persistent_term_get_2_light, unique_integer_0_light, unique_integer_1_light,
 };
 use crate::natives::{
-    bif_phash2, binary, erl_bif_chksum, erl_bif_guard, erl_bif_info, erl_bif_lists, erl_bif_op,
-    erl_hl_timer, erl_iolist, erl_map, erl_process_dict, external, register,
+    bif_phash2, binary, erl_bif_atomics, erl_bif_chksum, erl_bif_guard, erl_bif_info,
+    erl_bif_lists, erl_bif_op, erl_hl_timer, erl_iolist, erl_map, erl_process_dict, external,
+    register,
 };
 
 /// Binary guards whose erts entries have dedicated BeamAsm BIF functions.
@@ -226,6 +227,23 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "md5_init", 0) => bif!(erl_bif_chksum::md5_init_0),
         ("erlang", "md5_update", 2) => bif!(erl_bif_chksum::md5_update_2),
         ("erlang", "md5_final", 1) => bif!(erl_bif_chksum::md5_final_1),
+        // erl_bif_atomics.c
+        ("erts_internal", "atomics_new", 2) => bif!(erl_bif_atomics::atomics_new_2),
+        ("atomics", "put", 3) => bif!(erl_bif_atomics::atomics_put_3),
+        ("atomics", "get", 2) => bif!(erl_bif_atomics::atomics_get_2),
+        ("atomics", "add", 3) => bif!(erl_bif_atomics::atomics_add_3),
+        ("atomics", "add_get", 3) => bif!(erl_bif_atomics::atomics_add_get_3),
+        ("atomics", "exchange", 3) => bif!(erl_bif_atomics::atomics_exchange_3),
+        ("atomics", "compare_exchange", 4) => {
+            bif!(erl_bif_atomics::atomics_compare_exchange_4)
+        }
+        ("atomics", "info", 1) => bif!(erl_bif_atomics::atomics_info_1),
+        // erl_bif_counters.c
+        ("erts_internal", "counters_new", 1) => bif!(erl_bif_atomics::counters_new_1),
+        ("erts_internal", "counters_get", 2) => bif!(erl_bif_atomics::counters_get_2),
+        ("erts_internal", "counters_add", 3) => bif!(erl_bif_atomics::counters_add_3),
+        ("erts_internal", "counters_put", 3) => bif!(erl_bif_atomics::counters_put_3),
+        ("erts_internal", "counters_info", 1) => bif!(erl_bif_atomics::counters_info_1),
         // bif.c
         ("erlang", "phash2", 1) => bif!(bif_phash2::phash2_1),
         ("erlang", "phash2", 2) => bif!(bif_phash2::phash2_2),

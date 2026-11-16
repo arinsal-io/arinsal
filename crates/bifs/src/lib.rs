@@ -22,9 +22,7 @@ use std::sync::Arc;
 use arinsal_term::{ExternalBinary, HeapAlloc, MagicBin, NativeAbi, Node, ProcessHeap, Term};
 
 mod arith;
-mod atomics;
 mod binary_mod;
-mod checksum;
 mod dirty;
 mod etf;
 mod lists;
@@ -36,11 +34,6 @@ mod time;
 mod unicode;
 mod unique;
 
-pub use checksum::{
-    BYTES_PER_REDUCTION, CHUNK_PER_SCHEDULE, Chksum, Md5State, combine as chksum_combine,
-    do_chksum_md5, do_chksum_zlib, md5_state_arg, new_binary as chksum_new_binary, term_to_u32,
-    zlib_initial,
-};
 pub use etf::{
     BlockHashWalk, EncodeWalk, RefcEncoded, encode_term_to_binary, install_refc_binary,
     local_term_hash,
@@ -561,9 +554,6 @@ pub fn visit_bif<V: BifTableVisitor>(
     visitor: &mut V,
 ) -> Option<V::Output> {
     if let Some(found) = arith::lookup(module, name, arity, visitor) {
-        return Some(found);
-    }
-    if let Some(found) = atomics::lookup(module, name, arity, visitor) {
         return Some(found);
     }
     if let Some(found) = time::lookup(module, name, arity, visitor) {
