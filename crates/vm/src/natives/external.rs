@@ -92,37 +92,37 @@ fn charge_for(walk: &EncodeWalk, work: usize) -> usize {
 
 /// `erlang:term_to_binary/1`.
 // Port of erts/emulator/beam/external.c (term_to_binary_1), OTP-29.1.1.
-pub(crate) extern "C" fn term_to_binary_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    term_to_binary_start(c_p, i, 0)
+pub(crate) extern "C" fn term_to_binary_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    term_to_binary_start(c_p, reg, i, 0)
 }
 
 /// `erlang:term_to_binary/2`.
 // Port of erts/emulator/beam/external.c (term_to_binary_2), OTP-29.1.1.
-pub(crate) extern "C" fn term_to_binary_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    term_to_binary_start(c_p, i, 1)
+pub(crate) extern "C" fn term_to_binary_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    term_to_binary_start(c_p, reg, i, 1)
 }
 
 /// `erlang:term_to_iovec/1`.
 // Port of erts/emulator/beam/external.c (term_to_iovec_1), OTP-29.1.1.
-pub(crate) extern "C" fn term_to_iovec_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    term_to_binary_start(c_p, i, 2)
+pub(crate) extern "C" fn term_to_iovec_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    term_to_binary_start(c_p, reg, i, 2)
 }
 
 /// `erlang:term_to_iovec/2`.
 // Port of erts/emulator/beam/external.c (term_to_iovec_2), OTP-29.1.1.
-pub(crate) extern "C" fn term_to_iovec_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    term_to_binary_start(c_p, i, 3)
+pub(crate) extern "C" fn term_to_iovec_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    term_to_binary_start(c_p, reg, i, 3)
 }
 
 /// The shared first call of `term_to_binary_1/2` and `term_to_iovec_1/2`: the option parse,
 /// then `erts_term_to_binary_int` with a context on the stack.
-fn term_to_binary_start(c_p: *mut ProcessHeader, i: u64, bif_ix: usize) -> u64 {
+fn term_to_binary_start(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, bif_ix: usize) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
     let (name, arity, iovec) = TTB_BIFS[bif_ix];
-    let args = [process.x[0], process.x[1]];
+    let args = crate::bif_table::bif_args::<2>(reg);
     let term = args[0];
     let opts = if arity == 2 {
         args[1]
@@ -151,21 +151,21 @@ fn term_to_binary_start(c_p: *mut ProcessHeader, i: u64, bif_ix: usize) -> u64 {
         },
         walk,
     };
-    erts_term_to_binary_int(c_p, i, process, bif_ix, (term, opts), context, None)
+    erts_term_to_binary_int(c_p, reg, i, process, bif_ix, (term, opts), context, None)
 }
 
 /// `erts_internal:term_to_binary_trap/1`.
 // Port of erts/emulator/beam/external.c (term_to_binary_trap_1), OTP-29.1.1.
 pub(crate) extern "C" fn term_to_binary_trap_1(
     c_p: *mut ProcessHeader,
-    _reg: *mut u64,
+    reg: *mut u64,
     i: u64,
 ) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let state = process.x[0];
+    let [state] = crate::bif_table::bif_args::<1>(reg);
     let (Ok(term), Ok(opts), Ok(mref), Ok(bix)) = (
         arinsal_bifs::tuple_element(state, 0),
         arinsal_bifs::tuple_element(state, 1),
@@ -186,15 +186,26 @@ pub(crate) extern "C" fn term_to_binary_trap_1(
     let Some(context) = context else {
         return bif_ret(c_p, i, Err(badarg()));
     };
-    erts_term_to_binary_int(c_p, i, process, bif_ix, (term, opts), context, Some(mref))
+    erts_term_to_binary_int(
+        c_p,
+        reg,
+        i,
+        process,
+        bif_ix,
+        (term, opts),
+        context,
+        Some(mref),
+    )
 }
 
 /// `erts_term_to_binary_int` and the BIF tail that follows it in `term_to_binary_N` (first
 /// call, `mref` is `None`) or `term_to_binary_trap_1` (`mref` is the context's magic ref).
 // Port of erts/emulator/beam/external.c (erts_term_to_binary_int, term_to_binary_1/2,
 // term_to_iovec_1/2, term_to_binary_trap_1), OTP-29.1.1.
+#[allow(clippy::too_many_arguments)]
 fn erts_term_to_binary_int(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     process: &mut Process,
     bif_ix: usize,
@@ -209,8 +220,8 @@ fn erts_term_to_binary_int(
         TtbOutcome::Failed(error) => {
             // ERTS_BIF_ERROR_TRAPPED1/2 name the original BIF and arguments.
             let args = [term, opts];
-            process.x[0] = term;
-            process.x[1] = opts;
+            crate::bif_table::set_bif_arg(reg, 0, term);
+            crate::bif_table::set_bif_arg(reg, 1, opts);
             let error =
                 crate::exceptions::bif_error(process, "erlang", name, &args[..arity], error);
             bif_ret(c_p, i, Err(error))
@@ -502,25 +513,25 @@ fn finish_iovec(process: &mut Process, walk: EncodeWalk) -> Result<Term, BifErro
 
 /// `erlang:external_size/1`.
 // Port of erts/emulator/beam/external.c (external_size_1), OTP-29.1.1.
-pub(crate) extern "C" fn external_size_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    external_size(c_p, i, 1)
+pub(crate) extern "C" fn external_size_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    external_size(c_p, reg, i, 1)
 }
 
 /// `erlang:external_size/2`.
 // Port of erts/emulator/beam/external.c (external_size_2), OTP-29.1.1.
-pub(crate) extern "C" fn external_size_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    external_size(c_p, i, 2)
+pub(crate) extern "C" fn external_size_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    external_size(c_p, reg, i, 2)
 }
 
 /// `erts_encode_ext_size[_2]` with an unbounded budget, then `make_small` or `uint_to_big`.
 // Port of erts/emulator/beam/external.c (external_size_1, external_size_2,
 // erts_encode_ext_size_2), OTP-29.1.1.
-fn external_size(c_p: *mut ProcessHeader, i: u64, arity: usize) -> u64 {
+fn external_size(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let args = [process.x[0], process.x[1]];
+    let args = crate::bif_table::bif_args::<2>(reg);
     let result = (|| {
         let mut walk = EncodeWalk::new_external_size(&args[..arity])?;
         walk.set_local_node_source(local_node_source);
@@ -576,20 +587,21 @@ enum B2tExit {
 
 /// `erlang:binary_to_term/1`.
 // Port of erts/emulator/beam/external.c (binary_to_term_1), OTP-29.1.1.
-pub(crate) extern "C" fn binary_to_term_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    binary_to_term_start(c_p, i, 1)
+pub(crate) extern "C" fn binary_to_term_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    binary_to_term_start(c_p, reg, i, 1)
 }
 
 /// `erlang:binary_to_term/2`.
 // Port of erts/emulator/beam/external.c (binary_to_term_2), OTP-29.1.1.
-pub(crate) extern "C" fn binary_to_term_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    binary_to_term_start(c_p, i, 2)
+pub(crate) extern "C" fn binary_to_term_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    binary_to_term_start(c_p, reg, i, 2)
 }
 
 /// The BADARG of `binary_to_term_N` / `binary_to_term_int` with the reductions done so far
 /// (`BUMP_REDS`); `trapped` is `ERTS_BIF_PREP_ERROR_TRAPPED*` after `erts_set_gc_state(p, 1)`.
 fn b2t_error(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     process: &mut Process,
     args: &[Term],
@@ -605,9 +617,9 @@ fn b2t_error(
         BifError::Unsupported(_) => BifError::BADARG,
         other => other,
     };
-    process.x[0] = args[0];
+    crate::bif_table::set_bif_arg(reg, 0, args[0]);
     if args.len() > 1 {
-        process.x[1] = args[1];
+        crate::bif_table::set_bif_arg(reg, 1, args[1]);
     }
     let error = crate::exceptions::bif_error(process, "erlang", "binary_to_term", args, error);
     bif_ret(c_p, i, Err(error))
@@ -615,35 +627,35 @@ fn b2t_error(
 
 /// `binary_to_term_1/2`: the context on the stack, then `binary_to_term_int`.
 // Port of erts/emulator/beam/external.c (binary_to_term_1, binary_to_term_2), OTP-29.1.1.
-fn binary_to_term_start(c_p: *mut ProcessHeader, i: u64, arity: usize) -> u64 {
+fn binary_to_term_start(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let call_args = [process.x[0], process.x[1]];
+    let call_args = crate::bif_table::bif_args::<2>(reg);
     let args = &call_args[..arity];
     let mut ctx = match B2tContext::new(args, arity) {
         Ok(ctx) => ctx,
-        Err(error) => return b2t_error(c_p, i, process, args, error, 0),
+        Err(error) => return b2t_error(c_p, reg, i, process, args, error, 0),
     };
     // `dec_is_this_node`.
     let local_node = arinsal_term::this_node();
     ctx.set_local_node(local_node.0, local_node.1);
-    binary_to_term_int(c_p, i, process, ctx)
+    binary_to_term_int(c_p, reg, i, process, ctx)
 }
 
 /// `erts_internal:binary_to_term_trap/1`.
 // Port of erts/emulator/beam/external.c (binary_to_term_trap_1), OTP-29.1.1.
 pub(crate) extern "C" fn binary_to_term_trap_1(
     c_p: *mut ProcessHeader,
-    _reg: *mut u64,
+    reg: *mut u64,
     i: u64,
 ) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let mref = process.x[0];
+    let [mref] = crate::bif_table::bif_args::<1>(reg);
     let context = mref
         .with_magic_payload::<B2tHolder, _>(|holder| holder.lock().ok()?.take())
         .flatten();
@@ -652,7 +664,7 @@ pub(crate) extern "C" fn binary_to_term_trap_1(
     };
     b2t_init_reds(process, &mut ctx);
     let exit = b2t_run(process, &mut ctx);
-    b2t_exit_exported(c_p, i, process, ctx, exit)
+    b2t_exit_exported(c_p, reg, i, process, ctx, exit)
 }
 
 /// `initial_reds = ERTS_BIF_REDS_LEFT(p) * B2T_BYTES_PER_REDUCTION`, `ctx->reds = initial_reds`.
@@ -667,6 +679,7 @@ fn b2t_init_reds(process: &Process, ctx: &mut B2tContext<'_>) {
 // Port of erts/emulator/beam/external.c (binary_to_term_int), OTP-29.1.1.
 fn binary_to_term_int(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     process: &mut Process,
     mut ctx: B2tContext<'_>,
@@ -674,32 +687,33 @@ fn binary_to_term_int(
     b2t_init_reds(process, &mut ctx);
     let exit = b2t_run(process, &mut ctx);
     if let B2tExit::Done | B2tExit::Fail(_) = exit {
-        return b2t_finish(c_p, i, process, &mut ctx, exit);
+        return b2t_finish(c_p, reg, i, process, &mut ctx, exit);
     }
     // `b2t_export_context` (`ASSERT(ctx->state < B2TDecode)`): the rest of the call runs on the
     // exported context, which stays at its address in the magic binary.
     let mut exported = match b2t_export_context(process, ctx) {
         Ok(owned) => owned,
-        Err((args, error)) => return b2t_error(c_p, i, process, &args, error, 0),
+        Err((args, error)) => return b2t_error(c_p, reg, i, process, &args, error, 0),
     };
     let exit = match exit {
         B2tExit::Export => b2t_run(process, &mut exported),
         exit => exit,
     };
-    b2t_exit_exported(c_p, i, process, exported, exit)
+    b2t_exit_exported(c_p, reg, i, process, exported, exit)
 }
 
 /// What `binary_to_term_int` does after its loop on an exported context: the result, the
 /// BADARG, or BUMP_ALL_REDS and BIF_TRAP1 with the context in its magic binary.
 fn b2t_exit_exported(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     process: &mut Process,
     mut ctx: Box<B2tContext<'static>>,
     exit: B2tExit,
 ) -> u64 {
     if let B2tExit::Done | B2tExit::Fail(_) = exit {
-        return b2t_finish(c_p, i, process, &mut ctx, exit);
+        return b2t_finish(c_p, reg, i, process, &mut ctx, exit);
     }
     let mref = ctx.trap_bin.expect("exported context has a trap_bin");
     let _ = mref.with_magic_payload::<B2tHolder, _>(|holder| {
@@ -713,6 +727,7 @@ fn b2t_exit_exported(
 /// `B2TDone` / `B2TDecodeFail` of `binary_to_term_int`: the result or the BADARG.
 fn b2t_finish(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     process: &mut Process,
     ctx: &mut B2tContext<'_>,
@@ -726,7 +741,7 @@ fn b2t_finish(
             }
             let consumed = ctx.initial_reds - ctx.reds;
             let (arity, arg) = (ctx.arity, ctx.arg);
-            b2t_error(c_p, i, process, &arg[..arity], error, consumed)
+            b2t_error(c_p, reg, i, process, &arg[..arity], error, consumed)
         }
         _ => {
             // erts_set_gc_state(p, 1) when a magic binary disabled it; BUMP_REDS.

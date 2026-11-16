@@ -26,12 +26,12 @@ type B2lHolder = TrapContext<BinaryToListWalk>;
 
 /// `erlang:binary_to_list/1`.
 // Port of erts/emulator/beam/binary.c (binary_to_list_1), OTP-29.1.1.
-pub(crate) extern "C" fn binary_to_list_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn binary_to_list_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let bin = process.x[0];
+    let [bin] = crate::bif_table::bif_args::<1>(reg);
     let Ok((bits, byte_start, bit_offset)) = arinsal_bifs::bitstring_source(bin) else {
         return bif_ret(c_p, i, Err(badarg()));
     };
@@ -44,6 +44,7 @@ pub(crate) extern "C" fn binary_to_list_1(c_p: *mut ProcessHeader, _reg: *mut u6
     let size = bits / 8;
     binary_to_list_checked(
         c_p,
+        reg,
         i,
         process,
         "erlang:binary_to_list/1",
@@ -54,12 +55,12 @@ pub(crate) extern "C" fn binary_to_list_1(c_p: *mut ProcessHeader, _reg: *mut u6
 
 /// `erlang:binary_to_list/3`.
 // Port of erts/emulator/beam/binary.c (binary_to_list_3), OTP-29.1.1.
-pub(crate) extern "C" fn binary_to_list_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn binary_to_list_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (bin, start, stop) = (process.x[0], process.x[1], process.x[2]);
+    let [bin, start, stop] = crate::bif_table::bif_args::<3>(reg);
     let Ok((bits, byte_start, bit_offset)) = arinsal_bifs::bitstring_source(bin) else {
         return bif_ret(c_p, i, Err(badarg()));
     };
@@ -80,6 +81,7 @@ pub(crate) extern "C" fn binary_to_list_3(c_p: *mut ProcessHeader, _reg: *mut u6
     }
     binary_to_list_checked(
         c_p,
+        reg,
         i,
         process,
         "erlang:binary_to_list/3",
@@ -92,6 +94,7 @@ pub(crate) extern "C" fn binary_to_list_3(c_p: *mut ProcessHeader, _reg: *mut u6
 /// `ERTS_BIF_YIELD1/3` of a call that gets too few reductions.
 fn binary_to_list_checked(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     process: &mut crate::Process,
     bif: &'static str,
@@ -106,7 +109,7 @@ fn binary_to_list_checked(
         if reds_left <= B2L_RESCHED_REDS {
             // ERTS_BIF_YIELD1/3: ERTS_VBUMP_ALL_REDS, then BIF_TRAP to the BIF itself.
             crate::bif_traps::vbump_all_reds(process);
-            let args = process.x[..arity].to_vec();
+            let args = crate::bif_table::bif_arg_vec(reg, arity);
             let trap = bif_trap(process, bif, args);
             return bif_ret(c_p, i, Err(trap));
         }
@@ -151,14 +154,14 @@ fn binary_to_list(
 // Port of erts/emulator/beam/binary.c (binary_to_list_continue), OTP-29.1.1.
 pub(crate) extern "C" fn binary_to_list_continue_1(
     c_p: *mut ProcessHeader,
-    _reg: *mut u64,
+    reg: *mut u64,
     i: u64,
 ) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let mref = process.x[0];
+    let [mref] = crate::bif_table::bif_args::<1>(reg);
     let reds_left = process.heap.abi.fcalls.max(0) as usize;
     binary_to_list_chunk(c_p, i, process, mref, reds_left, true)
 }

@@ -5,7 +5,7 @@
 //! branches to it with `(c_p, reg, I)`. `invoke_dispatch_bif` is not that pointer.
 
 mod raw;
-pub(crate) use raw::bif_args;
+pub(crate) use raw::{bif_arg_vec, bif_args, set_bif_arg};
 
 use arinsal_beamasm::ProcessHeader;
 use std::sync::atomic::{AtomicUsize, Ordering};

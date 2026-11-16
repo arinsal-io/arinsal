@@ -18,15 +18,11 @@ const IS_PROCESS_ALIVE_TRAP: &str = "erts_internal:is_process_alive/1";
 
 /// `is_process_alive/1`.
 // Port of erts/emulator/beam/erl_bif_info.c (is_process_alive_1), OTP-29.1.1.
-pub(crate) extern "C" fn is_process_alive_1(
-    c_p: *mut ProcessHeader,
-    _reg: *mut u64,
-    i: u64,
-) -> u64 {
+pub(crate) extern "C" fn is_process_alive_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
-    let arg = process.x[0]; // BIF_ARG_1
+    let [arg] = crate::bif_table::bif_args::<1>(reg);
     if let Some(pid) = Pid::from_term(arg) {
         if arg.tagged_word() == process.heap.abi.self_pid {
             return crate::native_hooks::raw(Term::atom(atoms::TRUE));

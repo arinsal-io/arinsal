@@ -88,86 +88,97 @@ fn zlib_sum(
     Ok(res_sum)
 }
 
-fn zlib_1(process: &mut Process, adler: bool, bif: &'static str) -> Result<Term, VmError> {
-    let data = process.x[0];
+fn zlib_1(
+    process: &mut Process,
+    reg: *mut u64,
+    adler: bool,
+    bif: &'static str,
+) -> Result<Term, VmError> {
+    let [data] = crate::bif_table::bif_args::<1>(reg);
     zlib_sum(process, adler, arinsal_bifs::zlib_initial(adler), data, bif)
 }
 
-fn zlib_2(process: &mut Process, adler: bool, bif: &'static str) -> Result<Term, VmError> {
-    let (seed, data) = (process.x[0], process.x[1]);
+fn zlib_2(
+    process: &mut Process,
+    reg: *mut u64,
+    adler: bool,
+    bif: &'static str,
+) -> Result<Term, VmError> {
+    let [seed, data] = crate::bif_table::bif_args::<2>(reg);
     let seed = arinsal_bifs::term_to_u32(seed).map_err(|_| badarg())?;
     zlib_sum(process, adler, seed, data, bif)
 }
 
 /// `erlang:crc32/1`.
 // Port of erts/emulator/beam/erl_bif_chksum.c (crc32_1), OTP-29.1.1.
-pub(crate) extern "C" fn crc32_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn crc32_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let result = zlib_1(process, false, "erlang:crc32/2");
+    let result = zlib_1(process, reg, false, "erlang:crc32/2");
     bif_ret(c_p, i, result)
 }
 
 /// `erlang:crc32/2`.
 // Port of erts/emulator/beam/erl_bif_chksum.c (crc32_2), OTP-29.1.1.
-pub(crate) extern "C" fn crc32_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn crc32_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let result = zlib_2(process, false, "erlang:crc32/2");
+    let result = zlib_2(process, reg, false, "erlang:crc32/2");
     bif_ret(c_p, i, result)
 }
 
 /// `erlang:adler32/1`.
 // Port of erts/emulator/beam/erl_bif_chksum.c (adler32_1), OTP-29.1.1.
-pub(crate) extern "C" fn adler32_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn adler32_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let result = zlib_1(process, true, "erlang:adler32/2");
+    let result = zlib_1(process, reg, true, "erlang:adler32/2");
     bif_ret(c_p, i, result)
 }
 
 /// `erlang:adler32/2`.
 // Port of erts/emulator/beam/erl_bif_chksum.c (adler32_2), OTP-29.1.1.
-pub(crate) extern "C" fn adler32_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn adler32_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let result = zlib_2(process, true, "erlang:adler32/2");
+    let result = zlib_2(process, reg, true, "erlang:adler32/2");
     bif_ret(c_p, i, result)
 }
 
-fn combine(process: &Process, adler: bool) -> Result<Term, VmError> {
-    let arg = |index: usize| arinsal_bifs::term_to_u32(process.x[index]).map_err(|_| badarg());
+fn combine(reg: *mut u64, adler: bool) -> Result<Term, VmError> {
+    let args = crate::bif_table::bif_args::<3>(reg);
+    let arg = |index: usize| arinsal_bifs::term_to_u32(args[index]).map_err(|_| badarg());
     let (a, b, length) = (arg(0)?, arg(1)?, arg(2)?);
     Ok(sum_term(arinsal_bifs::chksum_combine(adler, a, b, length)))
 }
 
 /// `erlang:crc32_combine/3`.
 // Port of erts/emulator/beam/erl_bif_chksum.c (crc32_combine_3), OTP-29.1.1.
-pub(crate) extern "C" fn crc32_combine_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn crc32_combine_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let result = combine(process, false);
+    let result = combine(reg, false);
     bif_ret(c_p, i, result)
 }
 
 /// `erlang:adler32_combine/3`.
 // Port of erts/emulator/beam/erl_bif_chksum.c (adler32_combine_3), OTP-29.1.1.
-pub(crate) extern "C" fn adler32_combine_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn adler32_combine_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let result = combine(process, true);
+    let result = combine(reg, true);
     bif_ret(c_p, i, result)
 }
 
@@ -205,12 +216,12 @@ fn md5_run(process: &mut Process, mut context: Md5State, data: Term) -> Result<T
 
 /// `erlang:md5/1`.
 // Port of erts/emulator/beam/erl_bif_chksum.c (md5_1), OTP-29.1.1.
-pub(crate) extern "C" fn md5_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn md5_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let data = process.x[0];
+    let [data] = crate::bif_table::bif_args::<1>(reg);
     let result = md5_run(process, Md5State::new(), data);
     bif_ret(c_p, i, result)
 }
@@ -219,12 +230,12 @@ pub(crate) extern "C" fn md5_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) 
 /// (`bif_table::trap_function`). The context is always a binary of `sizeof(erts_md5_state)`
 /// bytes because only `md5_1` and this function trap to it.
 // Port of erts/emulator/beam/erl_bif_chksum.c (md5_2), OTP-29.1.1.
-pub(crate) extern "C" fn md5_trap_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn md5_trap_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (context, data) = (process.x[0], process.x[1]);
+    let [context, data] = crate::bif_table::bif_args::<2>(reg);
     let result = arinsal_bifs::md5_state_arg(context)
         .map_err(|_| badarg())
         .and_then(|state| md5_run(process, state, data));
@@ -244,12 +255,12 @@ pub(crate) extern "C" fn md5_init_0(c_p: *mut ProcessHeader, _reg: *mut u64, i: 
 
 /// `erlang:md5_update/2`.
 // Port of erts/emulator/beam/erl_bif_chksum.c (md5_update_2), OTP-29.1.1.
-pub(crate) extern "C" fn md5_update_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn md5_update_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (context, data) = (process.x[0], process.x[1]);
+    let [context, data] = crate::bif_table::bif_args::<2>(reg);
     let result = md5_update(process, context, data);
     bif_ret(c_p, i, result)
 }
@@ -279,12 +290,12 @@ fn md5_update(process: &mut Process, context: Term, data: Term) -> Result<Term, 
 
 /// `erlang:md5_final/1`.
 // Port of erts/emulator/beam/erl_bif_chksum.c (md5_final_1), OTP-29.1.1.
-pub(crate) extern "C" fn md5_final_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn md5_final_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let context = process.x[0];
+    let [context] = crate::bif_table::bif_args::<1>(reg);
     let result = arinsal_bifs::md5_state_arg(context)
         .map_err(|_| badarg())
         .and_then(|state| binary(process, &state.final_digest()));

@@ -35,13 +35,12 @@ fn badarg_cause(function: &str, arity: usize, cause: &str) -> VmError {
 macro_rules! timer_bif {
     ($name:ident, $arity:literal, $body:expr) => {
         #[doc = concat!("`", stringify!($name), "`.")]
-        pub(crate) extern "C" fn $name(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+        pub(crate) extern "C" fn $name(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
             let Some(process) = crate::native_hooks::process_from_header(c_p) else {
                 return 0;
             };
             process.heap.note_bif_entry();
-            let mut args = [Term::NIL; $arity];
-            args.copy_from_slice(&process.x[..$arity]);
+            let args = crate::bif_table::bif_args::<$arity>(reg);
             let body: fn(&mut Process, &[Term]) -> Result<Term, VmError> = $body;
             let result = body(process, &args);
             crate::natives::bif::bif_ret(c_p, i, result)

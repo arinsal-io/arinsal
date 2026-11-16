@@ -32,41 +32,42 @@ type ProjectionState = TrapContext<Option<MapsProjectionWalk>>;
 
 /// `maps:from_list/1`.
 // Port of erts/emulator/beam/erl_map.c (maps_from_list_1), OTP-29.1.1.
-pub(crate) extern "C" fn maps_from_list_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    maps_build(c_p, i, "maps:from_list/1", false)
+pub(crate) extern "C" fn maps_from_list_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    maps_build(c_p, reg, i, "maps:from_list/1", false)
 }
 
 /// `maps:from_keys/2`.
 // Port of erts/emulator/beam/erl_map.c (maps_from_keys_2), OTP-29.1.1.
-pub(crate) extern "C" fn maps_from_keys_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    maps_build(c_p, i, "maps:from_keys/2", true)
+pub(crate) extern "C" fn maps_from_keys_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    maps_build(c_p, reg, i, "maps:from_keys/2", true)
 }
 
 /// `maps:keys/1`.
 // Port of erts/emulator/beam/erl_map.c (maps_keys_1), OTP-29.1.1.
-pub(crate) extern "C" fn maps_keys_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    maps_projection(c_p, i, "maps:keys/1", true)
+pub(crate) extern "C" fn maps_keys_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    maps_projection(c_p, reg, i, "maps:keys/1", true)
 }
 
 /// `maps:values/1`.
 // Port of erts/emulator/beam/erl_map.c (maps_values_1), OTP-29.1.1.
-pub(crate) extern "C" fn maps_values_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    maps_projection(c_p, i, "maps:values/1", false)
+pub(crate) extern "C" fn maps_values_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    maps_projection(c_p, reg, i, "maps:values/1", false)
 }
 
 /// `map_size/1`.
 // Port of erts/emulator/beam/erl_map.c (map_size_1), OTP-29.1.1.
-pub(crate) extern "C" fn map_size_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn map_size_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let map = process.x[0];
+    let [map] = crate::bif_table::bif_args::<1>(reg);
     match arinsal_maps::size(map) {
         // A map's size is far below the small integer limit.
         Ok(size) => Term::small(size as i64).map_or(0, crate::native_hooks::raw),
         Err(_) => bif_error_tagged(
             c_p,
+            reg,
             i,
             process,
             "erlang:map_size/1",
@@ -79,18 +80,19 @@ pub(crate) extern "C" fn map_size_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: 
 
 /// `map_get/2`.
 // Port of erts/emulator/beam/erl_map.c (map_get_2), OTP-29.1.1.
-pub(crate) extern "C" fn map_get_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn map_get_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (key, map) = (process.x[0], process.x[1]);
+    let [key, map] = crate::bif_table::bif_args::<2>(reg);
     if map.is_flatmap() || map.is_hashmap() {
         if let Ok(Some(value)) = arinsal_maps::get(map, key) {
             return crate::native_hooks::raw(value);
         }
         return bif_error_tagged(
             c_p,
+            reg,
             i,
             process,
             "erlang:map_get/2",
@@ -101,6 +103,7 @@ pub(crate) extern "C" fn map_get_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u
     }
     bif_error_tagged(
         c_p,
+        reg,
         i,
         process,
         "erlang:map_get/2",
@@ -112,12 +115,12 @@ pub(crate) extern "C" fn map_get_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u
 
 /// `is_map_key/2`.
 // Port of erts/emulator/beam/erl_map.c (is_map_key_2), OTP-29.1.1.
-pub(crate) extern "C" fn is_map_key_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn is_map_key_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (key, map) = (process.x[0], process.x[1]);
+    let [key, map] = crate::bif_table::bif_args::<2>(reg);
     if map.is_flatmap() || map.is_hashmap() {
         let found = matches!(arinsal_maps::get(map, key), Ok(Some(_)));
         return crate::native_hooks::raw(Term::atom(if found {
@@ -128,6 +131,7 @@ pub(crate) extern "C" fn is_map_key_2(c_p: *mut ProcessHeader, _reg: *mut u64, i
     }
     bif_error_tagged(
         c_p,
+        reg,
         i,
         process,
         "erlang:is_map_key/2",
@@ -158,17 +162,12 @@ fn is_boxed(term: Term) -> bool {
     term.tagged_word() & 3 == 2
 }
 
-/// The arguments of the running BIF: `BIF__ARGS`.
-#[inline(always)]
-fn bif_args<const N: usize>(process: &crate::Process) -> [Term; N] {
-    std::array::from_fn(|index| process.x[index])
-}
-
 /// `BIF_ERROR(p, reason)` of a body below.
 #[cold]
 #[inline(never)]
 fn ycf_error(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     process: &mut crate::Process,
     export: &'static str,
@@ -177,7 +176,7 @@ fn ycf_error(
 ) -> u64 {
     let (module, rest) = export.split_once(':').unwrap_or(("maps", export));
     let function = rest.split_once('/').map_or(rest, |(function, _)| function);
-    let args = process.x[..arity].to_vec();
+    let args = crate::bif_table::bif_arg_vec(reg, arity);
     let error = crate::exceptions::bif_error(process, module, function, &args, error);
     bif_ret(c_p, i, Err(error))
 }
@@ -189,13 +188,14 @@ fn ycf_error(
 #[inline(never)]
 fn ycf_trap(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     process: &mut crate::Process,
     export: &'static str,
     arity: usize,
     state_mref: Term,
 ) -> u64 {
-    let mut args = process.x[..arity].to_vec();
+    let mut args = crate::bif_table::bif_arg_vec(reg, arity);
     args[0] = state_mref;
     let trap = VmError::TrapExport(crate::ExportTrap::new(process, export, args));
     bif_ret(c_p, i, Err(trap))
@@ -227,13 +227,19 @@ fn create_state_mref<T: arinsal_term::MagicPayload>(
 // Port of erts/emulator/beam/utils.c (erts_ycf_trap_driver) and erl_map.c
 // (maps_from_keys_2_helper, maps_from_list_1_helper, hashmap_from_validated_list), OTP-29.1.1.
 #[inline(always)]
-fn maps_build(c_p: *mut ProcessHeader, i: u64, export: &'static str, from_keys: bool) -> u64 {
+fn maps_build(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+    export: &'static str,
+    from_keys: bool,
+) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
     let arity = if from_keys { 2 } else { 1 };
-    let [list, fill] = bif_args::<2>(process);
+    let [list, fill] = crate::bif_table::bif_args::<2>(reg);
     let init = ycf_reds(process, FROM_LIST_ITERATIONS_PER_RED);
     let mut reds = init;
     // Continue a trapped call: the state is ours when its holder is a `BuildState`.
@@ -261,9 +267,9 @@ fn maps_build(c_p: *mut ProcessHeader, i: u64, export: &'static str, from_keys: 
                 Ok(Some(value)) => return crate::native_hooks::raw(value),
                 Ok(None) => {
                     process.set_gc_enabled(false);
-                    return ycf_trap(c_p, i, process, export, arity, list);
+                    return ycf_trap(c_p, reg, i, process, export, arity, list);
                 }
-                Err(error) => return ycf_error(c_p, i, process, export, arity, error),
+                Err(error) => return ycf_error(c_p, reg, i, process, export, arity, error),
             }
         }
         // A spent state (its holder has no trap state) starts a new call, as erts does.
@@ -286,8 +292,8 @@ fn maps_build(c_p: *mut ProcessHeader, i: u64, export: &'static str, from_keys: 
     ycf_bump_reds(process, init, reds, FROM_LIST_ITERATIONS_PER_RED);
     match step {
         Ok(Some(value)) => crate::native_hooks::raw(value),
-        Ok(None) => build_first_trap(c_p, i, process, export, arity, walk),
-        Err(error) => ycf_error(c_p, i, process, export, arity, error),
+        Ok(None) => build_first_trap(c_p, reg, i, process, export, arity, walk),
+        Err(error) => ycf_error(c_p, reg, i, process, export, arity, error),
     }
 }
 
@@ -297,6 +303,7 @@ fn maps_build(c_p: *mut ProcessHeader, i: u64, export: &'static str, from_keys: 
 #[inline(never)]
 fn build_first_trap(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     process: &mut crate::Process,
     export: &'static str,
@@ -312,19 +319,25 @@ fn build_first_trap(
         Err(error) => return bif_ret(c_p, i, Err(error)),
     };
     process.set_gc_enabled(false);
-    ycf_trap(c_p, i, process, export, arity, state_mref)
+    ycf_trap(c_p, reg, i, process, export, arity, state_mref)
 }
 
 /// `erts_ycf_trap_driver` over `maps_keys_1_helper` / `maps_values_1_helper`.
 // Port of erts/emulator/beam/utils.c (erts_ycf_trap_driver) and erl_map.c (maps_keys_1_helper,
 // maps_values_1_helper, hashmap_keys, hashmap_values), OTP-29.1.1.
 #[inline(always)]
-fn maps_projection(c_p: *mut ProcessHeader, i: u64, export: &'static str, keys: bool) -> u64 {
+fn maps_projection(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+    export: &'static str,
+    keys: bool,
+) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let map = process.x[0];
+    let [map] = crate::bif_table::bif_args::<1>(reg);
     // `is_internal_magic_ref(bif_args[0])` with the driver's destructor: continue a trapped
     // call before looking at the argument as a map.
     if is_boxed(map)
@@ -332,7 +345,7 @@ fn maps_projection(c_p: *mut ProcessHeader, i: u64, export: &'static str, keys: 
             state.lock().is_ok_and(|walk| walk.is_some())
         }) == Some(true)
     {
-        return projection_resume(c_p, i, process, export, map);
+        return projection_resume(c_p, reg, i, process, export, map);
     }
     // The flatmap arm runs without consuming YCF reductions and never yields.
     let flat = {
@@ -343,8 +356,8 @@ fn maps_projection(c_p: *mut ProcessHeader, i: u64, export: &'static str, keys: 
     };
     match flat {
         Ok(Some(value)) => crate::native_hooks::raw(value),
-        Ok(None) => projection_hashmap(c_p, i, process, export, keys, map),
-        Err(error) => ycf_error(c_p, i, process, export, 1, error),
+        Ok(None) => projection_hashmap(c_p, reg, i, process, export, keys, map),
+        Err(error) => ycf_error(c_p, reg, i, process, export, 1, error),
     }
 }
 
@@ -352,6 +365,7 @@ fn maps_projection(c_p: *mut ProcessHeader, i: u64, export: &'static str, keys: 
 #[inline(never)]
 fn projection_hashmap(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     process: &mut crate::Process,
     export: &'static str,
@@ -368,7 +382,7 @@ fn projection_hashmap(
     };
     let mut walk = match started {
         Ok(walk) => walk,
-        Err(error) => return ycf_error(c_p, i, process, export, 1, error),
+        Err(error) => return ycf_error(c_p, reg, i, process, export, 1, error),
     };
     let done = walk.step(&mut reds);
     ycf_bump_reds(process, init, reds, PROJECTION_ITERATIONS_PER_RED);
@@ -384,7 +398,7 @@ fn projection_hashmap(
         Err(error) => return bif_ret(c_p, i, Err(error)),
     };
     process.set_gc_enabled(false);
-    ycf_trap(c_p, i, process, export, 1, state_mref)
+    ycf_trap(c_p, reg, i, process, export, 1, state_mref)
 }
 
 /// X0 is the trap state of a yielded call: the next slice of its walk.
@@ -394,6 +408,7 @@ fn projection_hashmap(
 #[inline(never)]
 fn projection_resume(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     process: &mut crate::Process,
     export: &'static str,
@@ -419,7 +434,7 @@ fn projection_resume(
         Some(value) => crate::native_hooks::raw(value),
         None => {
             process.set_gc_enabled(false);
-            ycf_trap(c_p, i, process, export, 1, state_mref)
+            ycf_trap(c_p, reg, i, process, export, 1, state_mref)
         }
     }
 }
@@ -436,8 +451,10 @@ type MergeState = TrapContext<Option<HashmapMergeContext>>;
 // Port of erts/emulator/beam/beam_common.c (expand_error_value), OTP-29.1.1.
 #[cold]
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn bif_error_tagged(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     process: &mut crate::Process,
     export: &'static str,
@@ -450,7 +467,7 @@ fn bif_error_tagged(
         Ok(reason) => BifError::Error(reason),
         Err(_) => BifError::SystemLimit,
     };
-    ycf_error(c_p, i, process, export, arity, error)
+    ycf_error(c_p, reg, i, process, export, arity, error)
 }
 
 /// `BIF_ERROR(p, SYSTEM_LIMIT)` of a failed `HAlloc`, which erts cannot hit (the heap grows).
@@ -469,12 +486,12 @@ fn system_limit(c_p: *mut ProcessHeader, i: u64) -> u64 {
 /// `maps:merge/2`.
 // Port of erts/emulator/beam/erl_map.c (maps_merge_2, flatmap_merge, map_merge_mixed),
 // OTP-29.1.1.
-pub(crate) extern "C" fn maps_merge_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn maps_merge_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (map_a, map_b) = (process.x[0], process.x[1]);
+    let [map_a, map_b] = crate::bif_table::bif_args::<2>(reg);
     if map_a == map_b {
         // Merging upon itself always returns itself.
         if map_a.is_flatmap() || map_a.is_hashmap() {
@@ -482,6 +499,7 @@ pub(crate) extern "C" fn maps_merge_2(c_p: *mut ProcessHeader, _reg: *mut u64, i
         }
         return bif_error_tagged(
             c_p,
+            reg,
             i,
             process,
             "maps:merge/2",
@@ -500,10 +518,11 @@ pub(crate) extern "C" fn maps_merge_2(c_p: *mut ProcessHeader, _reg: *mut u64, i
         }
         if map_b.is_hashmap() {
             // Will always become a tree.
-            return map_merge_mixed(c_p, i, process, map_a, map_b, false);
+            return map_merge_mixed(c_p, reg, i, process, map_a, map_b, false);
         }
         return bif_error_tagged(
             c_p,
+            reg,
             i,
             process,
             "maps:merge/2",
@@ -515,13 +534,14 @@ pub(crate) extern "C" fn maps_merge_2(c_p: *mut ProcessHeader, _reg: *mut u64, i
     if map_a.is_hashmap() {
         if map_b.is_hashmap() {
             let merge = HashmapMergeContext::new(map_a, map_b, false);
-            return hashmap_merge(c_p, i, process, merge, None);
+            return hashmap_merge(c_p, reg, i, process, merge, None);
         }
         if map_b.is_flatmap() {
-            return map_merge_mixed(c_p, i, process, map_b, map_a, true);
+            return map_merge_mixed(c_p, reg, i, process, map_b, map_a, true);
         }
         return bif_error_tagged(
             c_p,
+            reg,
             i,
             process,
             "maps:merge/2",
@@ -532,6 +552,7 @@ pub(crate) extern "C" fn maps_merge_2(c_p: *mut ProcessHeader, _reg: *mut u64, i
     }
     bif_error_tagged(
         c_p,
+        reg,
         i,
         process,
         "maps:merge/2",
@@ -545,6 +566,7 @@ pub(crate) extern "C" fn maps_merge_2(c_p: *mut ProcessHeader, _reg: *mut u64, i
 // Port of erts/emulator/beam/erl_map.c (map_merge_mixed), OTP-29.1.1.
 fn map_merge_mixed(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     process: &mut crate::Process,
     flat: Term,
@@ -559,7 +581,7 @@ fn map_merge_mixed(
         Ok(None) => crate::native_hooks::raw(tree),
         Ok(Some(res)) => {
             let merge = HashmapMergeContext::new(res, tree, swap_args);
-            hashmap_merge(c_p, i, process, merge, None)
+            hashmap_merge(c_p, reg, i, process, merge, None)
         }
         Err(_) => system_limit(c_p, i),
     }
@@ -567,20 +589,21 @@ fn map_merge_mixed(
 
 /// `maps:merge_trap/1`, `hashmap_merge_trap_export`.
 // Port of erts/emulator/beam/erl_map.c (maps_merge_trap_1), OTP-29.1.1.
-pub(crate) extern "C" fn maps_merge_trap_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn maps_merge_trap_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let state_mref = process.x[0];
+    let [state_mref] = crate::bif_table::bif_args::<1>(reg);
     // `erts_magic_ref2bin(BIF_ARG_1)`: only `hashmap_merge` traps here, with its own state.
     let merge = state_mref
         .with_magic_payload::<MergeState, _>(|state| state.lock().ok()?.take())
         .flatten();
     match merge {
-        Some(merge) => hashmap_merge(c_p, i, process, merge, Some(state_mref)),
+        Some(merge) => hashmap_merge(c_p, reg, i, process, merge, Some(state_mref)),
         None => ycf_error(
             c_p,
+            reg,
             i,
             process,
             "maps:merge_trap/1",
@@ -597,6 +620,7 @@ pub(crate) extern "C" fn maps_merge_trap_1(c_p: *mut ProcessHeader, _reg: *mut u
 // entries, `BUMP_REDS`, and the `trap:` label), OTP-29.1.1.
 fn hashmap_merge(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     process: &mut crate::Process,
     mut merge: HashmapMergeContext,
@@ -652,6 +676,7 @@ fn hashmap_merge(
         }
         Err(_) => ycf_error(
             c_p,
+            reg,
             i,
             process,
             "maps:merge/2",
@@ -663,15 +688,16 @@ fn hashmap_merge(
 
 /// `maps:find/2`.
 // Port of erts/emulator/beam/erl_map.c (maps_find_2), OTP-29.1.1.
-pub(crate) extern "C" fn maps_find_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn maps_find_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (key, map) = (process.x[0], process.x[1]);
+    let [key, map] = crate::bif_table::bif_args::<2>(reg);
     if !(map.is_flatmap() || map.is_hashmap()) {
         return bif_error_tagged(
             c_p,
+            reg,
             i,
             process,
             "maps:find/2",
@@ -691,6 +717,7 @@ pub(crate) extern "C" fn maps_find_2(c_p: *mut ProcessHeader, _reg: *mut u64, i:
         Ok(None) => crate::native_hooks::raw(Term::atom(atoms::ERROR)),
         Err(_) => bif_error_tagged(
             c_p,
+            reg,
             i,
             process,
             "maps:find/2",
@@ -703,18 +730,19 @@ pub(crate) extern "C" fn maps_find_2(c_p: *mut ProcessHeader, _reg: *mut u64, i:
 
 /// `maps:get/2`.
 // Port of erts/emulator/beam/erl_map.c (maps_get_2), OTP-29.1.1.
-pub(crate) extern "C" fn maps_get_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn maps_get_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (key, map) = (process.x[0], process.x[1]);
+    let [key, map] = crate::bif_table::bif_args::<2>(reg);
     if map.is_flatmap() || map.is_hashmap() {
         if let Ok(Some(value)) = arinsal_maps::get(map, key) {
             return crate::native_hooks::raw(value);
         }
         return bif_error_tagged(
             c_p,
+            reg,
             i,
             process,
             "maps:get/2",
@@ -725,6 +753,7 @@ pub(crate) extern "C" fn maps_get_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: 
     }
     bif_error_tagged(
         c_p,
+        reg,
         i,
         process,
         "maps:get/2",
@@ -736,12 +765,12 @@ pub(crate) extern "C" fn maps_get_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: 
 
 /// `maps:is_key/2`.
 // Port of erts/emulator/beam/erl_map.c (maps_is_key_2), OTP-29.1.1.
-pub(crate) extern "C" fn maps_is_key_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn maps_is_key_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (key, map) = (process.x[0], process.x[1]);
+    let [key, map] = crate::bif_table::bif_args::<2>(reg);
     if map.is_flatmap() || map.is_hashmap() {
         let found = matches!(arinsal_maps::get(map, key), Ok(Some(_)));
         return crate::native_hooks::raw(Term::atom(if found {
@@ -752,6 +781,7 @@ pub(crate) extern "C" fn maps_is_key_2(c_p: *mut ProcessHeader, _reg: *mut u64, 
     }
     bif_error_tagged(
         c_p,
+        reg,
         i,
         process,
         "maps:is_key/2",
@@ -769,6 +799,7 @@ pub(crate) extern "C" fn maps_is_key_2(c_p: *mut ProcessHeader, _reg: *mut u64, 
 #[inline(never)]
 fn map_failure(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     process: &mut crate::Process,
     export: &'static str,
@@ -779,6 +810,7 @@ fn map_failure(
     match error {
         MapError::Badmap(map) => bif_error_tagged(
             c_p,
+            reg,
             i,
             process,
             export,
@@ -788,6 +820,7 @@ fn map_failure(
         ),
         MapError::Badkey(key) => bif_error_tagged(
             c_p,
+            reg,
             i,
             process,
             export,
@@ -796,72 +829,72 @@ fn map_failure(
             key,
         ),
         MapError::HeapFull { .. } => system_limit(c_p, i),
-        _ => ycf_error(c_p, i, process, export, arity, BifError::BADARG),
+        _ => ycf_error(c_p, reg, i, process, export, arity, BifError::BADARG),
     }
 }
 
 /// `maps:put/3`.
 // Port of erts/emulator/beam/erl_map.c (maps_put_3, erts_maps_put), OTP-29.1.1.
-pub(crate) extern "C" fn maps_put_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn maps_put_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (key, value, map) = (process.x[0], process.x[1], process.x[2]);
+    let [key, value, map] = crate::bif_table::bif_args::<3>(reg);
     let result = {
         let mut heap = ProcessHeapHandle(&mut process.heap);
         arinsal_maps::put(map, key, value, &mut heap)
     };
     match result {
         Ok(res) => crate::native_hooks::raw(res),
-        Err(error) => map_failure(c_p, i, process, "maps:put/3", 3, error),
+        Err(error) => map_failure(c_p, reg, i, process, "maps:put/3", 3, error),
     }
 }
 
 /// `maps:update/3`.
 // Port of erts/emulator/beam/erl_map.c (maps_update_3, erts_maps_update), OTP-29.1.1.
-pub(crate) extern "C" fn maps_update_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn maps_update_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (key, value, map) = (process.x[0], process.x[1], process.x[2]);
+    let [key, value, map] = crate::bif_table::bif_args::<3>(reg);
     let result = {
         let mut heap = ProcessHeapHandle(&mut process.heap);
         arinsal_maps::update(map, key, value, &mut heap)
     };
     match result {
         Ok(res) => crate::native_hooks::raw(res),
-        Err(error) => map_failure(c_p, i, process, "maps:update/3", 3, error),
+        Err(error) => map_failure(c_p, reg, i, process, "maps:update/3", 3, error),
     }
 }
 
 /// `maps:remove/2`.
 // Port of erts/emulator/beam/erl_map.c (maps_remove_2, erts_maps_remove), OTP-29.1.1.
-pub(crate) extern "C" fn maps_remove_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn maps_remove_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (key, map) = (process.x[0], process.x[1]);
+    let [key, map] = crate::bif_table::bif_args::<2>(reg);
     let result = {
         let mut heap = ProcessHeapHandle(&mut process.heap);
         arinsal_maps::remove(map, key, &mut heap)
     };
     match result {
         Ok(res) => crate::native_hooks::raw(res),
-        Err(error) => map_failure(c_p, i, process, "maps:remove/2", 2, error),
+        Err(error) => map_failure(c_p, reg, i, process, "maps:remove/2", 2, error),
     }
 }
 
 /// `maps:take/2`.
 // Port of erts/emulator/beam/erl_map.c (maps_take_2), OTP-29.1.1.
-pub(crate) extern "C" fn maps_take_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn maps_take_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (key, map) = (process.x[0], process.x[1]);
+    let [key, map] = crate::bif_table::bif_args::<2>(reg);
     let mut heap = ProcessHeapHandle(&mut process.heap);
     let result = arinsal_maps::take(map, key, &mut heap).and_then(|taken| match taken {
         Some((value, rest)) => TermBuilder::new(&mut heap)
@@ -873,7 +906,7 @@ pub(crate) extern "C" fn maps_take_2(c_p: *mut ProcessHeader, _reg: *mut u64, i:
     match result {
         Ok(Some(res)) => crate::native_hooks::raw(res),
         Ok(None) => crate::native_hooks::raw(Term::atom(atoms::ERROR)),
-        Err(error) => map_failure(c_p, i, process, "maps:take/2", 2, error),
+        Err(error) => map_failure(c_p, reg, i, process, "maps:take/2", 2, error),
     }
 }
 

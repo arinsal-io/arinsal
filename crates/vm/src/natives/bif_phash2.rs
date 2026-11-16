@@ -20,12 +20,12 @@ const ERTS_HASH2_CONTEXT_SIZE: usize = 136;
 
 /// `erlang:phash2/1`.
 // Port of erts/emulator/beam/bif.c (phash2_1), OTP-29.1.1.
-pub(crate) extern "C" fn phash2_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn phash2_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let term = process.x[0];
+    let [term] = crate::bif_table::bif_args::<1>(reg);
     // make_hash2_helper: atoms and smalls hash before the trapping work loop, with no charge.
     if let Some(value) = arinsal_bifs::phash2_immediate_1(term) {
         return crate::native_hooks::raw(value);
@@ -36,12 +36,12 @@ pub(crate) extern "C" fn phash2_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u6
 
 /// `erlang:phash2/2`.
 // Port of erts/emulator/beam/bif.c (phash2_2), OTP-29.1.1.
-pub(crate) extern "C" fn phash2_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn phash2_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (term, range) = (process.x[0], process.x[1]);
+    let [term, range] = crate::bif_table::bif_args::<2>(reg);
     // The range is checked before the term is hashed, on a resumed call too.
     if arinsal_bifs::phash2_range_arg(range).is_err() {
         return bif_ret(c_p, i, Err(badarg()));

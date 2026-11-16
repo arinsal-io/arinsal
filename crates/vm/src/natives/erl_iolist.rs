@@ -96,8 +96,10 @@ pub(crate) fn create_holder<T: arinsal_term::MagicPayload>(
 
 /// `ERTS_BIF_ERROR_TRAPPED1(c_p, reason, bif, arg)` after `erts_set_gc_state(c_p, 1)` of a
 /// parked call (`ERTS_VBUMP_ALL_REDS` when that moved delayed GC tasks).
+#[allow(clippy::too_many_arguments)]
 fn fail(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     process: &mut crate::Process,
     bif: &'static str,
@@ -108,7 +110,7 @@ fn fail(
     if gc_disabled && gc_enable(process) {
         crate::bif_traps::vbump_all_reds(process);
     }
-    process.x[0] = arg;
+    crate::bif_table::set_bif_arg(reg, 0, arg);
     let (module, rest) = bif.split_once(':').unwrap_or(("erlang", bif));
     let function = rest.split_once('/').map_or(rest, |(function, _)| function);
     let error = crate::exceptions::bif_error(process, module, function, &[arg], error);
@@ -129,37 +131,37 @@ fn trap_continue(
 
 /// `erlang:iolist_size/1`.
 // Port of erts/emulator/beam/erl_iolist.c (iolist_size_1), OTP-29.1.1.
-pub(crate) extern "C" fn iolist_size_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn iolist_size_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let arg = process.x[0];
+    let [arg] = crate::bif_table::bif_args::<1>(reg);
     let state = SizeState {
         walk: IolistSizeWalk::new(arg),
         accumulator: None,
         arg,
     };
-    iolist_size_dispatch(c_p, i, process, state, None)
+    iolist_size_dispatch(c_p, reg, i, process, state, None)
 }
 
 /// `erts_internal:iolist_size_continue/1`.
 // Port of erts/emulator/beam/erl_iolist.c (iolist_size_continue), OTP-29.1.1.
 pub(crate) extern "C" fn iolist_size_continue_1(
     c_p: *mut ProcessHeader,
-    _reg: *mut u64,
+    reg: *mut u64,
     i: u64,
 ) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let mref = process.x[0];
+    let [mref] = crate::bif_table::bif_args::<1>(reg);
     let state = mref
         .with_magic_payload::<SizeHolder, _>(|holder| holder.lock().ok()?.take())
         .flatten();
     match state {
-        Some(state) => iolist_size_dispatch(c_p, i, process, state, Some(mref)),
+        Some(state) => iolist_size_dispatch(c_p, reg, i, process, state, Some(mref)),
         None => bif_ret(c_p, i, Err(crate::natives::bif::badarg())),
     }
 }
@@ -204,6 +206,7 @@ fn iolist_size_accumulate(
 /// `ERTS_BIF_ERROR_TRAPPED1` naming `iolist_size/1` with the original argument.
 fn iolist_size_dispatch(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     process: &mut crate::Process,
     mut state: SizeState,
@@ -239,6 +242,7 @@ fn iolist_size_dispatch(
                             None => {
                                 return fail(
                                     c_p,
+                                    reg,
                                     i,
                                     process,
                                     BIF,
@@ -261,7 +265,7 @@ fn iolist_size_dispatch(
             Ok((true, _)) => {
                 let size = state.walk.take_size();
                 if let Err(error) = iolist_size_accumulate(process, &mut state, size) {
-                    return fail(c_p, i, process, BIF, state.arg, error, gc_disabled);
+                    return fail(c_p, reg, i, process, BIF, state.arg, error, gc_disabled);
                 }
                 if gc_disabled {
                     process.set_gc_enabled(true);
@@ -276,12 +280,13 @@ fn iolist_size_dispatch(
                     match iolist_size_accumulate(process, &mut state, bytes) {
                         Ok(()) => continue,
                         Err(error) => {
-                            return fail(c_p, i, process, BIF, state.arg, error, gc_disabled);
+                            return fail(c_p, reg, i, process, BIF, state.arg, error, gc_disabled);
                         }
                     }
                 }
                 return fail(
                     c_p,
+                    reg,
                     i,
                     process,
                     BIF,
@@ -291,7 +296,7 @@ fn iolist_size_dispatch(
                 );
             }
             Err((error, _)) => {
-                return fail(c_p, i, process, BIF, state.arg, error, gc_disabled);
+                return fail(c_p, reg, i, process, BIF, state.arg, error, gc_disabled);
             }
         }
     }
@@ -303,36 +308,32 @@ fn iolist_size_dispatch(
 // Port of erts/emulator/beam/erl_iolist.c (binary_list_to_bin_1), OTP-29.1.1.
 pub(crate) extern "C" fn binary_list_to_bin_1(
     c_p: *mut ProcessHeader,
-    _reg: *mut u64,
+    reg: *mut u64,
     i: u64,
 ) -> u64 {
-    list_to_bitstring_bif(c_p, i, "binary:list_to_bin/1", 8, false)
+    list_to_bitstring_bif(c_p, reg, i, "binary:list_to_bin/1", 8, false)
 }
 
 /// `erlang:list_to_binary/1`.
 // Port of erts/emulator/beam/erl_iolist.c (list_to_binary_1), OTP-29.1.1.
-pub(crate) extern "C" fn list_to_binary_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    list_to_bitstring_bif(c_p, i, "erlang:list_to_binary/1", 8, false)
+pub(crate) extern "C" fn list_to_binary_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    list_to_bitstring_bif(c_p, reg, i, "erlang:list_to_binary/1", 8, false)
 }
 
 /// `erlang:iolist_to_binary/1`.
 // Port of erts/emulator/beam/erl_iolist.c (iolist_to_binary_1), OTP-29.1.1.
-pub(crate) extern "C" fn iolist_to_binary_1(
-    c_p: *mut ProcessHeader,
-    _reg: *mut u64,
-    i: u64,
-) -> u64 {
-    list_to_bitstring_bif(c_p, i, "erlang:iolist_to_binary/1", 8, true)
+pub(crate) extern "C" fn iolist_to_binary_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    list_to_bitstring_bif(c_p, reg, i, "erlang:iolist_to_binary/1", 8, true)
 }
 
 /// `erlang:list_to_bitstring/1`.
 // Port of erts/emulator/beam/erl_iolist.c (list_to_bitstring_1), OTP-29.1.1.
 pub(crate) extern "C" fn list_to_bitstring_1(
     c_p: *mut ProcessHeader,
-    _reg: *mut u64,
+    reg: *mut u64,
     i: u64,
 ) -> u64 {
-    list_to_bitstring_bif(c_p, i, "erlang:list_to_bitstring/1", 1, false)
+    list_to_bitstring_bif(c_p, reg, i, "erlang:list_to_bitstring/1", 1, false)
 }
 
 /// `list_to_bitstring_bif`, with the `is_bitstring` head of `iolist_to_binary_1`.
@@ -340,6 +341,7 @@ pub(crate) extern "C" fn list_to_bitstring_1(
 // OTP-29.1.1.
 fn list_to_bitstring_bif(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     bif: &'static str,
     unit: usize,
@@ -349,7 +351,7 @@ fn list_to_bitstring_bif(
         return 0;
     };
     process.heap.note_bif_entry();
-    let arg = process.x[0];
+    let [arg] = crate::bif_table::bif_args::<1>(reg);
     if iolist_to_binary && arg.classify() == TermKind::Bitstring {
         return match arinsal_bifs::bitstring_bit_len(arg) {
             Ok(bits) if bits % 8 == 0 => crate::native_hooks::raw(arg),
@@ -373,7 +375,7 @@ fn list_to_bitstring_bif(
         };
         return match built {
             Ok(value) => crate::native_hooks::raw(value),
-            Err(_) => fail(c_p, i, process, bif, arg, BifError::SystemLimit, false),
+            Err(_) => fail(c_p, reg, i, process, bif, arg, BifError::SystemLimit, false),
         };
     }
     if arg.classify() != TermKind::List {
@@ -383,7 +385,7 @@ fn list_to_bitstring_bif(
     match arinsal_bifs::singleton_bitstring(arg, unit) {
         Ok(Some(head)) => return crate::native_hooks::raw(head),
         Ok(None) => {}
-        Err(error) => return fail(c_p, i, process, bif, arg, error, false),
+        Err(error) => return fail(c_p, reg, i, process, bif, arg, error, false),
     }
     let walk = if unit == 8 {
         IolistSizeWalk::new(arg)
@@ -395,27 +397,29 @@ fn list_to_bitstring_bif(
         root: arg,
         bif,
     };
-    list_to_bitstring_dispatch(c_p, i, process, state, None, reds_left)
+    list_to_bitstring_dispatch(c_p, reg, i, process, state, None, reds_left)
 }
 
 /// `erts_internal:list_to_bitstring_continue/1`.
 // Port of erts/emulator/beam/erl_iolist.c (list_to_bitstring_continue), OTP-29.1.1.
 pub(crate) extern "C" fn list_to_bitstring_continue_1(
     c_p: *mut ProcessHeader,
-    _reg: *mut u64,
+    reg: *mut u64,
     i: u64,
 ) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let mref = process.x[0];
+    let [mref] = crate::bif_table::bif_args::<1>(reg);
     let state = mref
         .with_magic_payload::<L2bHolder, _>(|holder| holder.lock().ok()?.take())
         .flatten();
     let reds_left = process.heap.abi.fcalls.max(0) as usize;
     match state {
-        Some(state) => list_to_bitstring_dispatch(c_p, i, process, state, Some(mref), reds_left),
+        Some(state) => {
+            list_to_bitstring_dispatch(c_p, reg, i, process, state, Some(mref), reds_left)
+        }
         None => bif_ret(c_p, i, Err(crate::natives::bif::badarg())),
     }
 }
@@ -424,6 +428,7 @@ pub(crate) extern "C" fn list_to_bitstring_continue_1(
 /// or `ERTS_BIF_ERROR_TRAPPED1` naming the BIF that was called.
 fn list_to_bitstring_dispatch(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     process: &mut crate::Process,
     mut state: L2bState,
@@ -454,7 +459,16 @@ fn list_to_bitstring_dispatch(
                     match create_holder(process, L2bHolder::new(Some(state)), ERTS_L2B_STATE_SIZE) {
                         Some(mref) => mref,
                         None => {
-                            return fail(c_p, i, process, bif, arg, BifError::SystemLimit, false);
+                            return fail(
+                                c_p,
+                                reg,
+                                i,
+                                process,
+                                bif,
+                                arg,
+                                BifError::SystemLimit,
+                                false,
+                            );
                         }
                     }
                 }
@@ -463,9 +477,9 @@ fn list_to_bitstring_dispatch(
         }
         Ok(IolistStep::Fail(error, reds)) => {
             charge(process, reds as usize);
-            fail(c_p, i, process, bif, arg, error, gc_disabled)
+            fail(c_p, reg, i, process, bif, arg, error, gc_disabled)
         }
-        Err(error) => fail(c_p, i, process, bif, arg, error, gc_disabled),
+        Err(error) => fail(c_p, reg, i, process, bif, arg, error, gc_disabled),
     }
 }
 
@@ -692,13 +706,13 @@ fn iolist_binary_step(
 
 /// `erlang:iolist_to_iovec/1`.
 // Port of erts/emulator/beam/erl_iolist.c (iolist_to_iovec_1), OTP-29.1.1.
-pub(crate) extern "C" fn iolist_to_iovec_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn iolist_to_iovec_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     const BIF: &str = "erlang:iolist_to_iovec/1";
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let arg = process.x[0];
+    let [arg] = crate::bif_table::bif_args::<1>(reg);
     let shortcut = {
         let mut heap = ProcessHeapHandle(&mut process.heap);
         arinsal_bifs::iolist_to_iovec_shortcut(&mut heap, arg)
@@ -706,32 +720,32 @@ pub(crate) extern "C" fn iolist_to_iovec_1(c_p: *mut ProcessHeader, _reg: *mut u
     match shortcut {
         Ok(Some(value)) => return crate::native_hooks::raw(value),
         Ok(None) => {}
-        Err(error) => return fail(c_p, i, process, BIF, arg, error, false),
+        Err(error) => return fail(c_p, reg, i, process, BIF, arg, error, false),
     }
     let state = VecState {
         walk: IolistVecWalk::new(arg),
         arg,
     };
-    iolist_to_iovec_dispatch(c_p, i, process, state, None)
+    iolist_to_iovec_dispatch(c_p, reg, i, process, state, None)
 }
 
 /// `erts_internal:iolist_to_iovec_continue/1`.
 // Port of erts/emulator/beam/erl_iolist.c (iolist_to_iovec_continue), OTP-29.1.1.
 pub(crate) extern "C" fn iolist_to_iovec_continue_1(
     c_p: *mut ProcessHeader,
-    _reg: *mut u64,
+    reg: *mut u64,
     i: u64,
 ) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let mref = process.x[0];
+    let [mref] = crate::bif_table::bif_args::<1>(reg);
     let state = mref
         .with_magic_payload::<VecHolder, _>(|holder| holder.lock().ok()?.take())
         .flatten();
     match state {
-        Some(state) => iolist_to_iovec_dispatch(c_p, i, process, state, Some(mref)),
+        Some(state) => iolist_to_iovec_dispatch(c_p, reg, i, process, state, Some(mref)),
         None => bif_ret(c_p, i, Err(crate::natives::bif::badarg())),
     }
 }
@@ -741,6 +755,7 @@ pub(crate) extern "C" fn iolist_to_iovec_continue_1(
 // OTP-29.1.1.
 fn iolist_to_iovec_dispatch(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     process: &mut crate::Process,
     mut state: VecState,
@@ -823,7 +838,16 @@ fn iolist_to_iovec_dispatch(
                     ) {
                         Some(mref) => mref,
                         None => {
-                            return fail(c_p, i, process, BIF, arg, BifError::SystemLimit, false);
+                            return fail(
+                                c_p,
+                                reg,
+                                i,
+                                process,
+                                BIF,
+                                arg,
+                                BifError::SystemLimit,
+                                false,
+                            );
                         }
                     }
                 }
@@ -832,7 +856,7 @@ fn iolist_to_iovec_dispatch(
         }
         Err((error, reds)) => {
             charge(process, reds);
-            fail(c_p, i, process, BIF, arg, error, gc_disabled)
+            fail(c_p, reg, i, process, BIF, arg, error, gc_disabled)
         }
     }
 }

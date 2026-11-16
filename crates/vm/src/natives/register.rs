@@ -17,11 +17,11 @@ use arinsal_term::{Atom, HeapReservation, Term, TermBuilder, atoms};
 /// `register/2`: `erts_register_name`; a failure is `BADARG | EXF_HAS_EXT_INFO` with the
 /// cause it left in `c_p->fvalue`.
 // Port of erts/emulator/beam/bif.c (register_2), OTP-29.1.1.
-pub(crate) extern "C" fn register_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn register_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
-    let (name, id) = (process.x[0], process.x[1]);
+    let [name, id] = crate::bif_table::bif_args::<2>(reg);
     let result = match erts_register_name(process, name, id) {
         Ok(()) => Ok(Term::atom(atoms::TRUE)),
         Err(cause) => Err(badarg_ext(atoms::ERLANG, "register", 2, Term::atom(cause))),
@@ -123,11 +123,11 @@ fn trace_register(process: &mut Process, pid: Pid, event: &str, name: Atom) {
 
 /// `unregister/1`.
 // Port of erts/emulator/beam/bif.c (unregister_1), OTP-29.1.1.
-pub(crate) extern "C" fn unregister_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn unregister_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
-    let name = process.x[0];
+    let [name] = crate::bif_table::bif_args::<1>(reg);
     let result = match name.as_atom() {
         Some(name) if erts_unregister_name(process, name) => Ok(Term::atom(atoms::TRUE)),
         _ => Err(badarg()),
@@ -170,11 +170,11 @@ fn erts_unregister_name(process: &mut Process, name: Atom) -> bool {
 
 /// `whereis/1`: `erts_whereis_name_to_id`.
 // Port of erts/emulator/beam/bif.c (whereis_1), OTP-29.1.1.
-pub(crate) extern "C" fn whereis_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn whereis_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
-    let Some(name) = process.x[0].as_atom() else {
+    let Some(name) = crate::bif_table::bif_args::<1>(reg)[0].as_atom() else {
         return bif_ret(c_p, i, Err(badarg()));
     };
     crate::native_hooks::raw(erts_whereis_name_to_id(process, name))

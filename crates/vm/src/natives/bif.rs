@@ -86,48 +86,48 @@ fn heap_ret(c_p: *mut ProcessHeader, built: Result<Term, arinsal_term::TermError
 
 /// `monitor/2`.
 // Port of erts/emulator/beam/bif.c (monitor_2), OTP-29.1.1.
-pub(crate) extern "C" fn monitor_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn monitor_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let args = [process.x[0], process.x[1]];
+    let args = crate::bif_table::bif_args::<2>(reg);
     let result = monitor(process, None, &args);
     bif_ret(c_p, i, result)
 }
 
 /// `monitor/3`.
 // Port of erts/emulator/beam/bif.c (monitor_3), OTP-29.1.1.
-pub(crate) extern "C" fn monitor_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn monitor_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let args = [process.x[0], process.x[1], process.x[2]];
+    let args = crate::bif_table::bif_args::<3>(reg);
     let result = monitor(process, None, &args);
     bif_ret(c_p, i, result)
 }
 
 /// `demonitor/1`.
 // Port of erts/emulator/beam/bif.c (demonitor_1), OTP-29.1.1.
-pub(crate) extern "C" fn demonitor_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn demonitor_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let args = [process.x[0]];
+    let args = crate::bif_table::bif_args::<1>(reg);
     let result = demonitor(process, &args);
     bif_ret(c_p, i, result)
 }
 
 /// `demonitor/2`.
 // Port of erts/emulator/beam/bif.c (demonitor_2), OTP-29.1.1.
-pub(crate) extern "C" fn demonitor_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn demonitor_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let args = [process.x[0], process.x[1]];
+    let args = crate::bif_table::bif_args::<2>(reg);
     let result = demonitor(process, &args);
     bif_ret(c_p, i, result)
 }
@@ -459,14 +459,14 @@ pub(crate) extern "C" fn group_leader_0(c_p: *mut ProcessHeader, _reg: *mut u64,
 // Port of erts/emulator/beam/bif.c (erts_internal_group_leader_2), OTP-29.1.1.
 pub(crate) extern "C" fn erts_internal_group_leader_2(
     c_p: *mut ProcessHeader,
-    _reg: *mut u64,
+    reg: *mut u64,
     i: u64,
 ) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (leader, target) = (process.x[0], process.x[1]);
+    let [leader, target] = crate::bif_table::bif_args::<2>(reg);
     let result = group_leader_2(process, leader, target);
     bif_ret(c_p, i, result)
 }
@@ -489,12 +489,12 @@ fn group_leader_2(process: &mut Process, leader: Term, target: Term) -> Result<T
 
 /// `process_flag/2`.
 // Port of erts/emulator/beam/bif.c (process_flag_2), OTP-29.1.1.
-pub(crate) extern "C" fn process_flag_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn process_flag_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (flag, value) = (process.x[0], process.x[1]);
+    let [flag, value] = crate::bif_table::bif_args::<2>(reg);
     let result = process_flag(process, flag, value);
     bif_ret(c_p, i, result)
 }
@@ -647,27 +647,27 @@ fn monitor_nodes(
 
 /// `erlang:'!'/2` (`ebif_bang_2`): `erl_send`.
 // Port of erts/emulator/beam/bif.c (ebif_bang_2), OTP-29.1.1.
-pub(crate) extern "C" fn ebif_bang_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    erl_send(c_p, i)
+pub(crate) extern "C" fn ebif_bang_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    erl_send(c_p, reg, i)
 }
 
 /// `send/2`: `erl_send`. The `send` instruction calls it through the `send/2` export
 /// (`emit_send`).
 // Port of erts/emulator/beam/bif.c (send_2) and jit/arm/instr_bif.cpp (emit_send), OTP-29.1.1.
-pub(crate) extern "C" fn send_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    erl_send(c_p, i)
+pub(crate) extern "C" fn send_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    erl_send(c_p, reg, i)
 }
 
-/// `erl_send(c_p, BIF_ARG_1, BIF_ARG_2)`: `do_send`, then `ERTS_VBUMP_REDS(p, 4)` and the
+/// `erl_send(c_p, reg, BIF_ARG_1, BIF_ARG_2)`: `do_send`, then `ERTS_VBUMP_REDS(p, 4)` and the
 /// message as the value, or `ERTS_BIF_PREP_YIELD_RETURN` when that used up the slice.
 // Port of erts/emulator/beam/bif.c (erl_send), OTP-29.1.1.
 #[inline(always)]
-fn erl_send(c_p: *mut ProcessHeader, i: u64) -> u64 {
+fn erl_send(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (to, msg) = (process.x[0], process.x[1]);
+    let [to, msg] = crate::bif_table::bif_args::<2>(reg);
     let result = match do_send(process, to, msg, SendOptions::default()) {
         Ok(Sent::Done) => send_return(process, msg),
         Ok(Sent::NoConnect) => Ok(msg),
@@ -875,12 +875,12 @@ impl Sent {
 
 /// `send/3`: the option list, then `do_send` with its `connect`/`suspend`/`prio` flags.
 // Port of erts/emulator/beam/bif.c (send_3), OTP-29.1.1.
-pub(crate) extern "C" fn send_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn send_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (to, msg, list) = (process.x[0], process.x[1], process.x[2]);
+    let [to, msg, list] = crate::bif_table::bif_args::<3>(reg);
     let Some(opts) = send_options(list) else {
         // `BIF_P->fvalue = am_badopt; BADARG | EXF_HAS_EXT_INFO`.
         let error = badarg_ext(atoms::ERLANG, "send", 3, Term::atom(atoms::BADOPT));
@@ -956,22 +956,22 @@ pub(crate) fn with_sched<R>(
 
 /// `link/1`.
 // Port of erts/emulator/beam/bif.c (link_1), OTP-29.1.1.
-pub(crate) extern "C" fn link_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn link_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
-    let other = process.x[0];
+    let [other] = crate::bif_table::bif_args::<1>(reg);
     let result = link_opt(process, other, Term::NIL, 1);
     bif_ret(c_p, i, result)
 }
 
 /// `link/2`.
 // Port of erts/emulator/beam/bif.c (link_2), OTP-29.1.1.
-pub(crate) extern "C" fn link_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn link_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
-    let (other, opts) = (process.x[0], process.x[1]);
+    let [other, opts] = crate::bif_table::bif_args::<2>(reg);
     let result = link_opt(process, other, opts, 2);
     bif_ret(c_p, i, result)
 }
@@ -1231,11 +1231,11 @@ fn wake_for_procs_trace(process: &Process, target: Pid) {
 
 /// `unlink/1`.
 // Port of erts/emulator/beam/bif.c (unlink_1), OTP-29.1.1.
-pub(crate) extern "C" fn unlink_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn unlink_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
-    let other = process.x[0];
+    let [other] = crate::bif_table::bif_args::<1>(reg);
     let result = unlink(process, other);
     bif_ret(c_p, i, result)
 }
@@ -1317,35 +1317,45 @@ fn unlink(process: &mut Process, other: Term) -> Result<Term, VmError> {
 
 /// `exit/2`.
 // Port of erts/emulator/beam/bif.c (exit_2), OTP-29.1.1.
-pub(crate) extern "C" fn exit_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    exit_signal_bif(c_p, i, 2, true)
+pub(crate) extern "C" fn exit_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    exit_signal_bif(c_p, reg, i, 2, true)
 }
 
 /// `exit/3`.
 // Port of erts/emulator/beam/bif.c (exit_3), OTP-29.1.1.
-pub(crate) extern "C" fn exit_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    exit_signal_bif(c_p, i, 3, true)
+pub(crate) extern "C" fn exit_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    exit_signal_bif(c_p, reg, i, 3, true)
 }
 
 /// `exit_signal/2`.
 // Port of erts/emulator/beam/bif.c (exit_signal_2), OTP-29.1.1.
-pub(crate) extern "C" fn exit_signal_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    exit_signal_bif(c_p, i, 2, false)
+pub(crate) extern "C" fn exit_signal_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    exit_signal_bif(c_p, reg, i, 2, false)
 }
 
 /// `exit_signal/3`.
 // Port of erts/emulator/beam/bif.c (exit_signal_3), OTP-29.1.1.
-pub(crate) extern "C" fn exit_signal_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    exit_signal_bif(c_p, i, 3, false)
+pub(crate) extern "C" fn exit_signal_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    exit_signal_bif(c_p, reg, i, 3, false)
 }
 
 #[inline(always)]
-fn exit_signal_bif(c_p: *mut ProcessHeader, i: u64, arity: usize, exit2: bool) -> u64 {
+fn exit_signal_bif(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+    arity: usize,
+    exit2: bool,
+) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
-    let (id, reason) = (process.x[0], process.x[1]);
-    let opts = if arity == 3 { process.x[2] } else { Term::NIL };
+    let [id, reason] = crate::bif_table::bif_args::<2>(reg);
+    let opts = if arity == 3 {
+        crate::bif_table::bif_args::<3>(reg)[2]
+    } else {
+        Term::NIL
+    };
     let result = send_exit_signal_bif(process, id, reason, opts, exit2, arity);
     bif_ret(c_p, i, result)
 }
@@ -1440,11 +1450,11 @@ fn send_exit_signal_bif(
 
 /// `spawn/3`.
 // Port of erts/emulator/beam/bif.c (spawn_3), OTP-29.1.1.
-pub(crate) extern "C" fn spawn_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn spawn_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
-    let (module, function, args) = (process.x[0], process.x[1], process.x[2]);
+    let [module, function, args] = crate::bif_table::bif_args::<3>(reg);
     let mut so = ErlSpawnOpts::new(process.runtime);
     let result = erl_create_process(process, module, function, args, &mut so)
         .map_err(CreateError::into_bif_error);
@@ -1453,11 +1463,11 @@ pub(crate) extern "C" fn spawn_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64
 
 /// `spawn_link/3`: `spawn/3` with `SPO_LINK` and `link` in `so.opts`.
 // Port of erts/emulator/beam/bif.c (spawn_link_3), OTP-29.1.1.
-pub(crate) extern "C" fn spawn_link_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn spawn_link_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
-    let (module, function, args) = (process.x[0], process.x[1], process.x[2]);
+    let [module, function, args] = crate::bif_table::bif_args::<3>(reg);
     let mut so = ErlSpawnOpts::new(process.runtime);
     so.link = true;
     // `so.opts = CONS(&tmp_heap[0], am_link, so.opts)`: only seq_trace reads it.
@@ -1476,11 +1486,11 @@ pub(crate) extern "C" fn spawn_link_3(c_p: *mut ProcessHeader, _reg: *mut u64, i
 /// `spawn_opt/4`. Fail order: bad types, then bad options; a bad option list is
 /// `badarg` with `cause => badopt` whatever the MFA.
 // Port of erts/emulator/beam/bif.c (spawn_opt_4), OTP-29.1.1.
-pub(crate) extern "C" fn spawn_opt_4(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn spawn_opt_4(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
-    let (module, function, args, opts) = (process.x[0], process.x[1], process.x[2], process.x[3]);
+    let [module, function, args, opts] = crate::bif_table::bif_args::<4>(reg);
     let result = spawn_opt(process, module, function, args, opts);
     bif_ret(c_p, i, result)
 }
@@ -1520,13 +1530,13 @@ fn spawn_opt(
 // Port of erts/emulator/beam/bif.c (erts_internal_spawn_request_4), OTP-29.1.1.
 pub(crate) extern "C" fn erts_internal_spawn_request_4(
     c_p: *mut ProcessHeader,
-    _reg: *mut u64,
+    reg: *mut u64,
     i: u64,
 ) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
-    let (module, function, args, opts) = (process.x[0], process.x[1], process.x[2], process.x[3]);
+    let [module, function, args, opts] = crate::bif_table::bif_args::<4>(reg);
     let result = spawn_request(process, module, function, args, opts);
     bif_ret(c_p, i, result)
 }
@@ -1601,13 +1611,13 @@ fn spawn_request(
 // Port of erts/emulator/beam/bif.c (spawn_request_abandon_1), OTP-29.1.1.
 pub(crate) extern "C" fn spawn_request_abandon_1(
     c_p: *mut ProcessHeader,
-    _reg: *mut u64,
+    reg: *mut u64,
     i: u64,
 ) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
-    let id = process.x[0];
+    let [id] = crate::bif_table::bif_args::<1>(reg);
     let result = if id.local_ref_numbers().is_none() {
         // is_not_internal_ref: `badarg` for a non-reference, otherwise not an outstanding
         // spawn_request of this process.
@@ -1631,11 +1641,11 @@ pub(crate) extern "C" fn spawn_request_abandon_1(
 
 /// `alias/1`.
 // Port of erts/emulator/beam/bif.c (alias_1), OTP-29.1.1.
-pub(crate) extern "C" fn alias_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn alias_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
-    let opts = process.x[0];
+    let [opts] = crate::bif_table::bif_args::<1>(reg);
     let result = alias(process, opts);
     bif_ret(c_p, i, result)
 }
@@ -1673,11 +1683,11 @@ fn alias(process: &mut Process, opts: Term) -> Result<Term, VmError> {
 
 /// `unalias/1`.
 // Port of erts/emulator/beam/bif.c (unalias_1), OTP-29.1.1.
-pub(crate) extern "C" fn unalias_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn unalias_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
-    let reference = process.x[0];
+    let [reference] = crate::bif_table::bif_args::<1>(reg);
     // erts_get_pid_of_ref: the pid of a pid reference, `undefined` for another reference.
     let result = if reference.classify() != arinsal_term::TermKind::Ref {
         Err(badarg())

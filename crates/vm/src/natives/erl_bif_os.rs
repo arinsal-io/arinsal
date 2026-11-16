@@ -91,13 +91,13 @@ pub(crate) extern "C" fn env_0(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) 
 
 /// `os:getenv/1`.
 // Port of erts/emulator/beam/erl_bif_os.c:94-111 (os_getenv_1), OTP-29.1.1.
-pub(crate) extern "C" fn getenv_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn getenv_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
     let env = crate::erl_osenv::read();
-    let key = match native_bytes(process.x[0], true) {
+    let key = match native_bytes(crate::bif_table::bif_args::<1>(reg)[0], true) {
         Ok(key) => key,
         Err(error) => return super::bif::bif_ret(c_p, i, Err(error)),
     };
@@ -112,17 +112,17 @@ pub(crate) extern "C" fn getenv_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u6
 
 /// `os:putenv/2`.
 // Port of erts/emulator/beam/erl_bif_os.c:113-127 (os_putenv_2), OTP-29.1.1.
-pub(crate) extern "C" fn putenv_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn putenv_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
     let mut env = crate::erl_osenv::write();
-    let key = match native_bytes(process.x[0], true) {
+    let key = match native_bytes(crate::bif_table::bif_args::<1>(reg)[0], true) {
         Ok(key) => key,
         Err(error) => return super::bif::bif_ret(c_p, i, Err(error)),
     };
-    let value = match native_bytes(process.x[1], false) {
+    let value = match native_bytes(crate::bif_table::bif_args::<2>(reg)[1], false) {
         Ok(value) => value,
         Err(error) => return super::bif::bif_ret(c_p, i, Err(error)),
     };
@@ -132,13 +132,13 @@ pub(crate) extern "C" fn putenv_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u6
 
 /// `os:unsetenv/1`.
 // Port of erts/emulator/beam/erl_bif_os.c:129-143 (os_unsetenv_1), OTP-29.1.1.
-pub(crate) extern "C" fn unsetenv_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn unsetenv_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
     let mut env = crate::erl_osenv::write();
-    let key = match native_bytes(process.x[0], true) {
+    let key = match native_bytes(crate::bif_table::bif_args::<1>(reg)[0], true) {
         Ok(key) => key,
         Err(error) => return super::bif::bif_ret(c_p, i, Err(error)),
     };
@@ -148,12 +148,12 @@ pub(crate) extern "C" fn unsetenv_1(c_p: *mut ProcessHeader, _reg: *mut u64, i: 
 
 /// `os:set_signal/2`.
 // Port of erts/emulator/beam/erl_bif_os.c:145-164 (os_set_signal_2), OTP-29.1.1.
-pub(crate) extern "C" fn set_signal_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn set_signal_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (signal, action) = (process.x[0], process.x[1]);
+    let [signal, action] = crate::bif_table::bif_args::<2>(reg);
     if action != Term::atom(atoms::IGNORE)
         && action != Term::atom(atoms::DEFAULT)
         && action != Term::atom(atoms::HANDLE)

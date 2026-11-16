@@ -56,14 +56,14 @@ fn boolean(value: bool) -> u64 {
 
 /// `erlang:'++'/2`.
 // Port of erts/emulator/beam/erl_bif_lists.c (ebif_plusplus_2), OTP-29.1.1.
-pub(crate) extern "C" fn ebif_plusplus_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    append(c_p, i, "erlang:++/2")
+pub(crate) extern "C" fn ebif_plusplus_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    append(c_p, reg, i, "erlang:++/2")
 }
 
 /// `erlang:append/2`.
 // Port of erts/emulator/beam/erl_bif_lists.c (append_2), OTP-29.1.1.
-pub(crate) extern "C" fn append_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    append(c_p, i, "erlang:append/2")
+pub(crate) extern "C" fn append_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    append(c_p, reg, i, "erlang:append/2")
 }
 
 /// `append(bif_entry, BIF_ALIST_2)`: `[] ++ Rhs` is Rhs, and a left list that fits the young
@@ -72,17 +72,17 @@ pub(crate) extern "C" fn append_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u6
 // Port of erts/emulator/beam/erl_bif_lists.c (append, append_start, lists_append_onheap),
 // OTP-29.1.1.
 #[inline(always)]
-fn append(c_p: *mut ProcessHeader, i: u64, bif_entry: &'static str) -> u64 {
+fn append(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, bif_entry: &'static str) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (lhs, rhs) = (process.x[0], process.x[1]);
+    let [lhs, rhs] = crate::bif_table::bif_args::<2>(reg);
     // `[] ++ 'not_a_list'` has always been 'not_a_list'.
     if let Some(value) = arinsal_bifs::append_onheap_direct(&mut process.heap, lhs, rhs) {
         return crate::native_hooks::raw(value);
     }
-    append_general(c_p, i, process, lhs, rhs, bif_entry)
+    append_general(c_p, reg, i, process, lhs, rhs, bif_entry)
 }
 
 /// The rest of `append`: a list that needs `append_empty_rhs` or `lists_append_alloc` or
@@ -92,6 +92,7 @@ fn append(c_p: *mut ProcessHeader, i: u64, bif_entry: &'static str) -> u64 {
 #[inline(never)]
 fn append_general(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     process: &mut crate::Process,
     lhs: Term,
@@ -127,8 +128,8 @@ fn append_general(
         Err(_) => {
             process.set_gc_enabled(true);
             // ERTS_BIF_ERROR_TRAPPED2: the error names the original arguments.
-            process.x[0] = lhs_original;
-            process.x[1] = rhs_original;
+            crate::bif_table::set_bif_arg(reg, 0, lhs_original);
+            crate::bif_table::set_bif_arg(reg, 1, rhs_original);
             bif_ret(c_p, i, Err(badarg()))
         }
     }
@@ -209,26 +210,26 @@ where
 
 /// `erlang:'--'/2`.
 // Port of erts/emulator/beam/erl_bif_lists.c (ebif_minusminus_2), OTP-29.1.1.
-pub(crate) extern "C" fn ebif_minusminus_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    subtract(c_p, i, "erlang:--/2")
+pub(crate) extern "C" fn ebif_minusminus_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    subtract(c_p, reg, i, "erlang:--/2")
 }
 
 /// `erlang:subtract/2`.
 // Port of erts/emulator/beam/erl_bif_lists.c (subtract_2), OTP-29.1.1.
-pub(crate) extern "C" fn subtract_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    subtract(c_p, i, "erlang:subtract/2")
+pub(crate) extern "C" fn subtract_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    subtract(c_p, reg, i, "erlang:subtract/2")
 }
 
 /// `subtract(bif_entry, BIF_ALIST_2)`: two lists start the stages with the context on the
 /// stack; a call that finishes in this slice returns at once.
 // Port of erts/emulator/beam/erl_bif_lists.c (subtract, subtract_start), OTP-29.1.1.
 #[inline(always)]
-fn subtract(c_p: *mut ProcessHeader, i: u64, bif_entry: &'static str) -> u64 {
+fn subtract(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, bif_entry: &'static str) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (lhs, rhs) = (process.x[0], process.x[1]);
+    let [lhs, rhs] = crate::bif_table::bif_args::<2>(reg);
     if (is_list(lhs) || lhs == Term::NIL) && (is_list(rhs) || rhs == Term::NIL) {
         let Ok(mut context) = SubtractWalk::new(lhs, rhs) else {
             return bif_ret(c_p, i, Err(badarg()));
@@ -239,7 +240,7 @@ fn subtract(c_p: *mut ProcessHeader, i: u64, bif_entry: &'static str) -> u64 {
         }
         return subtract_first_slice_end(c_p, i, process, context, result.is_ok(), bif_entry);
     }
-    subtract_resume(c_p, i, process, lhs, bif_entry)
+    subtract_resume(c_p, reg, i, process, lhs, bif_entry)
 }
 
 /// The first call ran out of reductions (`subtract_create_trap_state`, then
@@ -274,6 +275,7 @@ fn subtract_first_slice_end(
 #[inline(never)]
 fn subtract_resume(
     c_p: *mut ProcessHeader,
+    reg: *mut u64,
     i: u64,
     process: &mut crate::Process,
     lhs: Term,
@@ -299,8 +301,8 @@ fn subtract_resume(
         Err(_) => {
             process.set_gc_enabled(true);
             // ERTS_BIF_ERROR_TRAPPED2: the error names the original arguments.
-            process.x[0] = lhs_original;
-            process.x[1] = rhs_original;
+            crate::bif_table::set_bif_arg(reg, 0, lhs_original);
+            crate::bif_table::set_bif_arg(reg, 1, rhs_original);
             bif_ret(c_p, i, Err(badarg()))
         }
     }
@@ -322,11 +324,11 @@ fn subtract_continue(
 
 /// `lists:member/2`.
 // Port of erts/emulator/beam/erl_bif_lists.c (lists_member_2), OTP-29.1.1.
-pub(crate) extern "C" fn lists_member_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn lists_member_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
-    let (term, list) = (process.x[0], process.x[1]);
+    let [term, list] = crate::bif_table::bif_args::<2>(reg);
     let max_iter = bif_reds_left(process).saturating_mul(arinsal_bifs::MEMBER_PER_RED);
     let step = {
         let mut heap = ProcessHeapHandle(&mut process.heap);
@@ -348,12 +350,12 @@ pub(crate) extern "C" fn lists_member_2(c_p: *mut ProcessHeader, _reg: *mut u64,
 /// `lists:reverse/2`.
 // Port of erts/emulator/beam/erl_bif_lists.c (lists_reverse_2, lists_reverse_onheap,
 // lists_reverse_alloc), OTP-29.1.1.
-pub(crate) extern "C" fn lists_reverse_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn lists_reverse_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (list, tail) = (process.x[0], process.x[1]);
+    let [list, tail] = crate::bif_table::bif_args::<2>(reg);
     // `[]` returns the tail; lists_reverse_onheap when the whole reversal fits the young heap
     // and the budget.
     if let Some(value) = arinsal_bifs::reverse_onheap_direct(&mut process.heap, list, tail) {
@@ -394,32 +396,32 @@ fn lists_reverse_slice(
 
 /// `lists:keymember/3`.
 // Port of erts/emulator/beam/erl_bif_lists.c (lists_keymember_3), OTP-29.1.1.
-pub(crate) extern "C" fn lists_keymember_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    keyfind(c_p, i, KeyOp::Member, "lists:keymember/3")
+pub(crate) extern "C" fn lists_keymember_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    keyfind(c_p, reg, i, KeyOp::Member, "lists:keymember/3")
 }
 
 /// `lists:keysearch/3`.
 // Port of erts/emulator/beam/erl_bif_lists.c (lists_keysearch_3), OTP-29.1.1.
-pub(crate) extern "C" fn lists_keysearch_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    keyfind(c_p, i, KeyOp::Search, "lists:keysearch/3")
+pub(crate) extern "C" fn lists_keysearch_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    keyfind(c_p, reg, i, KeyOp::Search, "lists:keysearch/3")
 }
 
 /// `lists:keyfind/3`.
 // Port of erts/emulator/beam/erl_bif_lists.c (lists_keyfind_3), OTP-29.1.1.
-pub(crate) extern "C" fn lists_keyfind_3(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
-    keyfind(c_p, i, KeyOp::Find, "lists:keyfind/3")
+pub(crate) extern "C" fn lists_keyfind_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    keyfind(c_p, reg, i, KeyOp::Find, "lists:keyfind/3")
 }
 
 /// `keyfind(Bif, p, Key, Pos, List)` and the result wrapping of its three callers. The loop
 /// counts `10 * CONTEXT_REDS` elements, independent of the reductions left.
 // Port of erts/emulator/beam/erl_bif_lists.c (keyfind), OTP-29.1.1.
 #[inline(always)]
-fn keyfind(c_p: *mut ProcessHeader, i: u64, op: KeyOp, bif: &'static str) -> u64 {
+fn keyfind(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, op: KeyOp, bif: &'static str) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let (key, pos, list) = (process.x[0], process.x[1], process.x[2]);
+    let [key, pos, list] = crate::bif_table::bif_args::<3>(reg);
     let outcome = {
         let mut heap = ProcessHeapHandle(&mut process.heap);
         let mut call = BifCall::default();

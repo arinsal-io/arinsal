@@ -55,3 +55,39 @@ pub(crate) fn bif_args<const N: usize>(reg: *const u64) -> [arinsal_term::Term; 
     let words = unsafe { std::ptr::read(reg.cast::<[u64; N]>()) };
     words.map(crate::native_hooks::from_raw)
 }
+
+/// `reg[index] = term`: a BIF that fails after it trapped puts the original arguments back in
+/// the register array the call passed, which handle_error reads.
+///
+/// `reg` must be the register array of the running BIF's `(c_p, reg, I)` with at least
+/// `index + 1` registers.
+// Port of erts/emulator/beam/bif.h (ERTS_BIF_PREP_ERROR_TRAPPED1..3: `reg[0..2] = A0..A2`),
+// OTP-29.1.1.
+#[inline(always)]
+pub(crate) fn set_bif_arg(reg: *mut u64, index: usize, term: arinsal_term::Term) {
+    debug_assert!(!reg.is_null());
+    // SAFETY: per the contract above, `reg[index]` is a register of the running BIF, which no
+    // other thread reads or writes while it runs.
+    unsafe { reg.add(index).write(crate::native_hooks::raw(term)) }
+}
+
+/// `reg[0..arity]` as a vector, for a BIF that names a run-time arity (a trap or an error that
+/// carries the arguments of the export it stands for).
+///
+/// `reg` must be the register array of the running BIF's `(c_p, reg, I)` holding at least
+/// `arity` initialized terms.
+// Port of erts/emulator/beam/bif.h (`BIF__ARGS`), OTP-29.1.1.
+pub(crate) fn bif_arg_vec(reg: *const u64, arity: usize) -> Vec<arinsal_term::Term> {
+    debug_assert!(!reg.is_null() || arity == 0);
+    if arity == 0 {
+        return Vec::new();
+    }
+    // SAFETY: per the contract above, `reg[0..arity]` are initialized argument words of the
+    // running BIF, which no other thread writes while it runs.
+    let words = unsafe { std::slice::from_raw_parts(reg, arity) };
+    words
+        .iter()
+        .copied()
+        .map(crate::native_hooks::from_raw)
+        .collect()
+}

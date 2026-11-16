@@ -62,12 +62,11 @@ pub(crate) extern "C" fn get_0(c_p: *mut ProcessHeader, _reg: *mut u64, _i: u64)
 
 /// `get/1`.
 // Port of erts/emulator/beam/erl_process_dict.c (get_1), OTP-29.1.1.
-pub(crate) extern "C" fn get_1(c_p: *mut ProcessHeader, _reg: *mut u64, _i: u64) -> u64 {
+pub(crate) extern "C" fn get_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
-    // BIF_ARG_1: `reg[0]`, the scheduler register file `process.x` is for native code.
-    let key = process.x[0];
+    let [key] = crate::bif_table::bif_args::<1>(reg);
     crate::native_hooks::raw(pd_hash_get(process, key))
 }
 
@@ -94,11 +93,11 @@ pub(crate) extern "C" fn get_keys_0(c_p: *mut ProcessHeader, _reg: *mut u64, _i:
 
 /// `get_keys/1`.
 // Port of erts/emulator/beam/erl_process_dict.c (get_keys_1, pd_hash_get_keys), OTP-29.1.1.
-pub(crate) extern "C" fn get_keys_1(c_p: *mut ProcessHeader, _reg: *mut u64, _i: u64) -> u64 {
+pub(crate) extern "C" fn get_keys_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
-    let value = process.x[0];
+    let [value] = crate::bif_table::bif_args::<1>(reg);
     let keys: Vec<Term> = process
         .dictionary
         .as_ref()
@@ -116,11 +115,11 @@ pub(crate) extern "C" fn get_keys_1(c_p: *mut ProcessHeader, _reg: *mut u64, _i:
 
 /// `put/2`.
 // Port of erts/emulator/beam/erl_process_dict.c (put_2, pd_hash_put), OTP-29.1.1.
-pub(crate) extern "C" fn put_2(c_p: *mut ProcessHeader, _reg: *mut u64, _i: u64) -> u64 {
+pub(crate) extern "C" fn put_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
-    let (key, value) = (process.x[0], process.x[1]);
+    let [key, value] = crate::bif_table::bif_args::<2>(reg);
     let old = process
         .dictionary
         .get_or_insert_with(Box::<crate::proc_create::ProcDict>::default)
@@ -148,11 +147,11 @@ pub(crate) extern "C" fn erase_0(c_p: *mut ProcessHeader, _reg: *mut u64, _i: u6
 
 /// `erase/1`.
 // Port of erts/emulator/beam/erl_process_dict.c (erase_1, pd_hash_erase), OTP-29.1.1.
-pub(crate) extern "C" fn erase_1(c_p: *mut ProcessHeader, _reg: *mut u64, _i: u64) -> u64 {
+pub(crate) extern "C" fn erase_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
-    let key = process.x[0];
+    let [key] = crate::bif_table::bif_args::<1>(reg);
     let old = process
         .dictionary
         .as_mut()
