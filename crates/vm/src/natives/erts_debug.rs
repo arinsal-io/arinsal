@@ -3,6 +3,7 @@
 use crate::dirty::{DirtyBifException, DirtyBifOutcome};
 use crate::process::Message;
 use crate::{Process, Vm, VmError, exceptions};
+use arinsal_beamasm::ProcessHeader;
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::{DirtyKind, Pid, RunCtx, SchedulerType};
 use arinsal_term::{
@@ -1141,6 +1142,45 @@ fn copy_shared(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
             arinsal_term::atoms::SYSTEM_LIMIT,
         )))
     })
+}
+
+/// `erts_debug:copy_shared/2` through the direct BIF table entry.
+// Port of erts/emulator/beam/beam_debug.c (erts_debug_copy_shared_2), OTP-29.1.1.
+pub(crate) extern "C" fn copy_shared_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let args = crate::bif_table::bif_args::<2>(reg);
+    let result = copy_shared(process, &args);
+    crate::natives::bif::bif_ret(c_p, i, result)
+}
+
+/// `erts_debug:flat_size/1`.
+// Port of erts/emulator/beam/beam_debug.c (erts_debug_flat_size_1), OTP-29.1.1.
+pub(crate) extern "C" fn flat_size_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [term] = crate::bif_table::bif_args::<1>(reg);
+    match TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+        .int_from_u64(arinsal_term::flat_size(term) as u64)
+    {
+        Ok(result) => crate::native_hooks::raw(result),
+        Err(_) => crate::natives::bif::bif_system_limit(c_p),
+    }
+}
+
+/// `erts_debug:same/2`.
+// Port of erts/emulator/beam/beam_debug.c (erts_debug_same_2), OTP-29.1.1.
+pub(crate) extern "C" fn same_2(_c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let [left, right] = crate::bif_table::bif_args::<2>(reg);
+    crate::native_hooks::raw(Term::atom(if left == right {
+        arinsal_term::atoms::TRUE
+    } else {
+        arinsal_term::atoms::FALSE
+    }))
 }
 
 /// Port of erts/emulator/beam/erl_map.c:3301 (erts_debug_map_info_1), OTP-29.1.1.

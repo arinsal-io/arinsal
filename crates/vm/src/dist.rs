@@ -3968,11 +3968,8 @@ pub(crate) extern "C" fn node_1(
     reg: *mut u64,
     i: u64,
 ) -> u64 {
-    if crate::native_hooks::process_from_header(c_p).is_none() {
-        return 0;
-    }
-    let [arg] = crate::bif_table::bif_args::<1>(reg);
-    let result = crate::natives::node::node(arg);
+    let [term] = crate::bif_table::bif_args::<1>(reg);
+    let result = crate::natives::node::node(term);
     crate::natives::bif::bif_ret(c_p, i, result)
 }
 

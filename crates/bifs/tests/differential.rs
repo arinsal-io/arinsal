@@ -1,9 +1,9 @@
 mod support;
 
 use arinsal_bifs::{Ctx, ProcessHeapHandle, copy_bitstring_range, lookup};
-use arinsal_difftest::{CallResult, RefErl};
+use arinsal_difftest::RefErl;
 use arinsal_etf::OwnedTerm as O;
-use arinsal_term::{ProcessHeap, TermBuilder, to_owned};
+use arinsal_term::{ProcessHeap, TermBuilder};
 use num_traits::ToPrimitive;
 use similar_asserts::assert_eq;
 use std::collections::HashSet;
@@ -34,65 +34,18 @@ fn args(m: &str, f: &str, arity: u8, n: usize) -> Vec<O> {
     let bin = O::Binary(vec![1, (n % 255) as u8, 3, 4]);
     match (m, f, arity) {
         ("erlang", "length", 1) => vec![seq],
-        ("erlang", "size", 1) => vec![tup],
         ("erlang", "byte_size" | "bit_size" | "binary_to_list", 1) => vec![bin],
-        ("erlang", "node", 0) | ("erlang", "make_ref", 0) | ("erlang", "unique_integer", 0) => {
-            vec![]
-        }
-        ("erlang", "node", 1) => vec![O::Pid {
-            node: "nonode@nohost".into(),
-            id: 3,
-            serial: 0,
-            creation: 0,
-        }],
-        ("erlang", "phash", 2) => vec![term(n), O::Int((n % 1000 + 1) as i64)],
+        ("erlang", "make_ref", 0) | ("erlang", "unique_integer", 0) => vec![],
         ("erlang", "++" | "append" | "--" | "subtract", 2) => vec![seq, list(vec![x])],
         ("lists", "reverse", 2) => vec![seq, term(n)],
         ("lists", "member", 2) => vec![x, seq],
         ("lists", "keyfind" | "keysearch" | "keymember", 3) => {
             vec![x.clone(), O::Int(2), list(vec![tup])]
         }
-        ("erlang", "atom_to_list", 1) => {
-            vec![atom(if n.is_multiple_of(2) { "true" } else { "hello" })]
-        }
-        ("erlang", "list_to_atom", 1) => vec![O::charlist(&format!("a{}", n))],
-        ("erlang", "list_to_existing_atom", 1) => vec![O::charlist("true")],
-        ("erlang", "atom_to_binary", 2) => vec![
-            atom("hello"),
-            atom(if n.is_multiple_of(2) {
-                "utf8"
-            } else {
-                "latin1"
-            }),
-        ],
-        ("erlang", "binary_to_atom", 2) => {
-            vec![O::Binary(format!("a{}", n).into_bytes()), atom("utf8")]
-        }
-        ("erlang", "binary_to_existing_atom", 2) => vec![O::Binary(b"true".to_vec()), atom("utf8")],
-        ("erlang", "float_to_list" | "float_to_binary", 1) => {
-            vec![O::Float(n as f64 / 7.0 - 50.0)]
-        }
-        ("erlang", "float_to_list" | "float_to_binary", 2) => {
-            let option = match n % 4 {
-                0 => atom("short"),
-                1 => atom("compact"),
-                2 => O::Tuple(vec![atom("decimals"), O::Int(3)]),
-                _ => O::Tuple(vec![atom("scientific"), O::Int(5)]),
-            };
-            vec![O::Float(n as f64 / 7.0 - 50.0), list(vec![option])]
-        }
-        ("erlang", "list_to_float", 1) => {
-            vec![O::charlist(&format!("{}.{:02}", n % 1000, n % 100))]
-        }
-        ("erlang", "binary_to_float", 1) => {
-            vec![O::Binary(
-                format!("{}.{:02}", n % 1000, n % 100).into_bytes(),
-            )]
-        }
-        ("erlang", "integer_to_list" | "integer_to_binary", 1) => {
+        ("erlang", "integer_to_list", 1) => {
             vec![O::Int(n as i64 - 500)]
         }
-        ("erlang", "integer_to_list" | "integer_to_binary", 2) => {
+        ("erlang", "integer_to_list", 2) => {
             vec![O::Int(n as i64 - 500), O::Int((n % 35 + 2) as i64)]
         }
         ("erlang", "binary_to_list", 3) => vec![bin, O::Int(2), O::Int(3)],
@@ -149,22 +102,6 @@ fn args(m: &str, f: &str, arity: u8, n: usize) -> Vec<O> {
                 _ => "trim_all",
             })]),
         ],
-        ("erlang", "is_function", 2) => vec![term(n), O::Int((n % 5) as i64)],
-        ("erts_internal", "cmp_term" | "same", 2) => vec![term(n), term(n + 1)],
-        ("erts_debug", "same", 2) => vec![term(n), term(n + 1)],
-        ("erts_debug", "flat_size", 1) => vec![term(n)],
-        ("unicode", "bin_is_7bit", 1) => vec![bin],
-        ("erlang", "is_builtin", 3) => vec![
-            atom("erlang"),
-            atom(if n.is_multiple_of(2) {
-                "length"
-            } else {
-                "missing"
-            }),
-            O::Int(1),
-        ],
-        ("erlang", "error", 2) => vec![term(n), list(vec![term(n + 1)])],
-        ("erlang", "error", 3) => vec![term(n), list(vec![]), list(vec![])],
         ("erlang", "unique_integer", 1) => vec![list(vec![atom("positive")])],
         _ => vec![term(n); arity as usize],
     }
@@ -273,22 +210,6 @@ fn nondeterministic_identity_bifs() {
         assert!(value < 0);
         assert!(negative.insert(value));
     }
-}
-
-#[test]
-fn bitstring_and_iolist_edges() {
-    let reference = RefErl::shared().expect("OTP 29 reference");
-    let partial = O::BitString {
-        bytes: vec![0b1010_0000],
-        bits: 3,
-    };
-    let name = "size";
-    let actual = call("erlang", name, std::slice::from_ref(&partial));
-    let expected = reference.call("erlang", name, &[partial]);
-    assert!(
-        equivalent(&actual, &expected),
-        "{name}: {actual:?} != {expected:?}"
-    );
 }
 
 #[test]
@@ -534,39 +455,6 @@ fn clock_and_dst_behavior() {
 }
 
 #[test]
-fn binary_to_atom_oversized_name_is_system_limit() {
-    let reference = RefErl::shared().expect("OTP 29 reference");
-    for mut bytes in [vec![0; 256], vec![0; 512]] {
-        if bytes.len() == 512 {
-            bytes.push(255);
-        }
-        let bytes = O::Binary(bytes);
-        let expected = reference.call("erlang", "binary_to_atom", &[bytes.clone(), atom("utf8")]);
-        let actual = call("erlang", "binary_to_atom", &[bytes, atom("utf8")]);
-        assert!(
-            matches!(actual, CallResult::Exception { reason: O::Atom(ref name), .. } if name == "system_limit"),
-            "actual result: {actual:?}"
-        );
-        assert!(
-            matches!(expected, CallResult::Exception { reason: O::Atom(ref name), .. } if name == "system_limit"),
-            "OTP result: {expected:?}"
-        );
-    }
-}
-
-#[test]
-fn is_builtin_includes_instruction_implemented_exports() {
-    let reference = RefErl::shared().expect("OTP 29 reference");
-    for (name, arity) in [("apply", 2), ("apply", 3), ("yield", 0)] {
-        let input = [atom("erlang"), atom(name), O::Int(arity)];
-        let expected = reference.call("erlang", "is_builtin", &input);
-        let actual = call("erlang", "is_builtin", &input);
-        assert!(equivalent(&actual, &expected), "{actual:?} != {expected:?}");
-        assert_eq!(actual, CallResult::Ok(atom("true")));
-    }
-}
-
-#[test]
 fn identity_bifs_are_unique_across_threads() {
     let threads = (0..8)
         .map(|_| {
@@ -625,22 +513,4 @@ fn binary_reads_and_bit_copies_handle_unaligned_subbinary() {
     assert_eq!(aligned_copy, [0b1000_0000]);
     // The binary:at/match/split and binary_to_list bodies are VM bodies
     // (crates/vm/tests/bifs/moved_bif_differential.rs).
-}
-
-#[test]
-fn cmp_term_uses_exact_numeric_order_inside_containers() {
-    let reference = RefErl::shared().expect("OTP 29 reference");
-    for (left, right) in [
-        (O::list(vec![O::Int(-2)]), O::list(vec![O::Float(-2.0)])),
-        (O::Int(1_i64 << 62), O::Float(1.0)),
-        (
-            O::Tuple(vec![atom("key"), O::Int(5)]),
-            O::Tuple(vec![atom("key"), O::Float(5.0)]),
-        ),
-    ] {
-        let args = [left, right];
-        let actual = call("erts_internal", "cmp_term", &args);
-        let expected = reference.call("erts_internal", "cmp_term", &args);
-        assert_eq!(actual, expected);
-    }
 }

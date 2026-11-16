@@ -10,8 +10,8 @@
 use crate::natives::bif::{bif_badarg, bif_ret, bif_system_limit};
 use arinsal_beamasm::ProcessHeader;
 use arinsal_bifs::ProcessHeapHandle;
-use arinsal_term::Term;
 use arinsal_term::raw::Cons;
+use arinsal_term::{Term, TermBuilder, TermKind, atoms};
 
 /// `erlang:length/1`.
 // Port of erts/emulator/beam/erl_bif_guard.c (length_1), OTP-29.1.1.
@@ -109,6 +109,54 @@ pub(crate) extern "C" fn max_2(_c_p: *mut ProcessHeader, reg: *mut u64, _i: u64)
         a
     };
     crate::native_hooks::raw(max)
+}
+
+/// `size/1`: tuple arity or the byte size of a bitstring.
+// Port of erts/emulator/beam/erl_bif_guard.c (size_1), OTP-29.1.1.
+pub(crate) extern "C" fn size_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [term] = crate::bif_table::bif_args::<1>(reg);
+    let size = match term.classify() {
+        TermKind::Tuple | TermKind::Record => arinsal_term::raw::Tuple::try_from(term)
+            .ok()
+            .map(|tuple| tuple.arity()),
+        TermKind::Bitstring => arinsal_term::raw::BinRef::try_from(term)
+            .ok()
+            .map(|bits| bits.bit_len() / 8),
+        _ => None,
+    };
+    let Some(size) = size else {
+        return bif_badarg(c_p);
+    };
+    match TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+        .int_from_u64(size as u64)
+    {
+        Ok(result) => crate::native_hooks::raw(result),
+        Err(_) => crate::natives::bif::bif_system_limit(c_p),
+    }
+}
+
+/// `is_integer/3`: integer bounds are validated before the subject is examined.
+// Port of erts/emulator/beam/erl_bif_guard.c (is_integer_3), OTP-29.1.1.
+pub(crate) extern "C" fn is_integer_3(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let [term, lower, upper] = crate::bif_table::bif_args::<3>(reg);
+    let (Some(lower), Some(upper)) = (
+        crate::natives::raw::integer(lower),
+        crate::natives::raw::integer(upper),
+    ) else {
+        return bif_badarg(c_p);
+    };
+    let Some(value) = crate::natives::raw::integer(term) else {
+        return crate::native_hooks::raw(Term::atom(atoms::FALSE));
+    };
+    crate::native_hooks::raw(Term::atom(if lower <= value && value <= upper {
+        atoms::TRUE
+    } else {
+        atoms::FALSE
+    }))
 }
 
 /// A one-argument number BIF of erl_bif_guard.c: the result on the process heap, or

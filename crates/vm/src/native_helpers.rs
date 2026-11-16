@@ -1217,113 +1217,6 @@ fn park_executor(
     0
 }
 
-/// `atom_to_list/1` as the BIF `call_light_bif_shared` branches to.
-// Port of erts/emulator/beam/bif.c:3186-3210 (`atom_to_list_1`) and
-// erl_unicode.c:1388-1395 (`erts_atom_to_string`: latin1 names are
-// `buf_to_intlist` of the atom bytes), OTP-29.1.1.
-pub(crate) extern "C" fn atom_to_list_light(
-    header: *mut ProcessHeader,
-    regs: *mut u64,
-    _i: u64,
-) -> u64 {
-    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
-    // finds its export through `c_p->current`, which the call fragment set.
-    let (descriptor, _) = crate::bif_table::current_export(header);
-    if let Some(raw) = atom_to_list_latin1(header, regs) {
-        return raw;
-    }
-    allocating_bif(header, regs, descriptor, 1, |heap, arg| {
-        arinsal_bifs::atom_to_list_term(heap, arg)
-    })
-}
-
-/// ASCII / single-byte latin1: one `HAlloc` and `buf_to_intlist`. `None` is a
-/// non-atom, a multi-byte name, or a heap that needs a fragment.
-fn atom_to_list_latin1(header: *mut ProcessHeader, regs: *mut u64) -> Option<u64> {
-    let process = crate::native_hooks::process_from_header(header)?;
-    let [arg] = crate::bif_table::bif_args::<1>(regs);
-    let text = arinsal_term::global_atoms().text(arg.as_atom()?)?;
-    let bytes = text.as_bytes();
-    // Atoms are stored as UTF-8. `latin1_chars == len` is exactly the
-    // single-byte case: each byte is already the code point, so
-    // `buf_to_intlist` matches `erts_utf8_to_list`.
-    if bytes.iter().any(|byte| *byte >= 0x80) {
-        return None;
-    }
-    if bytes.is_empty() {
-        return Some(crate::native_hooks::raw(Term::NIL));
-    }
-    // The fragment stored HTOP. Commit it so `HAlloc` bumps the same index,
-    // then publish the new pointer for `emit_leave_runtime`.
-    let term = arinsal_term::TermBuilder::new(&mut process.heap)
-        .byte_string_list(bytes)
-        .ok()?;
-    Some(crate::native_hooks::raw(term))
-}
-
-/// `integer_to_binary/1` as the BIF `call_light_bif_shared` branches to.
-// Port of erts/emulator/beam/binary.c:80-127 (integer_to_binary), OTP-29.1.1.
-pub(crate) extern "C" fn integer_to_binary_light(
-    header: *mut ProcessHeader,
-    regs: *mut u64,
-    _i: u64,
-) -> u64 {
-    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
-    // finds its export through `c_p->current`, which the call fragment set.
-    let (descriptor, _) = crate::bif_table::current_export(header);
-    allocating_bif(header, regs, descriptor, 1, |heap, arg| {
-        arinsal_arith::integer_to_binary_decimal(arg, heap).map_err(arith_bif_error)
-    })
-}
-
-/// Sync the native cursors, run an allocating BIF, and publish HTOP.
-fn allocating_bif(
-    header: *mut ProcessHeader,
-    regs: *mut u64,
-    descriptor: u64,
-    arity: usize,
-    body: impl FnOnce(
-        &mut arinsal_bifs::ProcessHeapHandle<'_>,
-        Term,
-    ) -> Result<Term, arinsal_bifs::BifError>,
-) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, regs) else {
-        return 0;
-    };
-    // The caller (call_light_bif or the export fragment) already charged FCALLS.
-    // reg[0] is BIF_ARG_1, whether the fragment passed `regs` or left it in the
-    // scheduler file `enter_runtime` already resolved.
-    let _ = regs;
-    let arg = registers.x_reg_array[0];
-    let result = {
-        let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        body(&mut fragment, arg)
-    };
-    // The light fragment tests the collection after this call (instr_bif.cpp:488-523).
-    if let Ok(value) = &result {
-        let value = *value;
-        registers.x_reg_array[0] = value;
-        return crate::native_hooks::raw(value);
-    }
-    // The fragment passed `Export.info`; the descriptor is the export, so no table lookup.
-    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
-        crate::native_hooks::set_error(process, "badarg");
-        return 0;
-    };
-    plain_bif_result(process, registers, export, arity, result)
-}
-
-fn arith_bif_error(error: arinsal_arith::ArithError) -> arinsal_bifs::BifError {
-    match error {
-        arinsal_arith::ArithError::Badarg | arinsal_arith::ArithError::Badarith => {
-            arinsal_bifs::BifError::BADARG
-        }
-        arinsal_arith::ArithError::SystemLimit | arinsal_arith::ArithError::HeapFull { .. } => {
-            arinsal_bifs::BifError::SystemLimit
-        }
-    }
-}
-
 /// `make_ref/0`. `HAlloc` of three words and `esdp->ref++`, then the term.
 // Port of erts/emulator/beam/erl_bif_unique.c:821-833 (`make_ref_0`) and
 // erl_bif_unique.h:190-198 (`erts_sched_make_ref_in_buffer`), OTP-29.1.1.
@@ -2783,8 +2676,19 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
         return 0;
     };
     let freason = process.heap.abi.exc.freason;
-    let Some(class) = native_exception_class(freason) else {
+    let error_arglist = is_error_arglist(process, bif_info, freason);
+    let Some(class) = native_exception_class(freason, error_arglist) else {
         return 0;
+    };
+    // `handle_error` removes error/2,3's encoded argument tuple before saving the trace.
+    // The live BIF registers remain the roots for Args while fvalue carries error_info.
+    let arglist = if error_arglist {
+        let Some(arglist) = unpack_error_arglist(process, freason) else {
+            return 0;
+        };
+        Some(arglist)
+    } else {
+        None
     };
     // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:300-318 (`raise_exception_shared`),
     // OTP-29.1.1. The shared fragment already ran `emit_enter_runtime` and stored HTOP and E
@@ -2838,7 +2742,9 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     process.heap.abi.exc.ftrace = crate::native_hooks::raw(trace);
     // Port of beam_common.c:742 (`expand_error_value`): only an indexed reason or an
     // `error_info` value needs expanding; the rest is `fvalue` itself.
-    let reason = if freason
+    let reason = if let Some((reason, _args)) = arglist {
+        reason
+    } else if freason
         & (arinsal_beamasm::exc::EXC_INDEXBITS | arinsal_beamasm::exc::EXF_HAS_EXT_INFO)
         == 0
     {
@@ -2865,13 +2771,13 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
 /// for one the scheduler completes.
 ///
 /// The scheduler keeps: TRAP; `function_clause` (its top frame is built from the current
-/// function's arguments); re-raise words carrying `EXF_RESTORE_NFUNC` or a class atom;
-/// `error/2,3` failures with `EXF_HAS_EXT_INFO` and no index. The native resolver takes
-/// the generic codes (`EXC_ERROR`, `EXC_EXIT`, `EXC_THROWN`, optionally with
-/// `EXF_ARGLIST`), the indexed errors (`(index << 10) | EXC_ERROR`, optionally with
+/// function's arguments); re-raise words carrying `EXF_RESTORE_NFUNC` or a class atom; and
+/// generic `EXF_HAS_EXT_INFO` errors. The native resolver takes the generic codes
+/// (`EXC_ERROR`, `EXC_EXIT`, `EXC_THROWN`, optionally with `EXF_ARGLIST`), `error/3`'s encoded
+/// argument tuple, indexed errors (`(index << 10) | EXC_ERROR`, optionally with
 /// `EXF_HAS_EXT_INFO`), and a `raw_raise` re-raise (a class code without `EXF_SAVETRACE`).
 #[inline]
-fn native_exception_class(freason: u64) -> Option<arinsal_bifs::Class> {
+fn native_exception_class(freason: u64, error_arglist: bool) -> Option<arinsal_bifs::Class> {
     use arinsal_beamasm::exc::{
         EXC_ERROR, EXC_EXIT, EXC_INDEXBITS, EXC_THROWN, EXF_ARGLIST, EXF_HAS_EXT_INFO,
         EXF_SAVETRACE,
@@ -2881,6 +2787,8 @@ fn native_exception_class(freason: u64) -> Option<arinsal_bifs::Class> {
     }
     let handled = if freason & EXC_INDEXBITS != 0 {
         freason & !(EXC_INDEXBITS | EXF_HAS_EXT_INFO) == EXC_ERROR
+    } else if freason & EXF_HAS_EXT_INFO != 0 {
+        error_arglist && freason == EXC_ERROR | EXF_ARGLIST | EXF_HAS_EXT_INFO
     } else {
         matches!(freason & !EXF_ARGLIST, EXC_ERROR | EXC_EXIT | EXC_THROWN)
             || matches!(freason | EXF_SAVETRACE, EXC_ERROR | EXC_EXIT | EXC_THROWN)
@@ -2891,6 +2799,45 @@ fn native_exception_class(freason: u64) -> Option<arinsal_bifs::Class> {
     } else {
         None
     }
+}
+
+/// Identifies `error/2,3`'s encoded arglist using the same BIF MFA passed to `handle_error`.
+pub(crate) fn is_error_arglist(process: &crate::Process, bif_info: u64, freason: u64) -> bool {
+    use arinsal_beamasm::exc::{EXC_ERROR, EXF_ARGLIST, EXF_HAS_EXT_INFO};
+    if freason & EXF_ARGLIST == 0 || freason & !(EXF_ARGLIST | EXF_HAS_EXT_INFO) != EXC_ERROR {
+        return false;
+    }
+    let bif_info = if bif_info == 0 {
+        process.heap.abi.current as usize as u64
+    } else {
+        bif_info
+    };
+    arinsal_beamasm::bif::static_bif_mfa(bif_info).is_some_and(|(module, function, arity)| {
+        module == arinsal_term::atoms::ERLANG
+            && function == arinsal_term::atoms::ERROR
+            && matches!(arity, 2 | 3)
+    })
+}
+
+/// Unpacks the `Value = {Reason, Args[, ErrorInfo]}` used by `erlang:error/2,3`.
+// Port of erts/emulator/beam/beam_common.c (`handle_error`), OTP-29.1.1.
+pub(crate) fn unpack_error_arglist(
+    process: &mut crate::Process,
+    freason: u64,
+) -> Option<(Term, Term)> {
+    use arinsal_term::raw::Tuple;
+    let value = crate::native_hooks::from_raw(process.heap.abi.exc.fvalue);
+    let tuple = Tuple::try_from(value).ok()?;
+    let has_error_info = freason & arinsal_beamasm::exc::EXF_HAS_EXT_INFO != 0;
+    if tuple.arity() != if has_error_info { 3 } else { 2 } {
+        return None;
+    }
+    let reason = tuple.get(0)?;
+    let args = tuple.get(1)?;
+    if has_error_info {
+        process.heap.abi.exc.fvalue = crate::native_hooks::raw(tuple.get(2)?);
+    }
+    Some((reason, args))
 }
 
 /// Supplies erts' `bif_mfa` input to `save_stacktrace`, with arguments in the live X registers.

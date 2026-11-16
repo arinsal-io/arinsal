@@ -18,7 +18,12 @@ use crate::signals::OriginDemonitor;
 use crate::{Process, Vm, VmError};
 use arinsal_beamasm::ProcessHeader;
 use arinsal_sched::{Pid, RunCtx};
-use arinsal_term::{Term, TermKind, atoms};
+use arinsal_term::{
+    AtomEncoding, AtomError, Term, TermBuilder, TermKind, atoms, cmp_exact, global_atoms, phash,
+};
+use num_bigint::BigInt;
+use num_traits::ToPrimitive;
+use std::cmp::Ordering;
 
 /// The executor's scheduler data, when the executor calls the BIF by its MFA (an `apply` it
 /// resolves, a traced call). Native code passes `None` and the distributed arm reaches the
@@ -1889,6 +1894,439 @@ fn primary_exception(c_p: *mut ProcessHeader, reg: *mut u64, freason: u64) -> u6
 // Port of erts/emulator/beam/bif.c (error_1), OTP-29.1.1.
 pub(crate) extern "C" fn error_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     primary_exception(c_p, reg, arinsal_term::exc::EXC_ERROR)
+}
+
+/// `erlang:error/2`: retain the explicit arguments in the BIF error value.
+// Port of erts/emulator/beam/bif.c (error_2), OTP-29.1.1.
+pub(crate) extern "C" fn error_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [reason, arguments] = bif_args::<2>(reg);
+    error_with_value(
+        c_p,
+        process,
+        &[reason, arguments],
+        arinsal_term::exc::EXC_ERROR | arinsal_term::exc::EXF_ARGLIST,
+    )
+}
+
+/// `erlang:error/3`: use the first valid error-info map, or the error/2 form.
+// Port of erts/emulator/beam/bif.c (error_3), OTP-29.1.1.
+pub(crate) extern "C" fn error_3(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [reason, arguments, options] = bif_args::<3>(reg);
+    if let Some(info) = crate::exceptions::error_info_term(options) {
+        error_with_value(
+            c_p,
+            process,
+            &[reason, arguments, info],
+            arinsal_term::exc::EXC_ERROR
+                | arinsal_term::exc::EXF_ARGLIST
+                | arinsal_term::exc::EXF_HAS_EXT_INFO,
+        )
+    } else {
+        error_with_value(
+            c_p,
+            process,
+            &[reason, arguments],
+            arinsal_term::exc::EXC_ERROR | arinsal_term::exc::EXF_ARGLIST,
+        )
+    }
+}
+
+fn error_with_value(
+    c_p: *mut ProcessHeader,
+    process: &mut Process,
+    values: &[Term],
+    freason: u64,
+) -> u64 {
+    let Ok(value) =
+        TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap)).tuple(values)
+    else {
+        return bif_system_limit(c_p);
+    };
+    let exc = &mut process.heap.abi.exc;
+    exc.freason = freason;
+    exc.fvalue = value.word();
+    exc.ftrace = 0;
+    arinsal_term::THE_NON_VALUE
+}
+
+/// `atom_to_list/1`.
+// Port of erts/emulator/beam/bif.c (atom_to_list_1), OTP-29.1.1.
+pub(crate) extern "C" fn atom_to_list_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [term] = bif_args::<1>(reg);
+    let Some(name) = term.as_atom().and_then(|atom| global_atoms().text(atom)) else {
+        return bif_badarg(c_p);
+    };
+    let count = name.chars().count();
+    let list = match TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+        .reserve_cons_list(count)
+    {
+        Ok(list) => list,
+        Err(_) => return bif_system_limit(c_p),
+    };
+    let values = name
+        .chars()
+        .rev()
+        .map(|character| Term::small(i64::from(character as u32)).expect("Unicode point is small"));
+    match list.prepend_exact_with_tail(values, Term::NIL) {
+        Ok(result) => crate::native_hooks::raw(result),
+        Err(_) => bif_system_limit(c_p),
+    }
+}
+
+const MAX_ATOM_CHARACTERS: usize = 255;
+const MAX_ATOM_BYTES: usize = MAX_ATOM_CHARACTERS * 4;
+
+fn unicode_list_bytes(list: Term, bytes: &mut [u8; MAX_ATOM_BYTES]) -> Result<usize, bool> {
+    let mut written = 0;
+    let mut characters = 0;
+    let mut tail = list;
+    while let Ok(cons) = arinsal_term::raw::Cons::try_from(tail) {
+        if characters == MAX_ATOM_CHARACTERS {
+            return Err(true);
+        }
+        let Some(value) = cons
+            .head()
+            .as_small()
+            .and_then(|value| u32::try_from(value).ok())
+        else {
+            return Err(false);
+        };
+        let character = char::from_u32(value).ok_or(false)?;
+        let mut encoded = [0; 4];
+        let encoded = character.encode_utf8(&mut encoded).as_bytes();
+        let Some(destination) = bytes.get_mut(written..written + encoded.len()) else {
+            return Err(true);
+        };
+        destination.copy_from_slice(encoded);
+        written += encoded.len();
+        characters += 1;
+        tail = cons.tail();
+    }
+    if tail != Term::NIL {
+        return Err(false);
+    }
+    Ok(written)
+}
+
+/// `list_to_atom/1`.
+// Port of erts/emulator/beam/bif.c (list_to_atom_1), OTP-29.1.1.
+pub(crate) extern "C" fn list_to_atom_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    atom_from_list(c_p, reg, false)
+}
+
+/// `list_to_existing_atom/1`.
+// Port of erts/emulator/beam/bif.c (list_to_existing_atom_1), OTP-29.1.1.
+pub(crate) extern "C" fn list_to_existing_atom_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    _i: u64,
+) -> u64 {
+    atom_from_list(c_p, reg, true)
+}
+
+fn atom_from_list(c_p: *mut ProcessHeader, reg: *mut u64, existing: bool) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [list] = bif_args::<1>(reg);
+    let mut bytes = [0; MAX_ATOM_BYTES];
+    let written = match unicode_list_bytes(list, &mut bytes) {
+        Ok(written) => written,
+        Err(true) if !existing => return bif_system_limit(c_p),
+        Err(_) => return bif_badarg(c_p),
+    };
+    if existing {
+        return global_atoms()
+            .existing(&bytes[..written], AtomEncoding::Utf8)
+            .map_or_else(
+                || bif_badarg(c_p),
+                |atom| crate::native_hooks::raw(Term::atom(atom)),
+            );
+    }
+    match global_atoms().put(&bytes[..written], AtomEncoding::Utf8, false) {
+        Ok(atom) => crate::native_hooks::raw(Term::atom(atom)),
+        Err(AtomError::TooLong | AtomError::SystemLimit) => bif_system_limit(c_p),
+        Err(AtomError::BadEncoding) => bif_badarg(c_p),
+    }
+}
+
+/// `erlang:phash/2`.
+// Port of erts/emulator/beam/bif.c (phash_2), OTP-29.1.1.
+pub(crate) extern "C" fn phash_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [term, range_term] = bif_args::<2>(reg);
+    let Some(range) = crate::natives::raw::integer(range_term).and_then(|n| n.to_u64()) else {
+        return bif_badarg(c_p);
+    };
+    let Some(value) = phash(term, range) else {
+        return bif_badarg(c_p);
+    };
+    match TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+        .int_from_u64(value)
+    {
+        Ok(result) => crate::native_hooks::raw(result),
+        Err(_) => bif_system_limit(c_p),
+    }
+}
+
+/// `erts_internal:cmp_term/2`.
+// Port of erts/emulator/beam/bif.c (erts_internal_cmp_term_2), OTP-29.1.1.
+pub(crate) extern "C" fn cmp_term_2(_c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let [left, right] = bif_args::<2>(reg);
+    let value = match cmp_exact(left, right) {
+        Ordering::Less => -1,
+        Ordering::Equal => 0,
+        Ordering::Greater => 1,
+    };
+    crate::native_hooks::raw(Term::small(value).expect("comparison result is small"))
+}
+
+/// `erlang:is_builtin/3`.
+// Port of erts/emulator/beam/bif.c (is_builtin_3), OTP-29.1.1.
+pub(crate) extern "C" fn is_builtin_3(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let [module, function, arity] = bif_args::<3>(reg);
+    let (Some(module), Some(function), Some(arity)) = (
+        module.as_atom().and_then(|atom| global_atoms().text(atom)),
+        function
+            .as_atom()
+            .and_then(|atom| global_atoms().text(atom)),
+        arity.as_small(),
+    ) else {
+        return bif_badarg(c_p);
+    };
+    let instruction = module == "erlang"
+        && ((function == "apply" && matches!(arity, 2 | 3)) || (function == "yield" && arity == 0));
+    let builtin = instruction
+        || u8::try_from(arity)
+            .ok()
+            .and_then(|arity| arinsal_spec::bif_lookup(module, function, arity))
+            .is_some();
+    crate::native_hooks::raw(Term::atom(if builtin { atoms::TRUE } else { atoms::FALSE }))
+}
+
+fn integer_bigint(term: Term) -> Option<BigInt> {
+    crate::natives::raw::integer(term)
+}
+
+fn float_options(args: &[Term]) -> Option<arinsal_float::FloatFormatOpts> {
+    use arinsal_float::{FloatFormatOpts, FloatNotation};
+
+    let mut options = FloatFormatOpts::default();
+    let Some(option_list) = args.get(1).copied() else {
+        return Some(options);
+    };
+    let mut tail = option_list;
+    while let Ok(cons) = arinsal_term::raw::Cons::try_from(tail) {
+        let option = cons.head();
+        if option == Term::atom(atoms::COMPACT) {
+            options.compact = true;
+        } else if option == Term::atom(atoms::SHORT) {
+            options.notation = FloatNotation::Short;
+        } else if let Ok(tuple) = arinsal_term::raw::Tuple::try_from(option)
+            && tuple.arity() == 2
+        {
+            let name = tuple.get(0)?;
+            let digits = tuple
+                .get(1)?
+                .as_small()
+                .and_then(|n| u16::try_from(n).ok())?;
+            options.notation = if name == Term::atom(atoms::DECIMALS) {
+                FloatNotation::Decimals(digits)
+            } else if name == Term::atom(atoms::SCIENTIFIC) {
+                FloatNotation::Scientific(digits)
+            } else {
+                return None;
+            };
+        } else {
+            return None;
+        }
+        tail = cons.tail();
+    }
+    (tail == Term::NIL).then_some(options)
+}
+
+fn float_buffer(args: &[Term]) -> Option<([u8; arinsal_float::FLOAT_BUFFER_SIZE], usize)> {
+    let value = crate::natives::raw::float(args[0])?;
+    let options = float_options(args)?;
+    let mut buffer = [0; arinsal_float::FLOAT_BUFFER_SIZE];
+    let length = arinsal_float::float_to_buffer(value, &options, &mut buffer).ok()?;
+    Some((buffer, length))
+}
+
+/// `float_to_list/1` and `/2`.
+// Port of erts/emulator/beam/bif.c (do_float_to_charbuf, do_float_to_list), OTP-29.1.1.
+pub(crate) extern "C" fn float_to_list_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let args = bif_args::<1>(reg);
+    float_to_output(c_p, &args, false)
+}
+
+/// `float_to_list/2`.
+// Port of erts/emulator/beam/bif.c (float_to_list_2), OTP-29.1.1.
+pub(crate) extern "C" fn float_to_list_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let args = bif_args::<2>(reg);
+    float_to_output(c_p, &args, false)
+}
+
+/// `float_to_binary/1` and `/2`.
+// Port of erts/emulator/beam/bif.c (do_float_to_charbuf, do_float_to_binary), OTP-29.1.1.
+pub(crate) extern "C" fn float_to_binary_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let args = bif_args::<1>(reg);
+    float_to_output(c_p, &args, true)
+}
+
+/// `float_to_binary/2`.
+// Port of erts/emulator/beam/bif.c (float_to_binary_2), OTP-29.1.1.
+pub(crate) extern "C" fn float_to_binary_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let args = bif_args::<2>(reg);
+    float_to_output(c_p, &args, true)
+}
+
+fn float_to_output(c_p: *mut ProcessHeader, args: &[Term], binary: bool) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let Some((buffer, length)) = float_buffer(args) else {
+        return bif_badarg(c_p);
+    };
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let mut builder = TermBuilder::new(&mut heap);
+    let result = if binary {
+        builder.binary(&buffer[..length])
+    } else {
+        let list = match builder.reserve_cons_list(length) {
+            Ok(list) => list,
+            Err(_) => return bif_system_limit(c_p),
+        };
+        let values = buffer[..length]
+            .iter()
+            .rev()
+            .map(|byte| Term::small(i64::from(*byte)).expect("ASCII byte is a small integer"));
+        return match list.prepend_exact_with_tail(values, Term::NIL) {
+            Ok(result) => crate::native_hooks::raw(result),
+            Err(_) => bif_system_limit(c_p),
+        };
+    };
+    match result {
+        Ok(result) => crate::native_hooks::raw(result),
+        Err(_) => bif_system_limit(c_p),
+    }
+}
+
+/// `list_to_float/1`.
+// Port of erts/emulator/beam/bif.c (list_to_float_1), OTP-29.1.1.
+pub(crate) extern "C" fn list_to_float(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [list] = bif_args::<1>(reg);
+    let mut bytes = Vec::new();
+    let mut tail = list;
+    while let Ok(cons) = arinsal_term::raw::Cons::try_from(tail) {
+        let Some(byte) = cons.head().as_small().and_then(|n| u8::try_from(n).ok()) else {
+            return bif_badarg(c_p);
+        };
+        bytes.push(byte);
+        tail = cons.tail();
+    }
+    if tail != Term::NIL {
+        return bif_badarg(c_p);
+    }
+    parse_float(c_p, process, &bytes)
+}
+
+/// `binary_to_float/1`.
+// Port of erts/emulator/beam/bif.c (binary_to_float_1), OTP-29.1.1.
+pub(crate) extern "C" fn binary_to_float(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [binary] = bif_args::<1>(reg);
+    let Some(bytes) = arinsal_term::raw::BinRef::try_from(binary)
+        .ok()
+        .and_then(|binary| binary.bytes())
+    else {
+        return bif_badarg(c_p);
+    };
+    parse_float(c_p, process, bytes)
+}
+
+fn parse_float(c_p: *mut ProcessHeader, process: &mut Process, bytes: &[u8]) -> u64 {
+    let Ok(value) = arinsal_float::list_to_float(bytes) else {
+        return bif_badarg(c_p);
+    };
+    match TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap)).float(value) {
+        Ok(result) => crate::native_hooks::raw(result),
+        Err(_) => bif_system_limit(c_p),
+    }
+}
+
+/// `integer_to_binary/1` and `/2`.
+// Port of erts/emulator/beam/binary.c (integer_to_binary_1, integer_to_binary_2), OTP-29.1.1.
+pub(crate) extern "C" fn integer_to_binary_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    _i: u64,
+) -> u64 {
+    let args = bif_args::<1>(reg);
+    integer_to_binary_for_base(c_p, &args)
+}
+
+/// `integer_to_binary/2`.
+// Port of erts/emulator/beam/binary.c (integer_to_binary_2), OTP-29.1.1.
+pub(crate) extern "C" fn integer_to_binary_2(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    _i: u64,
+) -> u64 {
+    let args = bif_args::<2>(reg);
+    integer_to_binary_for_base(c_p, &args)
+}
+
+fn integer_to_binary_for_base(c_p: *mut ProcessHeader, args: &[Term]) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let Some(value) = integer_bigint(args[0]) else {
+        return bif_badarg(c_p);
+    };
+    let base = if args.len() == 1 {
+        10
+    } else {
+        let Some(base) = args[1].as_small() else {
+            return bif_badarg(c_p);
+        };
+        if !(2..=36).contains(&base) {
+            return bif_badarg(c_p);
+        }
+        base as u32
+    };
+    let text = value.to_str_radix(base).to_uppercase();
+    match TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+        .binary(text.as_bytes())
+    {
+        Ok(result) => crate::native_hooks::raw(result),
+        Err(_) => bif_system_limit(c_p),
+    }
 }
 
 /// `exit/1`.

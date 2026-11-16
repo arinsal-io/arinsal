@@ -147,16 +147,6 @@ pub(crate) extern "C" fn integer_to_list_2(c_p: *mut ProcessHeader, reg: *mut u6
     integer_text_bif(c_p, reg, i, "integer_to_list", 2)
 }
 
-/// `erlang:integer_to_binary/2`.
-// Port of erts/emulator/beam/binary.c (integer_to_binary_2), OTP-29.1.1.
-pub(crate) extern "C" fn integer_to_binary_2(
-    c_p: *mut ProcessHeader,
-    reg: *mut u64,
-    i: u64,
-) -> u64 {
-    integer_text_bif(c_p, reg, i, "integer_to_binary", 2)
-}
-
 fn status(name: &'static str) -> Result<Term, BifError> {
     global_atoms()
         .intern(name)

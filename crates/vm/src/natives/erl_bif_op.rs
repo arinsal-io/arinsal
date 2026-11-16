@@ -107,6 +107,31 @@ comparison!(
     /// `erlang:'=/='/2`. Port of erl_bif_op.c (sneq_2).
     sneq_2, |a, b| !exact_eq(a, b)
 );
+
+/// `erlang:is_function/2`.
+// Port of erts/emulator/beam/erl_bif_op.c (is_function_2, erl_is_function), OTP-29.1.1.
+pub(crate) extern "C" fn is_function_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    use num_bigint::Sign;
+
+    let [function, arity] = bif_args::<2>(reg);
+    let arity = if let Some(arity) = arity.as_small() {
+        if arity < 0 {
+            return bif_badarg(c_p);
+        }
+        Some(u8::try_from(arity).ok())
+    } else if let Some(arity) = crate::natives::raw::integer(arity) {
+        if arity.sign() == Sign::Minus {
+            return bif_badarg(c_p);
+        }
+        return boolean(false);
+    } else {
+        return bif_badarg(c_p);
+    };
+    let result = arity
+        .flatten()
+        .is_some_and(|arity| crate::natives::raw::fun_arity(function) == Some(arity));
+    boolean(result)
+}
 comparison!(
     /// `erlang:'/='/2`. Port of erl_bif_op.c (sneqeq_2).
     sneqeq_2, |a, b| !loose_eq(a, b)

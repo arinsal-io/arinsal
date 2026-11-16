@@ -1327,15 +1327,28 @@ fn native_exit(
     } else if process.heap.abi.exc.freason != 0 {
         let class = process.heap.abi.exc.freason;
         let has_ext_info = class & arinsal_beamasm::exc::EXF_HAS_EXT_INFO != 0;
+        let arglist = if crate::native_helpers::is_error_arglist(process, 0, class) {
+            crate::native_helpers::unpack_error_arglist(process, class)
+        } else {
+            None
+        };
         let info = crate::native_hooks::from_raw(process.heap.abi.exc.fvalue);
-        let reason = if has_ext_info {
+        let reason = if let Some((reason, _args)) = arglist {
+            reason
+        } else if has_ext_info {
             crate::native_helpers::expand_error_value(process)
                 .ok_or_else(|| VmError::Unsupported("native error_info reason".into()))?
         } else {
             info
         };
         let mut trap = exceptions::native_trap(class, crate::native_hooks::raw(reason))?;
-        if has_ext_info && info.classify() == arinsal_term::TermKind::Map {
+        if let Some((_reason, args)) = arglist {
+            trap.top = Some(if has_ext_info {
+                crate::stacktrace::TopFrame::CurrentArgsInfoTerm(Some(args), info)
+            } else {
+                crate::stacktrace::TopFrame::CurrentArgs(args)
+            });
+        } else if has_ext_info && info.classify() == arinsal_term::TermKind::Map {
             trap.top = Some(crate::stacktrace::TopFrame::CurrentArgsInfoTerm(None, info));
         }
         return Err(VmError::Trap(trap));

@@ -162,8 +162,8 @@ fn function_at(index: usize) -> Option<Bif> {
 }
 
 use crate::native_helpers::{
-    atom_to_list_light, integer_to_binary_light, make_ref_light, persistent_term_get_1_light,
-    persistent_term_get_2_light, unique_integer_0_light, unique_integer_1_light,
+    make_ref_light, persistent_term_get_1_light, persistent_term_get_2_light,
+    unique_integer_0_light, unique_integer_1_light,
 };
 use crate::natives::{
     bif_phash2, binary, erl_arith, erl_bif_atomics, erl_bif_binary, erl_bif_chksum, erl_bif_guard,
@@ -269,8 +269,34 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erts_internal", "counters_put", 3) => bif!(erl_bif_atomics::counters_put_3),
         ("erts_internal", "counters_info", 1) => bif!(erl_bif_atomics::counters_info_1),
         // bif.c
+        ("erlang", "phash", 2) => bif!(crate::natives::bif::phash_2),
         ("erlang", "phash2", 1) => bif!(bif_phash2::phash2_1),
         ("erlang", "phash2", 2) => bif!(bif_phash2::phash2_2),
+        ("erlang", "atom_to_list", 1) => bif!(crate::natives::bif::atom_to_list_1),
+        ("erlang", "list_to_atom", 1) => bif!(crate::natives::bif::list_to_atom_1),
+        ("erlang", "list_to_existing_atom", 1) => {
+            bif!(crate::natives::bif::list_to_existing_atom_1)
+        }
+        ("erlang", "float_to_list", 1) => bif!(crate::natives::bif::float_to_list_1),
+        ("erlang", "float_to_list", 2) => bif!(crate::natives::bif::float_to_list_2),
+        ("erlang", "float_to_binary", 1) => bif!(crate::natives::bif::float_to_binary_1),
+        ("erlang", "float_to_binary", 2) => bif!(crate::natives::bif::float_to_binary_2),
+        ("erlang", "list_to_float", 1) => bif!(crate::natives::bif::list_to_float),
+        ("erlang", "binary_to_float", 1) => bif!(crate::natives::bif::binary_to_float),
+        ("erlang", "integer_to_binary", 1) => {
+            bif!(crate::natives::bif::integer_to_binary_1)
+        }
+        ("erlang", "integer_to_binary", 2) => {
+            bif!(crate::natives::bif::integer_to_binary_2)
+        }
+        ("erlang", "error", 2) => bif!(crate::natives::bif::error_2),
+        ("erlang", "error", 3) => bif!(crate::natives::bif::error_3),
+        ("erlang", "is_builtin", 3) => bif!(crate::natives::bif::is_builtin_3),
+        ("erts_internal", "cmp_term", 2) => bif!(crate::natives::bif::cmp_term_2),
+        ("erts_debug", "copy_shared", 2) => bif!(crate::natives::erts_debug::copy_shared_2),
+        ("erts_debug", "flat_size", 1) => bif!(crate::natives::erts_debug::flat_size_1),
+        ("erts_debug", "same", 2) => bif!(crate::natives::erts_debug::same_2),
+        ("unicode", "bin_is_7bit", 1) => bif!(crate::natives::erl_unicode_atom::bin_is_7bit_1),
         ("erlang", "hd", 1) => bif!(crate::natives::bif::hd_1),
         ("erlang", "tl", 1) => bif!(crate::natives::bif::tl_1),
         ("erlang", "element", 2) => bif!(crate::natives::bif::element_2),
@@ -361,6 +387,8 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "list_to_bitstring", 1) => bif!(erl_iolist::list_to_bitstring_1),
         ("erlang", "iolist_to_iovec", 1) => bif!(erl_iolist::iolist_to_iovec_1),
         // erl_bif_guard.c
+        ("erlang", "size", 1) => bif!(erl_bif_guard::size_1),
+        ("erlang", "is_integer", 3) => bif!(erl_bif_guard::is_integer_3),
         ("erlang", "length", 1) => bif!(erl_bif_guard::length_1),
         ("erlang", "min", 2) => bif!(erl_bif_guard::min_2),
         ("erlang", "max", 2) => bif!(erl_bif_guard::max_2),
@@ -395,6 +423,7 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "is_binary", 1) => bif!(erl_bif_op::is_binary_1),
         ("erlang", "is_bitstring", 1) => bif!(erl_bif_op::is_bitstring_1),
         ("erlang", "is_function", 1) => bif!(erl_bif_op::is_function_1),
+        ("erlang", "is_function", 2) => bif!(erl_bif_op::is_function_2),
         ("erlang", "is_boolean", 1) => bif!(erl_bif_op::is_boolean_1),
         ("erlang", "is_record", 1) => bif!(erl_bif_op::is_record_1),
         ("erlang", "is_record", 2) => bif!(erl_bif_op::is_record_2),
@@ -417,7 +446,6 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "bnot", 1) => bif!(erl_arith::bnot_1),
         ("erlang", "integer_to_list", 1) => bif!(erl_arith::integer_to_list_1),
         ("erlang", "integer_to_list", 2) => bif!(erl_arith::integer_to_list_2),
-        ("erlang", "integer_to_binary", 2) => bif!(erl_arith::integer_to_binary_2),
         ("erts_internal", "list_to_integer", 2) => bif!(erl_arith::list_to_integer_2),
         ("erts_internal", "binary_to_integer", 2) => bif!(erl_arith::binary_to_integer_2),
         // erl_process_dict.c
@@ -434,8 +462,11 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("os", "putenv", 2) => bif!(crate::natives::erl_bif_os::putenv_2),
         ("os", "unsetenv", 1) => bif!(crate::natives::erl_bif_os::unsetenv_1),
         ("os", "set_signal", 2) => bif!(crate::natives::erl_bif_os::set_signal_2),
-        ("erlang", "atom_to_list", 1) => bif!(atom_to_list_light),
-        ("erlang", "integer_to_binary", 1) => bif!(integer_to_binary_light),
+        ("erlang", "atom_to_binary", 2) => bif!(crate::natives::erl_unicode_atom::atom_to_binary_2),
+        ("erlang", "binary_to_atom", 2) => bif!(crate::natives::erl_unicode_atom::binary_to_atom_2),
+        ("erlang", "binary_to_existing_atom", 2) => {
+            bif!(crate::natives::erl_unicode_atom::binary_to_existing_atom_2)
+        }
         ("erlang", "byte_size", 1) => bif!(erl_bif_guard::byte_size_1),
         ("erlang", "bit_size", 1) => bif!(erl_bif_guard::bit_size_1),
         ("erlang", "binary_part", 2) | ("binary", "part", 2) => {

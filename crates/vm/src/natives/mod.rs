@@ -29,6 +29,7 @@ pub(crate) mod erl_process;
 pub(crate) mod erl_process_dict;
 pub(crate) mod erl_ptab;
 pub(crate) mod erl_unicode;
+pub(crate) mod erl_unicode_atom;
 mod erl_unicode_normalize;
 pub(crate) mod erts_debug;
 pub(crate) mod external;
@@ -89,6 +90,7 @@ pub(crate) fn plain_static_nif_lookup(
 }
 pub(crate) mod node;
 pub(crate) mod proc;
+pub(crate) mod raw;
 
 /// Arguments passed to a process-aware native. Register windows stay in the scheduler's
 /// register array `reg` and are copied only when a legacy family needs a slice.

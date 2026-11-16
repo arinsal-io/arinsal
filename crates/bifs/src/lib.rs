@@ -27,7 +27,7 @@ mod time;
 mod unique;
 
 pub use pure::{
-    Phash2Cont, Phash2Run, atom_to_list_term, binary_bytes, bitstring_bit_len, copy_binary_range,
+    Phash2Cont, Phash2Run, binary_bytes, bitstring_bit_len, copy_binary_range,
     copy_bitstring_range, copy_bitstring_range_to, eval_unique_integer, for_each_list_term,
     next_ref_id, next_unique_monotonic, phash2_immediate_1, phash2_range_arg,
     phash2_run_1_after_immediate_check, phash2_run_2, phash2_slice, proper_list_terms,
@@ -489,28 +489,6 @@ pub fn visit_bif<V: BifTableVisitor>(
     }
     None
 }
-
-/// One [`BifBody`] per BIF function of a module, named after the function, in
-/// that module's `bodies`.
-macro_rules! bif_bodies {
-    ($($bif:ident),* $(,)?) => {
-        #[allow(non_camel_case_types)]
-        mod bodies {
-            $(
-                pub(super) struct $bif;
-                impl $crate::BifBody for $bif {
-                    fn call(
-                        ctx: &mut $crate::Ctx<'_>,
-                        args: &[arinsal_term::Term],
-                    ) -> Result<arinsal_term::Term, $crate::BifError> {
-                        super::$bif(ctx, args)
-                    }
-                }
-            )*
-        }
-    };
-}
-pub(crate) use bif_bodies;
 
 /// Bodies that return a term or [`arinsal_term::Term::NON_VALUE`] (erts' BIF shape), in their
 /// own table module. `call_word` is the body itself; `call` adapts it for callers that want a
