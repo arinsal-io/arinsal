@@ -5081,7 +5081,7 @@ fn rbuf_stage(inner: &mut Inner, extra: usize) -> bool {
     } else {
         total
     };
-    let Ok(mut bin) = arinsal_term::RefcBinary::new_zeroed(initial) else {
+    let Ok(mut bin) = arinsal_term::RefcBinary::new_uninit(initial) else {
         return false;
     };
     let Some(buf) = bin.bytes_mut_unique() else {

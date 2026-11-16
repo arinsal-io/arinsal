@@ -1881,7 +1881,12 @@ const BINARY_COPY_TRAP: &str = "erlang:binary_copy_trap/3";
 /// `copy_binary_to_buffer` for a byte-aligned destination: `count` source bytes starting at bit
 /// `source_bit` of `window`, shifted when the source starts inside a byte.
 // Port of erts/emulator/beam/erl_bits.h (copy_binary_to_buffer), OTP-29.1.1.
-fn copy_binary_to_buffer(target: &mut [u8], window: &[u8], source_bit: usize, count: usize) {
+pub(crate) fn copy_binary_to_buffer(
+    target: &mut [u8],
+    window: &[u8],
+    source_bit: usize,
+    count: usize,
+) {
     let from = source_bit / 8;
     let shift = source_bit % 8;
     if shift == 0 {
@@ -1925,10 +1930,16 @@ fn copy_loop(
     trap_offset: usize,
 ) -> Result<usize, BifError> {
     let source = BinRef::try_from(input).map_err(|_| BifError::BADARG)?;
-    arinsal_term::raw::with_iolist_binary_output(result, |destination| {
-        binary_copy_loop(source, destination, copied_bits, trap_offset)
-    })
-    .ok_or(BifError::SystemLimit)
+    // `binary_copy_trap`: the contents of the unshared result are updated in place.
+    let mut target =
+        arinsal_term::raw::UninitBitstring::from_term(result).ok_or(BifError::BADARG)?;
+    let destination = target.bytes_mut().ok_or(BifError::BADARG)?;
+    Ok(binary_copy_loop(
+        source,
+        destination,
+        copied_bits,
+        trap_offset,
+    ))
 }
 
 /// `get_reds` for the copy loops.
@@ -1989,12 +2000,15 @@ fn do_binary_copy(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize) 
             Err(_) => bif_ret(c_p, i, Err(find_error(BifError::SystemLimit))),
         };
     }
-    let Ok(result) = arinsal_term::raw::allocate_iolist_binary(
+    // `erts_new_bitstring`: an uninitialized off-heap binary (the target is above one slice, so
+    // beyond the on-heap limit).
+    let Ok(output) = arinsal_term::raw::UninitBitstring::allocate(
         &mut ProcessHeapHandle(&mut process.heap),
         length,
     ) else {
         return bif_ret(c_p, i, Err(find_error(BifError::SystemLimit)));
     };
+    let result = output.term();
     let Ok(copied) = copy_loop(bin, result, 0, max_copy_bits.min(target_bits)) else {
         return bif_ret(c_p, i, Err(badarg()));
     };
@@ -2048,7 +2062,6 @@ pub(crate) extern "C" fn binary_copy_trap(c_p: *mut ProcessHeader, reg: *mut u64
             process,
             (copied - initial_target_offset) / BITSTRING_COPY_LOOP_FACTOR,
         );
-        arinsal_term::raw::finish_iolist_binary_output(result);
         return crate::native_hooks::raw(result);
     }
     crate::bif_traps::vbump_all_reds(process);

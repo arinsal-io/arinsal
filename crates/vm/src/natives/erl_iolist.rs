@@ -11,9 +11,7 @@
 use crate::Process;
 use crate::bif_traps::TrapContext;
 use crate::natives::bif::bif_ret;
-use crate::natives::erl_iolist_vec::{
-    IolistVecWalk, iolist_to_iovec_shortcut, iolist_yield_reductions,
-};
+use crate::natives::erl_iolist_vec::{IolistAction, VecState, iolist_to_iovec_shortcut};
 use arinsal_beamasm::ProcessHeader;
 use arinsal_bifs::{BifCall, BifError, Ctx, ProcessHeapHandle};
 use arinsal_term::erl_iolist::{IolistCopyWalk, IolistError, IolistProgress, IolistSizeWalk};
@@ -59,12 +57,6 @@ struct L2bState {
 
 type L2bHolder = TrapContext<Option<L2bState>>;
 
-/// `ErtsIOList2VecState`.
-struct VecState {
-    walk: IolistVecWalk,
-    arg: Term,
-}
-
 type VecHolder = TrapContext<Option<VecState>>;
 
 /// The walks' progress with the error of the BIF layer.
@@ -76,6 +68,11 @@ fn bif_progress(progress: IolistProgress) -> Result<(bool, usize), (BifError, us
         };
         (error, work)
     })
+}
+
+/// The reductions `generic_iolist_size` charges for `used` yield counts.
+fn iolist_yield_reductions(used: usize) -> usize {
+    used.saturating_sub(1) / SIZE_YIELDS_PER_RED + 1
 }
 
 /// `BUMP_REDS(c_p, reds)`.
@@ -741,10 +738,8 @@ pub(crate) extern "C" fn iolist_to_iovec_1(c_p: *mut ProcessHeader, reg: *mut u6
         Ok(None) => {}
         Err(error) => return fail(c_p, reg, i, process, BIF, arg, error, false),
     }
-    let state = VecState {
-        walk: IolistVecWalk::new(arg),
-        arg,
-    };
+    let mut state = VecState::new(arg);
+    state.set_reds_left(process);
     iolist_to_iovec_dispatch(c_p, reg, i, process, state, None)
 }
 
@@ -764,14 +759,18 @@ pub(crate) extern "C" fn iolist_to_iovec_continue_1(
         .with_magic_payload::<VecHolder, _>(|holder| holder.lock().ok()?.take())
         .flatten();
     match state {
-        Some(state) => iolist_to_iovec_dispatch(c_p, reg, i, process, state, Some(mref)),
+        Some(mut state) => {
+            state.set_reds_left(process);
+            iolist_to_iovec_dispatch(c_p, reg, i, process, state, Some(mref))
+        }
         None => bif_ret(c_p, i, Err(crate::natives::bif::badarg())),
     }
 }
 
-/// `iolist_to_iovec_dispatch`: size pass, then copy pass, each for the reductions left.
-// Port of erts/emulator/beam/erl_iolist.c (iolist_to_iovec_engine, iolist_to_iovec_dispatch),
-// OTP-29.1.1.
+/// `iolist_to_iovec_dispatch`: run the engine, then return the result, `BIF_TRAP1` to
+/// `iolist_to_iovec_continue_export` with the state in a magic binary, or
+/// `ERTS_BIF_ERROR_TRAPPED1`.
+// Port of erts/emulator/beam/erl_iolist.c (iolist_to_iovec_dispatch), OTP-29.1.1.
 fn iolist_to_iovec_dispatch(
     c_p: *mut ProcessHeader,
     reg: *mut u64,
@@ -782,66 +781,15 @@ fn iolist_to_iovec_dispatch(
 ) -> u64 {
     const BIF: &str = "erlang:iolist_to_iovec/1";
     let gc_disabled = mref.is_some();
-    let arg = state.arg;
-    let entry_reds = process.heap.abi.fcalls.max(0) as usize;
-    let mut spent = 0_usize;
-    let mut reds_left = entry_reds;
-    // Outcome: Ok(Some(value)) done, Ok(None) yield with the reductions to charge.
-    let outcome: Result<(Option<Term>, usize), (BifError, usize)> = (|| {
-        if !state.walk.sized() {
-            if reds_left == 0 {
-                return Ok((None, 0));
-            }
-            match state
-                .walk
-                .size_step(reds_left.saturating_mul(SIZE_YIELDS_PER_RED))
-            {
-                Err((error, used)) => {
-                    return Err((error, iolist_yield_reductions(used)));
-                }
-                Ok((false, _)) => return Ok((None, entry_reds)),
-                Ok((true, used)) => {
-                    let reds = iolist_yield_reductions(used);
-                    spent += reds;
-                    reds_left = reds_left.saturating_sub(reds);
-                }
-            }
-            if reds_left == 0 {
-                return Ok((None, entry_reds));
-            }
-        }
-        if reds_left == 0 {
-            return Ok((None, 0));
-        }
-        match state
-            .walk
-            .copy_step(reds_left.saturating_mul(SIZE_YIELDS_PER_RED))
-        {
-            Err((error, used)) => Err((error, spent + iolist_yield_reductions(used))),
-            Ok((false, _)) => Ok((None, entry_reds)),
-            Ok((true, used)) => {
-                let reds = spent + iolist_yield_reductions(used);
-                let finished = {
-                    let mut heap = ProcessHeapHandle(&mut process.heap);
-                    state.walk.finish(&mut heap)
-                };
-                match finished {
-                    Ok(value) => Ok((Some(value), reds)),
-                    Err(error) => Err((error, reds)),
-                }
-            }
-        }
-    })();
-    match outcome {
-        Ok((Some(value), reds)) => {
-            charge(process, reds);
+    let arg = state.arg();
+    match state.engine(process) {
+        IolistAction::Ok => {
             if gc_disabled {
                 process.set_gc_enabled(true);
             }
-            crate::native_hooks::raw(value)
+            crate::native_hooks::raw(state.result())
         }
-        Ok((None, reds)) => {
-            charge(process, reds);
+        IolistAction::Yield => {
             let mref = match mref {
                 Some(mref) => {
                     let _ = mref.with_magic_payload::<VecHolder, _>(|holder| {
@@ -873,8 +821,12 @@ fn iolist_to_iovec_dispatch(
             };
             trap_continue(c_p, i, process, IOLIST_TO_IOVEC_CONTINUE, mref)
         }
-        Err((error, reds)) => {
-            charge(process, reds);
+        action => {
+            let error = if action == IolistAction::Overflow {
+                BifError::SystemLimit
+            } else {
+                BifError::BADARG
+            };
             fail(c_p, reg, i, process, BIF, arg, error, gc_disabled)
         }
     }

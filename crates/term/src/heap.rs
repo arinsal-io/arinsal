@@ -4391,7 +4391,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
                     .ok_or(TermError::SystemLimit)
             });
         }
-        let mut binary = RefcBinary::new_zeroed(size)?;
+        let mut binary = RefcBinary::new_uninit(size)?;
         let written = fill(binary.bytes_mut_unique().ok_or(TermError::BadArg)?)?;
         if written > size {
             return Err(TermError::BadArg);
@@ -4400,6 +4400,16 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
             binary,
             written.checked_mul(8).ok_or(TermError::SystemLimit)?,
         )
+    }
+    /// A whole-byte off-heap binary of `size` bytes (`size > 0`) that the caller fills while it
+    /// still holds the only reference (`erts_bin_nrml_alloc` plus
+    /// its `BinRef`, as `iolist_to_iovec` does for its copied components). The payload is not
+    /// initialized.
+    // Port of erts/emulator/beam/erl_iolist.c (iolist_to_iovec_engine), OTP-29.1.1.
+    pub fn refc_binary_uninit(&mut self, size: usize) -> Result<Term, TermError> {
+        let bit_len = size.checked_mul(8).ok_or(TermError::SystemLimit)?;
+        let binary = RefcBinary::new_uninit(size)?;
+        self.install_refc_binary(binary, bit_len)
     }
     /// Build a bitstring with high bits significant in its final byte.
     pub fn bitstring(&mut self, bytes: &[u8], bit_len: usize) -> Result<Term, TermError> {
@@ -4412,7 +4422,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         }
         // Port of erts/emulator/beam/external.c (`dec_term`, BINARY_EXT / BIT_BINARY_EXT),
         // OTP-29.1.1: allocate the final refc binary and copy the payload once.
-        let mut binary = RefcBinary::new_zeroed(count)?;
+        let mut binary = RefcBinary::new_uninit(count)?;
         let data = binary.bytes_mut_unique().ok_or(TermError::BadArg)?;
         data.copy_from_slice(&bytes[..count]);
         if !bit_len.is_multiple_of(8)
@@ -4436,7 +4446,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
             })?;
             return Ok((term, address));
         }
-        let binary = RefcBinary::new_zeroed(count)?;
+        let binary = RefcBinary::new_uninit(count)?;
         address = binary.as_ptr() as usize;
         let term = self.install_refc_binary(binary, bit_len)?;
         Ok((term, address))

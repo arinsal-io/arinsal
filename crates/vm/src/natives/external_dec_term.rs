@@ -535,7 +535,7 @@ fn dec_term_body(
                         }
                         objp.store(make_boxed(hb));
                     } else {
-                        let mut binary = RefcBinary::new_zeroed(size_in_bits.div_ceil(8))
+                        let mut binary = RefcBinary::new_uninit(size_in_bits.div_ceil(8))
                             .map_err(map_term_build_error)?;
                         let data = binary.bytes_mut_unique().ok_or(BifError::BADARG)?;
                         let data_addr = data.as_mut_ptr() as usize;

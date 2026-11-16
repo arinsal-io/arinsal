@@ -282,14 +282,13 @@ fn bitstring_and_iolist_edges() {
         bytes: vec![0b1010_0000],
         bits: 3,
     };
-    for (name, value) in [("size", partial.clone())] {
-        let actual = call("erlang", name, std::slice::from_ref(&value));
-        let expected = reference.call("erlang", name, &[value]);
-        assert!(
-            equivalent(&actual, &expected),
-            "{name}: {actual:?} != {expected:?}"
-        );
-    }
+    let name = "size";
+    let actual = call("erlang", name, std::slice::from_ref(&partial));
+    let expected = reference.call("erlang", name, &[partial]);
+    assert!(
+        equivalent(&actual, &expected),
+        "{name}: {actual:?} != {expected:?}"
+    );
 }
 
 #[test]

@@ -1276,6 +1276,8 @@ pub fn with_iolist_binary_output<R>(term: Term, f: impl FnOnce(&mut [u8]) -> R) 
     Some(f(output))
 }
 
+pub use crate::bits::UninitBitstring;
+
 /// End the unique writer before the completed binary is shared with Erlang code.
 pub fn finish_iolist_binary_output(term: Term) {
     crate::writable_finalize(term);
