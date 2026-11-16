@@ -839,15 +839,16 @@ pub(crate) extern "C" fn arinsal_beamasm_call_error_handler(
     {
         return 0;
     }
-    let args: smallvec::SmallVec<[Term; 8]> = smallvec::SmallVec::from_slice(&process.x[..arity]);
+    let args: smallvec::SmallVec<[Term; 8]> =
+        smallvec::SmallVec::from_slice(&registers.x_reg_array[..arity]);
     let Ok(list) = arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
         .list_from_iter(args)
     else {
         return 0;
     };
-    process.x[0] = Term::atom(stub.module_atom);
-    process.x[1] = Term::atom(stub.function_atom);
-    process.x[2] = list;
+    registers.x_reg_array[0] = Term::atom(stub.module_atom);
+    registers.x_reg_array[1] = Term::atom(stub.function_atom);
+    registers.x_reg_array[2] = list;
     std::ptr::from_ref(handler_export) as usize
 }
 
@@ -936,15 +937,13 @@ fn scheduler_counter_entry(
 // Port of erts/emulator/beam/erl_bif_persistent.c:380 (`persistent_term_get_1`), OTP-29.1.1.
 pub(crate) extern "C" fn persistent_term_get_1_light(
     header: *mut ProcessHeader,
-    _regs: *mut u64,
+    regs: *mut u64,
     _i: u64,
 ) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(header) else {
         return 0;
     };
-    let Some(key) = process.x.first().copied() else {
-        return 0;
-    };
+    let [key] = crate::bif_table::bif_args::<1>(regs);
     let found = process.persistent_terms.get(key);
     match found {
         Some(value) => crate::native_hooks::raw(value),
@@ -959,18 +958,13 @@ pub(crate) extern "C" fn persistent_term_get_1_light(
 // Port of erts/emulator/beam/erl_bif_persistent.c:390 (`persistent_term_get_2`), OTP-29.1.1.
 pub(crate) extern "C" fn persistent_term_get_2_light(
     header: *mut ProcessHeader,
-    _regs: *mut u64,
+    regs: *mut u64,
     _i: u64,
 ) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(header) else {
         return 0;
     };
-    let Some(key) = process.x.first().copied() else {
-        return 0;
-    };
-    let Some(default) = process.x.get(1).copied() else {
-        return 0;
-    };
+    let [key, default] = crate::bif_table::bif_args::<2>(regs);
     let value = process.persistent_terms.get(key).unwrap_or(default);
     crate::native_hooks::raw(value)
 }
@@ -1098,7 +1092,7 @@ pub extern "C" fn arinsal_beamasm_line_breakpoint_prepare(
     };
 
     for index in 0..live {
-        if !process.heap.stack_set(index, process.x[index]) {
+        if !process.heap.stack_set(index, registers.x_reg_array[index]) {
             crate::native_hooks::set_error(process, "system_limit");
             return 0;
         }
@@ -1109,7 +1103,7 @@ pub extern "C" fn arinsal_beamasm_line_breakpoint_prepare(
         Term::small(i64::from(function.arity)).expect("arity is a small integer"),
         Term::small(i64::from(line)).expect("debug line is a small integer"),
     ];
-    process.x[..4].copy_from_slice(&args);
+    registers.x_reg_array[..4].copy_from_slice(&args);
     process.heap.abi.arity = 4;
     export as *const arinsal_beamasm::bif::ExportEntry as usize as u64
 }
@@ -1447,7 +1441,7 @@ pub(crate) extern "C" fn binary_part_2_light(
 // Port of erts/emulator/beam/erl_bif_binary.c:1954-2038 (`erts_binary_part`), OTP-29.1.1.
 pub(crate) extern "C" fn binary_part_3_light(
     header: *mut ProcessHeader,
-    _regs: *mut u64,
+    regs: *mut u64,
     _i: u64,
 ) -> u64 {
     // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
@@ -1456,11 +1450,11 @@ pub(crate) extern "C" fn binary_part_3_light(
     let Some(process) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
-    let args = [process.x[0], process.x[1], process.x[2]];
+    let args = crate::bif_table::bif_args::<3>(regs);
     let result = binary_part_3_apply(process, &args);
     match result {
         Ok(value) => {
-            process.x[0] = value;
+            crate::bif_table::set_bif_arg(regs, 0, value);
             crate::native_hooks::raw(value)
         }
         Err(error) => {
@@ -1491,7 +1485,7 @@ fn allocating_bif(
     // reg[0] is BIF_ARG_1, whether the fragment passed `regs` or left it in the
     // scheduler file `enter_runtime` already resolved.
     let _ = regs;
-    let arg = process.x[0];
+    let arg = registers.x_reg_array[0];
     let result = {
         let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         body(&mut fragment, arg)
@@ -1499,7 +1493,7 @@ fn allocating_bif(
     // The light fragment tests the collection after this call (instr_bif.cpp:488-523).
     if let Ok(value) = &result {
         let value = *value;
-        process.x[0] = value;
+        registers.x_reg_array[0] = value;
         return crate::native_hooks::raw(value);
     }
     // The fragment passed `Export.info`; the descriptor is the export, so no table lookup.
@@ -1606,7 +1600,7 @@ pub(crate) extern "C" fn unique_integer_1_light(
         return 0;
     };
     let _ = regs;
-    let arg = process.x[0];
+    let arg = registers.x_reg_array[0];
     unique_integer_n(process, registers, export, false, &[arg])
 }
 
@@ -1703,7 +1697,7 @@ pub(crate) extern "C" fn thin_bif_light<B: crate::natives::ThinProcessBif>(
     };
     match B::call(process, &registers.x_reg_array[..B::ARITY]) {
         Ok(value) => {
-            process.x[0] = value;
+            registers.x_reg_array[0] = value;
             crate::native_hooks::raw(value)
         }
         Err(trap) => thin_bif_failed(process, registers, descriptor, *trap),
@@ -1877,7 +1871,7 @@ fn call_trap_bif(
     }
     let arity = usize::from(export.arity);
     let mut args = [Term::NIL; 4];
-    args[..arity].copy_from_slice(&process.x[..arity]);
+    args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
     let callee = (export.module_atom, export.function_atom);
     let outcome = crate::bif_traps::call_light(process, entry, identity, callee, &args[..arity]);
     match outcome {
@@ -2174,7 +2168,7 @@ fn fast_scheduler_bif(
             unique_integer_n(process, registers, export, export_call, &[])
         }
         SchedulerCounterBif::Unique1 => {
-            let arg = process.x[0];
+            let arg = registers.x_reg_array[0];
             unique_integer_n(process, registers, export, export_call, &[arg])
         }
     })
@@ -2258,7 +2252,7 @@ fn finish_counter_bif(
                 && !process.heap.bin_vheap_gc_due()))
     {
         let value = *value;
-        process.x[0] = value;
+        registers.x_reg_array[0] = value;
         return crate::native_hooks::raw(value);
     }
     plain_bif_result(
@@ -2308,7 +2302,7 @@ fn call_plain_bif_body(
     let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let mut call = arinsal_bifs::BifCall::default();
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut call);
-    let result = bif(&mut ctx, &process.x[..arity]);
+    let result = bif(&mut ctx, &registers.x_reg_array[..arity]);
     let deferred = ctx.take_deferred();
     // ERTS_IS_GC_DESIRED_INTERNAL: a value goes straight back in x0, and the native
     // light-BIF fragment tests the collection itself (instr_bif.cpp:488-523). The
@@ -2324,7 +2318,7 @@ fn call_plain_bif_body(
     {
         let value = *value;
         if export_call {
-            process.x[0] = value;
+            registers.x_reg_array[0] = value;
         }
         return crate::native_hooks::raw(value);
     }
@@ -2350,7 +2344,7 @@ fn plain_bif_slow(
     let arity = usize::from(export.arity);
     if let Some(trap) = deferred {
         let mut args = [Term::NIL; 3];
-        args[..arity].copy_from_slice(&process.x[..arity]);
+        args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
         return install_deferred_bif_trap(process, identity, export, &args[..arity], *trap);
     }
     plain_bif_result(process, registers, export, arity, result)
@@ -2373,7 +2367,7 @@ fn call_plain_bif_word(
     let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let mut call = arinsal_bifs::BifCall::default();
     let mut ctx = arinsal_bifs::Ctx::with_failure(&mut fragment, &mut call);
-    let word = bif(&mut ctx, &process.x[..arity]);
+    let word = bif(&mut ctx, &registers.x_reg_array[..arity]);
     if word != arinsal_term::THE_NON_VALUE {
         return word;
     }
@@ -2511,7 +2505,7 @@ fn call_process_bif(
         // old block, so the post-BIF free-space check does not apply.
         return Some(match result {
             Ok(value) => {
-                process.x[0] = value;
+                registers.x_reg_array[0] = value;
                 crate::native_hooks::raw(value)
             }
             Err(error) => process_bif_result(process, export, Err(error)),
@@ -2525,7 +2519,7 @@ fn call_process_bif(
                 && !process.heap.bin_vheap_gc_due()))
     {
         let value = *value;
-        process.x[0] = value;
+        registers.x_reg_array[0] = value;
         return Some(crate::native_hooks::raw(value));
     }
     Some(process_bif_result(process, export, result))
@@ -2804,7 +2798,7 @@ fn plain_bif_result(
             let value = crate::native_hooks::raw(value);
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_light_bif,
             // ERTS_IS_GC_AFTER_BIF_DESIRED), OTP-29.1.1: one test, so at most one collection.
-            process.x[0] = crate::native_hooks::from_raw(value);
+            registers.x_reg_array[0] = crate::native_hooks::from_raw(value);
             value
         }
         Err(error) => plain_bif_error(process, export, error),
@@ -2848,7 +2842,7 @@ fn gc_after_bif_call(
     // without a collection.
     if !process.heap.gc_enabled {
         if value != arinsal_term::THE_NON_VALUE {
-            process.x[0] = crate::native_hooks::from_raw(value);
+            registers.x_reg_array[0] = crate::native_hooks::from_raw(value);
         }
         return value;
     }
@@ -3639,8 +3633,8 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(
             arinsal_bifs::BifError::SystemLimit,
         );
     }
-    let module = process.x[arity];
-    let function = process.x[arity + 1];
+    let module = registers.x_reg_array[arity];
+    let function = registers.x_reg_array[arity + 1];
     let (Some(module_atom), Some(function_atom)) = (module.as_atom(), function.as_atom()) else {
         // Port of erts/emulator/beam/beam_common.c:1540-1552 (fixed_apply, `error`), OTP-29.1.1.
         if process
@@ -3655,9 +3649,12 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(
                 arinsal_bifs::BifError::SystemLimit,
             );
         }
-        let (module, function) = (process.x[arity], process.x[arity + 1]);
+        let (module, function) = (
+            registers.x_reg_array[arity],
+            registers.x_reg_array[arity + 1],
+        );
         let args: smallvec::SmallVec<[Term; 8]> =
-            smallvec::SmallVec::from_slice(&process.x[..arity]);
+            smallvec::SmallVec::from_slice(&registers.x_reg_array[..arity]);
         let Ok(list) =
             arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
                 .list_from_iter(args)
@@ -3763,7 +3760,11 @@ fn apply3(
     stack_offset: u32,
 ) -> arinsal_beamasm::misc::ApplyResolution {
     use arinsal_beamasm::misc::ApplyResolution;
-    let (mut module, mut function, mut args) = (process.x[0], process.x[1], process.x[2]);
+    let (mut module, mut function, mut args) = (
+        registers.x_reg_array[0],
+        registers.x_reg_array[1],
+        registers.x_reg_array[2],
+    );
     // Port of erts/emulator/beam/beam_common.c:1462-1495 (nested apply loop), OTP-29.1.1.
     while module.as_atom() == Some(arinsal_term::atoms::ERLANG)
         && function.as_atom() == Some(arinsal_term::atoms::APPLY)

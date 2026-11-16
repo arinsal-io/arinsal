@@ -27,13 +27,17 @@ impl Vm {
             resolved,
             natives::NativeArgs::Registers(arity),
         );
-        // A BIF that traps to an export returns THE_NON_VALUE: no collection runs after it, so
-        // the trap's saved arguments stay valid until the process resumes (erts BIF_TRAP keeps
-        // them in def_arg_reg, GC disabled while trapped).
-        if let Some(result) = result
-            .as_mut()
-            .filter(|result| !matches!(result, Err(VmError::TrapExport(_))))
-        {
+        // Port of erts/emulator/beam/erl_gc.c:454-456 (erts_gc_after_bif_call_lhf: a BIF_TRAP
+        // collects with `regs` up to `p->arity`), OTP-29.1.1: BIF_TRAP's arguments are the
+        // registers the trap target is called with, so they are the roots, and they are what
+        // the executor installs when it makes the call.
+        if let Some(Err(VmError::TrapExport(trap))) = result.as_mut() {
+            if let Err(error) = calls::gc_after_native_parts(p, &mut trap.args, None, None) {
+                return Some(Err(error));
+            }
+            return result;
+        }
+        if let Some(result) = result.as_mut() {
             // Port of erts/emulator/beam/erl_gc.c:418-478 (erts_gc_after_bif_call_lhf with
             // `regs`), OTP-29.1.1: the argument registers are the BIF's arguments. A
             // collection inside the BIF (live = arity) already moved them, so the epilogue
