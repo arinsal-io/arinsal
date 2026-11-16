@@ -10,6 +10,7 @@
     "beamjit": 2,
     "beamops": 0,
     "bifs": 45,
+    "external": 7,
     "bits": 5,
     "cli": 0,
     "difftest": 0,
@@ -29,7 +30,7 @@
     "re": 18,
     "sched": 121,
     "spec": 0,
-    "term": 373,
+    "term": 375,
     "vm": 329,
     "drv": 92
   }

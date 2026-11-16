@@ -376,7 +376,7 @@ pub extern "C" fn enif_term_to_binary(
     if out.is_null() {
         return 0;
     };
-    let Ok(encoded) = arinsal_bifs::encode_term_to_binary(value) else {
+    let Ok(encoded) = arinsal_external::encode_term_to_binary(value) else {
         return 0;
     };
     if terms::enif_alloc_binary(encoded.len(), out) == 0 {

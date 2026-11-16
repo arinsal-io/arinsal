@@ -216,6 +216,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "arinsal-external"
+version = "0.0.1"
+dependencies = [
+ "arinsal-bifs",
+ "arinsal-maps",
+ "arinsal-term",
+ "flate2",
+ "num-bigint",
+ "num-traits",
+ "smallvec",
+]
+
+[[package]]
 name = "arinsal-float"
 version = "0.0.1"
 dependencies = [
@@ -255,6 +268,7 @@ dependencies = [
  "arinsal-alloc",
  "arinsal-bifs",
  "arinsal-etf",
+ "arinsal-external",
  "arinsal-maps",
  "arinsal-term",
  "cc",
@@ -416,6 +430,7 @@ dependencies = [
  "arinsal-drv",
  "arinsal-etf",
  "arinsal-ets",
+ "arinsal-external",
  "arinsal-float",
  "arinsal-loader",
  "arinsal-maps",

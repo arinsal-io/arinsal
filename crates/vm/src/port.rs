@@ -5600,7 +5600,7 @@ pub(crate) fn trace_command(process: &mut Process, port: Term, event: Term) -> R
     // enif_term_to_binary: erts_encode_ext_size + erts_encode_ext of the event, then the bytes
     // become the binary of the `{command, Bin}` message.
     let encoded = {
-        let bytes = arinsal_bifs::encode_term_to_binary(event).map_err(|_| badarg())?;
+        let bytes = arinsal_external::encode_term_to_binary(event).map_err(|_| badarg())?;
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         TermBuilder::new(&mut heap)
             .binary(&bytes)

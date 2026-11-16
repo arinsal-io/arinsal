@@ -1109,3 +1109,106 @@ pub(crate) fn node_entry<'a>(addr: usize) -> &'a crate::node_table::ErlNode {
     // lock once no reference remains.
     unsafe { &*(addr as *const crate::node_table::ErlNode) }
 }
+
+/// `DECLARE_WSTACK`: a word stack whose default-size array lives in the frame of its owner and
+/// is not initialized, with a heap overflow area beyond `N` words.
+// Port of DECLARE_WSTACK / WSTACK_PUSH / WSTACK_POP in erts/emulator/beam/global.h and
+// erl_grow_wstack in utils.c, OTP-29.1.1.
+pub struct WordStack<const N: usize> {
+    len: usize,
+    inline: [MaybeUninit<u64>; N],
+    spill: Vec<u64>,
+}
+
+impl<const N: usize> WordStack<N> {
+    /// An empty stack; the array is left uninitialized and nothing is allocated.
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self {
+            len: 0,
+            inline: [MaybeUninit::uninit(); N],
+            spill: Vec::new(),
+        }
+    }
+
+    /// `WSTACK_PUSH`.
+    #[inline(always)]
+    pub fn push(&mut self, word: u64) {
+        if self.len < N {
+            self.inline[self.len] = MaybeUninit::new(word);
+        } else {
+            self.push_spilled(word);
+        }
+        self.len += 1;
+    }
+
+    // `WSTACK_EXPAND`: the overflow area starts with a first block and doubles.
+    #[cold]
+    #[inline(never)]
+    fn push_spilled(&mut self, word: u64) {
+        if self.spill.capacity() == 0 {
+            self.spill.reserve(256);
+        }
+        self.spill.push(word);
+    }
+
+    /// `WSTACK_POP`: `None` on an empty stack.
+    #[inline(always)]
+    pub fn pop(&mut self) -> Option<u64> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        if self.len < N {
+            // SAFETY: slots below the old `len` were written by `push` and not yet popped.
+            Some(unsafe { self.inline[self.len].assume_init() })
+        } else {
+            self.spill.pop()
+        }
+    }
+
+    /// `WSTACK_POP` of a stack known to be nonempty.
+    #[inline(always)]
+    pub fn pop_word(&mut self) -> u64 {
+        self.pop().expect("WSTACK is nonempty")
+    }
+
+    /// `WSTACK_ISEMPTY`.
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// `WSTACK_RESTORE`: take the words of a saved context, bottom first.
+    #[inline(always)]
+    pub fn restore(&mut self, saved: &mut Vec<u64>) {
+        if !saved.is_empty() {
+            for word in saved.drain(..) {
+                self.push(word);
+            }
+        }
+    }
+
+    /// `WSTACK_SAVE`: move the contents, bottom first, into `saved`.
+    pub fn save(&mut self, saved: &mut Vec<u64>) {
+        if self.len == 0 {
+            return;
+        }
+        saved.clear();
+        let inline = self.len.min(N);
+        // SAFETY: the first `inline` slots were written by `push` and not yet popped.
+        saved.extend(
+            self.inline[..inline]
+                .iter()
+                .map(|slot| unsafe { slot.assume_init() }),
+        );
+        saved.append(&mut self.spill);
+        self.len = 0;
+    }
+}
+
+impl<const N: usize> Default for WordStack<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}

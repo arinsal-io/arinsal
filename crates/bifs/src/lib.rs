@@ -34,10 +34,7 @@ mod time;
 mod unicode;
 mod unique;
 
-pub use etf::{
-    BlockHashWalk, EncodeWalk, RefcEncoded, encode_term_to_binary, install_refc_binary,
-    local_term_hash,
-};
+pub use etf::{BlockHashWalk, local_node_hash, local_term_hash};
 pub use lists::{
     APPEND_ALLOC_PER_RED, APPEND_EMPTY_PER_RED, APPEND_ONHEAP_PER_RED, AppendCont, AppendStep,
     DeferredTrap, KEYFIND_MAX_ITER, KeyOp, KeyOutcome, KeyfindCont, LENGTH_PER_RED, LengthCont,

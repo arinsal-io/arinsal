@@ -16,7 +16,8 @@ use crate::natives::erl_bif_lists::bif_trap;
 use crate::natives::erl_iolist::{charge, create_holder, gc_enable};
 use crate::natives::external_dec::{B2tContext, B2tState};
 use arinsal_beamasm::ProcessHeader;
-use arinsal_bifs::{BifError, EncodeWalk, ProcessHeapHandle};
+use arinsal_bifs::{BifError, ProcessHeapHandle};
+use arinsal_external::EncodeWalk;
 use arinsal_term::{RefcBinary, Term, TermBuilder, atoms};
 
 /// `TERM_TO_BINARY_LOOP_FACTOR`.
@@ -413,7 +414,9 @@ fn ttb_pass(process: &mut Process, context: &mut TtbContext, chunk: usize) -> Tt
                 }
                 let binary = binary.take().expect("the result binary");
                 let mut heap = ProcessHeapHandle(&mut process.heap);
-                let value = tri!(arinsal_bifs::install_refc_binary(&mut heap, binary, size));
+                let value = tri!(arinsal_external::install_refc_binary(
+                    &mut heap, binary, size
+                ));
                 return TtbStep::Done(value, charge_for(&context.walk, work));
             }
             TtbState::EncodeStaged(output) => {

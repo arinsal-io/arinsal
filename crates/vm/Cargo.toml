@@ -32,6 +32,7 @@ arinsal-arith.workspace = true
 arinsal-maps.workspace = true
 arinsal-bits.workspace = true
 arinsal-bifs.workspace = true
+arinsal-external = { path = "../external" }
 arinsal-re.workspace = true
 arinsal-nif.workspace = true
 arinsal-drv.workspace = true
