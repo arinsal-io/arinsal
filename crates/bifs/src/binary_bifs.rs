@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 
 use arinsal_term::raw::Cons;
-use arinsal_term::{ConsListBuilder, HeapAlloc, MagicBin, TermBuilder};
+use arinsal_term::{HeapAlloc, MagicBin, TermBuilder};
 
 use crate::binary_mod::{SearchPattern, SearchPatternHandle, SearchWalk};
 use crate::{BifError, Ctx};
@@ -19,8 +19,6 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
     let bif = match (module, name, arity) {
         ("erlang", "byte_size", 1) => v.entry::<word_bodies::byte_size>(),
         ("erlang", "bit_size", 1) => v.entry::<word_bodies::bit_size>(),
-        ("erlang", "bitstring_to_list", 1) => v.entry::<bodies::bitstring_to_list>(),
-        ("erlang", "split_binary", 2) => v.entry::<word_bodies::split_binary>(),
         ("erlang", "binary_part", 2 | 3) | ("binary", "part", 2 | 3) => {
             v.entry::<word_bodies::binary_part>()
         }
@@ -53,90 +51,6 @@ fn byte_size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> 
 #[inline(always)]
 fn bit_size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     integer(ctx, bitstring_bit_len(args[0])?)
-}
-
-/// The bit length, first byte and bit offset of a bitstring, as `ERTS_GET_BITSTRING` yields
-/// them (`BYTE_OFFSET(offset)`, `BIT_OFFSET(offset)`).
-// Port of erts/emulator/beam/binary.c (binary_to_list_1/3: ERTS_GET_BITSTRING), OTP-29.1.1.
-pub fn bitstring_source(term: Term) -> Result<(usize, usize, usize), BifError> {
-    with_binary_bytes(term, |view| {
-        (view.bit_len(), view.start_bit() / 8, view.start_bit() % 8)
-    })
-}
-
-/// `ERTS_B2L_BYTES_PER_REDUCTION`.
-pub const B2L_BYTES_PER_REDUCTION: usize = 256;
-
-/// Resumable fill of one HAlloc reservation, as in `ErtsB2LState`.
-// Port of erts/emulator/beam/binary.c (binary_to_list_chunk), OTP-29.1.1.
-pub struct BinaryToListWalk {
-    source: Term,
-    source_start: usize,
-    bit_offset: usize,
-    remaining: usize,
-    total: usize,
-    list: Option<ConsListBuilder>,
-}
-
-impl BinaryToListWalk {
-    /// `ErtsB2LState` for `size` bytes of `source` starting at byte `source_start`.
-    pub fn new(source: Term, source_start: usize, bit_offset: usize, size: usize) -> Self {
-        Self {
-            source,
-            source_start,
-            bit_offset,
-            remaining: size,
-            total: size,
-            list: None,
-        }
-    }
-
-    /// Fill at most one scheduler chunk, visiting the source from its end.
-    pub fn step<H: HeapAlloc + ?Sized>(
-        &mut self,
-        heap: &mut H,
-        max_bytes: usize,
-    ) -> Result<(Option<Term>, usize), BifError> {
-        if self.list.is_none() {
-            let mut builder = TermBuilder::new(heap);
-            self.list = Some(
-                builder
-                    .reserve_cons_list(self.total)
-                    .map_err(|_| BifError::SystemLimit)?,
-            );
-        }
-        with_binary_bytes(self.source, |view| {
-            self.step_bytes(view.bytes(), self.source_start, self.bit_offset, max_bytes)
-        })?
-    }
-
-    fn step_bytes(
-        &mut self,
-        bytes: &[u8],
-        source_start: usize,
-        bit_offset: usize,
-        max_bytes: usize,
-    ) -> Result<(Option<Term>, usize), BifError> {
-        let count = self.remaining.min(max_bytes);
-        let from = source_start + self.remaining - count;
-        let list = self.list.as_mut().ok_or(BifError::SystemLimit)?;
-        // The exact chunk count is known, so check the reservation once and keep the
-        // inner loop to the two CONS stores and cursor advance used by erts.
-        list.prepend_binary_bytes(bytes, from, count, bit_offset)
-            .map_err(|_| BifError::SystemLimit)?;
-        self.remaining -= count;
-        if self.remaining == 0 {
-            let value = self
-                .list
-                .take()
-                .ok_or(BifError::SystemLimit)?
-                .finish(Term::NIL)
-                .map_err(|_| BifError::SystemLimit)?;
-            Ok((Some(value), count))
-        } else {
-            Ok((None, count))
-        }
-    }
 }
 
 /// Use the original byte slice when aligned; OTP likewise allocates a
@@ -529,36 +443,6 @@ pub fn finish_iolist_binary_output(term: Term) {
     arinsal_term::raw::finish_iolist_binary_output(term);
 }
 
-// Port of erts/emulator/beam/binary.c:413-474 (bitstring_to_list_1), OTP-29.1.1.
-fn bitstring_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // SAFETY: The source bitstring and owner remain live.
-    let view = unsafe { args[0].binary_ref() }.ok_or(BADARG)?;
-    let mut data = Vec::with_capacity(view.bit_len().div_ceil(8));
-    for i in 0..view.bit_len() {
-        let source = view.start_bit() + i;
-        if i % 8 == 0 {
-            data.push(0_u8);
-        }
-        let bit = (view.bytes()[source / 8] >> (7 - source % 8)) & 1;
-        let last = data.last_mut().expect("byte");
-        *last |= bit << (7 - i % 8);
-    }
-    let full = view.bit_len() / 8;
-    ctx.charge_reductions(full);
-    let mut values = data[..full]
-        .iter()
-        .map(|&b| Term::small(b as i64).unwrap())
-        .collect::<Vec<_>>();
-    if view.bit_len() % 8 != 0 {
-        values.push(
-            TermBuilder::new(&mut Heap(&mut ctx.heap))
-                .bitstring(&data[full..], view.bit_len() % 8)
-                .expect("infallible BIF heap"),
-        );
-    }
-    Ok(make_list(ctx, values, Term::NIL))
-}
-
 // Port of erts/emulator/beam/erl_bif_binary.c:1954-2038 (erts_binary_part), OTP-29.1.1.
 #[inline(always)]
 fn binary_part_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
@@ -609,28 +493,6 @@ pub fn binary_part_2(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>
         return Err(BADARG);
     }
     binary_part_result(ctx, args)
-}
-
-// Port of erts/emulator/beam/binary.c:476-513 (split_binary_2), OTP-29.1.1.
-#[inline(always)]
-fn split_binary_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let bits = bitstring_bit_len(args[0])?;
-    let at = args[1].as_small().ok_or(BADARG)?;
-    if at < 0 || at as u128 > (bits / 8) as u128 {
-        return Err(BADARG);
-    }
-    let split_at = usize::try_from(at).map_err(|_| BADARG)? * 8;
-    let mut heap = Heap(&mut ctx.heap);
-    let mut builder = TermBuilder::new(&mut heap);
-    let left = builder
-        .sub_binary_bif(args[0], 0, split_at)
-        .map_err(|_| BifError::SystemLimit)?;
-    let right = builder
-        .sub_binary_bif(args[0], split_at, bits - split_at)
-        .map_err(|_| BifError::SystemLimit)?;
-    builder
-        .tuple(&[left, right])
-        .map_err(|_| BifError::SystemLimit)
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:2286-2313 (binary_first_1), OTP-29.1.1.
@@ -1177,7 +1039,6 @@ macro_rules! word_result_body {
 
 word_result_body!(byte_size, byte_size_result);
 word_result_body!(bit_size, bit_size_result);
-word_result_body!(split_binary, split_binary_result);
 word_result_body!(binary_part, binary_part_result);
 word_result_body!(binary_first, binary_first_result);
 word_result_body!(binary_last, binary_last_result);
@@ -1196,7 +1057,6 @@ word_result_body!(decode_unsigned, decode_unsigned_result);
 crate::word_bif_bodies_in!(word_bodies;
     byte_size,
     bit_size,
-    split_binary,
     binary_part,
     binary_first,
     binary_last,
@@ -1212,5 +1072,3 @@ crate::word_bif_bodies_in!(word_bodies;
     encode_unsigned,
     decode_unsigned,
 );
-
-crate::bif_bodies!(bitstring_to_list,);

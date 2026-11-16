@@ -96,11 +96,6 @@ fn args(m: &str, f: &str, arity: u8, n: usize) -> Vec<O> {
             vec![O::Int(n as i64 - 500), O::Int((n % 35 + 2) as i64)]
         }
         ("erlang", "binary_to_list", 3) => vec![bin, O::Int(2), O::Int(3)],
-        ("erlang", "bitstring_to_list", 1) => vec![O::BitString {
-            bytes: vec![1, 2, ((n % 8) as u8) << 5],
-            bits: 3,
-        }],
-        ("erlang", "split_binary", 2) => vec![bin, O::Int((n % 5) as i64)],
         ("erlang" | "binary", "binary_part" | "part", 2) => {
             vec![bin, O::Tuple(vec![O::Int(1), O::Int(2)])]
         }
@@ -315,11 +310,7 @@ fn bitstring_and_iolist_edges() {
         bytes: vec![0b1010_0000],
         bits: 3,
     };
-    for (name, value) in [
-        ("size", partial.clone()),
-        ("byte_size", partial.clone()),
-        ("bitstring_to_list", partial),
-    ] {
+    for (name, value) in [("size", partial.clone()), ("byte_size", partial.clone())] {
         let actual = call("erlang", name, std::slice::from_ref(&value));
         let expected = reference.call("erlang", name, &[value]);
         assert!(

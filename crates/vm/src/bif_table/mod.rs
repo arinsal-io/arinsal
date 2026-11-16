@@ -315,6 +315,8 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         // binary.c
         ("erlang", "binary_to_list", 1) => bif!(binary::binary_to_list_1),
         ("erlang", "binary_to_list", 3) => bif!(binary::binary_to_list_3),
+        ("erlang", "bitstring_to_list", 1) => bif!(binary::bitstring_to_list_1),
+        ("erlang", "split_binary", 2) => bif!(binary::split_binary_2),
         // erl_unicode.c
         ("unicode", "characters_to_binary", 2) => {
             bif!(erl_unicode::unicode_characters_to_binary_2)

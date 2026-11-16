@@ -98,11 +98,7 @@ pub(crate) fn state_holds_heap_terms(state: &MagicBin) -> bool {
     macro_rules! any {
         ($($t:ty),* $(,)?) => { false $(|| state.downcast_ref::<TrapContext<$t>>().is_some())* };
     }
-    any!(
-        arinsal_bifs::BinaryToListWalk,
-        arinsal_bifs::BinarySearchWalk,
-        BinaryCopyState,
-    )
+    any!(arinsal_bifs::BinarySearchWalk, BinaryCopyState,)
 }
 
 /// What resuming a trapped call produces: a handler's result, or the Erlang export the trap

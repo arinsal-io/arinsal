@@ -1,4 +1,4 @@
-//! `binary_to_list/1,3` of binary.c.
+//! `binary_to_list/1,3`, `bitstring_to_list/1` and `split_binary/2` of binary.c.
 //!
 //! Port of erts/emulator/beam/binary.c (binary_to_list_1, binary_to_list_3, binary_to_list,
 //! binary_to_list_chunk, binary_to_list_continue), OTP-29.1.1. Each BIF is `bif_table[].f`
@@ -10,8 +10,12 @@ use crate::bif_traps::TrapContext;
 use crate::natives::bif::{badarg, bif_ret};
 use crate::natives::erl_bif_lists::bif_trap;
 use arinsal_beamasm::ProcessHeader;
-use arinsal_bifs::{B2L_BYTES_PER_REDUCTION, BifCall, BinaryToListWalk, Ctx, ProcessHeapHandle};
-use arinsal_term::{MagicBin, Term, TermBuilder};
+use arinsal_bifs::{BifCall, Ctx, ProcessHeapHandle};
+use arinsal_term::raw::BinRef;
+use arinsal_term::{ConsListBuilder, MagicBin, Term, TermBuilder};
+
+/// `ERTS_B2L_BYTES_PER_REDUCTION`.
+const B2L_BYTES_PER_REDUCTION: usize = 256;
 
 /// `CONTEXT_REDS`, `B2L_MIN_EXEC_REDS` and `B2L_RESCHED_REDS`.
 const CONTEXT_REDS: usize = 4000;
@@ -22,7 +26,74 @@ const B2L_RESCHED_REDS: usize = CONTEXT_REDS / 40;
 // Port of erts/emulator/beam/binary.c (ErtsB2LState), OTP-29.1.1.
 const ERTS_B2L_STATE_SIZE: usize = 40;
 
-type B2lHolder = TrapContext<BinaryToListWalk>;
+/// `ErtsB2LState`: the source, how much of it is still to be turned into cells, and the
+/// reserved cells filled from the end of the source.
+// Port of erts/emulator/beam/binary.c (ErtsB2LState, binary_to_list_chunk), OTP-29.1.1.
+struct B2lState {
+    source: Term,
+    source_start: usize,
+    bit_offset: usize,
+    remaining: usize,
+    total: usize,
+    /// What the last cell points at: `[]`, or the cell of a trailing partial byte.
+    tail: Term,
+    list: Option<ConsListBuilder>,
+}
+
+impl B2lState {
+    fn new(source: Term, source_start: usize, bit_offset: usize, size: usize, tail: Term) -> Self {
+        Self {
+            source,
+            source_start,
+            bit_offset,
+            remaining: size,
+            total: size,
+            tail,
+            list: None,
+        }
+    }
+
+    /// `binary_to_list_chunk`: fill at most `max_bytes` more cells, from the end of the source;
+    /// the list once all are filled and the bytes of this chunk.
+    fn step(
+        &mut self,
+        heap: &mut ProcessHeapHandle<'_>,
+        max_bytes: usize,
+    ) -> Result<(Option<Term>, usize), ()> {
+        if self.list.is_none() {
+            self.list = Some(
+                TermBuilder::new(heap)
+                    .reserve_cons_list(self.total)
+                    .map_err(|_| ())?,
+            );
+        }
+        let view = BinRef::try_from(self.source).map_err(|_| ())?;
+        let count = self.remaining.min(max_bytes);
+        let from = self.source_start + self.remaining - count;
+        let list = self.list.as_mut().ok_or(())?;
+        list.prepend_binary_bytes(view.window(), from, count, self.bit_offset)
+            .map_err(|_| ())?;
+        self.remaining -= count;
+        if self.remaining != 0 {
+            return Ok((None, count));
+        }
+        let value = self
+            .list
+            .take()
+            .ok_or(())?
+            .finish(self.tail)
+            .map_err(|_| ())?;
+        Ok((Some(value), count))
+    }
+}
+
+/// `ERTS_GET_BITSTRING`: the bit length, first byte and bit offset of a bitstring.
+fn bitstring_source(term: Term) -> Option<(usize, usize, usize)> {
+    let view = BinRef::try_from(term).ok()?;
+    Some((view.bit_len(), view.start_bit() / 8, view.start_bit() % 8))
+}
+
+type B2lHolder = TrapContext<B2lState>;
 
 /// `erlang:binary_to_list/1`.
 // Port of erts/emulator/beam/binary.c (binary_to_list_1), OTP-29.1.1.
@@ -32,7 +103,7 @@ pub(crate) extern "C" fn binary_to_list_1(c_p: *mut ProcessHeader, reg: *mut u64
     };
     process.heap.note_bif_entry();
     let [bin] = crate::bif_table::bif_args::<1>(reg);
-    let Ok((bits, byte_start, bit_offset)) = arinsal_bifs::bitstring_source(bin) else {
+    let Some((bits, byte_start, bit_offset)) = bitstring_source(bin) else {
         return bif_ret(c_p, i, Err(badarg()));
     };
     if bits == 0 {
@@ -50,6 +121,8 @@ pub(crate) extern "C" fn binary_to_list_1(c_p: *mut ProcessHeader, reg: *mut u64
         "erlang:binary_to_list/1",
         1,
         (bin, byte_start, bit_offset, size),
+        Term::NIL,
+        size,
     )
 }
 
@@ -61,7 +134,7 @@ pub(crate) extern "C" fn binary_to_list_3(c_p: *mut ProcessHeader, reg: *mut u64
     };
     process.heap.note_bif_entry();
     let [bin, start, stop] = crate::bif_table::bif_args::<3>(reg);
-    let Ok((bits, byte_start, bit_offset)) = arinsal_bifs::bitstring_source(bin) else {
+    let Some((bits, byte_start, bit_offset)) = bitstring_source(bin) else {
         return bif_ret(c_p, i, Err(badarg()));
     };
     // term_to_Uint: a non-negative small integer.
@@ -87,11 +160,104 @@ pub(crate) extern "C" fn binary_to_list_3(c_p: *mut ProcessHeader, reg: *mut u64
         "erlang:binary_to_list/3",
         3,
         (bin, byte_start + start - 1, bit_offset, stop - start + 1),
+        Term::NIL,
+        size,
     )
+}
+
+/// `erlang:bitstring_to_list/1`.
+// Port of erts/emulator/beam/binary.c (bitstring_to_list_1), OTP-29.1.1.
+pub(crate) extern "C" fn bitstring_to_list_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [bin] = crate::bif_table::bif_args::<1>(reg);
+    let Some((size, byte_start, bit_offset)) = bitstring_source(bin) else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    if size == 0 {
+        return crate::native_hooks::raw(Term::NIL);
+    }
+    // One cell per byte, plus one more for the trailing bits if any.
+    let cells = size.div_ceil(8);
+    let tail_bits = size % 8;
+    let tail = if tail_bits == 0 {
+        Term::NIL
+    } else {
+        // The trailing bits are a bitstring of their own, in the last cell.
+        let mut heap = ProcessHeapHandle(&mut process.heap);
+        let mut builder = TermBuilder::new(&mut heap);
+        let cell = builder
+            .sub_binary(bin, size - tail_bits, tail_bits)
+            .and_then(|last| builder.cons(last, Term::NIL));
+        match cell {
+            Ok(cell) => cell,
+            Err(_) => return bif_ret(c_p, i, Err(system_limit())),
+        }
+    };
+    binary_to_list_checked(
+        c_p,
+        reg,
+        i,
+        process,
+        "erlang:bitstring_to_list/1",
+        1,
+        (bin, byte_start, bit_offset, size / 8),
+        tail,
+        cells,
+    )
+}
+
+/// `erlang:split_binary/2`.
+// Port of erts/emulator/beam/binary.c (split_binary_2), OTP-29.1.1.
+pub(crate) extern "C" fn split_binary_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [bin, at] = crate::bif_table::bif_args::<2>(reg);
+    let (Ok(view), Some(split_at)) = (
+        BinRef::try_from(bin),
+        at.as_small().and_then(|n| usize::try_from(n).ok()),
+    ) else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    let size = view.bit_len();
+    if split_at > size / 8 {
+        return bif_ret(c_p, i, Err(badarg()));
+    }
+    let split_bits = split_at * 8;
+    let mut heap = ProcessHeapHandle(&mut process.heap);
+    let mut builder = TermBuilder::new(&mut heap);
+    // `erts_build_sub_bitstring`: a binary whose size is not a whole number of bytes keeps
+    // its trailing bits in the right part.
+    let aligned = size.is_multiple_of(8);
+    let sub = |builder: &mut TermBuilder<'_, _>, start: usize, bits: usize| {
+        if aligned {
+            builder.sub_binary_bif(bin, start, bits)
+        } else {
+            builder.sub_binary(bin, start, bits)
+        }
+    };
+    let built = sub(&mut builder, 0, split_bits)
+        .and_then(|left| {
+            sub(&mut builder, split_bits, size - split_bits).map(|right| (left, right))
+        })
+        .and_then(|(left, right)| builder.tuple(&[left, right]));
+    match built {
+        Ok(tuple) => crate::native_hooks::raw(tuple),
+        Err(_) => bif_ret(c_p, i, Err(system_limit())),
+    }
 }
 
 /// The tail shared by `binary_to_list_1` and `_3`: the one-chunk decision and the
 /// `ERTS_BIF_YIELD1/3` of a call that gets too few reductions.
+#[allow(clippy::too_many_arguments)]
 fn binary_to_list_checked(
     c_p: *mut ProcessHeader,
     reg: *mut u64,
@@ -100,9 +266,10 @@ fn binary_to_list_checked(
     bif: &'static str,
     arity: usize,
     (bin, source_start, bit_offset, count): (Term, usize, usize, usize),
+    tail: Term,
+    size: usize,
 ) -> u64 {
-    // `size` of the C code is the whole binary's byte size for the decision below.
-    let size = arinsal_bifs::bitstring_source(bin).map_or(0, |(bits, _, _)| bits / 8);
+    // `size` is what the C code's decision below measures: the whole binary's byte size.
     let mut reds_left = process.heap.abi.fcalls.max(0) as usize;
     let mut one_chunk = size < reds_left.saturating_mul(B2L_BYTES_PER_REDUCTION);
     if !one_chunk && size < B2L_MIN_EXEC_REDS * B2L_BYTES_PER_REDUCTION {
@@ -120,7 +287,7 @@ fn binary_to_list_checked(
         c_p,
         i,
         process,
-        BinaryToListWalk::new(bin, source_start, bit_offset, count),
+        B2lState::new(bin, source_start, bit_offset, count, tail),
         reds_left,
         one_chunk,
     )
@@ -132,7 +299,7 @@ fn binary_to_list(
     c_p: *mut ProcessHeader,
     i: u64,
     process: &mut crate::Process,
-    mut walk: BinaryToListWalk,
+    mut walk: B2lState,
     reds_left: usize,
     one_chunk: bool,
 ) -> u64 {
@@ -218,12 +385,14 @@ fn binary_to_list_chunk(
 /// `BUMP_REDS` of the bytes in the chunk, then `erts_bin_bytes_to_list` from the end.
 fn chunk_locked(
     process: &mut crate::Process,
-    walk: &mut BinaryToListWalk,
+    walk: &mut B2lState,
     size: usize,
 ) -> Result<Option<Term>, crate::VmError> {
     let mut heap = ProcessHeapHandle(&mut process.heap);
     let (value, used) = walk.step(&mut heap, size).map_err(|_| system_limit())?;
-    let reds = used.saturating_sub(1) / B2L_BYTES_PER_REDUCTION + 1;
+    // `(size - 1)/ERTS_B2L_BYTES_PER_REDUCTION + 1` in unsigned arithmetic, kept in an `int`: an
+    // empty chunk (only the trailing bits of a bitstring) wraps to 0.
+    let reds = ((used as u64).wrapping_sub(1) / B2L_BYTES_PER_REDUCTION as u64 + 1) as i32 as usize;
     let mut call = BifCall::default();
     let mut ctx = Ctx::with_fcalls(&mut heap, &mut call);
     ctx.charge_reductions(reds);
@@ -231,7 +400,7 @@ fn chunk_locked(
 }
 
 /// `erts_create_magic_binary(sizeof(ErtsB2LState))` + `erts_mk_magic_ref`.
-fn create_state(process: &mut crate::Process, walk: BinaryToListWalk) -> Option<Term> {
+fn create_state(process: &mut crate::Process, walk: B2lState) -> Option<Term> {
     let state: MagicBin = MagicBin::with_erts_payload_size_and_refn(
         B2lHolder::new(walk),
         ERTS_B2L_STATE_SIZE,

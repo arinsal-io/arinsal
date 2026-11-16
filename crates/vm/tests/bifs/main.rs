@@ -12,6 +12,7 @@ mod bif_trap_append;
 mod bif_trap_subtract;
 mod big_integer_select_differential;
 mod big_reds_differential;
+mod binary_c_differential;
 mod binary_copy_reductions;
 mod binary_iolist_differential;
 mod binary_replace_differential;

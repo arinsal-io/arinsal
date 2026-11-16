@@ -17,9 +17,9 @@ use crate::{BifError, Class, Ctx};
 #[path = "binary_bifs.rs"]
 mod binary_bifs;
 pub use binary_bifs::{
-    B2L_BYTES_PER_REDUCTION, BinarySearchKind, BinarySearchWalk, BinaryToListWalk, IolistVecWalk,
-    allocate_iolist_binary, binary_part_2, bitstring_source, finish_iolist_binary_output,
-    iolist_to_iovec_shortcut, iolist_yield_reductions, with_iolist_binary_output,
+    BinarySearchKind, BinarySearchWalk, IolistVecWalk, allocate_iolist_binary, binary_part_2,
+    finish_iolist_binary_output, iolist_to_iovec_shortcut, iolist_yield_reductions,
+    with_iolist_binary_output,
 };
 
 const BADARG: BifError = BifError::BADARG;
@@ -368,24 +368,6 @@ fn for_each_cons(
     } else {
         Ok(())
     }
-}
-
-pub(super) fn make_list(
-    ctx: &mut Ctx<'_>,
-    items: impl IntoIterator<Item = Term>,
-    tail: Term,
-) -> Term {
-    let mut result = tail;
-    let items: Vec<_> = items.into_iter().collect();
-    if items.is_empty() {
-        return result;
-    }
-    let mut heap = ConsBlock::new(&mut ctx.heap, items.len());
-    let mut builder = TermBuilder::new(&mut heap);
-    for item in items.into_iter().rev() {
-        result = builder.cons(item, result).expect("infallible BIF heap");
-    }
-    result
 }
 
 pub(super) fn tuple_build(ctx: &mut Ctx<'_>, values: &[Term]) -> Term {
