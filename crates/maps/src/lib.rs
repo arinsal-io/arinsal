@@ -1401,6 +1401,74 @@ pub fn put<H: HeapAlloc + ?Sized>(
     }
 }
 
+/// The process's unique-map slot (see [`put_unique`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UniqueSlot {
+    /// The map that may be updated in place, or 0.
+    pub map: u64,
+    /// Start of the heap words allocated by the chain that produced `map`.
+    pub lo: u64,
+    /// Current young-heap top.
+    pub htop: u64,
+}
+
+/// `Map#{Key => Value}` for a map that may be updated in place (experiment
+/// `ARINSAL_UNIQUE_MAPS`, default off).
+///
+/// `slot` is the process's unique-map slot: the one map that the analysis in
+/// `arinsal_loader::unique_maps` proved to be referenced only by the registers of the running
+/// analyzed function. When `map` is that map, an existing key is updated by overwriting the
+/// value word of a flatmap or of a HAMT leaf that the chain itself allocated (`[lo, htop)`).
+/// Otherwise this is `put`, and a freshly allocated result becomes the new slot value (nothing
+/// else references it yet); a result that starts a new chain also restarts `lo` at the heap top
+/// seen before the copy.
+#[inline]
+pub fn put_unique<H: HeapAlloc + ?Sized>(
+    map: Term,
+    key: Term,
+    value: Term,
+    heap: &mut H,
+    slot: &mut UniqueSlot,
+) -> MapResult<Term> {
+    let continuing = slot.map == bits(map);
+    if continuing {
+        if let Ok(flat) = arinsal_term::raw::MapRef::try_from(map) {
+            let found = if is_immed(key) {
+                (0..flat.len()).find(|&i| flat.pair(i).is_some_and(|(k, _)| bits(k) == bits(key)))
+            } else {
+                (0..flat.len()).find(|&i| flat.pair(i).is_some_and(|(k, _)| exact_eq(k, key)))
+            };
+            if let Some(i) = found
+                && (flat
+                    .pair(i)
+                    .is_some_and(|(_, old)| bits(old) == bits(value))
+                    || arinsal_term::raw::flatmap_store_value(map, i, value))
+            {
+                return Ok(map);
+            }
+        } else if arinsal_term::raw::hamt_store_value(
+            map,
+            key,
+            internal_hash(key),
+            value,
+            slot.lo,
+            slot.htop,
+        ) != arinsal_term::raw::HamtStore::Fallback
+        {
+            return Ok(map);
+        }
+    }
+    let before = slot.htop;
+    let result = put(map, key, value, heap)?;
+    if bits(result) != bits(map) {
+        slot.map = bits(result);
+        if !continuing {
+            slot.lo = before;
+        }
+    }
+    Ok(result)
+}
+
 /// `erts_maps_put` on a HAMT, out of line so the flatmap path keeps a small frame.
 #[inline(never)]
 fn put_hashmap<H: HeapAlloc + ?Sized>(

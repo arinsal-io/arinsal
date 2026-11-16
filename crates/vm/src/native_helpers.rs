@@ -4656,6 +4656,48 @@ pub extern "C" fn arinsal_beamasm_map_put_single(
     map_single::<false>(header, key, value, map, 0)
 }
 
+/// `Map#{Key => Value}` with a single pair at a site that `arinsal_loader::unique_maps` proved
+/// may update its map in place (experiment `ARINSAL_UNIQUE_MAPS`): the map named by the
+/// process's unique-map slot is updated without copying, any other map is put as usual and its
+/// fresh result becomes the slot.
+pub extern "C" fn arinsal_beamasm_map_put_single_uniq(
+    header: *mut ProcessHeader,
+    key: u64,
+    value: u64,
+    map: u64,
+    _unused: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(header) else {
+        return 0;
+    };
+    let (key, value, map) = (
+        crate::native_hooks::from_raw(key),
+        crate::native_hooks::from_raw(value),
+        crate::native_hooks::from_raw(map),
+    );
+    let htop = process.heap.abi.htop as u64;
+    let mut slot = arinsal_maps::UniqueSlot {
+        map: process.heap.abi.uniq_map,
+        lo: process.heap.abi.uniq_lo,
+        htop,
+    };
+    let before = slot.map;
+    let result = {
+        let mut top = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        arinsal_maps::put_unique(map, key, value, &mut top, &mut slot)
+    };
+    match result {
+        Ok(term) => {
+            if slot.map != before {
+                process.heap.abi.uniq_map = slot.map;
+                process.heap.abi.uniq_lo = slot.lo;
+            }
+            crate::native_hooks::raw(term)
+        }
+        Err(error) => put_single_failed(error),
+    }
+}
+
 /// `Map#{Key := Value}` with a single pair and no failure label: `erts_maps_update`; returns
 /// its status and writes the updated map through the scheduler's `TMP_MEM1` slot.
 // Port of erts/emulator/beam/jit/arm/instr_map.cpp:650-683

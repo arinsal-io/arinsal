@@ -271,6 +271,7 @@ fn test_map_runtime() -> arinsal_beamasm::map::MapRuntime {
         update_exact: unused_map_update,
         put_single: unused_map_update,
         update_single_assoc_shared: fragments.update_single_assoc_shared(),
+        update_single_assoc_uniq_shared: fragments.update_single_assoc_uniq_shared(),
         update_assoc_shared: fragments.update_assoc_shared(),
         update_exact_shared: fragments.update_exact_shared(),
         update_single_exact_shared: fragments.update_single_exact_shared(),

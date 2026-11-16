@@ -1458,6 +1458,7 @@ impl ProcessHeap {
         // Port of erl_gc.c:803-804: the clock is read only for long_gc monitoring.
         // Microstate accounting uses the same sample (`ERTS_MSACC_IS_ENABLED`).
         let start = gc_clock_active().then(Instant::now);
+        self.abi.uniq_map = 0;
         // Port of erl_gc.c:418-476 (`erts_gc_after_bif_call_lhf`): the fragments the BIF just
         // allocated are known live.
         let live_from = self.take_live_frags_from();

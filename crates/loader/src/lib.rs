@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 mod specialize;
+pub mod unique_maps;
 // ---- vm_maps_bits ----
 mod maps_bits;
 pub use maps_bits::{BitCommand, BitCommandKind};

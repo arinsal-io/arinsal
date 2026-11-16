@@ -223,6 +223,8 @@ impl ModuleEnv for CorpusEnv {
             put_single: map_many,
             update_single_assoc_shared: map_fragments(map_get, map_many)
                 .update_single_assoc_shared(),
+            update_single_assoc_uniq_shared: map_fragments(map_get, map_many)
+                .update_single_assoc_uniq_shared(),
             update_assoc_shared: map_fragments(map_get, map_many).update_assoc_shared(),
             update_exact_shared: map_fragments(map_get, map_many).update_exact_shared(),
             update_single_exact_shared: map_fragments(map_get, map_many)

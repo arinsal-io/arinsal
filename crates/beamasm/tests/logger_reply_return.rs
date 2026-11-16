@@ -66,6 +66,8 @@ fn reply_return(idle: bool) -> (u64, u64, u64) {
             put_single: unused_map_update,
             update_single_assoc_shared: map_fragments(unused_map_get, unused_map_update)
                 .update_single_assoc_shared(),
+            update_single_assoc_uniq_shared: map_fragments(unused_map_get, unused_map_update)
+                .update_single_assoc_uniq_shared(),
             update_assoc_shared: map_fragments(unused_map_get, unused_map_update)
                 .update_assoc_shared(),
             update_exact_shared: map_fragments(unused_map_get, unused_map_update)

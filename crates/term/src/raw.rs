@@ -330,3 +330,122 @@ pub fn term_at(words: &[u64], index: usize, tag: u64) -> Term {
     assert!(index < words.len() && tag < 4);
     Term((words.as_ptr() as u64).wrapping_add(8 * index as u64) | tag)
 }
+
+/// Overwrites value `index` of a flatmap in place (experiment `ARINSAL_UNIQUE_MAPS`).
+///
+/// Returns `false` without writing when `map` is not a flatmap or `index` is past its size.
+///
+/// Contract: the memory-safety half is checked here (shape and bounds of a live map object).
+/// The semantic half is the caller's: no other live term, register, stack slot or message may
+/// still observe the old value of the map, i.e. the object is uniquely referenced and lives in
+/// the young heap (a store into an older generation would need a remembered-set entry).
+#[inline(always)]
+pub fn flatmap_store_value(map: Term, index: usize, value: Term) -> bool {
+    let Some(header) = boxed_header(map) else {
+        return false;
+    };
+    // Flatmap: map subtag with the hashmap bits clear (`is_flatmap`).
+    if header & 63 != crate::MAP || header & 0xc0 != 0 {
+        return false;
+    }
+    let size = read_tagged(map.0, 6) as usize;
+    if index >= size {
+        return false;
+    }
+    // Header, size and keys tuple precede the value array (`MAP_HEADER_FLATMAP_SZ` = 3).
+    let address = map.0.wrapping_add(22 + 8 * index as u64) as *mut u64;
+    // SAFETY: the object is a live flatmap whose value array holds `size > index` words after
+    // its three header words; the semantic contract above covers aliasing.
+    unsafe { *address = value.0 }
+    true
+}
+
+/// Result of [`hamt_store_value`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HamtStore {
+    /// The leaf held the key and now holds the new value.
+    Stored,
+    /// The leaf already held the value; nothing was written.
+    Unchanged,
+    /// The key is absent or its leaf is not owned: the caller must copy the path.
+    Fallback,
+}
+
+/// Overwrites the value of the HAMT leaf holding `key` when the leaf lies in
+/// `[owned_lo, owned_hi)` (experiment `ARINSAL_UNIQUE_MAPS`).
+///
+/// `hash` is `internal_hash(key)`. The walk mirrors `erts_hashmap_get`; only the leaf cons cell
+/// is written, never a node.
+///
+/// Contract: as for [`flatmap_store_value`]; in addition every cell in the owned range was
+/// allocated by the unique chain of `map` and is reachable only through `map`.
+pub fn hamt_store_value(
+    map: Term,
+    key: Term,
+    mut hash: u64,
+    value: Term,
+    owned_lo: u64,
+    owned_hi: u64,
+) -> HamtStore {
+    let Some(mut header) = boxed_header(map) else {
+        return HamtStore::Fallback;
+    };
+    if header & 63 != crate::MAP || header & 0xc0 == 0 {
+        return HamtStore::Fallback;
+    }
+    // Children of the head start after header and size words; of an inner node after its header.
+    let mut children = map.0.wrapping_add(16 - 2);
+    loop {
+        let bitmap = ((header >> 16) & 0xffff) as u16;
+        let mut index = (hash & 0xf) as usize;
+        if bitmap != u16::MAX {
+            let bit = 1u16 << index;
+            if bitmap & bit == 0 {
+                return HamtStore::Fallback;
+            }
+            index = (bitmap & (bit - 1)).count_ones() as usize;
+        }
+        let child = read_tagged(children, 8 * index as i64);
+        if child & 3 == 1 {
+            return store_leaf(Term(child), key, value, owned_lo, owned_hi);
+        }
+        hash >>= 4;
+        if child & 3 != 2 {
+            return HamtStore::Fallback;
+        }
+        header = read_tagged(child, -2);
+        if header & 63 == 0 {
+            // Collision node: a tuple of leaves.
+            for i in 0..(header >> 6) as usize {
+                let leaf = read_tagged(child, 6 + 8 * i as i64);
+                if let Ok(cell) = Cons::try_from(Term(leaf))
+                    && crate::exact_eq(cell.head(), key)
+                {
+                    return store_leaf(Term(leaf), key, value, owned_lo, owned_hi);
+                }
+            }
+            return HamtStore::Fallback;
+        }
+        children = child.wrapping_add(8 - 2);
+    }
+}
+
+fn store_leaf(leaf: Term, key: Term, value: Term, owned_lo: u64, owned_hi: u64) -> HamtStore {
+    let Ok(cell) = Cons::try_from(leaf) else {
+        return HamtStore::Fallback;
+    };
+    if !crate::exact_eq(cell.head(), key) {
+        return HamtStore::Fallback;
+    }
+    let address = leaf.0 & !3;
+    if address < owned_lo || address.wrapping_add(16) > owned_hi {
+        return HamtStore::Fallback;
+    }
+    if cell.tail().0 == value.0 {
+        return HamtStore::Unchanged;
+    }
+    // SAFETY: a leaf cons cell of a live HAMT occupies two words at `address`, inside the
+    // owned range by the check above; the semantic contract covers aliasing.
+    unsafe { *((address + 8) as *mut u64) = value.0 }
+    HamtStore::Stored
+}

@@ -1524,6 +1524,14 @@ pub struct NativeAbi {
     pub self_pid: u64,
     /// First heap address safe for destructive tuple updates.
     pub high_water: *mut u64,
+    /// Experiment `ARINSAL_UNIQUE_MAPS`: the one map this process may update in place, or 0.
+    /// Set only by an analyzed single-pair `put_map_assoc` for the map it just allocated; cleared
+    /// by every collection or heap move and by analyzed function returns. See
+    /// `arinsal_loader::unique_maps` for the uniqueness argument.
+    pub uniq_map: u64,
+    /// Start of the young-heap words allocated since the unique chain began: HAMT leaves in
+    /// `[uniq_lo, htop)` belong to the chain and may be overwritten.
+    pub uniq_lo: u64,
 }
 
 // SAFETY: the pointers address the owning `ProcessHeap`'s own blocks and immutable code; the
@@ -1551,6 +1559,8 @@ impl Default for NativeAbi {
             flags: 0,
             self_pid: 0,
             high_water: std::ptr::null_mut(),
+            uniq_map: 0,
+            uniq_lo: 0,
         }
     }
 }
@@ -1568,6 +1578,8 @@ const _: () = assert!(std::mem::offset_of!(NativeAbi, current) == 0x58);
 const _: () = assert!(std::mem::offset_of!(NativeAbi, flags) == 0x60);
 const _: () = assert!(std::mem::offset_of!(NativeAbi, self_pid) == 0x68);
 const _: () = assert!(std::mem::offset_of!(NativeAbi, high_water) == 0x70);
+const _: () = assert!(std::mem::offset_of!(NativeAbi, uniq_map) == 0x78);
+const _: () = assert!(std::mem::offset_of!(NativeAbi, uniq_lo) == 0x80);
 
 /// A process heap with an upward bump pointer and a downward stack pointer.
 #[repr(C)]
@@ -2056,6 +2068,8 @@ impl ProcessHeap {
     }
     /// Refresh the native bounds after the collector replaces or resizes `words`.
     pub(crate) fn refresh_native_heap_bounds(&mut self) {
+        // Objects moved: the unique-map slot would name a stale address.
+        self.abi.uniq_map = 0;
         self.abi.heap = self.words.as_ptr().cast::<u64>().cast_mut();
         self.abi.hend = self.abi.heap.wrapping_add(self.words.len());
     }

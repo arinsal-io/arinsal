@@ -84,6 +84,10 @@ pub struct MapRuntime {
     pub update_single_exact_shared: usize,
     /// Shared single-pair associative update fragment (`update_map_single_assoc_shared`).
     pub update_single_assoc_shared: usize,
+    /// Shared single-pair associative update fragment for sites proven by
+    /// `arinsal_loader::unique_maps` (experiment `ARINSAL_UNIQUE_MAPS`); equals
+    /// `update_single_assoc_shared` when the experiment is off.
+    pub update_single_assoc_uniq_shared: usize,
     /// Shared multi-pair associative update fragment (`update_map_assoc_shared`).
     pub update_assoc_shared: usize,
     /// Shared multi-pair exact update fragment (`update_map_exact_guard_shared` and
@@ -94,6 +98,11 @@ pub struct MapRuntime {
     /// `i_get_map_element_hash_shared` fragment ([`MapFragments::get_element_hash_shared`]).
     pub get_element_hash_shared: usize,
 }
+
+/// Bit set in the `Live` operand of an `update_map_assoc` by `arinsal_loader::unique_maps`
+/// (experiment `ARINSAL_UNIQUE_MAPS`): a one-pair update is an in-place candidate, a
+/// zero-pair update releases the process's unique-map slot.
+pub const UNIQUE_MAP_FLAG: u32 = 1 << 20;
 
 /// The `hashmap_make_hash` the loader passes to `i_get_map_element_hash` for an
 /// immediate key; other literal keys are hashed by the runtime lookup.
@@ -115,6 +124,7 @@ pub struct MapFragments {
     get_element_hash_offset: usize,
     update_single_exact_offset: usize,
     update_single_assoc_offset: usize,
+    update_single_assoc_uniq_offset: usize,
     update_assoc_offset: usize,
     update_exact_offset: usize,
 }
@@ -138,7 +148,28 @@ impl MapFragments {
         update_assoc: MapUpdateHelper,
         update_exact: MapUpdateHelper,
     ) -> Result<Self, ExecError> {
+        Self::with_uniq_helper(
+            get,
+            update_single,
+            put_single,
+            put_single,
+            update_assoc,
+            update_exact,
+        )
+    }
+
+    /// [`with_helpers`](Self::with_helpers) plus `put_single_uniq`, the helper behind the
+    /// single-pair put fragment of sites that may update their map in place.
+    pub fn with_uniq_helper(
+        get: MapGetHelper,
+        update_single: MapUpdateHelper,
+        put_single: MapUpdateHelper,
+        put_single_uniq: MapUpdateHelper,
+        update_assoc: MapUpdateHelper,
+        update_exact: MapUpdateHelper,
+    ) -> Result<Self, ExecError> {
         let mut code = CodeBuffer::new();
+        let update_single_assoc_uniq = code.new_label();
         let get_element = code.new_label();
         let get_element_hash = code.new_label();
         let update_single_exact = code.new_label();
@@ -154,6 +185,8 @@ impl MapFragments {
         emit_update_map_single_exact_body_shared(&mut code, update_single).map_err(fail)?;
         code.bind(update_single_assoc).map_err(fail)?;
         emit_update_map_shared(&mut code, put_single, Update::HEAP_ALLOC).map_err(fail)?;
+        code.bind(update_single_assoc_uniq).map_err(fail)?;
+        emit_update_map_shared(&mut code, put_single_uniq, Update::HEAP_ALLOC).map_err(fail)?;
         let vector_update = Update::HEAP_ALLOC
             .union(Update::X_REGS)
             .union(Update::REDUCTIONS);
@@ -175,6 +208,7 @@ impl MapFragments {
             get_element_hash_offset: labels[&get_element_hash],
             update_single_exact_offset: labels[&update_single_exact],
             update_single_assoc_offset: labels[&update_single_assoc],
+            update_single_assoc_uniq_offset: labels[&update_single_assoc_uniq],
             update_assoc_offset: labels[&update_assoc_label],
             update_exact_offset: labels[&update_exact_label],
         })
@@ -202,6 +236,12 @@ impl MapFragments {
     /// the updated map in X0.
     pub fn update_single_assoc_shared(&self) -> usize {
         self.memory.ptr_at(self.update_single_assoc_offset) as usize
+    }
+
+    /// Entry of the single-pair put fragment for in-place candidates (same register contract as
+    /// [`update_single_assoc_shared`](Self::update_single_assoc_shared)).
+    pub fn update_single_assoc_uniq_shared(&self) -> usize {
+        self.memory.ptr_at(self.update_single_assoc_uniq_offset) as usize
     }
 
     /// Entry of `update_map_assoc_shared`: map in X1, live X count in X3, number of staged
@@ -808,6 +848,20 @@ impl BeamModuleAssembler {
                 "map update operands must be key/value pairs",
             ));
         }
+        let flagged = live & UNIQUE_MAP_FLAG != 0;
+        let live = live & !UNIQUE_MAP_FLAG;
+        if flagged && updates.is_empty() {
+            // Release of the unique-map slot before an analyzed function returns the map; the
+            // operands are the same register, so nothing else moves.
+            self.code.emit(|e| {
+                e.str_uoff(
+                    Gpr::xzr(),
+                    Gpr::x(21),
+                    std::mem::offset_of!(crate::ProcessHeader, uniq_map) as u32,
+                )
+            })?;
+            return Ok(());
+        }
         if updates.len() == 2 {
             for (target, value) in [
                 (Gpr::x(1), updates[0]),
@@ -817,7 +871,12 @@ impl BeamModuleAssembler {
                 let reg = self.source_reg(value)?;
                 self.code.emit(|e| e.mov_reg(target, reg))?;
             }
-            self.fragment_call(runtime.update_single_assoc_shared)?;
+            let fragment = if flagged {
+                runtime.update_single_assoc_uniq_shared
+            } else {
+                runtime.update_single_assoc_shared
+            };
+            self.fragment_call(fragment)?;
             return self.store_map_result(dst, Gpr::x(0));
         }
         self.stage_map_args(updates, live.max(6))?;

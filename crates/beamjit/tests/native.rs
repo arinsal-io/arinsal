@@ -123,6 +123,8 @@ impl ModuleEnv for TestEnv {
             put_single: map_update_helper,
             update_single_assoc_shared: map_fragments(map_get_helper, map_update_helper)
                 .update_single_assoc_shared(),
+            update_single_assoc_uniq_shared: map_fragments(map_get_helper, map_update_helper)
+                .update_single_assoc_uniq_shared(),
             update_assoc_shared: map_fragments(map_get_helper, map_update_helper)
                 .update_assoc_shared(),
             update_exact_shared: map_fragments(map_get_helper, map_update_helper)

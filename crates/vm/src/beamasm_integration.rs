@@ -575,10 +575,11 @@ fn map_fragments() -> Option<&'static arinsal_beamasm::map::MapFragments> {
     static FRAGMENTS: OnceLock<Option<arinsal_beamasm::map::MapFragments>> = OnceLock::new();
     FRAGMENTS
         .get_or_init(|| {
-            arinsal_beamasm::map::MapFragments::with_helpers(
+            arinsal_beamasm::map::MapFragments::with_uniq_helper(
                 crate::native_helpers::arinsal_beamasm_map_get,
                 crate::native_helpers::arinsal_beamasm_map_update_single,
                 crate::native_helpers::arinsal_beamasm_map_put_single,
+                crate::native_helpers::arinsal_beamasm_map_put_single_uniq,
                 crate::native_helpers::arinsal_beamasm_map_assoc,
                 crate::native_helpers::arinsal_beamasm_map_exact,
             )
@@ -2086,6 +2087,10 @@ impl ModuleEnv for VmModuleEnv<'_> {
                 0,
                 arinsal_beamasm::map::MapFragments::update_single_assoc_shared,
             ),
+            update_single_assoc_uniq_shared: map_fragments().map_or(
+                0,
+                arinsal_beamasm::map::MapFragments::update_single_assoc_uniq_shared,
+            ),
             update_assoc_shared: map_fragments()
                 .map_or(0, arinsal_beamasm::map::MapFragments::update_assoc_shared),
             update_exact_shared: map_fragments()
@@ -2230,7 +2235,20 @@ pub(crate) fn compile(
     if trace {
         eprintln!("arinsal boot: beamasm compiling {}", beam.module);
     }
-    let compiled = match compile_parsed_module_with_options(beam, &env, line_breakpoints) {
+    // Experiment ARINSAL_UNIQUE_MAPS (default off): the native code of analyzed functions
+    // updates unique maps in place; the interpreter form keeps the original code.
+    let marked = arinsal_loader::unique_maps::enabled()
+        .then(|| arinsal_loader::unique_maps::rewrite(beam))
+        .flatten();
+    if std::env::var_os("ARINSAL_UNIQUE_MAPS_TRACE").is_some() {
+        eprintln!(
+            "unique_maps: compile {} marked={}",
+            beam.module,
+            marked.is_some()
+        );
+    }
+    let jit_beam = marked.as_ref().unwrap_or(beam);
+    let compiled = match compile_parsed_module_with_options(jit_beam, &env, line_breakpoints) {
         Ok(compiled) => compiled,
         Err(error) => {
             eprintln!(
