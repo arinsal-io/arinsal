@@ -740,6 +740,22 @@ pub struct ConsHeapSegment {
     last_cdr: usize,
 }
 
+impl ConsHeapSegment {
+    /// The cells written at the start of the free young-heap window
+    /// ([`ProcessHeap::halloc_window`]), in input order with each CDR naming the next cell; the
+    /// last CDR stays open. `None` when no cell was written.
+    // Port of the `result_cdr` chaining in erts/emulator/beam/erl_bif_lists.c
+    // (lists_append_onheap), OTP-29.1.1.
+    pub fn from_window_cells(cells: &mut [[u64; 2]]) -> Option<Self> {
+        let head = Term::from_ptr(cells.as_mut_ptr().cast(), 1);
+        let last = cells.last_mut()?;
+        Some(Self {
+            head,
+            last_cdr: &raw mut last[1] as usize,
+        })
+    }
+}
+
 /// An append-only list whose open tail can survive a BIF reduction trap.
 ///
 /// The caller must keep the heap stable while the chain is open. Trapping BIFs

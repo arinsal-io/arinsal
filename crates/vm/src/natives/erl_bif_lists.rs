@@ -10,7 +10,7 @@ use arinsal_beamasm::ProcessHeader;
 use arinsal_bifs::ProcessHeapHandle;
 use arinsal_term::raw::{Cons, Tuple, UninitTermArray};
 use arinsal_term::{
-    ConsHeapBuilder, ConsHeapChain, MagicBin, Term, TermBuilder, TermError, atoms,
+    ConsHeapBuilder, ConsHeapChain, ConsHeapSegment, MagicBin, Term, TermBuilder, TermError, atoms,
     exact_eq_after_word_mismatch, loose_eq,
 };
 
@@ -135,6 +135,7 @@ pub(crate) extern "C" fn append_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64
 
 /// `append` dispatch, stack context, trap resume, and `BIF_ERROR` handling.
 // Port of erts/emulator/beam/erl_bif_lists.c (append), OTP-29.1.1.
+#[inline(always)]
 fn append(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, export: &'static str) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
@@ -145,6 +146,7 @@ fn append(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, export: &'static str) 
         return crate::native_hooks::raw(rhs);
     }
     if is_list(lhs) {
+        // The context starts on the stack in the hope that the call does not trap.
         let mut context = AppendContext::new(lhs, rhs);
         return match append_continue(process, &mut context) {
             Ok(Some(value)) => crate::native_hooks::raw(value),
@@ -153,6 +155,20 @@ fn append(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, export: &'static str) 
             Err(_) => bif_system_limit(c_p),
         };
     }
+    append_resume(c_p, reg, i, process, lhs, export)
+}
+
+/// The `is_internal_magic_ref(lhs)` arm of `append`: continue a trapped append.
+// Port of erts/emulator/beam/erl_bif_lists.c (append), OTP-29.1.1.
+#[inline(never)]
+fn append_resume(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+    process: &mut crate::Process,
+    lhs: Term,
+    export: &'static str,
+) -> u64 {
     let resumed = lhs.with_magic_payload::<TrapContext<AppendContext>, _>(|context| {
         let mut context = context.lock().expect("append context");
         let originals = (context.lhs_original, context.rhs_original);
@@ -203,72 +219,104 @@ fn append_trap(
     bif_ret(c_p, i, Err(trap))
 }
 
-/// `append_continue`: nil-RHS scan, young-heap copy, then exact alloc chunk.
+/// `append_continue`: nil-RHS scan, young-heap copy, or exact alloc chunk.
 // Port of erts/emulator/beam/erl_bif_lists.c (append_continue), OTP-29.1.1.
+#[inline(always)]
 fn append_continue(
     process: &mut crate::Process,
     context: &mut AppendContext,
 ) -> Result<Option<Term>, TermError> {
+    // Fast lane when the rhs is nil: return lhs.
     if context.rhs_original == Term::NIL {
-        let budget = bif_reds_left(process).saturating_mul(APPEND_EMPTY_PER_RED);
-        let mut count = 0;
-        while count < budget {
-            let Some((_, tail)) = cons_cell(context.iterator) else {
-                break;
-            };
-            context.iterator = tail;
-            count += 1;
-        }
-        bump_reds(process, count / APPEND_EMPTY_PER_RED);
-        if context.iterator == Term::NIL {
-            return Ok(Some(context.lhs_original));
-        }
-        if !is_list(context.iterator) {
-            return Err(TermError::BadArg);
-        }
-        return Ok(None);
+        return append_empty_rhs(process, context);
     }
+    // Build the result on the unused part of the heap if possible, falling back to
+    // lists_append_alloc when it runs out.
+    lists_append_onheap(process, context)
+}
 
-    let mut cells_left = bif_reds_left(process).saturating_mul(APPEND_ONHEAP_PER_RED);
-    if process
+/// Walk `lhs` to check that it is a proper list; the result is `lhs` itself.
+// Port of erts/emulator/beam/erl_bif_lists.c (append_empty_rhs), OTP-29.1.1.
+#[inline(never)]
+fn append_empty_rhs(
+    process: &mut crate::Process,
+    context: &mut AppendContext,
+) -> Result<Option<Term>, TermError> {
+    let budget = bif_reds_left(process).saturating_mul(APPEND_EMPTY_PER_RED);
+    let mut count = 0;
+    while count < budget {
+        let Some((_, tail)) = cons_cell(context.iterator) else {
+            break;
+        };
+        context.iterator = tail;
+        count += 1;
+    }
+    bump_reds(process, count / APPEND_EMPTY_PER_RED);
+    if context.iterator == Term::NIL {
+        return Ok(Some(context.lhs_original));
+    }
+    if !is_list(context.iterator) {
+        return Err(TermError::BadArg);
+    }
+    Ok(None)
+}
+
+/// Copy `lhs` into `[HEAP_TOP, HEAP_LIMIT - 2)` for at most the cells the reductions allow.
+// Port of erts/emulator/beam/erl_bif_lists.c (lists_append_onheap), OTP-29.1.1.
+#[inline(always)]
+fn lists_append_onheap(
+    process: &mut crate::Process,
+    context: &mut AppendContext,
+) -> Result<Option<Term>, TermError> {
+    let max_cells = bif_reds_left(process).saturating_mul(APPEND_ONHEAP_PER_RED);
+    // The window is `[HEAP_TOP, HEAP_LIMIT)`: its length is `HeapWordsLeft(p)`.
+    let Some(window) = process
         .heap
-        .halloc_words_left()
-        .is_some_and(|words| words > 8)
-    {
-        let window_words = process
-            .heap
-            .halloc_window()
-            .map_or(0, |window| window.len());
-        let onheap_max = cells_left.min(window_words.saturating_sub(2) / 2);
-        let mut heap = ProcessHeapHandle(&mut process.heap);
-        let mut builder = ConsHeapBuilder::new(&mut heap, onheap_max)?;
-        let mut count = 0;
-        while count < onheap_max {
-            let Some((head, tail)) = cons_cell(context.iterator) else {
-                break;
-            };
-            builder.push(head)?;
-            context.iterator = tail;
-            count += 1;
-        }
-        if let Some(segment) = builder.finish_open() {
-            context.result.append_segment(segment);
-        }
-        cells_left = cells_left.saturating_sub(count);
-        bump_reds(process, count / APPEND_ONHEAP_PER_RED);
-        if context.iterator == Term::NIL {
-            return Ok(Some(append_result(context, context.rhs_original)));
-        }
-        if !is_list(context.iterator) {
-            context.result.suspend();
-            return Err(TermError::BadArg);
-        }
-        if cells_left <= APPEND_ONHEAP_PER_RED {
-            context.result.suspend();
-            return Ok(None);
-        }
+        .halloc_window()
+        .filter(|window| window.len() > 8)
+    else {
+        return lists_append_alloc(process, context);
+    };
+    // alloc_end = MIN(alloc_top + 2 * cells_left, HEAP_LIMIT - 2); each CDR names the next cell.
+    let onheap_max = max_cells.min(window.len().saturating_sub(2) / 2);
+    let cells = &mut window.as_chunks_mut::<2>().0[..onheap_max];
+    let mut count = 0;
+    for cell in cells.iter_mut() {
+        let Some((head, tail)) = cons_cell(context.iterator) else {
+            break;
+        };
+        cell[0] = head.tagged_word();
+        cell[1] = (cell.as_ptr() as u64).wrapping_add(16) | 1;
+        context.iterator = tail;
+        count += 1;
     }
+    if let Some(segment) = ConsHeapSegment::from_window_cells(&mut cells[..count]) {
+        context.result.append_segment(segment);
+    }
+    process.heap.commit_window(count * 2);
+    let cells_left = max_cells.saturating_sub(count);
+    bump_reds(process, count / APPEND_ONHEAP_PER_RED);
+    if context.iterator == Term::NIL {
+        return Ok(Some(append_result(context, context.rhs_original)));
+    }
+    if !is_list(context.iterator) {
+        context.result.suspend();
+        return Err(TermError::BadArg);
+    }
+    if cells_left > APPEND_ONHEAP_PER_RED {
+        return lists_append_alloc(process, context);
+    }
+    context.result.suspend();
+    Ok(None)
+}
 
+/// Count the cells the reductions allow, then copy them into one `HAlloc`.
+// Port of erts/emulator/beam/erl_bif_lists.c (lists_append_alloc), OTP-29.1.1.
+#[inline(never)]
+fn lists_append_alloc(
+    process: &mut crate::Process,
+    context: &mut AppendContext,
+) -> Result<Option<Term>, TermError> {
     let max_cells = bif_reds_left(process).saturating_mul(APPEND_ALLOC_PER_RED);
     let mut lookahead = context.iterator;
     let mut count = 0;
@@ -759,83 +807,80 @@ pub(crate) extern "C" fn lists_reverse_2(c_p: *mut ProcessHeader, reg: *mut u64,
     };
     process.heap.note_bif_entry();
     let [list, tail] = crate::bif_table::bif_args::<2>(reg);
+    // Handle legal and illegal non-lists quickly.
     if list == Term::NIL {
         return crate::native_hooks::raw(tail);
     }
     if !is_list(list) {
         return bif_badarg(c_p);
     }
-    match reverse_continue(process, list, tail) {
-        Ok(ReverseResult::Done(value)) => crate::native_hooks::raw(value),
-        Ok(ReverseResult::Trap(list, tail)) => {
-            let trap = bif_trap(process, "lists:reverse/2", vec![list, tail]);
-            bif_ret(c_p, i, Err(trap))
-        }
-        Err(TermError::BadArg) => bif_badarg(c_p),
-        Err(_) => bif_system_limit(c_p),
-    }
+    // Build the reversal on the unused part of the heap if possible, falling back to
+    // lists_reverse_alloc when it runs out.
+    lists_reverse_onheap(c_p, i, process, list, tail)
 }
 
-enum ReverseResult {
-    Done(Term),
-    Trap(Term, Term),
-}
-
-/// `lists_reverse_onheap` followed by `lists_reverse_alloc` when its remaining budget is large.
-// Port of erts/emulator/beam/erl_bif_lists.c (lists_reverse_onheap, lists_reverse_alloc), OTP-29.1.1.
-fn reverse_continue(
+/// Reverse into `[HEAP_TOP, HEAP_LIMIT - 2)` for at most the cells the reductions allow.
+// Port of erts/emulator/beam/erl_bif_lists.c (lists_reverse_onheap), OTP-29.1.1.
+#[inline(always)]
+fn lists_reverse_onheap(
+    c_p: *mut ProcessHeader,
+    i: u64,
     process: &mut crate::Process,
     mut list: Term,
     mut tail: Term,
-) -> Result<ReverseResult, TermError> {
-    if process
+) -> u64 {
+    let max_cells = bif_reds_left(process).saturating_mul(REVERSE_ONHEAP_PER_RED);
+    // The window is `[HEAP_TOP, HEAP_LIMIT)`: its length is `HeapWordsLeft(c_p)`.
+    let Some(window) = process
         .heap
-        .halloc_words_left()
-        .is_some_and(|words| words > 8)
-    {
-        let max_cells = bif_reds_left(process).saturating_mul(REVERSE_ONHEAP_PER_RED);
-        let window_words = process
-            .heap
-            .halloc_window()
-            .ok_or(TermError::SystemLimit)?
-            .len();
-        let available = max_cells.min(window_words.saturating_sub(2) / 2);
-        let mut tail_bits = tail.tagged_word();
-        let mut cells = 0usize;
-        while cells < available {
-            let Some((head, next)) = cons_cell(list) else {
-                break;
-            };
-            let word_offset = cells * 2;
-            {
-                let window = process.heap.halloc_window().ok_or(TermError::SystemLimit)?;
-                window[word_offset] = head.tagged_word();
-                window[word_offset + 1] = tail_bits;
-                tail_bits = (window.as_ptr() as u64)
-                    .wrapping_add((word_offset * std::mem::size_of::<u64>()) as u64)
-                    | 1;
-            }
-            list = next;
-            cells += 1;
-        }
-        if cells != 0 {
-            tail = process.heap.window_list_term((cells - 1) * 2);
-        }
-        process.heap.commit_window(cells * 2);
-        let cells_left = max_cells.saturating_sub(cells);
-        bump_reds(process, cells / REVERSE_ONHEAP_PER_RED);
-        if list == Term::NIL {
-            return Ok(ReverseResult::Done(tail));
-        }
-        if !is_list(list) {
-            return Err(TermError::BadArg);
-        }
-        if cells_left <= REVERSE_ONHEAP_PER_RED {
-            bump_all_reds(process);
-            return Ok(ReverseResult::Trap(list, tail));
-        }
+        .halloc_window()
+        .filter(|window| window.len() > 8)
+    else {
+        return lists_reverse_alloc(c_p, i, process, list, tail);
+    };
+    // alloc_end = MIN(alloc_top + 2 * cells_left, HEAP_LIMIT - 2).
+    let available = max_cells.min(window.len().saturating_sub(2) / 2);
+    let mut tail_bits = tail.tagged_word();
+    let mut cells = 0usize;
+    for cell in &mut window.as_chunks_mut::<2>().0[..available] {
+        let Some((head, next)) = cons_cell(list) else {
+            break;
+        };
+        cell[0] = head.tagged_word();
+        cell[1] = tail_bits;
+        tail_bits = cell.as_ptr() as u64 | 1;
+        list = next;
+        cells += 1;
     }
+    if cells != 0 {
+        tail = process.heap.window_list_term((cells - 1) * 2);
+    }
+    process.heap.commit_window(cells * 2);
+    let cells_left = max_cells.saturating_sub(cells);
+    bump_reds(process, cells / REVERSE_ONHEAP_PER_RED);
+    if list == Term::NIL {
+        return crate::native_hooks::raw(tail);
+    }
+    if !is_list(list) {
+        return bif_badarg(c_p);
+    }
+    if cells_left > REVERSE_ONHEAP_PER_RED {
+        return lists_reverse_alloc(c_p, i, process, list, tail);
+    }
+    bump_all_reds(process);
+    lists_reverse_trap(c_p, i, process, list, tail)
+}
 
+/// Count the cells the reductions allow, then build them in one `HAlloc`.
+// Port of erts/emulator/beam/erl_bif_lists.c (lists_reverse_alloc), OTP-29.1.1.
+#[inline(never)]
+fn lists_reverse_alloc(
+    c_p: *mut ProcessHeader,
+    i: u64,
+    process: &mut crate::Process,
+    mut list: Term,
+    mut tail: Term,
+) -> u64 {
     let max_cells = bif_reds_left(process).saturating_mul(REVERSE_ALLOC_PER_RED);
     let mut lookahead = list;
     let mut cells = 0usize;
@@ -848,26 +893,49 @@ fn reverse_continue(
     }
     bump_reds(process, cells / REVERSE_ALLOC_PER_RED);
     if lookahead != Term::NIL && !is_list(lookahead) {
-        return Err(TermError::BadArg);
+        return bif_badarg(c_p);
     }
-    let builder =
-        TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap)).reserve_cons_list(cells)?;
-    let mut values = list;
-    tail = builder.prepend_exact_with_tail(
-        std::iter::from_fn(|| {
-            let (head, next) = cons_cell(values)?;
-            values = next;
-            Some(head)
-        })
-        .take(cells),
-        tail,
-    )?;
-    list = values;
+    let built = TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
+        .reserve_cons_list(cells)
+        .and_then(|builder| {
+            let mut values = list;
+            let reversed = builder.prepend_exact_with_tail(
+                std::iter::from_fn(|| {
+                    let (head, next) = cons_cell(values)?;
+                    values = next;
+                    Some(head)
+                })
+                .take(cells),
+                tail,
+            )?;
+            Ok((reversed, values))
+        });
+    match built {
+        Ok((reversed, rest)) => {
+            tail = reversed;
+            list = rest;
+        }
+        Err(TermError::BadArg) => return bif_badarg(c_p),
+        Err(_) => return bif_system_limit(c_p),
+    }
     if list == Term::NIL {
-        Ok(ReverseResult::Done(tail))
-    } else {
-        Ok(ReverseResult::Trap(list, tail))
+        return crate::native_hooks::raw(tail);
     }
+    lists_reverse_trap(c_p, i, process, list, tail)
+}
+
+/// `BIF_TRAP2(&bif_trap_export[BIF_lists_reverse_2], c_p, list, tail)`.
+#[cold]
+#[inline(never)]
+fn lists_reverse_trap(
+    c_p: *mut ProcessHeader,
+    i: u64,
+    process: &mut crate::Process,
+    list: Term,
+    tail: Term,
+) -> u64 {
+    let trap = bif_trap(process, "lists:reverse/2", vec![list, tail]);
+    bif_ret(c_p, i, Err(trap))
 }
 
 /// `lists:keymember/3`.
