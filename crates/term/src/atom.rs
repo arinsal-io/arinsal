@@ -118,9 +118,7 @@ impl AtomRec {
     /// Port of atom.c:107 (erts_atom_get_name): the UTF-8 bytes inside `u.bin`.
     #[inline(always)]
     fn name(&self) -> &str {
-        let view = crate::raw::BinRef::try_from(self.bin).expect("atom literal is a binary");
-        let bytes = view.bytes().expect("atom literal is a byte string");
-        debug_assert_eq!(bytes.len(), self.len as usize);
+        let bytes = crate::raw::atom_literal_bytes(self.bin, self.len as usize);
         // SAFETY: `atom_alloc` stored only text that passed `analyze_utf8` (or ASCII, or Latin-1
         // converted to UTF-8), and the literal binary is immutable.
         unsafe { std::str::from_utf8_unchecked(bytes) }

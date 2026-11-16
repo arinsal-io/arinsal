@@ -4,7 +4,7 @@
 
 use std::cmp::Ordering;
 use std::io::Write;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
 use arinsal_term::raw::{Cons, Tuple, term_at_pointer, term_from_bits};
 use arinsal_term::{
@@ -25,7 +25,7 @@ pub enum EncodeError {
     SystemLimit,
 }
 
-static LOCAL_NODE_HASH: OnceLock<u32> = OnceLock::new();
+static LOCAL_NODE_HASH: AtomicU32 = AtomicU32::new(0);
 
 /// `erts_late_init_external`: the hash that identifies this node in `LOCAL_EXT`, from the host
 /// name, the OS pid, the time offset and the monotonic time at boot.
@@ -39,14 +39,15 @@ pub fn erts_late_init_external(time_offset_nanos: i64, monotonic_raw_nanos: u32)
     node_id.extend_from_slice(&time_offset_nanos.to_le_bytes());
     node_id.extend_from_slice(hostname);
     node_id.extend_from_slice(pid.as_bytes());
-    let _ = LOCAL_NODE_HASH.set(block_hash(&node_id, monotonic_raw_nanos));
+    LOCAL_NODE_HASH.store(
+        block_hash(&node_id, monotonic_raw_nanos),
+        AtomicOrdering::Relaxed,
+    );
 }
 
-/// `local_node_hash`.
+/// `local_node_hash`: 0 until `erts_late_init_external` ran, as the C static.
 fn local_node_hash() -> u32 {
-    *LOCAL_NODE_HASH
-        .get()
-        .expect("erts_late_init_external ran at boot")
+    LOCAL_NODE_HASH.load(AtomicOrdering::Relaxed)
 }
 
 /// Incremental Jenkins block hash used by `LOCAL_EXT`.

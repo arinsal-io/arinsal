@@ -6,7 +6,7 @@
 //! [`Tuple`], [`boxed_header`]); it is public so that BIF loops outside this crate can walk
 //! lists and tuples with erts-shaped code while staying in safe Rust.
 
-use crate::{ARITY, BIN_REF, HeapAlloc, SUB_BITS, Term, TermError};
+use crate::{ARITY, BIN_REF, HEAP_BITS, HeapAlloc, SUB_BITS, Term, TermError};
 use arinsal_alloc::raw::BinaryView;
 use std::mem::MaybeUninit;
 use std::num::NonZeroUsize;
@@ -1211,4 +1211,21 @@ impl<const N: usize> Default for WordStack<N> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// `erts_atom_get_name`: the `len` bytes of an atom's literal binary (`Atom.u.bin`).
+///
+/// Contract: `bin` is the global-literal binary of an atom, which is never freed or moved, and
+/// `len` is the atom's name length.
+// Port of erts/emulator/beam/atom.c (erts_atom_get_name, ERTS_GET_BINARY_BYTES), OTP-29.1.1:
+// a heap binary is read where it lies; a longer name sits in a refc binary.
+#[inline(always)]
+pub fn atom_literal_bytes(bin: Term, len: usize) -> &'static [u8] {
+    if boxed_header(bin).is_some_and(|header| header & 63 == HEAP_BITS) {
+        // SAFETY: the contract above; a heap binary holds its `len` payload bytes from word two
+        // of the object (`bin` is the object address plus tag two).
+        return unsafe { std::slice::from_raw_parts(bin.0.wrapping_add(14) as *const u8, len) };
+    }
+    let view = BinRef::try_from(bin).expect("atom literal is a binary");
+    view.bytes().expect("atom literal is a byte string")
 }
