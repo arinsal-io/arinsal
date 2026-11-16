@@ -278,6 +278,10 @@ pub struct Vm {
     replica: bool,
     // ---- vm_exc ----
     backtrace_depth: usize,
+    /// `esdp->registers`: the address of the scheduler's register file while this scheduler's
+    /// executor runs a process, zero otherwise. An address so `Vm` stays `Send`.
+    // Port of erts/emulator/beam/erl_process.h (ErtsSchedulerData.registers), OTP-29.1.1.
+    pub(crate) esdp_registers: usize,
 }
 
 #[test]

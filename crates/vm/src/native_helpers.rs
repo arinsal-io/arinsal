@@ -2978,7 +2978,12 @@ pub(crate) fn set_native_error_info(
 /// Raises `{badfun,Fun}` or `{badarity,{Fun,Args}}` for a native fun call.
 // Port of erts/emulator/beam/beam_common.c:750-770 (expand_error_value) and
 // erts/emulator/beam/jit/arm/instr_fun.cpp:84-100, OTP-29.1.1.
-fn set_call_fun_error(process: &mut crate::Process, fun: Term, arity: u32) {
+fn set_call_fun_error(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    fun: Term,
+    arity: u32,
+) {
     let arity = arity as usize;
     if arity >= crate::proc_create::ATTACHED_X_REGS {
         crate::native_hooks::set_error(process, "system_limit");
@@ -2986,8 +2991,8 @@ fn set_call_fun_error(process: &mut crate::Process, fun: Term, arity: u32) {
     }
     // `apply/2` may pass more arguments than the module's registers (erts raises badarity with
     // all of them): the scheduler array holds them.
-    process.x[arity] = fun;
-    match crate::funs::call_error_reason(process, fun, arity) {
+    registers.x_reg_array[arity] = fun;
+    match crate::funs::call_error_reason(process, &mut registers.x_reg_array, fun, arity) {
         Ok(reason) => {
             process.heap.abi.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
             process.heap.abi.exc.fvalue = crate::native_hooks::raw(reason);
@@ -3178,8 +3183,7 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
             native_pc: (raising_pc != 0).then_some(raising_pc),
             top: top.as_ref().map(crate::stacktrace::SaveTop::Live),
         };
-        let Ok(trace) =
-            crate::stacktrace::save_stacktrace(process, input, Some(&registers.x_reg_array))
+        let Ok(trace) = crate::stacktrace::save_stacktrace(process, input, &registers.x_reg_array)
         else {
             return 0;
         };
@@ -3356,7 +3360,7 @@ pub extern "C" fn arinsal_beamasm_fun_resolver(
     match view {
         Some(arinsal_term::FunRef::Local { entry, .. }) => {
             if u32::from(entry.arity) != arity {
-                set_call_fun_error(process, fun, arity);
+                set_call_fun_error(process, registers, fun, arity);
                 return 0;
             }
             let code_ix =
@@ -3377,7 +3381,7 @@ pub extern "C" fn arinsal_beamasm_fun_resolver(
         }
         Some(arinsal_term::FunRef::Export { entry }) => {
             if u32::from(entry.arity) != arity {
-                set_call_fun_error(process, fun, arity);
+                set_call_fun_error(process, registers, fun, arity);
                 return 0;
             }
             // Port of erts/emulator/beam/jit/arm/instr_fun.cpp (emit_i_call_fun: the export's
@@ -3408,7 +3412,7 @@ pub extern "C" fn arinsal_beamasm_fun_resolver(
             }
         }
         None => {
-            set_call_fun_error(process, fun, arity);
+            set_call_fun_error(process, registers, fun, arity);
             0
         }
     }

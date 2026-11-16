@@ -96,6 +96,8 @@ impl Executor {
         // SAFETY: `self.native_registers` lives in this boxed `Executor`, which is not moved
         // or dropped during the call, and the epilogue below detaches before `run` returns.
         unsafe { process.x.attach(&mut self.native_registers) };
+        // `esdp->registers` of this scheduler: the VM paths the slice runs reach `reg` here.
+        self.vm.esdp_registers = std::ptr::from_mut(&mut self.native_registers) as usize;
         if crate::xreg_poison_enabled() {
             process.x[saved_len..].fill(crate::XREG_POISON);
         }

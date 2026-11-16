@@ -4899,8 +4899,7 @@ fn garbage_collect(process: &mut Process, arg: Term) -> Result<Term, VmError> {
     }
     // Port of bif.c:4084 (`erts_garbage_collect(BIF_P, 0, NULL, 0)`), OTP-29.1.1:
     // the caller spilled live X registers, so this BIF passes no register roots.
-    let live = 0;
-    let collected = process.collect_heap_roots(live, &mut [], 0);
+    let collected = process.collect_heap_roots_objv(&mut [], &mut [], 0);
     process.heap.set_fullsweep_after(fullsweep_after);
     let gc = collected.map_err(|error| VmError::Unsupported(format!("GC {error:?}")))?;
     after_collection(process, gc.collections, gc.words_reclaimed);

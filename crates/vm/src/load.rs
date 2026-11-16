@@ -853,6 +853,7 @@ impl Vm {
             code_ix,
             replica,
             backtrace_depth: 8,
+            esdp_registers: 0,
         }
     }
 

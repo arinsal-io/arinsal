@@ -17,9 +17,14 @@ pub(super) fn set_module_uniq(module: &mut Module, uniq: [u8; 16]) {
 }
 
 /// Build the Erlang exception reason before the exception handler formats it.
-pub(super) fn call_error_reason(p: &mut Process, fun: Term, arity: usize) -> Result<Term, VmError> {
+pub(super) fn call_error_reason(
+    p: &mut Process,
+    reg: &mut [Term],
+    fun: Term,
+    arity: usize,
+) -> Result<Term, VmError> {
     let is_fun = fun.classify() == TermKind::Fun;
-    p.ensure(6 + arity * 2, arity + 1)?;
+    p.ensure_objv(6 + arity * 2, &mut reg[..arity + 1])?;
     let fun = p.x[arity];
     let mut builder = TermBuilder::new(&mut p.heap);
     let kind = global_atoms()
@@ -150,6 +155,18 @@ fn unwrap_nested_apply(
 }
 
 impl Vm {
+    /// `reg[..live]` of `esdp->registers`, the roots of a collection the scheduler does for the
+    /// running process.
+    // Port of erts/emulator/beam/erl_process.h (erts_proc_sched_data(c_p)->registers),
+    // OTP-29.1.1.
+    pub(crate) fn reg_prefix<'a>(&self, live: usize) -> Result<&'a mut [Term], VmError> {
+        crate::native_hooks::registers_at(
+            self.esdp_registers as *mut arinsal_beamasm::SchedulerRegisters,
+        )
+        .and_then(|registers| registers.x_reg_array.get_mut(..live))
+        .ok_or_else(|| VmError::Unsupported("no scheduler registers".into()))
+    }
+
     pub(super) fn eval_erlang_fun_builtin(
         &mut self,
         function: &str,
@@ -226,7 +243,7 @@ impl Vm {
             None => None,
         };
         if actual != Some(arity) {
-            let reason = call_error_reason(p, fun, arity)?;
+            let reason = call_error_reason(p, self.reg_prefix(arity + 1)?, fun, arity)?;
             return Err(VmError::Trap(exceptions::Trap::error(reason)));
         }
         match view.unwrap() {
@@ -341,7 +358,10 @@ impl Vm {
             }
             (handler, "undefined_lambda")
         };
-        p.ensure(arity.saturating_mul(2).saturating_add(4), arity + 1)?;
+        p.ensure_objv(
+            arity.saturating_mul(2).saturating_add(4),
+            self.reg_prefix(arity + 1)?,
+        )?;
         let fun = p.x[arity];
         let args: Vec<Term> = p.x[..arity].to_vec();
         let list = TermBuilder::new(&mut p.heap)
@@ -383,7 +403,7 @@ impl Vm {
             // current code without this fun is `badfun`; no current code goes to
             // `error_handler:undefined_lambda/3`.
             if self.code.loaded.contains_key(&name) {
-                let reason = badfun_reason(p, arity)?;
+                let reason = badfun_reason(p, self.reg_prefix(arity + 1)?, arity)?;
                 return Err(VmError::Trap(exceptions::Trap::error(reason)));
             }
             return Ok(None);
@@ -943,16 +963,12 @@ impl Vm {
             )
         {
             let actions = crate::trace::executor_native_call_event(self, p, run, &native, false)?;
-            // XREG-1: the executor's call path does not hold `reg` yet.
-            let mut x = p.take_x_for_gc();
-            let pushed = crate::trace::push_native_trace_frame(
+            crate::trace::push_native_trace_frame(
                 p,
                 native.start,
                 &actions,
-                &mut x[..usize::from(native.arity)],
-            );
-            p.x = x;
-            pushed?;
+                self.reg_prefix(usize::from(native.arity))?,
+            )?;
         }
         self.set_position(p, module_id, target)?;
         // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3098-3116 (emit_i_test_yield),
@@ -1011,7 +1027,10 @@ impl Vm {
                 frame: format!("{module}:{function}/{arity}"),
             });
         }
-        p.ensure(arity.saturating_mul(2).saturating_add(8), arity)?;
+        p.ensure_objv(
+            arity.saturating_mul(2).saturating_add(8),
+            self.reg_prefix(arity)?,
+        )?;
         let args: Vec<Term> = p.x[..arity].to_vec();
         let list = TermBuilder::new(&mut p.heap)
             .list_from_iter(args)
@@ -1052,7 +1071,10 @@ impl Vm {
                 frame: format!("{module}:{function}/{arity}"),
             });
         }
-        p.ensure(arity.saturating_mul(2).saturating_add(8), arity)?;
+        p.ensure_objv(
+            arity.saturating_mul(2).saturating_add(8),
+            self.reg_prefix(arity)?,
+        )?;
         let args = p.x[..arity].to_vec();
         let list = TermBuilder::new(&mut p.heap)
             .list_from_iter(args)
@@ -1085,7 +1107,7 @@ impl Vm {
             let words = arity
                 .checked_mul(2)
                 .ok_or_else(|| self.exception(p, "system_limit"))?;
-            p.ensure(words, arity + 2)?;
+            p.ensure_objv(words, self.reg_prefix(arity + 2)?)?;
             let module_term = p.x[arity];
             let function_term = p.x[arity + 1];
             let arguments = TermBuilder::new(&mut p.heap)
@@ -1327,7 +1349,7 @@ impl Vm {
     // elixir_loop1: Port of erts/emulator/beam/erl_bif_info.c:4011
     // (fun_info_mfa_1), OTP-29.1.1.
     pub(super) fn fun_info_mfa(&self, p: &mut Process) -> Result<Term, VmError> {
-        p.ensure(4, 1)?;
+        p.ensure_objv(4, self.reg_prefix(1)?)?;
         // SAFETY: X0 retains the fun throughout this BIF; tuple construction cannot collect.
         let view = unsafe { p.x[0].fun_ref() }.ok_or_else(|| self.exception(p, "badarg"))?;
         let (module, name, arity) = match view {
@@ -1385,7 +1407,7 @@ impl Vm {
 
     pub(super) fn fun_info(&self, p: &mut Process, keyed: bool) -> Result<Term, VmError> {
         // Port of erts/emulator/beam/erl_bif_info.c:3912 (fun_info_2), OTP-29.1.1.
-        p.ensure(1024, usize::from(keyed) + 1)?;
+        p.ensure_objv(1024, self.reg_prefix(usize::from(keyed) + 1)?)?;
         let fun = p.x[0];
         // SAFETY: X0 retains the fun throughout construction; no collection follows.
         let view = unsafe { fun.fun_ref() }.ok_or_else(|| self.exception(p, "badarg"))?;
@@ -1502,8 +1524,8 @@ impl Vm {
 }
 
 /// `{badfun, Fun}` for a fun whose code is no longer loaded.
-fn badfun_reason(p: &mut Process, arity: usize) -> Result<Term, VmError> {
-    p.ensure(3, arity + 1)?;
+fn badfun_reason(p: &mut Process, reg: &mut [Term], arity: usize) -> Result<Term, VmError> {
+    p.ensure_objv(3, &mut reg[..arity + 1])?;
     let fun = p.x[arity];
     let kind = global_atoms()
         .intern("badfun")

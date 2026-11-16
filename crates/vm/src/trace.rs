@@ -2836,7 +2836,7 @@ fn caller_info(
 fn current_stacktraces(vm: &Vm, process: &mut Process) -> Result<Vec<(VecHeap, Term)>, VmError> {
     // Reserve one slot beyond OTP's MAX_BACKTRACE_SIZE for the current frame, which is
     // removed before the caller prefixes are built below.
-    let trace = crate::stacktrace::build(process, None, 65)?;
+    let trace = crate::stacktrace::build(process, 65)?;
     let owned = to_owned(trace)
         .map_err(|error| VmError::Unsupported(format!("match stacktrace copy: {error:?}")))?;
     let OwnedTerm::List { elems, .. } = &owned else {

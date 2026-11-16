@@ -138,13 +138,20 @@ pub(crate) fn scheduler_registers_at(
     process: &mut Process,
     registers: *mut SchedulerRegisters,
 ) -> Option<(&mut Process, &mut SchedulerRegisters)> {
+    Some((process, registers_at(registers)?))
+}
+
+/// The scheduler register file at `registers` (`esdp->registers`), or `None` for null.
+pub(crate) fn registers_at<'a>(
+    registers: *mut SchedulerRegisters,
+) -> Option<&'a mut SchedulerRegisters> {
     if registers.is_null() {
         return None;
     }
-    // SAFETY: run_native keeps its scheduler register area exclusively borrowed
-    // while native code and its synchronous hooks are executing.
-    let registers = unsafe { &mut *registers };
-    Some((process, registers))
+    // SAFETY: a non-null address is the register file of the running scheduler (a native
+    // fragment's `reg`, or the executor's `esdp->registers` while it runs a process), which only
+    // this scheduler touches and which stays in place for the call.
+    Some(unsafe { &mut *registers })
 }
 
 /// Enters a non-collecting heap helper that receives all operands as arguments.

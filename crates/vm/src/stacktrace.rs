@@ -649,7 +649,7 @@ fn push_frame(raw: &mut RawTrace, continuation: Continuation) {
 pub(super) fn save_stacktrace(
     p: &mut Process,
     input: StackTraceSave<'_>,
-    registers: Option<&[Term]>,
+    registers: &[Term],
 ) -> Result<Term, VmError> {
     let StackTraceSave {
         class,
@@ -707,7 +707,7 @@ pub(super) fn save_stacktrace(
     let (stack_trace, ftrace) = {
         let mut heap = TraceHeap::new(&mut p.heap);
         let stack_trace = StackTrace::reserve(&mut heap, max_depth, freason, pc, current)?;
-        let (args, error_info) = save_ftrace_values(&mut heap, top, registers.unwrap_or(&p.x))?;
+        let (args, error_info) = save_ftrace_values(&mut heap, top, registers)?;
         let ftrace = Ftrace {
             stack_trace,
             args,
@@ -1348,12 +1348,8 @@ fn mfa_arity_or_args(args: Term, arity: u8) -> Term {
 
 /// Port of erts/emulator/beam/beam_common.c:781 (gather_stacktrace), OTP-29.1.1.
 /// A continuation points after the call; the preceding instruction owns its line.
-pub(super) fn build(
-    p: &mut Process,
-    top: Option<&TopFrame>,
-    depth: usize,
-) -> Result<Term, VmError> {
-    build_with_reserve(p, top, depth, None)
+pub(super) fn build(p: &mut Process, depth: usize) -> Result<Term, VmError> {
+    build_with_reserve(p, depth, None)
 }
 
 /// Build the live `process_info` stacktrace using `erts_build_stacktrace`'s per-frame heap
@@ -1363,12 +1359,11 @@ pub(super) fn build_for_process_info(
     depth: usize,
     reserve: &mut usize,
 ) -> Result<Term, VmError> {
-    build_with_reserve(p, None, depth, Some(reserve))
+    build_with_reserve(p, depth, Some(reserve))
 }
 
 fn build_with_reserve(
     p: &mut Process,
-    top: Option<&TopFrame>,
     depth: usize,
     reserve: Option<&mut usize>,
 ) -> Result<Term, VmError> {
@@ -1390,10 +1385,11 @@ fn build_with_reserve(
     capture(
         &mut raw,
         None,
-        top,
+        None,
         Current {
             native_pc,
-            registers: &p.x,
+            // No top frame: the registers are not read.
+            registers: &[],
             trapped,
         },
         &p.heap,

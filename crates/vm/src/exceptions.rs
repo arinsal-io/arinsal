@@ -555,7 +555,15 @@ pub(super) fn resume(
             save_explicit(p, trace, trap.class, vm.backtrace_depth)?
         }
     } else {
-        save_raw(p, vm.backtrace_depth, trap.class, trap.top.as_ref())?
+        // `reg`, the scheduler's register array (`esdp->registers`), as handle_error passes it.
+        let registers = vm.reg_prefix(crate::proc_create::ATTACHED_X_REGS)?;
+        save_raw(
+            p,
+            registers,
+            vm.backtrace_depth,
+            trap.class,
+            trap.top.as_ref(),
+        )?
     };
     p.heap.abi.exc.ftrace = crate::native_hooks::raw(trace);
     trap.reason = crate::native_hooks::from_raw(p.heap.abi.exc.fvalue);
@@ -674,6 +682,7 @@ pub(super) fn resume(
 /// Port of erts/emulator/beam/beam_common.c:880 (save_stacktrace), OTP-29.1.1.
 fn save_raw(
     p: &mut Process,
+    registers: &[Term],
     depth: usize,
     class: Class,
     top: Option<&stacktrace::TopFrame>,
@@ -703,7 +712,7 @@ fn save_raw(
             native_pc,
             top: top.map(stacktrace::SaveTop::Live),
         },
-        None,
+        registers,
     )
 }
 
