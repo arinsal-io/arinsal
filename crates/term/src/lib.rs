@@ -3,6 +3,7 @@ mod atom;
 mod bignum;
 mod bits;
 mod copy;
+pub mod erl_bits;
 pub mod erl_iolist;
 pub mod exc;
 mod fun;

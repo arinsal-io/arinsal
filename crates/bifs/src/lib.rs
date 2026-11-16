@@ -24,7 +24,6 @@ use arinsal_term::{ExternalBinary, HeapAlloc, MagicBin, NativeAbi, Node, Process
 mod arith;
 mod binary_mod;
 mod dirty;
-mod etf;
 mod lists;
 mod maps_bifs;
 mod math;
@@ -34,7 +33,6 @@ mod time;
 mod unicode;
 mod unique;
 
-pub use etf::{BlockHashWalk, local_node_hash, local_term_hash};
 pub use lists::{
     APPEND_ALLOC_PER_RED, APPEND_EMPTY_PER_RED, APPEND_ONHEAP_PER_RED, AppendCont, AppendStep,
     DeferredTrap, KEYFIND_MAX_ITER, KeyOp, KeyOutcome, KeyfindCont, LENGTH_PER_RED, LengthCont,

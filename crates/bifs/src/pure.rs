@@ -1131,33 +1131,7 @@ pub fn copy_bitstring_range(
     output: &mut [u8],
     bit_count: usize,
 ) -> Result<(), BifError> {
-    let output_bits = output.len().checked_mul(8).ok_or(BADARG)?;
-    with_binary_bytes(term, |view| {
-        if bit_count > output_bits
-            || start
-                .checked_add(bit_count)
-                .is_none_or(|end| end > view.bit_len())
-        {
-            return Err(BADARG);
-        }
-        let source_start = view.start_bit().checked_add(start).ok_or(BADARG)?;
-        if source_start.is_multiple_of(8) && bit_count.is_multiple_of(8) {
-            let source_start = source_start / 8;
-            let byte_count = bit_count / 8;
-            let source_end = source_start.checked_add(byte_count).ok_or(BADARG)?;
-            output[..byte_count]
-                .copy_from_slice(view.bytes().get(source_start..source_end).ok_or(BADARG)?);
-            output[byte_count..].fill(0);
-        } else {
-            output.fill(0);
-            for index in 0..bit_count {
-                let source = source_start + index;
-                let bit = (view.bytes()[source / 8] >> (7 - source % 8)) & 1;
-                output[index / 8] |= bit << (7 - index % 8);
-            }
-        }
-        Ok(())
-    })?
+    arinsal_term::erl_bits::copy_bitstring_range(term, start, output, bit_count).map_err(|_| BADARG)
 }
 
 /// Run a read-only operation while the term's backing bytes remain borrowed.
@@ -1319,7 +1293,7 @@ pub fn singleton_bitstring(root: Term, unit: usize) -> Result<Option<Term>, BifE
 
 /// Return the significant bit count for a live bitstring term.
 pub fn bitstring_bit_len(term: Term) -> Result<usize, BifError> {
-    with_binary_bytes(term, |view| view.bit_len())
+    arinsal_term::erl_bits::bitstring_bit_len(term).ok_or(BADARG)
 }
 
 pub(crate) fn iolist_cons(term: Term) -> Result<(Term, Term), BifError> {

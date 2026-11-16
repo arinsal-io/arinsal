@@ -9,7 +9,7 @@ use arinsal_bifs::BifError;
 #[derive(Default)]
 pub(crate) struct B2tSizeState {
     /// `lext_state`: the block hash of a `LOCAL_EXT` term that yielded.
-    lext_state: Option<arinsal_bifs::BlockHashWalk>,
+    lext_state: Option<arinsal_external::BlockHashWalk>,
     started: bool,
     ep: usize,
     atom_extra_skip: usize,
@@ -321,8 +321,8 @@ pub(crate) fn decoded_size(
             if ep <= start {
                 return Err(error());
             }
-            let walk =
-                lext_state.get_or_insert_with(|| arinsal_bifs::BlockHashWalk::local(ep - start));
+            let walk = lext_state
+                .get_or_insert_with(|| arinsal_external::BlockHashWalk::local(ep - start));
             // `chunk_len = reds`: the hash yields when the reductions run out.
             let (done, hashed) = walk.step(&bytes[start..ep], (*reds).max(0) as usize);
             if !done {

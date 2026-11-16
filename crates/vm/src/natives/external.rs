@@ -17,8 +17,28 @@ use crate::natives::erl_iolist::{charge, create_holder, gc_enable};
 use crate::natives::external_dec::{B2tContext, B2tState};
 use arinsal_beamasm::ProcessHeader;
 use arinsal_bifs::{BifError, ProcessHeapHandle};
-use arinsal_external::EncodeWalk;
+use arinsal_external::{EncodeError, EncodeWalk};
 use arinsal_term::{RefcBinary, Term, TermBuilder, atoms};
+
+/// The BIF error of a failure of either layer.
+trait ToBifError {
+    fn to_bif(self) -> BifError;
+}
+
+impl ToBifError for BifError {
+    fn to_bif(self) -> BifError {
+        self
+    }
+}
+
+impl ToBifError for EncodeError {
+    fn to_bif(self) -> BifError {
+        match self {
+            EncodeError::BadArg => BifError::BADARG,
+            EncodeError::SystemLimit => BifError::SystemLimit,
+        }
+    }
+}
 
 /// `TERM_TO_BINARY_LOOP_FACTOR`.
 const TERM_TO_BINARY_LOOP_FACTOR: usize = 32;
@@ -134,8 +154,13 @@ fn term_to_binary_start(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, bif_ix: 
     let walk = match EncodeWalk::new(&args[..arity]) {
         Ok(walk) => walk,
         Err(error) => {
-            let error =
-                crate::exceptions::bif_error(process, "erlang", name, &args[..arity], error);
+            let error = crate::exceptions::bif_error(
+                process,
+                "erlang",
+                name,
+                &args[..arity],
+                error.to_bif(),
+            );
             return bif_ret(c_p, i, Err(error));
         }
     };
@@ -153,7 +178,16 @@ fn term_to_binary_start(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, bif_ix: 
         walk,
     };
     let mut context = context;
-    erts_term_to_binary_int(c_p, reg, i, process, bif_ix, (term, opts), &mut context, None)
+    erts_term_to_binary_int(
+        c_p,
+        reg,
+        i,
+        process,
+        bif_ix,
+        (term, opts),
+        &mut context,
+        None,
+    )
 }
 
 /// `erts_internal:term_to_binary_trap/1`.
@@ -368,7 +402,7 @@ fn ttb_pass(process: &mut Process, context: &mut TtbContext, chunk: usize) -> Tt
         ($e:expr) => {
             match $e {
                 Ok(value) => value,
-                Err(error) => return TtbStep::Failed(error, work),
+                Err(error) => return TtbStep::Failed(error.to_bif(), work),
             }
         };
     }
@@ -423,7 +457,10 @@ fn ttb_pass(process: &mut Process, context: &mut TtbContext, chunk: usize) -> Tt
                 let output = *output;
                 let budget = chunk.saturating_sub(work);
                 let encoded = arinsal_bifs::with_iolist_binary_output(output, |bytes| {
-                    context.walk.step_into(bytes, budget)
+                    context
+                        .walk
+                        .step_into(bytes, budget)
+                        .map_err(ToBifError::to_bif)
                 });
                 let (done, encode_work) = tri!(encoded);
                 work += encode_work;
@@ -472,6 +509,7 @@ fn ttb_pass(process: &mut Process, context: &mut TtbContext, chunk: usize) -> Tt
                         arinsal_bifs::with_binary_bytes(source, |view| {
                             arinsal_bifs::with_iolist_binary_output(destination, |bytes| {
                                 walk.compress_into(&view.bytes()[1..], &mut bytes[6..], budget)
+                                    .map_err(ToBifError::to_bif)
                             })
                         })
                         .and_then(|result| result)
@@ -515,7 +553,7 @@ fn ttb_pass(process: &mut Process, context: &mut TtbContext, chunk: usize) -> Tt
 fn finish_iovec(process: &mut Process, walk: EncodeWalk) -> Result<Term, BifError> {
     let mut heap = ProcessHeapHandle(&mut process.heap);
     let mut builder = TermBuilder::new(&mut heap);
-    let (parts, compressed) = walk.finish_iovec()?;
+    let (parts, compressed) = walk.finish_iovec().map_err(ToBifError::to_bif)?;
     let terms = parts
         .iter()
         .map(|bytes| builder.binary(bytes).map_err(|_| BifError::SystemLimit))
@@ -551,9 +589,9 @@ fn external_size(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize) -
     process.heap.note_bif_entry();
     let args = crate::bif_table::bif_args::<2>(reg);
     let result = (|| {
-        let mut walk = EncodeWalk::new_external_size(&args[..arity])?;
+        let mut walk = EncodeWalk::new_external_size(&args[..arity]).map_err(ToBifError::to_bif)?;
         walk.set_local_node_source(local_node_source);
-        walk.step_size(usize::MAX)?;
+        walk.step_size(usize::MAX).map_err(ToBifError::to_bif)?;
         let size = walk.encoded_size().ok_or(BifError::SystemLimit)?;
         let size = u64::try_from(size).map_err(|_| BifError::SystemLimit)?;
         TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))

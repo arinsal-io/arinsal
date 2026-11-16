@@ -4,8 +4,8 @@
 
 use std::cmp::Ordering;
 use std::io::Write;
+use std::sync::OnceLock;
 
-use arinsal_bifs::{BifError, BlockHashWalk, local_term_hash};
 use arinsal_term::raw::{Cons, Tuple, term_at_pointer, term_from_bits};
 use arinsal_term::{
     Atom, FunRef, HeapAlloc, Identity, RefcBinary, Term, TermBuilder, TermKind, atoms, cmp_exact,
@@ -15,6 +15,153 @@ use flate2::{Compress, Compression, FlushCompress, Status};
 use num_bigint::{BigInt, Sign};
 use num_traits::ToPrimitive;
 use smallvec::SmallVec;
+
+/// Why an encode failed: `BADARG` or `SYSTEM_LIMIT`, the only reasons erts raises.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EncodeError {
+    /// `BADARG`.
+    BadArg,
+    /// `SYSTEM_LIMIT`.
+    SystemLimit,
+}
+
+static LOCAL_NODE_HASH: OnceLock<u32> = OnceLock::new();
+
+/// `erts_late_init_external`: the hash that identifies this node in `LOCAL_EXT`, from the host
+/// name, the OS pid, the time offset and the monotonic time at boot.
+// Port of erts/emulator/beam/external.c (erts_late_init_external), OTP-29.1.1.
+pub fn erts_late_init_external(time_offset_nanos: i64, monotonic_raw_nanos: u32) {
+    let uname = rustix::system::uname();
+    let hostname = uname.nodename().to_bytes();
+    let hostname = &hostname[..hostname.len().min(255)];
+    let pid = std::process::id().to_string();
+    let mut node_id = Vec::with_capacity(8 + hostname.len() + pid.len());
+    node_id.extend_from_slice(&time_offset_nanos.to_le_bytes());
+    node_id.extend_from_slice(hostname);
+    node_id.extend_from_slice(pid.as_bytes());
+    let _ = LOCAL_NODE_HASH.set(block_hash(&node_id, monotonic_raw_nanos));
+}
+
+/// `local_node_hash`.
+fn local_node_hash() -> u32 {
+    *LOCAL_NODE_HASH
+        .get()
+        .expect("erts_late_init_external ran at boot")
+}
+
+/// Incremental Jenkins block hash used by `LOCAL_EXT`.
+// Port of erts_block_hash_init/erts_block_hash in
+// erts/emulator/beam/erl_term_hashing.c:450-577, OTP-29.1.1.
+pub struct BlockHashWalk {
+    a: u32,
+    b: u32,
+    c: u32,
+    length: usize,
+    cursor: usize,
+    hash: Option<u32>,
+}
+
+impl BlockHashWalk {
+    /// `erts_block_hash_init` over `length` bytes with the hash of this node as the seed, as
+    /// `LOCAL_EXT` uses it.
+    pub fn local(length: usize) -> Self {
+        Self::new(length, local_node_hash())
+    }
+
+    /// The hash once `step` reported the end of the data.
+    pub fn hash(&self) -> Option<u32> {
+        self.hash
+    }
+
+    fn new(length: usize, initial: u32) -> Self {
+        Self {
+            a: 0x9e37_79b9,
+            b: 0x9e37_79b9,
+            c: initial,
+            length,
+            cursor: 0,
+            hash: None,
+        }
+    }
+
+    /// `erts_block_hash` with `budget` bytes: whether the data is done and the bytes hashed.
+    pub fn step(&mut self, bytes: &[u8], budget: usize) -> (bool, usize) {
+        if self.hash.is_some() {
+            return (true, 0);
+        }
+        debug_assert_eq!(bytes.len(), self.length);
+        let remaining = self.length - self.cursor;
+        let (full, yields) = if budget < remaining {
+            let full = budget / 12 * 12;
+            if remaining > full + 12 {
+                (full + 12, true)
+            } else {
+                (remaining - remaining % 12, false)
+            }
+        } else {
+            (remaining - remaining % 12, false)
+        };
+        let end = self.cursor + full;
+        let (chunks, remaining_chunks) = bytes[self.cursor..end].as_chunks::<12>();
+        debug_assert!(remaining_chunks.is_empty());
+        for chunk in chunks {
+            self.a = self
+                .a
+                .wrapping_add(u32::from_le_bytes(chunk[0..4].try_into().unwrap()));
+            self.b = self
+                .b
+                .wrapping_add(u32::from_le_bytes(chunk[4..8].try_into().unwrap()));
+            self.c = self
+                .c
+                .wrapping_add(u32::from_le_bytes(chunk[8..12].try_into().unwrap()));
+            (self.a, self.b, self.c) = block_hash_mix(self.a, self.b, self.c);
+        }
+        self.cursor = end;
+        if yields {
+            return (false, full);
+        }
+
+        let remaining_bytes = &bytes[self.cursor..];
+        self.c = self.c.wrapping_add(self.length as u32);
+        for (index, byte) in remaining_bytes.iter().enumerate() {
+            match index {
+                0..=3 => self.a = self.a.wrapping_add((*byte as u32) << (8 * index)),
+                4..=7 => self.b = self.b.wrapping_add((*byte as u32) << (8 * (index - 4))),
+                _ => self.c = self.c.wrapping_add((*byte as u32) << (8 * (index - 7))),
+            }
+        }
+        self.cursor = self.length;
+        self.c = block_hash_mix(self.a, self.b, self.c).2;
+        self.hash = Some(self.c);
+        (true, full + remaining_bytes.len())
+    }
+}
+
+fn block_hash(bytes: &[u8], initial: u32) -> u32 {
+    let mut walk = BlockHashWalk::new(bytes.len(), initial);
+    let (done, _) = walk.step(bytes, usize::MAX);
+    debug_assert!(done);
+    walk.hash.expect("unlimited block hash completes")
+}
+
+#[inline]
+fn block_hash_mix(mut a: u32, mut b: u32, mut c: u32) -> (u32, u32, u32) {
+    a = a.wrapping_sub(b).wrapping_sub(c) ^ (c >> 13);
+    b = b.wrapping_sub(c).wrapping_sub(a) ^ (a << 8);
+    c = c.wrapping_sub(a).wrapping_sub(b) ^ (b >> 13);
+    a = a.wrapping_sub(b).wrapping_sub(c) ^ (c >> 12);
+    b = b.wrapping_sub(c).wrapping_sub(a) ^ (a << 16);
+    c = c.wrapping_sub(a).wrapping_sub(b) ^ (b >> 5);
+    a = a.wrapping_sub(b).wrapping_sub(c) ^ (c >> 3);
+    b = b.wrapping_sub(c).wrapping_sub(a) ^ (a << 10);
+    c = c.wrapping_sub(a).wrapping_sub(b) ^ (b >> 15);
+    (a, b, c)
+}
+
+// Port of erts/emulator/beam/external.c:4046-4105, OTP-29.1.1.
+pub fn local_term_hash(bytes: &[u8]) -> u32 {
+    block_hash(bytes, local_node_hash())
+}
 
 #[derive(Default, Clone, Copy)]
 struct EncodeOpts {
@@ -33,7 +180,7 @@ struct SizePass {
 }
 
 // Port of erts/emulator/beam/external.c:1480-1535 (parse_t2b_opts), OTP-29.1.1.
-fn options(term: Option<Term>) -> Result<EncodeOpts, BifError> {
+fn options(term: Option<Term>) -> Result<EncodeOpts, EncodeError> {
     let mut opts = EncodeOpts {
         minor: 2,
         ..EncodeOpts::default()
@@ -43,7 +190,7 @@ fn options(term: Option<Term>) -> Result<EncodeOpts, BifError> {
     };
     while tail != Term::NIL {
         // SAFETY: BIF arguments remain on stable live heaps throughout this call.
-        let (head, next) = unsafe { tail.cons_ref() }.ok_or(BifError::BADARG)?;
+        let (head, next) = unsafe { tail.cons_ref() }.ok_or(EncodeError::BadArg)?;
         tail = next;
         match head.as_atom() {
             Some(atoms::COMPRESSED) => opts.compressed = Some(6),
@@ -51,19 +198,23 @@ fn options(term: Option<Term>) -> Result<EncodeOpts, BifError> {
             Some(atoms::LOCAL) => opts.local = true,
             _ => {
                 // SAFETY: BIF arguments remain on stable live heaps throughout this call.
-                let tuple = unsafe { head.tuple_ref() }.ok_or(BifError::BADARG)?;
+                let tuple = unsafe { head.tuple_ref() }.ok_or(EncodeError::BadArg)?;
                 if tuple.len() != 2 {
-                    return Err(BifError::BADARG);
+                    return Err(EncodeError::BadArg);
                 }
                 let name = tuple
                     .get(0)
                     .and_then(Term::as_atom)
-                    .ok_or(BifError::BADARG)?;
-                let value = tuple.get(1).unwrap().as_small().ok_or(BifError::BADARG)?;
+                    .ok_or(EncodeError::BadArg)?;
+                let value = tuple
+                    .get(1)
+                    .unwrap()
+                    .as_small()
+                    .ok_or(EncodeError::BadArg)?;
                 match (name, value) {
                     (atoms::COMPRESSED, 0..=9) => opts.compressed = Some(value as u8),
                     (atoms::MINOR_VERSION, 0..=2) => opts.minor = value as u8,
-                    _ => return Err(BifError::BADARG),
+                    _ => return Err(EncodeError::BadArg),
                 }
             }
         }
@@ -89,15 +240,16 @@ trait ByteOutput {
         term: Term,
         start: usize,
         bit_count: usize,
-    ) -> Result<(), BifError> {
+    ) -> Result<(), EncodeError> {
         let byte_count = bit_count.div_ceil(8);
         let start_at = self.len();
         self.extend_zeroed(byte_count);
         let destination = self.slice_mut(start_at..start_at + byte_count);
         if destination.len() != byte_count {
-            return Err(BifError::SystemLimit);
+            return Err(EncodeError::SystemLimit);
         }
-        arinsal_bifs::copy_bitstring_range(term, start, destination, bit_count)
+        arinsal_term::erl_bits::copy_bitstring_range(term, start, destination, bit_count)
+            .map_err(|_| EncodeError::BadArg)
     }
 }
 
@@ -235,14 +387,15 @@ impl ByteOutput for OutputSlice<'_> {
         term: Term,
         start: usize,
         bit_count: usize,
-    ) -> Result<(), BifError> {
+    ) -> Result<(), EncodeError> {
         // The copy fills every byte of the range, so it needs no zeroed bytes first.
         let end = self.position.saturating_add(bit_count.div_ceil(8));
         let destination = self
             .bytes
             .get_mut(self.position..end)
-            .ok_or(BifError::SystemLimit)?;
-        arinsal_bifs::copy_bitstring_range(term, start, destination, bit_count)?;
+            .ok_or(EncodeError::SystemLimit)?;
+        arinsal_term::erl_bits::copy_bitstring_range(term, start, destination, bit_count)
+            .map_err(|_| EncodeError::BadArg)?;
         self.position = end;
         Ok(())
     }
@@ -272,7 +425,7 @@ fn int_bytes(out: &mut impl ByteOutput, n: &BigInt) {
 }
 
 // Port of erts/emulator/beam/external.c:2877 (enc_atom), OTP-29.1.1.
-fn atom_bytes(out: &mut impl ByteOutput, atom: Atom, minor: u8) -> Result<(), BifError> {
+fn atom_bytes(out: &mut impl ByteOutput, atom: Atom, minor: u8) -> Result<(), EncodeError> {
     atom_bytes_in(global_atoms(), out, atom, minor)
 }
 
@@ -283,8 +436,8 @@ fn atom_bytes_in(
     out: &mut impl ByteOutput,
     atom: Atom,
     minor: u8,
-) -> Result<(), BifError> {
-    let (name, latin1_chars) = table.encoding_info(atom).ok_or(BifError::BADARG)?;
+) -> Result<(), EncodeError> {
+    let (name, latin1_chars) = table.encoding_info(atom).ok_or(EncodeError::BadArg)?;
     if minor <= 1
         && let Some(chars) = latin1_chars
     {
@@ -308,14 +461,18 @@ fn atom_bytes_in(
     Ok(())
 }
 
-fn atom_term(out: &mut impl ByteOutput, term: Term, minor: u8) -> Result<(), BifError> {
-    atom_bytes(out, term.as_atom().ok_or(BifError::BADARG)?, minor)
+fn atom_term(out: &mut impl ByteOutput, term: Term, minor: u8) -> Result<(), EncodeError> {
+    atom_bytes(out, term.as_atom().ok_or(EncodeError::BadArg)?, minor)
 }
 
 // Port of erts/emulator/beam/external.c:encode_atom_size, OTP-29.1.1.
 #[inline(always)]
-fn atom_size_in(table: &arinsal_term::AtomTable, atom: Atom, minor: u8) -> Result<usize, BifError> {
-    let (name, latin1_chars) = table.encoding_info(atom).ok_or(BifError::BADARG)?;
+fn atom_size_in(
+    table: &arinsal_term::AtomTable,
+    atom: Atom,
+    minor: u8,
+) -> Result<usize, EncodeError> {
+    let (name, latin1_chars) = table.encoding_info(atom).ok_or(EncodeError::BadArg)?;
     Ok(
         if minor <= 1
             && let Some(chars) = latin1_chars
@@ -346,7 +503,7 @@ fn encode_one_cons(
     stack: &mut WStack,
     out: &mut impl ByteOutput,
     cons: Cons<'static>,
-) -> Result<Term, BifError> {
+) -> Result<Term, EncodeError> {
     let len_cnt = pop_stack_small(stack);
     let (head, tail) = cons.pair();
     if is_list_term(tail) {
@@ -357,7 +514,7 @@ fn encode_one_cons(
         out.patch(
             len_at,
             &u32::try_from(len_cnt)
-                .map_err(|_| BifError::SystemLimit)?
+                .map_err(|_| EncodeError::SystemLimit)?
                 .to_be_bytes(),
         );
         push_term_task(stack, ENC_TERM, tail);
@@ -381,7 +538,7 @@ fn big_size(digits: usize) -> usize {
     1 + if digits < 256 { 1 } else { 4 } + 1 + digits
 }
 
-fn bignum_size(term: Term) -> Result<usize, BifError> {
+fn bignum_size(term: Term) -> Result<usize, EncodeError> {
     term.with_bignum_digits_mut(|digits| {
         let Some(last) = digits.last() else {
             return 0;
@@ -391,7 +548,7 @@ fn bignum_size(term: Term) -> Result<usize, BifError> {
     })
     .filter(|size| *size > 0)
     .map(big_size)
-    .ok_or(BifError::BADARG)
+    .ok_or(EncodeError::BadArg)
 }
 
 // Port of erts/emulator/beam/external.c:3542 (SMALL_DEF), OTP-29.1.1.
@@ -420,14 +577,14 @@ fn write_nested_small(out: &mut impl ByteOutput, n: i64, opts: EncodeOpts) {
     }
 }
 
-fn fun_of<'a>(term: Term) -> Result<FunRef<'a>, BifError> {
+fn fun_of<'a>(term: Term) -> Result<FunRef<'a>, EncodeError> {
     // SAFETY: the live source heap retains the fun entry and its environment.
-    unsafe { term.fun_ref() }.ok_or(BifError::BADARG)
+    unsafe { term.fun_ref() }.ok_or(EncodeError::BadArg)
 }
 
-fn record_of<'a>(term: Term) -> Result<arinsal_term::RecordRef<'a>, BifError> {
+fn record_of<'a>(term: Term) -> Result<arinsal_term::RecordRef<'a>, EncodeError> {
     // SAFETY: the live record retains its definition and values.
-    unsafe { term.record_ref() }.ok_or(BifError::BADARG)
+    unsafe { term.record_ref() }.ok_or(EncodeError::BadArg)
 }
 
 /// Leading byte-valued elements of a list and whether the whole list is a string.
@@ -570,7 +727,7 @@ fn push_flatmap_task(
     stack: &mut WStack,
     container: Term,
     remaining: usize,
-) -> Result<(), BifError> {
+) -> Result<(), EncodeError> {
     stack.push(container.word());
     stack.push(stack_command(ENC_MAP_PAIR_CODE as i64));
     stack.push(stack_small(remaining)?);
@@ -594,8 +751,8 @@ fn push_task(stack: &mut WStack, command: Option<u64>, term: Term) {
 }
 
 #[inline(always)]
-fn stack_small(value: usize) -> Result<u64, BifError> {
-    u64::try_from(value).map_err(|_| BifError::SystemLimit)
+fn stack_small(value: usize) -> Result<u64, EncodeError> {
+    u64::try_from(value).map_err(|_| EncodeError::SystemLimit)
 }
 
 // Port of the saved integer WSTACK words in erts/emulator/beam/external.c (enc_term_int).
@@ -622,7 +779,7 @@ fn push_size_tuple_array(stack: &mut WStack, pointer: u64, remaining: usize) {
 
 /// Element `len - remaining` of the array a TERM_ARRAY_OP walks.
 #[inline(always)]
-fn size_array_element(kind: u64, container: Term, remaining: usize) -> Result<Term, BifError> {
+fn size_array_element(kind: u64, container: Term, remaining: usize) -> Result<Term, EncodeError> {
     match kind {
         ARRAY_FLAT_KEYS | ARRAY_FLAT_VALUES => {
             let (key, value) = flatmap_pair(container, remaining)?;
@@ -633,36 +790,40 @@ fn size_array_element(kind: u64, container: Term, remaining: usize) -> Result<Te
             let index = fun
                 .num_free()
                 .checked_sub(remaining)
-                .ok_or(BifError::BADARG)?;
-            fun.free(index).ok_or(BifError::BADARG)
+                .ok_or(EncodeError::BadArg)?;
+            fun.free(index).ok_or(EncodeError::BadArg)
         }
         _ => {
             let record = record_of(container)?;
             let index = record
                 .len()
                 .checked_sub(remaining)
-                .ok_or(BifError::BADARG)?;
-            record.value(index).ok_or(BifError::BADARG)
+                .ok_or(EncodeError::BadArg)?;
+            record.value(index).ok_or(EncodeError::BadArg)
         }
     }
 }
 
 /// Key and value of a flatmap with `remaining` pairs still to read.
 #[inline(always)]
-fn flatmap_pair(map: Term, remaining: usize) -> Result<(Term, Term), BifError> {
-    let checked = arinsal_maps::checked_map(map).map_err(|_| BifError::BADARG)?;
+fn flatmap_pair(map: Term, remaining: usize) -> Result<(Term, Term), EncodeError> {
+    let checked = arinsal_maps::checked_map(map).map_err(|_| EncodeError::BadArg)?;
     let arinsal_maps::CheckedMapKind::Flatmap(flat) = checked.kind() else {
-        return Err(BifError::BADARG);
+        return Err(EncodeError::BadArg);
     };
-    flat.pair_at(flat.size().checked_sub(remaining).ok_or(BifError::BADARG)?)
-        .ok_or(BifError::BADARG)
+    flat.pair_at(
+        flat.size()
+            .checked_sub(remaining)
+            .ok_or(EncodeError::BadArg)?,
+    )
+    .ok_or(EncodeError::BadArg)
 }
 
 /// Pop the next object of the size pass, resolving the operation words.
 // Port of the pop section of erts/emulator/beam/external.c (encode_size_struct_int),
 // OTP-29.1.1.
 #[inline(always)]
-fn size_pop(stack: &mut WStack) -> Result<Option<Term>, BifError> {
+fn size_pop(stack: &mut WStack) -> Result<Option<Term>, EncodeError> {
     let Some(word) = stack.pop() else {
         return Ok(None);
     };
@@ -673,7 +834,9 @@ fn size_pop(stack: &mut WStack) -> Result<Option<Term>, BifError> {
     if code == SIZE_LIST_TAIL {
         let tail = term_from_bits(stack.pop_word());
         if is_list_term(tail) {
-            let (head, rest) = Cons::try_from(tail).map_err(|_| BifError::BADARG)?.pair();
+            let (head, rest) = Cons::try_from(tail)
+                .map_err(|_| EncodeError::BadArg)?
+                .pair();
             push_term_task(stack, size_op(SIZE_LIST_TAIL), rest);
             Ok(Some(head))
         } else {
@@ -716,8 +879,8 @@ fn push_hashmap_root_tasks(
     map: Term,
     node_command: u64,
     term_command: Option<u64>,
-) -> Result<(), BifError> {
-    let children = arinsal_term::MapNodeChildren::new(map).ok_or(BifError::BADARG)?;
+) -> Result<(), EncodeError> {
+    let children = arinsal_term::MapNodeChildren::new(map).ok_or(EncodeError::BadArg)?;
     for child in children.rev() {
         let command = if matches!(child.classify(), TermKind::List | TermKind::Tuple) {
             Some(node_command)
@@ -736,19 +899,19 @@ fn push_hashmap_node_tasks(
     node: Term,
     node_command: Option<u64>,
     value_command: Option<u64>,
-) -> Result<Term, BifError> {
+) -> Result<Term, EncodeError> {
     if node.classify() == TermKind::List {
-        let (key, value) = arinsal_term::hashmap_leaf_pair(node).ok_or(BifError::BADARG)?;
+        let (key, value) = arinsal_term::hashmap_leaf_pair(node).ok_or(EncodeError::BadArg)?;
         push_task(stack, value_command, value);
         return Ok(key);
     }
-    let children = arinsal_term::MapNodeChildren::new(node).ok_or(BifError::BADARG)?;
+    let children = arinsal_term::MapNodeChildren::new(node).ok_or(EncodeError::BadArg)?;
     let mut children = children;
-    let last = children.next().ok_or(BifError::BADARG)?;
+    let last = children.next().ok_or(EncodeError::BadArg)?;
     for child in children.rev() {
         push_task(stack, node_command, child);
     }
-    let (key, value) = arinsal_term::hashmap_leaf_pair(last).ok_or(BifError::BADARG)?;
+    let (key, value) = arinsal_term::hashmap_leaf_pair(last).ok_or(EncodeError::BadArg)?;
     push_task(stack, value_command, value);
     Ok(key)
 }
@@ -855,7 +1018,7 @@ fn size_walk(
     sizes: &mut SizePass,
     consumed: &mut usize,
     budget: usize,
-) -> Result<Option<Term>, BifError> {
+) -> Result<Option<Term>, EncodeError> {
     let table = global_atoms();
     let minor = opts.minor;
     let mut total = sizes.estimated;
@@ -871,10 +1034,10 @@ fn size_walk(
     macro_rules! add {
         ($size:expr) => {{
             let size = $size;
-            total = total.checked_add(size).ok_or(BifError::SystemLimit)?;
+            total = total.checked_add(size).ok_or(EncodeError::SystemLimit)?;
             output_total = output_total
                 .checked_add(size)
-                .ok_or(BifError::SystemLimit)?;
+                .ok_or(EncodeError::SystemLimit)?;
         }};
     }
     macro_rules! add_recursive_local_headers {
@@ -882,7 +1045,7 @@ fn size_walk(
             if opts.local {
                 output_total = output_total
                     .checked_add(5 * $count)
-                    .ok_or(BifError::SystemLimit)?;
+                    .ok_or(EncodeError::SystemLimit)?;
             }
         };
     }
@@ -918,10 +1081,10 @@ fn size_walk(
                 add!(if arity <= 255 { 2 } else { 5 });
                 if arity > 0 {
                     if arity > 1 {
-                        let pointer = tuple.element_pointer(1).ok_or(BifError::BADARG)?;
+                        let pointer = tuple.element_pointer(1).ok_or(EncodeError::BadArg)?;
                         push_size_tuple_array(stack, pointer, arity - 1);
                     }
-                    obj = tuple.get(0).ok_or(BifError::BADARG)?;
+                    obj = tuple.get(0).ok_or(EncodeError::BadArg)?;
                     continue;
                 }
             }
@@ -933,7 +1096,7 @@ fn size_walk(
                 }
             }
             FastEncodeKind::Rare(TermKind::Map) => {
-                let checked = arinsal_maps::checked_map(obj).map_err(|_| BifError::BADARG)?;
+                let checked = arinsal_maps::checked_map(obj).map_err(|_| EncodeError::BadArg)?;
                 match checked.kind() {
                     arinsal_maps::CheckedMapKind::Flatmap(_) => {
                         let size = checked.size();
@@ -945,7 +1108,7 @@ fn size_walk(
                     }
                     arinsal_maps::CheckedMapKind::Hashmap(_) => {
                         let children =
-                            arinsal_term::MapNodeChildren::new(obj).ok_or(BifError::BADARG)?;
+                            arinsal_term::MapNodeChildren::new(obj).ok_or(EncodeError::BadArg)?;
                         if children.is_head() {
                             add!(5);
                         }
@@ -954,10 +1117,11 @@ fn size_walk(
                 }
             }
             FastEncodeKind::Rare(TermKind::Bitstring) => {
-                let bits = arinsal_bifs::bitstring_bit_len(obj)?;
+                let bits =
+                    arinsal_term::erl_bits::bitstring_bit_len(obj).ok_or(EncodeError::BadArg)?;
                 let len = bits.div_ceil(8);
                 let header: usize = if bits.is_multiple_of(8) { 5 } else { 6 };
-                add!(header.checked_add(len).ok_or(BifError::SystemLimit)?);
+                add!(header.checked_add(len).ok_or(EncodeError::SystemLimit)?);
             }
             FastEncodeKind::Rare(TermKind::Pid | TermKind::Port | TermKind::Ref) => {
                 // Port of erts/emulator/beam/external.c:5613-5636 (REF_DEF sizing), OTP-29.1.1.
@@ -965,7 +1129,7 @@ fn size_walk(
                 if internal && !opts.local {
                     resolve_local_node(opts, node_source);
                 }
-                let identity = obj.identity().ok_or(BifError::BADARG)?;
+                let identity = obj.identity().ok_or(EncodeError::BadArg)?;
                 let identity = local_identity(identity, internal, opts.local, opts.local_node);
                 let node_size = if opts.local && internal {
                     1
@@ -1018,7 +1182,7 @@ fn size_walk(
                             push_size_array(stack, obj, free - 1, ARRAY_FUN_ENV);
                         }
                         if free != 0 {
-                            obj = fun.free(0).ok_or(BifError::BADARG)?;
+                            obj = fun.free(0).ok_or(EncodeError::BadArg)?;
                             continue;
                         }
                     }
@@ -1032,14 +1196,14 @@ fn size_walk(
                     + atom_size_in(table, record.module(), minor)?
                     + atom_size_in(table, record.name(), minor)?;
                 for index in 0..record.len() {
-                    let sorted = record.sorted_index(index).ok_or(BifError::BADARG)?;
+                    let sorted = record.sorted_index(index).ok_or(EncodeError::BadArg)?;
                     size = size
                         .checked_add(atom_size_in(
                             table,
-                            record.key(sorted).ok_or(BifError::BADARG)?,
+                            record.key(sorted).ok_or(EncodeError::BadArg)?,
                             minor,
                         )?)
-                        .ok_or(BifError::SystemLimit)?;
+                        .ok_or(EncodeError::SystemLimit)?;
                 }
                 add!(size);
                 let values = record.len();
@@ -1047,11 +1211,11 @@ fn size_walk(
                     push_size_array(stack, obj, values - 1, ARRAY_RECORD);
                 }
                 if values != 0 {
-                    obj = record.value(0).ok_or(BifError::BADARG)?;
+                    obj = record.value(0).ok_or(EncodeError::BadArg)?;
                     continue;
                 }
             }
-            FastEncodeKind::Rare(_) => return Err(BifError::Unsupported("ETF representation")),
+            FastEncodeKind::Rare(_) => return Err(EncodeError::BadArg),
         }
         match size_pop(stack)? {
             Some(next) => obj = next,
@@ -1070,10 +1234,10 @@ pub fn install_refc_binary<H: HeapAlloc>(
     heap: &mut H,
     binary: RefcBinary,
     size: usize,
-) -> Result<Term, BifError> {
+) -> Result<Term, EncodeError> {
     TermBuilder::new(heap)
         .refc_binary(binary, size * 8)
-        .map_err(|_| BifError::SystemLimit)
+        .map_err(|_| EncodeError::SystemLimit)
 }
 
 /// Result of [`EncodeWalk::encode_into_refc`].
@@ -1149,13 +1313,13 @@ impl EncodeWalk {
 
     /// Begin encoding a `term_to_binary/1,2` argument vector.
     #[inline]
-    pub fn new(args: &[Term]) -> Result<Self, BifError> {
+    pub fn new(args: &[Term]) -> Result<Self, EncodeError> {
         let opts = options(args.get(1).copied())?;
         Ok(Self::start(args[0], opts))
     }
 
     /// Begin a size-only walk for `external_size/1,2`, where compression is ignored.
-    pub fn new_external_size(args: &[Term]) -> Result<Self, BifError> {
+    pub fn new_external_size(args: &[Term]) -> Result<Self, EncodeError> {
         let mut opts = options(args.get(1).copied())?;
         opts.compressed = None;
         Ok(Self::start(args[0], opts))
@@ -1229,7 +1393,7 @@ impl EncodeWalk {
 
     /// Count the yield counts of the size pass, at most `budget - 1` of them.
     // Port of erts/emulator/beam/external.c:5579 (encode_size_struct_int), OTP-29.1.1.
-    fn size_step(&mut self, budget: usize, consumed: &mut usize) -> Result<bool, BifError> {
+    fn size_step(&mut self, budget: usize, consumed: &mut usize) -> Result<bool, EncodeError> {
         let mut opts = self.opts;
         let node_source = self.node_source;
         let mut stack = WStack::new();
@@ -1264,7 +1428,7 @@ impl EncodeWalk {
     }
 
     /// Advance the size pass used before result allocation.
-    pub fn step_size(&mut self, budget: usize) -> Result<(bool, usize), BifError> {
+    pub fn step_size(&mut self, budget: usize) -> Result<(bool, usize), EncodeError> {
         if self.sized {
             return Ok((true, 0));
         }
@@ -1277,7 +1441,7 @@ impl EncodeWalk {
     }
 
     /// Encode at most `budget` pending terms and patch records into the owned byte buffer.
-    pub fn step(&mut self, budget: usize) -> Result<(bool, usize), BifError> {
+    pub fn step(&mut self, budget: usize) -> Result<(bool, usize), EncodeError> {
         let mut output = std::mem::take(&mut self.cold().out);
         if output.is_empty() {
             output.push(131);
@@ -1295,13 +1459,13 @@ impl EncodeWalk {
         &mut self,
         output: &mut [u8],
         budget: usize,
-    ) -> Result<(bool, usize), BifError> {
+    ) -> Result<(bool, usize), EncodeError> {
         let (sized, size_work) = self.step_size(budget)?;
         if !sized {
             return Ok((false, budget));
         }
         if output.len() != self.output_size {
-            return Err(BifError::SystemLimit);
+            return Err(EncodeError::SystemLimit);
         }
         if !self.direct_started {
             let mut writer = OutputSlice::new(output, 0);
@@ -1310,7 +1474,7 @@ impl EncodeWalk {
                 writer.extend_from_slice(&[121, 0, 0, 0, 0]);
             }
             if writer.failed() {
-                return Err(BifError::SystemLimit);
+                return Err(EncodeError::SystemLimit);
             }
             self.written = writer.len();
             self.direct_started = true;
@@ -1322,7 +1486,7 @@ impl EncodeWalk {
         let (mut done, used) = self.step_with_output(budget, &mut writer, size_work)?;
         self.written = writer.len();
         if writer.failed() {
-            return Err(BifError::SystemLimit);
+            return Err(EncodeError::SystemLimit);
         }
         if done && self.opts.local {
             let written = self.written;
@@ -1335,19 +1499,19 @@ impl EncodeWalk {
             let (hash_done, hash_work) = hash_walk.step(writer.slice(6..written), hash_budget);
             let consumed = (hash_work / 128).saturating_mul(32);
             if hash_done {
-                let hash = hash_walk.hash().ok_or(BifError::SystemLimit)?;
+                let hash = hash_walk.hash().ok_or(EncodeError::SystemLimit)?;
                 writer.patch(2, &hash.to_be_bytes());
             } else {
                 done = false;
             }
             let used = used.saturating_add(consumed);
             if writer.failed() {
-                return Err(BifError::SystemLimit);
+                return Err(EncodeError::SystemLimit);
             }
             return Ok((done, used));
         }
         if writer.failed() {
-            return Err(BifError::SystemLimit);
+            return Err(EncodeError::SystemLimit);
         }
         Ok((done, used))
     }
@@ -1360,11 +1524,11 @@ impl EncodeWalk {
         &mut self,
         heap: &mut H,
         budget: usize,
-    ) -> Result<(RefcEncoded, usize), BifError> {
-        let size = self.output_size().ok_or(BifError::SystemLimit)?;
-        let mut binary = RefcBinary::new_zeroed(size).map_err(|_| BifError::SystemLimit)?;
+    ) -> Result<(RefcEncoded, usize), EncodeError> {
+        let size = self.output_size().ok_or(EncodeError::SystemLimit)?;
+        let mut binary = RefcBinary::new_zeroed(size).map_err(|_| EncodeError::SystemLimit)?;
         let (done, work) = self.step_into(
-            binary.bytes_mut_unique().ok_or(BifError::SystemLimit)?,
+            binary.bytes_mut_unique().ok_or(EncodeError::SystemLimit)?,
             budget,
         )?;
         if !done {
@@ -1377,17 +1541,20 @@ impl EncodeWalk {
     /// Encode a simple result directly into its final binary, using erts' stack buffer only
     /// for the compression source on the compressed simple path.
     // Port of erts/emulator/beam/external.c:2250-2319 (`erts_term_to_binary_simple`), OTP-29.1.1.
-    pub fn encode_simple_binary<H: HeapAlloc>(&mut self, heap: &mut H) -> Result<Term, BifError> {
-        let size = self.output_size().ok_or(BifError::SystemLimit)?;
+    pub fn encode_simple_binary<H: HeapAlloc>(
+        &mut self,
+        heap: &mut H,
+    ) -> Result<Term, EncodeError> {
+        let size = self.output_size().ok_or(EncodeError::SystemLimit)?;
         if size > 64 || !self.finishes_simple() {
-            return Err(BifError::BADARG);
+            return Err(EncodeError::BadArg);
         }
         let mut builder = TermBuilder::new(heap);
         if let Some(level) = self.opts.compressed.filter(|level| *level > 0) {
             let mut plain = [0; 64];
             let (done, _) = self.step_into(&mut plain[..size], usize::MAX)?;
             if !done {
-                return Err(BifError::SystemLimit);
+                return Err(EncodeError::SystemLimit);
             }
             let result = builder.binary_from_fn_with_len(size, |destination| {
                 if size >= 6 {
@@ -1411,20 +1578,20 @@ impl EncodeWalk {
                 destination[..size].copy_from_slice(&plain[..size]);
                 Ok(size)
             });
-            return result.map_err(|_| BifError::SystemLimit);
+            return result.map_err(|_| EncodeError::SystemLimit);
         }
         let mut encode_error = None;
         let result = builder.binary_from_fn(size, |destination| {
             match self.step_into(destination, usize::MAX) {
                 Ok((true, _)) => {}
-                Ok((false, _)) => encode_error = Some(BifError::SystemLimit),
+                Ok((false, _)) => encode_error = Some(EncodeError::SystemLimit),
                 Err(error) => encode_error = Some(error),
             }
         });
         if let Some(error) = encode_error {
             return Err(error);
         }
-        result.map_err(|_| BifError::SystemLimit)
+        result.map_err(|_| EncodeError::SystemLimit)
     }
 
     /// Continue the zlib stream directly into the destination's reserved byte range.
@@ -1434,21 +1601,22 @@ impl EncodeWalk {
         input: &[u8],
         output: &mut [u8],
         budget: usize,
-    ) -> Result<(bool, usize), BifError> {
+    ) -> Result<(bool, usize), EncodeError> {
         let level = self
             .opts
             .compressed
             .filter(|level| *level > 0)
-            .ok_or(BifError::BADARG)?;
+            .ok_or(EncodeError::BadArg)?;
         let cold = self.cold();
         let compressor = cold
             .compressor
             .get_or_insert_with(|| Compress::new(Compression::new(level as u32), true));
-        let input_at = usize::try_from(compressor.total_in()).map_err(|_| BifError::SystemLimit)?;
+        let input_at =
+            usize::try_from(compressor.total_in()).map_err(|_| EncodeError::SystemLimit)?;
         let output_at =
-            usize::try_from(compressor.total_out()).map_err(|_| BifError::SystemLimit)?;
+            usize::try_from(compressor.total_out()).map_err(|_| EncodeError::SystemLimit)?;
         if input_at > input.len() || output_at > output.len() {
-            return Err(BifError::SystemLimit);
+            return Err(EncodeError::SystemLimit);
         }
         if output_at == output.len() {
             return Ok((cold.compression_finished, 0));
@@ -1461,9 +1629,9 @@ impl EncodeWalk {
                 &mut output[output_at..end],
                 FlushCompress::Finish,
             )
-            .map_err(|_| BifError::SystemLimit)?;
-        let written =
-            usize::try_from(compressor.total_out() - before).map_err(|_| BifError::SystemLimit)?;
+            .map_err(|_| EncodeError::SystemLimit)?;
+        let written = usize::try_from(compressor.total_out() - before)
+            .map_err(|_| EncodeError::SystemLimit)?;
         cold.compression_finished = status == Status::StreamEnd;
         Ok((cold.compression_finished, written))
     }
@@ -1509,7 +1677,7 @@ impl EncodeWalk {
         budget: usize,
         out: &mut impl ByteOutput,
         mut consumed: usize,
-    ) -> Result<(bool, usize), BifError> {
+    ) -> Result<(bool, usize), EncodeError> {
         if !self.sized {
             let (done, size_work) = self.step_size(budget)?;
             consumed += size_work;
@@ -1545,10 +1713,11 @@ impl EncodeWalk {
                     term_from_bits(object_word)
                 } else if code == ENC_ONE_CONS_CODE {
                     let list = term_from_bits(object_word);
-                    let cons = Cons::try_from(list).map_err(|_| BifError::BADARG)?;
+                    let cons = Cons::try_from(list).map_err(|_| EncodeError::BadArg)?;
                     encode_one_cons(&mut stack, out, cons)?
                 } else if code == ENC_MAP_PAIR_CODE {
-                    let remaining = usize::try_from(object_word).map_err(|_| BifError::BADARG)?;
+                    let remaining =
+                        usize::try_from(object_word).map_err(|_| EncodeError::BadArg)?;
                     let container = term_from_bits(stack.pop_word());
                     let (key, value) = flatmap_pair(container, remaining)?;
                     if remaining > 1 {
@@ -1571,8 +1740,9 @@ impl EncodeWalk {
                     element
                 } else if code == ENC_PATCH_FUN_SIZE_CODE {
                     consumed += 1;
-                    let at = usize::try_from(object_word).map_err(|_| BifError::BADARG)?;
-                    let size = u32::try_from(out.len() - at).map_err(|_| BifError::SystemLimit)?;
+                    let at = usize::try_from(object_word).map_err(|_| EncodeError::BadArg)?;
+                    let size =
+                        u32::try_from(out.len() - at).map_err(|_| EncodeError::SystemLimit)?;
                     out.patch(at, &size.to_be_bytes());
                     continue;
                 } else if code == ENC_BIN_COPY_CODE {
@@ -1621,7 +1791,7 @@ impl EncodeWalk {
                     continue;
                 } else if code == ENC_START_SORTING_MAP_CODE {
                     debug_assert_eq!(object_word, Term::NON_VALUE.word());
-                    let mut sorting = self.cold().map_sort.take().ok_or(BifError::BADARG)?;
+                    let mut sorting = self.cold().map_sort.take().ok_or(EncodeError::BadArg)?;
                     let work_budget = budget.saturating_sub(consumed).max(1);
                     consumed += sorting.step(work_budget);
                     if sorting.is_done() {
@@ -1633,7 +1803,7 @@ impl EncodeWalk {
                     }
                     continue;
                 } else {
-                    return Err(BifError::BADARG);
+                    return Err(EncodeError::BadArg);
                 }
             };
             if !std::mem::take(&mut free_first) {
@@ -1649,7 +1819,9 @@ impl EncodeWalk {
                     if let Some(header) = term.header() {
                         if header & 63 == 0x18 {
                             // SAFETY: a live boxed FLOAT has one initialized data word.
-                            let f = unsafe { term.float_ref() }.ok_or(BifError::BADARG)?.get();
+                            let f = unsafe { term.float_ref() }
+                                .ok_or(EncodeError::BadArg)?
+                                .get();
                             if opts.minor == 0 {
                                 let s = format!("{f:.20e}");
                                 let (mantissa, exponent) = s.split_once('e').unwrap();
@@ -1669,7 +1841,7 @@ impl EncodeWalk {
                         } else {
                             // SAFETY: a live boxed integer has initialized magnitude words.
                             let n = unsafe { term.big_ref() }
-                                .ok_or(BifError::BADARG)?
+                                .ok_or(EncodeError::BadArg)?
                                 .to_bigint();
                             int_bytes(out, &n);
                         }
@@ -1681,13 +1853,13 @@ impl EncodeWalk {
                     if is_string {
                         out.push(107);
                         out.extend_from_slice(&(len as u16).to_be_bytes());
-                        let first = cons.head().as_small().ok_or(BifError::BADARG)?;
+                        let first = cons.head().as_small().ok_or(EncodeError::BadArg)?;
                         out.push(first as u8);
                         let mut cursor = cons.tail();
                         for _ in 1..len {
                             // external_string_prefix already walked these cons cells.
-                            let cell = Cons::try_from(cursor).map_err(|_| BifError::BADARG)?;
-                            out.push(cell.head().as_small().ok_or(BifError::BADARG)? as u8);
+                            let cell = Cons::try_from(cursor).map_err(|_| EncodeError::BadArg)?;
+                            out.push(cell.head().as_small().ok_or(EncodeError::BadArg)? as u8);
                             cursor = cell.tail();
                         }
                         consumed += len;
@@ -1713,7 +1885,7 @@ impl EncodeWalk {
                     }
                     if arity > 0 {
                         // WSTACK_PUSH2(s, ENC_LAST_ARRAY_ELEMENT+i-1, ptr)
-                        let pointer = tuple.element_pointer(0).ok_or(BifError::BADARG)?;
+                        let pointer = tuple.element_pointer(0).ok_or(EncodeError::BadArg)?;
                         push_tuple_pointer_task(
                             &mut stack,
                             stack_command((ENC_LAST_ARRAY_ELEMENT + arity as u64 - 1) as i64),
@@ -1722,19 +1894,20 @@ impl EncodeWalk {
                     }
                 }
                 FastEncodeKind::Rare(TermKind::Map) => {
-                    let checked = arinsal_maps::checked_map(term).map_err(|_| BifError::BADARG)?;
+                    let checked =
+                        arinsal_maps::checked_map(term).map_err(|_| EncodeError::BadArg)?;
                     match checked.kind() {
                         arinsal_maps::CheckedMapKind::Flatmap(_) => {
                             let len = checked.size();
                             out.push(116);
                             out.extend_from_slice(
                                 &u32::try_from(len)
-                                    .map_err(|_| BifError::SystemLimit)?
+                                    .map_err(|_| EncodeError::SystemLimit)?
                                     .to_be_bytes(),
                             );
                             if len > 0 && opts.deterministic {
                                 let pairs = arinsal_maps::term_to_binary_pairs(term)
-                                    .map_err(|_| BifError::BADARG)?;
+                                    .map_err(|_| EncodeError::BadArg)?;
                                 self.cold().map_sort = Some(Box::new(MapSort::new(pairs)));
                                 stack.push(ENC_START_SORTING_MAP);
                                 stack.push(Term::NON_VALUE.word());
@@ -1744,19 +1917,19 @@ impl EncodeWalk {
                             }
                         }
                         arinsal_maps::CheckedMapKind::Hashmap(_) => {
-                            let children =
-                                arinsal_term::MapNodeChildren::new(term).ok_or(BifError::BADARG)?;
+                            let children = arinsal_term::MapNodeChildren::new(term)
+                                .ok_or(EncodeError::BadArg)?;
                             if children.is_head() {
                                 let len = checked.size();
                                 out.push(116);
                                 out.extend_from_slice(
                                     &u32::try_from(len)
-                                        .map_err(|_| BifError::SystemLimit)?
+                                        .map_err(|_| EncodeError::SystemLimit)?
                                         .to_be_bytes(),
                                 );
                                 if len > 0 && opts.deterministic {
                                     let pairs = arinsal_maps::term_to_binary_pairs(term)
-                                        .map_err(|_| BifError::BADARG)?;
+                                        .map_err(|_| EncodeError::BadArg)?;
                                     self.cold().map_sort = Some(Box::new(MapSort::new(pairs)));
                                     stack.push(ENC_START_SORTING_MAP);
                                     stack.push(Term::NON_VALUE.word());
@@ -1781,11 +1954,11 @@ impl EncodeWalk {
                 }
                 FastEncodeKind::Rare(TermKind::Bitstring) => {
                     // SAFETY: the binary owner remains live and no append runs during encoding.
-                    let view = unsafe { term.binary_ref() }.ok_or(BifError::BADARG)?;
+                    let view = unsafe { term.binary_ref() }.ok_or(EncodeError::BadArg)?;
                     let bits = view.bit_len();
                     let len = bits.div_ceil(8);
                     let n = u32::try_from(len)
-                        .map_err(|_| BifError::SystemLimit)?
+                        .map_err(|_| EncodeError::SystemLimit)?
                         .to_be_bytes();
                     if bits.is_multiple_of(8) {
                         out.extend_from_slice(&[109, n[0], n[1], n[2], n[3]]);
@@ -1809,7 +1982,9 @@ impl EncodeWalk {
                                 // copy_binary_to_buffer: one memcpy of the payload.
                                 let from = view.start_bit() / 8;
                                 out.extend_from_slice(
-                                    view.bytes().get(from..from + len).ok_or(BifError::BADARG)?,
+                                    view.bytes()
+                                        .get(from..from + len)
+                                        .ok_or(EncodeError::BadArg)?,
                                 );
                             } else {
                                 out.write_bitstring(term, 0, bits)?;
@@ -1829,7 +2004,7 @@ impl EncodeWalk {
                         resolve_local_node(&mut opts, node_source);
                     }
                     let identity = local_identity(
-                        term.identity().ok_or(BifError::BADARG)?,
+                        term.identity().ok_or(EncodeError::BadArg)?,
                         internal,
                         opts.local,
                         opts.local_node,
@@ -1903,7 +2078,7 @@ impl EncodeWalk {
                             push_term_task(
                                 &mut stack,
                                 ENC_TERM,
-                                view.free(i).ok_or(BifError::BADARG)?,
+                                view.free(i).ok_or(EncodeError::BadArg)?,
                             );
                         }
                         push_term_task(&mut stack, ENC_TERM, entry.pid);
@@ -1918,25 +2093,25 @@ impl EncodeWalk {
                     atom_bytes_in(table, out, record.module(), opts.minor)?;
                     atom_bytes_in(table, out, record.name(), opts.minor)?;
                     for i in 0..record.len() {
-                        let sorted = record.sorted_index(i).ok_or(BifError::BADARG)?;
+                        let sorted = record.sorted_index(i).ok_or(EncodeError::BadArg)?;
                         atom_bytes_in(
                             table,
                             out,
-                            record.key(sorted).ok_or(BifError::BADARG)?,
+                            record.key(sorted).ok_or(EncodeError::BadArg)?,
                             opts.minor,
                         )?;
                     }
                     for i in (0..record.len()).rev() {
-                        let sorted = record.sorted_index(i).ok_or(BifError::BADARG)?;
+                        let sorted = record.sorted_index(i).ok_or(EncodeError::BadArg)?;
                         push_term_task(
                             &mut stack,
                             ENC_TERM,
-                            record.value(sorted).ok_or(BifError::BADARG)?,
+                            record.value(sorted).ok_or(EncodeError::BadArg)?,
                         );
                     }
                 }
                 FastEncodeKind::Rare(_) => {
-                    return Err(BifError::Unsupported("ETF representation"));
+                    return Err(EncodeError::BadArg);
                 }
             }
         }
@@ -1951,18 +2126,18 @@ impl EncodeWalk {
         self.current_term = cur;
         self.free_first = !done;
         if out.failed() || (done && !iovec && out.len() != self.output_size) {
-            return Err(BifError::SystemLimit);
+            return Err(EncodeError::SystemLimit);
         }
         Ok((done, if done { consumed } else { budget.max(consumed) }))
     }
 
     /// Finish compression and return the serialized byte vector.
-    pub fn finish_binary(self) -> Result<Vec<u8>, BifError> {
+    pub fn finish_binary(self) -> Result<Vec<u8>, EncodeError> {
         self.finish_binary_buffer().map(SmallVec::into_vec)
     }
 
     /// Finish as an inline buffer when the ETF output is small.
-    pub fn finish_binary_buffer(mut self) -> Result<SmallVec<[u8; 64]>, BifError> {
+    pub fn finish_binary_buffer(mut self) -> Result<SmallVec<[u8; 64]>, EncodeError> {
         self.patch_local_hash();
         if self.opts.compressed.is_some_and(|level| level > 0) {
             return encode_bytes(self.take_out(), self.opts).map(SmallVec::from_vec);
@@ -1983,7 +2158,7 @@ impl EncodeWalk {
     }
 
     /// Finish as `term_to_iovec/1,2`, preserving large-binary split boundaries.
-    pub fn finish_iovec(mut self) -> Result<(Vec<Vec<u8>>, bool), BifError> {
+    pub fn finish_iovec(mut self) -> Result<(Vec<Vec<u8>>, bool), EncodeError> {
         self.patch_local_hash();
         if self.opts.compressed.is_some_and(|level| level > 0) {
             return Ok((vec![encode_bytes(self.take_out(), self.opts)?], true));
@@ -2008,7 +2183,7 @@ impl EncodeWalk {
 /// Encode one term with the default `term_to_binary/1` options without running its BIF body.
 ///
 /// Port of erts/emulator/beam/external.c:3305 (`erts_term_to_binary`), OTP-29.1.1.
-pub fn encode_term_to_binary(term: Term) -> Result<Vec<u8>, BifError> {
+pub fn encode_term_to_binary(term: Term) -> Result<Vec<u8>, EncodeError> {
     let mut walk = EncodeWalk::new(&[term])?;
     walk.step(usize::MAX)?;
     walk.finish_binary()
@@ -2078,7 +2253,7 @@ fn write_node(
     node: arinsal_term::Atom,
     internal: bool,
     opts: EncodeOpts,
-) -> Result<(), BifError> {
+) -> Result<(), EncodeError> {
     if opts.local && internal {
         out.push(106);
         Ok(())
@@ -2092,12 +2267,12 @@ fn local_creation(creation: u32, internal: bool, opts: EncodeOpts) -> u32 {
     if opts.local && internal { 0 } else { creation }
 }
 
-fn encode_bytes(plain: Vec<u8>, opts: EncodeOpts) -> Result<Vec<u8>, BifError> {
+fn encode_bytes(plain: Vec<u8>, opts: EncodeOpts) -> Result<Vec<u8>, EncodeError> {
     if let Some(level) = opts.compressed.filter(|n| *n > 0) {
         let mut z = flate2::write::ZlibEncoder::new(Vec::new(), Compression::new(level as u32));
         z.write_all(&plain[1..])
-            .map_err(|_| BifError::SystemLimit)?;
-        let bytes = z.finish().map_err(|_| BifError::SystemLimit)?;
+            .map_err(|_| EncodeError::SystemLimit)?;
+        let bytes = z.finish().map_err(|_| EncodeError::SystemLimit)?;
         // Port of erts/emulator/beam/external.c:2276-2300, OTP-29.1.1.
         if bytes.len() + 5 < plain.len() {
             let mut compressed = vec![131, 80];

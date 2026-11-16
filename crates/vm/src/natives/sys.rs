@@ -56,6 +56,12 @@ impl StatisticsOrigins {
 /// Initialize clock origins before a VM can execute code.
 pub(crate) fn initialize_statistics_origins() -> StatisticsOrigins {
     arinsal_bifs::initialize_time_origin();
+    // erts_late_init_external: the node hash of LOCAL_EXT reads the time offset and clock here.
+    arinsal_external::erts_late_init_external(
+        arinsal_bifs::time_offset_nanos_value().expect("the system time offset is available")
+            as i64,
+        arinsal_bifs::monotonic_time_raw_nanos() as u32,
+    );
     StatisticsOrigins::now()
 }
 
