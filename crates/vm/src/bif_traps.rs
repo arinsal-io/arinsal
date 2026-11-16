@@ -266,38 +266,6 @@ fn unicode_trap(
     })
 }
 
-// Port of erts/emulator/beam/erl_unicode.c:851 (characters_to_utf8_trap), OTP-29.1.1.
-fn unicode_binary_trap(
-    process: &mut Process,
-    state: Option<&MagicBin>,
-) -> Result<HandlerResult, BifError> {
-    // BIF_TRAP4 restores the continuation arguments in the live X registers.
-    let cont = arinsal_bifs::UnicodeCont::from_binary_trap_arguments(&process.x[..4])
-        .ok_or(BifError::BADARG)?;
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut bif_state = arinsal_bifs::BifState::default();
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut bif_state);
-    match arinsal_bifs::unicode_resume(&mut ctx, &cont) {
-        arinsal_bifs::UnicodeStep::Done(value) => Ok(HandlerResult::Done {
-            value,
-            reductions: 0,
-        }),
-        arinsal_bifs::UnicodeStep::More(cont) => {
-            let trap_args = cont.binary_trap_arguments().ok_or(BifError::BADARG)?;
-            process.x.ensure_x(trap_args.len());
-            process.x[..trap_args.len()].copy_from_slice(&trap_args);
-            process.gc_live = trap_args.len();
-            Ok(HandlerResult::Yield {
-                continuation: cont.continuation(),
-                state: state
-                    .cloned()
-                    .unwrap_or_else(|| argument_trap_state(NoContext)),
-                reductions: 0,
-            })
-        }
-    }
-}
-
 fn unicode_convert_start(
     process: &mut Process,
     args: &[Term],
@@ -360,25 +328,6 @@ fn unicode_convert_start(
     }
 }
 
-// Port of erts/emulator/beam/erl_unicode.c:931 (unicode_characters_to_binary_2), OTP-29.1.1.
-fn unicode_characters_to_binary(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&MagicBin>,
-    _pid: Option<arinsal_sched::Pid>,
-    _gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    if state.is_none()
-        && let Some(value) = arinsal_bifs::unicode_utf8_binary_fast_path(args)?
-    {
-        return Ok(HandlerResult::Done {
-            value,
-            reductions: 0,
-        });
-    }
-    unicode_convert_start(process, args, state, "characters_to_binary")
-}
-
 // Port of erts/emulator/beam/erl_unicode.c:1122 (unicode_characters_to_list_2), OTP-29.1.1.
 fn unicode_characters_to_list(
     process: &mut Process,
@@ -404,15 +353,6 @@ macro_rules! unicode_trap_entry {
     };
 }
 
-fn erlang_characters_to_utf8_trap(
-    process: &mut Process,
-    _args: &[Term],
-    state: Option<&MagicBin>,
-    _pid: Option<arinsal_sched::Pid>,
-    _gc_changed: bool,
-) -> Result<HandlerResult, BifError> {
-    unicode_binary_trap(process, state)
-}
 unicode_trap_entry!(erlang_characters_to_list_trap_1);
 unicode_trap_entry!(erlang_characters_to_list_trap_2);
 unicode_trap_entry!(erlang_characters_to_list_trap_3);
@@ -428,24 +368,10 @@ const ENTRIES: &[Entry] = &[
     },
     Entry {
         module: "unicode",
-        function: "characters_to_binary",
-        arity: 2,
-        continuation: "erlang:characters_to_utf8_trap/4",
-        handler: unicode_characters_to_binary,
-    },
-    Entry {
-        module: "unicode",
         function: "characters_to_list",
         arity: 2,
         continuation: "erlang:characters_to_list_trap_1/3",
         handler: unicode_characters_to_list,
-    },
-    Entry {
-        module: "erlang",
-        function: "characters_to_utf8_trap",
-        arity: 4,
-        continuation: "erlang:characters_to_utf8_trap/4",
-        handler: erlang_characters_to_utf8_trap,
     },
     Entry {
         module: "erlang",

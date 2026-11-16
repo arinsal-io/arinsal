@@ -28,6 +28,11 @@ static BINARY_LOOP_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 static RE_LOOP_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(64_000);
 static UNICODE_LOOP_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(40_000);
 
+/// The `unicode_loop_limit` debug state (`max_loop_limit` of erl_unicode.c).
+pub(crate) fn unicode_loop_limit() -> u64 {
+    UNICODE_LOOP_LIMIT.load(Ordering::Relaxed)
+}
+
 /// The `binary_loop_limit` debug state: zero means no limit.
 pub(crate) fn binary_loop_limit() -> u64 {
     BINARY_LOOP_LIMIT.load(Ordering::Relaxed)

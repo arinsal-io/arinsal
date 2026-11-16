@@ -974,6 +974,16 @@ impl HeapBinaryWriter {
         unsafe { std::slice::from_raw_parts_mut(data.wrapping_add(2).cast::<u8>(), self.bytes) }
     }
 
+    /// `erts_shrink_binary_term` of the reserved heap binary: only `used` bytes are visible.
+    // Port of erts/emulator/beam/erl_bits.c (erts_shrink_binary_term), OTP-29.1.1.
+    pub fn shrink_to(&mut self, used: usize) {
+        assert!(!self.finished, "heap binary writer is finalized");
+        assert!(used <= self.bytes, "shrink beyond the reservation");
+        let start = (self.term.0 & !7) as *mut u64;
+        store(start.wrapping_add(1), (used * 8) as u64);
+        self.written = self.bytes;
+    }
+
     /// Record that the payload was filled through [`Self::bytes_mut`].
     pub fn set_written(&mut self, bytes: usize) {
         assert!(bytes <= self.bytes, "written bytes exceed the reservation");
