@@ -28,15 +28,14 @@ mod lists;
 mod pure;
 mod sys;
 mod time;
-mod unicode;
 mod unique;
 
 pub use lists::{
     APPEND_ALLOC_PER_RED, APPEND_EMPTY_PER_RED, APPEND_ONHEAP_PER_RED, AppendCont, AppendStep,
-    DeferredTrap, KEYFIND_MAX_ITER, KeyOp, KeyOutcome, KeyfindCont, LENGTH_PER_RED, LengthCont,
-    LengthStep, MEMBER_PER_RED, MemberCont, MemberStep, REVERSE_CELLS_PER_RED,
-    REVERSE_ONHEAP_CELLS_PER_RED, ReverseCont, ReverseStep, SubtractWalk, append_onheap_direct,
-    length_slice, lists_append, lists_key, lists_member, lists_reverse, reverse_onheap_direct,
+    KEYFIND_MAX_ITER, KeyOp, KeyOutcome, KeyfindCont, LENGTH_PER_RED, LengthCont, LengthStep,
+    MEMBER_PER_RED, MemberCont, MemberStep, REVERSE_CELLS_PER_RED, REVERSE_ONHEAP_CELLS_PER_RED,
+    ReverseCont, ReverseStep, SubtractWalk, append_onheap_direct, length_slice, lists_append,
+    lists_key, lists_member, lists_reverse, reverse_onheap_direct,
 };
 pub use pure::{
     B2L_BYTES_PER_REDUCTION, BinarySearchKind, BinarySearchWalk, BinaryToListWalk, IolistVecWalk,
@@ -52,10 +51,6 @@ pub use pure::{
 pub use time::{
     monotonic_time_milliseconds, monotonic_time_nanos, monotonic_time_raw_nanos, next_now_micros,
     time_offset_nanos_value,
-};
-pub use unicode::{
-    UnicodeCont, UnicodeStage, UnicodeStep, set_locale_utf8 as unicode_set_locale_utf8,
-    unicode_resume, unicode_utf8_binary_fast_path,
 };
 pub use unique::{
     SchedulerRefState, UniqueInt, bind_scheduler_ref_state, debug_make_unique_integer,
@@ -133,8 +128,6 @@ pub struct BifCall {
     pub fallback_reductions: u32,
     /// `usize::MAX` runs the BIF to completion. A finite budget is one scheduler slice.
     pub budget: usize,
-    /// Deferred continuation installed by the VM after the BIF body returns.
-    pub deferred: Option<Box<lists::DeferredTrap>>,
     /// Context-local failure when this state is not attached to a process exception record.
     pub error: Option<BifError>,
     /// Whether reductions are charged against `fcalls`.
@@ -152,7 +145,6 @@ impl Default for BifCall {
             initial_fcalls: 0,
             fallback_reductions: 0,
             budget: usize::MAX,
-            deferred: None,
             error: None,
             has_fcalls: false,
             uses_process_exc: false,
@@ -176,10 +168,7 @@ impl BifCall {
         self.initial_fcalls = fcalls;
         self.fallback_reductions = 0;
         self.budget = usize::MAX;
-        // Both fields are `None` on every value path; assigning drops the old value each call.
-        if self.deferred.is_some() {
-            self.deferred = None;
-        }
+        // `error` is `None` on every value path; assigning would drop the old value each call.
         if self.error.is_some() {
             self.error = None;
         }
@@ -190,9 +179,8 @@ impl BifCall {
     /// Initialize a process BIF context that writes failures to the ABI exception words.
     #[inline]
     pub fn begin_process_call(&mut self, fcalls: i32) {
-        // A process BIF consumes deferred work and context errors before returning. Keep
-        // those cold fields untouched on the value path; clearing an `Option<Box<_>>`
-        // here makes construction drop glue for every ordinary BIF call.
+        // A process BIF consumes context errors before returning. Keep that cold field
+        // untouched on the value path.
         self.initial_fcalls = fcalls;
         self.budget = usize::MAX;
         self.has_fcalls = true;
@@ -204,7 +192,6 @@ impl BifCall {
         self.initial_fcalls = 0;
         self.fallback_reductions = 0;
         self.budget = usize::MAX;
-        self.deferred = None;
         self.error = None;
         self.has_fcalls = false;
         self.uses_process_exc = false;
@@ -238,11 +225,6 @@ impl<'a, H: HeapAlloc> ProcessBif<'a, H> {
     /// One scheduler slice, from `ERTS_BIF_REDS_LEFT`.
     pub fn set_reduction_budget(&mut self, budget: usize) {
         self.state.budget = budget;
-    }
-
-    /// Remember a continuation. The VM installs it only after this call returns.
-    pub fn defer_trap(&mut self, trap: lists::DeferredTrap) {
-        self.state.deferred = Some(Box::new(trap));
     }
 
     /// Fail the call: leave `error` in the process' failure words (or in the context when it
@@ -279,36 +261,11 @@ impl<'a, H: HeapAlloc> ProcessBif<'a, H> {
         self.fail(BifError::Error(reason))
     }
 
-    /// Defer the continuation `trap` and return the non-value: `BIF_TRAP`.
-    // Port of erts/emulator/beam/bif.h (BIF_TRAP sets c_p->freason = TRAP), OTP-29.1.1.
-    #[inline]
-    pub fn trap(&mut self, trap: lists::DeferredTrap) -> Term {
-        self.defer_trap(trap);
-        self.mark_pending_trap();
-        Term::NON_VALUE
-    }
-
-    /// Mark a deferred process BIF as a trap while preserving its continuation.
-    // Port of BIF_TRAP in erts/emulator/beam/bif.h, OTP-29.1.1.
-    pub(crate) fn mark_pending_trap(&mut self) {
-        if self.state.uses_process_exc
-            && let Some(abi) = self.heap.native_abi_mut()
-        {
-            abi.exc.freason = arinsal_term::exc::TRAP;
-        }
-    }
-
     /// The failure of a body that returned the non-value, for a context without process
     /// failure words.
     #[inline]
     pub fn take_context_failure(&mut self) -> Option<BifError> {
         self.state.error.take()
-    }
-
-    /// Whether a continuation was deferred.
-    #[inline]
-    pub fn has_deferred(&self) -> bool {
-        self.state.deferred.is_some()
     }
 
     /// Record why the body returned the non-value.
@@ -321,11 +278,6 @@ impl<'a, H: HeapAlloc> ProcessBif<'a, H> {
     #[inline]
     pub fn take_error(&mut self) -> Option<BifError> {
         self.state.error.take()
-    }
-
-    /// Take a continuation the BIF deferred, if the slice ran out.
-    pub fn take_deferred(&mut self) -> Option<Box<lists::DeferredTrap>> {
-        self.state.deferred.take()
     }
 
     /// Charge work performed by this BIF so the VM can schedule large calls.
@@ -507,10 +459,6 @@ pub trait BifBody {
     // Port of erts/emulator/beam/bif.h (BIF_ERROR returns THE_NON_VALUE), OTP-29.1.1.
     fn call_word(process: &mut ProcessBif<'_>, args: &[Term], instruction: usize) -> u64 {
         match Self::call_process(process, args, instruction) {
-            Ok(_value) if process.has_deferred() => {
-                process.mark_pending_trap();
-                arinsal_term::THE_NON_VALUE
-            }
             Ok(value) => value.word(),
             Err(error) => {
                 process.set_error(error);
@@ -560,7 +508,7 @@ pub fn visit_bif<V: BifTableVisitor>(
     if let Some(found) = pure::lookup(module, name, arity, visitor) {
         return Some(found);
     }
-    unicode::lookup(module, name, arity, visitor)
+    None
 }
 
 /// One [`BifBody`] per BIF function of a module, named after the function, in
@@ -627,8 +575,6 @@ macro_rules! word_bif_bodies_in {
                         let value = super::$bif(ctx, args);
                         if !value.is_non_value() {
                             Ok(value)
-                        } else if ctx.has_deferred() {
-                            Ok(arinsal_term::Term::NIL)
                         } else {
                             Err(ctx.take_context_failure().unwrap_or($crate::BifError::BADARG))
                         }
@@ -639,13 +585,7 @@ macro_rules! word_bif_bodies_in {
                         args: &[arinsal_term::Term],
                         _instruction: usize,
                     ) -> u64 {
-                        let value = super::$bif(ctx, args);
-                        if ctx.has_deferred() {
-                            ctx.mark_pending_trap();
-                            arinsal_term::THE_NON_VALUE
-                        } else {
-                            value.word()
-                        }
+                        super::$bif(ctx, args).word()
                     }
                 }
             )*

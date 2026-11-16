@@ -1577,3 +1577,253 @@ pub(crate) extern "C" fn characters_to_list_trap_4(
         tail,
     )
 }
+
+// ---- filename conversion --------------------------------------------------------------------
+
+/// How the OS names files, as `erts_get_native_filename_encoding` reports it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FilenameEncoding {
+    Latin1,
+    Utf8,
+    /// UTF-8 with the decomposed forms macOS stores; names are recomposed on the way in.
+    Utf8Mac,
+}
+
+/// Whether the environment's locale uses a UTF-8 codeset, as the runtime found out at boot
+/// (`erts_init_sys_common_misc`); set once by the VM, which owns the libc locale calls.
+static LOCALE_UTF8: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Record the locale's codeset; later calls are ignored.
+pub(crate) fn set_locale_utf8(utf8: bool) {
+    let _ = LOCALE_UTF8.set(utf8);
+}
+
+/// Port of erts/emulator/sys/common/erl_sys_common_misc.c (erts_init_sys_common_misc),
+/// OTP-29.1.1. The `+fn` flags that override the locale are not honoured. Without a boot
+/// (unit tests) the locale environment variables decide, as erts' `PRIMITIVE_UTF8_CHECK`.
+fn filename_encoding() -> FilenameEncoding {
+    // macOS, Windows and Android default the user-requested encoding to UTF-8.
+    if cfg!(target_os = "macos") {
+        return FilenameEncoding::Utf8Mac;
+    }
+    let utf8 = LOCALE_UTF8.get().copied().unwrap_or_else(|| {
+        ["LC_ALL", "LC_CTYPE", "LANG"]
+            .iter()
+            .filter_map(|name| std::env::var(name).ok())
+            .find(|value| !value.is_empty())
+            .is_some_and(|value| value.contains("UTF-8"))
+    });
+    if utf8 {
+        FilenameEncoding::Utf8
+    } else {
+        FilenameEncoding::Latin1
+    }
+}
+
+fn valid_cp(cp: u32) -> bool {
+    cp <= 0x10ffff && !(0xd800..=0xdfff).contains(&cp)
+}
+
+/// `erts_native_filename_need` and the copy of `erts_convert_filename_to_native`: the bytes of a
+/// name given as a (deep) list of code points; `None` when it is not a valid name.
+// Port of erts/emulator/beam/erl_unicode.c (erts_native_filename_need), OTP-29.1.1.
+fn filename_list_bytes(root: Term, encoding: FilenameEncoding) -> Option<Vec<u8>> {
+    if root != Term::NIL && Cons::try_from(root).is_err() {
+        return None;
+    }
+    let mut result = Vec::new();
+    let mut stack = Vec::new();
+    let mut current = root;
+    loop {
+        if current == Term::NIL {
+            match stack.pop() {
+                Some(next) => current = next,
+                None => break,
+            }
+            continue;
+        }
+        let cell = Cons::try_from(current).ok()?;
+        let (head, tail) = cell.pair();
+        if head == Term::NIL {
+            current = tail;
+        } else if Cons::try_from(head).is_ok() {
+            stack.push(tail);
+            current = head;
+        } else {
+            let cp = head.as_small().and_then(|n| u32::try_from(n).ok())?;
+            if cp == 0 || !valid_cp(cp) {
+                return None;
+            }
+            if encoding == FilenameEncoding::Latin1 {
+                result.push(u8::try_from(cp).ok()?);
+            } else {
+                let mut buffer = [0; 4];
+                result.extend_from_slice(
+                    char::from_u32(cp)
+                        .expect("a valid code point")
+                        .encode_utf8(&mut buffer)
+                        .as_bytes(),
+                );
+            }
+            current = tail;
+        }
+    }
+    Some(result)
+}
+
+/// A list of the code points, in order, from one reservation.
+fn codepoint_list(process: &mut Process, points: &[u32]) -> Term {
+    let terms: smallvec::SmallVec<[Term; 64]> = points
+        .iter()
+        .map(|&cp| Term::small(i64::from(cp)).expect("a code point is small"))
+        .collect();
+    TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
+        .list_from_slice_with_tail(&terms, Term::NIL)
+        .expect("HAlloc")
+}
+
+/// `prim_file:internal_name2native/1`.
+// Port of erts/emulator/beam/erl_unicode.c (prim_file_internal_name2native_1), OTP-29.1.1.
+pub(crate) extern "C" fn prim_file_internal_name2native_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [name] = crate::bif_table::bif_args::<1>(reg);
+    let data = if is_bitstring(name) {
+        match aligned_bytes(name) {
+            Some(bytes) if !bytes.contains(&0) => bytes.into_owned(),
+            _ => return bif_ret(c_p, i, Err(badarg())),
+        }
+    } else {
+        match filename_list_bytes(name, filename_encoding()) {
+            Some(bytes) => bytes,
+            None => return bif_ret(c_p, i, Err(badarg())),
+        }
+    };
+    let mut data = data;
+    data.push(0);
+    let result = binary(process, &data);
+    crate::native_hooks::raw(result)
+}
+
+/// `prim_file:internal_native2name/1`.
+// Port of erts/emulator/beam/erl_unicode.c (prim_file_internal_native2name_1), OTP-29.1.1.
+pub(crate) extern "C" fn prim_file_internal_native2name_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [name] = crate::bif_table::bif_args::<1>(reg);
+    let Some(data) = aligned_bytes(name) else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    if data.is_empty() {
+        return crate::native_hooks::raw(Term::NIL);
+    }
+    let encoding = filename_encoding();
+    if encoding == FilenameEncoding::Latin1 {
+        let points: Vec<u32> = data.iter().map(|&b| u32::from(b)).collect();
+        let list = codepoint_list(process, &points);
+        return crate::native_hooks::raw(list);
+    }
+    let Ok(text) = std::str::from_utf8(&data) else {
+        let warning = Term::atom(
+            arinsal_term::global_atoms()
+                .intern("warning")
+                .expect("the warning atom"),
+        );
+        let result = TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
+            .tuple(&[Term::atom(atoms::ERROR), warning])
+            .expect("HAlloc");
+        return crate::native_hooks::raw(result);
+    };
+    let points: Vec<u32> = text.chars().map(|c| c as u32).collect();
+    let points = if encoding == FilenameEncoding::Utf8Mac {
+        super::erl_unicode_normalize::normalize_filename(points)
+    } else {
+        points
+    };
+    let list = codepoint_list(process, &points);
+    crate::native_hooks::raw(list)
+}
+
+/// `prim_file:internal_normalize_utf8/1`.
+// Port of erts/emulator/beam/erl_unicode.c (prim_file_internal_normalize_utf8_1), OTP-29.1.1.
+pub(crate) extern "C" fn prim_file_internal_normalize_utf8_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [name] = crate::bif_table::bif_args::<1>(reg);
+    let Some(data) = aligned_bytes(name) else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    let Ok(text) = std::str::from_utf8(&data) else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    let points: Vec<u32> = text.chars().map(|c| c as u32).collect();
+    let normalized = super::erl_unicode_normalize::normalize_filename(points);
+    let list = codepoint_list(process, &normalized);
+    crate::native_hooks::raw(list)
+}
+
+/// `prim_file:is_translatable/1`.
+// Port of erts/emulator/beam/erl_unicode.c (prim_file_is_translatable_1), OTP-29.1.1.
+pub(crate) extern "C" fn prim_file_is_translatable_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [name] = crate::bif_table::bif_args::<1>(reg);
+    let Some(data) = aligned_bytes(name) else {
+        return bif_ret(c_p, i, Err(badarg()));
+    };
+    let translatable = data.is_empty()
+        || filename_encoding() == FilenameEncoding::Latin1
+        || std::str::from_utf8(&data).is_ok();
+    crate::native_hooks::raw(Term::atom(if translatable {
+        atoms::TRUE
+    } else {
+        atoms::FALSE
+    }))
+}
+
+/// `file:native_name_encoding/0`.
+// Port of erts/emulator/beam/erl_unicode.c (file_native_name_encoding_0), OTP-29.1.1.
+pub(crate) extern "C" fn file_native_name_encoding_0(
+    _c_p: *mut ProcessHeader,
+    _reg: *mut u64,
+    _i: u64,
+) -> u64 {
+    crate::native_hooks::raw(Term::atom(match filename_encoding() {
+        FilenameEncoding::Latin1 => atoms::LATIN1,
+        FilenameEncoding::Utf8 | FilenameEncoding::Utf8Mac => atoms::UTF8,
+    }))
+}
+
+/// `io:printable_range/0`: the OTP 29.1.1 default without the `+pc` emulator flag.
+// Port of erts/emulator/beam/erl_unicode.c (io_printable_range_0), OTP-29.1.1.
+pub(crate) extern "C" fn io_printable_range_0(
+    _c_p: *mut ProcessHeader,
+    _reg: *mut u64,
+    _i: u64,
+) -> u64 {
+    crate::native_hooks::raw(Term::atom(atoms::LATIN1))
+}

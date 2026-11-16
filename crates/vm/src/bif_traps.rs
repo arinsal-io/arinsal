@@ -35,7 +35,6 @@ arinsal_term::magic_payload!(
     NoContext => no_context_destructor,
     TrapContext<arinsal_bifs::Phash2Cont> => make_hash2_destructor,
     CodePermission => code_permission_destructor,
-    TrapContext<arinsal_bifs::UnicodeCont> => unicode_restart_destructor,
     TrapContext<arinsal_bifs::BinarySearchWalk> => binary_find_context_destructor,
     TrapContext<BinaryCopyState> => binary_copy_destructor,
     TrapContext<PtabListContinuation> => cleanup_ptab_list_bif_data,
@@ -158,8 +157,6 @@ const RE_URUN_CONTINUATION: &str = "re:urun/3";
 // C payload sizes passed to erts_create_magic_binary on macOS arm64. The separate magic binary
 // data offset is added by MagicBin::with_erts_payload_size.
 // Port of erts/emulator/beam/erl_bif_re.c (RestartContext).
-// Port of erts/emulator/beam/erl_unicode.c (RestartContext).
-const ERTS_UNICODE_RESTART_CONTEXT_SIZE: usize = 40;
 // Port of erts/emulator/beam/erl_bif_re.c (RestartContext).
 const ERTS_REGEX_RESTART_CONTEXT_SIZE: usize = 64;
 const ERTS_BINARY_FIND_CONTEXT_SIZE: usize = 312;
@@ -1241,54 +1238,6 @@ pub(crate) fn finish_light(
     process.set_gc_enabled(gc_was_enabled);
     charge_light(process, reductions);
     LightTrap::Returned(result)
-}
-
-/// Install a list-BIF continuation after the plain call's counter ran out.
-///
-/// The scan itself was the plain BIF. This only does what `BIF_TRAP` does once
-/// `max_iter` is exhausted.
-pub(crate) fn install_deferred_trap(
-    process: &mut Process,
-    import: usize,
-    callee: (arinsal_term::Atom, arinsal_term::Atom),
-    args: &[Term],
-    trap: arinsal_bifs::DeferredTrap,
-) -> Result<(), arinsal_term::TermError> {
-    let gc_was_enabled = process.heap.gc_enabled;
-    let (continuation, state) = match trap {
-        arinsal_bifs::DeferredTrap::Unicode(cont) => (
-            cont.continuation(),
-            magic_binary_state(TrapContext::new(cont), ERTS_UNICODE_RESTART_CONTEXT_SIZE),
-        ),
-    };
-    let state_term = trap_state_term(process, &state)?;
-    let gc_policy = trap_gc_policy(continuation);
-    if gc_policy == TrapGc::Disabled {
-        process.set_gc_enabled(false);
-    }
-    let root_args = match gc_policy {
-        TrapGc::RootedArgs(n) => n,
-        _ => 0,
-    };
-    let mut saved = [Term::NIL; 4];
-    let arity = args.len().min(4);
-    saved[..arity].copy_from_slice(&args[..arity]);
-    process.slice_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
-        caller_module: process.trap_site().0,
-        caller_ip: process.trap_site().1,
-        schedule_out: true,
-        import,
-        continuation,
-        target: continuation_target(continuation),
-        state,
-        state_term,
-        gc_was_enabled,
-        arity,
-        callee,
-        root_args,
-        args: saved,
-    });
-    Ok(())
 }
 
 /// Charges a light trapping BIF's reductions against FCALLS (BUMP_REDS, bif.h); the call site

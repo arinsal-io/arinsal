@@ -58,5 +58,6 @@ mod reds_size_bifs_differential;
 mod reg_table;
 mod small_gaps;
 mod system_info_light;
+mod unicode_filename_differential;
 mod unicode_to_binary_differential;
 mod unicode_to_list_differential;

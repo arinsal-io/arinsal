@@ -1625,7 +1625,7 @@ pub(crate) extern "C" fn plain_bif_light(
     let Some(bif) = export.light_bif else {
         return park_executor(process, export, identity, false);
     };
-    call_plain_bif(process, registers, identity as usize, export, bif, false)
+    call_plain_bif(process, registers, export, bif, false)
 }
 
 /// `bif_table[].f` of one plain BIF: the body is this entry's own callee.
@@ -1638,20 +1638,16 @@ pub(crate) extern "C" fn plain_bif_entry<B: arinsal_bifs::BifBody>(
 ) -> u64 {
     // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
     // finds its export through `c_p->current`, which the call fragment set.
-    let (descriptor, identity) = crate::bif_table::current_export(header);
+    let (descriptor, _) = crate::bif_table::current_export(header);
     let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, regs) else {
         return 0;
     };
     let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
         return 0;
     };
-    call_plain_bif_word(
-        process,
-        registers,
-        identity as usize,
-        export,
-        |process, args| B::call_word(process, args, instruction as usize),
-    )
+    call_plain_bif_word(process, registers, export, |process, args| {
+        B::call_word(process, args, instruction as usize)
+    })
 }
 
 /// A process BIF (`c_p` plus the register array), chosen when the export was created.
@@ -1801,14 +1797,7 @@ fn invoke_dispatch_bif(
             && !export_checks
             && !export.trap_entry
         {
-            return Some(call_plain_bif(
-                process,
-                registers,
-                identity,
-                export,
-                bif,
-                export_call,
-            ));
+            return Some(call_plain_bif(process, registers, export, bif, export_call));
         }
         // ETS and the process dictionary run here so a `call_ext` does not trap back
         // into the executor once per key.
@@ -2037,14 +2026,7 @@ fn invoke_dispatch_bif_slow(
         return None;
     }
     let bif = export.bif?;
-    Some(call_plain_bif(
-        process,
-        registers,
-        identity,
-        export,
-        bif,
-        export_call,
-    ))
+    Some(call_plain_bif(process, registers, export, bif, export_call))
 }
 
 /// Runs an ETS or process-dictionary BIF from native code.
@@ -2269,7 +2251,6 @@ fn finish_counter_bif(
 fn call_plain_bif(
     process: &mut crate::Process,
     registers: &mut arinsal_beamasm::SchedulerRegisters,
-    identity: usize,
     export: ExportDispatch,
     bif: arinsal_bifs::BifFn,
     export_call: bool,
@@ -2277,7 +2258,7 @@ fn call_plain_bif(
     if let Some(raw) = fast_scheduler_bif(process, registers, export, export_call) {
         return raw;
     }
-    call_plain_bif_body(process, registers, identity, export, bif, export_call)
+    call_plain_bif_body(process, registers, export, bif, export_call)
 }
 
 /// [`call_plain_bif`] once the BIF is known not to be a scheduler counter.
@@ -2285,7 +2266,6 @@ fn call_plain_bif(
 fn call_plain_bif_body(
     process: &mut crate::Process,
     registers: &mut arinsal_beamasm::SchedulerRegisters,
-    identity: usize,
     export: ExportDispatch,
     bif: impl Fn(&mut arinsal_bifs::Ctx<'_>, &[Term]) -> Result<Term, arinsal_bifs::BifError>,
     export_call: bool,
@@ -2303,14 +2283,12 @@ fn call_plain_bif_body(
     let mut call = arinsal_bifs::BifCall::default();
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut call);
     let result = bif(&mut ctx, &registers.x_reg_array[..arity]);
-    let deferred = ctx.take_deferred();
     // ERTS_IS_GC_DESIRED_INTERNAL: a value goes straight back in x0, and the native
     // light-BIF fragment tests the collection itself (instr_bif.cpp:488-523). The
     // fragment installs x0 in the cached X register, so the result need not also be
     // copied to the scheduler register array. Only the export trampoline, which has no
     // such test, checks collection here.
-    if deferred.is_none()
-        && let Ok(value) = &result
+    if let Ok(value) = &result
         && (!export_call
             || (process.heap.stack_index() - process.heap.heap_top_index()
                 >= process.heap.mbuf_size()
@@ -2322,7 +2300,7 @@ fn call_plain_bif_body(
         }
         return crate::native_hooks::raw(value);
     }
-    plain_bif_slow(process, registers, identity, export, result, deferred)
+    plain_bif_slow(process, registers, export, result)
 }
 
 /// Everything after a light BIF that did not just return a value: a continuation the body
@@ -2336,17 +2314,10 @@ fn call_plain_bif_body(
 fn plain_bif_slow(
     process: &mut crate::Process,
     registers: &mut arinsal_beamasm::SchedulerRegisters,
-    identity: usize,
     export: ExportDispatch,
     result: Result<Term, arinsal_bifs::BifError>,
-    deferred: Option<Box<arinsal_bifs::DeferredTrap>>,
 ) -> u64 {
     let arity = usize::from(export.arity);
-    if let Some(trap) = deferred {
-        let mut args = [Term::NIL; 3];
-        args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
-        return install_deferred_bif_trap(process, identity, export, &args[..arity], *trap);
-    }
     plain_bif_result(process, registers, export, arity, result)
 }
 
@@ -2359,7 +2330,6 @@ fn plain_bif_slow(
 fn call_plain_bif_word(
     process: &mut crate::Process,
     registers: &mut arinsal_beamasm::SchedulerRegisters,
-    identity: usize,
     export: ExportDispatch,
     bif: impl Fn(&mut arinsal_bifs::Ctx<'_>, &[Term]) -> u64,
 ) -> u64 {
@@ -2371,9 +2341,8 @@ fn call_plain_bif_word(
     if word != arinsal_term::THE_NON_VALUE {
         return word;
     }
-    let deferred = ctx.take_deferred();
     let error = ctx.take_error();
-    plain_bif_word_slow(process, registers, identity, export, word, deferred, error)
+    plain_bif_word_slow(process, registers, export, word, error)
 }
 
 /// The tail of [`call_plain_bif_word`] for a failure, a trap or a due collection, out of line
@@ -2383,10 +2352,8 @@ fn call_plain_bif_word(
 fn plain_bif_word_slow(
     process: &mut crate::Process,
     registers: &mut arinsal_beamasm::SchedulerRegisters,
-    identity: usize,
     export: ExportDispatch,
     word: u64,
-    deferred: Option<Box<arinsal_bifs::DeferredTrap>>,
     error: Option<arinsal_bifs::BifError>,
 ) -> u64 {
     // A migrated body left its failure in the process' exit words; an adapted `Result` body
@@ -2401,7 +2368,7 @@ fn plain_bif_word_slow(
     } else {
         Ok(crate::native_hooks::from_raw(word))
     };
-    plain_bif_slow(process, registers, identity, export, result, deferred)
+    plain_bif_slow(process, registers, export, result)
 }
 
 /// The `BifError` a word-returning body left in the process' failure words, which are then
@@ -2451,32 +2418,6 @@ pub(crate) fn decode_failure(
         0 => BifError::Error(fvalue),
         _ => BifError::BADARG,
     })
-}
-
-/// Installs a BIF continuation after its process-bound context has returned.
-fn install_deferred_bif_trap(
-    process: &mut crate::Process,
-    identity: usize,
-    export: ExportDispatch,
-    args: &[Term],
-    trap: arinsal_bifs::DeferredTrap,
-) -> u64 {
-    if crate::bif_traps::install_deferred_trap(
-        process,
-        identity,
-        (export.module_atom, export.function_atom),
-        args,
-        trap,
-    )
-    .is_err()
-    {
-        crate::native_hooks::set_error(process, "system_limit");
-        return 0;
-    }
-    debug_assert_native_heap(process);
-    crate::bif_traps::arm_export_trap(process);
-    process.heap.abi.exc.freason = 1 << 10;
-    0
 }
 
 /// Calls a BIF that needs its process (`c_p`) straight from native code.

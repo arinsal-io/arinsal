@@ -315,6 +315,18 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("unicode", "characters_to_list", 2) => {
             bif!(erl_unicode::unicode_characters_to_list_2)
         }
+        ("prim_file", "internal_name2native", 1) => {
+            bif!(erl_unicode::prim_file_internal_name2native_1)
+        }
+        ("prim_file", "internal_native2name", 1) => {
+            bif!(erl_unicode::prim_file_internal_native2name_1)
+        }
+        ("prim_file", "internal_normalize_utf8", 1) => {
+            bif!(erl_unicode::prim_file_internal_normalize_utf8_1)
+        }
+        ("prim_file", "is_translatable", 1) => bif!(erl_unicode::prim_file_is_translatable_1),
+        ("file", "native_name_encoding", 0) => bif!(erl_unicode::file_native_name_encoding_0),
+        ("io", "printable_range", 0) => bif!(erl_unicode::io_printable_range_0),
         // erl_iolist.c
         ("erlang", "iolist_size", 1) => bif!(erl_iolist::iolist_size_1),
         ("erlang", "list_to_binary", 1) => bif!(erl_iolist::list_to_binary_1),

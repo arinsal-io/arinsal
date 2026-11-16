@@ -24,6 +24,7 @@ pub(crate) mod erl_math;
 pub(crate) mod erl_process;
 pub(crate) mod erl_process_dict;
 pub(crate) mod erl_unicode;
+mod erl_unicode_normalize;
 pub(crate) mod erts_debug;
 pub(crate) mod external;
 pub(crate) mod external_dec;

@@ -251,12 +251,6 @@ fn keysearch_result(ctx: &mut Ctx<'_>, tuple: Term) -> Term {
         .expect("infallible BIF heap")
 }
 
-/// Continuation built only after a slice's counter runs out.
-pub enum DeferredTrap {
-    /// `unicode:characters_to_binary/2` and `characters_to_list/2`.
-    Unicode(crate::unicode::UnicodeCont),
-}
-
 /// A finished key BIF, or a trap back to the same export.
 pub enum KeyOutcome {
     /// The Erlang return value.

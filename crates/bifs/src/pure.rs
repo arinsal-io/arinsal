@@ -1372,10 +1372,6 @@ macro_rules! word_adapter {
     ($name:ident, $result:ident) => {
         fn $name(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
             match $result(ctx, args) {
-                Ok(value) if ctx.has_deferred() => match ctx.take_deferred() {
-                    Some(trap) => ctx.trap(*trap),
-                    None => value,
-                },
                 Ok(value) => value,
                 Err(error) => ctx.fail(error),
             }
