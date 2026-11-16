@@ -167,9 +167,9 @@ use crate::native_helpers::{
     persistent_term_get_2_light, unique_integer_0_light, unique_integer_1_light,
 };
 use crate::natives::{
-    bif_phash2, binary, erl_bif_atomics, erl_bif_chksum, erl_bif_guard, erl_bif_info,
-    erl_bif_lists, erl_bif_op, erl_bif_re, erl_hl_timer, erl_iolist, erl_map, erl_math,
-    erl_process_dict, erl_ptab, erl_unicode, external, register,
+    bif_phash2, binary, erl_bif_atomics, erl_bif_binary, erl_bif_chksum, erl_bif_guard,
+    erl_bif_info, erl_bif_lists, erl_bif_op, erl_bif_re, erl_hl_timer, erl_iolist, erl_map,
+    erl_math, erl_process_dict, erl_ptab, erl_unicode, external, register,
 };
 
 /// Binary guards whose erts entries have dedicated BeamAsm BIF functions.
@@ -317,6 +317,14 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "binary_to_list", 3) => bif!(binary::binary_to_list_3),
         ("erlang", "bitstring_to_list", 1) => bif!(binary::bitstring_to_list_1),
         ("erlang", "split_binary", 2) => bif!(binary::split_binary_2),
+        // erl_bif_binary.c
+        ("binary", "compile_pattern", 1) => bif!(erl_bif_binary::binary_compile_pattern_1),
+        ("binary", "match", 2) => bif!(erl_bif_binary::binary_match_2),
+        ("binary", "match", 3) => bif!(erl_bif_binary::binary_match_3),
+        ("binary", "matches", 2) => bif!(erl_bif_binary::binary_matches_2),
+        ("binary", "matches", 3) => bif!(erl_bif_binary::binary_matches_3),
+        ("binary", "split", 2) => bif!(erl_bif_binary::binary_split_2),
+        ("binary", "split", 3) => bif!(erl_bif_binary::binary_split_3),
         // erl_unicode.c
         ("unicode", "characters_to_binary", 2) => {
             bif!(erl_unicode::unicode_characters_to_binary_2)
@@ -489,6 +497,7 @@ pub(crate) fn trap_function(module: &str, function: &str, arity: u8) -> Option<u
         ("erts_internal", "binary_to_list_continue", 1) => {
             bif!(binary::binary_to_list_continue_1)
         }
+        ("erlang", "binary_find_trap", 3) => bif!(erl_bif_binary::binary_find_trap),
         ("erlang", "characters_to_utf8_trap", 4) => bif!(erl_unicode::characters_to_utf8_trap),
         ("erlang", "characters_to_list_trap_1", 3) => bif!(erl_unicode::characters_to_list_trap_1),
         ("erlang", "characters_to_list_trap_2", 3) => bif!(erl_unicode::characters_to_list_trap_2),

@@ -35,7 +35,6 @@ arinsal_term::magic_payload!(
     NoContext => no_context_destructor,
     TrapContext<arinsal_bifs::Phash2Cont> => make_hash2_destructor,
     CodePermission => code_permission_destructor,
-    TrapContext<arinsal_bifs::BinarySearchWalk> => binary_find_context_destructor,
     TrapContext<BinaryCopyState> => binary_copy_destructor,
     TrapContext<crate::dist::DsigSendContext> => dsig_send_context_destructor,
 
@@ -98,7 +97,7 @@ pub(crate) fn state_holds_heap_terms(state: &MagicBin) -> bool {
     macro_rules! any {
         ($($t:ty),* $(,)?) => { false $(|| state.downcast_ref::<TrapContext<$t>>().is_some())* };
     }
-    any!(arinsal_bifs::BinarySearchWalk, BinaryCopyState,)
+    any!(BinaryCopyState,)
 }
 
 /// What resuming a trapped call produces: a handler's result, or the Erlang export the trap
@@ -127,16 +126,12 @@ pub(crate) struct Entry {
 
 const CODE_PERMISSION_CONTINUATION: &str = "erts_debug:set_internal_state/2";
 const BINARY_COPY_CONTINUATION: &str = "erlang:binary_copy_trap/3";
-const BINARY_SEARCH_CONTINUATION: &str = "erlang:binary_find_trap/3";
 /// `dsend_continue_trap_export`.
 pub(crate) const DSEND_CONTINUE_CONTINUATION: &str = "erts_internal:dsend_continue_trap/1";
 // sizeof(ErtsDSigSendContext) (dist.h), measured with a C probe against the configured OTP-29.1.1
 // aarch64-apple-darwin tree: the magic binary payload of a parked send.
 const ERTS_DSIG_SEND_CONTEXT_SIZE: usize = 536;
 
-// C payload sizes passed to erts_create_magic_binary on macOS arm64. The separate magic binary
-// data offset is added by MagicBin::with_erts_payload_size.
-const ERTS_BINARY_FIND_CONTEXT_SIZE: usize = 312;
 // Port of erts/emulator/beam/erl_iolist.c (ErtsL2BState, IOListSizeState,
 // ErtsIOList2VecState).
 
@@ -238,162 +233,12 @@ const ENTRIES: &[Entry] = &[
         continuation: BINARY_COPY_CONTINUATION,
         handler: binary_copy,
     },
-    Entry {
-        module: "binary",
-        function: "match",
-        arity: 2,
-        continuation: BINARY_SEARCH_CONTINUATION,
-        handler: binary_match,
-    },
-    Entry {
-        module: "binary",
-        function: "match",
-        arity: 3,
-        continuation: BINARY_SEARCH_CONTINUATION,
-        handler: binary_match,
-    },
-    Entry {
-        module: "binary",
-        function: "matches",
-        arity: 2,
-        continuation: BINARY_SEARCH_CONTINUATION,
-        handler: binary_matches,
-    },
-    Entry {
-        module: "binary",
-        function: "matches",
-        arity: 3,
-        continuation: BINARY_SEARCH_CONTINUATION,
-        handler: binary_matches,
-    },
-    Entry {
-        module: "binary",
-        function: "split",
-        arity: 2,
-        continuation: BINARY_SEARCH_CONTINUATION,
-        handler: binary_split,
-    },
-    Entry {
-        module: "binary",
-        function: "split",
-        arity: 3,
-        continuation: BINARY_SEARCH_CONTINUATION,
-        handler: binary_split,
-    },
 ];
 
 // Port of erts/emulator/beam/erl_bif_binary.c:2365-2374 (CopyBinState), OTP-29.1.1.
 struct BinaryCopyState {
     result: Term,
     copied_bits: usize,
-}
-
-fn binary_match(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&MagicBin>,
-    _pid: Option<arinsal_sched::Pid>,
-    restore_gc: bool,
-) -> Result<HandlerResult, BifError> {
-    binary_search(
-        process,
-        args,
-        state,
-        restore_gc,
-        arinsal_bifs::BinarySearchKind::Match,
-    )
-}
-
-fn binary_matches(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&MagicBin>,
-    _pid: Option<arinsal_sched::Pid>,
-    restore_gc: bool,
-) -> Result<HandlerResult, BifError> {
-    binary_search(
-        process,
-        args,
-        state,
-        restore_gc,
-        arinsal_bifs::BinarySearchKind::Matches,
-    )
-}
-
-fn binary_split(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&MagicBin>,
-    _pid: Option<arinsal_sched::Pid>,
-    restore_gc: bool,
-) -> Result<HandlerResult, BifError> {
-    binary_search(
-        process,
-        args,
-        state,
-        restore_gc,
-        arinsal_bifs::BinarySearchKind::Split,
-    )
-}
-
-fn binary_search(
-    process: &mut Process,
-    args: &[Term],
-    state: Option<&MagicBin>,
-    restore_gc: bool,
-    kind: arinsal_bifs::BinarySearchKind,
-) -> Result<HandlerResult, BifError> {
-    // Port of erts/emulator/beam/erl_bif_binary.c:1433-1528 (do_binary_find), OTP-29.1.1.
-    // Port of erts/emulator/beam/erl_bif_binary.c:110 (get_reds), OTP-29.1.1.
-    const SEARCH_LOOP_FACTOR: usize = 10;
-    let budget = (process.heap.abi.fcalls.max(0) as usize)
-        .saturating_mul(SEARCH_LOOP_FACTOR)
-        .max(1);
-    if let Some(state) = state {
-        let state = MagicBin::clone(state);
-        let search = state
-            .downcast_ref::<TrapContext<arinsal_bifs::BinarySearchWalk>>()
-            .ok_or(BifError::BADARG)?;
-        let mut search = search.lock().map_err(|_| BifError::SystemLimit)?;
-        let (done, work) = search.step(budget);
-        let reductions = (work / SEARCH_LOOP_FACTOR) as u32;
-        if !done {
-            drop(search);
-            // Port of erts/emulator/beam/erl_bif_binary.c (binary_find_trap),
-            // OTP-29.1.1: only the first call bumps all reductions before trapping.
-            return Ok(HandlerResult::Yield {
-                continuation: BINARY_SEARCH_CONTINUATION,
-                state,
-                reductions: 0,
-            });
-        }
-        process.set_gc_enabled(restore_gc);
-        return finish_binary_search(process, &search, reductions);
-    }
-
-    let mut search = arinsal_bifs::BinarySearchWalk::new(kind, args)?;
-    let (done, work) = search.step(budget);
-    let reductions = (work / SEARCH_LOOP_FACTOR) as u32;
-    if !done {
-        return Ok(HandlerResult::Yield {
-            continuation: BINARY_SEARCH_CONTINUATION,
-            state: magic_binary_state(TrapContext::new(search), ERTS_BINARY_FIND_CONTEXT_SIZE),
-            reductions,
-        });
-    }
-    finish_binary_search(process, &search, reductions)
-}
-
-fn finish_binary_search(
-    process: &mut Process,
-    search: &arinsal_bifs::BinarySearchWalk,
-    reductions: u32,
-) -> Result<HandlerResult, BifError> {
-    // Port of erts/emulator/beam/erl_bif_binary.c result callbacks, OTP-29.1.1:
-    // allocate directly on the process heap after the search loop completes.
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let value = search.finish(&mut heap)?;
-    Ok(HandlerResult::Done { value, reductions })
 }
 
 /// Key of a trapped call made through `apply` when the caller does not import the BIF.

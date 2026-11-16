@@ -1,21 +1,94 @@
-//! Boyer–Moore and Aho–Corasick search used by the `binary` BIFs.
+//! `binary:compile_pattern/1`, `match/2,3`, `matches/2,3` and `split/2,3` of erl_bif_binary.c.
+//!
+//! Port of erts/emulator/beam/erl_bif_binary.c (binary_compile_pattern_1, do_binary_find,
+//! binary_match, binary_matches, binary_split, binary_find_trap, the Boyer-Moore and
+//! Aho-Corasick searches), OTP-29.1.1. Each BIF is `bif_table[].f` with `(c_p, reg, I)`. A
+//! search that runs out of loop iterations keeps its context in a magic binary, disables
+//! collection and `BIF_TRAP3`s to the hidden `erlang:binary_find_trap/3` export.
 
 use std::ops::Deref;
 
-use crate::BifError;
+use crate::bif_traps::TrapContext;
+use crate::natives::bif::{badarg, bif_ret};
+use crate::natives::erl_bif_lists::bif_trap;
+use crate::natives::erl_iolist::charge;
+use arinsal_beamasm::ProcessHeader;
+use arinsal_bifs::{BifError, ProcessHeapHandle};
+use arinsal_term::raw::{BinRef, Cons};
+use arinsal_term::{HeapAlloc, MagicBin, Term, TermBuilder, TermKind, global_atoms};
+
+/// The bytes of a byte-sized binary (`erts_get_aligned_binary_bytes`), copied when unaligned.
+fn with_binary_input<R>(
+    term: Term,
+    f: impl FnOnce(&[u8]) -> Result<R, BifError>,
+) -> Result<R, BifError> {
+    let view = BinRef::try_from(term).map_err(|_| BifError::BADARG)?;
+    if let Some(bytes) = view.bytes() {
+        return f(bytes);
+    }
+    let bits = view.bit_len();
+    if !bits.is_multiple_of(8) {
+        return Err(BifError::BADARG);
+    }
+    let mut copy = vec![0u8; bits / 8];
+    arinsal_term::erl_bits::copy_bitstring_range(term, 0, &mut copy, bits)
+        .map_err(|_| BifError::BADARG)?;
+    f(&copy)
+}
+
+/// The bytes of a byte-sized binary as an owned vector.
+fn binary_bytes(term: Term) -> Result<Vec<u8>, BifError> {
+    with_binary_input(term, |bytes| Ok(bytes.to_vec()))
+}
+
+fn atom_name(term: Term) -> Option<String> {
+    global_atoms()
+        .text(term.as_atom()?)
+        .map(|name| name.to_string())
+}
+
+fn cons_cell(term: Term) -> Option<(Term, Term)> {
+    Cons::try_from(term).ok().map(Cons::pair)
+}
+
+/// The elements of a proper list.
+fn proper_list(term: Term) -> Result<Vec<Term>, BifError> {
+    let mut items = Vec::new();
+    let mut rest = term;
+    while rest != Term::NIL {
+        let (head, tail) = cons_cell(rest).ok_or(BifError::BADARG)?;
+        items.push(head);
+        rest = tail;
+    }
+    Ok(items)
+}
+
+fn tuple_arity(term: Term) -> Result<usize, BifError> {
+    arinsal_bifs::tuple_arity(term)
+}
+
+fn tuple_element(term: Term, index: usize) -> Result<Term, BifError> {
+    arinsal_bifs::tuple_element(term, index)
+}
+
+fn iolist_cons(term: Term) -> Result<(Term, Term), BifError> {
+    cons_cell(term).ok_or(BifError::BADARG)
+}
+
+// Boyer–Moore and Aho–Corasick search used by the `binary` BIFs.
 
 const ALPHABET_SIZE: usize = 256;
 const NO_NODE: usize = usize::MAX;
 const MC_LOOP_FACTOR: usize = 8;
 
 /// Compiled search data shared by `binary:compile_pattern/1` and search calls.
-pub(super) enum SearchPattern {
+pub(crate) enum SearchPattern {
     BoyerMoore(BoyerMoore),
     AhoCorasick(AhoCorasick),
 }
 
 /// Temporary search data belongs to one BIF call; compiled patterns retain their magic owner.
-pub(super) enum SearchPatternHandle {
+pub(crate) enum SearchPatternHandle {
     Owned(SearchPattern),
     /// The compiled pattern's magic binary (`erts_magic_ref2bin` of the `{bm | ac, Ref}`).
     Shared(arinsal_term::MagicBin),
@@ -42,21 +115,21 @@ impl SearchPattern {
     /// Build the search data selected by OTP from the number of patterns.
     // Port of erts/emulator/beam/erl_bif_binary.c:470-615 (create_bmdata,
     // ac_add_one_pattern, ac_compute_failure_functions), OTP-29.1.1.
-    pub(super) fn compile_single(pattern: &[u8]) -> Result<Self, BifError> {
+    pub(crate) fn compile_single(pattern: &[u8]) -> Result<Self, BifError> {
         if pattern.is_empty() {
             return Err(BifError::BADARG);
         }
         Ok(Self::BoyerMoore(BoyerMoore::new(pattern)?))
     }
 
-    pub(super) fn compile(patterns: Vec<Vec<u8>>) -> Result<Self, BifError> {
+    pub(crate) fn compile(patterns: Vec<Vec<u8>>) -> Result<Self, BifError> {
         if patterns.len() == 1 {
             return Self::compile_single(&patterns[0]);
         }
         Ok(Self::AhoCorasick(AhoCorasick::new(&patterns)?))
     }
 
-    pub(super) fn tag(&self) -> &'static str {
+    pub(crate) fn tag(&self) -> &'static str {
         match self {
             Self::BoyerMoore(_) => "bm",
             Self::AhoCorasick(_) => "ac",
@@ -64,7 +137,7 @@ impl SearchPattern {
     }
 
     /// Payload bytes allocated by OTP's `create_bmdata` or `create_acdata`.
-    pub(super) fn erts_payload_size(&self) -> usize {
+    pub(crate) fn erts_payload_size(&self) -> usize {
         match self {
             Self::BoyerMoore(pattern) => pattern.erts_payload_size,
             Self::AhoCorasick(trie) => trie.erts_payload_size,
@@ -338,7 +411,7 @@ enum SearchState {
 }
 
 /// Resumable OTP binary search state.
-pub(super) struct SearchWalk {
+pub(crate) struct SearchWalk {
     len: usize,
     scope: (usize, usize),
     pattern: SearchPatternHandle,
@@ -349,7 +422,7 @@ impl SearchWalk {
     /// Start searching at `scope.0` and stop at `scope.1`.
     // Port of erts/emulator/beam/erl_bif_binary.c:624-635, 827-833,
     // 892-900 (search-state initialization), OTP-29.1.1.
-    pub(super) fn new(
+    pub(crate) fn new(
         len: usize,
         pattern: SearchPatternHandle,
         scope: (usize, usize),
@@ -394,7 +467,7 @@ impl SearchWalk {
     /// Scan at most `budget` internal OTP search reductions.
     // Port of erts/emulator/beam/erl_bif_binary.c:637-699, 729-824,
     // 834-890, 918-1000 (incremental search loops), OTP-29.1.1.
-    pub(super) fn step(&mut self, bytes: &[u8], budget: usize) -> (bool, usize) {
+    pub(crate) fn step(&mut self, bytes: &[u8], budget: usize) -> (bool, usize) {
         if budget == 0 {
             return (self.is_done(), 0);
         }
@@ -423,7 +496,7 @@ impl SearchWalk {
     }
 
     /// Read one recorded match without copying the search result buffer.
-    pub(super) fn match_at(&self, index: usize) -> Option<(usize, usize)> {
+    pub(crate) fn match_at(&self, index: usize) -> Option<(usize, usize)> {
         match &self.state {
             SearchState::BoyerMooreFirst { found, .. } => {
                 if index == 0 {
@@ -447,12 +520,12 @@ impl SearchWalk {
         }
     }
 
-    pub(super) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len
     }
 
     /// Number of matches recorded so far.
-    pub(super) fn match_count(&self) -> usize {
+    pub(crate) fn match_count(&self) -> usize {
         match &self.state {
             SearchState::BoyerMooreFirst { found, .. } => usize::from(found.is_some()),
             SearchState::BoyerMooreAll { found, .. }
@@ -461,7 +534,7 @@ impl SearchWalk {
         }
     }
 
-    pub(super) fn is_done(&self) -> bool {
+    pub(crate) fn is_done(&self) -> bool {
         match &self.state {
             SearchState::BoyerMooreFirst { done, .. }
             | SearchState::BoyerMooreAll { done, .. }
@@ -829,5 +902,513 @@ mod tests {
                 "needle={needle:?} scope={scope:?} first_only={first_only}"
             );
         }
+    }
+}
+
+fn compile_search_pattern(term: Term) -> Result<SearchPattern, BifError> {
+    match term.classify() {
+        TermKind::Bitstring => with_binary_input(term, SearchPattern::compile_single),
+        TermKind::List => {
+            let (head, tail) = iolist_cons(term)?;
+            if tail == Term::NIL && head.classify() == TermKind::Bitstring {
+                return with_binary_input(head, SearchPattern::compile_single);
+            }
+            let mut patterns = Vec::new();
+            let mut remaining = term;
+            while remaining != Term::NIL {
+                let Some((candidate, tail)) = cons_cell(remaining) else {
+                    return Err(BifError::BADARG);
+                };
+                let bytes = binary_bytes(candidate)?;
+                if bytes.is_empty() {
+                    return Err(BifError::BADARG);
+                }
+                patterns.push(bytes);
+                remaining = tail;
+            }
+            SearchPattern::compile(patterns)
+        }
+        _ => Err(BifError::BADARG),
+    }
+}
+
+// Port of erts/emulator/beam/erl_bif_binary.c:1004-1113, 1230-1270 (pattern extraction), OTP-29.1.1.
+fn pattern(term: Term) -> Result<SearchPatternHandle, BifError> {
+    if tuple_arity(term).ok() == Some(2) {
+        let tag =
+            atom_name(tuple_element(term, 0)?).filter(|tag| matches!(tag.as_str(), "bm" | "ac"));
+        if let Some(tag) = tag {
+            let reference = tuple_element(term, 1)?;
+            let owner = reference.magic_owner().ok_or(BifError::BADARG)?;
+            if owner
+                .downcast_ref::<SearchPattern>()
+                .is_none_or(|compiled| compiled.tag() != tag.as_str())
+            {
+                return Err(BifError::BADARG);
+            }
+            return Ok(SearchPatternHandle::Shared(owner));
+        }
+    }
+    Ok(SearchPatternHandle::Owned(compile_search_pattern(term)?))
+}
+
+// Port of erts/emulator/beam/erl_bif_binary.c:1004-1113 (binary_compile_pattern_1), OTP-29.1.1.
+fn compile_pattern_result<H: HeapAlloc + ?Sized>(
+    heap: &mut H,
+    arg: Term,
+) -> Result<Term, BifError> {
+    let compiled = compile_search_pattern(arg)?;
+    let orig_size = arinsal_term::MAGIC_BIN_DATA_OFFSET + compiled.erts_payload_size();
+    let tag = Term::atom(global_atoms().intern(compiled.tag()).expect("atom"));
+    let reference = TermBuilder::new(heap)
+        .magic_ref(MagicBin::with_orig_size_and_refn(
+            compiled,
+            orig_size,
+            arinsal_bifs::next_ref_words(),
+        ))
+        .map_err(|_| BifError::SystemLimit)?;
+    TermBuilder::new(heap)
+        .tuple(&[tag, reference])
+        .map_err(|_| BifError::SystemLimit)
+}
+
+// Port of erts/emulator/beam/erl_bif_binary.c:1273-1344 (parse_match_opts_list), OTP-29.1.1.
+fn match_scope(len: usize, options: Term) -> Result<(usize, usize), BifError> {
+    let mut scope = (0, len);
+    for option in proper_list(options)? {
+        scope = scope_option(len, option)?;
+    }
+    Ok(scope)
+}
+
+// Port of erts/emulator/beam/erl_bif_binary.c:1273-1400 (scope option parsing), OTP-29.1.1.
+fn scope_option(len: usize, option: Term) -> Result<(usize, usize), BifError> {
+    if tuple_arity(option)? != 2 || atom_name(tuple_element(option, 0)?).as_deref() != Some("scope")
+    {
+        return Err(BifError::BADARG);
+    }
+    let range = tuple_element(option, 1)?;
+    if tuple_arity(range)? != 2 {
+        return Err(BifError::BADARG);
+    }
+    let start = tuple_element(range, 0)?
+        .as_small()
+        .ok_or(BifError::BADARG)?;
+    let length = tuple_element(range, 1)?
+        .as_small()
+        .ok_or(BifError::BADARG)?;
+    let end = start.checked_add(length).ok_or(BifError::BADARG)?;
+    let (lo, hi) = if length < 0 {
+        (end, start)
+    } else {
+        (start, end)
+    };
+    if lo < 0 || hi < 0 || hi as usize > len {
+        return Err(BifError::BADARG);
+    }
+    Ok((lo as usize, hi as usize))
+}
+
+/// Search operations supported by the binary BIF continuation.
+#[derive(Clone, Copy)]
+pub(crate) enum BinarySearchKind {
+    /// Return the first matching range.
+    Match,
+    /// Return all non-overlapping matching ranges.
+    Matches,
+    /// Split at the first or all matching ranges.
+    Split,
+}
+
+/// Resumable state for `binary:match/2,3`, `matches/2,3`, and `split/2,3`.
+pub(crate) struct BinarySearchWalk {
+    subject: Term,
+    walk: SearchWalk,
+    kind: BinarySearchKind,
+    split_trim: bool,
+    split_trim_all: bool,
+    global: bool,
+    result_left: Option<usize>,
+}
+
+impl BinarySearchWalk {
+    /// Parse BIF options and prepare a Boyer–Moore or Aho–Corasick walk.
+    pub fn new(kind: BinarySearchKind, args: &[Term]) -> Result<Self, BifError> {
+        let compiled = pattern(args[1])?;
+        let (walk, split_trim, split_trim_all, first_only) = with_binary_input(args[0], |bytes| {
+            let (scope, first_only, split_trim, split_trim_all) = match kind {
+                BinarySearchKind::Match => (
+                    if args.len() == 3 {
+                        match_scope(bytes.len(), args[2])?
+                    } else {
+                        (0, bytes.len())
+                    },
+                    true,
+                    false,
+                    false,
+                ),
+                BinarySearchKind::Matches => (
+                    if args.len() == 3 {
+                        match_scope(bytes.len(), args[2])?
+                    } else {
+                        (0, bytes.len())
+                    },
+                    false,
+                    false,
+                    false,
+                ),
+                BinarySearchKind::Split => {
+                    let (global, trim, trim_all, scope) = if args.len() == 3 {
+                        split_options(bytes.len(), args[2])?
+                    } else {
+                        (false, false, false, (0, bytes.len()))
+                    };
+                    (scope, !global, trim, trim_all)
+                }
+            };
+            Ok((
+                SearchWalk::new(bytes.len(), compiled, scope, first_only),
+                split_trim,
+                split_trim_all,
+                first_only,
+            ))
+        })?;
+        let global = !first_only;
+        Ok(Self {
+            subject: args[0],
+            walk,
+            kind,
+            split_trim,
+            split_trim_all,
+            global,
+            result_left: None,
+        })
+    }
+
+    /// Run the search and result loops until completion or reduction exhaustion.
+    // Port of erts/emulator/beam/erl_bif_binary.c (do_binary_find) and
+    // 1671-1735, 1809-1915 (do_match_global_result, do_split_global_result), OTP-29.1.1.
+    pub fn step(&mut self, budget: usize) -> (bool, usize) {
+        let mut work = 0;
+        if !self.walk.is_done() {
+            let (done, used) =
+                with_binary_input(self.subject, |bytes| Ok(self.walk.step(bytes, budget)))
+                    .expect("search subject remains a live binary");
+            if !done {
+                return (false, used);
+            }
+            work = used;
+        }
+        // Port of do_match_global_result and do_split_global_result: the C callbacks
+        // count one or two result-building passes before the final heap construction.
+        let mut left = *self.result_left.get_or_insert_with(|| {
+            let found = self.walk.match_count();
+            match (self.kind, self.global) {
+                (BinarySearchKind::Matches, _) => found * 2,
+                (BinarySearchKind::Split, true) => found,
+                _ => 0,
+            }
+        });
+        while left > 0 && work < budget {
+            work += 1;
+            left -= 1;
+        }
+        self.result_left = Some(left);
+        (left == 0, work)
+    }
+
+    /// Build the BIF result after searching completes.
+    pub fn finish<H: HeapAlloc + ?Sized>(&self, heap: &mut H) -> Result<Term, BifError> {
+        let found_count = self.walk.match_count();
+        match self.kind {
+            BinarySearchKind::Match => match self.walk.match_at(0) {
+                Some((position, length)) => match_result(heap, position, length),
+                None => Ok(Term::atom(global_atoms().intern("nomatch").expect("atom"))),
+            },
+            BinarySearchKind::Matches => {
+                let mut builder = TermBuilder::new(heap);
+                let mut result = Term::NIL;
+                for index in (0..found_count).rev() {
+                    let (position, length) = self
+                        .walk
+                        .match_at(index)
+                        .expect("match count matches recorded search results");
+                    let position = builder
+                        .int_from_i128(position as i128)
+                        .map_err(|_| BifError::SystemLimit)?;
+                    let length = builder
+                        .int_from_i128(length as i128)
+                        .map_err(|_| BifError::SystemLimit)?;
+                    let tuple = builder
+                        .tuple(&[position, length])
+                        .map_err(|_| BifError::SystemLimit)?;
+                    result = builder
+                        .cons(tuple, result)
+                        .map_err(|_| BifError::SystemLimit)?;
+                }
+                Ok(result)
+            }
+            BinarySearchKind::Split => {
+                if found_count == 0 {
+                    if (self.split_trim || self.split_trim_all) && self.walk.len() == 0 {
+                        return Ok(Term::NIL);
+                    }
+                    return TermBuilder::new(heap)
+                        .cons(self.subject, Term::NIL)
+                        .map_err(|_| BifError::SystemLimit);
+                }
+
+                let mut builder = TermBuilder::new(heap);
+                let mut result = Term::NIL;
+                let mut end = self.walk.len();
+                let mut trim_tail = self.split_trim;
+                for index in (0..found_count).rev() {
+                    let (position, length) = self
+                        .walk
+                        .match_at(index)
+                        .expect("match count matches recorded search results");
+                    let start = position + length;
+                    let segment_len = end - start;
+                    if segment_len != 0 || (!self.split_trim_all && !trim_tail) {
+                        let segment = builder
+                            .sub_binary_bif(self.subject, start * 8, segment_len * 8)
+                            .map_err(|_| BifError::SystemLimit)?;
+                        result = builder
+                            .cons(segment, result)
+                            .map_err(|_| BifError::SystemLimit)?;
+                        trim_tail = false;
+                    }
+                    end = position;
+                }
+                if end != 0 || (!self.split_trim_all && !trim_tail) {
+                    let prefix = builder
+                        .sub_binary_bif(self.subject, 0, end * 8)
+                        .map_err(|_| BifError::SystemLimit)?;
+                    result = builder
+                        .cons(prefix, result)
+                        .map_err(|_| BifError::SystemLimit)?;
+                }
+                Ok(result)
+            }
+        }
+    }
+}
+
+// Port of erts/emulator/beam/erl_bif_binary.c:1840-1850 (match result), OTP-29.1.1.
+fn match_result<H: HeapAlloc + ?Sized>(
+    heap: &mut H,
+    position: usize,
+    length: usize,
+) -> Result<Term, BifError> {
+    let mut builder = TermBuilder::new(heap);
+    let position = builder
+        .int_from_i128(position as i128)
+        .map_err(|_| BifError::SystemLimit)?;
+    let length = builder
+        .int_from_i128(length as i128)
+        .map_err(|_| BifError::SystemLimit)?;
+    builder
+        .tuple(&[position, length])
+        .map_err(|_| BifError::SystemLimit)
+}
+
+// Port of erts/emulator/beam/erl_bif_binary.c:1346-1405 (parse_split_opts_list), OTP-29.1.1.
+fn split_options(
+    len: usize,
+    options: Term,
+) -> Result<(bool, bool, bool, (usize, usize)), BifError> {
+    let mut global = false;
+    let mut trim = false;
+    let mut trim_all = false;
+    let mut scope = (0, len);
+    let mut rest = options;
+    while rest != Term::NIL {
+        let Some((option, tail)) = cons_cell(rest) else {
+            return Err(BifError::BADARG);
+        };
+        rest = tail;
+        match atom_name(option).as_deref() {
+            Some("global") => global = true,
+            Some("trim") => trim = true,
+            Some("trim_all") => trim_all = true,
+            _ => scope = scope_option(len, option)?,
+        }
+    }
+    Ok((global, trim, trim_all, scope))
+}
+
+// ---- BIF entries -------------------------------------------------------------------------
+
+/// `sizeof(BinaryFindContext)` on a 64-bit build: the magic binary's `orig_size`.
+// Port of erts/emulator/beam/erl_bif_binary.c (BinaryFindContext), OTP-29.1.1.
+const ERTS_BINARY_FIND_CONTEXT_SIZE: usize = 312;
+
+const BINARY_FIND_TRAP: &str = "erlang:binary_find_trap/3";
+
+/// The search loop's iterations per reduction (`ctx->loop_factor`).
+const SEARCH_LOOP_FACTOR: usize = 10;
+
+type FindHolder = TrapContext<BinarySearchWalk>;
+
+arinsal_term::magic_payload!(FindHolder => bf_context_destructor);
+
+/// `get_reds`: the loop iterations this call may run.
+// Port of erts/emulator/beam/erl_bif_binary.c (get_reds), OTP-29.1.1.
+fn get_reds(process: &crate::Process) -> usize {
+    let reds = (process.heap.abi.fcalls.max(0) as usize).saturating_mul(SEARCH_LOOP_FACTOR);
+    let limit = crate::natives::erts_debug::binary_loop_limit() as usize;
+    if limit != 0 && limit < reds {
+        return limit;
+    }
+    reds.max(1)
+}
+
+/// `binary:compile_pattern/1`.
+// Port of erts/emulator/beam/erl_bif_binary.c (binary_compile_pattern_1), OTP-29.1.1.
+pub(crate) extern "C" fn binary_compile_pattern_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [pattern] = crate::bif_table::bif_args::<1>(reg);
+    let mut heap = ProcessHeapHandle(&mut process.heap);
+    match compile_pattern_result(&mut heap, pattern) {
+        Ok(result) => crate::native_hooks::raw(result),
+        Err(error) => bif_ret(c_p, i, Err(find_error(error))),
+    }
+}
+
+fn find_error(error: BifError) -> crate::VmError {
+    match error {
+        BifError::SystemLimit => crate::VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::SYSTEM_LIMIT,
+        ))),
+        _ => badarg(),
+    }
+}
+
+/// `binary_match`, `binary_split` and the global variants: the search for `kind`, finished in
+/// this call or trapped to `binary_find_trap/3` with the context in a magic binary.
+// Port of erts/emulator/beam/erl_bif_binary.c (binary_match, binary_split, do_binary_find),
+// OTP-29.1.1.
+fn binary_find(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+    kind: BinarySearchKind,
+    arity: usize,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let args = crate::bif_table::bif_arg_vec(reg, arity);
+    let mut search = match BinarySearchWalk::new(kind, &args) {
+        Ok(search) => search,
+        Err(error) => return bif_ret(c_p, i, Err(find_error(error))),
+    };
+    let initial = get_reds(process);
+    let (done, work) = search.step(initial);
+    if !done {
+        // The context leaves the stack for a magic binary and collection is disabled while
+        // the call is parked.
+        let bin = MagicBin::with_erts_payload_size_and_refn(
+            FindHolder::new(search),
+            ERTS_BINARY_FIND_CONTEXT_SIZE,
+            arinsal_bifs::next_ref_words(),
+        );
+        let mref = TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap)).magic_ref(bin);
+        let Ok(mref) = mref else {
+            return bif_ret(c_p, i, Err(find_error(BifError::SystemLimit)));
+        };
+        process.set_gc_enabled(false);
+        process.heap.abi.fcalls = 0;
+        let trap = bif_trap(process, BINARY_FIND_TRAP, vec![args[0], mref, Term::NIL]);
+        return bif_ret(c_p, i, Err(trap));
+    }
+    charge(process, work / SEARCH_LOOP_FACTOR);
+    find_result(c_p, i, process, &search)
+}
+
+/// The result of a finished search (`found` / `not_found` callbacks).
+fn find_result(
+    c_p: *mut ProcessHeader,
+    i: u64,
+    process: &mut crate::Process,
+    search: &BinarySearchWalk,
+) -> u64 {
+    let mut heap = ProcessHeapHandle(&mut process.heap);
+    match search.finish(&mut heap) {
+        Ok(value) => crate::native_hooks::raw(value),
+        Err(error) => bif_ret(c_p, i, Err(find_error(error))),
+    }
+}
+
+/// `binary:match/2`.
+pub(crate) extern "C" fn binary_match_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    binary_find(c_p, reg, i, BinarySearchKind::Match, 2)
+}
+
+/// `binary:match/3`.
+pub(crate) extern "C" fn binary_match_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    binary_find(c_p, reg, i, BinarySearchKind::Match, 3)
+}
+
+/// `binary:matches/2`.
+pub(crate) extern "C" fn binary_matches_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    binary_find(c_p, reg, i, BinarySearchKind::Matches, 2)
+}
+
+/// `binary:matches/3`.
+pub(crate) extern "C" fn binary_matches_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    binary_find(c_p, reg, i, BinarySearchKind::Matches, 3)
+}
+
+/// `binary:split/2`.
+pub(crate) extern "C" fn binary_split_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    binary_find(c_p, reg, i, BinarySearchKind::Split, 2)
+}
+
+/// `binary:split/3`.
+pub(crate) extern "C" fn binary_split_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    binary_find(c_p, reg, i, BinarySearchKind::Split, 3)
+}
+
+/// `erlang:binary_find_trap/3`.
+// Port of erts/emulator/beam/erl_bif_binary.c (binary_find_trap), OTP-29.1.1.
+pub(crate) extern "C" fn binary_find_trap(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [subject, mref, pattern] = crate::bif_table::bif_args::<3>(reg);
+    let initial = get_reds(process);
+    let stepped = mref.with_magic_payload::<FindHolder, _>(|holder| {
+        let mut search = holder.lock().expect("binary_find context");
+        let (done, work) = search.step(initial);
+        if !done {
+            return (false, work, None);
+        }
+        let mut heap = ProcessHeapHandle(&mut process.heap);
+        (true, work, Some(search.finish(&mut heap)))
+    });
+    match stepped {
+        Some((true, work, Some(result))) => {
+            process.set_gc_enabled(true);
+            charge(process, work / SEARCH_LOOP_FACTOR);
+            match result {
+                Ok(value) => crate::native_hooks::raw(value),
+                Err(error) => bif_ret(c_p, i, Err(find_error(error))),
+            }
+        }
+        Some(_) => {
+            let trap = bif_trap(process, BINARY_FIND_TRAP, vec![subject, mref, pattern]);
+            bif_ret(c_p, i, Err(trap))
+        }
+        None => bif_ret(c_p, i, Err(badarg())),
     }
 }

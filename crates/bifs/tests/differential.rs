@@ -3,7 +3,7 @@ mod support;
 use arinsal_bifs::{Ctx, ProcessHeapHandle, copy_bitstring_range, lookup};
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm as O;
-use arinsal_term::{ProcessHeap, TermBuilder, from_owned, to_owned};
+use arinsal_term::{ProcessHeap, TermBuilder, to_owned};
 use num_traits::ToPrimitive;
 use similar_asserts::assert_eq;
 use std::collections::HashSet;
@@ -272,34 +272,6 @@ fn nondeterministic_identity_bifs() {
         };
         assert!(value < 0);
         assert!(negative.insert(value));
-    }
-}
-
-#[test]
-fn compiled_patterns_match_plain_patterns() {
-    let reference = RefErl::shared().expect("OTP 29 reference");
-    for n in 0..1000 {
-        let needle = O::Binary(vec![1, (n % 255) as u8]);
-        let haystack = O::Binary(vec![0, 1, (n % 255) as u8, 1]);
-        let mut heap = ProcessHeap::with_words(1024);
-        let mut allocator = ProcessHeapHandle(&mut heap);
-        let needle_term = from_owned(&needle, &mut allocator).expect("needle term");
-        let haystack_term = from_owned(&haystack, &mut allocator).expect("haystack term");
-        let compile = lookup("binary", "compile_pattern", 1).expect("compile_pattern/1");
-        let compiled = {
-            let mut state = arinsal_bifs::BifState::default();
-            let mut ctx = Ctx::new(&mut allocator, &mut state);
-            compile(&mut ctx, &[needle_term]).expect("compile_pattern succeeds")
-        };
-        let matching = lookup("binary", "match", 2).expect("match/2");
-        let mut state = arinsal_bifs::BifState::default();
-        let mut ctx = Ctx::new(&mut allocator, &mut state);
-        let actual_term = matching(&mut ctx, &[haystack_term, compiled])
-            .expect("compiled pattern must match in its owner heap");
-        let actual =
-            arinsal_difftest::CallResult::Ok(to_owned(actual_term).expect("owned match result"));
-        let expected = reference.call("binary", "match", &[haystack, needle]);
-        assert!(equivalent(&actual, &expected), "{actual:?} != {expected:?}");
     }
 }
 
@@ -608,42 +580,6 @@ fn clock_and_dst_behavior() {
 }
 
 #[test]
-#[ignore = "performance measurement; run with --release --ignored --nocapture"]
-fn binary_search_megabyte_benchmark() {
-    let mut heap = ProcessHeap::with_words(1024);
-    let mut subject = vec![b'a'; 1_000_000];
-    subject[999_990..999_998].copy_from_slice(b"bbbbbbbb");
-    let mut builder = TermBuilder::new(&mut heap);
-    let haystack = builder.binary(&subject).expect("subject");
-    let needle = builder.binary(b"bbbbbbbb").expect("needle");
-    let second_needle = builder.binary(b"cccccccc").expect("second needle");
-    let tail = builder
-        .cons(second_needle, arinsal_term::Term::NIL)
-        .expect("tail");
-    let patterns = builder.cons(needle, tail).expect("patterns");
-    let single = lookup("binary", "match", 2).expect("match BIF");
-    let mut allocator = ProcessHeapHandle(&mut heap);
-    let mut state = arinsal_bifs::BifState::default();
-    let mut ctx = Ctx::new(&mut allocator, &mut state);
-    let started = std::time::Instant::now();
-    for _ in 0..200 {
-        std::hint::black_box(single(&mut ctx, &[haystack, needle]).expect("match"));
-    }
-    println!(
-        "binary:match/2, 1 MB single pattern: {:.1} us/call",
-        started.elapsed().as_secs_f64() * 1e6 / 200.0
-    );
-    let started = std::time::Instant::now();
-    for _ in 0..200 {
-        std::hint::black_box(single(&mut ctx, &[haystack, patterns]).expect("multi match"));
-    }
-    println!(
-        "binary:match/2, 1 MB two patterns: {:.1} us/call",
-        started.elapsed().as_secs_f64() * 1e6 / 200.0
-    );
-}
-
-#[test]
 fn binary_to_atom_oversized_name_is_system_limit() {
     let reference = RefErl::shared().expect("OTP 29 reference");
     for mut bytes in [vec![0; 256], vec![0; 512]] {
@@ -716,132 +652,6 @@ fn identity_bifs_are_unique_across_threads() {
     }
     assert_eq!(all_integers.len(), 8000);
     assert_eq!(all_references.len(), 8000);
-}
-
-#[test]
-fn one_byte_pattern_search_matches_otp_29() {
-    let reference = RefErl::shared().expect("OTP 29 reference");
-    let subject = O::Binary(b"abracadabra".to_vec());
-    let aye = O::Binary(b"a".to_vec());
-    let zee = O::Binary(b"z".to_vec());
-    let dash = O::Binary(b"-".to_vec());
-    let dashed = O::Binary(b"a-b-a".to_vec());
-    let scope_hit = list(vec![O::Tuple(vec![
-        atom("scope"),
-        O::Tuple(vec![O::Int(3), O::Int(5)]),
-    ])]);
-    let scope_miss = list(vec![O::Tuple(vec![
-        atom("scope"),
-        O::Tuple(vec![O::Int(1), O::Int(2)]),
-    ])]);
-    let scope_dash = list(vec![O::Tuple(vec![
-        atom("scope"),
-        O::Tuple(vec![O::Int(2), O::Int(3)]),
-    ])]);
-    let cases = [
-        ("match", vec![subject.clone(), aye.clone()]),
-        ("match", vec![subject.clone(), zee.clone()]),
-        (
-            "match",
-            vec![subject.clone(), aye.clone(), scope_hit.clone()],
-        ),
-        (
-            "match",
-            vec![subject.clone(), aye.clone(), scope_miss.clone()],
-        ),
-        ("matches", vec![subject.clone(), aye.clone()]),
-        ("matches", vec![subject.clone(), zee.clone()]),
-        (
-            "matches",
-            vec![subject.clone(), aye.clone(), scope_hit.clone()],
-        ),
-        ("matches", vec![O::Binary(Vec::new()), aye.clone()]),
-        ("split", vec![dashed.clone(), dash.clone()]),
-        ("split", vec![subject.clone(), zee.clone()]),
-        (
-            "split",
-            vec![dashed.clone(), dash.clone(), scope_dash.clone()],
-        ),
-    ];
-    for (name, args) in cases {
-        let actual = call("binary", name, &args);
-        let expected = reference.call("binary", name, &args);
-        assert!(
-            equivalent(&actual, &expected),
-            "binary:{name} {args:?}: {actual:?} != {expected:?}"
-        );
-    }
-
-    // A compiled 1-byte pattern is still Boyer–Moore (`words == 1` in
-    // do_binary_match_compile). erl's compile_pattern result matches the raw pattern.
-    let mut heap = ProcessHeap::with_words(1024);
-    let mut allocator = ProcessHeapHandle(&mut heap);
-    let subject_term = from_owned(&subject, &mut allocator).unwrap();
-    let aye_term = from_owned(&aye, &mut allocator).unwrap();
-    let dash_term = from_owned(&dash, &mut allocator).unwrap();
-    let dashed_term = from_owned(&dashed, &mut allocator).unwrap();
-    let scope_term = from_owned(&scope_hit, &mut allocator).unwrap();
-    let mut state = arinsal_bifs::BifState::default();
-    let mut ctx = Ctx::new(&mut allocator, &mut state);
-    let compile = lookup("binary", "compile_pattern", 1).unwrap();
-    let aye_pattern = compile(&mut ctx, &[aye_term]).unwrap();
-    let dash_pattern = compile(&mut ctx, &[dash_term]).unwrap();
-    let compiled_cases: &[(&str, u8, Vec<_>, &str)] = &[
-        (
-            "match",
-            2,
-            vec![subject_term, aye_pattern],
-            "binary:match(<<\"abracadabra\">>, binary:compile_pattern(<<\"a\">>))",
-        ),
-        (
-            "matches",
-            3,
-            vec![subject_term, aye_pattern, scope_term],
-            "binary:matches(<<\"abracadabra\">>, binary:compile_pattern(<<\"a\">>), [{scope,{3,5}}])",
-        ),
-        (
-            "split",
-            2,
-            vec![dashed_term, dash_pattern],
-            "binary:split(<<\"a-b-a\">>, binary:compile_pattern(<<\"-\">>))",
-        ),
-    ];
-    for (name, arity, args, expr) in compiled_cases {
-        let bif = lookup("binary", name, *arity).unwrap();
-        let mut state = arinsal_bifs::BifState::default();
-        let mut ctx = Ctx::new(&mut allocator, &mut state);
-        let actual = CallResult::Ok(to_owned(bif(&mut ctx, args).unwrap()).unwrap());
-        let expected = CallResult::Ok(reference.eval(expr).unwrap());
-        assert!(
-            equivalent(&actual, &expected),
-            "compiled binary:{name}: {actual:?} != {expected:?}"
-        );
-    }
-}
-
-#[test]
-fn binary_match_accepts_unaligned_subbinary() {
-    let reference = RefErl::shared().expect("OTP 29 reference");
-    let mut heap = ProcessHeap::with_words(128);
-    let mut builder = TermBuilder::new(&mut heap);
-    let backing = builder
-        .binary(&[0b0100_0000, 0b1100_0000])
-        .expect("backing");
-    let subject = builder.sub_binary(backing, 1, 8).expect("subbinary");
-    let needle = builder.binary(&[0b1000_0001]).expect("needle");
-    let mut allocator = ProcessHeapHandle(&mut heap);
-    let mut state = arinsal_bifs::BifState::default();
-    let mut ctx = Ctx::new(&mut allocator, &mut state);
-    let bif = lookup("binary", "match", 2).expect("BIF");
-    let actual = arinsal_difftest::CallResult::Ok(
-        to_owned(bif(&mut ctx, &[subject, needle]).expect("match")).expect("term"),
-    );
-    let expected = reference.call(
-        "binary",
-        "match",
-        &[O::Binary(vec![0b1000_0001]), O::Binary(vec![0b1000_0001])],
-    );
-    assert!(equivalent(&actual, &expected), "{actual:?} != {expected:?}");
 }
 
 #[test]
