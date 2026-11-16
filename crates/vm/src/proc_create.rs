@@ -2221,6 +2221,27 @@ impl Process {
         if live > self.x.len() {
             return Err(VmError::Unsupported("live X register count".into()));
         }
+        let mut x = self.take_x_for_gc();
+        let cost = self.ensure_objv_cost(words, &mut x[..live]);
+        self.x = x;
+        cost
+    }
+
+    /// [`Process::ensure`] rooting `objv`, the register array prefix the caller holds
+    /// (`erts_garbage_collect(p, need, reg, live)`).
+    // Port of erts/emulator/beam/erl_gc.c (erts_garbage_collect), OTP-29.1.1.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn ensure_objv(&mut self, words: usize, objv: &mut [Term]) -> Result<(), VmError> {
+        let cost = self.ensure_objv_cost(words, objv)?;
+        if cost != 0 {
+            self.bump_gc_reds(cost);
+        }
+        Ok(())
+    }
+
+    fn ensure_objv_cost(&mut self, words: usize, objv: &mut [Term]) -> Result<u32, VmError> {
+        let live = objv.len();
         self.gc_live = live;
         let allocation_words = words + self.heap.check_reserve();
         // Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED), OTP-29.1.1.
@@ -2238,7 +2259,7 @@ impl Process {
         }
         // Port of erts/emulator/beam/jit/arm/instr_common.cpp:94-99, OTP-29.1.1:
         // the native heap check uses S_RESERVED, but GC receives the raw `need`.
-        let gc = self.collect_heap_roots(live, &mut [], words)?;
+        let gc = self.collect_heap_roots_objv(objv, &mut [], words)?;
         // Port of erl_gc.c:501-513 (`delay_garbage_collection`): a zero-need
         // delayed collection forces rescheduling without manufacturing heap space.
         if words == 0 && gc.collections == 0 {

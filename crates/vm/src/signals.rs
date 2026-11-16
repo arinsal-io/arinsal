@@ -1046,7 +1046,12 @@ fn call_resolved(
             let pid = {
                 let _slice = crate::process::sched_data::NativeSlice::enter(vm, ctx);
                 crate::natives::erl_process::erl_create_process(
-                    process, *module, *function, *args, &mut so,
+                    process,
+                    std::ptr::null_mut(),
+                    *module,
+                    *function,
+                    *args,
+                    &mut so,
                 )
                 .map_err(crate::natives::erl_process::CreateError::into_bif_error)?
             };

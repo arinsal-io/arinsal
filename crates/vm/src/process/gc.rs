@@ -111,7 +111,7 @@ impl Process {
             return Ok(result);
         }
         let mut roots = [result];
-        let gc = self.collect_heap_roots(0, &mut roots, 0)?;
+        let gc = self.collect_heap_roots_objv(&mut [], &mut roots, 0)?;
         crate::natives::sys::after_collection(self, gc.collections, gc.words_reclaimed);
         self.charge_gc_stats(&gc);
         Ok(roots[0])
@@ -193,10 +193,30 @@ impl Process {
         extra: &mut [Term],
         min_free: usize,
     ) -> Result<arinsal_term::GcStats, VmError> {
-        // Port of erts/emulator/beam/erl_gc.c:934 (garbage_collect clears F_HIBERNATED),
-        // OTP-29.1.1.
+        let mut x = self.take_x_for_gc();
+        let collected = self.collect_heap_roots_objv(&mut x[..live_x], extra, min_free);
+        self.x = x;
+        collected
+    }
+
+    /// `erts_garbage_collect(p, need, objv, nobj)` with the root array the caller holds.
+    // Port of erts/emulator/beam/erl_gc.c:934 (garbage_collect clears F_HIBERNATED),
+    // OTP-29.1.1.
+    pub(crate) fn collect_heap_roots_objv(
+        &mut self,
+        objv: &mut [Term],
+        extra: &mut [Term],
+        min_free: usize,
+    ) -> Result<arinsal_term::GcStats, VmError> {
         self.hibernated = false;
-        self.collect_roots(live_x, extra, min_free, false)
+        self.collect_roots(objv, extra, min_free, false)
+    }
+
+    /// The process's X file, taken out for a collection whose caller does not hold the
+    /// register array yet (XREG-1: these callers move to [`Self::collect_heap_roots_objv`]
+    /// with the `reg` they are given; this goes with the attached `ArgRegs`).
+    pub(crate) fn take_x_for_gc(&mut self) -> crate::proc_create::ArgRegs {
+        std::mem::replace(&mut self.x, crate::proc_create::ArgRegs::empty())
     }
 
     /// Shrink the heap to the live data of `x[..live_x]` and the mailbox.
@@ -205,7 +225,10 @@ impl Process {
         &mut self,
         live_x: usize,
     ) -> Result<arinsal_term::GcStats, VmError> {
-        let stats = self.collect_roots(live_x, &mut [], 0, true)?;
+        let mut x = self.take_x_for_gc();
+        let collected = self.collect_roots(&mut x[..live_x], &mut [], 0, true);
+        self.x = x;
+        let stats = collected?;
         self.hibernated = true;
         Ok(stats)
     }

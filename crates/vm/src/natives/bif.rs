@@ -92,7 +92,7 @@ pub(crate) extern "C" fn monitor_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u6
     };
     process.heap.note_bif_entry();
     let args = crate::bif_table::bif_args::<2>(reg);
-    let result = monitor(process, None, &args);
+    let result = monitor(process, reg, None, &args);
     bif_ret(c_p, i, result)
 }
 
@@ -104,7 +104,7 @@ pub(crate) extern "C" fn monitor_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u6
     };
     process.heap.note_bif_entry();
     let args = crate::bif_table::bif_args::<3>(reg);
-    let result = monitor(process, None, &args);
+    let result = monitor(process, reg, None, &args);
     bif_ret(c_p, i, result)
 }
 
@@ -139,7 +139,7 @@ pub(crate) fn monitor_executor(
     ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    monitor(process, Some((vm, ctx)), args)
+    monitor(process, std::ptr::null_mut(), Some((vm, ctx)), args)
 }
 
 /// `demonitor/1,2` called by the executor by MFA.
@@ -155,7 +155,12 @@ pub(crate) fn demonitor_executor(
 /// `monitor(Type, Item [, Opts])`: `erts_monitor_opts` for `monitor/3`, then the type arms.
 // Port of erts/emulator/beam/bif.c (monitor_3: erts_monitor_opts, am_badopt; monitor),
 // OTP-29.1.1.
-fn monitor(process: &mut Process, sched: Sched<'_, '_>, args: &[Term]) -> Result<Term, VmError> {
+fn monitor(
+    process: &mut Process,
+    reg: *mut u64,
+    sched: Sched<'_, '_>,
+    args: &[Term],
+) -> Result<Term, VmError> {
     let (tag, alias_mode, priority) = if args.len() == 3 {
         crate::signals::monitor_options(args).map_err(|_| badarg_cause(3, atoms::BADOPT))?
     } else {
@@ -192,7 +197,7 @@ fn monitor(process: &mut Process, sched: Sched<'_, '_>, args: &[Term]) -> Result
         if let Some(node) = crate::dist::remote_node(target)? {
             return match sched {
                 Some((_vm, ctx)) => crate::dist::monitor_remote(process, ctx, args, node),
-                None => monitor_remote_native(process, args, node),
+                None => monitor_remote_native(process, reg, args, node),
             };
         }
         // `{Name, Node}` of this node is a local name.
@@ -338,13 +343,12 @@ pub(crate) fn prio_ml(
 #[inline(never)]
 fn monitor_remote_native(
     process: &mut Process,
+    reg: *mut u64,
     args: &[Term],
     node: String,
 ) -> Result<Term, VmError> {
     // The call site a suspending BIF names (`c_p->i` at the call).
-    if let Some((process, registers)) = crate::native_hooks::scheduler_registers(process) {
-        process.native_call_pc = registers.tmp_mem[6] as usize;
-    }
+    crate::native_hooks::note_call_site(process, reg);
     let result = crate::process::sched_data::with_sched_data(process, |_vm, process, ctx| {
         crate::dist::monitor_remote(process, ctx, args, node)
     })
@@ -668,7 +672,7 @@ fn erl_send(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     };
     process.heap.note_bif_entry();
     let [to, msg] = crate::bif_table::bif_args::<2>(reg);
-    let result = match do_send(process, to, msg, SendOptions::default()) {
+    let result = match do_send(process, reg, to, msg, SendOptions::default()) {
         Ok(Sent::Done) => send_return(process, msg),
         Ok(Sent::NoConnect) => Ok(msg),
         // The sender is suspended on the busy port; the send is redone through the send/2
@@ -730,9 +734,15 @@ fn send_yield_return(process: &mut Process, value: Term) -> Result<Term, VmError
 /// scheduler's data, which Arinsal's trace evaluation needs.
 // Port of erts/emulator/beam/bif.c (do_send, remote_send), OTP-29.1.1.
 #[inline(always)]
-fn do_send(process: &mut Process, to: Term, msg: Term, opts: SendOptions) -> Result<Sent, VmError> {
+fn do_send(
+    process: &mut Process,
+    reg: *mut u64,
+    to: Term,
+    msg: Term,
+    opts: SendOptions,
+) -> Result<Sent, VmError> {
     if !crate::trace::send_hooks_idle(process) {
-        return do_send_hooked(process, to, msg, opts);
+        return do_send_hooked(process, reg, to, msg, opts);
     }
     // is_internal_pid(to): erts_proc_lookup_raw, then erts_send_message.
     if !opts.priority
@@ -744,7 +754,7 @@ fn do_send(process: &mut Process, to: Term, msg: Term, opts: SendOptions) -> Res
         };
     }
     if crate::dist::is_remote_target(to)? {
-        return remote_send(process, to, msg, opts);
+        return remote_send(process, reg, to, msg, opts);
     }
     do_send_local(process, to, msg, opts)
 }
@@ -770,6 +780,7 @@ fn do_send_local(
 #[inline(never)]
 fn do_send_hooked(
     process: &mut Process,
+    reg: *mut u64,
     to: Term,
     msg: Term,
     opts: SendOptions,
@@ -778,9 +789,9 @@ fn do_send_hooked(
         crate::trace::save_call(process, crate::trace::SavedCall::Send);
     }
     if crate::dist::is_remote_target(to)? {
-        return remote_send(process, to, msg, opts);
+        return remote_send(process, reg, to, msg, opts);
     }
-    with_sched(process, |vm, process, ctx| {
+    with_sched(process, reg, |vm, process, ctx| {
         let sent = process.send_message_prio(
             Some(vm),
             Some(ctx),
@@ -800,6 +811,7 @@ fn do_send_hooked(
 #[inline(never)]
 fn remote_send(
     process: &mut Process,
+    reg: *mut u64,
     to: Term,
     msg: Term,
     opts: SendOptions,
@@ -807,6 +819,7 @@ fn remote_send(
     use crate::dist::RemoteSendOutcome;
     with_sched(
         process,
+        reg,
         |vm, process, ctx| match crate::dist::try_remote_send_with_options(
             process,
             ctx,
@@ -887,7 +900,7 @@ pub(crate) extern "C" fn send_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) 
         return bif_ret(c_p, i, Err(error));
     };
     let ok = Term::atom(atoms::OK);
-    let result = match do_send(process, to, msg, opts) {
+    let result = match do_send(process, reg, to, msg, opts) {
         Ok(Sent::Done) => send_return(process, ok),
         Ok(Sent::NoConnect) => Ok(Term::atom(if opts.noconnect {
             atoms::NOCONNECT
@@ -943,11 +956,10 @@ fn send_options(list: Term) -> Option<SendOptions> {
 // Port of erts/emulator/beam/erl_process.h (erts_proc_sched_data), OTP-29.1.1.
 pub(crate) fn with_sched<R>(
     process: &mut Process,
+    reg: *mut u64,
     f: impl FnOnce(&mut Vm, &mut Process, &mut RunCtx<'_, Message>) -> R,
 ) -> Result<R, VmError> {
-    if let Some((process, registers)) = crate::native_hooks::scheduler_registers(process) {
-        process.native_call_pc = registers.tmp_mem[6] as usize;
-    }
+    crate::native_hooks::note_call_site(process, reg);
     let result = crate::process::sched_data::with_sched_data(process, f)
         .ok_or_else(|| VmError::Unsupported("BIF: no scheduler data".into()));
     process.native_call_pc = 0;
@@ -961,7 +973,7 @@ pub(crate) extern "C" fn link_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) 
         return 0;
     };
     let [other] = crate::bif_table::bif_args::<1>(reg);
-    let result = link_opt(process, other, Term::NIL, 1);
+    let result = link_opt(process, reg, other, Term::NIL, 1);
     bif_ret(c_p, i, result)
 }
 
@@ -972,7 +984,7 @@ pub(crate) extern "C" fn link_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) 
         return 0;
     };
     let [other, opts] = crate::bif_table::bif_args::<2>(reg);
-    let result = link_opt(process, other, opts, 2);
+    let result = link_opt(process, reg, other, opts, 2);
     bif_ret(c_p, i, result)
 }
 
@@ -1024,10 +1036,16 @@ fn external(id: Term, refs: bool, port: bool) -> External {
 
 /// `link_opt(c_p, other, opts)`.
 // Port of erts/emulator/beam/bif.c (link_opt), OTP-29.1.1.
-fn link_opt(process: &mut Process, other: Term, opts: Term, arity: usize) -> Result<Term, VmError> {
+fn link_opt(
+    process: &mut Process,
+    reg: *mut u64,
+    other: Term,
+    opts: Term,
+    arity: usize,
+) -> Result<Term, VmError> {
     let me = process.self_pid.ok_or_else(badarg)?;
     if crate::trace::active() {
-        trace_procs(process, me, "link", other);
+        trace_procs(process, reg, me, "link", other);
     }
     let Some(priority) = erts_link_opts(opts) else {
         return Err(badarg_ext(
@@ -1118,7 +1136,7 @@ fn link_opt(process: &mut Process, other: Term, opts: Term, arity: usize) -> Res
         return ok;
     }
     match external(other, false, false) {
-        External::Remote(node) => with_sched(process, |_vm, process, ctx| {
+        External::Remote(node) => with_sched(process, reg, |_vm, process, ctx| {
             crate::dist::link_remote(process, ctx, &node, other, priority)
         })?,
         // An old incarnation of this node: `noproc`, or its link exit when trapping exits.
@@ -1181,8 +1199,8 @@ fn link_node_create(
 // OTP-29.1.1.
 #[cold]
 #[inline(never)]
-fn trace_procs(process: &mut Process, me: Pid, event: &str, other: Term) {
-    let _ = with_sched(process, |vm, process, ctx| {
+fn trace_procs(process: &mut Process, reg: *mut u64, me: Pid, event: &str, other: Term) {
+    let _ = with_sched(process, reg, |vm, process, ctx| {
         crate::trace::emit(
             Some(vm),
             process,
@@ -1236,17 +1254,17 @@ pub(crate) extern "C" fn unlink_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64
         return 0;
     };
     let [other] = crate::bif_table::bif_args::<1>(reg);
-    let result = unlink(process, other);
+    let result = unlink(process, reg, other);
     bif_ret(c_p, i, result)
 }
 
 /// The arms of `unlink_1`.
 // Port of erts/emulator/beam/bif.c (unlink_1), OTP-29.1.1.
-fn unlink(process: &mut Process, other: Term) -> Result<Term, VmError> {
+fn unlink(process: &mut Process, reg: *mut u64, other: Term) -> Result<Term, VmError> {
     let me = process.self_pid.ok_or_else(badarg)?;
     let ok = Ok(Term::atom(atoms::TRUE));
     if crate::trace::active() && other.as_port().is_none() {
-        trace_procs(process, me, "unlink", other);
+        trace_procs(process, reg, me, "unlink", other);
     }
     if let Some(pid) = Pid::from_term(other) {
         // erts_link_tree_lookup; a link already unlinking sends nothing.
@@ -1302,7 +1320,7 @@ fn unlink(process: &mut Process, other: Term) -> Result<Term, VmError> {
         return ok;
     }
     match external(other, false, false) {
-        External::Remote(node) => with_sched(process, |_vm, process, ctx| {
+        External::Remote(node) => with_sched(process, reg, |_vm, process, ctx| {
             crate::dist::unlink_remote(process, ctx, &node, other)
         })?,
         External::ThisNode => ok,
@@ -1356,7 +1374,7 @@ fn exit_signal_bif(
     } else {
         Term::NIL
     };
-    let result = send_exit_signal_bif(process, id, reason, opts, exit2, arity);
+    let result = send_exit_signal_bif(process, reg, id, reason, opts, exit2, arity);
     bif_ret(c_p, i, result)
 }
 
@@ -1364,6 +1382,7 @@ fn exit_signal_bif(
 // Port of erts/emulator/beam/bif.c (send_exit_signal_bif), OTP-29.1.1.
 fn send_exit_signal_bif(
     process: &mut Process,
+    reg: *mut u64,
     id: Term,
     reason: Term,
     opts: Term,
@@ -1436,7 +1455,7 @@ fn send_exit_signal_bif(
         return ok;
     }
     match external(id, true, false) {
-        External::Remote(node) => with_sched(process, |_vm, process, ctx| {
+        External::Remote(node) => with_sched(process, reg, |_vm, process, ctx| {
             crate::dist::exit2_remote(process, ctx, &node, id, reason)
         })?,
         External::ThisNode => ok,
@@ -1456,7 +1475,7 @@ pub(crate) extern "C" fn spawn_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64)
     };
     let [module, function, args] = crate::bif_table::bif_args::<3>(reg);
     let mut so = ErlSpawnOpts::new(process.runtime);
-    let result = erl_create_process(process, module, function, args, &mut so)
+    let result = erl_create_process(process, reg, module, function, args, &mut so)
         .map_err(CreateError::into_bif_error);
     bif_ret(c_p, i, result)
 }
@@ -1478,7 +1497,7 @@ pub(crate) extern "C" fn spawn_link_3(c_p: *mut ProcessHeader, reg: *mut u64, i:
             Err(_) => return bif_ret(c_p, i, Err(crate::natives::erl_process::system_limit())),
         }
     }
-    let result = erl_create_process(process, module, function, args, &mut so)
+    let result = erl_create_process(process, reg, module, function, args, &mut so)
         .map_err(CreateError::into_bif_error);
     bif_ret(c_p, i, result)
 }
@@ -1491,12 +1510,13 @@ pub(crate) extern "C" fn spawn_opt_4(c_p: *mut ProcessHeader, reg: *mut u64, i: 
         return 0;
     };
     let [module, function, args, opts] = crate::bif_table::bif_args::<4>(reg);
-    let result = spawn_opt(process, module, function, args, opts);
+    let result = spawn_opt(process, reg, module, function, args, opts);
     bif_ret(c_p, i, result)
 }
 
 fn spawn_opt(
     process: &mut Process,
+    reg: *mut u64,
     module: Term,
     function: Term,
     args: Term,
@@ -1514,7 +1534,7 @@ fn spawn_opt(
     }
     so.opts = opts;
     so.tag = Term::atom(atoms::SPAWN_REPLY);
-    let pid = erl_create_process(process, module, function, args, &mut so)
+    let pid = erl_create_process(process, reg, module, function, args, &mut so)
         .map_err(CreateError::into_bif_error)?;
     if so.monitor.is_none() {
         return Ok(pid);
@@ -1537,12 +1557,13 @@ pub(crate) extern "C" fn erts_internal_spawn_request_4(
         return 0;
     };
     let [module, function, args, opts] = crate::bif_table::bif_args::<4>(reg);
-    let result = spawn_request(process, module, function, args, opts);
+    let result = spawn_request(process, reg, module, function, args, opts);
     bif_ret(c_p, i, result)
 }
 
 fn spawn_request(
     process: &mut Process,
+    reg: *mut u64,
     module: Term,
     function: Term,
     args: Term,
@@ -1576,6 +1597,7 @@ fn spawn_request(
             so.opts = opts;
             match erl_create_process(
                 process,
+                reg,
                 Term::atom(atoms::ERTS_INTERNAL),
                 Term::atom(atoms::SPAWN_INIT),
                 init_args,

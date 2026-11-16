@@ -1,14 +1,18 @@
 use super::*;
 
 impl Process {
+    /// `garbage_collect(p, live_hf_end, need, objv, nobj)`: `objv` is the root array the caller
+    /// holds (the register array `reg[..live]`, or `c_p->arg_reg` of a process that is not
+    /// running), never read back from the process.
+    // Port of erts/emulator/beam/erl_gc.c (garbage_collect, erts_garbage_collect), OTP-29.1.1.
     pub(super) fn collect_roots(
         &mut self,
-        live_x: usize,
+        objv: &mut [Term],
         extra: &mut [Term],
         min_free: usize,
         hibernate: bool,
     ) -> Result<arinsal_term::GcStats, VmError> {
-        let stats = self.collect_roots_inner(live_x, extra, min_free, hibernate)?;
+        let stats = self.collect_roots_inner(objv, extra, min_free, hibernate)?;
         // A collection moves the young heap. erts keeps HTOP, STOP, HEAP and HEND as the
         // process's own fields, so they are right the moment the collector returns; here the
         // ABI prefix is a copy, and every path that returns to native code after a collection
@@ -18,17 +22,18 @@ impl Process {
 
     fn collect_roots_inner(
         &mut self,
-        live_x: usize,
+        objv: &mut [Term],
         extra: &mut [Term],
         min_free: usize,
         hibernate: bool,
     ) -> Result<arinsal_term::GcStats, VmError> {
         if crate::xreg_poison_enabled()
-            && let Some(register) = self.x[..live_x.min(self.x.len())]
-                .iter()
-                .position(|term| *term == crate::XREG_POISON)
+            && let Some(register) = objv.iter().position(|term| *term == crate::XREG_POISON)
         {
-            panic!("xreg poison: GC roots dead register x{register} (live_x={live_x})");
+            panic!(
+                "xreg poison: GC roots dead register x{register} (live_x={})",
+                objv.len()
+            );
         }
         // Port of erts/emulator/beam/erl_gc.c:782-785 (garbage_collect: F_DELAY_GC), OTP-29.1.1.
         if !hibernate && self.delay_gc {
@@ -86,7 +91,7 @@ impl Process {
         {
             let stats = self
                 .heap
-                .collect(&mut self.x[..live_x], extra, min_free)
+                .collect(objv, extra, min_free)
                 .map_err(|error| VmError::Unsupported(format!("process GC: {error:?}")))?;
             self.stats.gc.collections += stats.collections;
             self.stats.gc.nanoseconds += stats.nanoseconds;
@@ -151,7 +156,7 @@ impl Process {
                 .expect("limited heap has cold data")
                 .max_heap;
             let binary_words = (if limit.include_shared_binaries {
-                off_heap_binary_words(self)
+                off_heap_binary_words(self, objv)
             } else {
                 0
             }) as u64;
@@ -202,7 +207,7 @@ impl Process {
                 roots.push_term(root);
             }
         }
-        roots.push(&mut self.x[..live_x]);
+        roots.push(objv);
         let mut moved = self.inbox.gc_root_slots_and_moved_messages(
             &moved_indices,
             moved_fragments,

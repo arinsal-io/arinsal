@@ -119,12 +119,17 @@ pub(crate) fn enter_runtime_with_registers<'a>(
     Some((process, registers))
 }
 
-pub(crate) fn scheduler_registers(
-    process: &mut Process,
-) -> Option<(&mut Process, &mut SchedulerRegisters)> {
-    // `esdp->registers`: the scheduler's register file the process is attached to.
-    let registers = process.x.scheduler_registers();
-    scheduler_registers_at(process, registers)
+/// Records the call site of the running BIF (`I`) as `process.native_call_pc`. The call fragment
+/// keeps it in the TMP_MEM of the register array `reg`, as erts' `call_light_bif_shared` keeps
+/// `I` in TMP_MEM1q.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-470 (call_light_bif_shared: `I` in
+// TMP_MEM1q, passed as ARG3), OTP-29.1.1.
+pub(crate) fn note_call_site(process: &mut Process, reg: *mut u64) {
+    if let Some((process, registers)) =
+        scheduler_registers_at(process, reg.cast::<SchedulerRegisters>())
+    {
+        process.native_call_pc = registers.tmp_mem[6] as usize;
+    }
 }
 
 /// The process and the register file `reg` a native fragment passed (`esdp->registers`, which
@@ -756,17 +761,20 @@ fn list_length(mut list: Term) -> Option<usize> {
 }
 
 /// Collects with the first `live` scheduler X registers as roots, like
-/// `erts_garbage_collect(p, need, reg, live)` on the register array. `process.x` is that
-/// array, so the roots move in place.
+/// `erts_garbage_collect(p, need, reg, live)` on the register array the fragment passed; the
+/// roots move in place.
 // Exactly the live X registers are GC roots, including those past the six register-backed
 // ones; dead registers may hold stale words (erts_garbage_collect_nobump, OTP-29.1.1).
 pub(crate) fn collect_native(
     process: &mut Process,
-    _registers: &mut SchedulerRegisters,
+    registers: &mut SchedulerRegisters,
     need_words: usize,
     live: usize,
 ) -> Result<(), VmError> {
-    process.ensure(need_words, live)
+    let Some(objv) = registers.x_reg_array.get_mut(..live) else {
+        return Err(VmError::Unsupported("live X register count".into()));
+    };
+    process.ensure_objv(need_words, objv)
 }
 
 /// Heap slow path used by `test_heap` and heap allocation emitters.

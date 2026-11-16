@@ -64,7 +64,10 @@ fn heap_limit_check(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> boo
         // Only a collection checks the limit (`garbage_collect`), so judge the size seen there.
         let mut used = std::mem::take(&mut process.max_heap_peak) as u64;
         if limit.include_shared_binaries {
-            used = used.saturating_add(off_heap_binary_words(process) as u64);
+            // Only the `arity` registers a switched-out process saved are roots; a completed
+            // process has released its register file.
+            let objv = &process.x[..switched_out_live(process)];
+            used = used.saturating_add(off_heap_binary_words(process, objv) as u64);
         }
         if used <= limit.size {
             return false;
@@ -83,17 +86,13 @@ fn heap_limit_check(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> boo
     kill
 }
 
-pub(super) fn off_heap_binary_words(process: &Process) -> usize {
+/// Off-heap binary words reachable from `objv` (the X register roots the caller holds), the
+/// mailbox and the dictionary.
+pub(super) fn off_heap_binary_words(process: &Process, objv: &[Term]) -> usize {
     let mut seen = HashSet::new();
     let mut bytes = HashMap::<usize, usize>::new();
     let mut stack = Vec::new();
-    // Only the `arity` registers a switched-out process saved are roots; a completed process
-    // has released its register file.
-    for term in process.x[..switched_out_live(process)]
-        .iter()
-        .copied()
-        .chain(process.inbox.iter().copied())
-    {
+    for term in objv.iter().copied().chain(process.inbox.iter().copied()) {
         stack.push(term);
     }
     if let Some(dictionary) = &process.dictionary {

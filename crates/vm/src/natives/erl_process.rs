@@ -301,6 +301,7 @@ struct UnscheduledChild {
 // added to the parent's run queue last.
 pub(crate) fn erl_create_process(
     parent: &mut Process,
+    reg: *mut u64,
     module: Term,
     function: Term,
     args: Term,
@@ -349,12 +350,13 @@ pub(crate) fn erl_create_process(
     let pid = spawned.pid();
     let pid_term = pid.to_term().ok_or(CreateError::SystemLimit)?;
     if crate::trace::spawn_interested(parent, parent_pid) {
-        trace_spawn(parent, pid, (module, function, args), so.link)?;
+        trace_spawn(parent, reg, pid, (module, function, args), so.link)?;
     }
     let mut seq_reply_token = None;
     if let Some(request) = seq_spawn.as_ref() {
         seq_reply_token = seq_spawn_events(
             parent,
+            reg,
             parent_pid,
             request,
             pid,
@@ -382,6 +384,7 @@ pub(crate) fn erl_create_process(
 #[inline(never)]
 fn trace_spawn(
     parent: &mut Process,
+    reg: *mut u64,
     child: Pid,
     mfa: (Term, Term, Term),
     linked: bool,
@@ -396,7 +399,7 @@ fn trace_spawn(
             .tuple(&[module, function, arg_list])
             .map_err(|error| VmError::Unsupported(format!("spawn trace MFA: {error:?}")))?
     };
-    with_sched(parent, |vm, parent, ctx| {
+    with_sched(parent, reg, |vm, parent, ctx| {
         crate::trace::spawned(vm, parent, ctx, child, mfa, linked);
     })
 }
@@ -407,8 +410,10 @@ fn trace_spawn(
 // have_seqtrace), OTP-29.1.1.
 #[cold]
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn seq_spawn_events(
     parent: &mut Process,
+    reg: *mut u64,
     parent_pid: Pid,
     request: &crate::seq_trace::Token,
     child: Pid,
@@ -445,7 +450,7 @@ fn seq_spawn_events(
         owned(child_term),
     ]);
     let synchronous = !so.r#async;
-    with_sched(parent, |vm, parent, ctx| {
+    with_sched(parent, reg, |vm, parent, ctx| {
         Some(crate::seq_trace::spawn_events(
             vm,
             parent,

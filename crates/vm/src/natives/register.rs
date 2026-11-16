@@ -22,7 +22,7 @@ pub(crate) extern "C" fn register_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u
         return 0;
     };
     let [name, id] = crate::bif_table::bif_args::<2>(reg);
-    let result = match erts_register_name(process, name, id) {
+    let result = match erts_register_name(process, reg, name, id) {
         Ok(()) => Ok(Term::atom(atoms::TRUE)),
         Err(cause) => Err(badarg_ext(atoms::ERLANG, "register", 2, Term::atom(cause))),
     };
@@ -32,7 +32,12 @@ pub(crate) extern "C" fn register_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u
 /// `erts_register_name(c_p, name, id)`: `Err(fvalue)` is `am_none`, `am_registered_name` or
 /// `am_notalive`.
 // Port of erts/emulator/beam/register.c (erts_register_name), OTP-29.1.1.
-fn erts_register_name(process: &mut Process, name: Term, id: Term) -> Result<(), Atom> {
+fn erts_register_name(
+    process: &mut Process,
+    reg: *mut u64,
+    name: Term,
+    id: Term,
+) -> Result<(), Atom> {
     let none = atoms::NONE;
     let name = name
         .as_atom()
@@ -59,7 +64,7 @@ fn erts_register_name(process: &mut Process, name: Term, id: Term) -> Result<(),
         scheduler.set_registered_atom_index(pid, name.0);
         drop(table);
         if crate::trace::active() {
-            trace_register(process, pid, "register", name);
+            trace_register(process, reg, pid, "register", name);
         }
         return Ok(());
     }
@@ -107,8 +112,8 @@ fn registered_name() -> Atom {
 // trace_proc), OTP-29.1.1.
 #[cold]
 #[inline(never)]
-fn trace_register(process: &mut Process, pid: Pid, event: &str, name: Atom) {
-    let _ = with_sched(process, |vm, process, ctx| {
+fn trace_register(process: &mut Process, reg: *mut u64, pid: Pid, event: &str, name: Atom) {
+    let _ = with_sched(process, reg, |vm, process, ctx| {
         crate::trace::emit(
             Some(vm),
             process,
@@ -129,7 +134,7 @@ pub(crate) extern "C" fn unregister_1(c_p: *mut ProcessHeader, reg: *mut u64, i:
     };
     let [name] = crate::bif_table::bif_args::<1>(reg);
     let result = match name.as_atom() {
-        Some(name) if erts_unregister_name(process, name) => Ok(Term::atom(atoms::TRUE)),
+        Some(name) if erts_unregister_name(process, reg, name) => Ok(Term::atom(atoms::TRUE)),
         _ => Err(badarg()),
     };
     bif_ret(c_p, i, result)
@@ -137,7 +142,7 @@ pub(crate) extern "C" fn unregister_1(c_p: *mut ProcessHeader, reg: *mut u64, i:
 
 /// `erts_unregister_name(c_p, ..., name)`: whether the name was registered.
 // Port of erts/emulator/beam/register.c (erts_unregister_name), OTP-29.1.1.
-fn erts_unregister_name(process: &mut Process, name: Atom) -> bool {
+fn erts_unregister_name(process: &mut Process, reg: *mut u64, name: Atom) -> bool {
     let Some(rt) = process.runtime else {
         return false;
     };
@@ -149,7 +154,7 @@ fn erts_unregister_name(process: &mut Process, name: Atom) -> bool {
             }
             drop(table);
             if crate::trace::active() {
-                trace_register(process, pid, "unregister", name);
+                trace_register(process, reg, pid, "unregister", name);
             }
             true
         }

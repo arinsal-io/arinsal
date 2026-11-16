@@ -158,7 +158,7 @@ pub extern "C" fn arinsal_beamasm_bs_init_writable(header: *mut ProcessHeader, s
         return 0;
     };
     let size = crate::native_hooks::from_raw(size).as_small();
-    if process.ensure(8, 0).is_err() {
+    if process.ensure_objv(8, &mut []).is_err() {
         crate::native_hooks::set_error(process, "system_limit");
         return 0;
     }
@@ -821,7 +821,10 @@ pub(crate) extern "C" fn arinsal_beamasm_call_error_handler(
         return 0;
     };
     let arity = usize::from(stub.arity);
-    if process.ensure(arity * 2, arity).is_err() {
+    if process
+        .ensure_objv(arity * 2, &mut registers.x_reg_array[..arity])
+        .is_err()
+    {
         return 0;
     }
     let args: smallvec::SmallVec<[Term; 8]> = smallvec::SmallVec::from_slice(&process.x[..arity]);
@@ -2831,7 +2834,7 @@ pub(crate) extern "C" fn arinsal_beamasm_light_bif_gc(
     }
     let arity = usize::from(export.arity);
     if value == arinsal_term::THE_NON_VALUE {
-        return gc_after_failed_bif(process, arity);
+        return gc_after_failed_bif(process, registers, arity);
     }
     plain_bif_result(
         process,
@@ -2848,13 +2851,17 @@ pub(crate) extern "C" fn arinsal_beamasm_light_bif_gc(
 // Port of erts/emulator/beam/erl_gc.c:454-459 (erts_gc_after_bif_call_lhf), OTP-29.1.1.
 #[cold]
 #[inline(never)]
-fn gc_after_failed_bif(process: &mut crate::Process, arity: usize) -> u64 {
+fn gc_after_failed_bif(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    arity: usize,
+) -> u64 {
     let live = if process.heap.abi.exc.freason == arinsal_term::exc::TRAP {
         usize::from(process.heap.abi.arity)
     } else {
         arity
     };
-    match process.collect_heap_roots(live, &mut [], 0) {
+    match process.collect_heap_roots_objv(&mut registers.x_reg_array[..live], &mut [], 0) {
         Ok(stats) => {
             crate::natives::sys::after_collection(
                 process,
@@ -3596,7 +3603,10 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(
     let function = process.x[arity + 1];
     let (Some(module_atom), Some(function_atom)) = (module.as_atom(), function.as_atom()) else {
         // Port of erts/emulator/beam/beam_common.c:1540-1552 (fixed_apply, `error`), OTP-29.1.1.
-        if process.ensure(arity * 2, arity + 2).is_err() {
+        if process
+            .ensure_objv(arity * 2, &mut registers.x_reg_array[..arity + 2])
+            .is_err()
+        {
             return apply_error(
                 process,
                 module,
@@ -4480,7 +4490,10 @@ pub extern "C" fn arinsal_beamasm_bs_match_command(
         match outcome {
             Err(BitsError::HeapFull { need_words }) => {
                 request = need_words.max(request.saturating_mul(2));
-                if process.ensure(request, root_live).is_err() {
+                if process
+                    .ensure_objv(request, &mut registers.x_reg_array[..root_live])
+                    .is_err()
+                {
                     crate::native_hooks::set_error(process, "system_limit");
                     return 0;
                 }
