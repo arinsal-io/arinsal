@@ -473,7 +473,7 @@ impl Executor {
                     arinsal_loader::ImportClass::Native
                         | arinsal_loader::ImportClass::Dynamic
                         | arinsal_loader::ImportClass::Fun
-                ) || export.bif.is_some()
+                ) || export.export_object().bif_number() != -1
                 {
                     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:388-397
                     // (call_light_bif_shared), OTP-29.1.1: the call was routed here by
