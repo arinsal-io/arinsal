@@ -2791,7 +2791,6 @@ struct Inner<T: Task> {
     halt_started: AtomicBool,
     halt_requested: AtomicBool,
     runq_halting: Arc<[AtomicBool]>,
-    searching: AtomicU32,
     active_schedulers: AtomicUsize,
     worker_stats: Vec<WorkerCounters>,
     stats_requests: Vec<thr_queue::ThrQueue<mpsc::Sender<LocalStatsSnapshot>>>,
@@ -6964,7 +6963,6 @@ impl<T: Task> Scheduler<T> {
                 .map(|_| AtomicBool::new(false))
                 .collect::<Vec<_>>()
                 .into(),
-            searching: AtomicU32::new(0),
             active_schedulers: AtomicUsize::new(0),
             worker_stats: (0..workers)
                 .map(|_| WorkerCounters {
@@ -9986,14 +9984,10 @@ fn schedule_next<T: Task>(
     local_cell: &Rc<RefCell<Local<T>>>,
     managed_thread: &thr_progress::ManagedThread,
     spin_count: u32,
-    steal_armed: &mut bool,
     previous: Option<SliceEnd<T>>,
 ) -> Option<Scheduled<T>> {
     let mut local_guard = local_cell.borrow_mut();
     let local = &mut *local_guard;
-    // Port of erts/emulator/beam/erl_process.c:9943 (schedule: non_empty_runq after
-    // scheduler_wait), OTP-29.1.1.
-    inner.balance.non_empty_runq(id);
     // `rq->mtx` of this scheduler: held from the enqueue of the slice that just ended up to the
     // dequeue, given up where erts calls erts_runq_unlock, released by every return.
     let mut rq = run_queue::RqHold::new(&inner.run_queues[id]);
@@ -10284,25 +10278,14 @@ fn schedule_next<T: Task>(
         // OTP-29.1.1.
         rq.unlock();
     }
-    if item.is_none() && *steal_armed {
-        // Port of erts/emulator/beam/erl_process.c:4640 (try_steal_task), OTP-29.1.1.
-        // A scheduler steals only after it has run out of work and been through
-        // scheduler_wait, or after it has already executed. The first look at an
-        // empty queue waits, the way a booted scheduler sleeps before user work
-        // exists, so it does not take processes another scheduler just enqueued
-        // on its own run queue.
-        let limit = inner.config.workers.div_ceil(2) as u32;
-        if inner.searching.fetch_add(1, Ordering::AcqRel) < limit {
-            match inner.try_steal_task(&mut *local) {
-                Some(Stolen::Process(found)) => item = Some(found),
-                Some(Stolen::Port) => {
-                    inner.searching.fetch_sub(1, Ordering::AcqRel);
-                    return None;
-                }
-                None => {}
-            }
+    if item.is_none() {
+        // Port of erts/emulator/beam/erl_process.c:9922 (erts_schedule: try_steal_task on an
+        // empty run queue before scheduler_wait), OTP-29.1.1.
+        match inner.try_steal_task(&mut *local) {
+            Some(Stolen::Process(found)) => item = Some(found),
+            Some(Stolen::Port) => return None,
+            None => {}
         }
-        inner.searching.fetch_sub(1, Ordering::AcqRel);
     }
     if item.is_none() {
         item = inner.run_queues[id].pop_next();
@@ -10317,7 +10300,6 @@ fn schedule_next<T: Task>(
             profile_scheduler_transition::<T>(id, true, count);
         }
         local.last_process = Some(item.process.pid);
-        *steal_armed = true;
         drop(local_guard);
         return Some(item);
     }
@@ -10354,6 +10336,9 @@ fn schedule_next<T: Task>(
             || thr_progress::scheduler_later_op_ready()
     {
         inner.parked[id].store(false, Ordering::SeqCst);
+        // Port of erts/emulator/beam/erl_process.c:9943 (erts_schedule: non_empty_runq right
+        // after scheduler_wait returns), OTP-29.1.1.
+        inner.balance.non_empty_runq(id);
         return None;
     }
     if local.profile_active {
@@ -10442,11 +10427,13 @@ fn schedule_next<T: Task>(
         }
         local.set_msacc_state(MsaccState::Other);
     }
-    *steal_armed = true;
     thr_progress::scheduler_finalize_wait();
     inner.waiting_schedulers.fetch_sub(1, Ordering::Relaxed);
     inner.balance.set_waiting(id, false);
     inner.parked[id].store(false, Ordering::SeqCst);
+    // Port of erts/emulator/beam/erl_process.c:9943 (erts_schedule: non_empty_runq right after
+    // scheduler_wait returns), OTP-29.1.1.
+    inner.balance.non_empty_runq(id);
     None
 }
 
@@ -10488,10 +10475,6 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         inner: Arc::clone(&inner),
         local: Rc::downgrade(&local_cell),
     }) as Rc<dyn NativeSend<T::Message>>);
-    // Stealing starts after this scheduler has run, or after its first wait.
-    // Until then an empty queue sleeps, matching a scheduler that reached
-    // scheduler_wait at boot before any user process existed.
-    let mut steal_armed = false;
     #[cfg(target_os = "linux")]
     let inherited_affinity = rustix::thread::sched_getaffinity(None).ok();
     #[cfg(target_os = "linux")]
@@ -10516,7 +10499,6 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
             &local_cell,
             &managed_thread,
             spin_count,
-            &mut steal_armed,
             previous.take(),
         ) else {
             continue;
