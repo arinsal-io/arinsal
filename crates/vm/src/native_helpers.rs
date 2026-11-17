@@ -1551,21 +1551,12 @@ fn call_direct_bif(
         return Some(0);
     }
     registers.x_reg_array[0] = value;
-    let mut raw = crate::native_hooks::raw(value);
-    // The light fragment tests the collection after this call (instr_bif.cpp:488-523).
-    if export_call && (process.heap.gc_desired() || process.heap.bin_vheap_gc_due()) {
-        if process.collect_bin_vheap_if_due(1).is_err() {
-            crate::native_hooks::set_error(process, "system_limit");
-            return Some(0);
-        }
-        raw = crate::native_hooks::raw(registers.x_reg_array[0]);
-        // The collection moved the heap: publish every bound.
-        return Some(raw);
-    }
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_light_bif_shared,
-    // emit_leave_runtime<eReductions | eHeap | eStack | eXRegs>), OTP-29.1.1: a BIF that did not
-    // collect only moved HTOP and the reduction counter; the heap bounds and stack are unchanged.
-    Some(raw)
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_light_bif_shared) and
+    // beam_jit_common.cpp (beam_jit_call_bif), OTP-29.1.1: the BIF only returns its result.
+    // The one collection after it is the caller's `erts_gc_after_bif_call_lhf`, with the
+    // result as its root: the light fragment's test, or the export trampoline's
+    // `gc_after_bif_call`.
+    Some(crate::native_hooks::raw(value))
 }
 
 /// Collects after a direct BIF that failed: the argument registers and the failure words are
