@@ -638,19 +638,9 @@ impl Executor {
             process.x.detach_save(0);
             process.x = crate::proc_create::ArgRegs::empty();
         }
-        // A waiting process is not collected when it switches out: erts only runs
-        // `scheduler_gc_proc` for a process being scheduled in (a yielded process is still
-        // active) or handling signals/sys tasks, so a sleeping receiver with on-heap message
-        // fragments keeps them until it next runs.
-        if matches!(result, Ok(RunState::Yield)) {
-            // erts collects a switched-out process rooting only its `c_p->arity` live X
-            // registers; the saved register file above that holds dead registers whose
-            // pointers may refer to a heap an earlier collection already freed.
-            // Port of erts/emulator/beam/erl_process.c:10415 (ERTS_IS_GC_DESIRED ->
-            // scheduler_gc_proc, garbage_collect with p->arity), OTP-29.1.1.
-            let live = switched_out_live(process);
-            process.collect_bin_vheap_if_due(live)?;
-        }
+        // Port of erts/emulator/beam/erl_process.c:10415 (erts_schedule), OTP-29.1.1: erts has no
+        // collection at schedule-out. ERTS_IS_GC_DESIRED is tested once, when the process is
+        // scheduled in (`collect_on_schedule_in`), so a yielded process is collected there.
         // OTP emits regular `out` only when a process is scheduled out; normal exit uses the
         // separate `out_exiting` event when that flag is enabled.
         // Port of erts/emulator/beam/erl_process.c:10550-10567, OTP-29.1.1.
