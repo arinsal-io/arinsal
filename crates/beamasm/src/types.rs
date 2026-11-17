@@ -91,12 +91,25 @@ pub struct TypedArg {
     pub val: ArgVal,
     /// Its type; only meaningful for registers and literals.
     pub ty: ArgType,
+    /// Arity of the literal tuple behind a `Literal` operand (erts reads it with
+    /// `beamfile_get_literal`); `None` for any other operand.
+    pub literal_tuple_arity: Option<u64>,
 }
 
 impl TypedArg {
     /// Pairs an operand with its type.
     pub fn new(val: ArgVal, ty: ArgType) -> Self {
-        Self { val, ty }
+        Self {
+            val,
+            ty,
+            literal_tuple_arity: None,
+        }
+    }
+
+    /// Records the arity of a literal tuple operand.
+    pub fn with_literal_tuple_arity(mut self, arity: Option<u64>) -> Self {
+        self.literal_tuple_arity = arity;
+        self
     }
 
     /// `ArgSource::isSmall`: an immediate small integer.

@@ -500,6 +500,49 @@ impl BeamModuleAssembler {
         destination: ArgVal,
     ) -> Result<(), ModuleError> {
         let (from_guard, direct) = self.element_error_labels();
+        // Port of instr_guard_bifs.cpp:585-640: a lookup table in a literal tuple indexed by an
+        // integer needs neither a tuple test nor, for a known range, a bounds test.
+        if pos.exact_type(type_id::INTEGER)
+            && let (ArgVal::Literal(_), Some(size)) = (tuple.val, tuple.literal_tuple_arity)
+        {
+            let (p, t) = self.load_two_sources(pos.val, ARG1, tuple.val, ARG2)?;
+            let output = self.guard_destination(destination)?;
+            let fail_label = self.code.new_label();
+            let next = self.code.new_label();
+            let (min, max) = pos.clamped_range();
+            let size = size as i64;
+            let can_fail = min < 1 || size < max;
+            if !pos.always_small() {
+                self.emit_is_not_boxed(fail_label, p)?;
+            }
+            self.code.emit(|e| {
+                e.sub_imm(TMP1, t, 2, false)?;
+                e.asr_imm(Gpr::x(10), p, 4)
+            })?;
+            if !(1 <= min && max <= size) {
+                self.code.emit(|e| e.sub_imm(TMP2, Gpr::x(10), 1, false))?;
+                self.cmp_signed(TMP2, size)?;
+                self.code.b_cond(Cond::Cs, fail_label)?;
+            }
+            self.code
+                .emit(|e| e.ldr_regoff(output, TMP1, Gpr::x(10), 3))?;
+            if can_fail {
+                self.code.b(next)?;
+            }
+            self.code.bind(fail_label)?;
+            if can_fail {
+                if fail != 0 {
+                    let target = self.label(fail);
+                    self.code.b(target)?;
+                } else {
+                    self.mov_var(ARG1, p)?;
+                    self.mov_var(ARG2, t)?;
+                    self.code.bl(direct)?;
+                }
+            }
+            self.code.bind(next)?;
+            return self.store_guard_result(destination, output);
+        }
         let max_arity = (1_i64 << 58) - 1;
         let const_position =
             pos.is_small() && pos.small_value() > 0 && pos.small_value() <= max_arity;

@@ -8,7 +8,6 @@ use crate::erts_tables::*;
 use crate::loader_state::{LoaderState, TeResult, erts_transform_engine};
 use crate::{NewLiteral, OpSink, SpecificOperand, TransformArena};
 use arinsal_beam::BeamFile;
-use std::sync::LazyLock;
 
 /// Why a module cannot be loaded: the `BeamLoadError*` messages of `load_code`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,31 +27,6 @@ fn error(message: impl Into<String>) -> LoadCodeError {
 
 /// `ERTS_DEBUGGER_ENABLED | ERTS_DEBUGGER_LINE_BREAKPOINTS`.
 const DEBUGGER_LINE_BREAKPOINTS: u64 = 0b11;
-
-/// Operations whose operands keep their `Type` chunk entry in the typed transform, by generic
-/// operation number.
-// Port of erts/emulator/beam/jit/arm/instr_arith.cpp and instr_guard_bifs.cpp, OTP-29.1.1.
-static TYPED_OPS: LazyLock<Vec<bool>> = LazyLock::new(|| {
-    const NAMES: &[&str] = &[
-        "is_map",
-        "bif_is_map_key",
-        "bif_map_size",
-        "i_plus",
-        "i_minus",
-        "i_band",
-        "i_bor",
-        "i_bxor",
-        "i_bsl",
-        "i_bsr",
-        "i_rem",
-        "i_int_div",
-        "bif_map_get",
-    ];
-    GEN_OPC
-        .iter()
-        .map(|entry| NAMES.contains(&entry.name))
-        .collect()
-});
 
 /// `load_code`: transforms the module's code and hands its specific instructions to `sink`.
 pub(crate) fn load_code<S: OpSink>(
@@ -429,7 +403,9 @@ fn emit_op<S: OpSink>(
             .map_err(error)?;
         *announced += 1;
     }
-    let use_types = typed && TYPED_OPS[op as usize];
+    // Port of erts/emulator/beam/jit/asm_load.c (beam_load_emit_op), OTP-29.1.1: every x/y
+    // operand keeps its type index; the emitters decide whether they read it.
+    let use_types = typed;
     operands.clear();
     for index in 0..arity {
         let arg = st.ops.op(genop).a(index);

@@ -2196,10 +2196,26 @@ fn typed_arg(
     beam: &BeamFile,
     env: &impl ModuleEnv,
 ) -> Result<arinsal_beamasm::types::TypedArg, String> {
-    Ok(arinsal_beamasm::types::TypedArg::new(
-        arg(value, beam, env)?,
-        operand_type(value, beam),
-    ))
+    Ok(
+        arinsal_beamasm::types::TypedArg::new(arg(value, beam, env)?, operand_type(value, beam))
+            .with_literal_tuple_arity(literal_tuple_arity(value, beam)),
+    )
+}
+
+/// The arity of a literal tuple operand, read from the literal's external term format.
+// erts reads it from the loaded literal (beamfile_get_literal + arityval).
+fn literal_tuple_arity(value: Option<&SpecificOperand>, beam: &BeamFile) -> Option<u64> {
+    let Some(SpecificOperand::Literal(index)) = value else {
+        return None;
+    };
+    let etf = &beam.literals.get(*index as usize)?.0;
+    match etf.get(1)? {
+        104 => etf.get(2).map(|arity| u64::from(*arity)),
+        105 => etf
+            .get(2..6)
+            .map(|bytes| u64::from(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))),
+        _ => None,
+    }
 }
 
 /// The compiler type of an operand: its `Type` chunk entry for a typed register, the type of a
@@ -2656,7 +2672,8 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
             }
             let mut indices = Vec::with_capacity(registers);
             for register in &args[1..] {
-                let SpecificOperand::Y(index) = register else {
+                let (SpecificOperand::Y(index) | SpecificOperand::TypedY { index, .. }) = register
+                else {
                     return Err(EmitError::Operand(
                         "init_yregs list must contain Y registers".to_owned(),
                     ));

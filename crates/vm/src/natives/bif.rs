@@ -1861,19 +1861,7 @@ pub(crate) extern "C" fn setelement_3(c_p: *mut ProcessHeader, reg: *mut u64, _i
     else {
         return bif_badarg(c_p);
     };
-    let slot = ix as usize - 1;
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let built = arinsal_term::TermBuilder::new(&mut heap).tuple_from_fn(source.arity(), |at, _| {
-        if at == slot {
-            value
-        } else {
-            source.get(at).unwrap_or(Term::NIL)
-        }
-    });
-    match built {
-        Ok(tuple) => crate::native_hooks::raw(tuple),
-        Err(_) => bif_system_limit(c_p),
-    }
+    crate::native_hooks::raw(process.heap.setelement(source, ix as usize, value))
 }
 
 /// `BIF_P->fvalue = BIF_ARG_1; BIF_ERROR(BIF_P, freason)`.

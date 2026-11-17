@@ -2058,6 +2058,25 @@ impl ProcessHeap {
         }
         self.alloc_halloc_slow(words)
     }
+    /// The tail of `setelement/3` after its argument checks: one `HAlloc` of `arity + 1`
+    /// words, the copy of the tuple, then `resp[ix] = value` (`ix` is 1-based, `<= arity`).
+    // Port of erts/emulator/beam/bif.c (setelement_3), OTP-29.1.1.
+    #[inline(always)]
+    pub fn setelement(&mut self, source: crate::raw::Tuple<'_>, ix: usize, value: Term) -> Term {
+        let size = source.arity() + 1;
+        // HAlloc never fails: HAllocX falls back to a heap fragment (erts_heap_alloc).
+        let hp = self
+            .alloc_halloc(size)
+            .unwrap_or_else(|| self.heap_fragment(size));
+        // sys_memcpy(hp, ptr, sizeof(Eterm) * size): the header and every element.
+        crate::raw::copy_words(
+            (source.term().bits() as usize).wrapping_sub(2),
+            hp as usize,
+            size,
+        );
+        store(hp.wrapping_add(ix), value.bits());
+        Term::from_ptr(hp, 2)
+    }
 
     /// Allocate `words` while keeping `extra` words available for native stores.
     // Port of `HeapWordsLeft` and `HAlloc` in erts/emulator/beam/erl_vm.h, OTP-29.1.1.
