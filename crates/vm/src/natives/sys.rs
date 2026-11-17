@@ -1097,34 +1097,7 @@ fn system_info(
     ctx: Option<&RunCtx<'_, Message>>,
     selector: Term,
 ) -> Option<Result<Term, VmError>> {
-    // `system_info(process_count)` is a direct process-table count in erts; handle its atom
-    // before constructing the owned selector used by tuple and allocator selectors below.
-    // Port of erts/emulator/beam/erl_bif_info.c:2942, OTP-29.1.1.
-    if selector
-        .as_atom()
-        .and_then(|atom| global_atoms().text(atom))
-        == Some("process_count")
-    {
-        return Some(non_neg(process, process_count(process) as u64));
-    }
     let owned_selector = arinsal_term::to_owned(selector).ok();
-    if let Some(arinsal_etf::OwnedTerm::Tuple(parts)) = owned_selector.as_ref()
-        && let [
-            arinsal_etf::OwnedTerm::Atom(name),
-            arinsal_etf::OwnedTerm::Atom(kind),
-        ] = parts.as_slice()
-    {
-        match (name.as_str(), kind.as_str()) {
-            ("wordsize", "internal" | "external") => return Some(Ok(Term::small(8).unwrap())),
-            ("wordsize", _) => return Some(Err(badarg())),
-            ("cpu_topology", "detected") => return Some(detected_cpu_topology_info(process)),
-            ("cpu_topology", "defined") => return Some(defined_cpu_topology_info(process)),
-            ("cpu_topology", "used") => return Some(cpu_topology_info(process)),
-            ("cpu_topology", _) => return Some(Err(badarg())),
-            // Other two-atom selectors ({allocator, A}, ...) are handled below.
-            _ => {}
-        }
-    }
     if let Some(arinsal_etf::OwnedTerm::Tuple(parts)) = owned_selector.as_ref()
         && let [
             arinsal_etf::OwnedTerm::Atom(operation),
@@ -1137,11 +1110,8 @@ fn system_info(
     let name = selector
         .as_atom()
         .and_then(|atom| global_atoms().text(atom));
-    if let Some(item) = name.and_then(|name| system_info_process_item(process, name)) {
-        return Some(item);
-    }
-    if let Some(item) = crate::natives::erl_bif_info::system_info_light_item(process, selector) {
-        return Some(item);
+    if matches!(name, Some("allocator" | "alloc_util_allocators")) {
+        return name.and_then(|name| system_info_process_item(process, name));
     }
     match name {
         // Port of erts/emulator/beam/erl_bif_info.c:2949-2954, OTP-29.1.1.
@@ -1452,7 +1422,6 @@ pub(crate) fn system_info_process_item(
                 .collect::<Vec<_>>();
             Some(cons_list(process, &terms))
         }
-        Some("cpu_topology") => Some(cpu_topology_info(process)),
         // Port of erts/emulator/beam/erl_bif_info.c:3251 and
         // erts/emulator/beam/erl_cpu_topology.c:662-692, OTP-29.1.1.
         Some("scheduler_bind_type") => {
@@ -3149,6 +3118,41 @@ fn cpu_topology_info(process: &mut Process) -> Result<Term, VmError> {
         )
         .map_err(|_| badarg()),
         None => detected_cpu_topology_info(process),
+    }
+}
+
+/// The cpu_topology selectors are answered by the system_info BIF body on OTP's direct path.
+// Port of erts/emulator/beam/erl_bif_info.c (system_info_1), OTP-29.1.1.
+pub(crate) fn system_info_topology_item(
+    process: &mut Process,
+    selector: Term,
+) -> Option<Result<Term, VmError>> {
+    if selector
+        .as_atom()
+        .and_then(|atom| global_atoms().text(atom))
+        == Some("cpu_topology")
+    {
+        return Some(cpu_topology_info(process));
+    }
+    let owned = arinsal_term::to_owned(selector).ok()?;
+    let arinsal_etf::OwnedTerm::Tuple(parts) = &owned else {
+        return None;
+    };
+    let [
+        arinsal_etf::OwnedTerm::Atom(name),
+        arinsal_etf::OwnedTerm::Atom(kind),
+    ] = parts.as_slice()
+    else {
+        return None;
+    };
+    match (name.as_str(), kind.as_str()) {
+        ("wordsize", "internal" | "external") => Some(Ok(Term::small(8).unwrap())),
+        ("wordsize", _) => Some(Err(badarg())),
+        ("cpu_topology", "detected") => Some(detected_cpu_topology_info(process)),
+        ("cpu_topology", "defined") => Some(defined_cpu_topology_info(process)),
+        ("cpu_topology", "used") => Some(cpu_topology_info(process)),
+        ("cpu_topology", _) => Some(Err(badarg())),
+        _ => None,
     }
 }
 
@@ -5599,6 +5603,15 @@ mod tests {
     /// at a time; the flags are shared by every test in this binary.
     static SCHEDULER_FLAGS: Mutex<()> = Mutex::new(());
 
+    fn system_info_test_item(
+        vm: &Vm,
+        process: &mut Process,
+        selector: Term,
+    ) -> Option<Result<Term, VmError>> {
+        crate::natives::erl_bif_info::system_info_body_item(process, selector)
+            .or_else(|| system_info(vm, process, None, selector))
+    }
+
     #[test]
     fn scheduler_startup_system_info_matches_otp_on_scheduler_path() {
         let _flags = SCHEDULER_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
@@ -5727,7 +5740,7 @@ mod tests {
             &[OwnedTerm::atom("debug_compiled")],
         );
         let selector = Term::atom(global_atoms().intern("debug_compiled").unwrap());
-        let actual = system_info(&Vm::new([]), &mut Process::new(), None, selector)
+        let actual = system_info_test_item(&Vm::new([]), &mut Process::new(), selector)
             .unwrap()
             .unwrap();
         assert_eq!(expected, CallResult::Ok(to_owned(actual).unwrap()));
@@ -5745,7 +5758,7 @@ mod tests {
             &[OwnedTerm::atom("ets_always_compress")],
         );
         let selector = Term::atom(global_atoms().intern("ets_always_compress").unwrap());
-        let actual = system_info(&Vm::new([]), &mut Process::new(), None, selector)
+        let actual = system_info_test_item(&Vm::new([]), &mut Process::new(), selector)
             .unwrap()
             .unwrap();
         assert_eq!(expected, CallResult::Ok(to_owned(actual).unwrap()));
@@ -5759,7 +5772,7 @@ mod tests {
         };
         let expected = reference.call("erlang", "system_info", &[OwnedTerm::atom("max_integer")]);
         let selector = Term::atom(global_atoms().intern("max_integer").unwrap());
-        let actual = system_info(&Vm::new([]), &mut Process::new(), None, selector)
+        let actual = system_info_test_item(&Vm::new([]), &mut Process::new(), selector)
             .unwrap()
             .unwrap();
         assert_eq!(expected, CallResult::Ok(to_owned(actual).unwrap()));
@@ -5774,7 +5787,7 @@ mod tests {
         let expected = reference.call("erlang", "system_info", &[OwnedTerm::atom("check_io")]);
         let selector = Term::atom(global_atoms().intern("check_io").unwrap());
         let mut process = Process::new();
-        let actual = system_info(&Vm::new([]), &mut process, None, selector)
+        let actual = system_info_test_item(&Vm::new([]), &mut process, selector)
             .unwrap()
             .unwrap();
         let CallResult::Ok(expected) = expected else {
@@ -5795,7 +5808,7 @@ mod tests {
         };
         let expected = reference.call("erlang", "system_info", &[OwnedTerm::atom("cpu_quota")]);
         let selector = Term::atom(global_atoms().intern("cpu_quota").unwrap());
-        let actual = system_info(&Vm::new([]), &mut Process::new(), None, selector)
+        let actual = system_info_test_item(&Vm::new([]), &mut Process::new(), selector)
             .unwrap()
             .unwrap();
         similar_asserts::assert_eq!(expected, CallResult::Ok(to_owned(actual).unwrap()));
@@ -5854,7 +5867,7 @@ mod tests {
             let mut heap = VecHeap::new();
             let selector_term = from_owned(&selector, &mut heap).unwrap();
             let mut process = Process::new();
-            let actual = system_info(&Vm::new([]), &mut process, None, selector_term)
+            let actual = system_info_test_item(&Vm::new([]), &mut process, selector_term)
                 .unwrap()
                 .unwrap();
             assert_eq!(expected, CallResult::Ok(to_owned(actual).unwrap()));
@@ -5911,7 +5924,7 @@ mod tests {
         ] {
             let expected = reference.call("erlang", "system_info", &[OwnedTerm::atom(selector)]);
             let input = Term::atom(global_atoms().intern(selector).unwrap());
-            let actual = system_info(&Vm::new([]), &mut Process::new(), None, input)
+            let actual = system_info_test_item(&Vm::new([]), &mut Process::new(), input)
                 .unwrap()
                 .unwrap();
             assert_eq!(
@@ -6109,7 +6122,7 @@ mod tests {
                 &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
             )
             .unwrap();
-            let actual = system_info(&Vm::new([]), &mut process, None, input)
+            let actual = system_info_test_item(&Vm::new([]), &mut process, input)
                 .unwrap()
                 .unwrap();
             assert_eq!(
@@ -6134,7 +6147,7 @@ mod tests {
                 &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
             )
             .unwrap();
-            let actual = system_info(&Vm::new([]), &mut process, None, input)
+            let actual = system_info_test_item(&Vm::new([]), &mut process, input)
                 .unwrap()
                 .unwrap();
             assert_eq!(to_owned(actual).unwrap(), *expected, "{selector}");
@@ -6193,7 +6206,7 @@ mod tests {
             .unwrap();
             actual_infos.push(
                 to_owned(
-                    system_info(&Vm::new([]), &mut process, None, input)
+                    system_info_test_item(&Vm::new([]), &mut process, input)
                         .unwrap()
                         .unwrap(),
                 )
@@ -6220,7 +6233,7 @@ mod tests {
         }
         let mut process = Process::new();
         let input = Term::atom(global_atoms().intern("allocator").unwrap());
-        let actual = system_info(&Vm::new([]), &mut process, None, input)
+        let actual = system_info_test_item(&Vm::new([]), &mut process, input)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -6237,7 +6250,7 @@ mod tests {
             &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
         )
         .unwrap();
-        let actual = system_info(&Vm::new([]), &mut process, None, input)
+        let actual = system_info_test_item(&Vm::new([]), &mut process, input)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -6266,7 +6279,7 @@ mod tests {
             &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
         )
         .unwrap();
-        let actual = system_info(&Vm::new([]), &mut process, None, input)
+        let actual = system_info_test_item(&Vm::new([]), &mut process, input)
             .unwrap()
             .unwrap();
         assert_eq!(

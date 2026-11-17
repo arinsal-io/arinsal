@@ -97,11 +97,34 @@ pub(crate) extern "C" fn system_info_1(c_p: *mut ProcessHeader, reg: *mut u64, i
         return 0;
     };
     let [selector] = crate::bif_table::bif_args::<1>(reg);
-    let Some(name) = system_info_light_name(selector) else {
-        return crate::native_helpers::process_bif_light(c_p, reg, i);
-    };
-    process.heap.note_bif_entry();
-    bif_ret(c_p, i, system_info_result(process, name))
+    if let Some(item) = system_info_body_item(process, selector) {
+        process.heap.note_bif_entry();
+        return bif_ret(c_p, i, item);
+    }
+    crate::native_helpers::process_bif_light(c_p, reg, i)
+}
+
+/// Selectors answered directly by `system_info_1`, before allocator aux-work or trap paths.
+// Port of erts/emulator/beam/erl_bif_info.c (system_info_1), OTP-29.1.1.
+pub(crate) fn system_info_body_item(
+    process: &mut Process,
+    selector: Term,
+) -> Option<Result<Term, VmError>> {
+    let name = selector
+        .as_atom()
+        .and_then(|atom| global_atoms().text(atom));
+    if matches!(name, Some("allocator" | "alloc_util_allocators")) {
+        return None;
+    }
+    if let Some(item) =
+        name.and_then(|name| crate::natives::sys::system_info_process_item(process, name))
+    {
+        return Some(item);
+    }
+    if let Some(item) = crate::natives::sys::system_info_topology_item(process, selector) {
+        return Some(item);
+    }
+    system_info_light_item(process, selector)
 }
 
 /// `system_info/1` from the generated-code process entry.
@@ -368,7 +391,6 @@ fn system_info_with_heap<H: HeapAlloc + ?Sized>(heap: &mut H, key: &str) -> Resu
         "os_monotonic_time_source" => clock_source(heap, monotonic_clock_id(), true),
         "os_system_time_source" => clock_source(heap, "CLOCK_REALTIME", false),
         "os_version" => Ok(arinsal_bifs::os_version()),
-        "scheduler_bind_type" => Ok(atom("unbound")),
         // Port of erts/emulator/beam/erl_bif_info.c (smp_support, constant_pool_support,
         // hipe_architecture, ets_realloc_moves, compat_rel), OTP-29.1.1.
         "smp_support" | "constant_pool_support" => Ok(atom("true")),
