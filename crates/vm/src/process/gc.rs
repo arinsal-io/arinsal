@@ -139,17 +139,6 @@ impl Process {
         Ok(roots[0])
     }
 
-    /// Force a collection of the running process before the current BIF returns.
-    /// Port of erts/emulator/beam/erl_gc.h:152 (`ERTS_FORCE_GC`), OTP-29.1.1.
-    ///
-    /// Roots the exact live count recorded at the current call or switch-out point;
-    /// registers above it are dead and may hold stale pointers.
-    pub(crate) fn force_gc(&mut self) -> Result<(), VmError> {
-        // erl_gc.c:418 (erts_gc_after_bif_call_lhf): after a BIF only its result is live, and
-        // this BIF returns an immediate.
-        self.force_gc_live(0)
-    }
-
     /// Force collection with the current BEAM live-register count.
     // Port of erts/emulator/beam/erl_gc.c:1136 (`erts_garbage_collect_literals`), OTP-29.1.1.
     pub(crate) fn force_gc_live(&mut self, live: usize) -> Result<(), VmError> {
