@@ -1686,6 +1686,39 @@ pub fn ets_free_words(user: *mut u64, words: usize) {
     }
 }
 
+/// `erts_alloc(ERTS_ALC_T_ESTACK, bytes)`: the grown array of an ESTACK/WSTACK, served by
+/// temp_alloc as `ESTACK` is in erl_alloc.types.
+// Port of erts/emulator/beam/utils.c (erl_grow_estack, erl_grow_wstack), OTP-29.1.1.
+pub fn estack_alloc(bytes: usize) -> Result<std::ptr::NonNull<u8>, AllocError> {
+    let allocators = allocator_for(ErtsAlcType::TMP)?;
+    let (_, base) = allocators.alloc_with_ptr_at(crate::instances::thread_alloc_ix(), bytes)?;
+    std::ptr::NonNull::new(base.cast::<u8>()).ok_or(AllocError::InvalidAllocation)
+}
+
+/// `erts_realloc(ERTS_ALC_T_ESTACK, ...)` of an [`estack_alloc`] block of `old_bytes`.
+// Port of erts/emulator/beam/utils.c (erl_grow_estack), OTP-29.1.1.
+pub fn estack_realloc(
+    block: std::ptr::NonNull<u8>,
+    old_bytes: usize,
+    new_bytes: usize,
+) -> Result<std::ptr::NonNull<u8>, AllocError> {
+    let allocators = allocator_for(ErtsAlcType::TMP)?;
+    let (instance, id, _) = crate::alloc_util::used_block_from_payload(block.as_ptr() as usize);
+    let handle = InstanceAllocation::from_parts(instance, id, old_bytes);
+    let (_, base) = allocators.realloc_with_ptr(handle, new_bytes)?;
+    std::ptr::NonNull::new(base.cast::<u8>()).ok_or(AllocError::InvalidAllocation)
+}
+
+/// `DESTROY_ESTACK`: `erts_free(ERTS_ALC_T_ESTACK, start)` of an [`estack_alloc`] block.
+// Port of erts/emulator/beam/global.h (DESTROY_ESTACK), OTP-29.1.1.
+pub fn estack_free(block: std::ptr::NonNull<u8>, bytes: usize) {
+    let (instance, id, _) = crate::alloc_util::used_block_from_payload(block.as_ptr() as usize);
+    let handle = InstanceAllocation::from_parts(instance, id, bytes);
+    if let Ok(allocators) = allocator_for(ErtsAlcType::TMP) {
+        let _ = allocators.free_at(crate::instances::thread_alloc_ix(), handle);
+    }
+}
+
 /// `erts_alloc(ERTS_ALC_T_MSG, bytes)`: a message node of the eheap allocator, with no header of
 /// the caller's own; the owning instance is found from the block's carrier when it is freed.
 // Port of erts/emulator/beam/erl_message.c (erts_alloc_message), OTP-29.1.1.

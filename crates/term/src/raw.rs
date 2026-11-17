@@ -11,6 +11,7 @@ use arinsal_alloc::raw::BinaryView;
 use std::mem::MaybeUninit;
 use std::num::NonZeroUsize;
 
+pub mod estack;
 pub mod magic_bin;
 
 /// Allocate an ordinary local reference before invoking the callback that returns its numbers.

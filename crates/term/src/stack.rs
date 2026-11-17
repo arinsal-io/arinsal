@@ -1,101 +1,18 @@
 //! Explicit work stacks for iterative term walkers.
+//!
+//! Port of DECLARE_WSTACK / DECLARE_ESTACK in erts/emulator/beam/global.h and
+//! erl_grow_estack / erl_grow_wstack in erts/emulator/beam/utils.c, OTP-29.1.1. The stack and
+//! its memory live in [`crate::raw::estack`]; this module adds the safe conveniences.
 use crate::Term;
-use arrayvec::ArrayVec;
 use std::ops::{Index, IndexMut};
 
-/// Work stack with an inline buffer that moves to one growing heap buffer.
-///
-/// Port of DECLARE_WSTACK / DECLARE_ESTACK in erts/emulator/beam/global.h
-/// (WSTACK_PUSH, WSTACK_POP, WSTACK_COUNT, WSTACK_ROLLBACK, erl_grow_wstack),
-/// and erts/emulator/beam/utils.c (erl_grow_wstack), OTP-29.1.1. The first
-/// growth moves every inline entry into a buffer with twice the inline capacity,
-/// matching erts' single active `start/sp/end` range.
-#[derive(Clone, Debug)]
-pub struct WStack<T, const N: usize> {
-    storage: Storage<T, N>,
-}
-
-#[derive(Clone, Debug)]
-enum Storage<T, const N: usize> {
-    Inline(ArrayVec<T, N>),
-    Heap(Vec<T>),
-}
+pub use crate::raw::estack::WStack;
 
 /// Stack of terms: the Rust form of ESTACK (a WSTACK whose words are `Eterm`s).
 pub type EStack<const N: usize> = WStack<Term, N>;
 
-impl<T, const N: usize> Default for WStack<T, N> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<T, const N: usize> WStack<T, N> {
-    /// An empty stack; allocates nothing.
-    #[inline(always)]
-    pub fn new() -> Self {
-        Self {
-            storage: Storage::Inline(ArrayVec::new()),
-        }
-    }
-
-    /// Push a value (WSTACK_PUSH).
-    #[inline(always)]
-    pub fn push(&mut self, value: T) {
-        let overflow = match &mut self.storage {
-            Storage::Inline(inline) => inline.try_push(value).err().map(|full| full.element()),
-            Storage::Heap(heap) => {
-                heap.push(value);
-                None
-            }
-        };
-        if let Some(value) = overflow {
-            self.grow(value);
-        }
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn grow(&mut self, value: T) {
-        let old = std::mem::replace(&mut self.storage, Storage::Heap(Vec::new()));
-        let Storage::Inline(inline) = old else {
-            unreachable!("only inline storage can require its first growth")
-        };
-        let mut heap = Vec::with_capacity(N.saturating_mul(2));
-        heap.extend(inline);
-        heap.push(value);
-        self.storage = Storage::Heap(heap);
-    }
-
-    /// Pop the top value (WSTACK_POP).
-    #[inline(always)]
-    pub fn pop(&mut self) -> Option<T> {
-        // The enum branch selects the one active buffer, then its pop checks emptiness.
-        match &mut self.storage {
-            Storage::Inline(inline) => inline.pop(),
-            Storage::Heap(heap) => heap.pop(),
-        }
-    }
-
-    /// Number of entries (WSTACK_COUNT).
-    #[inline(always)]
-    pub fn len(&self) -> usize {
-        match &self.storage {
-            Storage::Inline(inline) => inline.len(),
-            Storage::Heap(heap) => heap.len(),
-        }
-    }
-
-    /// Whether the stack holds no entries (WSTACK_ISEMPTY).
-    #[inline(always)]
-    pub fn is_empty(&self) -> bool {
-        match &self.storage {
-            Storage::Inline(inline) => inline.is_empty(),
-            Storage::Heap(heap) => heap.is_empty(),
-        }
-    }
-
-    /// Drop every entry, keeping the spill capacity.
+    /// Drop every entry, keeping a grown array.
     #[inline]
     pub fn clear(&mut self) {
         self.truncate(0);
@@ -104,56 +21,45 @@ impl<T, const N: usize> WStack<T, N> {
     /// Top entry without popping.
     #[inline(always)]
     pub fn last(&self) -> Option<&T> {
-        match &self.storage {
-            Storage::Inline(inline) => inline.last(),
-            Storage::Heap(heap) => heap.last(),
-        }
+        self.as_slice().last()
     }
 
     /// Mutable top entry.
     #[inline(always)]
     pub fn last_mut(&mut self) -> Option<&mut T> {
-        match &mut self.storage {
-            Storage::Inline(inline) => inline.last_mut(),
-            Storage::Heap(heap) => heap.last_mut(),
-        }
+        self.as_mut_slice().last_mut()
     }
 
     /// Entry `index` counted from the bottom.
     #[inline(always)]
     pub fn get(&self, index: usize) -> Option<&T> {
-        match &self.storage {
-            Storage::Inline(inline) => inline.get(index),
-            Storage::Heap(heap) => heap.get(index),
-        }
+        self.as_slice().get(index)
     }
 
     /// Mutable entry `index` counted from the bottom.
     #[inline(always)]
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
-        match &mut self.storage {
-            Storage::Inline(inline) => inline.get_mut(index),
-            Storage::Heap(heap) => heap.get_mut(index),
-        }
+        self.as_mut_slice().get_mut(index)
     }
 
     /// Entries from the bottom to the top.
     #[inline]
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &T> + '_ {
-        let active = match &self.storage {
-            Storage::Inline(inline) => inline.as_slice(),
-            Storage::Heap(heap) => heap.as_slice(),
-        };
-        active.iter()
+        self.as_slice().iter()
     }
+}
 
-    /// Roll back to `len` entries (WSTACK_ROLLBACK); spill capacity is retained.
-    #[inline(always)]
-    pub fn truncate(&mut self, len: usize) {
-        match &mut self.storage {
-            Storage::Inline(inline) => inline.truncate(len),
-            Storage::Heap(heap) => heap.truncate(len),
-        }
+impl<T: Clone, const N: usize> Clone for WStack<T, N> {
+    fn clone(&self) -> Self {
+        let mut copy = Self::new();
+        copy.extend(self.iter().cloned());
+        copy
+    }
+}
+
+impl<T: std::fmt::Debug, const N: usize> std::fmt::Debug for WStack<T, N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
     }
 }
 
@@ -229,7 +135,6 @@ mod tests {
         assert_eq!(stack.len(), 33);
         assert_eq!(stack.get(16), Some(&16));
         assert_eq!(stack.get(32), Some(&32));
-        assert!(matches!(stack.storage, Storage::Heap(_)));
         for expected in (0..33).rev() {
             assert_eq!(stack.pop(), Some(expected));
         }
@@ -246,6 +151,5 @@ mod tests {
         stack.push(99);
         assert_eq!(stack.pop(), Some(99));
         assert_eq!(stack.pop(), Some(11));
-        assert!(matches!(stack.storage, Storage::Heap(_)));
     }
 }
