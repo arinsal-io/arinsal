@@ -548,8 +548,7 @@ impl Vm {
         let traced = match ctx.as_deref_mut() {
             Some(run)
                 if arity <= usize::from(u8::MAX)
-                    && crate::trace_bp::any_pattern()
-                    && arinsal_spec::bif_lookup(module, function, arity as u8).is_some() =>
+                    && crate::export::is_bif_traced(module, function, arity as u8) =>
             {
                 // The apply's return address names its native call site.
                 let site = (

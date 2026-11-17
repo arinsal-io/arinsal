@@ -302,11 +302,6 @@ impl Vm {
         let untraced = |p: &mut Process, _: &mut arinsal_sched::RunCtx<'_, process::Message>| {
             calls::call_bif_metered(&mut p.heap, bif, &reg[..arity])
         };
-        if !crate::trace_bp::any_pattern()
-            || !crate::trace_bp::selects(p, module, function, arity as u8)
-        {
-            return untraced(p, ctx);
-        }
         let (module, function) = (module.to_owned(), function.to_owned());
         let args = reg[..arity].to_vec();
         // A native import that missed (dynamic natives) already emitted the call event.
@@ -369,11 +364,6 @@ impl Vm {
         site: (usize, usize),
         scan: crate::trace::StackScan,
     ) -> Option<(String, String, Vec<Term>)> {
-        if !crate::trace_bp::any_pattern()
-            || !crate::trace_bp::selects(p, module, function, arity as u8)
-        {
-            return None;
-        }
         let (module, function) = (module.to_owned(), function.to_owned());
         let args = self.x_regs().ok()?[..arity].to_vec();
         let resumed = p.cold.as_ref().is_some_and(

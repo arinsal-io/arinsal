@@ -54,6 +54,22 @@ pub(crate) fn active_export_entry(mfa: Mfa) -> Option<&'static Arc<ExportEntry>>
         .find_arc(mfa)
 }
 
+/// `Export.is_bif_traced` of `module:function/arity` in the active export table: the one
+/// decision whether a BIF call enters the export's breakpoint.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:391 (call_light_bif_shared), OTP-29.1.1.
+pub(crate) fn is_bif_traced(module: &str, function: &str, arity: u8) -> bool {
+    let atoms = arinsal_term::global_atoms();
+    let (Some(module), Some(function)) = (atoms.get(module), atoms.get(function)) else {
+        return false;
+    };
+    active_export_entry((module, function, arity)).is_some_and(|export| {
+        export
+            .is_bif_traced
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+    })
+}
+
 /// `erts_export_get_or_make_stub`: the export of `mfa`, or a new stub entering the export
 /// trampoline (whose call runs the error handler) entered in the export table.
 // Port of erts/emulator/beam/export.c:228-242 (erts_export_get_or_make_stub), OTP-29.1.1.

@@ -1325,17 +1325,6 @@ pub(crate) fn any_pattern() -> bool {
     ACTIVE_NODES.load(Ordering::Relaxed) != 0
 }
 
-/// Whether a breakpoint of any session or runtime is set on this function.
-// Port of erts/emulator/beam/beam_bp.c:321-330 (erts_export_is_bif_traced), OTP-29.1.1.
-pub(crate) fn selects(process: &Process, module: &str, function: &str, arity: u8) -> bool {
-    let ix = bp_node(process).active_bp_ix();
-    let runtime = runtime_id(process);
-    with_function_bps(module, function, arity, |bps| {
-        bps.iter()
-            .any(|g| g.runtime == runtime && g.data[ix].flags != 0)
-    })
-}
-
 /// What `trace_info` reports about one function of one session.
 pub(crate) struct FunctionInfo {
     /// Breakpoint flags of the session restricted to the ones the key asks for.

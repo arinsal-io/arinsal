@@ -473,15 +473,12 @@ impl Executor {
                     arinsal_loader::ImportClass::Native
                         | arinsal_loader::ImportClass::Dynamic
                         | arinsal_loader::ImportClass::Fun
-                ) || (crate::trace_bp::any_pattern()
-                    && export.bif.is_some()
-                    && crate::trace_bp::selects(
-                        process,
-                        &export.module,
-                        &export.function,
-                        export.arity,
-                    ))
+                ) || export.bif.is_some()
                 {
+                    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:388-397
+                    // (call_light_bif_shared), OTP-29.1.1: the call was routed here by
+                    // `Export.is_bif_traced`; a BIF is never re-decided, the breakpoint
+                    // matching below records what its flags select.
                     let saved_arguments: smallvec::SmallVec<[Term; 8]> =
                         smallvec::SmallVec::from_slice(
                             &self.native_registers.x_reg_array[..usize::from(export.arity)],
@@ -538,17 +535,21 @@ impl Executor {
                         // The BIF runs at the native call site (erts c_p->i).
                         let position_before = process.position_marker();
                         process.native_call_pc = call_site_pc;
-                        let traced = self.vm.trace_native_call_named(
-                            process,
-                            ctx,
-                            &export.module,
-                            &export.function,
-                            usize::from(export.arity),
-                            (usize::MAX, call_site_pc),
-                            // The trampoline pushed the CP: a tail apply's is a trace
-                            // frame of its caller (fixup_cp_before_trace).
-                            crate::trace::StackScan::Top,
-                        );
+                        let traced = if export.is_bif_traced() {
+                            self.vm.trace_native_call_named(
+                                process,
+                                ctx,
+                                &export.module,
+                                &export.function,
+                                usize::from(export.arity),
+                                (usize::MAX, call_site_pc),
+                                // The trampoline pushed the CP: a tail apply's is a trace
+                                // frame of its caller (fixup_cp_before_trace).
+                                crate::trace::StackScan::Top,
+                            )
+                        } else {
+                            None
+                        };
                         // Port of erts/emulator/beam/jit/arm/instr_bif.cpp
                         // (call_light_bif_shared), OTP-29.1.1: a light BIF
                         // runs with E at the caller's frame; the return

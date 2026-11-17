@@ -1351,7 +1351,7 @@ fn invoke_dispatch_bif(
         // `active_code_ix` (instr_bif.cpp:391-397). An export-entry call has not.
         let export_checks = export_call
             && (registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64
-                || crate::trace_bp::any_pattern());
+                || export.is_bif_traced());
         if let Some(bif) = export.light_bif
             && !export_checks
         {
@@ -1369,7 +1369,7 @@ fn invoke_dispatch_bif(
         && let Some(bif) = export.light_process_bif
         && !(export_call
             && (registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64
-                || crate::trace_bp::any_pattern()))
+                || export.is_bif_traced()))
         // Port of erl_gc.c:987-990: an on-heap queue with signals still in the
         // outer queue is fetched before the collection. That fetch needs the
         // scheduler context, so this call leaves native code. An empty outer
@@ -1483,18 +1483,15 @@ fn invoke_dispatch_bif_slow(
     // the table BIFs run on the process heap straight from the generated code; anything the
     // direct path declines is redone through the scheduler. The hot helper already ran a
     // direct BIF that accepted the call.
-    if export.runs_in_executor()
-        // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (bif trace trampolines),
-        // OTP-29.1.1: a traced BIF runs in the executor, which has the trace context.
-        || (crate::trace_bp::any_pattern()
-            && crate::trace_bp::selects(process, &export.module, &export.function, export.arity))
-    {
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:391 (call_light_bif_shared),
+    // OTP-29.1.1: `Export.is_bif_traced` is the only decision, read once; the export's
+    // breakpoint (the executor, which has the trace context) matches the call itself.
+    let bif_traced = export.is_bif_traced();
+    if export.runs_in_executor() || bif_traced {
         // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:388-397
         // (call_light_bif_shared), OTP-29.1.1: a traced BIF branches to the
-        // export breakpoint before the ordinary FCALLS decrement.
-        let traced_export = crate::trace_bp::any_pattern()
-            && crate::trace_bp::selects(process, &export.module, &export.function, export.arity);
-        if export_call && !traced_export {
+        // export breakpoint before the ordinary FCALL decrement.
+        if export_call && !bif_traced {
             charge_bif_reductions(process, 1);
         }
         process.heap.abi.arity = export.arity;
@@ -1518,7 +1515,7 @@ fn call_direct_bif(
     export_call: bool,
 ) -> Option<u64> {
     let direct = export.direct_ets?;
-    if crate::trace_bp::any_pattern() {
+    if export.is_bif_traced() {
         return None;
     }
     let arity = usize::from(export.arity).min(4);

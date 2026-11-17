@@ -148,6 +148,16 @@ fn light_kind(module: &str, function: &str, arity: u8) -> bool {
 }
 
 impl DispatchTarget {
+    /// `Export.is_bif_traced`: the one decision whether a BIF call enters the export's
+    /// breakpoint.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:391 (call_light_bif_shared), OTP-29.1.1.
+    pub(crate) fn is_bif_traced(&self) -> bool {
+        self.slot
+            .is_bif_traced
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+    }
+
     /// `Export.info.mfa` of this export.
     pub(crate) fn mfa(&self) -> &'static arinsal_beamasm::bif::ErtsCodeMfa {
         &self.slot.mfa
