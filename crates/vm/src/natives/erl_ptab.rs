@@ -22,28 +22,190 @@ const MIN_START_REDS: u32 = CHUNK_SIZE / INDICES_PER_RED;
 const CONSES_PER_RED: usize = 75;
 const MAX_DELETED_REDS: u32 = CHUNK_SIZE / INDICES_PER_RED;
 
-struct ProcessListData {
-    snapshot: Option<arinsal_sched::PtabListSnapshot<Process>>,
-    scheduler: Arc<Scheduler<Process>>,
-    pids: Vec<Term>,
-    chunk_intervals: Vec<u64>,
-    next_index: u32,
-    deleted_done: bool,
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PtabListBifState {
+    Initializing,
+    InspectingTable,
+    InspectingDeleted,
+    BuildingResult,
+    ReturnResult,
 }
 
-struct PortListData {
-    snapshot: Option<crate::port::PortPtabListSnapshot>,
-    runtime: &'static crate::process::Runtime,
-    ids: Vec<Term>,
-    chunk_intervals: Vec<u64>,
-    next_index: u32,
-    deleted_done: bool,
+enum PtabListTable {
+    Processes(Arc<Scheduler<Process>>),
+    Ports {
+        runtime: &'static crate::process::Runtime,
+        port_zero: Term,
+    },
 }
 
-/// Per-call state held by the `ErtsPTabListBifData` magic binary.
-enum PtabListBifData {
-    Processes(ProcessListData),
-    Ports(PortListData),
+enum PtabListSnapshot {
+    Processes(arinsal_sched::PtabListSnapshot<Process>),
+    Ports(crate::port::PortPtabListSnapshot),
+}
+
+/// Per-call `ErtsPTabListBifData` stored in the trapping magic binary.
+struct PtabListBifData {
+    ptab: Option<PtabListTable>,
+    state: PtabListBifState,
+    snapshot: Option<PtabListSnapshot>,
+    chunk: Vec<u64>,
+    tix: u32,
+    pid_ix: usize,
+    pid_sz: usize,
+    pid: Vec<Term>,
+}
+
+impl PtabListBifData {
+    fn new(ptab: PtabListTable) -> Self {
+        Self {
+            ptab: Some(ptab),
+            state: PtabListBifState::Initializing,
+            snapshot: None,
+            chunk: Vec::new(),
+            tix: 0,
+            pid_ix: 0,
+            pid_sz: 0,
+            pid: Vec::new(),
+        }
+    }
+
+    fn table_max(&self) -> u32 {
+        match self.ptab.as_ref().expect("active ptab list owns its table") {
+            PtabListTable::Processes(_) => arinsal_term::ptab::process_table_layout().max(),
+            PtabListTable::Ports { .. } => arinsal_term::ptab::port_table_layout().max(),
+        }
+    }
+
+    /// Initialize the table state and inspect chunk zero without releasing its list lock.
+    // Port of erts/emulator/beam/erl_ptab.c (ptab_list_bif_engine, INITIALIZING), OTP-29.1.1.
+    fn initialize(&mut self) -> u32 {
+        let table_max = self.table_max();
+        let end = table_max.min(CHUNK_SIZE);
+        let chunk_count = table_max.div_ceil(CHUNK_SIZE) as usize;
+        self.chunk.resize(chunk_count, 0);
+        let track_deletions = chunk_count > 1;
+        let pid = std::cell::RefCell::new(&mut self.pid);
+
+        let (snapshot, invocation_interval, count) =
+            match self.ptab.as_ref().expect("active ptab list owns its table") {
+                PtabListTable::Processes(scheduler) => {
+                    let (snapshot, interval, count) = scheduler.begin_ptab_list_chunk(
+                        end,
+                        track_deletions,
+                        |count| {
+                            let mut pid = pid.borrow_mut();
+                            let additional = count.saturating_sub(pid.len());
+                            pid.reserve_exact(additional);
+                        },
+                        |process_id| {
+                            if let Some(term) = process_id.to_term() {
+                                pid.borrow_mut().push(term);
+                            }
+                        },
+                    );
+                    (PtabListSnapshot::Processes(snapshot), interval, count)
+                }
+                PtabListTable::Ports { runtime, port_zero } => {
+                    let (snapshot, interval, count) = runtime.ports.begin_ptab_list_chunk(
+                        end,
+                        track_deletions,
+                        |count| {
+                            let mut pid = pid.borrow_mut();
+                            let additional = count.saturating_add(1).saturating_sub(pid.len());
+                            pid.reserve_exact(additional);
+                            pid.push(*port_zero);
+                        },
+                        |id| {
+                            if id != 0
+                                && let Some(term) = Term::port(id)
+                            {
+                                pid.borrow_mut().push(term);
+                            }
+                        },
+                    );
+                    (PtabListSnapshot::Ports(snapshot), interval, count + 1)
+                }
+            };
+
+        self.pid_sz = count;
+        self.pid_ix = self.pid.len();
+        debug_assert!(self.pid_ix <= self.pid_sz);
+        self.chunk[0] = invocation_interval;
+        self.tix = end;
+        self.snapshot = Some(snapshot);
+        self.state = if chunk_count == 1 {
+            PtabListBifState::BuildingResult
+        } else {
+            PtabListBifState::InspectingTable
+        };
+        end / INDICES_PER_RED
+    }
+
+    /// Inspect the next full table chunk under the table's list lock.
+    // Port of erts/emulator/beam/erl_ptab.c (ptab_list_bif_engine, INSPECTING_TABLE), OTP-29.1.1.
+    fn inspect_table_chunk(&mut self, end: u32) -> u32 {
+        let first = self.tix;
+        let chunk_index = (first / CHUNK_SIZE) as usize;
+        let interval = match (
+            self.ptab.as_ref().expect("active ptab list owns its table"),
+            self.snapshot.as_ref().unwrap(),
+        ) {
+            (PtabListTable::Processes(_), PtabListSnapshot::Processes(snapshot)) => snapshot
+                .scan_chunk_with(first, end, |process_id| {
+                    if let Some(term) = process_id.to_term() {
+                        self.pid.push(term);
+                    }
+                }),
+            (PtabListTable::Ports { .. }, PtabListSnapshot::Ports(snapshot)) => snapshot
+                .scan_chunk_with(first, end, |id| {
+                    if id != 0
+                        && let Some(term) = Term::port(id)
+                    {
+                        self.pid.push(term);
+                    }
+                }),
+            _ => unreachable!("ptab list table and snapshot kinds match"),
+        };
+        self.chunk[chunk_index] = interval;
+        self.tix = end;
+        self.pid_ix = self.pid.len();
+        let table_max = self.table_max();
+        if end == table_max {
+            self.state = PtabListBifState::InspectingDeleted;
+        }
+        (end - first) / INDICES_PER_RED
+    }
+
+    /// Reconcile elements deleted between their table chunk's interval and the scan.
+    // Port of erts/emulator/beam/erl_ptab.c (ptab_list_bif_engine, INSPECTING_DELETED), OTP-29.1.1.
+    fn inspect_deleted(&mut self, max_reds: u32) -> (u32, bool) {
+        let chunks = &self.chunk;
+        let pid = &mut self.pid;
+        let (spent, done) = match self.snapshot.as_mut().unwrap() {
+            PtabListSnapshot::Processes(snapshot) => {
+                snapshot.inspect_deleted_with(chunks, max_reds, |process_id| {
+                    if let Some(term) = process_id.to_term() {
+                        pid.push(term);
+                    }
+                })
+            }
+            PtabListSnapshot::Ports(snapshot) => {
+                snapshot.inspect_deleted_with(chunks, max_reds, |id| {
+                    if id != 0
+                        && let Some(term) = Term::port(id)
+                    {
+                        pid.push(term);
+                    }
+                })
+            }
+        };
+        self.pid_ix = self.pid.len();
+        if done {
+            self.state = PtabListBifState::BuildingResult;
+        }
+        (spent, done)
+    }
 }
 
 arinsal_term::magic_payload!(TrapContext<PtabListBifData> => cleanup_ptab_list_bif_data);
@@ -75,16 +237,11 @@ pub(crate) extern "C" fn ptab_list_continue_2(
     let reds_left = process.heap.abi.fcalls.max(0) as u32;
     let result = magic_ref.with_magic_payload_mut::<TrapContext<PtabListBifData>, _>(|state| {
         let state = &mut state.0;
-        let table_max = match &*state {
-            PtabListBifData::Processes(_) => arinsal_term::ptab::process_table_layout().max(),
-            PtabListBifData::Ports(_) => arinsal_term::ptab::port_table_layout().max(),
-        };
         ptab_list_bif_engine(
             process,
             state,
             &mut accumulator,
             Some(&mut magic_ref),
-            table_max,
             reds_left,
         )
     });
@@ -134,11 +291,6 @@ fn ptab_list(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, processes: bool) ->
     };
     process.heap.note_bif_entry();
     let function = if processes { "processes" } else { "ports" };
-    let table_max = if processes {
-        arinsal_term::ptab::process_table_layout().max()
-    } else {
-        arinsal_term::ptab::port_table_layout().max()
-    };
     let reds_left = process.heap.abi.fcalls.max(0) as u32;
 
     let Some(runtime) = process.runtime.as_ref() else {
@@ -157,36 +309,20 @@ fn ptab_list(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, processes: bool) ->
         };
     };
 
-    let state = if processes {
+    let ptab = if processes {
         let scheduler = match runtime.scheduler_arc() {
             Ok(scheduler) => scheduler,
             Err(_) => return fail(c_p, reg, i, process, function, &[], BifError::SystemLimit),
         };
-        let list = ProcessListData {
-            snapshot: None,
-            scheduler,
-            pids: Vec::new(),
-            chunk_intervals: Vec::with_capacity(table_max.div_ceil(CHUNK_SIZE) as usize),
-            next_index: 0,
-            deleted_done: false,
-        };
-        PtabListBifData::Processes(list)
+        PtabListTable::Processes(scheduler)
     } else {
         let Some(port_zero) = Term::port(0) else {
             return fail(c_p, reg, i, process, function, &[], BifError::SystemLimit);
         };
-        let list = PortListData {
-            snapshot: None,
-            runtime,
-            ids: vec![port_zero],
-            chunk_intervals: Vec::with_capacity(table_max.div_ceil(CHUNK_SIZE) as usize),
-            next_index: 0,
-            deleted_done: false,
-        };
-        PtabListBifData::Ports(list)
+        PtabListTable::Ports { runtime, port_zero }
     };
     let state = MagicBin::with_erts_payload_size_and_refn(
-        TrapContext::new(state),
+        TrapContext::new(PtabListBifData::new(ptab)),
         ERTS_PTAB_LIST_STATE_SIZE,
         arinsal_sched::unique::next_ref_words(),
     );
@@ -194,7 +330,7 @@ fn ptab_list(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, processes: bool) ->
     let done = if reds_left < MIN_START_REDS {
         false
     } else {
-        match run_state(process, &state, &mut accumulator, table_max, reds_left) {
+        match run_state(process, &state, &mut accumulator, reds_left) {
             Ok(done) => done,
             Err(error) => return fail(c_p, reg, i, process, function, &[], error),
         }
@@ -223,209 +359,95 @@ fn run_state(
     process: &mut Process,
     state: &MagicBin,
     accumulator: &mut Term,
-    table_max: u32,
     reds_left: u32,
 ) -> Result<bool, BifError> {
     state
         .with_payload_mut::<TrapContext<PtabListBifData>, _>(|state| {
-            ptab_list_bif_engine(
-                process,
-                &mut state.0,
-                accumulator,
-                None,
-                table_max,
-                reds_left,
-            )
+            ptab_list_bif_engine(process, &mut state.0, accumulator, None, reds_left)
         })
         .ok_or(BifError::BADARG)?
 }
 
-/// The Rust table snapshots preserve erts' initial interval and deleted-entry reconciliation.
 // Port of erts/emulator/beam/erl_ptab.c (ptab_list_bif_engine), OTP-29.1.1.
 fn ptab_list_bif_engine(
     process: &mut Process,
     state: &mut PtabListBifData,
     accumulator: &mut Term,
     magic_ref: Option<&mut Term>,
-    table_max: u32,
     reds_left: u32,
 ) -> Result<bool, BifError> {
-    match state {
-        PtabListBifData::Processes(list) => {
-            run_process_list(process, list, table_max, reds_left, accumulator, magic_ref)
-        }
-        PtabListBifData::Ports(list) => {
-            run_port_list(process, list, table_max, reds_left, accumulator, magic_ref)
-        }
-    }
-}
+    let mut magic_ref = magic_ref;
+    let mut have_reds = reds_left;
+    let mut charged_reds = 0_u32;
+    let mut first_iteration = true;
 
-fn run_process_list(
-    process: &mut Process,
-    list: &mut ProcessListData,
-    table_max: u32,
-    reds_left: u32,
-    accumulator: &mut Term,
-    magic_ref: Option<&mut Term>,
-) -> Result<bool, BifError> {
-    let (table_done, mut spent) = scan_process_table(list, table_max, reds_left);
-    if !table_done {
-        bump_reds(process, spent);
-        return Ok(false);
-    }
-    if !list.deleted_done {
-        let max_deleted_reds = reds_left.saturating_sub(spent).min(MAX_DELETED_REDS);
-        let (deleted_reds, done) = list
-            .snapshot
-            .as_mut()
-            .expect("table scan initialized its snapshot")
-            .inspect_deleted_with(&list.chunk_intervals, max_deleted_reds, |pid| {
-                if let Some(pid) = pid.to_term() {
-                    list.pids.push(pid);
-                }
-            });
-        list.deleted_done = done;
-        spent += deleted_reds;
-        if !done {
-            bump_reds(process, spent);
-            return Ok(false);
-        }
-    }
-    let (done, cons_reds) = build_ptab_result(
-        process,
-        &mut list.pids,
-        accumulator,
-        magic_ref,
-        reds_left.saturating_sub(spent),
-    )?;
-    bump_reds(process, spent.saturating_add(cons_reds));
-    if done {
-        list.snapshot.take();
-    }
-    Ok(done)
-}
-
-fn scan_process_table(list: &mut ProcessListData, table_max: u32, reds_left: u32) -> (bool, u32) {
-    if list.snapshot.is_none() {
-        list.snapshot = Some(list.scheduler.begin_ptab_list());
-        let count = list
-            .snapshot
-            .as_ref()
-            .expect("snapshot initialized")
-            .count();
-        list.pids
-            .reserve_exact(count.saturating_sub(list.pids.capacity()));
-    }
-    let mut spent = 0_u32;
-    let mut first_chunk = true;
-    while list.next_index < table_max {
-        let first = list.next_index;
-        let end = (first + CHUNK_SIZE).min(table_max);
-        let chunk_reds = (end - first) / INDICES_PER_RED;
-        if !first_chunk && (spent >= reds_left || chunk_reds > reds_left - spent) {
+    loop {
+        if !first_iteration && have_reds == 0 && state.state != PtabListBifState::ReturnResult {
             break;
         }
-        let interval = list
-            .snapshot
-            .as_ref()
-            .expect("snapshot initialized")
-            .scan_chunk_with(first, end, |pid| {
-                if let Some(pid) = pid.to_term() {
-                    list.pids.push(pid);
-                }
-            });
-        list.chunk_intervals.push(interval);
-        list.next_index = end;
-        spent += (end - first) / INDICES_PER_RED;
-        first_chunk = false;
-    }
-    (list.next_index >= table_max, spent)
-}
+        first_iteration = false;
 
-fn run_port_list(
-    process: &mut Process,
-    list: &mut PortListData,
-    table_max: u32,
-    reds_left: u32,
-    accumulator: &mut Term,
-    magic_ref: Option<&mut Term>,
-) -> Result<bool, BifError> {
-    let (table_done, mut spent) = scan_port_table(list, table_max, reds_left);
-    if !table_done {
-        bump_reds(process, spent);
-        return Ok(false);
-    }
-    if !list.deleted_done {
-        let max_deleted_reds = reds_left.saturating_sub(spent).min(MAX_DELETED_REDS);
-        let (deleted_reds, done) = list
-            .snapshot
-            .as_mut()
-            .expect("table scan initialized its snapshot")
-            .inspect_deleted_with(&list.chunk_intervals, max_deleted_reds, |id| {
-                if id != 0
-                    && let Some(id) = Term::port(id)
-                {
-                    list.ids.push(id);
+        let reds = match state.state {
+            PtabListBifState::Initializing => state.initialize(),
+            PtabListBifState::InspectingTable => {
+                let first = state.tix;
+                let end = first.saturating_add(CHUNK_SIZE).min(state.table_max());
+                let chunk_reds = (end - first) / INDICES_PER_RED;
+                if charged_reds != 0 && chunk_reds > have_reds {
+                    break;
                 }
-            });
-        list.deleted_done = done;
-        spent += deleted_reds;
-        if !done {
-            bump_reds(process, spent);
-            return Ok(false);
+                state.inspect_table_chunk(end)
+            }
+            PtabListBifState::InspectingDeleted => {
+                let (reds, done) = state.inspect_deleted(have_reds.min(MAX_DELETED_REDS));
+                if done {
+                    state.state = PtabListBifState::BuildingResult;
+                }
+                reds
+            }
+            PtabListBifState::BuildingResult => {
+                let (done, reds) = build_ptab_result(
+                    process,
+                    &mut state.pid,
+                    accumulator,
+                    magic_ref.as_deref_mut(),
+                    have_reds,
+                )?;
+                state.pid_ix = state.pid.len();
+                debug_assert!(state.pid_ix <= state.pid_sz);
+                if done {
+                    state.state = PtabListBifState::ReturnResult;
+                } else {
+                    state.pid_sz = state.pid_ix;
+                    state.pid.shrink_to_fit();
+                }
+                reds
+            }
+            PtabListBifState::ReturnResult => {
+                state.snapshot.take();
+                state.pid = Vec::new();
+                state.chunk = Vec::new();
+                state.pid_ix = 0;
+                state.pid_sz = 0;
+                state.tix = 0;
+                state.ptab.take();
+                bump_reds(process, charged_reds);
+                return Ok(true);
+            }
+        };
+
+        have_reds = have_reds.saturating_sub(reds);
+        charged_reds = charged_reds.saturating_add(reds);
+        if state.state == PtabListBifState::InspectingTable {
+            let next_len = (state.table_max() - state.tix).min(CHUNK_SIZE);
+            let next_reds = next_len / INDICES_PER_RED;
+            if next_reds > have_reds {
+                have_reds = 0;
+            }
         }
     }
-    let (done, cons_reds) = build_ptab_result(
-        process,
-        &mut list.ids,
-        accumulator,
-        magic_ref,
-        reds_left.saturating_sub(spent),
-    )?;
-    bump_reds(process, spent.saturating_add(cons_reds));
-    if done {
-        list.snapshot.take();
-    }
-    Ok(done)
-}
-
-fn scan_port_table(list: &mut PortListData, table_max: u32, reds_left: u32) -> (bool, u32) {
-    if list.snapshot.is_none() {
-        list.snapshot = Some(list.runtime.ports.begin_ptab_list());
-        let count = list
-            .snapshot
-            .as_ref()
-            .expect("snapshot initialized")
-            .count();
-        list.ids
-            .reserve_exact(count.saturating_sub(list.ids.capacity()));
-    }
-    let mut spent = 0_u32;
-    let mut first_chunk = true;
-    while list.next_index < table_max {
-        let first = list.next_index;
-        let end = (first + CHUNK_SIZE).min(table_max);
-        let chunk_reds = (end - first) / INDICES_PER_RED;
-        if !first_chunk && (spent >= reds_left || chunk_reds > reds_left - spent) {
-            break;
-        }
-        let interval = list
-            .snapshot
-            .as_ref()
-            .expect("snapshot initialized")
-            .scan_chunk_with(first, end, |id| {
-                if id != 0
-                    && let Some(id) = Term::port(id)
-                {
-                    list.ids.push(id);
-                }
-            });
-        list.chunk_intervals.push(interval);
-        list.next_index = end;
-        spent += (end - first) / INDICES_PER_RED;
-        first_chunk = false;
-    }
-    (list.next_index >= table_max, spent)
+    bump_reds(process, charged_reds);
+    Ok(false)
 }
 
 /// Builds result cons cells from highest table indexes to lowest, as `ptab_list_bif_engine` does.

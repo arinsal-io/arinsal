@@ -510,8 +510,8 @@ impl PortTable {
     }
 
     // Port of erts/emulator/beam/erl_ptab.c:675 (erts_ptab_delete_element), OTP-29.1.1.
-    /// Clear the slot of port `id` and return its handle.
-    pub(crate) fn remove(&self, id: u64) -> Option<Arc<PortHandle>> {
+    /// Clear one port while the caller holds `list` write-locked across id release.
+    fn remove_locked(&self, id: u64) -> Option<Arc<PortHandle>> {
         let slot = self.slot(id)?;
         let progress = self.progress.get()?;
         // The caller holds the table lock, so the slot cannot change between the check and the swap.
@@ -523,7 +523,7 @@ impl PortTable {
             raw::retire_data(removed.data.swap(0), &removed.scheduler);
             self.count.fetch_sub(1, Ordering::Relaxed);
             let started_interval = removed.started_interval.load(Ordering::Acquire);
-            let deleted_interval = self.interval.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+            let deleted_interval = self.interval.load(Ordering::Acquire);
             let index = arinsal_term::ptab::port_table_layout().data2pix(id);
             let entry = arinsal_sched::PtabListDeleted {
                 index,
@@ -562,28 +562,54 @@ impl PortTable {
             .collect()
     }
 
-    // Port of erts/emulator/beam/erl_ptab.c:746 (erts_ptab_list), OTP-29.1.1.
-    pub(crate) fn begin_ptab_list(&'static self) -> PortPtabListSnapshot {
+    // Port of erts/emulator/beam/erl_ptab.c (erts_ptab_list / ptab_list_bif_engine), OTP-29.1.1.
+    pub(crate) fn begin_ptab_list_chunk(
+        &'static self,
+        limit: u32,
+        track_deletions: bool,
+        reserve_ids: impl FnOnce(usize),
+        mut append_id: impl FnMut(u64),
+    ) -> (PortPtabListSnapshot, u64, usize) {
         let _list = self.list.write().unwrap();
         let count = self.count.load(Ordering::Relaxed);
-        let invocation_interval = self.interval.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-        let marker = self.list_deleted.lock().begin(invocation_interval);
-        PortPtabListSnapshot {
-            table: self,
-            marker,
+        let invocation_interval = if track_deletions {
+            self.interval.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
+        } else {
+            self.interval.load(Ordering::Acquire)
+        };
+        let marker = if track_deletions {
+            Some(self.list_deleted.lock().begin(invocation_interval))
+        } else {
+            None
+        };
+        reserve_ids(count);
+        for slot in self.slots.iter().take(limit as usize) {
+            slot.with_managed(|handle| {
+                if !track_deletions
+                    || handle.started_interval.load(Ordering::Acquire) < invocation_interval
+                {
+                    append_id(handle.id);
+                }
+            });
+        }
+        (
+            PortPtabListSnapshot {
+                table: self,
+                marker,
+                invocation_interval,
+                active: marker.is_some(),
+            },
             invocation_interval,
             count,
-            active: true,
-        }
+        )
     }
 }
 
 /// State shared by one trapping `ports/0` table scan.
 pub(crate) struct PortPtabListSnapshot {
     table: &'static PortTable,
-    marker: usize,
+    marker: Option<usize>,
     invocation_interval: u64,
-    count: usize,
     active: bool,
 }
 
@@ -616,21 +642,19 @@ impl PortPtabListSnapshot {
         chunk_interval
     }
 
-    pub(crate) fn count(&self) -> usize {
-        // Arinsal's standard I/O port is represented outside this table, while erts stores it
-        // in erts_port and includes it in erts_ptab_count.
-        self.count.saturating_add(1)
-    }
-
     pub(crate) fn inspect_deleted_with(
         &mut self,
         chunk_intervals: &[u64],
         max_reds: u32,
         append_id: impl FnMut(u64),
     ) -> (u32, bool) {
+        let Some(marker) = self.marker else {
+            self.active = false;
+            return (0, true);
+        };
         let _list = self.table.list.write().unwrap();
         let result = self.table.list_deleted.lock().inspect(
-            self.marker,
+            marker,
             self.invocation_interval,
             chunk_intervals,
             max_reds,
@@ -643,8 +667,11 @@ impl PortPtabListSnapshot {
 
 impl Drop for PortPtabListSnapshot {
     fn drop(&mut self) {
-        if self.active {
-            self.table.list_deleted.lock().cancel(self.marker);
+        if self.active
+            && let Some(marker) = self.marker
+        {
+            let _list = self.table.list.write().unwrap();
+            self.table.list_deleted.lock().cancel(marker);
         }
     }
 }
@@ -695,7 +722,7 @@ fn reserve_port_id(runtime: &crate::process::Runtime) -> Result<PortIdReservatio
 
 fn remove_port(runtime: &crate::process::Runtime, id: u64) -> Option<Arc<PortHandle>> {
     let ports = runtime.ports.lock();
-    let handle = runtime.ports.remove(id)?;
+    let handle = runtime.ports.remove_locked(id)?;
     runtime.port_ids.release(id);
     drop(ports);
     release_port_name(runtime, &handle);
@@ -4693,7 +4720,7 @@ fn remove_and_notify(
     reason: Term,
 ) -> Option<Arc<PortHandle>> {
     let ports = runtime.ports.lock();
-    let handle = runtime.ports.remove(id)?;
+    let handle = runtime.ports.remove_locked(id)?;
     runtime.port_ids.release(id);
     drop(ports);
     release_port_name(runtime, &handle);

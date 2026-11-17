@@ -2307,16 +2307,36 @@ impl<T: Task> ProcessTable<T> {
         }
     }
 
-    // Port of erts/emulator/beam/erl_ptab.c:746 (erts_ptab_list), OTP-29.1.1.
-    fn begin_ptab_list(&self) -> (usize, u64, usize) {
+    // Port of erts/emulator/beam/erl_ptab.c (erts_ptab_list / ptab_list_bif_engine), OTP-29.1.1.
+    fn begin_ptab_list_chunk(
+        &self,
+        limit: u32,
+        track_deletions: bool,
+        reserve_ids: impl FnOnce(usize),
+        mut append_pid: impl FnMut(Pid),
+    ) -> (Option<usize>, u64, usize) {
         let _exclusive = self.lock.write();
         let count = self.ids.count();
-        let interval = self.interval.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-        let mut log = self.list_deleted.lock();
-        let marker = log.begin(interval);
-        self.list_active
-            .store(log.has_invocations(), Ordering::Release);
-        drop(log);
+        let interval = if track_deletions {
+            self.interval.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
+        } else {
+            self.interval.load(Ordering::Acquire)
+        };
+        let marker = if track_deletions {
+            let mut log = self.list_deleted.lock();
+            let marker = log.begin(interval);
+            self.list_active
+                .store(log.has_invocations(), Ordering::Release);
+            Some(marker)
+        } else {
+            None
+        };
+        reserve_ids(count);
+        self.with_slot_range_ptab_locked(0, limit, |process| {
+            if !track_deletions || process.started_interval < interval {
+                append_pid(process.pid);
+            }
+        });
         (marker, interval, count)
     }
 
@@ -6717,7 +6737,7 @@ pub struct Scheduler<T: Task> {
 /// A table-list invocation that reconciles removals between 1000-slot scan chunks.
 pub struct PtabListSnapshot<T: Task> {
     scheduler: Arc<Scheduler<T>>,
-    marker: usize,
+    marker: Option<usize>,
     invocation_interval: u64,
     count: usize,
     active: bool,
@@ -6749,8 +6769,12 @@ impl<T: Task> PtabListSnapshot<T> {
         max_reds: u32,
         append_pid: impl FnMut(Pid),
     ) -> (u32, bool) {
+        let Some(marker) = self.marker else {
+            self.active = false;
+            return (0, true);
+        };
         let result = self.scheduler.inner.table.inspect_ptab_list_deleted(
-            self.marker,
+            marker,
             self.invocation_interval,
             chunk_intervals,
             max_reds,
@@ -6769,8 +6793,10 @@ impl<T: Task> PtabListSnapshot<T> {
 
 impl<T: Task> Drop for PtabListSnapshot<T> {
     fn drop(&mut self) {
-        if self.active {
-            self.scheduler.inner.table.cancel_ptab_list(self.marker);
+        if self.active
+            && let Some(marker) = self.marker
+        {
+            self.scheduler.inner.table.cancel_ptab_list(marker);
         }
     }
 }
@@ -7910,17 +7936,30 @@ impl<T: Task> Scheduler<T> {
         self.inner.table.pids_in_range(first, limit, max)
     }
 
-    /// Begin an OTP-style process table listing, with per-chunk deletion reconciliation.
-    // Port of erts/emulator/beam/erl_ptab.c:746 (erts_ptab_list), OTP-29.1.1.
-    pub fn begin_ptab_list(self: &Arc<Self>) -> PtabListSnapshot<T> {
-        let (marker, invocation_interval, count) = self.inner.table.begin_ptab_list();
-        PtabListSnapshot {
-            scheduler: Arc::clone(self),
-            marker,
+    /// Initialize a table-list invocation and scan its first chunk under one list lock.
+    // Port of erts/emulator/beam/erl_ptab.c (erts_ptab_list / ptab_list_bif_engine), OTP-29.1.1.
+    pub fn begin_ptab_list_chunk(
+        self: &Arc<Self>,
+        limit: u32,
+        track_deletions: bool,
+        reserve_ids: impl FnOnce(usize),
+        append_pid: impl FnMut(Pid),
+    ) -> (PtabListSnapshot<T>, u64, usize) {
+        let (marker, invocation_interval, count) =
+            self.inner
+                .table
+                .begin_ptab_list_chunk(limit, track_deletions, reserve_ids, append_pid);
+        (
+            PtabListSnapshot {
+                scheduler: Arc::clone(self),
+                marker,
+                invocation_interval,
+                count,
+                active: marker.is_some(),
+            },
             invocation_interval,
             count,
-            active: true,
-        }
+        )
     }
 
     /// Bytes of the process table: the slot array and the free identifier ring.
