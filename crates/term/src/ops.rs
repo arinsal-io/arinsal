@@ -408,6 +408,9 @@ pub fn size_object_litopt(root: Term, literals: &crate::LiteralAreas) -> usize {
 /// contribute nothing when `litopt` is set.
 /// Port of erts/emulator/beam/copy.c:88 (`size_object_x`), OTP-29.1.1.
 pub(crate) fn size_object_x(mut obj: Term, litopt: Option<&crate::LiteralAreas>) -> usize {
+    // Port of copy.c:98-100: `size_object_x` snapshots the literal range before walking.
+    let (literal_start, literal_end) = litopt.map_or((0, 0), |_| crate::literal::literal_area());
+    let literal_size = literal_end - literal_start;
     // `DECLARE_ESTACK` starts at DEF_ESTACK_SIZE (global.h:322).
     let mut stack = WStack::new();
     let mut sum = 0usize;
@@ -418,7 +421,11 @@ pub(crate) fn size_object_x(mut obj: Term, litopt: Option<&crate::LiteralAreas>)
             match obj.0 & 3 {
                 1 => {
                     let ptr = obj.raw_ptr();
-                    if lit_kept(litopt, ptr) {
+                    if litopt.is_some_and(|areas| {
+                        let address = ptr as usize;
+                        address.wrapping_sub(literal_start) < literal_size
+                            && !areas.in_purge_area(address)
+                    }) {
                         pop_size(&mut stack, &mut obj);
                         if obj.0 == u64::MAX {
                             return sum;
@@ -434,7 +441,11 @@ pub(crate) fn size_object_x(mut obj: Term, litopt: Option<&crate::LiteralAreas>)
                 }
                 2 => {
                     let ptr = obj.raw_ptr();
-                    if lit_kept(litopt, ptr) {
+                    if litopt.is_some_and(|areas| {
+                        let address = ptr as usize;
+                        address.wrapping_sub(literal_start) < literal_size
+                            && !areas.in_purge_area(address)
+                    }) {
                         pop_size(&mut stack, &mut obj);
                         if obj.0 == u64::MAX {
                             return sum;
@@ -569,12 +580,6 @@ pub(crate) fn size_object_x(mut obj: Term, litopt: Option<&crate::LiteralAreas>)
             }
         }
     }
-}
-
-#[inline]
-fn lit_kept(litopt: Option<&crate::LiteralAreas>, ptr: *const u64) -> bool {
-    // Port of copy.c:105 (`litopt && erts_is_literal && !in_literal_purge_area`).
-    litopt.is_some_and(|areas| areas.keeps(ptr as u64))
 }
 
 #[inline]

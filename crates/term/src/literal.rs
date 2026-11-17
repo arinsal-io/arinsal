@@ -244,6 +244,14 @@ impl LiteralAreas {
             .is_none_or(|ranges| ranges.is_empty() || find(ranges, address as usize).is_none())
     }
 
+    /// Whether an address lies inside the literal collector's purge ranges.
+    #[inline(always)]
+    pub(crate) fn in_purge_area(&self, address: usize) -> bool {
+        self.ranges
+            .as_deref()
+            .is_some_and(|ranges| !ranges.is_empty() && find(ranges, address).is_some())
+    }
+
     /// Whether `term`'s object lies in any literal area, including the purge area.
     // Port of erts/emulator/beam/global.h:1568 (`erts_is_literal`), OTP-29.1.1.
     pub fn is_literal(&self, address: u64) -> bool {

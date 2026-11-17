@@ -375,6 +375,9 @@ fn copy_struct_into_layout<H: HeapAlloc + ?Sized>(
     ets_element: bool,
     require_full: bool,
 ) -> Result<CopyLayout, TermError> {
+    // Port of copy.c:674-675: `copy_struct_x` snapshots the literal range before copying.
+    let (literal_start, literal_end) = litopt.map_or((0, 0), |_| crate::literal::literal_area());
+    let literal_size = literal_end - literal_start;
     let hstart = base;
     let hsize = size * 8;
     let mut hp = base;
@@ -477,7 +480,11 @@ fn copy_struct_into_layout<H: HeapAlloc + ?Sized>(
                 }
                 CopyAt::List(mut argp, mut obj) => {
                     let mut objp = obj.raw_ptr();
-                    if lit_kept(litopt, objp) {
+                    if litopt.is_some_and(|areas| {
+                        let address = objp as usize;
+                        address.wrapping_sub(literal_start) < literal_size
+                            && !areas.in_purge_area(address)
+                    }) {
                         *argp = obj.0;
                         at = CopyAt::Scan;
                         continue;
@@ -502,7 +509,11 @@ fn copy_struct_into_layout<H: HeapAlloc + ?Sized>(
                             break;
                         }
                         objp = obj.raw_ptr();
-                        if lit_kept(litopt, objp) {
+                        if litopt.is_some_and(|areas| {
+                            let address = objp as usize;
+                            address.wrapping_sub(literal_start) < literal_size
+                                && !areas.in_purge_area(address)
+                        }) {
                             *tailp = obj.0;
                             at = CopyAt::Scan;
                             break;
@@ -527,7 +538,11 @@ fn copy_struct_into_layout<H: HeapAlloc + ?Sized>(
                 }
                 CopyAt::Boxed(argp, obj) => {
                     let mut objp = obj.raw_ptr();
-                    if lit_kept(litopt, objp) {
+                    if litopt.is_some_and(|areas| {
+                        let address = objp as usize;
+                        address.wrapping_sub(literal_start) < literal_size
+                            && !areas.in_purge_area(address)
+                    }) {
                         *argp = obj.0;
                         at = CopyAt::Scan;
                         continue;
@@ -746,11 +761,6 @@ pub(crate) fn copy_binary_to_buffer(dst: &mut [u8], src: &[u8], src_offset: usiz
         let bit = (byte >> (7 - src_bit % 8)) & 1;
         dst[i / 8] |= bit << (7 - i % 8);
     }
-}
-
-#[inline]
-fn lit_kept(litopt: Option<&LiteralAreas>, ptr: *const u64) -> bool {
-    litopt.is_some_and(|areas| areas.keeps(ptr as u64))
 }
 
 #[inline]
