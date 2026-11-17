@@ -287,13 +287,29 @@ impl Process {
             .unwrap_or(DEFAULT_LIMIT);
         #[cfg(not(debug_assertions))]
         let long_gc_hsize: usize = DEFAULT_LIMIT;
+        // erl_gc.c:606-644 (young_gen_usage) counts the data still attached to queued
+        // messages with an on-heap queue, and check_for_possibly_long_gc (erl_gc.c:704-710)
+        // adds one word per private-queue message.
+        let (msg_words, msg_len) = if self.message_queue_data() == MessageQueueData::OnHeap {
+            (
+                arinsal_term::GcMessageQueue::attached_words(&self.inbox),
+                self.inbox.len(),
+            )
+        } else {
+            (0, 0)
+        };
         let mut size = self
             .heap
             .young_gen_usage()
+            .saturating_add(msg_words)
             .saturating_add(self.heap.stack_words());
         // The old generation only counts for a major collection, so a young generation
         // plus old heap below the limit is below it whichever collection runs.
-        if size.saturating_add(self.heap.old_used_words()) < long_gc_hsize {
+        if size
+            .saturating_add(self.heap.old_used_words())
+            .saturating_add(msg_len)
+            < long_gc_hsize
+        {
             return None;
         }
         // A collection that starts as minor is checked on its young generation alone. If
@@ -301,14 +317,14 @@ impl Process {
         // collection it falls back to. Otherwise the minor attempt runs here, and a minor
         // that cannot tenure is checked again as a major collection.
         let counted_major = self.heap.collection_is_major();
-        let minor_is_long = !counted_major && size >= long_gc_hsize;
+        let minor_is_long = !counted_major && size.saturating_add(msg_len) >= long_gc_hsize;
         let failed_minor =
             !counted_major && !minor_is_long && self.heap.minor_falls_back_to_major();
         let major = counted_major || failed_minor;
         if major {
             size = size.saturating_add(self.heap.old_used_words());
         }
-        if size < long_gc_hsize {
+        if size.saturating_add(msg_len) < long_gc_hsize {
             return None;
         }
         if failed_minor {

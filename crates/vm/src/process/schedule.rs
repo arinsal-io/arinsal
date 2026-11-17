@@ -490,6 +490,7 @@ impl Process {
                     && self.slice().is_some_and(|work| work.dirty_sys_gc) =>
             {
                 ctx.set_active(true);
+                ctx.set_dirty_active_sys();
                 RunOutcome::Dirty(arinsal_sched::DirtyKind::Cpu)
             }
             Ok(RunState::Yield) => {
@@ -562,6 +563,9 @@ impl Process {
                     return RunOutcome::Yield;
                 }
                 if let VmError::Dirty(kind) = error {
+                    if self.slice().is_some_and(|work| work.dirty_sys_gc) {
+                        ctx.set_dirty_active_sys();
+                    }
                     return RunOutcome::Dirty(kind);
                 }
                 let reason = exit_reason_from(self, &error);
