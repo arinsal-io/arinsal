@@ -17,6 +17,9 @@ pub struct Message {
     /// The data is in the heap fragment inline in this message's own node
     /// (`data.attached == ERTS_MSG_COMBINED_HFRAG`).
     pub(super) combined: bool,
+    /// The data is in a heap fragment of its own (`data.heap_frag`): a send to an on-heap
+    /// receiver whose main lock or heap was not available (`in_message_fragment`).
+    pub(super) heap_frag: Option<arinsal_term::message::NodeFragment>,
 }
 
 /// What the sender knows about a message beyond its term: the sequential trace token state
@@ -66,6 +69,7 @@ impl Message {
     fn is_heap_root(&self) -> bool {
         self.term.is_pointer()
             && !self.combined
+            && self.heap_frag.is_none()
             && self
                 .fragment
                 .as_ref()
@@ -204,6 +208,7 @@ impl Message {
             seq_nil: false,
             alias: 0,
             combined: false,
+            heap_frag: None,
         })
     }
 
@@ -244,6 +249,31 @@ impl Message {
         Ok(node)
     }
 
+    /// The message of a send to an on-heap receiver that could not take it on its heap:
+    /// `erts_alloc_message(0, NULL)` (a message reference) plus `new_message_buffer(sz)` as
+    /// `data.heap_frag`, then `copy_struct` into the buffer. `words` is
+    /// `size_object_litopt(term, literals)`.
+    // Port of erts/emulator/beam/erl_message.c (erts_try_alloc_message_on_heap,
+    // in_message_fragment), OTP-29.1.1.
+    pub(super) fn node_heap_frag(
+        from: Pid,
+        term: Term,
+        words: usize,
+        literals: &arinsal_term::LiteralAreas,
+    ) -> Result<MessageNode, VmError> {
+        let mut message = Self::immediate(term);
+        if words != 0 {
+            let mut heap_frag = arinsal_term::message::NodeFragment::new_message_buffer(words);
+            message.term = copy_struct_litopt(term, &mut heap_frag.fragment_mut(), words, literals)
+                .map_err(|error| VmError::Unsupported(format!("message copy: {error:?}")))?;
+            message.heap_frag = Some(heap_frag);
+        }
+        Ok(arinsal_sched::OwnedSignal::new(Event {
+            from,
+            payload: Payload::Message(message),
+        }))
+    }
+
     /// A node for a message built directly in its own inline heap fragment: the driver's
     /// `erts_factory_message_create` takes `erts_alloc_message_heap(need)`, builds the term
     /// there and keeps the combined node. `build` returns the term, or `None` when it cannot.
@@ -279,6 +309,7 @@ impl Message {
             seq_nil: false,
             alias: 0,
             combined: false,
+            heap_frag: None,
         }
     }
 
@@ -320,6 +351,7 @@ impl Message {
             seq_nil: false,
             alias: 0,
             combined: false,
+            heap_frag: None,
         })
     }
 
@@ -406,6 +438,11 @@ impl Message {
             !self.combined,
             "a message with inline data stays in its node"
         );
+        if let Some(heap_frag) = self.heap_frag {
+            // erts_save_message_in_proc: the fragment is kept with the process.
+            process.heap.adopt_message_node(heap_frag);
+            return Ok(self.term);
+        }
         if self.fragment.is_none() {
             // Immediate, literal, or already placed on this heap
             // (erl_message.c:657, `attached == NULL`).

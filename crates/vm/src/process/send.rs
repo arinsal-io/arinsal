@@ -73,6 +73,7 @@ fn message_on_receiver_heap(
         seq_nil: false,
         alias: 0,
         combined: false,
+        heap_frag: None,
     };
     if priority {
         envelope = envelope.with_priority();
@@ -554,9 +555,18 @@ impl Process {
                 envelope.alias = seq_token.alias;
                 Self::message_node(sender, envelope)
             } else {
-                // Port of erts/emulator/beam/erl_message.c (erts_send_message): the message
-                // and its data in one allocation.
-                let mut node = Message::node_counted(sender, value, words, &literals)?;
+                // Port of erts/emulator/beam/erl_message.c (erts_send_message ->
+                // erts_alloc_message_heap_state), OTP-29.1.1: an off-heap queue takes the
+                // message and its data in one allocation (`ERTS_MSG_COMBINED_HFRAG`); an on-heap
+                // receiver that did not take the data on its heap gets a message reference with
+                // a heap fragment of its own (`in_message_fragment`).
+                let off_heap =
+                    pid == sender && self.message_queue_data() == MessageQueueData::OffHeap;
+                let mut node = if off_heap {
+                    Message::node_counted(sender, value, words, &literals)?
+                } else {
+                    Message::node_heap_frag(sender, value, words, &literals)?
+                };
                 if let Payload::Message(envelope) = &mut node.payload {
                     envelope.priority = via_prio_alias;
                     envelope.apply_seq_state(std::mem::take(&mut seq_token.seq));

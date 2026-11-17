@@ -675,6 +675,46 @@ pub struct NodeFragment {
 unsafe impl Send for NodeFragment {}
 
 impl NodeFragment {
+    /// A standalone message heap fragment with room for `words` (`new_message_buffer`): the
+    /// header and the words in one `ERTS_ALC_T_HEAP_FRAG` block, which is its own memory. A
+    /// message refers to it as `data.heap_frag`.
+    // Port of erts/emulator/beam/erl_message.c (new_message_buffer), OTP-29.1.1.
+    pub fn new_message_buffer(words: usize) -> Self {
+        let (layout, _) = Layout::new::<HeapFragment>()
+            .extend(Layout::array::<u64>(words).expect("message size fits"))
+            .expect("message size fits");
+        let layout = layout.pad_to_align();
+        let Ok(memory) = arinsal_alloc::typed::heap_frag_alloc(layout.size()) else {
+            std::alloc::handle_alloc_error(layout)
+        };
+        let header = memory.cast::<HeapFragment>();
+        // SAFETY: `memory` is a fresh word-aligned block of `layout`: the header at its start,
+        // then `words` words.
+        unsafe {
+            header.as_ptr().write(HeapFragment {
+                off_heap: crate::heap::OffHeapLists::default(),
+                bin_vheap: 0,
+                alloc_size: words,
+                used_size: 0,
+            });
+        }
+        Self { memory, header }
+    }
+
+    /// The fragment to allocate message data in.
+    pub fn fragment_mut(&mut self) -> FragmentMut<'_> {
+        FragmentMut {
+            header: self.header,
+            _node: PhantomData,
+        }
+    }
+
+    /// Whether this is a standalone heap fragment (`data.heap_frag`), not the inline fragment
+    /// of a combined message node.
+    fn is_message_buffer(&self) -> bool {
+        self.memory == self.header.cast()
+    }
+
     /// The first word (`mem`).
     pub fn as_ptr(&self) -> *const u64 {
         fragment_words_ptr(self.header)
@@ -722,7 +762,12 @@ impl Drop for NodeFragment {
         unsafe {
             std::ptr::drop_in_place(self.header.as_ptr());
         }
-        arinsal_alloc::typed::msg_free(self.memory);
+        if self.is_message_buffer() {
+            // `free_message_buffer`.
+            arinsal_alloc::typed::heap_frag_free(self.memory);
+        } else {
+            arinsal_alloc::typed::msg_free(self.memory);
+        }
     }
 }
 

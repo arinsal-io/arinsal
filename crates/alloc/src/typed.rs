@@ -1738,6 +1738,35 @@ pub fn msg_free(block: std::ptr::NonNull<u8>) {
     }
 }
 
+/// `erts_alloc(ERTS_ALC_T_HEAP_FRAG, bytes)`: a standalone message heap fragment of the eheap
+/// allocator (`new_message_buffer`), header inline; freed by [`heap_frag_free`].
+// Port of erts/emulator/beam/erl_message.c (new_message_buffer), OTP-29.1.1.
+pub fn heap_frag_alloc(bytes: usize) -> Result<std::ptr::NonNull<u8>, AllocError> {
+    let allocators = heap_frag_allocators()?;
+    let (_, base) = allocators.alloc_with_ptr_at(crate::instances::thread_alloc_ix(), bytes)?;
+    std::ptr::NonNull::new(base.cast::<u8>()).ok_or(AllocError::InvalidAllocation)
+}
+
+/// `free_message_buffer`: `erts_free(ERTS_ALC_T_HEAP_FRAG, block)` of a [`heap_frag_alloc`] block.
+// Port of erts/emulator/beam/erl_message.c (free_message_buffer), OTP-29.1.1.
+pub fn heap_frag_free(block: std::ptr::NonNull<u8>) {
+    let handle = driver_handle(block.as_ptr());
+    if let Ok(allocators) = heap_frag_allocators() {
+        let _ = allocators.free_at(crate::instances::thread_alloc_ix(), handle);
+    }
+}
+
+/// The allocator of `ERTS_ALC_T_HEAP_FRAG`, looked up once.
+#[inline(always)]
+fn heap_frag_allocators() -> Result<&'static ThreadSpecificAllocators, AllocError> {
+    static HEAP_FRAG: OnceLock<&'static ThreadSpecificAllocators> = OnceLock::new();
+    if let Some(allocators) = HEAP_FRAG.get() {
+        return Ok(allocators);
+    }
+    let allocators = allocator_for(ErtsAlcType::HEAP_FRAG)?;
+    Ok(HEAP_FRAG.get_or_init(|| allocators))
+}
+
 /// The allocator of `ERTS_ALC_T_MSG`, looked up once.
 #[inline(always)]
 fn msg_allocators() -> Result<&'static ThreadSpecificAllocators, AllocError> {
