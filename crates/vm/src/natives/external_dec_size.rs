@@ -18,6 +18,29 @@ pub(crate) struct B2tSizeState {
     lext_hash: Option<(u32, usize)>,
     lext_term_end: u32,
     terms: u32,
+    complete: bool,
+    input_ptr: usize,
+    input_len: usize,
+}
+
+/// Input whose lengths and encoded term structure completed the `decoded_size` pass.
+// Port of erts/emulator/beam/external.c (`decoded_size` before `dec_term`), OTP-29.1.1.
+#[derive(Clone, Copy)]
+pub(crate) struct ValidatedBytes<'a>(&'a [u8]);
+
+impl<'a> ValidatedBytes<'a> {
+    pub(crate) fn as_slice(self) -> &'a [u8] {
+        self.0
+    }
+}
+
+impl B2tSizeState {
+    pub(crate) fn validated_bytes<'a>(&self, bytes: &'a [u8]) -> Option<ValidatedBytes<'a>> {
+        (self.complete
+            && self.input_ptr == bytes.as_ptr() as usize
+            && self.input_len == bytes.len())
+        .then_some(ValidatedBytes(bytes))
+    }
 }
 
 /// `decoded_size(ep, endp, 0, ctx)` of a body that follows the version byte: the heap size in
@@ -344,6 +367,9 @@ pub(crate) fn decoded_size(
             *sc = B2tSizeState {
                 lext_state,
                 started: true,
+                complete: false,
+                input_ptr: 0,
+                input_len: 0,
                 ep,
                 atom_extra_skip,
                 heap_size,
@@ -354,6 +380,10 @@ pub(crate) fn decoded_size(
             return Ok(None);
         }
         if terms == 0 {
+            sc.ep = ep;
+            sc.complete = true;
+            sc.input_ptr = bytes.as_ptr() as usize;
+            sc.input_len = bytes.len();
             return Ok(Some(heap_size));
         }
     }

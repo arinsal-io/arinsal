@@ -2,6 +2,8 @@
 // Port of erts/emulator/beam/external.c (erts_encode_ext_size, encode_size_struct_int,
 // enc_term_int, erts_term_to_binary_int), OTP-29.1.1.
 
+mod raw;
+
 use std::cmp::Ordering;
 use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
@@ -344,28 +346,28 @@ impl ByteOutput for OutputSlice<'_> {
     }
 
     fn push(&mut self, byte: u8) {
-        self.bytes[self.position] = byte;
+        raw::write_byte_validated(self.bytes, self.position, byte);
         self.position = self.position.saturating_add(1);
     }
 
     fn extend_from_slice(&mut self, bytes: &[u8]) {
         let end = self.position.saturating_add(bytes.len());
-        self.bytes[self.position..end].copy_from_slice(bytes);
+        raw::write_validated(self.bytes, self.position, bytes);
         self.position = end;
     }
 
     fn extend_zeroed(&mut self, len: usize) {
         let end = self.position.saturating_add(len);
-        self.bytes[self.position..end].fill(0);
+        raw::zero_validated(self.bytes, self.position, len);
         self.position = end;
     }
 
     fn patch(&mut self, at: usize, bytes: &[u8]) {
-        self.bytes[at..at + bytes.len()].copy_from_slice(bytes);
+        raw::write_validated(self.bytes, at, bytes);
     }
 
     fn mask_last(&mut self, mask: u8) {
-        self.bytes[self.position - 1] &= mask;
+        raw::mask_validated(self.bytes, self.position - 1, mask);
     }
 
     fn slice(&self, range: std::ops::Range<usize>) -> &[u8] {

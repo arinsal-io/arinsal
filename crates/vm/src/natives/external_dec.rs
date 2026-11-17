@@ -490,6 +490,7 @@ impl<'a> B2tContext<'a> {
         } else {
             &self.input.bytes()[1..]
         };
+        let validated = self.size.validated_bytes(bytes).ok_or(BifError::BADARG)?;
         let mut flags = DecFlags {
             safe: self.safe,
             internal_nc: self.internal_nc,
@@ -498,7 +499,7 @@ impl<'a> B2tContext<'a> {
         let ep = self.dc.ep;
         let result = dec_term(
             &mut fac,
-            bytes,
+            validated,
             ep,
             None,
             Some(DecCtx {

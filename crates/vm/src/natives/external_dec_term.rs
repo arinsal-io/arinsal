@@ -4,7 +4,10 @@
 //! Port of erts/emulator/beam/external.c (`dec_term`, `dec_pid`, `dec_sysname`,
 //! `B2TDecodeContext`), OTP-29.1.1.
 
+mod raw;
+
 use super::external_dec::{B2T_MEMCPY_FACTOR, B2tState};
+use super::external_dec_size::ValidatedBytes;
 use arinsal_bifs::BifError;
 use arinsal_term::raw::{HeapSlotPtr, copy_to_binary_payload, term_from_bits};
 use arinsal_term::{
@@ -17,30 +20,34 @@ use smallvec::SmallVec;
 use std::sync::Arc;
 
 pub(super) struct Reader<'a> {
-    pub(super) bytes: &'a [u8],
+    pub(super) validated: ValidatedBytes<'a>,
     pub(super) at: usize,
 }
 impl Reader<'_> {
     pub(super) fn take(&mut self, n: usize) -> Result<&[u8], BifError> {
-        let end = self.at.checked_add(n).ok_or(BifError::BADARG)?;
-        let part = self
-            .bytes
-            .get(self.at..end)
-            .ok_or(BifError::Unsupported("incomplete ETF input"))?;
-        self.at = end;
+        let part = raw::take_validated(self.validated, self.at, n);
+        self.at += n;
         Ok(part)
     }
     pub(super) fn u8(&mut self) -> Result<u8, BifError> {
-        Ok(self.take(1)?[0])
+        let value = raw::u8_validated(self.validated, self.at);
+        self.at += 1;
+        Ok(value)
     }
     pub(super) fn u16(&mut self) -> Result<u16, BifError> {
-        Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+        let value = raw::u16_validated(self.validated, self.at);
+        self.at += 2;
+        Ok(value)
     }
     pub(super) fn u32(&mut self) -> Result<u32, BifError> {
-        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        let value = raw::u32_validated(self.validated, self.at);
+        self.at += 4;
+        Ok(value)
     }
     pub(super) fn u64(&mut self) -> Result<u64, BifError> {
-        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+        let value = raw::u64_validated(self.validated, self.at);
+        self.at += 8;
+        Ok(value)
     }
     pub(super) fn atom(
         &mut self,
@@ -97,8 +104,8 @@ impl Reader<'_> {
 }
 
 impl<'a> Reader<'a> {
-    pub(super) fn new(bytes: &'a [u8], at: usize) -> Self {
-        Self { bytes, at }
+    pub(super) fn new(validated: ValidatedBytes<'a>, at: usize) -> Self {
+        Self { validated, at }
     }
 }
 
@@ -179,7 +186,7 @@ fn produce(
 /// `dec_sysname`: a node name atom, or `NIL_EXT` for this node under `LOCAL_EXT`.
 // Port of erts/emulator/beam/external.c (dec_sysname), OTP-29.1.1.
 fn dec_sysname(r: &mut Reader<'_>, flags: &DecFlags) -> Result<(Atom, bool), BifError> {
-    if flags.internal_nc && r.bytes.get(r.at) == Some(&106) {
+    if flags.internal_nc && r.validated.as_slice().get(r.at) == Some(&106) {
         r.at += 1;
         return Ok((flags.this_node.0, true));
     }
@@ -233,7 +240,7 @@ fn dec_pid(
 // Port of erts/emulator/beam/external.c (dec_term), OTP-29.1.1.
 pub(crate) fn dec_term(
     fac: &mut HeapReservation<'_, ProcessHeap>,
-    bytes: &[u8],
+    validated: ValidatedBytes<'_>,
     ep: usize,
     objp: Option<HeapSlotPtr>,
     ctx: Option<DecCtx<'_>>,
@@ -242,13 +249,13 @@ pub(crate) fn dec_term(
     match ctx {
         Some(mut ctx) => {
             let mut reds = *ctx.reds;
-            let result = dec_term_body(fac, bytes, ep, None, Some(&mut ctx), flags, &mut reds);
+            let result = dec_term_body(fac, validated, ep, None, Some(&mut ctx), flags, &mut reds);
             *ctx.reds = reds;
             result
         }
         None => {
             let mut reds = i64::MAX;
-            dec_term_body(fac, bytes, ep, objp, None, flags, &mut reds)
+            dec_term_body(fac, validated, ep, objp, None, flags, &mut reds)
         }
     }
 }
@@ -256,14 +263,14 @@ pub(crate) fn dec_term(
 #[allow(clippy::too_many_arguments)]
 fn dec_term_body(
     fac: &mut HeapReservation<'_, ProcessHeap>,
-    bytes: &[u8],
+    validated: ValidatedBytes<'_>,
     ep: usize,
     objp: Option<HeapSlotPtr>,
     mut ctx: Option<&mut DecCtx<'_>>,
     flags: &mut DecFlags,
     reds: &mut i64,
 ) -> Result<Option<usize>, BifError> {
-    let mut r = Reader::new(bytes, ep);
+    let mut r = Reader::new(validated, ep);
     let mut next: Option<HeapSlotPtr>;
     let mut map_array: SmallVec<[DecTermMap; 10]>;
     if let Some(c) = ctx.as_deref_mut() {
@@ -525,14 +532,7 @@ fn dec_term_body(
                         let hb = produce(fac, words)?;
                         hb.store((((words - 1) as u64) << 6) | HEAP_BITS);
                         hb.offset(1).store(size_in_bits as u64);
-                        for (index, chunk) in src.chunks(8).enumerate() {
-                            let mut word = [0; 8];
-                            word[..chunk.len()].copy_from_slice(chunk);
-                            if index + 1 == words - 2 && !size_in_bits.is_multiple_of(8) {
-                                word[chunk.len() - 1] &= 0xff << (8 - size_in_bits % 8);
-                            }
-                            hb.offset(2 + index).store(u64::from_ne_bytes(word));
-                        }
+                        raw::copy_to_heap_payload(hb.offset(2), src);
                         objp.store(make_boxed(hb));
                     } else {
                         let mut binary = RefcBinary::new_uninit(size_in_bits.div_ceil(8))
@@ -808,7 +808,7 @@ fn dec_sub_term(
 ) -> Result<Term, BifError> {
     let mut temp: u64 = 0;
     let slot = HeapSlotPtr::from_ptr(&mut temp).ok_or(BifError::BADARG)?;
-    r.at = dec_term(fac, r.bytes, r.at, Some(slot), None, flags)?.ok_or(BifError::BADARG)?;
+    r.at = dec_term(fac, r.validated, r.at, Some(slot), None, flags)?.ok_or(BifError::BADARG)?;
     Ok(term_from_bits(temp))
 }
 
