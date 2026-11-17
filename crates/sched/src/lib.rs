@@ -1618,6 +1618,11 @@ pub mod proc_flags {
     /// `F_DISTRIBUTION`: the process is `net_kernel` (set by `setnode/2` under the thread
     /// progress block), so its exit runs `erts_do_net_exits` for this node. Outside `ALL`.
     pub const DISTRIBUTION: u32 = 1 << 12;
+    /// `ERTS_PSFLG_OFF_HEAP_MSGQ`: the message queue is off heap, so a sender builds each
+    /// message in a combined node instead of trying the receiver's heap. Outside `ALL` and its
+    /// done bits. Port of erts/emulator/beam/erl_process.h (ERTS_PSFLG_OFF_HEAP_MSGQ) and
+    /// erl_message.c (erts_alloc_message_heap_state), OTP-29.1.1.
+    pub const OFF_HEAP_MSGQ: u32 = 1 << 28;
     /// Sets a state bit of the owning process (no cleanup bookkeeping).
     pub fn set_state(flags: &AtomicU32, bit: u32) {
         flags.fetch_or(bit, Ordering::AcqRel);

@@ -524,8 +524,26 @@ impl Process {
                 token_words,
                 literals: &literals,
             };
+            // Port of erts/emulator/beam/erl_message.c (erts_send_message reads
+            // `receiver->state`; erts_alloc_message_heap_state), OTP-29.1.1: an off-heap queue
+            // takes a combined message without trying the receiver's heap.
+            let receiver_off_heap = if pid == sender {
+                self.message_queue_data() == MessageQueueData::OffHeap
+            } else {
+                self.runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.scheduler().ok())
+                    .and_then(|scheduler| {
+                        scheduler.with_proc_flags(pid, |flags| {
+                            flags.load(Ordering::Relaxed) & proc_flags::OFF_HEAP_MSGQ != 0
+                        })
+                    })
+                    .unwrap_or(false)
+            };
             let mut on_heap = None;
-            if pid == sender {
+            if receiver_off_heap {
+                // erts_alloc_message_heap_state: ERTS_PSFLG_OFF_HEAP_MSGQ, no heap attempt.
+            } else if pid == sender {
                 // Port of erts/emulator/beam/erl_message.c (erts_try_alloc_message_on_heap),
                 // OTP-29.1.1: a process that sends to itself holds its own main lock, so the
                 // message and its token are allocated on its own young heap when they fit.
@@ -560,9 +578,7 @@ impl Process {
                 // message and its data in one allocation (`ERTS_MSG_COMBINED_HFRAG`); an on-heap
                 // receiver that did not take the data on its heap gets a message reference with
                 // a heap fragment of its own (`in_message_fragment`).
-                let off_heap =
-                    pid == sender && self.message_queue_data() == MessageQueueData::OffHeap;
-                let mut node = if off_heap {
+                let mut node = if receiver_off_heap {
                     Message::node_counted(sender, value, words, &literals)?
                 } else {
                     Message::node_heap_frag(sender, value, words, &literals)?

@@ -553,7 +553,7 @@ pub(crate) fn flag(process: &mut Process, name: &str, value: Term) -> Result<Ter
             let previous = flag_value(process, name)
                 .unwrap_or_else(|| Term::atom(arinsal_term::atoms::ON_HEAP));
             set_flag(process, name, value);
-            process.cold_mut().off_heap_msgq = value == Term::atom(arinsal_term::atoms::OFF_HEAP);
+            process.set_off_heap_msgq(value == Term::atom(arinsal_term::atoms::OFF_HEAP));
             previous
         }
         "sensitive" => {

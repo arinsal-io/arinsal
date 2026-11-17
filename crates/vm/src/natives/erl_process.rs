@@ -659,6 +659,13 @@ fn create_child(
             return Err(CreateError::SystemLimit);
         }
     };
+    // Port of erts/emulator/beam/erl_process.c (erl_create_process), OTP-29.1.1: the state
+    // word carries ERTS_PSFLG_OFF_HEAP_MSGQ before the pid is handed out.
+    if so.off_heap_msgq == Some(true) {
+        scheduler.with_proc_flags(spawned.pid(), |flags| {
+            arinsal_sched::proc_flags::set_state(flags, arinsal_sched::proc_flags::OFF_HEAP_MSGQ);
+        });
+    }
     let seq_spawn = if crate::seq_trace::has_token(parent) {
         spawned
             .with_task(|child: &mut Process| {

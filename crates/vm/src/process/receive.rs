@@ -25,6 +25,26 @@ impl Process {
         }
     }
 
+    /// Set the queue mode: `FS_OFF_HEAP_MSGQ` in the process's own flags and
+    /// `ERTS_PSFLG_OFF_HEAP_MSGQ` in its state word, which senders read without its lock.
+    // Port of erts/emulator/beam/erl_message.c (erts_change_message_queue_management) and
+    // erl_process.c (erl_create_process: state flag from the spawn options), OTP-29.1.1.
+    pub(crate) fn set_off_heap_msgq(&mut self, off_heap: bool) {
+        self.cold_mut().off_heap_msgq = off_heap;
+        let (Some(pid), Some(runtime)) = (self.self_pid, self.runtime.as_ref()) else {
+            return;
+        };
+        if let Ok(scheduler) = runtime.scheduler() {
+            scheduler.with_proc_flags(pid, |flags| {
+                if off_heap {
+                    proc_flags::set_state(flags, proc_flags::OFF_HEAP_MSGQ);
+                } else {
+                    proc_flags::clear_state(flags, proc_flags::OFF_HEAP_MSGQ);
+                }
+            });
+        }
+    }
+
     /// Whether `erts_garbage_collect` must fetch the outer signal queue first.
     // Port of erts/emulator/beam/erl_gc.c:987-990, OTP-29.1.1: only an on-heap
     // queue (or a queue changing onto the heap) is fetched, and only when the

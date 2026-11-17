@@ -556,7 +556,7 @@ fn process_flag(process: &mut Process, flag: Term, value: Term) -> Result<Term, 
                 return Err(badarg());
             };
             let previous = process.cold.as_ref().is_some_and(|cold| cold.off_heap_msgq);
-            process.cold_mut().off_heap_msgq = off_heap;
+            process.set_off_heap_msgq(off_heap);
             if let Some(probe) = process.signal_probe() {
                 probe.set_parallel_signal_buffers(off_heap);
             }
