@@ -1910,9 +1910,9 @@ impl Process {
         let Some(probe) = self.signal_probe.as_ref() else {
             return false;
         };
+        // The fetch sets `ERTS_PSFLG_SIG_Q` itself when it leaves signals to handle.
         probe.fetch_all(&mut self.sig_cont);
         let busy = !self.sig_cont.is_empty();
-        probe.set_sig_q(busy);
         self.set_slow(Self::SLOW_SIG_CONT, busy);
         true
     }

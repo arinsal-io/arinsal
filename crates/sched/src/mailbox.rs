@@ -76,6 +76,8 @@ pub mod psflg {
     pub const DIRTY_RUNNING_SYS: u32 = bit(24);
     /// `ERTS_PSFLGS_DIRTY_WORK`.
     pub const DIRTY_WORK: u32 = DIRTY_CPU_PROC | DIRTY_IO_PROC | DIRTY_ACTIVE_SYS;
+    /// `ERTS_PSFLG_DIRTY_RUNNING`: the process executes on a dirty scheduler.
+    pub const DIRTY_RUNNING: u32 = bit(23);
 }
 
 /// How a queued signal sets the in-queue state bits.
@@ -747,16 +749,44 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
     /// receiver handles the signals and moves the messages into its own message queue.
     // Port of erts/emulator/beam/erl_proc_sig_queue.h:1997 (erts_proc_sig_fetch: the outer
     // queue is spliced onto the end of the inner queue under the msgq lock), OTP-29.1.1.
-    pub fn take_all(&self, into: &mut SignalQueue<T>) {
+    ///
+    /// `keep_in_cont`: the receiver keeps the fetched messages in the middle queue too (erts
+    /// `sig_qs.cont` in use or receive tracing on). `ERTS_PSFLG_SIG_Q` is set in the same
+    /// read-modify-write that clears the in-queue bits when the fetch leaves signals to handle:
+    /// non-message signals, or messages kept in the middle queue.
+    pub fn take_all(&self, into: &mut SignalQueue<T>, keep_in_cont: bool) {
         if !self.has_pending() {
             return;
         }
         let mut queue = self.lock_msgq();
-        if self.buffers.is_occupied() {
+        let buffers = self.buffers.is_occupied();
+        if buffers {
             self.flush_buffers_locked(&mut queue, true);
         }
+        let set = if !queue.is_empty()
+            && (keep_in_cont || !into.is_empty() || queue.non_messages() != 0)
+        {
+            psflg::SIG_Q
+        } else {
+            0
+        };
         into.append(&mut queue);
-        self.dequeued(&queue);
+        if buffers {
+            self.dequeued(&queue);
+            if set != 0 {
+                self.state.fetch_or(set, Ordering::SeqCst);
+            }
+        } else if set == 0 {
+            // `erts_atomic32_read_band_nob(&state, ~clear_flags)`.
+            self.state.fetch_and(!psflg::SIG_IN_Q, Ordering::SeqCst);
+        } else {
+            // `erts_atomic32_read_bset_nob(&state, set_flags | clear_flags, set_flags)`.
+            let _ = self
+                .state
+                .fetch_update(Ordering::SeqCst, Ordering::Relaxed, |word| {
+                    Some(word & !psflg::SIG_IN_Q | set)
+                });
+        }
     }
 
     /// Take the whole in-queue when `accept` takes every queued signal; otherwise leave it.
@@ -843,7 +873,7 @@ mod tests {
         assert_eq!(input.fetch_first_if(|_| true), Some(1));
         assert_eq!(bits(&input), psflg::NMSG_SIG_IN_Q);
         input.push(2);
-        input.take_all(&mut inner);
+        input.take_all(&mut inner, false);
         assert_eq!(bits(&input), 0);
         input.push_block(vec![3, 4]);
         assert_eq!(bits(&input), psflg::MSG_SIG_IN_Q);
@@ -862,9 +892,9 @@ mod tests {
         for i in 0..10 {
             input.push(i);
         }
-        input.take_all(&mut inner);
+        input.take_all(&mut inner, false);
         input.push(20);
-        input.take_all(&mut inner);
+        input.take_all(&mut inner, false);
         assert_eq!(
             inner.iter().copied().collect::<Vec<_>>(),
             (0..10).chain([20]).collect::<Vec<_>>()
@@ -890,11 +920,11 @@ mod tests {
                 });
             }
             while done.load(Ordering::Acquire) < 4 || input.has_pending() {
-                input.take_all(&mut inner);
+                input.take_all(&mut inner, false);
                 std::thread::yield_now();
             }
         });
-        input.take_all(&mut inner);
+        input.take_all(&mut inner, false);
         let mut expected = [0; 4];
         while let Some((sender, sequence)) = inner.pop_front() {
             assert_eq!(sequence, expected[sender]);
@@ -913,7 +943,7 @@ mod tests {
             input.push_routed(&progress, || 17, sequence).unwrap();
         }
         assert!(input.has_pending());
-        input.take_all(&mut inner);
+        input.take_all(&mut inner, false);
         assert_eq!(
             std::iter::from_fn(|| inner.pop_front()).collect::<Vec<_>>(),
             (0..128).collect::<Vec<_>>()
@@ -922,7 +952,7 @@ mod tests {
         input.push_routed(&progress, || 17, 128).unwrap();
         input.set_buffers_enabled(false);
         input.push_routed(&progress, || 17, 129).unwrap();
-        input.take_all(&mut inner);
+        input.take_all(&mut inner, false);
         assert_eq!(
             std::iter::from_fn(|| inner.pop_front()).collect::<Vec<_>>(),
             [128, 129]
@@ -961,11 +991,11 @@ mod tests {
                     1 => input.set_buffers_enabled(false),
                     _ => {}
                 }
-                input.take_all(&mut inner);
+                input.take_all(&mut inner, false);
                 std::thread::yield_now();
             }
         });
-        input.take_all(&mut inner);
+        input.take_all(&mut inner, false);
         let mut expected = [0; SENDERS];
         while let Some((sender, sequence)) = inner.pop_front() {
             assert_eq!(sequence, expected[sender]);

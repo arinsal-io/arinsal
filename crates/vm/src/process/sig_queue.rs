@@ -69,16 +69,17 @@ impl Process {
     pub(crate) fn fetch_signals(&mut self, ctx: &mut RunCtx<'_, Message>) -> Result<(), VmError> {
         let cont = !self.sig_cont_empty();
         let start = self.sig_cont().len();
-        ctx.fetch_signals(&mut self.sig_cont_mut());
+        let recv_traced = crate::trace::active()
+            && crate::trace::flags(self, ctx.pid()) & crate::trace::RECEIVE != 0;
+        // The fetch sets `ERTS_PSFLG_SIG_Q` itself when it leaves signals to handle.
+        ctx.fetch_signals(&mut self.sig_cont_mut(), recv_traced);
         if cont
             || self.sig_cont().len() == start
-            || (crate::trace::active()
-                && crate::trace::flags(self, ctx.pid()) & crate::trace::RECEIVE != 0)
+            || recv_traced
             // erts_proc_sig_fetch__ tests `nmsigs.next`: a fetched queue without non-message
             // signals goes straight onto the message queue.
             || self.sig_cont().non_messages() != 0
         {
-            ctx.set_sig_q(!self.sig_cont_empty());
             return Ok(());
         }
         // The whole batch is one splice onto the message queue in erts (LINK_MESSAGE of the

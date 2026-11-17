@@ -1573,7 +1573,7 @@ impl<M: SignalMessage> SignalProbe<M> {
     /// event taken from there is accounted with [`RunCtx::consume_fetched`].
     // Port of erts/emulator/beam/erl_proc_sig_queue.h:1997 (erts_proc_sig_fetch), OTP-29.1.1.
     pub fn fetch_all(&self, into: &mut SignalQueue<Event<M>>) {
-        self.input().take_all(into);
+        self.input().take_all(into, true);
     }
 
     /// Move the whole outer queue, through `splice`, to the end of a queue when it holds only
@@ -1745,9 +1745,6 @@ struct ProcShared<M: SignalMessage> {
     /// priority queues of the dirty run queues the process has an entry in.
     /// Port of erts/emulator/beam/erl_process.h:1390-1425, OTP-29.1.1.
     xstate: AtomicU32,
-    /// One plus the dirty thread slot executing this process, 0 when not executing dirty.
-    /// Port of erl_process.h (`ERTS_PSFLG_DIRTY_RUNNING`), OTP-29.1.1.
-    dirty_runner: AtomicUsize,
 }
 
 struct Process<T: Task> {
@@ -2245,7 +2242,6 @@ impl<T: Task> ProcessTable<T> {
                     rtimer: ReceiveTimer::default(),
                     input: Incoming::default(),
                     xstate: AtomicU32::new(0),
-                    dirty_runner: AtomicUsize::new(0),
                 },
                 cell: parking_lot::Mutex::new(TaskCell::uninit()),
             },
@@ -2752,7 +2748,7 @@ fn progress_wait<R>(wait: impl FnOnce() -> R) -> R {
 /// finalize_wait around a blocking wait, OTP-29.1.1).
 /// The receiver is not executing, so its heap stays put for the caller that holds
 /// the main lock. `RUNNING` owns the cell for the whole slice. `EXITED` is gone.
-/// A dirty job sets `dirty_runner`. `QUEUED` and `WAITING` are stable: collection
+/// A dirty job sets `ERTS_PSFLG_DIRTY_RUNNING`. `QUEUED` and `WAITING` are stable: collection
 /// fetches the outer queue before it scans (erl_gc.c:987).
 /// Port of erts/emulator/beam/erl_message.c:621 (`erts_try_alloc_message_on_heap`
 /// try-locks the main lock and rejects a volatile heap), OTP-29.1.1.
@@ -2764,7 +2760,9 @@ fn receiver_off_heap_msgq<T: Task>(process: &Process<T>) -> bool {
 
 fn receiver_heap_stable<T: Task>(process: &Process<T>) -> bool {
     let state = process.run_state().load(Ordering::Acquire);
-    state != RUNNING && state != EXITED && process.dirty_runner.load(Ordering::Acquire) == 0
+    state != RUNNING
+        && state != EXITED
+        && process.input.state().load(Ordering::Acquire) & psflg::DIRTY_RUNNING == 0
 }
 
 fn lock_cell<T: Task>(process: &Process<T>) -> parking_lot::MutexGuard<'_, TaskCell<T>> {
@@ -2879,8 +2877,6 @@ struct DirtyPool<T: Task> {
     queue: Mutex<DirtyQueue>,
     online: AtomicUsize,
     threads: Vec<DirtyThread>,
-    /// Global dirty slot of this pool's first thread.
-    first_slot: usize,
 }
 
 struct DirtyQueue {
@@ -3018,7 +3014,7 @@ impl<T: Task> DirtyPool<T> {
         }
     }
 
-    fn new(threads: usize, first_slot: usize) -> Self {
+    fn new(threads: usize) -> Self {
         Self {
             procs: run_queue::ProcQueues::new(),
             queue: Mutex::new(DirtyQueue {
@@ -3032,7 +3028,6 @@ impl<T: Task> DirtyPool<T> {
                     stats: Mutex::new(DirtyStats::new()),
                 })
                 .collect(),
-            first_slot,
         }
     }
 }
@@ -3205,10 +3200,15 @@ impl<T: Task> Inner<T> {
 
     /// Port of erts/emulator/beam/erl_process.h:1367 (`ERTS_PROC_IN_DIRTY_STATE`), OTP-29.1.1:
     /// queued on or executing on a dirty scheduler, and not running a system task or on a
-    /// normal scheduler. `dirty_runner` stands for `ERTS_PSFLG_DIRTY_RUNNING`; a dirty
-    /// scheduler's claim sets `RUNNING` too, which `dirty_runner` overrides.
-    fn in_dirty_state(process: &Process<T>, state: u32) -> bool {
-        let dirty_running = process.dirty_runner.load(Ordering::SeqCst) != 0;
+    /// normal scheduler; a dirty scheduler's claim sets `RUNNING` too, which
+    /// `ERTS_PSFLG_DIRTY_RUNNING` overrides.
+    fn in_dirty_state(process: &Process<T>) -> bool {
+        Self::in_dirty_state_word(process.input.state().load(Ordering::SeqCst))
+    }
+
+    /// `ERTS_PROC_IN_DIRTY_STATE(state)` of a state word the caller already read.
+    fn in_dirty_state_word(state: u32) -> bool {
+        let dirty_running = state & psflg::DIRTY_RUNNING != 0;
         (state & psflg::DIRTY_WORK != 0 || dirty_running)
             && state & (psflg::DIRTY_RUNNING_SYS | psflg::RUNNING_SYS) == 0
             && (state & psflg::RUNNING == 0 || dirty_running)
@@ -3216,8 +3216,8 @@ impl<T: Task> Inner<T> {
 
     /// Port of erts/emulator/beam/erl_process.h:1378 (`ERTS_PROC_NEED_DIRTY_SIG_HANDLING`),
     /// OTP-29.1.1: unhandled signals and a dirty state.
-    fn need_dirty_sig_handling(process: &Process<T>, state: u32) -> bool {
-        state & (psflg::SIG_Q | psflg::SIG_IN_Q) != 0 && Self::in_dirty_state(process, state)
+    fn need_dirty_sig_handling(state: u32) -> bool {
+        state & (psflg::SIG_Q | psflg::SIG_IN_Q) != 0 && Self::in_dirty_state_word(state)
     }
 
     /// Ask a dirty signal handler to handle the signals of `process`, which is in a dirty
@@ -4325,7 +4325,7 @@ impl<T: Task> Inner<T> {
         // (maybe_elevate_sig_handling_prio), OTP-29.1.1: a dirty target cannot run at the
         // elevated priority, so its matching dirty signal handler is notified.
         let state = process.input.state().load(Ordering::SeqCst);
-        if Self::need_dirty_sig_handling(&process, state) {
+        if Self::need_dirty_sig_handling(state) {
             self.notify_dirty_signal_handler(&process, Some(priority));
         }
         if priority.index() < before.index() {
@@ -4489,8 +4489,10 @@ impl<T: Task> Inner<T> {
         // OTP-29.1.1: read the state and schedule only a process that is not active. The
         // SeqCst load orders after the SeqCst enqueue (see the wake protocol above).
         let prio = process.priority().index();
+        // erts tests the state word the enqueue returned (erts_proc_notify_new_sig), not a
+        // fresh read; it reads only when no state was returned.
         let state = state.unwrap_or_else(|| process.input.state().load(Ordering::SeqCst));
-        let need_dirty = Self::need_dirty_sig_handling(process, state);
+        let need_dirty = Self::need_dirty_sig_handling(state);
         let kind = process.run_state().wake(Some(state), prio);
         // Port of erts/emulator/beam/erl_proc_sig_queue.h:2086 (erts_proc_notify_new_message):
         // the handler is notified from the state read before scheduling.
@@ -5933,9 +5935,12 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     /// `into` is accounted with [`Self::consume_fetched`].
     // Port of erts/emulator/beam/erl_proc_sig_queue.h:1997 (erts_proc_sig_fetch: the outer
     // queue is appended to the inner one), OTP-29.1.1.
-    pub fn fetch_signals(&mut self, into: &mut SignalQueue<Event<M>>) {
+    ///
+    /// `recv_traced`: receive tracing is on, so fetched messages stay in `into` as well
+    /// (`ERTS_MSG_RECV_TRACED` in erts_proc_sig_fetch__).
+    pub fn fetch_signals(&mut self, into: &mut SignalQueue<Event<M>>, recv_traced: bool) {
         self.inner.flush();
-        self.proc.input.take_all(into);
+        self.proc.input.take_all(into, recv_traced);
     }
     /// Record whether this process's middle signal queue holds unhandled signals
     /// (`ERTS_PSFLG_SIG_Q`).
@@ -6310,9 +6315,9 @@ impl<T: Task> Runner<'_, T> {
             wall_enabled: false,
             gc_accounted_total: 0,
             sys_task_run: false,
-            dirty_running: process.dirty_runner.load(Ordering::SeqCst) != 0,
+            dirty_running: process.input.state().load(Ordering::SeqCst) & psflg::DIRTY_RUNNING != 0,
             dirty_queued: process.input.state().load(Ordering::SeqCst) & psflg::DIRTY_WORK != 0
-                && process.dirty_runner.load(Ordering::SeqCst) == 0,
+                && process.input.state().load(Ordering::SeqCst) & psflg::DIRTY_RUNNING == 0,
         };
         handle(task, &mut ctx)
     }
@@ -6361,8 +6366,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         let state = |process: &Process<T>| {
             if process.run_state().load(Ordering::SeqCst) == EXITED {
                 Some(DirtySignals::NoProc)
-            } else if !Inner::in_dirty_state(process, process.input.state().load(Ordering::SeqCst))
-            {
+            } else if !Inner::in_dirty_state(process) {
                 Some(DirtySignals::Normal)
             } else {
                 None
@@ -6405,7 +6409,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         // A dirty job runs without the main lock, so its process can be locked here too.
         let check = |process: &Process<T>| match process.run_state().load(Ordering::SeqCst) {
             EXITED => Err(SignalFreeError::NoProcess),
-            RUNNING if process.dirty_runner.load(Ordering::SeqCst) == 0 => {
+            RUNNING if process.input.state().load(Ordering::SeqCst) & psflg::DIRTY_RUNNING == 0 => {
                 Err(SignalFreeError::Busy)
             }
             _ => Ok(()),
@@ -6993,10 +6997,7 @@ impl<T: Task> Scheduler<T> {
             fanin_delivered: AtomicU64::new(0),
             progress_domain: Progress(Arc::clone(&progress)),
             progress,
-            dirty: [
-                DirtyPool::new(dirty_cpu, 0),
-                DirtyPool::new(dirty_io, dirty_cpu),
-            ],
+            dirty: [DirtyPool::new(dirty_cpu), DirtyPool::new(dirty_io)],
             msb_exec: Mutex::new(MsbExec {
                 current: SchedulerType::Normal,
                 last_dirty: SchedulerType::DirtyIo,
@@ -7530,10 +7531,9 @@ impl<T: Task> Scheduler<T> {
     /// Port of erts/emulator/beam/erl_process.c:9216
     /// (`erts_internal_is_process_executing_dirty_1`), OTP-29.1.1.
     pub fn is_executing_dirty(&self, pid: Pid) -> bool {
-        self.inner
-            .table
-            .lookup(pid)
-            .is_some_and(|process| process.dirty_runner.load(Ordering::Acquire) != 0)
+        self.inner.table.lookup(pid).is_some_and(|process| {
+            process.input.state().load(Ordering::Acquire) & psflg::DIRTY_RUNNING != 0
+        })
     }
     /// Number of dirty CPU and dirty I/O scheduler threads.
     pub fn dirty_scheduler_counts(&self) -> (usize, usize) {
@@ -7703,7 +7703,7 @@ impl<T: Task> Scheduler<T> {
     ///
     /// The task-cell mutex is the process main lock: `run_slice` sets `RUNNING`
     /// and then holds the cell for the whole slice, and a dirty job does the
-    /// same after setting `dirty_runner`. `std::sync::Mutex` is not reentrant,
+    /// same after setting `ERTS_PSFLG_DIRTY_RUNNING`. `std::sync::Mutex` is not reentrant,
     /// so a process that sends to itself fails the try-lock.
     ///
     /// Port of erts/emulator/beam/erl_message.c:661 (`erts_proc_trylock`) and
@@ -8342,7 +8342,7 @@ mod dirty_state_tests {
 
     #[test]
     fn dirty_wake_takes_the_most_recent_eligible_sleeper() {
-        let pool = DirtyPool::<Idle>::new(4, 0);
+        let pool = DirtyPool::<Idle>::new(4);
         pool.online.store(3, Ordering::Release);
         let mut queue = pool.queue.lock().unwrap();
         queue.sleepers.extend([0, 1, 2, 3]);
@@ -8394,7 +8394,10 @@ mod dirty_state_tests {
 
         assert!(!scheduler.is_executing_dirty(pid));
 
-        process.dirty_runner.store(1, Ordering::Release);
+        process
+            .input
+            .state()
+            .fetch_or(psflg::DIRTY_RUNNING, Ordering::Release);
         assert!(scheduler.is_executing_dirty(pid));
     }
 
@@ -8534,9 +8537,15 @@ mod dirty_state_tests {
         target.run_state().store(RUNNING, Ordering::Release);
         assert!(scheduler.try_with_task(to, |_| ()).is_none());
         target.run_state().store(WAITING, Ordering::Release);
-        target.dirty_runner.store(1, Ordering::Release);
+        target
+            .input
+            .state()
+            .fetch_or(psflg::DIRTY_RUNNING, Ordering::Release);
         assert!(scheduler.try_with_task(to, |_| ()).is_none());
-        target.dirty_runner.store(0, Ordering::Release);
+        target
+            .input
+            .state()
+            .fetch_and(!psflg::DIRTY_RUNNING, Ordering::Release);
         // erts_alloc_message_heap_state: an off-heap queue is reported before any lock attempt.
         proc_flags::set_state(&target.exit_flags, proc_flags::OFF_HEAP_MSGQ);
         assert_eq!(
@@ -8968,7 +8977,8 @@ fn schedule_out<T: Task>(
         // Port of erts/emulator/beam/erl_nif.c:462 (erts_call_dirty_nif) and bif.c:5789
         // (erts_call_dirty_bif), OTP-29.1.1: the dirty work is done, so the process has no
         // dirty run queue to go back to. erts clears the bits when the call starts; while the
-        // job runs `dirty_runner` keeps the process in its dirty state, so nothing can tell.
+        // job runs `ERTS_PSFLG_DIRTY_RUNNING` keeps the process in its dirty state, so nothing
+        // can tell.
         process.input.state().fetch_and(
             !(psflg::DIRTY_WORK | psflg::DIRTY_RUNNING_SYS),
             Ordering::AcqRel,
@@ -8996,7 +9006,7 @@ fn schedule_out<T: Task>(
             // Port of erts/emulator/beam/erl_process.c:9763 (ensure signals are handled while
             // scheduled dirty), OTP-29.1.1.
             let state = process.input.state().load(Ordering::Acquire);
-            if Inner::need_dirty_sig_handling(&process, state) {
+            if Inner::<T>::need_dirty_sig_handling(state) {
                 inner.notify_dirty_signal_handler(&process, Some(process.priority()));
             }
         }
@@ -10720,7 +10730,6 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
     arinsal_term::initialize_scheduler_random(std::ptr::from_ref(&scheduler_data).cast());
     let pool = &inner.dirty[kind.index()];
     let thread = &pool.threads[index];
-    let slot = pool.first_slot + index;
     let spin_count = scheduler_spin_count(
         &inner.config.busy_wait_thresholds,
         match kind {
@@ -10788,9 +10797,15 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
         };
         thread.stats.lock().unwrap().begin_active();
         let process = item.process.clone();
-        process.dirty_runner.store(slot + 1, Ordering::SeqCst);
+        process
+            .input
+            .state()
+            .fetch_or(psflg::DIRTY_RUNNING, Ordering::SeqCst);
         run_slice(&inner, item, &mut scheduler_data, None, Some(kind));
-        process.dirty_runner.store(0, Ordering::SeqCst);
+        process
+            .input
+            .state()
+            .fetch_and(!psflg::DIRTY_RUNNING, Ordering::SeqCst);
         {
             let mut stats = thread.stats.lock().unwrap();
             stats.end_active();
