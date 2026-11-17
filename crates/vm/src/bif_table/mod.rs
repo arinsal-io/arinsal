@@ -113,6 +113,11 @@ pub(crate) fn call_from_executor(
     let export = crate::beamasm_integration::bif_mfa_export(module, function, arity8)?;
     process.heap.abi.current = std::ptr::from_ref(export.mfa()).cast();
     let reg_ptr = reg.as_mut_ptr().cast::<u64>();
+    // The call fragment keeps `I` in TMP_MEM1q for the BIF (call_light_bif_shared); the executor
+    // stores its call site there, or the BIF would read the previous call's `I`.
+    if let Some(registers) = crate::native_hooks::registers_at(reg_ptr.cast()) {
+        registers.tmp_mem[6] = process.native_call_pc as u64;
+    }
     let c_p = std::ptr::from_mut(process).cast::<ProcessHeader>();
     let raw = func(c_p, reg_ptr, 0);
     if raw != arinsal_term::THE_NON_VALUE {
