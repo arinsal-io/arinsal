@@ -21,13 +21,17 @@ pub(crate) struct HibernateCont {
 // Port of erts/emulator/beam/erl_process.c:10415-10418 and 9558 (`scheduler_gc_proc`),
 // OTP-29.1.1.
 #[inline]
-pub(super) fn collect_on_schedule_in(process: &mut Process) -> Result<(), VmError> {
+pub(super) fn collect_on_schedule_in(process: &mut Process) -> Result<bool, VmError> {
     // ERTS_IS_GC_DESIRED is tested before anything about the saved registers is computed.
     if !process.heap.gc_after_bif_desired() {
-        return Ok(());
+        return Ok(false);
     }
     let live = switched_out_live(process);
-    process.collect_bin_vheap_if_due(live)
+    process.collect_bin_vheap_if_due(live)?;
+    // `calls += cost; reds -= cost; if (reds <= 0) goto sched_out_proc;` and
+    // `if (p->flags & (F_DIRTY_MAJOR_GC|F_DIRTY_MINOR_GC)) goto sched_out_proc;`: a delayed
+    // collection leaves at once, before the process runs an instruction on this scheduler.
+    Ok(process.heap.abi.fcalls <= 0 || process.slice().is_some_and(|work| work.dirty_sys_gc))
 }
 
 // g_proc_sched

@@ -343,11 +343,13 @@ impl Executor {
                         }
 
                         if let Some(code_ptr) = process.native_pc() {
-                            crate::beamasm_integration::count_native_call();
                             if schedule_in_gc {
                                 schedule_in_gc = false;
-                                collect_on_schedule_in(process)?;
+                                if collect_on_schedule_in(process)? {
+                                    break Ok(RunState::Yield);
+                                }
                             }
+                            crate::beamasm_integration::count_native_call();
                             process.set_native_pc(None);
 
                             let trace_boot = trace_boot_enabled();
@@ -472,15 +474,22 @@ impl Executor {
                                 Err(error) => return Err(error),
                             }
                         }
+                        let mut sched_out = false;
                         let result = process.drain(ctx).and_then(|()| {
                             if schedule_in_gc {
                                 schedule_in_gc = false;
-                                collect_on_schedule_in(process)?;
+                                if collect_on_schedule_in(process)? {
+                                    sched_out = true;
+                                    return Ok(RunState::Yield);
+                                }
                             }
                             // Only a BIF run for a native exit keeps a redzone.
                             process.heap.clear_native_redzone();
                             self.vm.enter_native_position(process)
                         });
+                        if sched_out {
+                            break Ok(RunState::Yield);
+                        }
                         // erts schedules out only when FCALLS runs out; entering the native code
                         // of the process's position continues the slice.
                         if matches!(&result, Ok(RunState::Yield))

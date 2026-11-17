@@ -193,13 +193,15 @@ impl Executor {
             if !first && !std::mem::take(&mut reenter) && !Self::fast_entry_ok(process, ctx) {
                 return None;
             }
-            crate::beamasm_integration::count_native_call();
             if first {
                 first = false;
-                if let Err(error) = collect_on_schedule_in(process) {
-                    return Some(Err(error));
+                match collect_on_schedule_in(process) {
+                    Ok(false) => {}
+                    Ok(true) => return Some(Ok(RunState::Yield)),
+                    Err(error) => return Some(Err(error)),
                 }
             }
+            crate::beamasm_integration::count_native_call();
             *ran = true;
             process.native_transfer = false;
             process.set_native_pc(None);
