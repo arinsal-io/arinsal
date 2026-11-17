@@ -1097,6 +1097,12 @@ fn system_info(
     ctx: Option<&RunCtx<'_, Message>>,
     selector: Term,
 ) -> Option<Result<Term, VmError>> {
+    // The executor path of a traced system_info/1 runs the same BIF body as the table entry
+    // (erts calls one C function for traced and untraced calls).
+    // Port of erts/emulator/beam/erl_bif_info.c (system_info_1), OTP-29.1.1.
+    if let Some(item) = crate::natives::erl_bif_info::system_info_body_item(process, selector) {
+        return Some(item);
+    }
     let owned_selector = arinsal_term::to_owned(selector).ok();
     if let Some(arinsal_etf::OwnedTerm::Tuple(parts)) = owned_selector.as_ref()
         && let [
