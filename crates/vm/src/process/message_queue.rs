@@ -54,9 +54,9 @@ fn queued_mut(event: &mut Event<Message>) -> &mut Message {
 struct QueuedMessage(MessageNode);
 
 impl QueuedMessage {
-    fn node(term: Term, fragment: Option<MessageFragmentBox>, seq_nil: bool) -> MessageNode {
+    fn node(term: Term, data: Option<MessageData>, seq_nil: bool) -> MessageNode {
         let mut message = Message::immediate(term);
-        message.fragment = fragment;
+        message.data = data;
         message.seq_nil = seq_nil;
         arinsal_sched::OwnedSignal::new(Event {
             from: Pid::from_data(0),
@@ -79,7 +79,7 @@ impl QueuedMessage {
     /// The node released into the receiver's heap: its inline data becomes a fragment of the
     /// process (`erts_save_message_in_proc`); any other data was adopted already.
     fn save_in_process(mut self, heap: &mut ProcessHeap) {
-        if let Some(heap_frag) = queued_mut(&mut self.0).heap_frag.take() {
+        if let Some(heap_frag) = queued_mut(&mut self.0).take_heap_frag() {
             heap.adopt_message_node(heap_frag);
         }
         if queued(&self.0).combined
@@ -177,11 +177,11 @@ impl MessageQueue {
     pub(crate) fn push_back_token(&mut self, term: Term, token: Box<crate::seq_trace::Token>) {
         self.entries.push_back(QueuedMessage::node(
             term,
-            Some(system_fragment(MessageFragment {
+            Some(MessageData::attached(system_fragment(MessageFragment {
                 heap: None,
                 seq_token: Some(token),
                 timer_id: None,
-            })),
+            }))),
             false,
         ));
     }
@@ -224,7 +224,7 @@ impl MessageQueue {
             !message.combined,
             "a message with inline data stays in its node"
         );
-        let node = QueuedMessage::node(message.term, message.fragment, message.seq_nil);
+        let node = QueuedMessage::node(message.term, message.data, message.seq_nil);
         self.push_message_node(node);
         Ok(())
     }
@@ -239,8 +239,8 @@ impl MessageQueue {
     pub(crate) fn is_on_heap_at_save(&self) -> bool {
         self.entries.peek().map(queued).is_some_and(|entry| {
             !entry.combined
-                && entry.heap_frag.is_none()
-                && entry.fragment.as_ref().is_none_or(|f| f.heap.is_none())
+                && !entry.has_heap_frag()
+                && entry.fragment().is_none_or(|f| f.heap.is_none())
         })
     }
 
@@ -258,13 +258,9 @@ impl MessageQueue {
         self.with_inline_words()
             .map(|(entry, inline)| {
                 inline.map_or(0, <[u64]>::len)
+                    + entry.heap_frag_words().map_or(0, <[u64]>::len)
                     + entry
-                        .heap_frag
-                        .as_ref()
-                        .map_or(0, arinsal_term::message::NodeFragment::len)
-                    + entry
-                        .fragment
-                        .as_ref()
+                        .fragment()
                         .and_then(|fragment| fragment.heap.as_ref())
                         .map_or(0, arinsal_term::message::MessageHeap::message_data_size)
             })
@@ -301,15 +297,13 @@ impl MessageQueue {
         };
         if (entry.seq_nil && receiver_has_token)
             || entry
-                .fragment
-                .as_ref()
+                .fragment()
                 .is_some_and(|fragment| fragment.seq_token.is_some())
         {
             return Ok(false);
         }
         if let Some(heap_fragment) = entry
-            .fragment
-            .as_mut()
+            .fragment_mut()
             .and_then(|fragment| fragment.heap.take())
         {
             heap.adopt_message_heap(heap_fragment).map_err(|error| {
@@ -334,7 +328,7 @@ impl MessageQueue {
             if entry.seq_nil {
                 state = crate::seq_trace::SeqState::Nil;
             }
-            if let Some(fragment) = entry.fragment.as_mut() {
+            if let Some(fragment) = entry.fragment_mut() {
                 if let Some(token) = fragment.seq_token.take() {
                     state = crate::seq_trace::SeqState::Token(token);
                 }
@@ -366,8 +360,7 @@ impl MessageQueue {
             let &(_, entry) = entries.peek().expect("root index");
             roots.push(if slot.token {
                 entry
-                    .fragment
-                    .as_ref()
+                    .fragment()
                     .unwrap()
                     .seq_token
                     .as_ref()
@@ -385,10 +378,9 @@ impl MessageQueue {
         let mut slots = Vec::new();
         for (index, entry) in self.entries.iter().map(queued).enumerate() {
             let on_heap = !entry.combined
-                && entry.heap_frag.is_none()
+                && !entry.has_heap_frag()
                 && entry
-                    .fragment
-                    .as_ref()
+                    .fragment()
                     .is_none_or(|fragment| fragment.heap.is_none());
             if !on_heap {
                 continue;
@@ -400,8 +392,7 @@ impl MessageQueue {
                 });
             }
             if let Some(token) = entry
-                .fragment
-                .as_ref()
+                .fragment()
                 .and_then(|fragment| fragment.seq_token.as_ref())
                 && token.root().is_pointer()
             {
@@ -424,8 +415,7 @@ impl MessageQueue {
             let entry = queued_mut(event);
             if slot.token {
                 if let Some(token) = entry
-                    .fragment
-                    .as_mut()
+                    .fragment_mut()
                     .and_then(|fragment| fragment.seq_token.as_mut())
                 {
                     *token.heap_ref_mut() = term;
@@ -442,14 +432,11 @@ impl MessageQueue {
             || inline.is_some_and(|words| {
                 arinsal_term::message::words_have_heap_reference(words, |term| area.contains(term))
             })
-            || entry.heap_frag.as_ref().is_some_and(|heap| {
-                arinsal_term::message::words_have_heap_reference(heap.words(), |term| {
-                    area.contains(term)
-                })
+            || entry.heap_frag_words().is_some_and(|words| {
+                arinsal_term::message::words_have_heap_reference(words, |term| area.contains(term))
             })
             || entry
-                .fragment
-                .as_ref()
+                .fragment()
                 .and_then(|fragment| fragment.heap.as_ref())
                 .is_some_and(|heap| heap.has_heap_reference(|term| area.contains(term)))
     }
@@ -466,13 +453,9 @@ impl MessageQueue {
         self.with_inline_words()
             .map(|(entry, inline)| {
                 1 + inline.map_or(0, <[u64]>::len)
+                    + entry.heap_frag_words().map_or(0, <[u64]>::len)
                     + entry
-                        .heap_frag
-                        .as_ref()
-                        .map_or(0, arinsal_term::message::NodeFragment::len)
-                    + entry
-                        .fragment
-                        .as_ref()
+                        .fragment()
                         .and_then(|fragment| fragment.heap.as_ref())
                         .map_or(0, arinsal_term::message::MessageHeap::literal_scan_words)
             })
@@ -505,8 +488,8 @@ impl MessageQueue {
                 Ok(updated) => {
                     let entry = queued_mut(&mut node);
                     entry.term = updated;
-                    entry.heap_frag = None;
-                    if let Some(fragment) = entry.fragment.as_mut() {
+                    drop(entry.take_heap_frag());
+                    if let Some(fragment) = entry.fragment_mut() {
                         fragment.heap = None;
                     }
                     copied += 1;
@@ -544,10 +527,9 @@ impl Message {
     /// the node's inline fragment or a heap fragment of its own.
     fn data_attached(&self) -> bool {
         self.combined
-            || self.heap_frag.is_some()
+            || self.has_heap_frag()
             || self
-                .fragment
-                .as_ref()
+                .fragment()
                 .is_some_and(|fragment| fragment.heap.is_some())
     }
 }
@@ -562,13 +544,9 @@ impl arinsal_term::GcMessageQueue for MessageQueue {
                 let message = queued(event);
                 // erl_gc.c (young_gen_usage): a combined message stays in its node.
                 let _ = inline;
-                message
-                    .heap_frag
-                    .as_ref()
-                    .map_or(0, arinsal_term::message::NodeFragment::len)
+                message.heap_frag_words().map_or(0, <[u64]>::len)
                     + message
-                        .fragment
-                        .as_ref()
+                        .fragment()
                         .and_then(|fragment| fragment.heap.as_ref())
                         .map_or(0, arinsal_term::message::MessageHeap::message_data_size)
             })
@@ -585,8 +563,7 @@ impl arinsal_term::GcMessageQueue for MessageQueue {
                 visit(&mut message.term);
             }
             if let Some(token) = message
-                .fragment
-                .as_mut()
+                .fragment_mut()
                 .and_then(|fragment| fragment.seq_token.as_mut())
                 && token.root().is_pointer()
             {
@@ -607,18 +584,18 @@ impl arinsal_term::GcMessageQueue for MessageQueue {
             }
             let message = queued_mut(&mut node);
             let token = message
-                .fragment
-                .as_ref()
+                .fragment()
                 .and_then(|fragment| fragment.seq_token.as_ref())
                 .map_or(Term::NIL, |token| token.root());
             let mut refs = [message.term, token];
-            let moved = if let Some(heap_frag) = message.heap_frag.as_mut() {
+            let moved = if let Some(heap_frag) =
+                message.data.as_mut().and_then(MessageData::heap_frag_mut)
+            {
                 // erts_copy_one_frag; the buffer is freed below (free_message_buffer).
-                heap.move_node_fragment(heap_frag.fragment_mut(), &mut refs)
+                heap.move_node_fragment(heap_frag, &mut refs)
             } else {
                 let data = message
-                    .fragment
-                    .as_mut()
+                    .fragment_mut()
                     .and_then(|fragment| fragment.heap.take())
                     .expect("attached message heap");
                 heap.move_message_heap(data, &mut refs)
@@ -629,15 +606,17 @@ impl arinsal_term::GcMessageQueue for MessageQueue {
             }
             let message = queued_mut(&mut node);
             message.term = refs[0];
-            message.heap_frag = None;
-            if let Some(fragment) = message.fragment.as_mut() {
+            drop(message.take_heap_frag());
+            let mut clear = false;
+            if let Some(fragment) = message.fragment_mut() {
                 if let Some(token) = fragment.seq_token.as_mut() {
                     *token.heap_ref_mut() = refs[1];
                 }
                 // mp->data.heap_frag = NULL
-                if fragment.seq_token.is_none() && fragment.timer_id.is_none() {
-                    message.fragment = None;
-                }
+                clear = fragment.seq_token.is_none() && fragment.timer_id.is_none();
+            }
+            if clear {
+                message.data = None;
             }
             node
         });

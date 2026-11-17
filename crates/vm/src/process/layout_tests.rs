@@ -50,7 +50,7 @@ fn on_heap_message_is_a_gc_root_in_the_process_heap() {
     assert_eq!(process.inbox.entries.len(), 1);
     assert!(
         super::queued(process.inbox.entries.peek().unwrap())
-            .fragment
+            .data
             .is_none()
     );
     process

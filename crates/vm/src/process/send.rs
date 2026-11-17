@@ -67,13 +67,12 @@ fn message_on_receiver_heap(
     }
     let mut envelope = Message {
         term,
-        fragment: None,
+        data: None,
         priority: false,
         receive_traced: false,
         seq_nil: false,
         alias: 0,
         combined: false,
-        heap_frag: None,
     };
     if priority {
         envelope = envelope.with_priority();

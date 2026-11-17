@@ -492,6 +492,35 @@ impl<T, const TYPE: u8> FixOrBox<T, TYPE> {
     fn pointer(&self) -> *mut T {
         (self.tagged.as_ptr() as usize & !1) as *mut T
     }
+
+    /// Give up ownership as the tagged word (bit 0: fixed-size block); bit 1 is always clear.
+    #[inline(always)]
+    pub fn into_raw(self) -> std::ptr::NonNull<T> {
+        let tagged = self.tagged;
+        std::mem::forget(self);
+        tagged
+    }
+
+    /// Take back ownership of a word from [`Self::into_raw`].
+    ///
+    /// # Safety
+    ///
+    /// `tagged` came from [`Self::into_raw`] of this type and has no other owner.
+    #[inline(always)]
+    pub unsafe fn from_raw(tagged: std::ptr::NonNull<T>) -> Self {
+        Self { tagged }
+    }
+
+    /// Borrow the value of a word from [`Self::into_raw`] that is still owned elsewhere.
+    ///
+    /// # Safety
+    ///
+    /// `tagged` came from [`Self::into_raw`] of this type and stays owned while the borrow lives.
+    #[inline(always)]
+    pub unsafe fn raw_value<'a>(tagged: std::ptr::NonNull<T>) -> &'a mut T {
+        // SAFETY: per the contract the value is live and owned by the caller's handle.
+        unsafe { &mut *((tagged.as_ptr() as usize & !1) as *mut T) }
+    }
 }
 
 #[allow(unsafe_code)]

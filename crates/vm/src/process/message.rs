@@ -4,7 +4,10 @@ use super::*;
 /// destination process heap.
 pub struct Message {
     pub(super) term: Term,
-    pub(super) fragment: Option<MessageFragmentBox>,
+    /// `data` (erl_message.h `ErtsMessageData`): the attached signal data, or the message's
+    /// own heap fragment (`data.heap_frag`) after a send to an on-heap receiver whose main
+    /// lock or heap was not available (`in_message_fragment`).
+    pub(super) data: Option<MessageData>,
     /// When set, the receiver inserts this into the priority section of its
     /// private message queue (OTP 28+ priority messages).
     pub(super) priority: bool,
@@ -17,10 +20,10 @@ pub struct Message {
     /// The data is in the heap fragment inline in this message's own node
     /// (`data.attached == ERTS_MSG_COMBINED_HFRAG`).
     pub(super) combined: bool,
-    /// The data is in a heap fragment of its own (`data.heap_frag`): a send to an on-heap
-    /// receiver whose main lock or heap was not available (`in_message_fragment`).
-    pub(super) heap_frag: Option<arinsal_term::message::NodeFragment>,
 }
+
+/// The one word of [`Message::data`].
+pub(super) type MessageData = arinsal_term::message::MessageData<MessageFragment, 22>;
 
 /// What the sender knows about a message beyond its term: the sequential trace token state
 /// and the alias it was sent through.
@@ -58,6 +61,43 @@ fn timer_fragment(fragment: MessageFragment, alloc_ix: Option<usize>) -> Message
 pub(super) type RemovedMessage = (Term, crate::seq_trace::SeqState);
 
 impl Message {
+    /// The attached signal data (`fragment`), unless `data` is a heap fragment.
+    pub(super) fn fragment(&self) -> Option<&MessageFragment> {
+        self.data.as_ref().and_then(MessageData::as_attached)
+    }
+
+    /// [`Message::fragment`], mutably.
+    pub(super) fn fragment_mut(&mut self) -> Option<&mut MessageFragment> {
+        self.data.as_mut().and_then(MessageData::as_attached_mut)
+    }
+
+    /// Attach signal data, replacing what `data` held.
+    pub(super) fn set_fragment(&mut self, fragment: MessageFragmentBox) {
+        debug_assert!(!self.has_heap_frag(), "data.heap_frag is never replaced");
+        self.data = Some(MessageData::attached(fragment));
+    }
+
+    /// The used words of `data.heap_frag`.
+    pub(super) fn heap_frag_words(&self) -> Option<&[u64]> {
+        self.data.as_ref().and_then(MessageData::heap_frag_words)
+    }
+
+    /// Whether `data` is a heap fragment (`data.heap_frag`).
+    pub(super) fn has_heap_frag(&self) -> bool {
+        self.heap_frag_words().is_some()
+    }
+
+    /// Take `data.heap_frag` out, leaving `data` empty.
+    pub(super) fn take_heap_frag(&mut self) -> Option<arinsal_term::message::NodeFragment> {
+        match self.data.take()?.into_heap_frag() {
+            Ok(fragment) => Some(fragment),
+            Err(data) => {
+                self.data = Some(data);
+                None
+            }
+        }
+    }
+
     /// Mark a message as having arrived through a process alias.
     pub(crate) fn with_alias(mut self, alias: u64) -> Self {
         self.alias = alias;
@@ -69,10 +109,9 @@ impl Message {
     fn is_heap_root(&self) -> bool {
         self.term.is_pointer()
             && !self.combined
-            && self.heap_frag.is_none()
+            && !self.has_heap_frag()
             && self
-                .fragment
-                .as_ref()
+                .fragment()
                 .is_none_or(|fragment| fragment.heap.is_none())
     }
 
@@ -81,8 +120,9 @@ impl Message {
     pub(super) fn append_heap_roots_mut<'a>(&'a mut self, roots: &mut arinsal_term::GcRootSet<'a>) {
         let heap_root = self.is_heap_root();
         let token_root = self
-            .fragment
+            .data
             .as_mut()
+            .and_then(MessageData::as_attached_mut)
             .filter(|fragment| fragment.heap.is_none())
             .and_then(|fragment| fragment.seq_token.as_mut())
             .filter(|token| token.root().is_pointer())
@@ -126,7 +166,7 @@ impl Message {
     ) -> Result<Self, VmError> {
         if !term.is_pointer() {
             let mut message = Self::immediate(term);
-            message.fragment = Some(timer_fragment(
+            message.set_fragment(timer_fragment(
                 MessageFragment {
                     heap: None,
                     seq_token: None,
@@ -159,7 +199,7 @@ impl Message {
         if words + token_words == 0 {
             let mut message = Self::immediate(term);
             if let Some((timer_id, alloc_ix)) = timer_id {
-                message.fragment = Some(timer_fragment(
+                message.set_fragment(timer_fragment(
                     MessageFragment {
                         heap: None,
                         seq_token: None,
@@ -187,28 +227,29 @@ impl Message {
         }
         Ok(Self {
             term,
-            fragment: Some(if let Some((timer_id, alloc_ix)) = timer_id {
-                timer_fragment(
-                    MessageFragment {
+            data: Some(MessageData::attached(
+                if let Some((timer_id, alloc_ix)) = timer_id {
+                    timer_fragment(
+                        MessageFragment {
+                            heap: Some(arinsal_term::message::MessageHeap::Heap(fragment)),
+                            seq_token: None,
+                            timer_id: Some(timer_id),
+                        },
+                        alloc_ix,
+                    )
+                } else {
+                    system_fragment(MessageFragment {
                         heap: Some(arinsal_term::message::MessageHeap::Heap(fragment)),
                         seq_token: None,
-                        timer_id: Some(timer_id),
-                    },
-                    alloc_ix,
-                )
-            } else {
-                system_fragment(MessageFragment {
-                    heap: Some(arinsal_term::message::MessageHeap::Heap(fragment)),
-                    seq_token: None,
-                    timer_id: None,
-                })
-            }),
+                        timer_id: None,
+                    })
+                },
+            )),
             priority: false,
             receive_traced: false,
             seq_nil: false,
             alias: 0,
             combined: false,
-            heap_frag: None,
         })
     }
 
@@ -266,7 +307,7 @@ impl Message {
             let mut heap_frag = arinsal_term::message::NodeFragment::new_message_buffer(words);
             message.term = copy_struct_litopt(term, &mut heap_frag.fragment_mut(), words, literals)
                 .map_err(|error| VmError::Unsupported(format!("message copy: {error:?}")))?;
-            message.heap_frag = Some(heap_frag);
+            message.data = Some(MessageData::heap_frag(heap_frag));
         }
         Ok(arinsal_sched::OwnedSignal::new(Event {
             from,
@@ -303,13 +344,12 @@ impl Message {
     pub(super) fn immediate(term: Term) -> Self {
         Self {
             term,
-            fragment: None,
+            data: None,
             priority: false,
             receive_traced: false,
             seq_nil: false,
             alias: 0,
             combined: false,
-            heap_frag: None,
         }
     }
 
@@ -341,26 +381,27 @@ impl Message {
             .map_err(|error| VmError::Unsupported(format!("literal-copy request: {error:?}")))?;
         Ok(Self {
             term: request,
-            fragment: Some(system_fragment(MessageFragment {
+            data: Some(MessageData::attached(system_fragment(MessageFragment {
                 heap: Some(arinsal_term::message::MessageHeap::Heap(heap)),
                 seq_token: None,
                 timer_id: None,
-            })),
+            }))),
             priority: false,
             receive_traced: false,
             seq_nil: false,
             alias: 0,
             combined: false,
-            heap_frag: None,
         })
     }
 
     /// Append the collector reply to its original request fragment.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:8083 (`send_cla_reply`), OTP-29.1.1.
     pub(crate) fn literal_copy_reply(mut self, result: Term) -> Result<Self, VmError> {
+        let term = self.term;
         let Some(arinsal_term::message::MessageHeap::Heap(heap)) = self
-            .fragment
+            .data
             .as_mut()
+            .and_then(MessageData::as_attached_mut)
             .and_then(|fragment| fragment.heap.as_mut())
         else {
             return Err(VmError::Unsupported(
@@ -368,11 +409,7 @@ impl Message {
             ));
         };
         self.term = TermBuilder::new(heap)
-            .tuple(&[
-                Term::atom(arinsal_term::atoms::COPY_LITERALS),
-                self.term,
-                result,
-            ])
+            .tuple(&[Term::atom(arinsal_term::atoms::COPY_LITERALS), term, result])
             .map_err(|error| VmError::Unsupported(format!("literal-copy reply: {error:?}")))?;
         Ok(self)
     }
@@ -390,9 +427,7 @@ impl Message {
 
     /// The VM timer id this message carries, if it was sent by a timer.
     pub(super) fn timer_id(&self) -> Option<u64> {
-        self.fragment
-            .as_ref()
-            .and_then(|fragment| fragment.timer_id)
+        self.fragment().and_then(|fragment| fragment.timer_id)
     }
 
     pub(crate) fn is_priority(&self) -> bool {
@@ -407,8 +442,7 @@ impl Message {
 
     /// The seq_trace token the sender attached, if any.
     pub(crate) fn take_seq_token(&mut self) -> Option<Box<crate::seq_trace::Token>> {
-        self.fragment
-            .as_mut()
+        self.fragment_mut()
             .and_then(|fragment| fragment.seq_token.take())
     }
 
@@ -422,10 +456,10 @@ impl Message {
     }
 
     pub(crate) fn attach_seq_token(&mut self, token: Box<crate::seq_trace::Token>) {
-        if let Some(fragment) = self.fragment.as_mut() {
+        if let Some(fragment) = self.fragment_mut() {
             fragment.seq_token = Some(token);
         } else {
-            self.fragment = Some(system_fragment(MessageFragment {
+            self.set_fragment(system_fragment(MessageFragment {
                 heap: None,
                 seq_token: Some(token),
                 timer_id: None,
@@ -433,17 +467,17 @@ impl Message {
         }
     }
 
-    pub(crate) fn into_receiver(self, process: &mut Process) -> Result<Term, VmError> {
+    pub(crate) fn into_receiver(mut self, process: &mut Process) -> Result<Term, VmError> {
         debug_assert!(
             !self.combined,
             "a message with inline data stays in its node"
         );
-        if let Some(heap_frag) = self.heap_frag {
+        if let Some(heap_frag) = self.take_heap_frag() {
             // erts_save_message_in_proc: the fragment is kept with the process.
             process.heap.adopt_message_node(heap_frag);
             return Ok(self.term);
         }
-        if self.fragment.is_none() {
+        if self.fragment().is_none() {
             // Immediate, literal, or already placed on this heap
             // (erl_message.c:657, `attached == NULL`).
             return Ok(self.term);
@@ -454,8 +488,7 @@ impl Message {
             // can be copied directly into its managed heap.
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             let term = if self
-                .fragment
-                .as_ref()
+                .fragment()
                 .is_some_and(|fragment| fragment.heap.is_some())
             {
                 arinsal_term::copy_term_litopt(
@@ -469,7 +502,7 @@ impl Message {
             return term
                 .map_err(|error| VmError::Unsupported(format!("on-heap message copy: {error:?}")));
         }
-        if let Some(mut fragment) = self.fragment
+        if let Some(fragment) = self.fragment_mut()
             && let Some(heap_fragment) = fragment.heap.take()
         {
             process

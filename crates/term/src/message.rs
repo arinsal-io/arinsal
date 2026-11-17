@@ -18,7 +18,8 @@ use crate::heap::{
     HeapAlloc, OffHeapLists, link_external_bin_ref, link_magic_thing, link_node_thing, store,
 };
 use crate::{Node, Term, TermError};
-use arinsal_alloc::typed::{AllocBlock, ErtsAlcType};
+use arinsal_alloc::typed::{AllocBlock, ErtsAlcType, FixOrBox};
+use std::num::NonZeroUsize;
 
 /// One signal (`ErtsSignalCommon`): the queue link, then the signal value. A message node may
 /// be followed in the same allocation by a heap fragment (`ERTS_MSG_COMBINED_HFRAG`).
@@ -660,6 +661,117 @@ impl<T> Drop for OwnedSignal<T> {
                     arinsal_alloc::typed::MessageRefBlock::from_node(self.node.get().cast()),
                 );
             }
+        }
+    }
+}
+
+/// erts `ErtsMessage.data` (erl_message.h, the `ErtsMessageData` union): one word holding
+/// either the attached data of a message (`T` in a [`FixOrBox`]) or its standalone heap
+/// fragment (`data.heap_frag`, a [`NodeFragment::new_message_buffer`] block). The heap
+/// fragment is tagged with bit 1, which a [`FixOrBox`] word never sets.
+pub struct MessageData<T, const TYPE: u8> {
+    tagged: NonNull<T>,
+    _owns: PhantomData<FixOrBox<T, TYPE>>,
+}
+
+// SAFETY: the word owns either a `FixOrBox<T>` or a message buffer, both `Send` for `T: Send`.
+unsafe impl<T: Send, const TYPE: u8> Send for MessageData<T, TYPE> {}
+
+const HEAP_FRAG_TAG: usize = 2;
+
+impl<T, const TYPE: u8> MessageData<T, TYPE> {
+    /// Attached data.
+    pub fn attached(data: FixOrBox<T, TYPE>) -> Self {
+        let tagged = data.into_raw();
+        debug_assert_eq!(tagged.as_ptr() as usize & HEAP_FRAG_TAG, 0);
+        Self {
+            tagged,
+            _owns: PhantomData,
+        }
+    }
+
+    /// A standalone heap fragment (`data.heap_frag`).
+    pub fn heap_frag(fragment: NodeFragment) -> Self {
+        assert!(
+            fragment.is_message_buffer(),
+            "data.heap_frag is a message buffer"
+        );
+        let header = fragment.header;
+        std::mem::forget(fragment);
+        Self {
+            tagged: header.map_addr(|address| address | HEAP_FRAG_TAG).cast(),
+            _owns: PhantomData,
+        }
+    }
+
+    fn is_heap_frag(&self) -> bool {
+        self.tagged.as_ptr() as usize & HEAP_FRAG_TAG != 0
+    }
+
+    fn header(&self) -> Option<NonNull<HeapFragment>> {
+        self.is_heap_frag().then(|| {
+            self.tagged
+                .map_addr(|address| {
+                    NonZeroUsize::new(address.get() & !HEAP_FRAG_TAG).expect("aligned header")
+                })
+                .cast()
+        })
+    }
+
+    /// The attached data, unless this is a heap fragment.
+    pub fn as_attached(&self) -> Option<&T> {
+        // SAFETY: an untagged word is owned by this handle as a `FixOrBox`.
+        (!self.is_heap_frag()).then(|| &*unsafe { FixOrBox::<T, TYPE>::raw_value(self.tagged) })
+    }
+
+    /// [`MessageData::as_attached`], mutably.
+    pub fn as_attached_mut(&mut self) -> Option<&mut T> {
+        // SAFETY: as in `as_attached`, borrowed exclusively.
+        (!self.is_heap_frag()).then(|| unsafe { FixOrBox::<T, TYPE>::raw_value(self.tagged) })
+    }
+
+    /// The used words of the heap fragment.
+    pub fn heap_frag_words(&self) -> Option<&[u64]> {
+        let header = self.header()?;
+        // SAFETY: the handle owns the buffer; its first `used_size` words were written.
+        unsafe {
+            let used = (*header.as_ptr()).used_size;
+            Some(std::slice::from_raw_parts(fragment_words_ptr(header), used))
+        }
+    }
+
+    /// The heap fragment, to move its data out.
+    pub fn heap_frag_mut(&mut self) -> Option<FragmentMut<'_>> {
+        self.header().map(|header| FragmentMut {
+            header,
+            _node: PhantomData,
+        })
+    }
+
+    /// The heap fragment as an owned buffer, or the attached data back.
+    pub fn into_heap_frag(self) -> Result<NodeFragment, Self> {
+        match self.header() {
+            Some(header) => {
+                std::mem::forget(self);
+                Ok(NodeFragment {
+                    memory: header.cast(),
+                    header,
+                })
+            }
+            None => Err(self),
+        }
+    }
+}
+
+impl<T, const TYPE: u8> Drop for MessageData<T, TYPE> {
+    fn drop(&mut self) {
+        match self.header() {
+            Some(header) => drop(NodeFragment {
+                memory: header.cast(),
+                header,
+            }),
+            // SAFETY: an untagged word came from `FixOrBox::into_raw` and is owned here.
+            None => drop(unsafe { FixOrBox::<T, TYPE>::from_raw(self.tagged) }),
         }
     }
 }
