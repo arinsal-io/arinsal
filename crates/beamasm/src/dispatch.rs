@@ -73,7 +73,8 @@ pub struct LightGcOffsets {
     pub off_heap_overhead: u32,
     /// `Process.heap.bin_vheap_size` (`bin_vheap_sz`).
     pub bin_vheap_size: u32,
-    /// `Process.gc_enabled` as a byte; clear means `F_DISABLE_GC`.
+    /// `Process.gc_enabled` and the adjacent `force_gc` byte, read as one halfword; anything
+    /// but 1 means `F_DISABLE_GC` or `F_FORCE_GC`.
     pub gc_enabled: u32,
 }
 
@@ -854,7 +855,9 @@ fn emit_gc_desired_test(
     const NZCV_CF: u8 = 0b0010;
     const NZCV_VF: u8 = 0b0001;
     code.emit(|encoder| {
-        encoder.ldrb_uoff(Gpr::w(9), Gpr::x(21), gc.gc_enabled as u16)?;
+        // `gc_enabled` and `force_gc` are adjacent bytes: the halfword is 1 only for an
+        // enabled process with no forced collection (`F_FORCE_GC | F_DISABLE_GC` clear).
+        encoder.ldrh_uoff(Gpr::w(9), Gpr::x(21), gc.gc_enabled as u16)?;
         encoder.cmp_imm(Gpr::w(9), 1, false)?;
         encoder.ldr_uoff(Gpr::x(12), Gpr::x(21), gc.off_heap_overhead)
     })?;

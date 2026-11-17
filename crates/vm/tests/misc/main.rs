@@ -19,6 +19,7 @@ mod elixir_loop1;
 mod env;
 mod erl_debugger;
 mod exceptions;
+mod force_gc_after_bif;
 mod frame_trap;
 mod fun_table;
 mod funs;

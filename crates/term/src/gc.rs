@@ -1615,6 +1615,9 @@ impl ProcessHeap {
         self.abandoned = false;
         self.detached = false;
         self.gc_enabled = true;
+        // Port of erts/emulator/beam/erl_gc.c:934 and 1100 (`FLAGS(p) &= ~F_FORCE_GC`),
+        // OTP-29.1.1.
+        self.force_gc = false;
         if let Some((min, old_size, old)) = old_vheap {
             self.owners.vheap.min = min;
             self.owners.vheap.old_size = old_size;

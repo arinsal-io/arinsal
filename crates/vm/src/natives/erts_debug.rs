@@ -2920,8 +2920,10 @@ fn internal_state_set(
             }
             // Port of erts/emulator/beam/erl_bif_info.c:5124-5133 and
             // erts/emulator/beam/erl_gc.h:146-153, OTP-29.1.1. The target PID is only
-            // checked for existence; ERTS_FORCE_GC collects the calling process.
-            process.force_gc()?;
+            // checked for existence; ERTS_FORCE_GC sets F_FORCE_GC and gives up the rest of
+            // the slice, the collection is the BIF epilogue's (erts_gc_after_bif_call_lhf).
+            process.heap.force_gc = true;
+            crate::bif_traps::vbump_all_reds(process);
             return Ok(Term::atom(arinsal_term::atoms::TRUE));
         }
         Some("unique_monotonic_integer_state") => {

@@ -1422,6 +1422,10 @@ const _: () = assert!(std::mem::offset_of!(NativeAbi, current) == 0x58);
 const _: () = assert!(std::mem::offset_of!(NativeAbi, flags) == 0x60);
 const _: () = assert!(std::mem::offset_of!(NativeAbi, self_pid) == 0x68);
 const _: () = assert!(std::mem::offset_of!(NativeAbi, high_water) == 0x70);
+const _: () = assert!(
+    std::mem::offset_of!(ProcessHeap, force_gc)
+        == std::mem::offset_of!(ProcessHeap, gc_enabled) + 1
+);
 
 /// A process heap with an upward bump pointer and a downward stack pointer.
 #[repr(C)]
@@ -1461,6 +1465,10 @@ pub struct ProcessHeap {
     pub(crate) fragment_words: usize,
     /// `F_DISABLE_GC` inverted: collection may run after a BIF (`Process.gc_enabled`).
     pub gc_enabled: bool,
+    /// `F_FORCE_GC`: the BIF epilogue collects whatever the heap state. Adjacent to
+    /// `gc_enabled` so the light-BIF fragment tests both with one halfword load, as erts tests
+    /// `F_FORCE_GC | F_DISABLE_GC` with one `tst` of `c_p->flags`.
+    pub force_gc: bool,
     /// Whether the next collection is the epilogue of a BIF call that decided to collect
     /// (`erts_gc_after_bif_call_lhf` with a valid `live_hf_end`).
     live_frags_armed: std::cell::Cell<bool>,
@@ -1670,6 +1678,7 @@ impl ProcessHeap {
         self.mbuf_fast = MbufFast::default();
         self.fragment_words = 0;
         self.gc_enabled = true;
+        self.force_gc = false;
         self.live_frags_armed.set(false);
         self.live_frag_mark.set(INVALID_HFRAG);
         self.live_frag_saved.set(INVALID_HFRAG);
@@ -1762,6 +1771,7 @@ impl ProcessHeap {
             mbuf_fast: MbufFast::default(),
             fragment_words: 0,
             gc_enabled: true,
+            force_gc: false,
             live_frags_armed: std::cell::Cell::new(false),
             live_frag_mark: std::cell::Cell::new(INVALID_HFRAG),
             live_frag_saved: std::cell::Cell::new(INVALID_HFRAG),
@@ -2981,7 +2991,8 @@ impl ProcessHeap {
     // that trips both is collected once.
     #[inline(always)]
     pub fn gc_after_bif_desired(&self) -> bool {
-        let desired = self.gc_enabled & (self.gc_desired() | self.bin_vheap_gc_due());
+        let desired =
+            self.gc_enabled & (self.gc_desired() | self.bin_vheap_gc_due() | self.force_gc);
         if desired {
             self.live_frags_armed.set(true);
         } else {
