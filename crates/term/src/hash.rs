@@ -225,6 +225,7 @@ fn simple_hash(term: Term) -> Option<u32> {
     None
 }
 
+#[inline(always)]
 fn aligned_binary<'a>(
     view: &'a crate::BinaryRef<'_>,
     size: usize,
@@ -1036,6 +1037,7 @@ impl Hash2Run {
     /// The binary case. Returns whether it trapped part way.
     // Port of the `BIN_REF_SUBTAG`, `HEAP_BITS_SUBTAG` and `SUB_BITS_SUBTAG` case of
     // `make_hash2_helper`, erts/emulator/beam/erl_term_hashing.c, OTP-29.1.1.
+    #[inline(always)]
     fn binary(
         hash: &mut u32,
         term: Term,
