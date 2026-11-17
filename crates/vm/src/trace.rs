@@ -2552,8 +2552,6 @@ enum SpecialFrame {
 /// Where a traced call looks for the trace frames already on the stack.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StackScan {
-    /// The return address of the call is on top: no trace frame is (a BIF call).
-    None,
     /// The run of trace frames on top of the stack (a call to Erlang code).
     Top,
     /// The current function's frame is dropped by the tail call: the run of trace frames
@@ -2612,7 +2610,6 @@ pub(crate) fn dedupe_return_frames(
     // caller's trace frames, and a return_to frame of the session already there means no new
     // one is pushed.
     let mut frames = match scan {
-        StackScan::None => Vec::new(),
         StackScan::Top => special_frames(process, first_only, false),
         StackScan::AfterFrame => special_frames(process, first_only, true),
     };

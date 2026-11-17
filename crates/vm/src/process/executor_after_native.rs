@@ -612,33 +612,6 @@ impl Executor {
                         }
                         result
                     };
-                    let result = result.or_else(|| {
-                        let arity = usize::from(export.arity);
-                        let bif = export.bif?;
-                        let result = self.vm.call_bif_traced_named(
-                            process,
-                            ctx,
-                            &export.module,
-                            &export.function,
-                            bif,
-                            arity,
-                        );
-                        Some(match result {
-                            Ok(value) => Ok(value),
-                            Err(error) => {
-                                let arguments = self.native_registers.x_reg_array[..arity].to_vec();
-                                Err(crate::exceptions::bif_error_with_atoms(
-                                    process,
-                                    &export.module,
-                                    &export.function,
-                                    export.module_atom,
-                                    export.function_atom,
-                                    &arguments,
-                                    error,
-                                ))
-                            }
-                        })
-                    });
                     // Interpreter-style BIF errors raise like traps, as in
                     // the interpreter's own call_ext path.
                     let result = match result {

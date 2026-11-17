@@ -3,7 +3,7 @@
 use crate::process::Message;
 use crate::{EvalResult, ImportOutcome, Process, Vm, VmError, exceptions};
 use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle};
-use arinsal_loader::{ImportClass, Module};
+use arinsal_loader::Module;
 use arinsal_sched::RunCtx;
 use arinsal_term::{ExportEntry, FunRef, Term, TermBuilder, TermKind, global_atoms};
 use std::sync::Arc;
@@ -86,45 +86,6 @@ fn argument_list(mut list: Term) -> Result<Vec<Term>, ArgumentError> {
 }
 
 // Port of erts/emulator/beam/beam_common.c:1462-1495 (nested apply loop), OTP-29.1.1.
-/// The plain BIF or static NIF that `{module, function, arity}` names, found once per export.
-///
-/// A name is plain when the load-time import classifier calls it `Pure` and it is not a
-/// trapping BIF: a static call of it runs the function directly, and so does `apply`.
-// Port of erts/emulator/beam/beam_common.c (apply: `erts_find_export_entry` then the BIF),
-// OTP-29.1.1.
-fn apply_plain_bif(
-    module_atom: arinsal_term::Atom,
-    function_atom: arinsal_term::Atom,
-    module: &str,
-    function: &str,
-    arity: usize,
-) -> Option<arinsal_bifs::BifFn> {
-    use std::collections::HashMap;
-    use std::sync::{OnceLock, RwLock};
-    type Key = (arinsal_term::Atom, arinsal_term::Atom, u8);
-    static PLAIN: OnceLock<RwLock<HashMap<Key, arinsal_bifs::BifFn>>> = OnceLock::new();
-    let arity = u8::try_from(arity).ok()?;
-    let key = (module_atom, function_atom, arity);
-    let table = PLAIN.get_or_init(|| RwLock::new(HashMap::new()));
-    if let Some(bif) = table
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&key)
-    {
-        return Some(*bif);
-    }
-    let bif = arinsal_bifs::lookup(module, function, arity)
-        .or_else(|| crate::natives::plain_static_nif_lookup(module, function, arity))?;
-    if crate::natives::classify(module, function, arity, true).0 != ImportClass::Pure {
-        return None;
-    }
-    table
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(key, bif);
-    Some(bif)
-}
-
 fn unwrap_nested_apply(
     mut module: Term,
     mut function: Term,
@@ -746,6 +707,26 @@ impl Vm {
                 _ => {}
             }
         }
+        // Apply enters the active BIF export through its bif_table index, as a static call does.
+        if arinsal_spec::bif_lookup(module, function, arity as u8).is_some()
+            && let Some(run) = ctx.as_deref_mut()
+        {
+            let native_function = if module == "erlang" && function == "!" && arity == 2 {
+                "send"
+            } else {
+                function
+            };
+            if let Some(result) = self.dispatch_native(
+                p,
+                run,
+                module,
+                native_function,
+                arity,
+                crate::natives::native_entry(module, native_function, arity as u8),
+            ) {
+                return self.finish_apply_native_result(p, module, function, arity, atoms, result);
+            }
+        }
         // Apply carries atom identities, so resolve the same process-aware BIF
         // entry as a static import without re-matching its module or function.
         let mut resolved_entry = false;
@@ -792,13 +773,6 @@ impl Vm {
                     return Ok(Self::return_value_after_dirty(p, self.x_regs()?[0]));
                 }
             }
-        }
-        // The export of a plain BIF is found by its atoms and run as a static call of it
-        // would, without matching names against every family of natives.
-        if let Some((module_atom, function_atom)) = atoms
-            && let Some(bif) = apply_plain_bif(module_atom, function_atom, module, function, arity)
-        {
-            return self.run_apply_bif(p, module, function, arity, bif);
         }
         // `!` is an export alias for the process-aware `send/2` BIF.
         let native_function = if module == "erlang" && function == "!" && arity == 2 {
@@ -872,9 +846,7 @@ impl Vm {
             return Ok(Self::return_value(p, self.x_regs()?[0]));
         }
         // elixir_loop1: dynamic apply must see static NIFs such as re:import/1.
-        if let Some(bif) = arinsal_bifs::lookup(module, function, arity as u8)
-            .or_else(|| crate::natives::plain_static_nif_lookup(module, function, arity as u8))
-        {
+        if let Some(bif) = crate::natives::plain_static_nif_lookup(module, function, arity as u8) {
             return self.run_apply_bif(p, module, function, arity, bif);
         }
         if arinsal_spec::bif_lookup(module, function, arity as u8).is_some() {
@@ -943,6 +915,54 @@ impl Vm {
         // `i_test_yield`, which runs at `set_position`'s native entry; a tick here charged
         // it twice (a traced BIF's trap continuation went through this path).
         Ok(ImportOutcome::Dispatch)
+    }
+
+    fn finish_apply_native_result(
+        &mut self,
+        p: &mut Process,
+        module: &str,
+        function: &str,
+        arity: usize,
+        atoms: Option<(arinsal_term::Atom, arinsal_term::Atom)>,
+        result: Result<Term, VmError>,
+    ) -> Result<ImportOutcome, VmError> {
+        let result = match result {
+            Err(VmError::Trap(mut trap))
+                if trap.class == arinsal_bifs::Class::Error
+                    && trap.top.is_none()
+                    && trap.trace.is_none()
+                    && !(module == "erlang" && function == "error") =>
+            {
+                // Port of erts/emulator/beam/beam_common.c (save_stacktrace), OTP-29.1.1.
+                let (module_atom, function_atom) = match atoms {
+                    Some(atoms) => atoms,
+                    None => (
+                        global_atoms().intern(module).map_err(|error| {
+                            VmError::Unsupported(format!("BIF module atom: {error:?}"))
+                        })?,
+                        global_atoms().intern(function).map_err(|error| {
+                            VmError::Unsupported(format!("BIF function atom: {error:?}"))
+                        })?,
+                    ),
+                };
+                trap.top = Some(crate::stacktrace::TopFrame::Bif {
+                    module: module_atom,
+                    function: function_atom,
+                    args: crate::stacktrace::BifArgs::from_terms(&self.x_regs()?[..arity])?,
+                    info: crate::stacktrace::BifErrorInfo::Plain,
+                });
+                Err(VmError::Trap(trap))
+            }
+            result => result,
+        };
+        match result {
+            Err(VmError::TrapExport(trap)) => self.bif_trap_from_executor(p, trap),
+            result => {
+                let value = result?;
+                self.x_regs()?[0] = value;
+                Ok(Self::return_value_after_dirty(p, value))
+            }
+        }
     }
 
     /// `code_server` is up, so a missing module must go through `error_handler`

@@ -122,7 +122,6 @@ pub(crate) struct DispatchTarget {
     pub module_atom: arinsal_term::Atom,
     pub function_atom: arinsal_term::Atom,
     pub arity: u8,
-    pub bif: Option<arinsal_bifs::BifFn>,
     pub class: arinsal_loader::ImportClass,
     pub native_bits: usize,
     /// The MFA is a light (not heap) BIF in the BIF table (erts `Export.bif_number` with the
@@ -133,9 +132,6 @@ pub(crate) struct DispatchTarget {
     /// heap BIFs in erts (`call_ext`), and trapping once per key dominated the
     /// dictionary benchmark.
     pub direct_ets: Option<crate::natives::ets::DirectEts>,
-    /// The BIF a light BIF call runs straight away: set when it neither traps nor runs in
-    /// the executor nor on the table fast path, so the call checks one word.
-    pub light_bif: Option<arinsal_bifs::BifFn>,
     /// The process BIF a light BIF call runs straight away, for a native that needs only its
     /// process (see `natives::ProcessBif`); the executor still runs it for interpreted code.
     pub light_process_bif: Option<crate::natives::ProcessBif>,
@@ -171,10 +167,15 @@ impl DispatchTarget {
     /// Whether `bif_table[].f` of this export runs the BIF itself, as `i_bif*` calls it: a body
     /// of its own, or the plain adapter of its `arinsal_bifs` body. Not an entry that parks the
     /// call in the executor.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-151 (`bif->f`), OTP-29.1.1.
     pub(crate) fn bif_table_runs_bif(&self) -> bool {
         crate::bif_table::is_body(self.bif_table_function())
-            && (self.light_bif.is_some()
-                || crate::bif_table::special(&self.module, &self.function, self.arity).is_some())
+    }
+
+    /// Whether this export has the `bif.tab` index that call fragments pass to `bif_table`.
+    // Port of erts/emulator/beam/jit/beam_jit_main.cpp (`install_bifs`), OTP-29.1.1.
+    pub(crate) fn is_bif_export(&self) -> bool {
+        self.slot.bif_number() >= 0
     }
 
     /// `bif_table[ep->bif_number].f` of this export, or 0.
@@ -296,9 +297,6 @@ impl DispatchRegistry {
     ) -> &'static DispatchTarget {
         self.by_identity.entry(identity).or_insert_with(|| {
             let mut leaked = DispatchTarget::clone(entry);
-            leaked.light_bif = leaked
-                .bif
-                .filter(|_| leaked.direct_ets.is_none() && !leaked.runs_in_executor());
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared),
             // OTP-29.1.1: erts calls every BIF from the generated code with `c_p`, so a native
             // that needs only its process is called the same way.
@@ -565,8 +563,8 @@ pub(crate) fn make_export(mfa: Mfa) -> Option<&'static Arc<arinsal_beamasm::bif:
     let module = global_atoms().text(mfa.0)?.to_string();
     let function = global_atoms().text(mfa.1)?.to_string();
     let entry = dispatch_entry(mfa, || {
-        let bif = arinsal_bifs::lookup(&module, &function, mfa.2);
-        let (class, bits) = crate::natives::classify(&module, &function, mfa.2, bif.is_some());
+        let has_bif = arinsal_spec::bif_lookup(&module, &function, mfa.2).is_some();
+        let (class, bits) = crate::natives::classify(&module, &function, mfa.2, has_bif);
         Some(DispatchTarget {
             // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
             slot: new_export_slot(mfa, trampoline, save_calls),
@@ -577,10 +575,8 @@ pub(crate) fn make_export(mfa: Mfa) -> Option<&'static Arc<arinsal_beamasm::bif:
             module_atom: mfa.0,
             function_atom: mfa.1,
             arity: mfa.2,
-            bif,
             class,
             native_bits: bits,
-            light_bif: None,
             light_process_bif: None,
         })
     })?;
@@ -623,7 +619,8 @@ fn import_entries(module: &arinsal_loader::Module) -> Option<ImportEntries> {
                     import.module,
                     import.function,
                     import.arity,
-                    import.bif_fn().is_some(),
+                    arinsal_spec::bif_lookup(import.module, import.function, import.arity)
+                        .is_some(),
                 )
             } else {
                 (import.class(), import.native_bits())
@@ -642,10 +639,8 @@ fn import_entries(module: &arinsal_loader::Module) -> Option<ImportEntries> {
                 module_atom: import.module_atom,
                 function_atom: import.function_atom,
                 arity: import.arity,
-                bif: import.bif_fn(),
                 class,
                 native_bits: bits,
-                light_bif: None,
                 light_process_bif: None,
             })
         })?;
@@ -672,8 +667,8 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
     let function_atom = global_atoms().get(function)?;
     let key = (module_atom, function_atom, arity);
     let entry = Arc::clone(registry.bif_mfas.entry(key).or_insert_with(|| {
-        let bif = arinsal_bifs::lookup(module, function, arity);
-        let (class, bits) = crate::natives::classify(module, function, arity, bif.is_some());
+        let has_bif = arinsal_spec::bif_lookup(module, function, arity).is_some();
+        let (class, bits) = crate::natives::classify(module, function, arity, has_bif);
         Arc::new(DispatchTarget {
             slot: new_export_slot(key, trampoline, save_calls),
             light_kind: light_kind(module, function, arity),
@@ -683,10 +678,8 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
             module_atom,
             function_atom,
             arity,
-            bif,
             class,
             native_bits: bits,
-            light_bif: None,
             light_process_bif: None,
         })
     }));
@@ -708,9 +701,10 @@ fn publish_module(
     for export in &module.exports {
         let function_atom = export.function_atom;
         let mfa = (module.name_atom, function_atom, export.arity);
-        let bif = arinsal_bifs::lookup(&module.name, export.function, export.arity);
+        let has_bif =
+            arinsal_spec::bif_lookup(&module.name, export.function, export.arity).is_some();
         let (class, bits) =
-            crate::natives::classify(&module.name, export.function, export.arity, bif.is_some());
+            crate::natives::classify(&module.name, export.function, export.arity, has_bif);
         let target = dispatch_entry(mfa, || {
             Some(DispatchTarget {
                 // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
@@ -726,10 +720,8 @@ fn publish_module(
                 module_atom: module.name_atom,
                 function_atom,
                 arity: export.arity,
-                bif,
                 class,
                 native_bits: bits,
-                light_bif: None,
                 light_process_bif: None,
             })
         });

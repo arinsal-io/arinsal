@@ -87,6 +87,32 @@ impl Vm {
         args: natives::NativeArgs<'_>,
     ) -> Option<Result<Term, VmError>> {
         let (class, bits) = resolved;
+        let arity = args.len();
+        if arity <= u8::MAX as usize
+            && arinsal_spec::bif_lookup(module, function, arity as u8).is_some()
+        {
+            // Port of erts/emulator/beam/beam_bp.c (`erts_bif_trace`): a traced BIF
+            // calls the pointer selected by the export's `bif_number`.
+            let table_result = {
+                // The BIF table body runs with this scheduler's process data, as from a
+                // generated call fragment.
+                let reg = match self.x_regs() {
+                    Ok(reg) => reg,
+                    Err(error) => return Some(Err(error)),
+                };
+                if let natives::NativeArgs::Slice(values) = args {
+                    reg[..values.len()].copy_from_slice(values);
+                }
+                let _slice = crate::process::sched_data::NativeSlice::enter(self, ctx);
+                crate::bif_table::call_from_executor(p, reg, module, function, arity)
+            };
+            if table_result.is_some() {
+                return table_result;
+            }
+            if class == ImportClass::Pure {
+                return None;
+            }
+        }
         if class == ImportClass::Dynamic
             && let Some(result) = args.with_values(p, |p, values| {
                 signals::call(self, p, ctx, module, function, values)
@@ -103,7 +129,9 @@ impl Vm {
             }
             Some(natives::NativeEntry::Resolved(fun)) => fun(self, p, ctx, args),
             // A native BIF without a named entry is its `bif_table` body.
-            None if class == ImportClass::Native => {
+            None if class == ImportClass::Native
+                && arinsal_spec::bif_lookup(module, function, arity as u8).is_none() =>
+            {
                 // `bif_table[].f` reads its arguments from the register array.
                 let reg = match self.x_regs() {
                     Ok(reg) => reg,

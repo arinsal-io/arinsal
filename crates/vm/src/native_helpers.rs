@@ -1110,19 +1110,14 @@ pub extern "C" fn arinsal_beamasm_line_breakpoint_cleanup(
 /// The function `call_light_bif_shared` branches to for this export.
 ///
 /// Port of erts/emulator/beam/erl_bif_table.c (`bif_table[].f`), OTP-29.1.1: each BIF
-/// has one function pointer, chosen when the export is created. Bodies that are
-/// their own C function come from [`crate::bif_table::special`]. Every other BIF
-/// uses the adapter for its kind. None of those pointers enter `invoke_dispatch_bif`.
+/// has one function pointer, chosen when the export is created. Calls enter that pointer
+/// directly; trace and save_calls dispatch it through the export path.
 pub(crate) fn light_entry(export: ExportDispatch) -> Option<usize> {
     if let Some(func) = crate::bif_table::special(&export.module, &export.function, export.arity) {
         return Some(func);
     }
     // The kind is fixed when the export is created (`bif_table[].f`). The call
     // fragment branches to that pointer; it does not walk `invoke_dispatch_bif`.
-    if export.light_bif.is_some() {
-        let own = crate::bif_table::entry(&export.module, &export.function, export.arity);
-        return Some(own.map_or(crate::bif_table::bif!(plain_bif_light), |e| e.plain));
-    }
     if export.light_process_bif.is_some() {
         return Some(
             crate::natives::thin_entry(&export.module, &export.function, export.arity)
@@ -1132,7 +1127,13 @@ pub(crate) fn light_entry(export: ExportDispatch) -> Option<usize> {
     if export.direct_ets.is_some() {
         return Some(crate::bif_table::bif!(direct_bif_light));
     }
-    let bif = export.bif.is_some()
+    if export.runs_in_executor() {
+        return Some(crate::bif_table::bif!(yield_executor_bif));
+    }
+    if let Some(entry) = crate::bif_table::entry(&export.module, &export.function, export.arity) {
+        return Some(entry.plain);
+    }
+    let bif = export.is_bif_export()
         || matches!(
             export.class,
             arinsal_loader::ImportClass::Pure
@@ -1182,30 +1183,6 @@ fn park_executor(
     process.heap.abi.i = identity as *const u8 as *const _;
     process.heap.abi.exc.freason = 1 << 10;
     0
-}
-
-/// A plain BIF: call `bif_table[].f` and return. Trace and save_calls already
-/// branched to the helper in the fragment.
-// Port of erts/emulator/beam/beam_jit_common.cpp:588-621 (`beam_jit_call_bif`), OTP-29.1.1.
-pub(crate) extern "C" fn plain_bif_light(
-    header: *mut ProcessHeader,
-    regs: *mut u64,
-    _i: u64,
-) -> u64 {
-    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
-    // finds its export through `c_p->current`, which the call fragment set.
-    let (descriptor, identity) = crate::bif_table::current_export(header);
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, regs) else {
-        return 0;
-    };
-    // The fragment loaded `Export.info` into this argument, so the slot is not hashed.
-    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
-        return 0;
-    };
-    let Some(bif) = export.light_bif else {
-        return park_executor(process, export, identity, false);
-    };
-    call_plain_bif(process, registers, export, bif, false)
 }
 
 /// `bif_table[].f` of one plain BIF: the body is this entry's own callee.
@@ -1334,14 +1311,12 @@ fn invoke_dispatch_bif(
     export: Option<ExportDispatch>,
     export_call: bool,
 ) -> Option<u64> {
-    // The BIF reads its arguments from the register array; only the paths that work on
-    // `process.x` (send, the direct table BIFs) load it.
     let (process, registers) = crate::native_hooks::enter_runtime_reg(header, reg)?;
     if let Some(export) = export {
         if export_call {
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:729-745:
             // call_bif_shared stores the export's MFA in c_p->current before the BIF call.
-            process.heap.abi.current = if export.bif.is_some() {
+            process.heap.abi.current = if export.is_bif_export() {
                 std::ptr::from_ref(export.mfa()).cast()
             } else {
                 std::ptr::null()
@@ -1349,14 +1324,6 @@ fn invoke_dispatch_bif(
         }
         // The light-BIF fragment already loaded `Export.is_bif_traced` and compared
         // `active_code_ix` (instr_bif.cpp:391-397). An export-entry call has not.
-        let export_checks = export_call
-            && (registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64
-                || export.is_bif_traced());
-        if let Some(bif) = export.light_bif
-            && !export_checks
-        {
-            return Some(call_plain_bif(process, registers, export, bif, export_call));
-        }
         // ETS and the process dictionary run here so a `call_ext` does not trap back
         // into the executor once per key.
         if export.direct_ets.is_some()
@@ -1500,8 +1467,8 @@ fn invoke_dispatch_bif_slow(
         process.native_light_bif_call = !export_call;
         return None;
     }
-    let bif = export.bif?;
-    Some(call_plain_bif(process, registers, export, bif, export_call))
+    park_executor(process, export, identity as u64, !export_call);
+    None
 }
 
 /// Runs an ETS or process-dictionary BIF from native code.
@@ -1596,60 +1563,6 @@ fn direct_bif_error_gc(
     }
 }
 
-/// Calls a BIF that runs on the scheduler straight from native code.
-#[inline(always)]
-fn call_plain_bif(
-    process: &mut crate::Process,
-    registers: &mut arinsal_beamasm::SchedulerRegisters,
-    export: ExportDispatch,
-    bif: arinsal_bifs::BifFn,
-    export_call: bool,
-) -> u64 {
-    call_plain_bif_body(process, registers, export, bif, export_call)
-}
-
-/// [`call_plain_bif`] once the BIF is known not to be a scheduler counter.
-#[inline(always)]
-fn call_plain_bif_body(
-    process: &mut crate::Process,
-    registers: &mut arinsal_beamasm::SchedulerRegisters,
-    export: ExportDispatch,
-    bif: impl Fn(&mut arinsal_bifs::Ctx<'_>, &[Term]) -> Result<Term, arinsal_bifs::BifError>,
-    export_call: bool,
-) -> u64 {
-    if export_call {
-        process.heap.abi.fcalls = process.heap.abi.fcalls.saturating_sub(1);
-    }
-    let arity = usize::from(export.arity);
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared),
-    // OTP-29.1.1: the BIF reads its arguments from the register array (BIF_ARG_n is reg[n]).
-    // A BIF leaves E alone, so only HTOP is read back after it.
-    // The result is matched where the BIF wrote it: moving it first would read it back with
-    // wider loads than the BIF's stores.
-    let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut call = arinsal_bifs::BifCall::default();
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut call);
-    let result = bif(&mut ctx, &registers.x_reg_array[..arity]);
-    // ERTS_IS_GC_DESIRED_INTERNAL: a value goes straight back in x0, and the native
-    // light-BIF fragment tests the collection itself (instr_bif.cpp:488-523). The
-    // fragment installs x0 in the cached X register, so the result need not also be
-    // copied to the scheduler register array. Only the export trampoline, which has no
-    // such test, checks collection here.
-    if let Ok(value) = &result
-        && (!export_call
-            || (process.heap.stack_index() - process.heap.heap_top_index()
-                >= process.heap.mbuf_size()
-                && !process.heap.bin_vheap_gc_due()))
-    {
-        let value = *value;
-        if export_call {
-            registers.x_reg_array[0] = value;
-        }
-        return crate::native_hooks::raw(value);
-    }
-    plain_bif_slow(process, registers, export, result)
-}
-
 /// Everything after a light BIF that did not just return a value: a continuation the body
 /// deferred, an error, or a collection that is due. Out of line so the value path keeps few
 /// live registers, as erts keeps these cases in the shared fragment behind one
@@ -1668,8 +1581,8 @@ fn plain_bif_slow(
     plain_bif_result(process, registers, export, arity, result)
 }
 
-/// [`call_plain_bif_body`] for a BIF function that returns one word, a term or the
-/// non-value with its failure in the context. The word is the value path's whole result, so
+/// The table adapter for a BIF function that returns one word, a term or the non-value with
+/// its failure in the context. The word is the value path's whole result, so
 /// it is tested once; failures and deferred continuations take [`plain_bif_slow`].
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-523 (call_light_bif_shared tests the
 // returned word against THE_NON_VALUE), OTP-29.1.1.

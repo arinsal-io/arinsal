@@ -146,16 +146,19 @@ pub(crate) fn call_from_executor(
     ))
 }
 
-/// Whether `f` (a `bif_table[].f`) is a BIF body: set, and not the shim that parks the call in
-/// the executor.
+/// Whether `f` is a complete BIF body, not a light-call adapter that hands the call to the VM.
 pub(crate) fn is_body(f: usize) -> bool {
-    f != 0 && f != bif!(crate::native_helpers::yield_executor_bif)
+    f != 0
+        && f != bif!(crate::native_helpers::yield_executor_bif)
+        && f != bif!(crate::native_helpers::direct_bif_light)
+        && f != bif!(crate::native_helpers::process_bif_light)
+        && f != bif!(crate::native_helpers::process_info_2_light)
 }
 
-/// The [`Bif`] at `bif_table[index]`, unless it is empty or the executor shim.
+/// The [`Bif`] at `bif_table[index]`, unless it only handles a generated light call.
 fn function_at(index: usize) -> Option<Bif> {
     let address = BIF_TABLE.get(index)?.load(Ordering::Acquire);
-    if address == 0 || address == bif!(crate::native_helpers::yield_executor_bif) {
+    if !is_body(address) {
         return None;
     }
     Some(raw::bif_at(address))

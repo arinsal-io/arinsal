@@ -44,18 +44,6 @@ pub fn call_bif(
     target(&mut ctx, args)
 }
 
-/// Invoke a BIF and return its reported work for scheduler accounting.
-pub(crate) fn call_bif_metered(
-    heap: &mut arinsal_term::ProcessHeap,
-    target: arinsal_bifs::BifFn,
-    args: &[arinsal_term::Term],
-) -> Result<arinsal_term::Term, arinsal_bifs::BifError> {
-    let mut fragment = arinsal_bifs::ProcessHeapHandle(heap);
-    let mut state = arinsal_bifs::BifState::default();
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut state);
-    target(&mut ctx, args)
-}
-
 /// Collect after a BIF when message-buffer fragments occupy more space than
 /// the process can keep free on its heap.
 // Port of erts/emulator/beam/erl_gc.c:418-478 (erts_gc_after_bif_call_lhf), OTP-29.1.1.
@@ -285,73 +273,6 @@ pub(crate) enum ImportOutcome {
 use super::*;
 
 impl Vm {
-    /// Call a BIF by name, emitting call and return events when a pattern selects it.
-    pub(crate) fn call_bif_traced_named(
-        &mut self,
-        p: &mut Process,
-        ctx: &mut arinsal_sched::RunCtx<'_, process::Message>,
-        module: &str,
-        function: &str,
-        bif: arinsal_bifs::BifFn,
-        arity: usize,
-    ) -> Result<Term, arinsal_bifs::BifError> {
-        let reg = self
-            .x_regs()
-            .map_err(|_| arinsal_bifs::BifError::SystemLimit)?;
-        // The BIF's BUMP_REDS lowers FCALLS, which the context switch reads.
-        let untraced = |p: &mut Process, _: &mut arinsal_sched::RunCtx<'_, process::Message>| {
-            calls::call_bif_metered(&mut p.heap, bif, &reg[..arity])
-        };
-        let (module, function) = (module.to_owned(), function.to_owned());
-        let args = reg[..arity].to_vec();
-        // A native import that missed (dynamic natives) already emitted the call event.
-        let mut site = None;
-        let actions = match p
-            .cold
-            .as_mut()
-            .and_then(|cold| cold.traced_native_call.take())
-        {
-            Some((site_module, site_ip, actions)) => {
-                site = Some((site_module, site_ip));
-                actions
-            }
-            None => crate::trace::bif_call_event(
-                self,
-                p,
-                ctx,
-                &module,
-                &function,
-                &args,
-                crate::trace::StackScan::None,
-            )
-            .unwrap_or_default(),
-        };
-        let result = untraced(p, ctx);
-        let outcome = match result {
-            Ok(value) => Some(Ok(value)),
-            Err(error) => match exceptions::bif_error(p, &module, &function, &args, error) {
-                VmError::Trap(trap) => exceptions::trace_class_reason(p, trap.class, trap.reason)
-                    .ok()
-                    .map(Err),
-                _ => None,
-            },
-        };
-        if let Some(outcome) = outcome {
-            let _ = crate::trace::bif_return_events(
-                self,
-                p,
-                ctx,
-                &actions,
-                &module,
-                &function,
-                arity as u8,
-                outcome,
-                site,
-            );
-        }
-        result
-    }
-
     /// `trace_native_call` for a caller that knows the callee name, keyed by its call site.
     #[allow(clippy::too_many_arguments)] // The call site and its stack scan accompany the MFA.
     pub(crate) fn trace_native_call_named(
