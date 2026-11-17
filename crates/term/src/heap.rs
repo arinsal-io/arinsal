@@ -1304,6 +1304,34 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapReservation<'_, H> {
         self.heap
             .update_writable_binary_overhead(source, old_size_bits, new_size_bits)
     }
+    // A reservation is words of its process heap (erts factory `hp` into the same heap), so
+    // every off-heap owner goes to the heap below, as the `&mut H` forwarding does.
+    fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
+        self.heap.retain_writable_binary(binary)
+    }
+    fn update_writable_binary_overhead_at(
+        &mut self,
+        source: Term,
+        bin_ref: usize,
+        old_size_bits: usize,
+        new_size_bits: usize,
+    ) {
+        self.heap
+            .update_writable_binary_overhead_at(source, bin_ref, old_size_bits, new_size_bits)
+    }
+    fn supports_writable_binary(&self) -> bool {
+        self.heap.supports_writable_binary()
+    }
+    fn link_external_binary(
+        &mut self,
+        bin_ref: *mut u64,
+        binary: Arc<ExternalBinary>,
+    ) -> Result<(), TermError> {
+        self.heap.link_external_binary(bin_ref, binary)
+    }
+    fn supports_external_binary(&self) -> bool {
+        self.heap.supports_external_binary()
+    }
     fn link_node(&mut self, thing: *mut u64, node: Node) {
         self.heap.link_node(thing, node)
     }

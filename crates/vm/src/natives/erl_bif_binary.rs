@@ -15,7 +15,9 @@ use crate::natives::erl_iolist::charge;
 use arinsal_beamasm::ProcessHeader;
 use arinsal_bifs::{BifError, ProcessHeapHandle};
 use arinsal_term::raw::{BinRef, Cons};
-use arinsal_term::{HeapAlloc, MagicBin, Term, TermBuilder, TermKind, global_atoms};
+use arinsal_term::{
+    HeapAlloc, HeapFactory, MagicBin, ProcessHeap, Term, TermBuilder, TermKind, global_atoms,
+};
 
 /// The bytes of a byte-sized binary (`erts_get_aligned_binary_bytes`), copied when unaligned.
 fn with_binary_input<R>(
@@ -1047,7 +1049,7 @@ pub(crate) struct BinarySearchWalk {
     split_trim: bool,
     split_trim_all: bool,
     global: bool,
-    result_left: Option<usize>,
+    result: Option<GlobalResult>,
 }
 
 impl BinarySearchWalk {
@@ -1111,126 +1113,281 @@ impl BinarySearchWalk {
             split_trim,
             split_trim_all,
             global,
-            result_left: None,
+            result: None,
         })
     }
 
-    /// Run the search and result loops until completion or reduction exhaustion.
-    // Port of erts/emulator/beam/erl_bif_binary.c (do_binary_find) and
-    // 1671-1735, 1809-1915 (do_match_global_result, do_split_global_result), OTP-29.1.1.
-    pub fn step(&mut self, budget: usize) -> (bool, usize) {
+    /// `ctx->found` / `ctx->not_found` of the first search (`do_binary_find`, `BFSearch`) and
+    /// the `BFResult` state: run the search, then the result phase of a global match or split,
+    /// until the result is built or `budget` loop iterations are used.
+    // Port of erts/emulator/beam/erl_bif_binary.c (do_binary_find, do_match_global_result,
+    // do_split_global_result), OTP-29.1.1.
+    pub fn step(
+        &mut self,
+        heap: &mut ProcessHeap,
+        budget: usize,
+    ) -> Result<(Option<Term>, usize), BifError> {
         let mut work = 0;
         if !self.walk.is_done() {
             let (done, used) =
                 with_binary_input(self.subject, |bytes| Ok(self.walk.step(bytes, budget)))
                     .expect("search subject remains a live binary");
             if !done {
-                return (false, used);
+                return Ok((None, used));
             }
             work = used;
         }
-        // Port of do_match_global_result and do_split_global_result: the C callbacks
-        // count one or two result-building passes before the final heap construction.
-        let mut left = *self.result_left.get_or_insert_with(|| {
-            let found = self.walk.match_count();
-            match (self.kind, self.global) {
-                (BinarySearchKind::Matches, _) => found * 2,
-                (BinarySearchKind::Split, true) => found,
-                _ => 0,
-            }
-        });
-        // `if (--reds == 0)` before each item: a call with `reds` left builds `reds - 1`
-        // items and then traps with none left (and the whole budget charged).
-        let reds = budget.saturating_sub(work);
-        if left > 0 {
-            if left < reds {
-                work += left;
-                left = 0;
-            } else {
-                left -= reds.saturating_sub(1);
-                work = budget;
-            }
+        if self.global && self.walk.match_count() > 0 {
+            return self.global_result(heap, budget, work);
         }
-        self.result_left = Some(left);
-        (left == 0, work)
+        let value = self.finish(&mut ProcessHeapHandle(heap))?;
+        Ok((Some(value), work))
     }
 
-    /// Build the BIF result after searching completes.
-    pub fn finish<H: HeapAlloc + ?Sized>(&self, heap: &mut H) -> Result<Term, BifError> {
+    /// `do_match_global_result` / `do_split_global_result`: the `BFResult` state of the trap
+    /// context. The first entry (`ctx->state == BFSearch`) sets up `fa->head`, `fa->term` and
+    /// `erts_factory_proc_prealloc_init`; every slice decrements `ctx->reds` once per item and
+    /// parks `fa->head` when it hits zero.
+    // Port of erts/emulator/beam/erl_bif_binary.c (do_match_global_result,
+    // do_split_global_result), OTP-29.1.1.
+    fn global_result(
+        &mut self,
+        heap: &mut ProcessHeap,
+        budget: usize,
+        work: usize,
+    ) -> Result<(Option<Term>, usize), BifError> {
+        let size = self.walk.match_count();
+        let split = matches!(self.kind, BinarySearchKind::Split);
+        if self.result.is_none() {
+            let words = if split {
+                (size + 1) * (BUILD_SUB_BITSTRING_HEAP_NEED + 2)
+            } else {
+                size * (3 + 2)
+            };
+            let factory =
+                HeapFactory::proc_prealloc_init(heap, words).map_err(|_| BifError::SystemLimit)?;
+            self.result = Some(GlobalResult {
+                factory,
+                epos_elen: Vec::with_capacity(if split { 0 } else { size }),
+                head: if split { size as isize - 1 } else { 0 },
+                numbers_done: split,
+                end_pos: if split { self.walk.len() } else { 0 },
+                term: Term::NIL,
+                trim_pending: self.split_trim,
+            });
+        }
+        let mut reds = budget.saturating_sub(work);
+        let mut state = self.result.take().expect("result phase state");
+        let outcome = if split {
+            self.split_slice(heap, &mut state, &mut reds)
+        } else {
+            Self::match_slice(&self.walk, heap, &mut state, &mut reds, size)
+        };
+        match outcome {
+            Ok(Some(term)) => {
+                state.factory.close(heap);
+                Ok((Some(term), budget - reds))
+            }
+            Ok(None) => {
+                self.result = Some(state);
+                Ok((None, budget))
+            }
+            Err(error) => {
+                state.factory.undo(heap);
+                Err(error)
+            }
+        }
+    }
+
+    /// The loops of `do_match_global_result`: first the position and length integers in
+    /// `fad[i].epos/elen`, then the tuples and conses from the tail of the match list.
+    fn match_slice(
+        walk: &SearchWalk,
+        heap: &mut ProcessHeap,
+        state: &mut GlobalResult,
+        reds: &mut usize,
+        size: usize,
+    ) -> Result<Option<Term>, BifError> {
+        let limit = |_: arinsal_term::TermError| BifError::SystemLimit;
+        if !state.numbers_done {
+            let mut i = state.head as usize;
+            while i < size {
+                *reds = reds.saturating_sub(1);
+                if *reds == 0 {
+                    state.head = i as isize;
+                    return Ok(None);
+                }
+                let (position, length) = walk.match_at(i).expect("recorded match");
+                let mut builder = TermBuilder::new(&mut *heap);
+                let epos = builder.int_from_i128(position as i128).map_err(limit)?;
+                let elen = builder.int_from_i128(length as i128).map_err(limit)?;
+                state.epos_elen.push((epos, elen));
+                i += 1;
+            }
+            state.numbers_done = true;
+            state.head = size as isize - 1;
+        }
+        let mut block = state.factory.open(heap);
+        let mut result = Ok(None);
+        let mut i = state.head;
+        while i >= 0 {
+            *reds = reds.saturating_sub(1);
+            if *reds == 0 {
+                state.head = i;
+                break;
+            }
+            let (epos, elen) = state.epos_elen[i as usize];
+            let mut builder = TermBuilder::new(&mut block);
+            let built = builder
+                .tuple(&[epos, elen])
+                .and_then(|tuple| builder.cons(tuple, state.term));
+            match built {
+                Ok(term) => state.term = term,
+                Err(error) => {
+                    result = Err(limit(error));
+                    break;
+                }
+            }
+            i -= 1;
+        }
+        if i < 0 {
+            result = Ok(Some(state.term));
+        }
+        state.factory.park(block);
+        result
+    }
+
+    /// The loop of `do_split_global_result`: pieces from the last match backwards, empty pieces
+    /// dropped under `trim`/`trim_all`, then the prefix before the first match.
+    fn split_slice(
+        &self,
+        heap: &mut ProcessHeap,
+        state: &mut GlobalResult,
+        reds: &mut usize,
+    ) -> Result<Option<Term>, BifError> {
+        let limit = |_: arinsal_term::TermError| BifError::SystemLimit;
+        let mut block = state.factory.open(heap);
+        let mut result = Ok(None);
+        let mut i = state.head;
+        while i >= 0 {
+            *reds = reds.saturating_sub(1);
+            if *reds == 0 {
+                // `ctx->flags &= ~BF_FLAG_SPLIT_TRIM` once a piece was kept is `trim_pending`.
+                state.head = i;
+                state.factory.park(block);
+                return Ok(None);
+            }
+            let (position, length) = self.walk.match_at(i as usize).expect("recorded match");
+            let start = position + length;
+            let piece_len = state.end_pos - start;
+            if !(piece_len == 0 && (self.split_trim_all || state.trim_pending)) {
+                let mut builder = TermBuilder::new(&mut block);
+                let built = builder
+                    .sub_binary_bif(self.subject, start * 8, piece_len * 8)
+                    .and_then(|piece| builder.cons(piece, state.term));
+                match built {
+                    Ok(term) => state.term = term,
+                    Err(error) => {
+                        result = Err(limit(error));
+                        break;
+                    }
+                }
+                state.trim_pending = false;
+            }
+            state.end_pos = position;
+            i -= 1;
+        }
+        if i < 0 {
+            state.head = -1;
+            if !(state.end_pos == 0 && (self.split_trim_all || state.trim_pending)) {
+                let mut builder = TermBuilder::new(&mut block);
+                let built = builder
+                    .sub_binary_bif(self.subject, 0, state.end_pos * 8)
+                    .and_then(|piece| builder.cons(piece, state.term));
+                result = match built {
+                    Ok(term) => Ok(Some(term)),
+                    Err(error) => Err(limit(error)),
+                };
+            } else {
+                result = Ok(Some(state.term));
+            }
+        }
+        state.factory.park(block);
+        result
+    }
+
+    /// The results that need no result phase: `found` of a first match, the single-split
+    /// result and the `not_found` callbacks.
+    // Port of erts/emulator/beam/erl_bif_binary.c (do_match_single_result,
+    // do_match_not_found_result, do_split_single_result, do_split_not_found_result),
+    // OTP-29.1.1.
+    fn finish<H: HeapAlloc + ?Sized>(&self, heap: &mut H) -> Result<Term, BifError> {
         let found_count = self.walk.match_count();
         match self.kind {
             BinarySearchKind::Match => match self.walk.match_at(0) {
                 Some((position, length)) => match_result(heap, position, length),
                 None => Ok(Term::atom(global_atoms().intern("nomatch").expect("atom"))),
             },
-            BinarySearchKind::Matches => {
-                let mut builder = TermBuilder::new(heap);
-                let mut result = Term::NIL;
-                for index in (0..found_count).rev() {
-                    let (position, length) = self
-                        .walk
-                        .match_at(index)
-                        .expect("match count matches recorded search results");
-                    let position = builder
-                        .int_from_i128(position as i128)
-                        .map_err(|_| BifError::SystemLimit)?;
-                    let length = builder
-                        .int_from_i128(length as i128)
-                        .map_err(|_| BifError::SystemLimit)?;
-                    let tuple = builder
-                        .tuple(&[position, length])
-                        .map_err(|_| BifError::SystemLimit)?;
-                    result = builder
-                        .cons(tuple, result)
-                        .map_err(|_| BifError::SystemLimit)?;
-                }
-                Ok(result)
-            }
+            BinarySearchKind::Matches => Ok(Term::NIL),
             BinarySearchKind::Split => {
+                let limit = |_: arinsal_term::TermError| BifError::SystemLimit;
+                let mut builder = TermBuilder::new(heap);
                 if found_count == 0 {
                     if (self.split_trim || self.split_trim_all) && self.walk.len() == 0 {
                         return Ok(Term::NIL);
                     }
-                    return TermBuilder::new(heap)
-                        .cons(self.subject, Term::NIL)
-                        .map_err(|_| BifError::SystemLimit);
+                    return builder.cons(self.subject, Term::NIL).map_err(limit);
                 }
-
-                let mut builder = TermBuilder::new(heap);
-                let mut result = Term::NIL;
-                let mut end = self.walk.len();
-                let mut trim_tail = self.split_trim;
-                for index in (0..found_count).rev() {
-                    let (position, length) = self
-                        .walk
-                        .match_at(index)
-                        .expect("match count matches recorded search results");
-                    let start = position + length;
-                    let segment_len = end - start;
-                    if segment_len != 0 || (!self.split_trim_all && !trim_tail) {
-                        let segment = builder
-                            .sub_binary_bif(self.subject, start * 8, segment_len * 8)
-                            .map_err(|_| BifError::SystemLimit)?;
-                        result = builder
-                            .cons(segment, result)
-                            .map_err(|_| BifError::SystemLimit)?;
-                        trim_tail = false;
+                let (position, length) = self.walk.match_at(0).expect("recorded match");
+                let end = position + length;
+                if (self.split_trim || self.split_trim_all) && self.walk.len() == end {
+                    if position == 0 {
+                        return Ok(Term::NIL);
                     }
-                    end = position;
+                    let first = builder
+                        .sub_binary_bif(self.subject, 0, position * 8)
+                        .map_err(limit)?;
+                    return builder.cons(first, Term::NIL).map_err(limit);
                 }
-                if end != 0 || (!self.split_trim_all && !trim_tail) {
-                    let prefix = builder
-                        .sub_binary_bif(self.subject, 0, end * 8)
-                        .map_err(|_| BifError::SystemLimit)?;
-                    result = builder
-                        .cons(prefix, result)
-                        .map_err(|_| BifError::SystemLimit)?;
+                let first = if self.split_trim_all && position == 0 {
+                    None
+                } else {
+                    Some(
+                        builder
+                            .sub_binary_bif(self.subject, 0, position * 8)
+                            .map_err(limit)?,
+                    )
+                };
+                let rest = builder
+                    .sub_binary_bif(self.subject, end * 8, (self.walk.len() - end) * 8)
+                    .map_err(limit)?;
+                let mut ret = builder.cons(rest, Term::NIL).map_err(limit)?;
+                if let Some(first) = first {
+                    ret = builder.cons(first, ret).map_err(limit)?;
                 }
-                Ok(result)
+                Ok(ret)
             }
         }
     }
 }
+
+/// `BinaryFindAllContext` result-phase fields of the trap context (`fa->head`, `fa->term`,
+/// `fa->end_pos`, `fa->factory`, the `epos`/`elen` of `FindallData`).
+// Port of erts/emulator/beam/erl_bif_binary.c (BinaryFindAllContext), OTP-29.1.1.
+struct GlobalResult {
+    factory: HeapFactory,
+    epos_elen: Vec<(Term, Term)>,
+    head: isize,
+    /// `fa->end_pos == 1` of the match list: all integers are built.
+    numbers_done: bool,
+    end_pos: usize,
+    term: Term,
+    /// `BF_FLAG_SPLIT_TRIM` while it is still set in `ctx->flags`.
+    trim_pending: bool,
+}
+
+/// `BUILD_SUB_BITSTRING_HEAP_NEED`: `MAX(ERL_SUB_BITS_SIZE, heap_bits_size(ERL_ONHEAP_BITS_LIMIT))`.
+const BUILD_SUB_BITSTRING_HEAP_NEED: usize = 10;
 
 // Port of erts/emulator/beam/erl_bif_binary.c:1840-1850 (match result), OTP-29.1.1.
 fn match_result<H: HeapAlloc + ?Sized>(
@@ -1350,8 +1507,12 @@ fn binary_find(
         Err(error) => return bif_ret(c_p, i, Err(find_error(error))),
     };
     let initial = get_reds(process);
-    let (done, work) = search.step(initial);
-    if !done {
+    let stepped = search.step(&mut process.heap, initial);
+    let (result, work) = match stepped {
+        Ok(stepped) => stepped,
+        Err(error) => return bif_ret(c_p, i, Err(find_error(error))),
+    };
+    let Some(result) = result else {
         // The context leaves the stack for a magic binary and collection is disabled while
         // the call is parked.
         // `bf_context_export`: the context and the compiled pattern each get a magic binary,
@@ -1376,23 +1537,9 @@ fn binary_find(
         process.heap.abi.fcalls = 0;
         let trap = bif_trap(process, BINARY_FIND_TRAP, vec![args[0], mref, pat_term]);
         return bif_ret(c_p, i, Err(trap));
-    }
+    };
     charge(process, work / SEARCH_LOOP_FACTOR);
-    find_result(c_p, i, process, &search)
-}
-
-/// The result of a finished search (`found` / `not_found` callbacks).
-fn find_result(
-    c_p: *mut ProcessHeader,
-    i: u64,
-    process: &mut crate::Process,
-    search: &BinarySearchWalk,
-) -> u64 {
-    let mut heap = ProcessHeapHandle(&mut process.heap);
-    match search.finish(&mut heap) {
-        Ok(value) => crate::native_hooks::raw(value),
-        Err(error) => bif_ret(c_p, i, Err(find_error(error))),
-    }
+    crate::native_hooks::raw(result)
 }
 
 /// `binary:match/2`.
@@ -1441,23 +1588,19 @@ pub(crate) extern "C" fn binary_find_trap(c_p: *mut ProcessHeader, reg: *mut u64
         let search = &mut holder.0;
         // `ctx->pat_bin = pat_bin`.
         search.set_pattern(pat_bin);
-        let (done, work) = search.step(initial);
-        if !done {
-            return (false, work, None);
-        }
-        let mut heap = ProcessHeapHandle(&mut process.heap);
-        (true, work, Some(search.finish(&mut heap)))
+        search.step(&mut process.heap, initial)
     });
     match stepped {
-        Some((true, work, Some(result))) => {
+        Some(Ok((Some(value), work))) => {
             process.set_gc_enabled(true);
             charge(process, work / SEARCH_LOOP_FACTOR);
-            match result {
-                Ok(value) => crate::native_hooks::raw(value),
-                Err(error) => bif_ret(c_p, i, Err(find_error(error))),
-            }
+            crate::native_hooks::raw(value)
         }
-        Some(_) => {
+        Some(Err(error)) => {
+            process.set_gc_enabled(true);
+            bif_ret(c_p, i, Err(find_error(error)))
+        }
+        Some(Ok((None, _))) => {
             let trap = bif_trap(process, BINARY_FIND_TRAP, vec![subject, mref, pattern]);
             bif_ret(c_p, i, Err(trap))
         }

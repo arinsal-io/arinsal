@@ -49,3 +49,43 @@ valid(_, _, _) -> true.
         .unwrap();
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
+
+/// A 2 MB subject with 500000 matches traps many times in the search phase and in the result
+/// phase (`BFResult`) of `matches/2,3` and `split/3 [global]`; results and reductions equal OTP.
+#[test]
+fn binary_global_result_phase_matches_otp_results_and_reductions() {
+    let reference = RefErl::start().expect("OTP 29 reference");
+    let source = r#"
+-module(binary_global_result_differential).
+-export([run/0]).
+reds(F) ->
+    erlang:garbage_collect(),
+    erlang:yield(),
+    {reductions, B} = process_info(self(), reductions),
+    R = F(),
+    {reductions, A} = process_info(self(), reductions),
+    {A - B, erlang:phash2(R), if is_list(R) -> length(R); true -> 0 end}.
+run() ->
+    process_flag(min_heap_size, 20000000),
+    Subject = binary:copy(<<"abc,">>, 524288),
+    Tail = iolist_to_binary([Subject, <<"abc,,">>]),
+    BM = binary:compile_pattern(<<",">>),
+    AC = binary:compile_pattern([<<",">>, <<"bc">>]),
+    Calls = [fun(S) -> binary:matches(S, BM) end,
+             fun(S) -> binary:matches(S, AC) end,
+             fun(S) -> binary:matches(S, <<"c,">>, [{scope, {10, 2000000}}]) end,
+             fun(S) -> binary:split(S, BM, [global]) end,
+             fun(S) -> binary:split(S, AC, [global, trim]) end,
+             fun(S) -> binary:split(S, BM, [global, trim_all]) end,
+             fun(S) -> binary:split(S, <<"c,">>, [global, trim, {scope, {5, 2000000}}]) end],
+    [reds(fun() -> C(S) end) || S <- [Subject, Tail], C <- Calls].
+"#;
+    let module = "binary_global_result_differential";
+    let beam = reference.compile_named(module, source, &[]).unwrap();
+    reference.load(module, &beam).unwrap();
+    let expected = reference.call(module, "run", &[]);
+    let mut vm = crate::common::node();
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm.eval_scheduled(module, "run", &[], 1).unwrap();
+    assert_eq!(expected, CallResult::Ok(actual.term));
+}
