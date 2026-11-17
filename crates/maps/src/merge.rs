@@ -5,6 +5,7 @@
 use super::{
     LIMIT, MAP, MAP_HEADER_FLATMAP, MapError, MapResult, bits, boxed, exact_cmp, key_cmp, term,
 };
+use crate::raw::{HamtChildren, HamtCursor};
 use arinsal_term::{HeapAlloc, Term, TermBuilder, TermError, WStack, exact_eq};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
@@ -367,24 +368,24 @@ pub fn flatmap_merge<H: HeapAlloc + ?Sized>(
 /// One level of the parallel HAMT walk (`struct HashmapMergePStackType`).
 ///
 /// Port of erts/emulator/beam/erl_map.c:1467-1476, OTP-29.1.1. `srcA`/`srcB`
-/// are pointers into the parent's child words in erts; here they are a slice
-/// and an index, while the root terms begin in the first frame's node fields.
+/// are pointers into the parent's child words, while the root terms begin in the
+/// first frame's node fields.
 struct Frame {
     node_a: Term,
     node_b: Term,
-    src_a: Src,
-    src_b: Src,
+    src_a: HamtCursor,
+    src_b: HamtCursor,
     abm: u32,
     bbm: u32,
     rbm: u32,
     /// `&1`: unique A content in this node; `&2`: unique B content.
     mix: u8,
     ix: usize,
-    array: [u64; 16],
+    children: HamtChildren,
 }
 
 impl Frame {
-    fn new(node_a: Term, node_b: Term, src_a: Src, src_b: Src) -> Self {
+    fn new(node_a: Term, node_b: Term, src_a: HamtCursor, src_b: HamtCursor) -> Self {
         Self {
             node_a,
             node_b,
@@ -395,40 +396,8 @@ impl Frame {
             rbm: 0,
             mix: 0,
             ix: 0,
-            array: [0; 16],
+            children: HamtChildren::new(),
         }
-    }
-}
-
-/// Safe slice cursor matching erts's advancing `Eterm*` source pointers.
-#[derive(Clone, Copy)]
-struct Src {
-    words: &'static [u64],
-    index: usize,
-}
-impl Src {
-    const fn empty() -> Self {
-        Self {
-            words: &[],
-            index: 0,
-        }
-    }
-
-    fn current(self) -> Term {
-        term(self.words[self.index])
-    }
-
-    // Port of `*srcA++` / `*srcB++` in erl_map.c:1758-1763, OTP-29.1.1.
-    fn next(&mut self) -> Term {
-        let value = term(self.words[self.index]);
-        self.index += 1;
-        value
-    }
-    fn advance(&mut self) {
-        self.index += 1;
-    }
-    fn get_at(self, offset: usize) -> Term {
-        term(self.words[self.index + offset])
     }
 }
 
@@ -464,7 +433,12 @@ impl HashmapMergeContext {
             (map_a, map_b)
         };
         let mut stack = WStack::new();
-        stack.push(Frame::new(src_a, src_b, Src::empty(), Src::empty()));
+        stack.push(Frame::new(
+            src_a,
+            src_b,
+            HamtCursor::empty(),
+            HamtCursor::empty(),
+        ));
         Self {
             size: hashmap_size(map_a) + hashmap_size(map_b),
             lvl: 0,
@@ -478,9 +452,9 @@ impl HashmapMergeContext {
 
 // Port of erts/emulator/beam/erl_map.c:1510-1555 (merge_collision_node), OTP-29.1.1.
 fn merge_collision_node<H: HeapAlloc + ?Sized>(
-    src_a: Src,
+    src_a: HamtCursor,
     sz_a: usize,
-    src_b: Src,
+    src_b: HamtCursor,
     sz_b: usize,
     map_size: &mut usize,
     heap: &mut H,
@@ -541,7 +515,7 @@ fn merge_collision_node<H: HeapAlloc + ?Sized>(
 // Port of erts/emulator/beam/erl_map.c:1615-1679 (hashmap_merge), OTP-29.1.1.
 // Keep this in the traversal loop like erts; an out-of-line call is measurable here.
 #[inline(always)]
-fn open_node(node: Term, src: &mut Src, lvl: usize, bm: &mut u32, coll_sz: &mut usize) {
+fn open_node(node: Term, src: &mut HamtCursor, lvl: usize, bm: &mut u32, coll_sz: &mut usize) {
     if is_leaf(node) {
         if lvl < HAMT_MAX_LEVEL {
             // hashmap_restore_hash + hashmap_index
@@ -558,34 +532,24 @@ fn open_node(node: Term, src: &mut Src, lvl: usize, bm: &mut u32, coll_sz: &mut 
         debug_assert!(lvl < HAMT_MAX_LEVEL);
         match (header >> 6) & 3 {
             HEAD_ARRAY => {
-                *src = Src {
-                    words: &boxed_words(node, 18)[2..],
-                    index: 0,
-                };
+                *src = HamtCursor::from_words(&boxed_words(node, 18)[2..]);
                 *bm = 0xffff;
             }
             HEAD_BITMAP => {
                 *bm = ((header >> 16) & 0xffff) as u32;
-                *src = Src {
-                    words: &boxed_words(node, 2 + bm.count_ones() as usize)[2..],
-                    index: 0,
-                };
+                *src =
+                    HamtCursor::from_words(&boxed_words(node, 2 + bm.count_ones() as usize)[2..]);
             }
             _ => {
                 *bm = ((header >> 16) & 0xffff) as u32;
-                *src = Src {
-                    words: &boxed_words(node, 1 + bm.count_ones() as usize)[1..],
-                    index: 0,
-                };
+                *src =
+                    HamtCursor::from_words(&boxed_words(node, 1 + bm.count_ones() as usize)[1..]);
             }
         }
     } else {
         debug_assert_eq!(lvl, HAMT_MAX_LEVEL);
         *coll_sz = (header >> 6) as usize;
-        *src = Src {
-            words: &boxed_words(node, 1 + *coll_sz)[1..],
-            index: 0,
-        };
+        *src = HamtCursor::from_words(&boxed_words(node, 1 + *coll_sz)[1..]);
         debug_assert!(*coll_sz >= 2);
     }
 }
@@ -675,7 +639,7 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
                     depth -= 1;
                     let child_mix = ctx.stack[depth].mix;
                     let sp = &mut ctx.stack[depth - 1];
-                    sp.array[sp.ix] = bits(child);
+                    sp.children.write(sp.ix, bits(child));
                     sp.ix += 1;
                     sp.mix |= child_mix;
                     if sp.rbm != 0 {
@@ -734,12 +698,12 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
                         clash = true;
                         break;
                     }
-                    sp.array[sp.ix] = bits(sp.src_a.next());
+                    sp.children.write(sp.ix, bits(sp.src_a.next()));
                     sp.ix += 1;
                     sp.mix |= 1;
                 } else {
                     debug_assert!(sp.bbm & bit != 0);
-                    sp.array[sp.ix] = bits(sp.src_b.next());
+                    sp.children.write(sp.ix, bits(sp.src_b.next()));
                     sp.ix += 1;
                     sp.mix |= 2;
                 }
@@ -789,7 +753,7 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
                     // Port of sys_memcpy(hp, sp->array, sp->ix * sizeof(Eterm)),
                     // erl_map.c:1793, OTP-29.1.1.
                     words[header_words..header_words + sp.ix]
-                        .write_copy_of_slice(&sp.array[..sp.ix]);
+                        .write_copy_of_slice(sp.children.prefix(sp.ix));
                     boxed(ptr)
                 }
                 mix => unreachable!("strange mix {mix}"),

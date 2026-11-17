@@ -4,6 +4,94 @@ use crate::{MAP_HEADER_FLATMAP, bits, boxed, key_cmp, term};
 use arinsal_term::{HeapAlloc, Term, TermError};
 use std::cmp::Ordering;
 
+/// Cursor over HAMT child words, matching the advancing `Eterm*` cursors in
+/// `hashmap_merge`.
+// Port of erts/emulator/beam/erl_map.c:1615-1804 (hashmap_merge), OTP-29.1.1.
+#[derive(Clone, Copy)]
+pub(crate) struct HamtCursor {
+    at: *const u64,
+}
+
+// SAFETY: cursors point only into process-owned, non-moving HAMT nodes. A trapped merge disables
+// GC until it resumes or is destroyed, and the owning trap context serializes scheduler access.
+unsafe impl Send for HamtCursor {}
+// SAFETY: shared cursors only read immutable map words; cursor advancement requires `&mut self`.
+unsafe impl Sync for HamtCursor {}
+
+impl HamtCursor {
+    /// Cursor used only until `open_node` replaces it with a live node cursor.
+    pub(crate) const fn empty() -> Self {
+        Self {
+            at: std::ptr::NonNull::<u64>::dangling().as_ptr(),
+        }
+    }
+
+    /// Start at the first child word in a live, non-moving map node.
+    #[inline(always)]
+    pub(crate) fn from_words(words: &'static [u64]) -> Self {
+        Self { at: words.as_ptr() }
+    }
+
+    /// Read the current child without a per-step slice bounds check.
+    #[inline(always)]
+    pub(crate) fn current(self) -> Term {
+        // SAFETY: `open_node` initializes this cursor into a live HAMT node, and the process
+        // heap does not move that node while the merge runs or while its trap state is saved.
+        term(unsafe { self.at.read() })
+    }
+
+    /// Read and advance one child, as `*srcA++` / `*srcB++` do in erts.
+    #[inline(always)]
+    pub(crate) fn next(&mut self) -> Term {
+        let value = self.current();
+        self.at = self.at.wrapping_add(1);
+        value
+    }
+
+    /// Advance over the paired child after a recursive merge.
+    #[inline(always)]
+    pub(crate) fn advance(&mut self) {
+        self.at = self.at.wrapping_add(1);
+    }
+
+    /// Read a collision-node child at an offset from this cursor.
+    #[inline(always)]
+    pub(crate) fn get_at(self, offset: usize) -> Term {
+        // SAFETY: collision-node sizes and the paired source ranges are established by
+        // `hashmap_merge` before `merge_collision_node` reads these offsets.
+        term(unsafe { self.at.wrapping_add(offset).read() })
+    }
+}
+
+/// The fixed sixteen-child output array in one `hashmap_merge` frame.
+// Port of erts/emulator/beam/erl_map.c:1467-1476 (HashmapMergePStackType), OTP-29.1.1.
+#[derive(Clone, Copy)]
+pub(crate) struct HamtChildren([u64; 16]);
+
+impl HamtChildren {
+    pub(crate) const fn new() -> Self {
+        Self([0; 16])
+    }
+
+    /// Store one child selected by the frame's pending bitmap.
+    #[inline(always)]
+    pub(crate) fn write(&mut self, index: usize, value: u64) {
+        debug_assert!(index < self.0.len());
+        // SAFETY: `hashmap_merge` consumes at most the sixteen bits in a HAMT bitmap, so
+        // every output index is within this frame's fixed child array.
+        unsafe { self.0.as_mut_ptr().add(index).write(value) };
+    }
+
+    /// Borrow the initialized prefix copied into a newly allocated HAMT node.
+    #[inline(always)]
+    pub(crate) fn prefix(&self, len: usize) -> &[u64] {
+        debug_assert!(len <= self.0.len());
+        // SAFETY: the merge loop writes every slot in the prefix before node allocation,
+        // and the bitmap bounds `len` to the sixteen-element array.
+        unsafe { std::slice::from_raw_parts(self.0.as_ptr(), len) }
+    }
+}
+
 // Port of erts/emulator/beam/erl_map.c:367-472 (flatmap_from_validated_list), OTP-29.1.1.
 pub(crate) fn flatmap_from_validated_list<H: HeapAlloc + ?Sized>(
     allocated: usize,
