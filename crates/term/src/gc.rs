@@ -95,32 +95,58 @@ impl Default for GcRootSet<'_> {
     }
 }
 
-/// A queued message's live terms and detached heap fragment during process collection.
-// Port of erts/emulator/beam/erl_gc.c `setup_rootset` / `move_msgs_to_heap`, OTP-29.1.1.
-pub struct GcMessageRoot<'a> {
-    term: &'a mut Term,
-    token: Option<&'a mut Term>,
-    heap: Option<crate::message::MessageHeap>,
+/// The private message queue of a process as the collector walks it (`sig_qs`).
+// Port of erts/emulator/beam/erl_gc.c (young_gen_usage, setup_rootset, offset_mqueue,
+// move_msgs_to_heap) and erl_proc_sig_queue.c (erts_proc_sig_move_msgs_to_heap), OTP-29.1.1.
+pub trait GcMessageQueue {
+    /// Words of the data still attached to queued messages (`young_gen_usage` with
+    /// `FS_ON_HEAP_MSGQ`).
+    fn attached_words(&self) -> usize;
+    /// Visit the term slots of each queued message whose data is on the process heap
+    /// (`!mp->data.attached`): roots in `setup_rootset`, offset by `offset_mqueue`.
+    fn for_each_heap_root(&mut self, visit: &mut dyn FnMut(&mut Term));
+    /// Copy the attached data of each queued message onto `heap` and free it
+    /// (`erts_proc_sig_move_msgs_to_heap`), with [`ProcessHeap::move_message_heap`] and
+    /// [`ProcessHeap::move_node_fragment`].
+    fn move_msgs_to_heap(&mut self, heap: &mut ProcessHeap) -> Result<(), TermError>;
 }
 
-impl<'a> GcMessageRoot<'a> {
-    /// Describes mutable message slots while retaining ownership of their detached heap.
-    pub fn new(
-        term: &'a mut Term,
-        token: Option<&'a mut Term>,
-        heap: Option<crate::message::MessageHeap>,
-    ) -> Self {
-        Self { term, token, heap }
+/// A process without queued messages.
+impl GcMessageQueue for () {
+    fn attached_words(&self) -> usize {
+        0
     }
-
-    /// The detached fragment, if this message carries one.
-    pub fn heap(&self) -> Option<&crate::message::MessageHeap> {
-        self.heap.as_ref()
+    fn for_each_heap_root(&mut self, _visit: &mut dyn FnMut(&mut Term)) {}
+    fn move_msgs_to_heap(&mut self, _heap: &mut ProcessHeap) -> Result<(), TermError> {
+        Ok(())
     }
+}
 
-    /// Takes the detached fragment so its queue node can reclaim it after collection.
-    pub fn take_heap(&mut self) -> Option<crate::message::MessageHeap> {
-        self.heap.take()
+/// Messages as `(term, seq_trace token, attached data)`: the data is `None` once on the heap.
+impl GcMessageQueue for &mut [(Term, Term, Option<crate::message::MessageHeap>)] {
+    fn attached_words(&self) -> usize {
+        self.iter()
+            .filter_map(|(_, _, heap)| heap.as_ref())
+            .map(crate::message::MessageHeap::message_data_size)
+            .fold(0usize, usize::saturating_add)
+    }
+    fn for_each_heap_root(&mut self, visit: &mut dyn FnMut(&mut Term)) {
+        for (term, token, heap) in self.iter_mut() {
+            if heap.is_none() {
+                visit(term);
+                visit(token);
+            }
+        }
+    }
+    fn move_msgs_to_heap(&mut self, heap: &mut ProcessHeap) -> Result<(), TermError> {
+        for (term, token, data) in self.iter_mut() {
+            if let Some(data) = data.take() {
+                let mut refs = [*term, *token];
+                heap.move_message_heap(data, &mut refs)?;
+                [*term, *token] = refs;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1425,16 +1451,17 @@ impl ProcessHeap {
         extra: &mut [Term],
         min_free: usize,
     ) -> Result<GcStats, TermError> {
-        self.collect_with_messages(roots, extra, min_free, &mut [])
+        let mut root_slots = GcRootSet::new();
+        root_slots.push(roots);
+        let mut extra_slots = GcRootSet::new();
+        extra_slots.push(extra);
+        self.collect_with_root_slots(&mut root_slots, &mut extra_slots, min_free, &mut (), false)
     }
 
     /// [`ProcessHeap::collect`] for a process with an on-heap message queue: `messages`
-    /// holds the queued messages whose data is still in their own heap fragment
-    /// (`ErtsMessage` with `data.attached`). Their size counts as young-generation usage,
-    /// and after copying they are moved onto the new heap; each moved entry's heap
-    /// becomes `None` and its term points into this heap. The second element of an
-    /// entry is the sequential trace token copied into the same fragment (`NIL` when
-    /// there is none); it moves with the fragment like the message term.
+    /// holds the queued messages as `(term, seq_trace token, attached data)`. The attached
+    /// data counts as young-generation usage, and after copying it moves onto the new heap;
+    /// each moved entry's data becomes `None` and its term and token point into this heap.
     // Port of erts/emulator/beam/erl_gc.c:606-644 (young_gen_usage, FS_ON_HEAP_MSGQ) and
     // erl_gc.c:1500-1501, 1947-1948 (move_msgs_to_heap after do_minor/do_major), OTP-29.1.1.
     pub fn collect_with_messages(
@@ -1448,33 +1475,26 @@ impl ProcessHeap {
         root_slots.push(roots);
         let mut extra_slots = GcRootSet::new();
         extra_slots.push(extra);
-        let mut message_roots: Vec<_> = messages
-            .iter_mut()
-            .map(|(term, token, heap)| GcMessageRoot::new(term, Some(token), heap.take()))
-            .collect();
-        let result = self.collect_with_root_slots(
+        let mut messages = messages;
+        self.collect_with_root_slots(
             &mut root_slots,
             &mut extra_slots,
             min_free,
-            &mut message_roots,
-        );
-        let heaps: Vec<_> = message_roots
-            .into_iter()
-            .map(|mut message| message.take_heap())
-            .collect();
-        for ((_, _, heap), moved) in messages.iter_mut().zip(heaps) {
-            *heap = moved;
-        }
-        result
+            &mut messages,
+            true,
+        )
     }
 
     /// Collect using roots that remain in their owning structures while they are rewritten.
+    /// `msgq` is the private message queue; `on_heap_msgq` is `FS_ON_HEAP_MSGQ`: its attached
+    /// data counts as young usage and moves onto the heap after the copy.
     pub fn collect_with_root_slots<'a>(
         &mut self,
         roots: &mut GcRootSet<'a>,
         extra: &mut GcRootSet<'a>,
         min_free: usize,
-        messages: &mut [GcMessageRoot<'_>],
+        msgq: &mut dyn GcMessageQueue,
+        on_heap_msgq: bool,
     ) -> Result<GcStats, TermError> {
         self.sync_mbuf_fast();
         crate::validate::check_heap_bits_if_active(self, "before collection");
@@ -1484,11 +1504,11 @@ impl ProcessHeap {
         // Port of erl_gc.c:418-476 (`erts_gc_after_bif_call_lhf`): the fragments the BIF just
         // allocated are known live.
         let live_from = self.take_live_frags_from();
-        let message_words = messages
-            .iter()
-            .filter_map(|message| message.heap.as_ref())
-            .map(crate::message::MessageHeap::message_data_size)
-            .fold(0usize, usize::saturating_add);
+        let message_words = if on_heap_msgq {
+            msgq.attached_words()
+        } else {
+            0
+        };
         let abandoned = self.abandoned_heap();
         let abandoned_mature = abandoned.map_or((0, 0), |abandoned| {
             (abandoned.start, abandoned.start + abandoned.high_water * 8)
@@ -1680,12 +1700,9 @@ impl ProcessHeap {
         }
         roots.evacuate::<false>(&mut copier, &mut n_htop, &mut old_htop);
         extra.evacuate::<false>(&mut copier, &mut n_htop, &mut old_htop);
-        for message in messages.iter_mut().filter(|message| message.heap.is_none()) {
-            message.term.0 = copier.evacuate::<false>(message.term.0, &mut n_htop, &mut old_htop);
-            if let Some(token) = message.token.as_deref_mut() {
-                token.0 = copier.evacuate::<false>(token.0, &mut n_htop, &mut old_htop);
-            }
-        }
+        msgq.for_each_heap_root(&mut |term| {
+            term.0 = copier.evacuate::<false>(term.0, &mut n_htop, &mut old_htop);
+        });
         // Port of erts/emulator/beam/erl_gc.c:1679-1720 (do_minor root loop over the stack)
         // and erl_gc.c:520 (copy_erlang_stack), OTP-29.1.1: words with the header tag are
         // continuation pointers or frame pointers; only frame pointers into the stack move.
@@ -1732,13 +1749,18 @@ impl ProcessHeap {
             // An empty `Vec` owns no allocation: skip the drop glue call.
             std::mem::forget(spare);
         }
-        let adjusted = if messages.is_empty() {
-            self.adjust_young_heap(major, min_free, roots, extra, None)?
-        } else {
-            self.move_msgs_to_heap(messages)?;
-            // erts resize_new_heap offsets the on-heap queue with the rest of the root set.
-            self.adjust_young_heap(major, min_free, roots, extra, Some(messages))?
-        };
+        // Port of erts/emulator/beam/erl_gc.c:203-217 (move_msgs_to_heap) as called at
+        // erl_gc.c:1500-1501 and 1947-1948, OTP-29.1.1: after the copy, before the resize.
+        if on_heap_msgq {
+            let pre_overhead = self.bin_vheap;
+            msgq.move_msgs_to_heap(self)?;
+            if pre_overhead != self.bin_vheap {
+                self.bin_vheap_size =
+                    next_vheap_size(self.bin_vheap, self.bin_vheap_size, self.owners.vheap_min());
+            }
+        }
+        // erts resize_new_heap offsets the on-heap queue with the rest of the root set.
+        let adjusted = self.adjust_young_heap(major, min_free, roots, extra, msgq)?;
         // erl_gc.c:1506/1952: `size_after` includes the moved message data.
         let copied = self.htop_index() as u64;
         #[cfg(debug_assertions)]
@@ -1796,16 +1818,12 @@ impl ProcessHeap {
     /// the major-collection check when the minor collection would fall back.
     // Port of erts/emulator/beam/erl_gc.c:1441-1455 (`minor_collection`) and
     // erts/emulator/beam/erl_gc.c:1875-1904 (`major_collection`), OTP-29.1.1.
-    pub fn max_heap_collection_checks<'a>(
+    /// `message_words` is the attached message data `young_gen_usage` counts.
+    pub fn max_heap_collection_checks(
         &self,
         min_free: usize,
-        message_heaps: impl IntoIterator<Item = &'a Option<crate::message::MessageHeap>>,
+        message_words: usize,
     ) -> Result<(usize, Option<usize>), TermError> {
-        let message_words = message_heaps
-            .into_iter()
-            .filter_map(Option::as_ref)
-            .map(crate::message::MessageHeap::message_data_size)
-            .fold(0usize, usize::saturating_add);
         let source_words = self
             .young_gen_usage()
             .checked_add(message_words)
@@ -1879,7 +1897,7 @@ impl ProcessHeap {
         root_slots.push(roots);
         let mut extra_slots = GcRootSet::new();
         extra_slots.push(extra);
-        self.collect_hibernate_root_slots(&mut root_slots, &mut extra_slots)
+        self.collect_hibernate_root_slots(&mut root_slots, &mut extra_slots, &mut ())
     }
 
     /// Hibernate after collecting roots in their owning structures.
@@ -1887,9 +1905,10 @@ impl ProcessHeap {
         &mut self,
         roots: &mut GcRootSet<'a>,
         extra: &mut GcRootSet<'a>,
+        msgq: &mut dyn GcMessageQueue,
     ) -> Result<GcStats, TermError> {
         self.request_full_sweep();
-        let stats = self.collect_with_root_slots(roots, extra, 0, &mut [])?;
+        let stats = self.collect_with_root_slots(roots, extra, 0, msgq, false)?;
         self.fragments.clear();
         self.mbuf_fast = crate::heap::MbufFast::default();
         self.abandoned = false;
@@ -1899,7 +1918,7 @@ impl ProcessHeap {
             .saturating_add(S_RESERVED)
             .saturating_add(self.stack_words());
         if exact != self.words.len() {
-            self.relocate_young(exact, roots, extra, None);
+            self.relocate_young(exact, roots, extra, msgq);
         }
         self.heap_grow = false;
         Ok(stats)
@@ -1912,7 +1931,7 @@ impl ProcessHeap {
         min_free: usize,
         roots: &mut GcRootSet<'a>,
         extra: &mut GcRootSet<'a>,
-        messages: Option<&mut [GcMessageRoot<'_>]>,
+        msgq: &mut dyn GcMessageQueue,
     ) -> Result<bool, TermError> {
         let stack = self.stack_words();
         let need_after = self
@@ -1965,93 +1984,82 @@ impl ProcessHeap {
         if let Some(wanted) = wanted
             && wanted != capacity
         {
-            self.relocate_young(wanted, roots, extra, messages);
+            self.relocate_young(wanted, roots, extra, msgq);
             return Ok(true);
         }
         Ok(false)
     }
 
-    /// Move queued message fragments onto the heap top, rebasing their pointers, and free
-    /// the fragments. The collection sized the heap to hold them.
-    // Port of erts/emulator/beam/erl_proc_sig_queue.c:8851-8889 (move_msg_to_heap,
-    // erts_proc_sig_move_msgs_to_heap), erl_gc.c:2514-2611 (erts_copy_one_frag) and
-    // copy.c:2049 (erts_move_multi_frags), OTP-29.1.1.
-    fn move_msgs_to_heap(&mut self, messages: &mut [GcMessageRoot<'_>]) -> Result<(), TermError> {
-        let pre_overhead = self.bin_vheap;
-        for message in messages.iter_mut() {
-            let Some(mut data) = message.heap.take() else {
-                continue;
-            };
-            let mut blocks: Vec<&[u64]> = Vec::new();
-            match &data {
-                crate::message::MessageHeap::Heap(fragment) => {
-                    blocks.push(fragment.words());
-                }
-                crate::message::MessageHeap::Node(fragment) => blocks.push(fragment.words()),
+    /// Copy the attached data of a queued message onto the heap top, rebase `refs` (the
+    /// message term and its seq_trace token) and adopt its off-heap objects; the data is
+    /// freed. The collection sized the heap to hold it.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:8851-8880 (move_msg_to_heap) and
+    // erl_gc.c:2514-2611 (erts_copy_one_frag), OTP-29.1.1.
+    pub fn move_message_heap(
+        &mut self,
+        mut data: crate::message::MessageHeap,
+        refs: &mut [Term],
+    ) -> Result<(), TermError> {
+        match &mut data {
+            crate::message::MessageHeap::Heap(fragment) => {
+                let range = self.copy_one_frag(fragment.words(), refs)?;
+                rebase_binref_chains_to_range(&mut fragment.off_heap, range);
+                self.absorb_off_heap(std::mem::take(&mut fragment.off_heap), fragment.bin_vheap);
             }
-            let words = blocks.iter().map(|block| block.len()).sum::<usize>();
-            if self.htop_index().saturating_add(words) > self.stop_index() {
-                return Err(TermError::SystemLimit);
-            }
-            let start = self.htop_index();
-            let mut ranges = Vec::with_capacity(blocks.len());
-            for block in blocks {
-                let at = self.htop_index();
-                self.words.words_mut()[at..at + block.len()].copy_from_slice(block);
-                ranges.push(MoveRange {
-                    old_start: block.as_ptr() as usize,
-                    old_end: block.as_ptr() as usize + block.len() * 8,
-                    new_start: self.words.as_ptr() as usize + at * 8,
-                });
-                self.set_htop_index(self.htop_index() + (block.len()));
-            }
-            let base = self
-                .words
-                .as_ptr()
-                .cast::<u64>()
-                .cast_mut()
-                .wrapping_add(start);
-            // erts_copy_one_frag offsets every non-literal pointer by the fragment's distance;
-            // pointers of a multi-fragment message are rebased per source block.
-            for range in &ranges {
-                offset_young_objects(base, words, range.old_start, range.old_end, range.new_start);
-                message.term.0 = offset_word(message.term.0, *range);
-                if let Some(token) = message.token.as_deref_mut() {
-                    token.0 = offset_word(token.0, *range);
-                }
-            }
-            // The message heap is released after this loop. Its BinRef nodes live in
-            // the copied blocks too, so move both intrusive lists before adopting them.
-            match &mut data {
-                crate::message::MessageHeap::Heap(fragment) => {
-                    rebase_binref_chains_to_ranges(
-                        &mut fragment.off_heap.off_heap_first,
-                        &mut fragment.off_heap.wrt_bins,
-                        &ranges,
-                    );
-                    self.absorb_off_heap(
-                        std::mem::take(&mut fragment.off_heap),
-                        fragment.bin_vheap,
-                    );
-                }
-                crate::message::MessageHeap::Node(fragment) => {
-                    let lists = fragment.owners_mut();
-                    rebase_binref_chains_to_ranges(
-                        &mut lists.off_heap_first,
-                        &mut lists.wrt_bins,
-                        &ranges,
-                    );
-                    let (off_heap, bin_vheap) = fragment.take_owners();
-                    self.absorb_off_heap(off_heap, bin_vheap);
-                }
+            crate::message::MessageHeap::Node(fragment) => {
+                let range = self.copy_one_frag(fragment.words(), refs)?;
+                rebase_binref_chains_to_range(fragment.owners_mut(), range);
+                let (off_heap, bin_vheap) = fragment.take_owners();
+                self.absorb_off_heap(off_heap, bin_vheap);
             }
         }
-        // Port of erts/emulator/beam/erl_gc.c:203-217 (move_msgs_to_heap), OTP-29.1.1.
-        if pre_overhead != self.bin_vheap {
-            self.bin_vheap_size =
-                next_vheap_size(self.bin_vheap, self.bin_vheap_size, self.owners.vheap_min());
-        }
+        // free_message_buffer
+        drop(data);
         Ok(())
+    }
+
+    /// [`ProcessHeap::move_message_heap`] for data in the inline fragment of a queued node:
+    /// the words are copied out and the fragment is left empty in its node.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:8851-8880 (move_msg_to_heap) and
+    // erl_gc.c:2514-2611 (erts_copy_one_frag), OTP-29.1.1.
+    pub fn move_node_fragment(
+        &mut self,
+        mut fragment: crate::message::FragmentMut<'_>,
+        refs: &mut [Term],
+    ) -> Result<(), TermError> {
+        let range = self.copy_one_frag(fragment.words(), refs)?;
+        rebase_binref_chains_to_range(fragment.owners_mut(), range);
+        let (off_heap, bin_vheap) = fragment.take_data();
+        self.absorb_off_heap(off_heap, bin_vheap);
+        Ok(())
+    }
+
+    /// Copy `block` onto the heap top and offset its pointers and `refs` by the distance.
+    // Port of erts/emulator/beam/erl_gc.c:2514-2611 (erts_copy_one_frag), OTP-29.1.1.
+    fn copy_one_frag(&mut self, block: &[u64], refs: &mut [Term]) -> Result<MoveRange, TermError> {
+        let words = block.len();
+        if self.htop_index().saturating_add(words) > self.stop_index() {
+            return Err(TermError::SystemLimit);
+        }
+        let at = self.htop_index();
+        self.words.words_mut()[at..at + words].copy_from_slice(block);
+        let range = MoveRange {
+            old_start: block.as_ptr() as usize,
+            old_end: block.as_ptr() as usize + words * 8,
+            new_start: self.words.as_ptr() as usize + at * 8,
+        };
+        self.set_htop_index(at + words);
+        let base = self
+            .words
+            .as_ptr()
+            .cast::<u64>()
+            .cast_mut()
+            .wrapping_add(at);
+        offset_young_objects(base, words, range.old_start, range.old_end, range.new_start);
+        for term in refs {
+            term.0 = offset_word(term.0, range);
+        }
+        Ok(range)
     }
 
     /// Resize the young heap with `ERTS_HEAP_REALLOC`. When the block stays put, only
@@ -2063,7 +2071,7 @@ impl ProcessHeap {
         new_words: usize,
         roots: &mut GcRootSet<'a>,
         extra: &mut GcRootSet<'a>,
-        messages: Option<&mut [GcMessageRoot<'_>]>,
+        msgq: &mut dyn GcMessageQueue,
     ) {
         let stack = self.stack_words();
         let htop_index = self.htop_index();
@@ -2134,14 +2142,8 @@ impl ProcessHeap {
             );
             roots.for_each_mut(|term| term.0 = offset_word(term.0, heap_move));
             extra.for_each_mut(|term| term.0 = offset_word(term.0, heap_move));
-            if let Some(messages) = messages {
-                for message in messages {
-                    message.term.0 = offset_word(message.term.0, heap_move);
-                    if let Some(token) = message.token.as_deref_mut() {
-                        token.0 = offset_word(token.0, heap_move);
-                    }
-                }
-            }
+            // Port of erts/emulator/beam/erl_gc.c (offset_mqueue), OTP-29.1.1.
+            msgq.for_each_heap_root(&mut |term| term.0 = offset_word(term.0, heap_move));
         }
         // Untagged stack words inside the old stack are frame pointers. Return
         // addresses fail that test and `offset_word` leaves them alone, so the
@@ -2205,30 +2207,27 @@ struct MoveRange {
 }
 
 // Port of erts/emulator/beam/erl_gc.c:2514-2611 (erts_copy_one_frag off-heap links),
-// OTP-29.1.1. The source fragment is freed after its terms and off-heap ownership are adopted.
-fn rebase_binref_chains_to_ranges(first: &mut usize, wrt_bins: &mut usize, ranges: &[MoveRange]) {
-    let nodes = binref_chain_nodes(*first)
-        .into_iter()
-        .chain(binref_chain_nodes(*wrt_bins))
-        .collect::<Vec<_>>();
-    let rebase = |address: usize| {
-        if address == 0 {
-            return 0;
+// OTP-29.1.1: the copied chain is walked in the new heap, each link offset by the distance.
+fn rebase_binref_chains_to_range(owners: &mut crate::heap::OffHeapLists, range: MoveRange) {
+    for head in [&mut owners.off_heap_first, &mut owners.wrt_bins] {
+        let rebase = |address: usize| {
+            if address == 0 {
+                return 0;
+            }
+            assert!(
+                address >= range.old_start && address < range.old_end,
+                "message BinRef chain points outside its copied heap fragment"
+            );
+            range.new_start + address - range.old_start
+        };
+        *head = rebase(*head);
+        let mut node = *head;
+        while node != 0 {
+            let link = (node as *mut u64).wrapping_add(2);
+            let next = rebase(crate::heap::load(link) as usize);
+            crate::heap::store(link, next as u64);
+            node = next;
         }
-        ranges
-            .iter()
-            .find_map(|range| {
-                (address >= range.old_start && address < range.old_end)
-                    .then_some(range.new_start + address - range.old_start)
-            })
-            .expect("message BinRef chain points outside copied heap fragments")
-    };
-    *first = rebase(*first);
-    *wrt_bins = rebase(*wrt_bins);
-    for source in nodes {
-        let destination = rebase(source) as *mut u64;
-        let next = crate::heap::load((source as *const u64).wrapping_add(2)) as usize;
-        crate::heap::store(destination.wrapping_add(2), rebase(next) as u64);
     }
 }
 

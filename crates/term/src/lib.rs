@@ -64,7 +64,7 @@ pub use fun::{
     set_fun_entry_stub_hook,
 };
 pub use gc::{
-    FragmentAlloc, FragmentIndex, GcMessageRoot, GcRootSet, GcStats, erts_next_heap_size,
+    FragmentAlloc, FragmentIndex, GcMessageQueue, GcRootSet, GcStats, erts_next_heap_size,
     normalize_heap_minimum, set_gc_clock_for_long_gc, set_gc_clock_for_msacc, spawned_heap_words,
 };
 pub use global_literals::{

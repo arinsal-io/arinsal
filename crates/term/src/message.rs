@@ -742,6 +742,32 @@ impl FragmentMut<'_> {
     pub fn used(&mut self) -> usize {
         self.fragment().used_size
     }
+
+    /// The used words.
+    pub(crate) fn words(&self) -> &[u64] {
+        // SAFETY: the view borrows the node; the first `used_size` words were written by
+        // allocations of the fragment.
+        unsafe {
+            let used = (*self.header.as_ptr()).used_size;
+            std::slice::from_raw_parts(fragment_words_ptr(self.header), used)
+        }
+    }
+
+    /// The off-heap owners, for rebasing their chain after the words moved.
+    pub(crate) fn owners_mut(&mut self) -> &mut crate::heap::OffHeapLists {
+        &mut self.fragment().off_heap
+    }
+
+    /// Give up the data after it was copied out: the off-heap owners and virtual binary heap
+    /// words go to the receiver, and the fragment is left empty in its node.
+    pub(crate) fn take_data(&mut self) -> (crate::heap::OffHeapLists, u64) {
+        let fragment = self.fragment();
+        fragment.used_size = 0;
+        (
+            std::mem::take(&mut fragment.off_heap),
+            std::mem::take(&mut fragment.bin_vheap),
+        )
+    }
 }
 
 impl HeapAlloc for FragmentMut<'_> {

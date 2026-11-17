@@ -136,12 +136,7 @@ impl Process {
         }
         // Port of erts/emulator/beam/erl_gc.c:1500-1501 and 1947-1948, OTP-29.1.1: with an
         // on-heap message queue the collection moves queued message data onto the heap.
-        let (moved_indices, moved_fragments) =
-            if !hibernate && self.message_queue_data() == MessageQueueData::OnHeap {
-                self.inbox.take_message_fragments()
-            } else {
-                (Vec::new(), Vec::new())
-            };
+        let on_heap_msgq = !hibernate && self.message_queue_data() == MessageQueueData::OnHeap;
         if self.max_heap_limited() {
             if hibernate {
                 self.heap.request_full_sweep();
@@ -156,19 +151,15 @@ impl Process {
             } else {
                 0
             }) as u64;
-            let checks = match self
-                .heap
-                .max_heap_collection_checks(min_free, moved_fragments.iter())
-            {
-                Ok(checks) => checks,
-                Err(error) => {
-                    if !moved_indices.is_empty() {
-                        self.inbox
-                            .restore_moved_heaps(&moved_indices, moved_fragments);
-                    }
-                    return Err(VmError::Unsupported(format!("process GC: {error:?}")));
-                }
+            let message_words = if on_heap_msgq {
+                arinsal_term::GcMessageQueue::attached_words(&self.inbox)
+            } else {
+                0
             };
+            let checks = self
+                .heap
+                .max_heap_collection_checks(min_free, message_words)
+                .map_err(|error| VmError::Unsupported(format!("process GC: {error:?}")))?;
             let exceeded = [Some(checks.0), checks.1]
                 .into_iter()
                 .flatten()
@@ -176,10 +167,6 @@ impl Process {
             if let Some(size) = exceeded {
                 self.max_heap_peak = self.max_heap_peak.max(size);
                 if limit.kill {
-                    if !moved_indices.is_empty() {
-                        self.inbox
-                            .restore_moved_heaps(&moved_indices, moved_fragments);
-                    }
                     return Err(VmError::Unsupported("max_heap_size".into()));
                 }
             }
@@ -204,11 +191,6 @@ impl Process {
             }
         }
         roots.push(objv);
-        let mut moved = self.inbox.gc_root_slots_and_moved_messages(
-            &moved_indices,
-            moved_fragments,
-            &mut roots,
-        );
         roots.push(extra);
         if let Some(dictionary) = self.dictionary.as_mut() {
             dictionary.append_gc_root_slots(&mut roots);
@@ -252,20 +234,17 @@ impl Process {
         let mut extra_rootset = arinsal_term::GcRootSet::new();
         let stats = if hibernate {
             self.heap
-                .collect_hibernate_root_slots(&mut roots, &mut extra_rootset)
+                .collect_hibernate_root_slots(&mut roots, &mut extra_rootset, &mut self.inbox)
         } else {
-            self.heap
-                .collect_with_root_slots(&mut roots, &mut extra_rootset, min_free, &mut moved)
+            self.heap.collect_with_root_slots(
+                &mut roots,
+                &mut extra_rootset,
+                min_free,
+                &mut self.inbox,
+                on_heap_msgq,
+            )
         };
         drop((roots, extra_rootset));
-        if !moved_indices.is_empty() {
-            let heaps = moved
-                .iter_mut()
-                .map(|message| message.take_heap())
-                .collect();
-            drop(moved);
-            self.inbox.restore_moved_heaps(&moved_indices, heaps);
-        }
         if exc_rooted[0] {
             self.heap.abi.exc.fvalue = exc_roots[0].tagged_word();
         }

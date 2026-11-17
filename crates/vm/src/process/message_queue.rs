@@ -404,60 +404,6 @@ impl MessageQueue {
         slots
     }
 
-    /// Build root descriptors over live queue slots and detached fragments.
-    // Port of erts/emulator/beam/erl_gc.c:2616 (`setup_rootset`), OTP-29.1.1.
-    pub(super) fn gc_root_slots_and_moved_messages<'a>(
-        &'a mut self,
-        moved_indices: &[usize],
-        moved_heaps: Vec<Option<arinsal_term::message::MessageHeap>>,
-        roots: &mut arinsal_term::GcRootSet<'a>,
-    ) -> Vec<arinsal_term::GcMessageRoot<'a>> {
-        let mut messages = Vec::with_capacity(moved_indices.len());
-        let mut moved = moved_indices.iter().copied().zip(moved_heaps).peekable();
-        for (index, event) in self.entries.iter_mut().enumerate() {
-            let entry = queued_mut(event);
-            if moved
-                .peek()
-                .is_some_and(|(moved_index, _)| *moved_index == index)
-            {
-                let (_, heap) = moved.next().expect("peeked moved message");
-                let token = entry
-                    .fragment
-                    .as_mut()
-                    .and_then(|fragment| fragment.seq_token.as_mut())
-                    .filter(|token| token.root().is_pointer())
-                    .map(|token| token.heap_ref_mut());
-                messages.push(arinsal_term::GcMessageRoot::new(
-                    &mut entry.term,
-                    token,
-                    heap,
-                ));
-                continue;
-            }
-            let on_heap = !entry.combined
-                && entry
-                    .fragment
-                    .as_ref()
-                    .is_none_or(|fragment| fragment.heap.is_none());
-            if on_heap {
-                let token = entry
-                    .fragment
-                    .as_mut()
-                    .and_then(|fragment| fragment.seq_token.as_mut())
-                    .filter(|token| token.root().is_pointer())
-                    .map(|token| token.heap_ref_mut());
-                if entry.term.is_pointer() {
-                    roots.push_term(&mut entry.term);
-                }
-                if let Some(token) = token {
-                    roots.push_term(token);
-                }
-            }
-        }
-        assert!(moved.next().is_none(), "all moved messages were found");
-        messages
-    }
-
     /// Rewrite mailbox terms after an operation that explicitly snapshots and transforms them.
     pub(crate) fn update_gc_roots(&mut self, slots: &[RootSlot], roots: &[Term]) {
         // The slots are in queue order, one walk reaches them all.
@@ -560,68 +506,6 @@ impl MessageQueue {
         }
     }
 
-    /// Take the heap fragments of queued messages for a collection that moves them onto
-    /// the heap (on-heap message queue). Each entry carries the message term and the copy of
-    /// its sequential trace token that sits in the same fragment.
-    // Port of erts/emulator/beam/erl_proc_sig_queue.c:8851-8880 (move_msg_to_heap), OTP-29.1.1.
-    pub(crate) fn take_message_fragments(
-        &mut self,
-    ) -> (Vec<usize>, Vec<Option<arinsal_term::message::MessageHeap>>) {
-        let mut indices = Vec::new();
-        let mut fragments = Vec::new();
-        self.entries.relink_each(|index, mut node| {
-            if queued(&node).combined {
-                let (node, fragment) = QueuedMessage(node).detach_inline();
-                if let Some(fragment) = fragment {
-                    indices.push(index);
-                    fragments.push(Some(arinsal_term::message::MessageHeap::Node(fragment)));
-                }
-                return node;
-            }
-            if let Some(fragment) = queued_mut(&mut node).fragment.as_mut()
-                && let Some(heap) = fragment.heap.take()
-            {
-                indices.push(index);
-                fragments.push(Some(heap));
-            }
-            node
-        });
-        (indices, fragments)
-    }
-
-    /// Restore detached message heaps; collection rewrote their term slots in place.
-    pub(crate) fn restore_moved_heaps(
-        &mut self,
-        indices: &[usize],
-        heaps: Vec<Option<arinsal_term::message::MessageHeap>>,
-    ) {
-        let mut moved = indices.iter().copied().zip(heaps).peekable();
-        for (index, event) in self.entries.iter_mut().enumerate() {
-            let Some((_, heap)) = moved.next_if(|(moved_index, _)| *moved_index == index) else {
-                continue;
-            };
-            let entry = queued_mut(event);
-            if entry.fragment.is_none() && heap.is_some() {
-                // A detached inline fragment the collection did not consume stays the
-                // message's data as a fragment of its own.
-                entry.fragment = Some(system_fragment(MessageFragment {
-                    heap: None,
-                    seq_token: None,
-                    timer_id: None,
-                }));
-            }
-            if let Some(fragment) = entry.fragment.as_mut() {
-                fragment.heap = heap;
-                if fragment.heap.is_none()
-                    && fragment.seq_token.is_none()
-                    && fragment.timer_id.is_none()
-                {
-                    entry.fragment = None;
-                }
-            }
-        }
-    }
-
     /// Return terms copied out of queue-owned storage for `process_info(messages)`.
     pub(crate) fn copied_terms(&self, heap: &mut ProcessHeap) -> Result<Vec<Term>, VmError> {
         let mut target = arinsal_bifs::ProcessHeapHandle(heap);
@@ -632,5 +516,110 @@ impl MessageQueue {
                     .map_err(|error| VmError::Unsupported(format!("message info copy: {error:?}")))
             })
             .collect()
+    }
+}
+
+impl Message {
+    /// Whether the message data is still attached to the message (`mp->data.attached`): in
+    /// the node's inline fragment or a heap fragment of its own.
+    fn data_attached(&self) -> bool {
+        self.combined
+            || self
+                .fragment
+                .as_ref()
+                .is_some_and(|fragment| fragment.heap.is_some())
+    }
+}
+
+// Port of erts/emulator/beam/erl_gc.c (young_gen_usage, setup_rootset, offset_mqueue) and
+// erl_proc_sig_queue.c (erts_proc_sig_move_msgs_to_heap, move_msg_to_heap), OTP-29.1.1.
+impl arinsal_term::GcMessageQueue for MessageQueue {
+    fn attached_words(&self) -> usize {
+        self.entries
+            .iter_with_fragments()
+            .map(|(event, inline)| {
+                let message = queued(event);
+                if message.combined {
+                    inline.map_or(0, <[u64]>::len)
+                } else {
+                    message
+                        .fragment
+                        .as_ref()
+                        .and_then(|fragment| fragment.heap.as_ref())
+                        .map_or(0, arinsal_term::message::MessageHeap::message_data_size)
+                }
+            })
+            .fold(0usize, usize::saturating_add)
+    }
+
+    fn for_each_heap_root(&mut self, visit: &mut dyn FnMut(&mut Term)) {
+        for event in self.entries.iter_mut() {
+            let message = queued_mut(event);
+            if message.data_attached() {
+                continue;
+            }
+            if message.term.is_pointer() {
+                visit(&mut message.term);
+            }
+            if let Some(token) = message
+                .fragment
+                .as_mut()
+                .and_then(|fragment| fragment.seq_token.as_mut())
+                && token.root().is_pointer()
+            {
+                visit(token.heap_ref_mut());
+            }
+        }
+    }
+
+    fn move_msgs_to_heap(
+        &mut self,
+        heap: &mut arinsal_term::ProcessHeap,
+    ) -> Result<(), arinsal_term::TermError> {
+        let mut result = Ok(());
+        self.entries.relink_each(|_, mut node| {
+            if result.is_err() || !queued(&node).data_attached() {
+                return node;
+            }
+            let message = queued_mut(&mut node);
+            let token = message
+                .fragment
+                .as_ref()
+                .and_then(|fragment| fragment.seq_token.as_ref())
+                .map_or(Term::NIL, |token| token.root());
+            let mut refs = [message.term, token];
+            let combined = message.combined;
+            let moved = if combined {
+                heap.move_node_fragment(
+                    node.heap_fragment().expect("combined message fragment"),
+                    &mut refs,
+                )
+            } else {
+                let data = message
+                    .fragment
+                    .as_mut()
+                    .and_then(|fragment| fragment.heap.take())
+                    .expect("attached message heap");
+                heap.move_message_heap(data, &mut refs)
+            };
+            if let Err(error) = moved {
+                result = Err(error);
+                return node;
+            }
+            let message = queued_mut(&mut node);
+            message.term = refs[0];
+            message.combined = false;
+            if let Some(fragment) = message.fragment.as_mut() {
+                if let Some(token) = fragment.seq_token.as_mut() {
+                    *token.heap_ref_mut() = refs[1];
+                }
+                // mp->data.heap_frag = NULL
+                if fragment.seq_token.is_none() && fragment.timer_id.is_none() {
+                    message.fragment = None;
+                }
+            }
+            node
+        });
+        result
     }
 }
