@@ -190,6 +190,9 @@ pub(crate) fn generic_iolist_size<const UNIT: usize>(
                         Some(sum) => size = sum,
                         None => break 'pass Err(Stop::Overflow),
                     }
+                    // A run of bytes stays in this loop: the next cell is the tail.
+                    obj = tail;
+                    continue;
                 } else if let Some((start, bits)) = bitstring_geometry(head) {
                     if bits % UNIT != 0 {
                         break 'pass Err(Stop::Type);
@@ -373,11 +376,14 @@ pub(crate) fn generic_iolist_copy<const UNIT: usize>(
         return IolistAction::Yield;
     }
     let init = YIELDS_PER_RED * iolist.reds_left;
-    let mut yield_count = init;
-    let mut obj = iolist.obj;
-    let mut resume = true;
-    let mut pass = |base: &mut [u8]| -> Option<Term> {
-        'pass: loop {
+    let start = iolist.obj;
+    let mut pass = |base: &mut [u8]| -> (Option<Term>, i64) {
+        // The cursor and the yield count are locals of the pass, not captured state.
+        let mut yield_count = init;
+        let mut obj = start;
+        let mut resume = true;
+        let mut offset = *to_offset;
+        let stopped = 'pass: loop {
             if !resume {
                 match iolist.estack.pop() {
                     Some(next) => obj = next,
@@ -393,9 +399,9 @@ pub(crate) fn generic_iolist_copy<const UNIT: usize>(
                 let (head, tail) = cons.pair();
                 obj = head;
                 if let Some(byte) = as_byte(obj) {
-                    let byte_offset = *to_offset / 8;
-                    let shift = *to_offset % 8;
-                    if UNIT == 8 || shift == 0 {
+                    let byte_offset = offset / 8;
+                    let shift = if UNIT == 8 { 0 } else { offset % 8 };
+                    if shift == 0 {
                         base[byte_offset] = byte;
                     } else {
                         let leading_bits = base[byte_offset];
@@ -403,15 +409,18 @@ pub(crate) fn generic_iolist_copy<const UNIT: usize>(
                             (byte >> shift) | ((leading_bits >> (8 - shift)) << (8 - shift));
                         base[byte_offset + 1] = byte << (8 - shift);
                     }
-                    *to_offset += 8;
+                    offset += 8;
+                    // A run of bytes stays in this loop: the next cell is the tail.
+                    obj = tail;
+                    continue;
                 } else if let Some((start, bits)) = bitstring_geometry(obj) {
                     if should_copy::<UNIT>(threshold, start, bits) {
-                        if copy_bitstring(from, base, to_offset, obj, &mut yield_count) {
+                        if copy_bitstring(from, base, &mut offset, obj, &mut yield_count) {
                             iolist.estack.push(tail);
                             break 'pass Some(obj);
                         }
                     } else {
-                        vec_enqueue(vec, *to_offset, process, obj);
+                        vec_enqueue(vec, offset, process, obj);
                     }
                 } else if Cons::try_from(obj).is_ok() {
                     iolist.estack.push(tail);
@@ -424,19 +433,21 @@ pub(crate) fn generic_iolist_copy<const UNIT: usize>(
                 break 'pass Some(obj);
             } else if let Some((start, bits)) = bitstring_geometry(obj) {
                 if should_copy::<UNIT>(threshold, start, bits) {
-                    if copy_bitstring(from, base, to_offset, obj, &mut yield_count) {
+                    if copy_bitstring(from, base, &mut offset, obj, &mut yield_count) {
                         break 'pass Some(obj);
                     }
                 } else {
-                    vec_enqueue(vec, *to_offset, process, obj);
+                    vec_enqueue(vec, offset, process, obj);
                 }
             }
-        }
+        };
+        *to_offset = offset;
+        (stopped, yield_count)
     };
     // A copy pass over a list of only empty leaves has no target. For the off-heap kind the
     // payload does not move when the pass allocates (iovec); a heap bitstring is only used by the
     // list_to_bitstring family, whose pass allocates nothing.
-    let stopped = match to_base.as_mut() {
+    let (stopped, yield_count) = match to_base.as_mut() {
         Some(output) => output.with_bytes_mut(&mut pass).expect("a sized copy pass"),
         None => pass(&mut []),
     };
