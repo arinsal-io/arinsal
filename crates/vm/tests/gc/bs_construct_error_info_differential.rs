@@ -84,3 +84,63 @@ fn bit_sized_binary_construct_errors_match_otp() {
     }
     let _ = std::fs::remove_dir_all(directory);
 }
+
+#[test]
+fn binary_construct_with_three_hundred_segments_matches_otp() {
+    const MODULE: &str = "bs_construct_many_segments_differential";
+    const CHILD: &str = "ARINSAL_BS_MANY_SEGMENTS_CHILD";
+    let segments = std::iter::repeat_n("(id(X))/binary", 300)
+        .collect::<Vec<_>>()
+        .join(",");
+    let source = format!(
+        "-module({MODULE}).\n-export([run/0]).\nid(X) -> X.\nrun() -> X = <<1,2,3>>, <<{segments}>>.\n"
+    );
+
+    if let Some(beam_path) = std::env::var_os(CHILD) {
+        let mut vm = crate::common::node();
+        crate::common::load_fresh(&mut vm, &std::fs::read(beam_path).expect("test BEAM"));
+        let actual = vm
+            .eval_scheduled(MODULE, "run", &[], 0)
+            .expect("run/0 with 300 binary segments");
+        println!("RESULT:{:?}", actual.term);
+        arinsal_vm::erts_exit(0);
+    }
+
+    let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
+    let beam = reference
+        .compile_named(MODULE, &source, &[])
+        .expect("compile 300-segment binary construction");
+    reference
+        .load(MODULE, &beam)
+        .expect("load 300-segment module in OTP");
+    let CallResult::Ok(expected) = reference.call(MODULE, "run", &[]) else {
+        panic!("OTP run/0 failed");
+    };
+
+    let directory =
+        std::env::temp_dir().join(format!("arinsal-bs-many-segments-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("create test directory");
+    let beam_path = directory.join(format!("{MODULE}.beam"));
+    std::fs::write(&beam_path, beam).expect("write test BEAM");
+    let output = Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "binary_construct_with_three_hundred_segments_matches_otp",
+            "--nocapture",
+        ])
+        .env(CHILD, &beam_path)
+        .output()
+        .expect("run BeamAsm child");
+    assert!(
+        output.status.success(),
+        "BeamAsm child failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let actual = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("RESULT:"))
+        .unwrap_or_else(|| panic!("missing child result: {stdout}"));
+    similar_asserts::assert_eq!(format!("{expected:?}"), actual);
+    let _ = std::fs::remove_dir_all(directory);
+}
