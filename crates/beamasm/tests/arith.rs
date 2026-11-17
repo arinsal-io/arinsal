@@ -4,6 +4,7 @@ use arinsal_beamasm::{
     arith::ArithHelper,
     enter_native,
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
+    types::{ArgType, TypedArg},
 };
 
 const OVERFLOW: u64 = u64::MAX;
@@ -169,8 +170,13 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     let add = |a, b| {
         run_binary(
             |m, h| {
-                m.emit_i_plus(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), h)
-                    .unwrap()
+                m.emit_i_plus(
+                    TypedArg::new(ArgVal::X(0), ArgType::ANY),
+                    TypedArg::new(ArgVal::X(1), ArgType::ANY),
+                    ArgVal::X(1),
+                    h,
+                )
+                .unwrap()
             },
             a,
             b,
@@ -179,8 +185,13 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     let sub = |a, b| {
         run_binary(
             |m, h| {
-                m.emit_i_minus(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), h)
-                    .unwrap()
+                m.emit_i_minus(
+                    TypedArg::new(ArgVal::X(0), ArgType::ANY),
+                    TypedArg::new(ArgVal::X(1), ArgType::ANY),
+                    ArgVal::X(1),
+                    h,
+                )
+                .unwrap()
             },
             a,
             b,
@@ -189,8 +200,13 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     let mul = |a, b| {
         run_binary(
             |m, h| {
-                m.emit_i_times(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), h)
-                    .unwrap()
+                m.emit_i_times(
+                    TypedArg::new(ArgVal::X(0), ArgType::ANY),
+                    TypedArg::new(ArgVal::X(1), ArgType::ANY),
+                    ArgVal::X(1),
+                    h,
+                )
+                .unwrap()
             },
             a,
             b,
@@ -199,8 +215,13 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     let div = |a, b| {
         run_binary(
             |m, h| {
-                m.emit_i_int_div(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), h)
-                    .unwrap()
+                m.emit_i_int_div(
+                    TypedArg::new(ArgVal::X(0), ArgType::ANY),
+                    TypedArg::new(ArgVal::X(1), ArgType::ANY),
+                    ArgVal::X(1),
+                    h,
+                )
+                .unwrap()
             },
             a,
             b,
@@ -209,8 +230,13 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     let rem = |a, b| {
         run_binary(
             |m, h| {
-                m.emit_i_rem(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), h)
-                    .unwrap()
+                m.emit_i_rem(
+                    TypedArg::new(ArgVal::X(0), ArgType::ANY),
+                    TypedArg::new(ArgVal::X(1), ArgType::ANY),
+                    ArgVal::X(1),
+                    h,
+                )
+                .unwrap()
             },
             a,
             b,
@@ -219,8 +245,13 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     let band = |a, b| {
         run_binary(
             |m, h| {
-                m.emit_i_band(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), h)
-                    .unwrap()
+                m.emit_i_band(
+                    TypedArg::new(ArgVal::X(0), ArgType::ANY),
+                    TypedArg::new(ArgVal::X(1), ArgType::ANY),
+                    ArgVal::X(1),
+                    h,
+                )
+                .unwrap()
             },
             a,
             b,
@@ -229,8 +260,13 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     let bor = |a, b| {
         run_binary(
             |m, h| {
-                m.emit_i_bor(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), h)
-                    .unwrap()
+                m.emit_i_bor(
+                    TypedArg::new(ArgVal::X(0), ArgType::ANY),
+                    TypedArg::new(ArgVal::X(1), ArgType::ANY),
+                    ArgVal::X(1),
+                    h,
+                )
+                .unwrap()
             },
             a,
             b,
@@ -239,8 +275,13 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     let bxor = |a, b| {
         run_binary(
             |m, h| {
-                m.emit_i_bxor(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), h)
-                    .unwrap()
+                m.emit_i_bxor(
+                    TypedArg::new(ArgVal::X(0), ArgType::ANY),
+                    TypedArg::new(ArgVal::X(1), ArgType::ANY),
+                    ArgVal::X(1),
+                    h,
+                )
+                .unwrap()
             },
             a,
             b,
@@ -249,8 +290,13 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     let bsl = |a, b| {
         run_binary(
             |m, h| {
-                m.emit_i_bsl(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), h)
-                    .unwrap()
+                m.emit_i_bsl(
+                    TypedArg::new(ArgVal::X(0), ArgType::ANY),
+                    TypedArg::new(ArgVal::X(1), ArgType::ANY),
+                    ArgVal::X(1),
+                    h,
+                )
+                .unwrap()
             },
             a,
             b,
@@ -259,8 +305,13 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     let bsr = |a, b| {
         run_binary(
             |m, h| {
-                m.emit_i_bsr(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), h)
-                    .unwrap()
+                m.emit_i_bsr(
+                    TypedArg::new(ArgVal::X(0), ArgType::ANY),
+                    TypedArg::new(ArgVal::X(1), ArgType::ANY),
+                    ArgVal::X(1),
+                    h,
+                )
+                .unwrap()
             },
             a,
             b,
@@ -324,11 +375,22 @@ fn guard_arithmetic_emits_fail_label_handling() {
         asm.emit_raw(|e| e.str_pre(Gpr::x(30), Gpr::sp(), -16))
             .unwrap();
         if with_fail_label {
-            asm.emit_i_plus_with_fail(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), 2, runtime_arith)
-                .unwrap();
+            asm.emit_i_plus_with_fail(
+                TypedArg::new(ArgVal::X(0), ArgType::ANY),
+                TypedArg::new(ArgVal::X(1), ArgType::ANY),
+                ArgVal::X(1),
+                2,
+                runtime_arith,
+            )
+            .unwrap();
         } else {
-            asm.emit_i_plus(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), runtime_arith)
-                .unwrap();
+            asm.emit_i_plus(
+                TypedArg::new(ArgVal::X(0), ArgType::ANY),
+                TypedArg::new(ArgVal::X(1), ArgType::ANY),
+                ArgVal::X(1),
+                runtime_arith,
+            )
+            .unwrap();
         }
         asm.return_().unwrap();
         asm.emit_label(2).unwrap();
@@ -345,8 +407,13 @@ fn immediate_add_sub_cover_small_boundary_overflow_and_non_integer_fallbacks() {
     let add = |lhs, immediate| {
         run_binary(
             |m, h| {
-                m.emit_i_plus(ArgVal::X(0), ArgVal::Immediate(immediate), ArgVal::X(1), h)
-                    .unwrap()
+                m.emit_i_plus(
+                    TypedArg::new(ArgVal::X(0), ArgType::ANY),
+                    TypedArg::new(ArgVal::Immediate(immediate), ArgType::ANY),
+                    ArgVal::X(1),
+                    h,
+                )
+                .unwrap()
             },
             lhs,
             0,
@@ -355,8 +422,13 @@ fn immediate_add_sub_cover_small_boundary_overflow_and_non_integer_fallbacks() {
     let sub = |lhs, immediate| {
         run_binary(
             |m, h| {
-                m.emit_i_minus(ArgVal::X(0), ArgVal::Immediate(immediate), ArgVal::X(1), h)
-                    .unwrap()
+                m.emit_i_minus(
+                    TypedArg::new(ArgVal::X(0), ArgType::ANY),
+                    TypedArg::new(ArgVal::Immediate(immediate), ArgType::ANY),
+                    ArgVal::X(1),
+                    h,
+                )
+                .unwrap()
             },
             lhs,
             0,
@@ -443,8 +515,8 @@ fn adjacent_y_registers_subtract_in_address_order() {
         asm.emit_raw(|e| e.str_pre(Gpr::x(30), Gpr::sp(), -16))
             .unwrap();
         asm.emit_i_minus(
-            ArgVal::Y(left),
-            ArgVal::Y(right),
+            TypedArg::new(ArgVal::Y(left), ArgType::ANY),
+            TypedArg::new(ArgVal::Y(right), ArgType::ANY),
             ArgVal::X(0),
             runtime_arith,
         )
@@ -497,10 +569,9 @@ fn typed_power_of_two_multiply_and_mul_add_stay_on_the_fast_path() {
     asm.emit_i_func_label(1).unwrap();
     asm.emit_raw(|e| e.str_pre(Gpr::x(30), Gpr::sp(), -16))
         .unwrap();
-    asm.set_arith_types(integer(0, 50), arinsal_beamasm::types::ArgType::ANY);
     asm.emit_i_times(
-        ArgVal::X(0),
-        ArgVal::Immediate(eight),
+        TypedArg::new(ArgVal::X(0), integer(0, 50)),
+        TypedArg::new(ArgVal::Immediate(eight), ArgType::ANY),
         ArgVal::X(1),
         slow_path,
     )
@@ -533,17 +604,11 @@ fn typed_power_of_two_multiply_and_mul_add_stay_on_the_fast_path() {
     asm.emit_i_func_label(1).unwrap();
     asm.emit_raw(|e| e.str_pre(Gpr::x(30), Gpr::sp(), -16))
         .unwrap();
-    asm.set_arith_types4([
-        integer(0, 20),
-        arinsal_beamasm::types::ArgType::ANY,
-        integer(0, 100),
-        arinsal_beamasm::types::ArgType::ANY,
-    ]);
     asm.emit_i_mul_add(
-        ArgVal::X(0),
-        ArgVal::Immediate(three),
-        ArgVal::X(0),
-        ArgVal::Immediate(five),
+        TypedArg::new(ArgVal::X(0), integer(0, 20)),
+        TypedArg::new(ArgVal::Immediate(three), ArgType::ANY),
+        TypedArg::new(ArgVal::X(0), integer(0, 100)),
+        TypedArg::new(ArgVal::Immediate(five), ArgType::ANY),
         ArgVal::X(1),
         slow_path,
     )

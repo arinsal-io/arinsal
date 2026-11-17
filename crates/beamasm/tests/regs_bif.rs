@@ -9,6 +9,7 @@ use arinsal_beamasm::{
     enter_native,
     guard::GuardHelper,
     module::{ArgVal, BeamModuleAssembler},
+    types::{ArgType, TypedArg},
 };
 
 static SCHEDULER_REGS: AtomicUsize = AtomicUsize::new(0);
@@ -222,8 +223,8 @@ fn arithmetic_runtime_call_preserves_register_state() {
     let (header, registers) = execute(|assembler| {
         assembler
             .emit_i_plus(
-                ArgVal::X(0),
-                ArgVal::X(1),
+                TypedArg::new(ArgVal::X(0), ArgType::ANY),
+                TypedArg::new(ArgVal::X(1), ArgType::ANY),
                 ArgVal::X(0),
                 arith_helper as ArithHelper,
             )

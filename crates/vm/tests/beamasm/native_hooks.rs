@@ -6,6 +6,7 @@ use arinsal_beamasm::{
     enter_native_raw,
     guard::GuardHelper,
     module::{ArgVal, BeamModuleAssembler},
+    types::{ArgType, TypedArg},
 };
 use arinsal_difftest::RefErl;
 use arinsal_term::{ProcessHeap, Term, TermBuilder, TermKind, to_owned};
@@ -74,8 +75,13 @@ fn arith_overflow_makes_bignum() {
     assert_eq!(
         run(&mut process, &mut registers, |asm| {
             let helper: ArithHelper = arinsal_beamasm_arith;
-            asm.emit_i_plus(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), helper)
-                .unwrap();
+            asm.emit_i_plus(
+                TypedArg::new(ArgVal::X(0), ArgType::ANY),
+                TypedArg::new(ArgVal::X(1), ArgType::ANY),
+                ArgVal::X(1),
+                helper,
+            )
+            .unwrap();
         }),
         ExitReason::Returned
     );
@@ -100,8 +106,13 @@ fn badarith_caught_by_interpreted_try() {
     assert_eq!(
         run(&mut process, &mut registers, |asm| {
             let helper: ArithHelper = arinsal_beamasm_arith;
-            asm.emit_i_plus(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), helper)
-                .unwrap();
+            asm.emit_i_plus(
+                TypedArg::new(ArgVal::X(0), ArgType::ANY),
+                TypedArg::new(ArgVal::X(1), ArgType::ANY),
+                ArgVal::X(1),
+                helper,
+            )
+            .unwrap();
         }),
         ExitReason::Returned
     );

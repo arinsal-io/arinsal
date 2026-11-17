@@ -2728,42 +2728,42 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
         }
         EmitterKind::Plus => {
             count(5)?;
-            assembler.set_arith_types(
-                operand_type(args.get(2), beam),
-                operand_type(args.get(3), beam),
-            );
-            assembler.emit_i_plus_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
+            assembler.emit_i_plus_with_fail(
+                TypedArg::new(value(2)?, operand_type(args.get(2), beam)),
+                TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
+                value(4)?,
+                n(0)?,
+                helper,
+            )
         }
         EmitterKind::Minus => {
             count(5)?;
-            assembler.set_arith_types(
-                operand_type(args.get(2), beam),
-                operand_type(args.get(3), beam),
-            );
-            assembler.emit_i_minus_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
+            assembler.emit_i_minus_with_fail(
+                TypedArg::new(value(2)?, operand_type(args.get(2), beam)),
+                TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
+                value(4)?,
+                n(0)?,
+                helper,
+            )
         }
         EmitterKind::Times => {
             count(5)?;
-            assembler.set_arith_types(
-                operand_type(args.get(2), beam),
-                operand_type(args.get(3), beam),
-            );
-            assembler.emit_i_times_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
+            assembler.emit_i_times_with_fail(
+                TypedArg::new(value(2)?, operand_type(args.get(2), beam)),
+                TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
+                value(4)?,
+                n(0)?,
+                helper,
+            )
         }
         EmitterKind::MulAdd => {
             count(6)?;
             // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:542-731, OTP-29.1.1.
-            assembler.set_arith_types4([
-                operand_type(args.get(1), beam),
-                operand_type(args.get(2), beam),
-                operand_type(args.get(3), beam),
-                operand_type(args.get(4), beam),
-            ]);
             assembler.emit_i_mul_add_with_fail(
-                value(1)?,
-                value(2)?,
-                value(3)?,
-                value(4)?,
+                TypedArg::new(value(1)?, operand_type(args.get(1), beam)),
+                TypedArg::new(value(2)?, operand_type(args.get(2), beam)),
+                TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
+                TypedArg::new(value(4)?, operand_type(args.get(4), beam)),
                 value(5)?,
                 n(0)?,
                 helper,
@@ -2771,26 +2771,30 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
         }
         EmitterKind::IntDiv if GENERIC == erts_tables::GENOP_I_M_DIV_5 => {
             count(5)?;
-            assembler.emit_i_m_div_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
+            assembler.emit_i_m_div_with_fail(
+                TypedArg::new(value(2)?, operand_type(args.get(2), beam)),
+                TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
+                value(4)?,
+                n(0)?,
+                helper,
+            )
         }
         EmitterKind::IntDiv => {
             count(5)?;
-            assembler.set_arith_types(
-                operand_type(args.get(2), beam),
-                operand_type(args.get(3), beam),
-            );
-            assembler.emit_i_int_div_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
+            assembler.emit_i_int_div_with_fail(
+                TypedArg::new(value(2)?, operand_type(args.get(2), beam)),
+                TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
+                value(4)?,
+                n(0)?,
+                helper,
+            )
         }
         EmitterKind::Rem if GENERIC == erts_tables::GENOP_I_DIV_REM_6 => {
             // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1055-1065, OTP-29.1.1.
             count(6)?;
-            assembler.set_arith_types(
-                operand_type(args.get(2), beam),
-                operand_type(args.get(3), beam),
-            );
             assembler.emit_i_div_rem_with_fail(
-                value(2)?,
-                value(3)?,
+                TypedArg::new(value(2)?, operand_type(args.get(2), beam)),
+                TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
                 value(4)?,
                 value(5)?,
                 n(0)?,
@@ -2800,13 +2804,9 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
         EmitterKind::Rem if GENERIC == erts_tables::GENOP_I_REM_DIV_6 => {
             // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1043-1053, OTP-29.1.1.
             count(6)?;
-            assembler.set_arith_types(
-                operand_type(args.get(2), beam),
-                operand_type(args.get(3), beam),
-            );
             assembler.emit_i_rem_div_with_fail(
-                value(2)?,
-                value(3)?,
+                TypedArg::new(value(2)?, operand_type(args.get(2), beam)),
+                TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
                 value(4)?,
                 value(5)?,
                 n(0)?,
@@ -2815,51 +2815,63 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
         }
         EmitterKind::Rem => {
             count(5)?;
-            assembler.set_arith_types(
-                operand_type(args.get(2), beam),
-                operand_type(args.get(3), beam),
-            );
-            assembler.emit_i_rem_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
+            assembler.emit_i_rem_with_fail(
+                TypedArg::new(value(2)?, operand_type(args.get(2), beam)),
+                TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
+                value(4)?,
+                n(0)?,
+                helper,
+            )
         }
         EmitterKind::Band => {
             count(5)?;
-            assembler.set_arith_types(
-                operand_type(args.get(2), beam),
-                operand_type(args.get(3), beam),
-            );
-            assembler.emit_i_band_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
+            assembler.emit_i_band_with_fail(
+                TypedArg::new(value(2)?, operand_type(args.get(2), beam)),
+                TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
+                value(4)?,
+                n(0)?,
+                helper,
+            )
         }
         EmitterKind::Bor => {
             count(5)?;
-            assembler.set_arith_types(
-                operand_type(args.get(2), beam),
-                operand_type(args.get(3), beam),
-            );
-            assembler.emit_i_bor_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
+            assembler.emit_i_bor_with_fail(
+                TypedArg::new(value(2)?, operand_type(args.get(2), beam)),
+                TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
+                value(4)?,
+                n(0)?,
+                helper,
+            )
         }
         EmitterKind::Bxor => {
             count(5)?;
-            assembler.set_arith_types(
-                operand_type(args.get(2), beam),
-                operand_type(args.get(3), beam),
-            );
-            assembler.emit_i_bxor_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
+            assembler.emit_i_bxor_with_fail(
+                TypedArg::new(value(2)?, operand_type(args.get(2), beam)),
+                TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
+                value(4)?,
+                n(0)?,
+                helper,
+            )
         }
         EmitterKind::Bsl => {
             count(5)?;
-            assembler.set_arith_types(
-                operand_type(args.get(2), beam),
-                operand_type(args.get(3), beam),
-            );
-            assembler.emit_i_bsl_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
+            assembler.emit_i_bsl_with_fail(
+                TypedArg::new(value(2)?, operand_type(args.get(2), beam)),
+                TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
+                value(4)?,
+                n(0)?,
+                helper,
+            )
         }
         EmitterKind::Bsr => {
             count(5)?;
-            assembler.set_arith_types(
-                operand_type(args.get(2), beam),
-                operand_type(args.get(3), beam),
-            );
-            assembler.emit_i_bsr_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
+            assembler.emit_i_bsr_with_fail(
+                TypedArg::new(value(2)?, operand_type(args.get(2), beam)),
+                TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
+                value(4)?,
+                n(0)?,
+                helper,
+            )
         }
         EmitterKind::Bnot => {
             count(4)?;

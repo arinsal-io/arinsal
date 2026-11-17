@@ -96,8 +96,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:145-244, OTP-29.1.1
     pub fn emit_i_plus(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
@@ -108,8 +108,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:145-244, OTP-29.1.1.
     pub fn emit_i_plus_with_fail(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
         helper: ArithHelper,
@@ -121,8 +121,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:334-456, OTP-29.1.1
     pub fn emit_i_minus(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
@@ -133,8 +133,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:334-456, OTP-29.1.1.
     pub fn emit_i_minus_with_fail(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
         helper: ArithHelper,
@@ -147,8 +147,8 @@ impl BeamModuleAssembler {
     // and instr_arith.cpp:542-731 (emit_i_mul_add), OTP-29.1.1.
     pub fn emit_i_times(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
@@ -159,24 +159,32 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:542-731 (emit_i_mul_add), OTP-29.1.1.
     pub fn emit_i_times_with_fail(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
         // `i_mul_add Fail S1 S2 Dst i Dst`: the addend is the small integer 0.
-        self.emit_i_mul_add_with_fail(lhs, rhs, dst, ArgVal::Immediate(0xf), dst, fail, helper)
+        self.emit_i_mul_add_with_fail(
+            lhs,
+            rhs,
+            TypedArg::new(dst, ArgType::ANY),
+            TypedArg::new(ArgVal::Immediate(0xf), ArgType::ANY),
+            dst,
+            fail,
+            helper,
+        )
     }
 
     /// Emits `i_mul_add`: `Dst = Src1 * Src2 + Src4`, with `Src3` used for the sum type check.
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:542-731, OTP-29.1.1.
     pub fn emit_i_mul_add(
         &mut self,
-        src1: ArgVal,
-        src2: ArgVal,
-        src3: ArgVal,
-        src4: ArgVal,
+        src1: TypedArg,
+        src2: TypedArg,
+        src3: TypedArg,
+        src4: TypedArg,
         dst: ArgVal,
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
@@ -188,10 +196,10 @@ impl BeamModuleAssembler {
     #[allow(clippy::too_many_arguments)]
     pub fn emit_i_mul_add_with_fail(
         &mut self,
-        src1: ArgVal,
-        src2: ArgVal,
-        src3: ArgVal,
-        src4: ArgVal,
+        src1: TypedArg,
+        src2: TypedArg,
+        src3: TypedArg,
+        src4: TypedArg,
         dst: ArgVal,
         fail: u32,
         helper: ArithHelper,
@@ -203,8 +211,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1043-1076, OTP-29.1.1
     pub fn emit_i_int_div(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
@@ -215,8 +223,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1043-1076, OTP-29.1.1.
     pub fn emit_i_int_div_with_fail(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
         helper: ArithHelper,
@@ -238,8 +246,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1055-1065, OTP-29.1.1.
     pub fn emit_i_div_rem(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         quotient: ArgVal,
         remainder: ArgVal,
         helper: ArithHelper,
@@ -251,8 +259,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1055-1065, OTP-29.1.1.
     pub fn emit_i_div_rem_with_fail(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         quotient: ArgVal,
         remainder: ArgVal,
         fail: u32,
@@ -276,8 +284,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1043-1053, OTP-29.1.1.
     pub fn emit_i_rem_div(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         remainder: ArgVal,
         quotient: ArgVal,
         helper: ArithHelper,
@@ -289,8 +297,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1043-1053, OTP-29.1.1.
     pub fn emit_i_rem_div_with_fail(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         remainder: ArgVal,
         quotient: ArgVal,
         fail: u32,
@@ -314,8 +322,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1089-1125 (emit_i_m_div), OTP-29.1.1
     pub fn emit_i_m_div(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
@@ -326,14 +334,14 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1089-1125 (emit_i_m_div), OTP-29.1.1.
     pub fn emit_i_m_div_with_fail(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        let left = self.source_reg(lhs)?;
-        let right = self.source_reg_into(rhs, Gpr::x(17))?;
+        let left = self.source_reg(lhs.val)?;
+        let right = self.source_reg_into(rhs.val, Gpr::x(17))?;
         self.emit_arith_call_with_mfa(
             12,
             left,
@@ -349,8 +357,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1043-1088, OTP-29.1.1
     pub fn emit_i_rem(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
@@ -361,8 +369,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1043-1088, OTP-29.1.1.
     pub fn emit_i_rem_with_fail(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
         helper: ArithHelper,
@@ -384,8 +392,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1172-1249, OTP-29.1.1
     pub fn emit_i_band(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
@@ -396,8 +404,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1172-1249, OTP-29.1.1.
     pub fn emit_i_band_with_fail(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
         helper: ArithHelper,
@@ -409,8 +417,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1268-1323, OTP-29.1.1
     pub fn emit_i_bor(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
@@ -421,8 +429,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1268-1323, OTP-29.1.1.
     pub fn emit_i_bor_with_fail(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
         helper: ArithHelper,
@@ -434,8 +442,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1343-1388, OTP-29.1.1
     pub fn emit_i_bxor(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
@@ -446,8 +454,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1343-1388, OTP-29.1.1.
     pub fn emit_i_bxor_with_fail(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
         helper: ArithHelper,
@@ -459,8 +467,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1628-1771, OTP-29.1.1
     pub fn emit_i_bsl(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
@@ -471,8 +479,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1628-1771, OTP-29.1.1.
     pub fn emit_i_bsl_with_fail(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
         helper: ArithHelper,
@@ -484,8 +492,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1507-1608, OTP-29.1.1
     pub fn emit_i_bsr(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
@@ -496,8 +504,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1507-1608, OTP-29.1.1.
     pub fn emit_i_bsr_with_fail(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
         helper: ArithHelper,
@@ -561,8 +569,8 @@ impl BeamModuleAssembler {
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
         self.emit_i_plus(
-            src,
-            ArgVal::Immediate(((amount as u64) << 4) | 15),
+            TypedArg::new(src, ArgType::ANY),
+            TypedArg::new(ArgVal::Immediate(((amount as u64) << 4) | 15), ArgType::ANY),
             dst,
             helper,
         )
@@ -674,12 +682,6 @@ impl BeamModuleAssembler {
         self.code.emit(|e| e.mov_reg(Gpr::x(17), right))?;
         self.emit_helper(op, Gpr::x(14), Gpr::x(17), helper, None)?;
         self.store_result(dst, Gpr::x(0))
-    }
-
-    /// Takes the operand types supplied by [`Self::set_arith_types`]; untyped operands are `Any`.
-    fn take_arith_args(&mut self, lhs: ArgVal, rhs: ArgVal) -> (TypedArg, TypedArg) {
-        let types = self.arith_types.take().unwrap_or([ArgType::ANY; 4]);
-        (TypedArg::new(lhs, types[0]), TypedArg::new(rhs, types[1]))
     }
 
     /// `load_sources(LHS, ARG2, RHS, ARG3)`, pairing adjacent memory operands with `ldp`.
@@ -845,13 +847,13 @@ impl BeamModuleAssembler {
     fn emit_add_sub(
         &mut self,
         add: bool,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         helper: ArithHelper,
         fail: u32,
     ) -> Result<(), ModuleError> {
-        let (l, r) = self.take_arith_args(lhs, rhs);
+        let (l, r) = (lhs, rhs);
         let rhs_is_arm_literal = r.is_small() && r.word() <= 4095;
         let is_small_result = if add {
             is_sum_small_if_args_are_small(&l, &r)
@@ -919,13 +921,13 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1172-1249, OTP-29.1.1
     fn emit_band(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         helper: ArithHelper,
         fail: u32,
     ) -> Result<(), ModuleError> {
-        let (l, r) = self.take_arith_args(lhs, rhs);
+        let (l, r) = (lhs, rhs);
         if l.always_small() && r.is_small() && is_logical_immediate(r.word(), 64) {
             // TAG & TAG = TAG, so the result needs no tagging.
             let left = self.source_reg_into(l.val, ARG2)?;
@@ -984,13 +986,13 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1268-1335, OTP-29.1.1
     fn emit_bor(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         helper: ArithHelper,
         fail: u32,
     ) -> Result<(), ModuleError> {
-        let (l, r) = self.take_arith_args(lhs, rhs);
+        let (l, r) = (lhs, rhs);
         if l.always_small() && r.is_small() {
             let cleared = r.word() & !15;
             if is_logical_immediate(cleared, 64) {
@@ -1039,13 +1041,13 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1343-1399, OTP-29.1.1
     fn emit_bxor(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         helper: ArithHelper,
         fail: u32,
     ) -> Result<(), ModuleError> {
-        let (l, r) = self.take_arith_args(lhs, rhs);
+        let (l, r) = (lhs, rhs);
         let (left, right) = self.load_sources(&l, &r)?;
         let d = self.init_destination(dst, ARG1);
         if l.always_small() && r.always_small() {
@@ -1087,13 +1089,13 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1507-1599, OTP-29.1.1
     fn emit_bsr(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         helper: ArithHelper,
         fail: u32,
     ) -> Result<(), ModuleError> {
-        let (l, r) = self.take_arith_args(lhs, rhs);
+        let (l, r) = (lhs, rhs);
         let generic = self.code.new_label();
         let next = self.code.new_label();
         let left = self.source_reg_into(l.val, ARG2)?;
@@ -1177,13 +1179,13 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1628-1771, OTP-29.1.1
     fn emit_bsl(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         dst: ArgVal,
         helper: ArithHelper,
         fail: u32,
     ) -> Result<(), ModuleError> {
-        let (l, r) = self.take_arith_args(lhs, rhs);
+        let (l, r) = (lhs, rhs);
         let d = self.init_destination(dst, ARG1);
 
         if is_bsl_small(&l, &r) {
@@ -1312,8 +1314,8 @@ impl BeamModuleAssembler {
     #[allow(clippy::too_many_arguments)]
     fn emit_div_rem(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         quotient_dst: ArgVal,
         remainder_dst: ArgVal,
         helper: ArithHelper,
@@ -1322,7 +1324,7 @@ impl BeamModuleAssembler {
         need_rem: bool,
         bif_mfa: &'static crate::bif::ErtsCodeMfa,
     ) -> Result<(), ModuleError> {
-        let (l, r) = self.take_arith_args(lhs, rhs);
+        let (l, r) = (lhs, rhs);
         let mut divisor = if r.is_small() { r.small_value() } else { 0 };
         if divisor == -1 {
             divisor = 0;
@@ -1649,15 +1651,14 @@ impl BeamModuleAssembler {
     #[allow(clippy::too_many_arguments)]
     fn emit_mul_add(
         &mut self,
-        src1: ArgVal,
-        src2: ArgVal,
-        src3: ArgVal,
-        src4: ArgVal,
+        src1: TypedArg,
+        src2: TypedArg,
+        src3: TypedArg,
+        src4: TypedArg,
         dst: ArgVal,
         helper: ArithHelper,
         fail: u32,
     ) -> Result<(), ModuleError> {
-        let (src1, src2, src3, src4) = self.take_mul_args(src1, src2, src3, src4);
         let is_product_small = is_product_small_if_args_are_small(&src1, &src2);
         let is_sum_small = is_sum_small_if_args_are_small(&src3, &src4);
         let sometimes_small = !(src2.is_literal() || src4.is_literal());
@@ -1867,21 +1868,6 @@ impl BeamModuleAssembler {
         self.emit_helper(15, ARG2, ARG3, helper, None)
     }
 
-    fn take_mul_args(
-        &mut self,
-        src1: ArgVal,
-        src2: ArgVal,
-        src3: ArgVal,
-        src4: ArgVal,
-    ) -> (TypedArg, TypedArg, TypedArg, TypedArg) {
-        let types = self.arith_types.take().unwrap_or([ArgType::ANY; 4]);
-        (
-            TypedArg::new(src1, types[0]),
-            TypedArg::new(src2, types[1]),
-            TypedArg::new(src3, types[2]),
-            TypedArg::new(src4, types[3]),
-        )
-    }
     fn emit_small_range_check(&mut self, slow: arinsal_a64::buf::Label) -> Result<(), ModuleError> {
         self.code.emit(|e| {
             e.lsl_imm(Gpr::x(13), Gpr::x(12), 4)?;

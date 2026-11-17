@@ -10,6 +10,7 @@ use arinsal_beamasm::{
     enter_native,
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
     rt,
+    types::{ArgType, TypedArg},
 };
 
 static MOVED_AREAS: OnceLock<Mutex<Vec<Box<[u64]>>>> = OnceLock::new();
@@ -295,16 +296,16 @@ fn native_list_tail_survives_tuple_field_loads() {
             m.emit_load_tuple_ptr(ArgVal::X(3), ArgVal::X(3))?;
             m.emit_get_tuple_element(ArgVal::X(3), 8, ArgVal::X(0))?;
             m.emit_i_plus(
-                ArgVal::X(1),
-                ArgVal::X(0),
+                TypedArg::new(ArgVal::X(1), ArgType::ANY),
+                TypedArg::new(ArgVal::X(0), ArgType::ANY),
                 ArgVal::X(0),
                 arithmetic_fallback,
             )?;
             m.emit_load_tuple_ptr(ArgVal::X(3), ArgVal::X(3))?;
             m.emit_get_tuple_element(ArgVal::X(3), 16, ArgVal::X(1))?;
             m.emit_i_plus(
-                ArgVal::X(1),
-                ArgVal::Immediate(tagged_small(0)),
+                TypedArg::new(ArgVal::X(1), ArgType::ANY),
+                TypedArg::new(ArgVal::Immediate(tagged_small(0)), ArgType::ANY),
                 ArgVal::X(2),
                 arithmetic_fallback,
             )?;

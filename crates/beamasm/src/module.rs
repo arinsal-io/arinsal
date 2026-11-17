@@ -233,8 +233,6 @@ pub struct BeamModuleAssembler {
     pub(super) map_lookups: Vec<crate::map::MapLookupTable>,
     /// Failure label of the arithmetic instruction being emitted (0: raise the error).
     pub(super) arith_fail: u32,
-    /// Compiler types of the next arithmetic instruction's operands, consumed by its emitter.
-    pub(super) arith_types: Option<[crate::types::ArgType; 4]>,
     labels: LabelIds,
     defined: DefinedLabels,
     lambda_labels: IdMap<Label>,
@@ -403,7 +401,6 @@ impl BeamModuleAssembler {
             last_error_offset: 0,
             last_line_location: None,
             arith_fail: 0,
-            arith_types: None,
             trace_breakpoints: IdMap::default(),
             pending_debug_line: None,
             line_breakpoints: Vec::new(),
@@ -1931,24 +1928,6 @@ impl BeamModuleAssembler {
     // OTP-29.1.1.
     pub fn set_arith_fail(&mut self, fail: u32) {
         self.arith_fail = fail;
-    }
-
-    /// Supplies the compiler types of the next arithmetic instruction's source operands
-    /// (left, right); the next arithmetic emitter consumes them.
-    // Port of erts/emulator/beam/jit/beam_jit_common.hpp:229-282 (getTypeEntry), OTP-29.1.1.
-    pub fn set_arith_types(&mut self, lhs: crate::types::ArgType, rhs: crate::types::ArgType) {
-        self.set_arith_types4([
-            lhs,
-            rhs,
-            crate::types::ArgType::ANY,
-            crate::types::ArgType::ANY,
-        ]);
-    }
-
-    /// Supplies the compiler types of an `i_mul_add` (Src1, Src2, Src3, Src4).
-    // Port of erts/emulator/beam/jit/beam_jit_common.hpp:229-282 (getTypeEntry), OTP-29.1.1.
-    pub fn set_arith_types4(&mut self, types: [crate::types::ArgType; 4]) {
-        self.arith_types = Some(types);
     }
 
     /// The label of the shared slow-path fragment calling `helper` with operation `op`
