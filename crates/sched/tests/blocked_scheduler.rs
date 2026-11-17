@@ -45,6 +45,10 @@ fn run_case(workers: usize, queued: usize, supervision_ms: Option<u64>) -> usize
     let running = Arc::new(AtomicBool::new(false));
     let release = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicUsize::new(0));
+    // Let every scheduler reach scheduler_wait first. A scheduler that has not yet gone to
+    // sleep finds its own run queue empty and steals from run queue 0 (try_steal_task), so
+    // the blocker could otherwise start on another scheduler and leave run queue 0 free.
+    std::thread::sleep(Duration::from_millis(200));
     sched
         .spawn_priority_on(
             Probe::Block {
