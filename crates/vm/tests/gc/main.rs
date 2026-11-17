@@ -29,5 +29,5 @@ mod memory_accounting;
 mod prepare_loading_gc_differential;
 mod resume_gc_timing_differential;
 mod schedule_in_dirty_gc;
+mod schedule_in_gc_live;
 mod send_gc_after_bif_differential;
-mod switch_out_gc_live;

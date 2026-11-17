@@ -1,7 +1,11 @@
-//! A collection run when a process switches out must root only its exact live X
-//! registers, like erts' `scheduler_gc_proc` with `c_p->arity`. Dead registers above
-//! that count keep pointers into heaps that earlier collections freed; rooting them
-//! made the copier read stale words ("invalid boxed subtag" panics).
+//! The collection a process runs when it is scheduled in roots exactly its live X registers, like
+//! erts' `scheduler_gc_proc` with `c_p->arity` (erts has no collection at schedule-out). Dead
+//! registers above that count keep pointers into heaps that earlier collections freed; rooting
+//! them made the copier read stale words ("invalid boxed subtag" panics). The result is compared
+//! with erl's.
+//!
+//! Port of erts/emulator/beam/erl_process.c:10415-10418 (erts_schedule: `scheduler_gc_proc`),
+//! OTP-29.1.1.
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -40,7 +44,7 @@ wide(Echo, A1, _A2, _A3, _A4, _A5, _A6, _A7, _A8, _A9, _A10, _A11, _A12, _A13, _
     churn(Echo, A1).
 
 %% Minor collections free the heaps the dead registers point into; the reply
-%% arrives as a heap fragment, so the next wait switches out wanting a GC.
+%% arrives as a heap fragment, so the process is scheduled in wanting a GC.
 churn(Echo, A) ->
     _ = build(A, 3000, []),
     Echo ! {self(), 5000},
@@ -92,9 +96,9 @@ fn run_cli(dir: &std::path::Path) -> String {
 }
 
 #[test]
-fn switch_out_gc_roots_only_live_registers() {
+fn schedule_in_gc_roots_only_live_registers() {
     let Ok(reference) = RefErl::start() else {
-        eprintln!("erl unavailable; skipping switch-out GC live register test");
+        eprintln!("erl unavailable; skipping schedule-in GC live register test");
         return;
     };
     let module = reference
@@ -107,10 +111,10 @@ fn switch_out_gc_roots_only_live_registers() {
         CallResult::Ok(term) => format!("{term}"),
         other => panic!("erl sol_stale_x:run failed: {other:?}"),
     };
-    let dir = std::env::temp_dir().join(format!("arinsal-switch-out-gc-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("arinsal-schedule-in-gc-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     std::fs::write(dir.join("sol_stale_x.beam"), &module).expect("write beam");
-    // Each run hits thousands of switch-outs that want a collection; looping the
+    // Each run hits thousands of schedule-ins that want a collection; looping the
     // node a few times makes a stale-root read all but certain before the fix.
     for _ in 0..3 {
         assert_eq!(run_cli(&dir), expected);

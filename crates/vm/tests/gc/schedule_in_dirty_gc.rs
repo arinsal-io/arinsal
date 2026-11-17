@@ -2,6 +2,10 @@
 //! out at once: it runs no instruction on the normal scheduler. Compared with erts through the
 //! scheduling, receive and GC trace (the dirty collection's reductions are time-based).
 //!
+//! The `in` event precedes the collection: erts_schedule calls `trace_schedule_in` (line 10292)
+//! before the GC block, so a delayed collection yields `in`, then `out`, and no instruction runs
+//! between them.
+//!
 //! Port of erts/emulator/beam/erl_process.c:10415-10428 (erts_schedule: `scheduler_gc_proc`,
 //! `goto sched_out_proc` on F_DIRTY_MAJOR_GC/F_DIRTY_MINOR_GC), OTP-29.1.1.
 
