@@ -1323,6 +1323,20 @@ pub enum OnHeapSend {
     Queued,
     /// The lock was held and the queue push failed.
     Failed(Error),
+    /// The receiver's state has `ERTS_PSFLG_OFF_HEAP_MSGQ`: no heap attempt was made, the
+    /// caller builds a combined message (erts_alloc_message_heap_state).
+    OffHeapMsgq,
+}
+
+/// Outcome of [`Scheduler::try_with_receiver_task`].
+#[derive(Debug, Eq, PartialEq)]
+pub enum OnHeapTask<R> {
+    /// As [`OnHeapSend::Unavailable`].
+    Unavailable,
+    /// As [`OnHeapSend::OffHeapMsgq`].
+    OffHeapMsgq,
+    /// The body ran under the receiver's main lock.
+    Done(R),
 }
 
 /// Outcome of attempting an erts-style sig-free task lock.
@@ -2738,6 +2752,12 @@ fn progress_wait<R>(wait: impl FnOnce() -> R) -> R {
 /// fetches the outer queue before it scans (erl_gc.c:987).
 /// Port of erts/emulator/beam/erl_message.c:621 (`erts_try_alloc_message_on_heap`
 /// try-locks the main lock and rejects a volatile heap), OTP-29.1.1.
+/// The receiver's `ERTS_PSFLG_OFF_HEAP_MSGQ`, read from the process the send already found
+/// (`erts_atomic32_read_nob(&receiver->state)` in erts_send_message).
+fn receiver_off_heap_msgq<T: Task>(process: &Process<T>) -> bool {
+    process.exit_flags.load(Ordering::Relaxed) & proc_flags::OFF_HEAP_MSGQ != 0
+}
+
 fn receiver_heap_stable<T: Task>(process: &Process<T>) -> bool {
     let state = process.run_state().load(Ordering::Acquire);
     state != RUNNING && state != EXITED && process.dirty_runner.load(Ordering::Acquire) == 0
@@ -7673,6 +7693,33 @@ impl<T: Task> Scheduler<T> {
         }
         Some(body(cell.task_mut()))
     }
+    /// [`Self::try_with_task`] for a send: one lookup that also reports the receiver's
+    /// `ERTS_PSFLG_OFF_HEAP_MSGQ` before any lock attempt, as erts_send_message reads
+    /// `receiver->state` from the process it found.
+    // Port of erts/emulator/beam/erl_message.c (erts_send_message,
+    // erts_alloc_message_heap_state, erts_try_alloc_message_on_heap), OTP-29.1.1.
+    pub fn try_with_receiver_task<R>(
+        &self,
+        pid: Pid,
+        body: impl FnOnce(&mut T) -> R,
+    ) -> OnHeapTask<R> {
+        let Some(process) = self.inner.table.lookup(pid) else {
+            return OnHeapTask::Unavailable;
+        };
+        if receiver_off_heap_msgq(&process) {
+            return OnHeapTask::OffHeapMsgq;
+        }
+        if !receiver_heap_stable(&process) {
+            return OnHeapTask::Unavailable;
+        }
+        let Some(mut cell) = process.cell.try_lock() else {
+            return OnHeapTask::Unavailable;
+        };
+        if !receiver_heap_stable(&process) {
+            return OnHeapTask::Unavailable;
+        }
+        OnHeapTask::Done(body(cell.task_mut()))
+    }
     /// Copy helper for a sender that has no [`RunCtx`]: queue `prepare`'s message
     /// before the main lock drops. A [`RunCtx`] send must use [`Self::try_with_task`]
     /// and publish through that context, so the message stays on the sender's worker.
@@ -7688,6 +7735,9 @@ impl<T: Task> Scheduler<T> {
         let Some(process) = self.inner.table.lookup(to) else {
             return Ok(OnHeapSend::Unavailable);
         };
+        if receiver_off_heap_msgq(&process) {
+            return Ok(OnHeapSend::OffHeapMsgq);
+        }
         if !receiver_heap_stable(&process) {
             return Ok(OnHeapSend::Unavailable);
         }
@@ -8460,8 +8510,29 @@ mod dirty_state_tests {
         target.dirty_runner.store(1, Ordering::Release);
         assert!(scheduler.try_with_task(to, |_| ()).is_none());
         target.dirty_runner.store(0, Ordering::Release);
+        // erts_alloc_message_heap_state: an off-heap queue is reported before any lock attempt.
+        proc_flags::set_state(&target.exit_flags, proc_flags::OFF_HEAP_MSGQ);
+        assert_eq!(
+            scheduler
+                .try_send_on_heap(from, to, |_| Ok::<_, ()>(Some(())))
+                .unwrap(),
+            OnHeapSend::OffHeapMsgq
+        );
+        assert_eq!(
+            scheduler.try_with_receiver_task(to, |_| ()),
+            OnHeapTask::OffHeapMsgq
+        );
+        proc_flags::clear_state(&target.exit_flags, proc_flags::OFF_HEAP_MSGQ);
+        assert_eq!(
+            scheduler.try_with_receiver_task(to, |_| ()),
+            OnHeapTask::Done(())
+        );
         let _held = target.cell.lock();
         assert!(scheduler.try_with_task(to, |_| ()).is_none());
+        assert_eq!(
+            scheduler.try_with_receiver_task(to, |_| ()),
+            OnHeapTask::Unavailable
+        );
     }
 }
 
@@ -9388,6 +9459,9 @@ impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
         let local = self.local.upgrade()?;
         let mut local = local.try_borrow_mut().ok()?;
         let outcome = self.inner.table.with_live_managed(to, |process| {
+            if receiver_off_heap_msgq(process) {
+                return OnHeapSend::OffHeapMsgq;
+            }
             let Some(mut cell) = process.cell.try_lock() else {
                 return OnHeapSend::Unavailable;
             };

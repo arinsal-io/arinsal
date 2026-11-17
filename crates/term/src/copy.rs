@@ -332,12 +332,6 @@ fn copy_struct_x<H: HeapAlloc + ?Sized>(
     copy_struct_into(root, base, size, dst, litopt, false)
 }
 
-enum CopyAt {
-    Scan,
-    List(*mut u64, Term),
-    Boxed(*mut u64, Term),
-}
-
 fn copy_struct_into<H: HeapAlloc + ?Sized>(
     root: Term,
     base: *mut u64,
@@ -386,16 +380,22 @@ fn copy_struct_into_layout<H: HeapAlloc + ?Sized>(
     let mut hbot = base.wrapping_add(size);
     let mut res = 0u64;
     let mut const_tuple: *mut u64 = std::ptr::null_mut();
-    let mut at = match root.0 & 3 {
-        1 => CopyAt::List(&mut res, root),
-        2 => CopyAt::Boxed(&mut res, root),
-        _ => {
-            return Ok(CopyLayout {
-                root,
-                front_words: 0,
-                back_words: 0,
-            });
-        }
+    if root.0 & 3 != 1 && root.0 & 3 != 2 {
+        return Ok(CopyLayout {
+            root,
+            front_words: 0,
+            back_words: 0,
+        });
+    }
+    // The pending pointer to copy and the word that receives the copy (copy.c `obj`, `argp`).
+    let mut argp: *mut u64 = &mut res;
+    let mut obj = root;
+    // copy.c's literal test: one range test against the snapshot, then the purge area only
+    // for an object inside that range.
+    let is_literal = |address: usize| {
+        litopt.is_some_and(|areas| {
+            address.wrapping_sub(literal_start) < literal_size && !areas.in_purge_area(address)
+        })
     };
     // SAFETY: `base` is `size` writable words that do not alias `root`. Every
     // source pointer is a live cons or boxed object. Off-heap owners are
@@ -426,69 +426,15 @@ fn copy_struct_into_layout<H: HeapAlloc + ?Sized>(
                 });
             }
         }
-        loop {
-            match at {
-                CopyAt::Scan => {
-                    if hp == htop {
-                        if require_full {
-                            debug_assert_eq!(
-                                htop, hbot,
-                                "copy_struct htop/hbot root={:#x} size={size}",
-                                root.0
-                            );
-                        }
-                        let end = base.wrapping_add(size);
-                        return Ok(CopyLayout {
-                            root: Term(res),
-                            front_words: (htop as usize - base as usize) / 8,
-                            back_words: (end as usize - hbot as usize) / 8,
-                        });
-                    }
-                    let obj = Term(*hp);
-                    match obj.0 & 3 {
-                        3 => hp = hp.add(1),
-                        1 => {
-                            let objp = obj.raw_ptr();
-                            if in_copy_area(objp, hstart, hsize) {
-                                hp = hp.add(1);
-                            } else {
-                                let argp = hp;
-                                hp = hp.add(1);
-                                at = CopyAt::List(argp, obj);
-                            }
-                        }
-                        2 => {
-                            let objp = obj.raw_ptr();
-                            if in_copy_area(objp, hstart, hsize) {
-                                hp = hp.add(1);
-                            } else {
-                                let argp = hp;
-                                hp = hp.add(1);
-                                at = CopyAt::Boxed(argp, obj);
-                            }
-                        }
-                        0 => {
-                            let hdr = obj.0;
-                            if header_is_thing(hdr) || hp == const_tuple {
-                                hp = hp.add(copy_scan_skip(hdr));
-                            } else {
-                                hp = hp.add(1);
-                            }
-                        }
-                        _ => hp = hp.add(1),
-                    }
-                }
-                CopyAt::List(mut argp, mut obj) => {
-                    let mut objp = obj.raw_ptr();
-                    if litopt.is_some_and(|areas| {
-                        let address = objp as usize;
-                        address.wrapping_sub(literal_start) < literal_size
-                            && !areas.in_purge_area(address)
-                    }) {
-                        *argp = obj.0;
-                        at = CopyAt::Scan;
-                        continue;
-                    }
+        // Port of copy.c:676-1010 (copy_struct_x): `L_copy` handles one pointer, then the
+        // scan of `hp..htop` finds the next uncopied pointer and jumps back (`goto L_copy`).
+        'copy: loop {
+            if obj.0 & 3 == 1 {
+                // L_copy_list.
+                let mut objp = obj.raw_ptr();
+                if is_literal(objp as usize) {
+                    *argp = obj.0;
+                } else {
                     loop {
                         let tp = argp;
                         let elem = Term(*objp);
@@ -504,49 +450,31 @@ fn copy_struct_into_layout<H: HeapAlloc + ?Sized>(
                         };
                         *tp = Term::from_ptr(tailp.sub(1), 1).0;
                         obj = Term(*objp.add(1));
+                        argp = tailp;
                         if obj.0 & 3 != 1 {
-                            argp = tailp;
                             break;
                         }
                         objp = obj.raw_ptr();
-                        if litopt.is_some_and(|areas| {
-                            let address = objp as usize;
-                            address.wrapping_sub(literal_start) < literal_size
-                                && !areas.in_purge_area(address)
-                        }) {
-                            *tailp = obj.0;
-                            at = CopyAt::Scan;
+                        if is_literal(objp as usize) {
                             break;
                         }
-                        argp = tailp;
-                    }
-                    if matches!(at, CopyAt::Scan) {
-                        continue;
                     }
                     match obj.0 & 3 {
-                        3 => {
-                            *argp = obj.0;
-                            at = CopyAt::Scan;
-                        }
-                        2 => at = CopyAt::Boxed(argp, obj),
+                        2 => continue 'copy,
+                        // An immediate tail, or a literal list tail kept as it is.
+                        3 | 1 => *argp = obj.0,
                         _ => {
                             debug_assert!(false, "copy_struct bad list tail {:#x}", obj.0);
                             *argp = obj.0;
-                            at = CopyAt::Scan;
                         }
                     }
                 }
-                CopyAt::Boxed(argp, obj) => {
-                    let mut objp = obj.raw_ptr();
-                    if litopt.is_some_and(|areas| {
-                        let address = objp as usize;
-                        address.wrapping_sub(literal_start) < literal_size
-                            && !areas.in_purge_area(address)
-                    }) {
-                        *argp = obj.0;
-                        at = CopyAt::Scan;
-                        continue;
-                    }
+            } else {
+                // L_copy_boxed.
+                let mut objp = obj.raw_ptr();
+                if is_literal(objp as usize) {
+                    *argp = obj.0;
+                } else {
                     let hdr = *objp;
                     // Debug-only: the sized block must hold this object (erts copy_struct
                     // asserts `htop <= hbot` on exit; here also before each object).
@@ -563,26 +491,25 @@ fn copy_struct_into_layout<H: HeapAlloc + ?Sized>(
                             let n = (hdr >> 6) as usize;
                             if n == 0 {
                                 *argp = crate::global_empty_tuple().0;
-                                at = CopyAt::Scan;
-                                continue;
-                            }
-                            *argp = Term::from_ptr(htop, 2).0;
-                            let tp = htop;
-                            *htop = *objp;
-                            htop = htop.add(1);
-                            objp = objp.add(1);
-                            let mut const_flag = true;
-                            for _ in 0..n {
-                                let elem = Term(*objp);
-                                objp = objp.add(1);
-                                if !elem.is_immed() {
-                                    const_flag = false;
-                                }
-                                *htop = elem.0;
+                            } else {
+                                *argp = Term::from_ptr(htop, 2).0;
+                                let tp = htop;
+                                *htop = *objp;
                                 htop = htop.add(1);
-                            }
-                            if const_flag {
-                                const_tuple = tp;
+                                objp = objp.add(1);
+                                let mut const_flag = true;
+                                for _ in 0..n {
+                                    let elem = Term(*objp);
+                                    objp = objp.add(1);
+                                    if !elem.is_immed() {
+                                        const_flag = false;
+                                    }
+                                    *htop = elem.0;
+                                    htop = htop.add(1);
+                                }
+                                if const_flag {
+                                    const_tuple = tp;
+                                }
                             }
                         }
                         RECORD => {
@@ -622,7 +549,44 @@ fn copy_struct_into_layout<H: HeapAlloc + ?Sized>(
                             *argp = Term::from_ptr(hbot, 2).0;
                         }
                     }
-                    at = CopyAt::Scan;
+                }
+            }
+            // The scan of the copied words for pointers not yet copied.
+            loop {
+                if hp == htop {
+                    if require_full {
+                        debug_assert_eq!(
+                            htop, hbot,
+                            "copy_struct htop/hbot root={:#x} size={size}",
+                            root.0
+                        );
+                    }
+                    let end = base.wrapping_add(size);
+                    return Ok(CopyLayout {
+                        root: Term(res),
+                        front_words: (htop as usize - base as usize) / 8,
+                        back_words: (end as usize - hbot as usize) / 8,
+                    });
+                }
+                let word = *hp;
+                match word & 3 {
+                    1 | 2 => {
+                        let objp = Term(word).raw_ptr();
+                        argp = hp;
+                        hp = hp.add(1);
+                        if !in_copy_area(objp, hstart, hsize) {
+                            obj = Term(word);
+                            continue 'copy;
+                        }
+                    }
+                    0 => {
+                        if header_is_thing(word) || hp == const_tuple {
+                            hp = hp.add(copy_scan_skip(word));
+                        } else {
+                            hp = hp.add(1);
+                        }
+                    }
+                    _ => hp = hp.add(1),
                 }
             }
         }

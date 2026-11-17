@@ -96,7 +96,8 @@ impl Process {
     ///
     /// Port of erts/emulator/beam/erl_message.c:621 (`erts_try_alloc_message_on_heap`)
     /// and erl_process.h:2878 (`erts_alloc_message_heap_state`), OTP-29.1.1.
-    /// `Ok(false)` keeps the existing heap-fragment copy.
+    /// `Ok(None)`: queued. `Ok(Some(off_heap))`: not queued; `off_heap` is the receiver's
+    /// `ERTS_PSFLG_OFF_HEAP_MSGQ` as read by the same lookup, which picks the message layout.
     #[allow(clippy::too_many_arguments)] // erts passes the scheduler data as one more.
     fn try_send_on_receiver_heap(
         &self,
@@ -107,10 +108,18 @@ impl Process {
         priority: bool,
         seq_token: &mut SendMeta,
         handle: Option<&arinsal_sched::NativeHandle<Message>>,
-    ) -> Result<bool, VmError> {
+    ) -> Result<Option<bool>, VmError> {
+        use arinsal_sched::OnHeapSend;
+        // No data: a message reference either way, whatever the queue mode.
         if counted.words + counted.token_words == 0 {
-            return Ok(false);
+            return Ok(Some(false));
         }
+        let outcome = |sent: OnHeapSend| match sent {
+            OnHeapSend::Unavailable | OnHeapSend::Declined => Ok(Some(false)),
+            OnHeapSend::OffHeapMsgq => Ok(Some(true)),
+            OnHeapSend::Queued => Ok(None),
+            OnHeapSend::Failed(error) => Err(VmError::Unsupported(format!("send: {error}"))),
+        };
         if ctx.is_none()
             && let Some(handle) = handle
         {
@@ -128,54 +137,40 @@ impl Process {
             if let Some(error) = failure {
                 return Err(error);
             }
-            match native {
-                Some(
-                    arinsal_sched::OnHeapSend::Unavailable | arinsal_sched::OnHeapSend::Declined,
-                ) => return Ok(false),
-                Some(arinsal_sched::OnHeapSend::Queued) => return Ok(true),
-                Some(arinsal_sched::OnHeapSend::Failed(error)) => {
-                    return Err(VmError::Unsupported(format!("send: {error}")));
-                }
-                None => {}
+            if let Some(sent) = native {
+                return outcome(sent);
             }
         }
         let Some(runtime) = self.runtime.as_ref() else {
-            return Ok(false);
+            return Ok(Some(false));
         };
         let Ok(scheduler) = runtime.scheduler() else {
-            return Ok(false);
+            return Ok(Some(false));
         };
         if let Some(ctx) = ctx {
-            return match scheduler.try_with_task(to, |receiver| {
+            return match scheduler.try_with_receiver_task(to, |receiver| {
                 let Some(envelope) =
                     message_on_receiver_heap(receiver, counted, priority, seq_token)?
                 else {
-                    return Ok(false);
+                    return Ok(Some(false));
                 };
                 let delivered = ctx.send(to, envelope);
                 // A queued target buffers on this worker. Publish before the lock drops
                 // so the term is in the signal queue while it still lives on that heap.
                 ctx.flush_pending();
                 match delivered {
-                    Ok(()) | Err(arinsal_sched::Error::NoProcess) => Ok(true),
+                    Ok(()) | Err(arinsal_sched::Error::NoProcess) => Ok(None),
                     Err(error) => Err(VmError::Unsupported(format!("send: {error}"))),
                 }
             }) {
-                Some(result) => result,
-                None => Ok(false),
+                arinsal_sched::OnHeapTask::Done(result) => result,
+                arinsal_sched::OnHeapTask::OffHeapMsgq => Ok(Some(true)),
+                arinsal_sched::OnHeapTask::Unavailable => Ok(Some(false)),
             };
         }
-        match scheduler.try_send_on_heap(from, to, |receiver| {
+        outcome(scheduler.try_send_on_heap(from, to, |receiver| {
             message_on_receiver_heap(receiver, counted, priority, seq_token)
-        })? {
-            arinsal_sched::OnHeapSend::Unavailable | arinsal_sched::OnHeapSend::Declined => {
-                Ok(false)
-            }
-            arinsal_sched::OnHeapSend::Queued => Ok(true),
-            arinsal_sched::OnHeapSend::Failed(error) => {
-                Err(VmError::Unsupported(format!("send: {error}")))
-            }
-        }
+        })?)
     }
 
     pub(crate) fn send_message(&mut self, target: Term, value: Term) -> Result<Term, VmError> {
@@ -524,43 +519,38 @@ impl Process {
                 token_words,
                 literals: &literals,
             };
-            // Port of erts/emulator/beam/erl_message.c (erts_send_message reads
-            // `receiver->state`; erts_alloc_message_heap_state), OTP-29.1.1: an off-heap queue
-            // takes a combined message without trying the receiver's heap.
-            let receiver_off_heap = if pid == sender {
-                self.message_queue_data() == MessageQueueData::OffHeap
-            } else {
-                self.runtime
-                    .as_ref()
-                    .and_then(|runtime| runtime.scheduler().ok())
-                    .and_then(|scheduler| {
-                        scheduler.with_proc_flags(pid, |flags| {
-                            flags.load(Ordering::Relaxed) & proc_flags::OFF_HEAP_MSGQ != 0
-                        })
-                    })
-                    .unwrap_or(false)
-            };
             let mut on_heap = None;
-            if receiver_off_heap {
-                // erts_alloc_message_heap_state: ERTS_PSFLG_OFF_HEAP_MSGQ, no heap attempt.
-            } else if pid == sender {
-                // Port of erts/emulator/beam/erl_message.c (erts_try_alloc_message_on_heap),
-                // OTP-29.1.1: a process that sends to itself holds its own main lock, so the
-                // message and its token are allocated on its own young heap when they fit.
-                on_heap = message_on_receiver_heap(self, counted, via_prio_alias, &mut seq_token)?;
-                on_own_heap = on_heap.is_some();
-            } else if self.try_send_on_receiver_heap(
-                ctx.as_deref_mut(),
-                sender,
-                pid,
-                counted,
-                via_prio_alias,
-                &mut seq_token,
-                native.as_ref(),
-            )? {
-                self.bump_send_reds(pid == sender, words);
-                return Ok(value);
-            }
+            // erts_send_message reads `receiver->state` (ERTS_PSFLG_OFF_HEAP_MSGQ) from the
+            // receiver it found; the heap attempt below reports it from the same lookup.
+            let receiver_off_heap = if pid == sender {
+                let off_heap = self.message_queue_data() == MessageQueueData::OffHeap;
+                if !off_heap {
+                    // Port of erts/emulator/beam/erl_message.c (erts_try_alloc_message_on_heap),
+                    // OTP-29.1.1: a process that sends to itself holds its own main lock, so
+                    // the message and its token are allocated on its own young heap when they
+                    // fit.
+                    on_heap =
+                        message_on_receiver_heap(self, counted, via_prio_alias, &mut seq_token)?;
+                    on_own_heap = on_heap.is_some();
+                }
+                off_heap
+            } else {
+                match self.try_send_on_receiver_heap(
+                    ctx.as_deref_mut(),
+                    sender,
+                    pid,
+                    counted,
+                    via_prio_alias,
+                    &mut seq_token,
+                    native.as_ref(),
+                )? {
+                    None => {
+                        self.bump_send_reds(false, words);
+                        return Ok(value);
+                    }
+                    Some(off_heap) => off_heap,
+                }
+            };
             let node = if let Some(envelope) = on_heap {
                 Self::message_node(sender, envelope)
             } else if let crate::seq_trace::SeqState::Token(token) = &mut seq_token.seq {
