@@ -41,7 +41,6 @@ fn bit_sized_binary_construct_errors_match_otp() {
                 "run",
                 &[Term::small(bits).expect("small bit size")],
                 1,
-                Some(0xB17_5EED),
             )
             .unwrap_or_else(|error| panic!("run/1 with {bits} bits: {error}"));
         println!("RESULT:{:?}", actual.term);
@@ -69,7 +68,7 @@ fn bit_sized_binary_construct_errors_match_otp() {
         let output = Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
-                "bit_sized_binary_construct_errors_match_otp",
+                "bs_construct_error_info_differential::bit_sized_binary_construct_errors_match_otp",
                 "--nocapture",
             ])
             .env(CHILD, &beam_path)

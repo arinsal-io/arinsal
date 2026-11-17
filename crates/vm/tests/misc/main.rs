@@ -9,6 +9,7 @@ mod bench;
 mod boot_loop1;
 mod boot_loop2;
 mod boot_loop3;
+mod bs_construct_error_info_differential;
 mod call_time_compile_differential;
 mod cli_boot;
 mod crash_regressions;

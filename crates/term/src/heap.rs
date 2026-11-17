@@ -2078,23 +2078,6 @@ impl ProcessHeap {
         Term::from_ptr(hp, 2)
     }
 
-    /// Port the tuple BIF's `HAlloc`, `sys_memcpy`, and indexed replacement sequence.
-    // Port of erts/emulator/beam/bif.c:2976-3000 (setelement_3), OTP-29.1.1.
-    #[inline(always)]
-    pub fn setelement(&mut self, source: crate::raw::Tuple<'_>, ix: usize, value: Term) -> Term {
-        let size = source.arity() + 1;
-        let hp = self
-            .alloc_halloc(size)
-            .unwrap_or_else(|| self.heap_fragment(size));
-        crate::raw::copy_words(
-            (source.term().bits() as usize).wrapping_sub(2),
-            hp as usize,
-            size,
-        );
-        store(hp.wrapping_add(ix), value.bits());
-        Term::from_ptr(hp, 2)
-    }
-
     /// Port `append_element_2`'s one allocation and forward element copy.
     // Port of erts/emulator/beam/bif.c:3083-3108 (append_element_2), OTP-29.1.1.
     pub fn append_element(&mut self, source: crate::raw::Tuple<'_>, value: Term) -> Term {
