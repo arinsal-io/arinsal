@@ -138,20 +138,6 @@ impl Process {
         if resources & proc_flags::TRACER != 0 {
             crate::trace::tracer_exited(self, ctx.pid());
         }
-        // Port of erts/emulator/beam/erl_process.c:11039 (cleanup_sys_tasks), OTP-29.1.1:
-        // delayed literal-copy requests of an exiting process are answered with `ok`.
-        {
-            for task in self.take_delayed_gc() {
-                if let crate::proc_create::DelayedGc::Literal {
-                    request, requester, ..
-                } = task
-                {
-                    let _ = crate::natives::sys::reply_exiting_literal_area(
-                        self, ctx, request, requester,
-                    );
-                }
-            }
-        }
         // Port of erts/emulator/beam/erl_process.c:14300-14304, OTP-29.1.1.
         // Timers aimed at this process are canceled only when p->bif_timers != NULL.
         if resources & proc_flags::BIF_TIMERS != 0 {

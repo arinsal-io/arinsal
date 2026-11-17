@@ -83,8 +83,7 @@ pub(crate) fn charge(process: &mut crate::Process, reds: usize) {
 
 /// `erts_set_gc_state(c_p, 1)`: whether delayed GC tasks were moved back to the system queue.
 pub(crate) fn gc_enable(process: &mut crate::Process) -> bool {
-    process.set_gc_enabled(true);
-    process.delayed_gc_due()
+    process.erts_set_gc_state_enable()
 }
 
 /// The magic reference of a new trap state: `erts_create_magic_binary` + `erts_mk_magic_ref`,

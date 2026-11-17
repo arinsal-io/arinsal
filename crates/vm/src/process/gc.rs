@@ -96,8 +96,30 @@ impl Process {
     /// Port of erts/emulator/beam/erl_process.c:11823 (`erts_set_gc_state`), OTP-29.1.1.
     pub(crate) fn set_gc_enabled(&mut self, enabled: bool) -> bool {
         let previous = self.heap.gc_enabled;
-        self.heap.gc_enabled = enabled;
+        if enabled {
+            self.erts_set_gc_state_enable();
+        } else {
+            self.heap.gc_enabled = false;
+        }
         previous
+    }
+
+    /// `erts_set_gc_state(c_p, 1)`: clear `F_DISABLE_GC` and move the delayed GC tasks back in
+    /// front of the system task queues, with `ERTS_PSFLG_ACTIVE_SYS` set at the next
+    /// scheduling point (`sys_tasks_deferred`). Returns whether tasks were moved.
+    // Port of erts/emulator/beam/erl_process.c:11823-11935 (erts_set_gc_state), OTP-29.1.1.
+    pub(crate) fn erts_set_gc_state_enable(&mut self) -> bool {
+        self.heap.gc_enabled = true;
+        let Some(cold) = self.cold.as_mut() else {
+            return false;
+        };
+        if cold.delayed_gc_tasks.is_empty() {
+            return false;
+        }
+        let delayed = std::mem::take(&mut cold.delayed_gc_tasks);
+        cold.sys_tasks.push_delayed_front(delayed);
+        self.slice_mut().sys_tasks_deferred = true;
+        true
     }
 
     /// Collect after a BIF whose heap fragments outgrew the free young area.
@@ -123,7 +145,9 @@ impl Process {
     /// Roots the exact live count recorded at the current call or switch-out point;
     /// registers above it are dead and may hold stale pointers.
     pub(crate) fn force_gc(&mut self) -> Result<(), VmError> {
-        self.force_gc_live(self.gc_live)
+        // erl_gc.c:418 (erts_gc_after_bif_call_lhf): after a BIF only its result is live, and
+        // this BIF returns an immediate.
+        self.force_gc_live(0)
     }
 
     /// Force collection with the current BEAM live-register count.
@@ -255,9 +279,6 @@ impl Process {
         // queue runs here: no unhandled signal in the middle queue, no receive tracing, and
         // an outer queue of ordinary messages only.
         if !self.sig_cont_empty() || crate::trace::active() {
-            return Ok(0);
-        }
-        if self.slice().is_some_and(|work| !work.delayed_gc.is_empty()) {
             return Ok(0);
         }
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:1332 (erts_proc_sig_fetch__): the outer

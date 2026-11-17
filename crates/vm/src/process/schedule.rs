@@ -472,10 +472,9 @@ impl Process {
         // with GC disabled the dirty collection is dropped; the next collection does it.
         if !ctx.scheduler_type().is_dirty()
             && !self.heap.gc_enabled
-            && self
-                .cold
-                .as_mut()
-                .is_some_and(|cold| cold.dirty_gc.take().is_some() && cold.delayed_gc.is_empty())
+            && self.cold.as_mut().is_some_and(|cold| {
+                cold.dirty_gc.take().is_some() && cold.dirty_sys_tasks.is_empty()
+            })
         {
             self.update_work(|work| work.dirty_sys_gc = false);
         }

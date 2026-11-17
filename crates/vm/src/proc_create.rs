@@ -1300,10 +1300,7 @@ pub(crate) struct SliceWork {
     pub(crate) sys_tasks_deferred: bool,
     /// A process-local BIF trap waiting for its private continuation export.
     pub(crate) bif_trap: Option<BifTrapPending>,
-    /// GC requests received while GC was disabled (`erts_set_gc_state`); replayed
-    /// once it is enabled again. Port of erl_process.c:10831 (`save_gc_task`).
-    pub(crate) delayed_gc: Vec<DelayedGc>,
-    /// A potentially long GC request waits in `delayed_gc` for a dirty CPU scheduler.
+    /// A system task GC request waits in `cold.dirty_sys_tasks` for a dirty CPU scheduler.
     pub(crate) dirty_sys_gc: bool,
     /// When the dirty CPU scheduler picked the process (`start_time` of
     /// erts_dirty_process_main); the time until it schedules again is the charge.
@@ -1345,7 +1342,6 @@ impl SliceWork {
             || self.rla_block.is_some()
             || self.dirty_pickup.is_some()
             || self.suspend_parked
-            || !self.delayed_gc.is_empty()
     }
 }
 
@@ -1435,6 +1431,13 @@ pub(crate) struct ProcessCold {
     /// erts `p->sys_task_qs`: the system tasks whose ordered signal was handled, until
     /// `execute_sys_tasks` runs them.
     pub(crate) sys_tasks: crate::signals::SysTaskQueues,
+    /// erts `ERTS_PSD_DELAYED_GC_TASK_QS`: GC and copy-literal-area tasks fetched while
+    /// `F_DISABLE_GC` was set (`save_gc_task`); `erts_set_gc_state(1)` moves them back to
+    /// `sys_tasks`.
+    pub(crate) delayed_gc_tasks: crate::signals::SysTaskQueues,
+    /// erts `c_p->dirty_sys_tasks`: tasks answered once the dirty scheduler has run the
+    /// collection the process was scheduled out for (`save_dirty_task`).
+    pub(crate) dirty_sys_tasks: Vec<crate::signals::Pending>,
     /// erts `F_DIRTY_MAJOR_GC` / `F_DIRTY_MINOR_GC`: a potentially long collection the
     /// process started itself waits for a dirty CPU scheduler.
     pub(crate) dirty_gc: Option<DirtyGc>,
@@ -1870,12 +1873,6 @@ impl Process {
         self.take_work(|work| std::mem::take(&mut work.native_timeout_trace).then_some(()))
             .is_some()
     }
-    /// Takes the delayed GC requests.
-    #[inline(always)]
-    pub(crate) fn take_delayed_gc(&mut self) -> Vec<DelayedGc> {
-        self.take_work(|work| Some(std::mem::take(&mut work.delayed_gc)))
-            .unwrap_or_default()
-    }
     /// Removes the first signal of the middle queue.
     #[inline(always)]
     pub(crate) fn pop_sig_cont_signal(
@@ -2245,21 +2242,6 @@ pub(crate) enum DirtyGc {
     Major,
     /// erts `F_DIRTY_MINOR_GC`.
     Minor,
-}
-
-/// A garbage-collection request saved while `F_DISABLE_GC` was set.
-pub(crate) enum DelayedGc {
-    /// Plain `garbage_collect` request.
-    Collect,
-    /// Asynchronous `garbage_collect/2,3` request whose reply is still owed.
-    Request(crate::signals::Pending),
-    /// Literal-area copy phase that needs a collection.
-    Literal {
-        area_id: u64,
-        request: crate::process::Message,
-        how: arinsal_sched::LiteralCopyHow,
-        requester: arinsal_sched::Pid,
-    },
 }
 
 /// Port of erts/emulator/beam/erl_db.c:3006-3080 (ets_delete_1 continuation) and
@@ -2959,7 +2941,6 @@ mod layout_report {
         field!("trace_flags", (u64, Vec<(u64, u64)>));
         field!("timer_pause", Option<crate::process::TimerPause>);
         field!("bif_trap", Option<BifTrapPending>);
-        field!("delayed_gc", Vec<DelayedGc>);
         field!("dirty_gc", Option<DirtyGc>);
         field!("flags", ProcFlags);
         field!("btreeset", std::collections::BTreeSet<u64>);

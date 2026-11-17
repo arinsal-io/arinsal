@@ -1106,6 +1106,13 @@ pub(crate) enum RemoteOp {
     },
     /// `erts_internal:request_system_task/3,4` `system_task_test` (erts `ERTS_PSTT_TEST`).
     SystemTaskTest { request_id: Message },
+    /// `ERTS_PSTT_CLA`: the `check_gc` / `need_gc` phase of a literal-area copy request; the
+    /// `init` phase is the `ERTS_SIG_Q_OP_CLA` signal. `request` is the reply envelope.
+    CopyLiteralArea {
+        area_id: u64,
+        request: Message,
+        how: arinsal_sched::LiteralCopyHow,
+    },
     /// `ERTS_PSTT_PRIO_SIG`: a system task without reply whose only purpose is to elevate
     /// the target's priority until it has handled its incoming signals.
     PrioSig,
@@ -1141,8 +1148,24 @@ pub(crate) struct SysTaskSignal {
 }
 
 impl SysTaskQueues {
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.sys.iter().all(VecDeque::is_empty)
+    }
+
+    /// Port of erts/emulator/beam/erl_process.c:11758 (save_gc_task), OTP-29.1.1: the task
+    /// joins the delayed queue of its priority.
+    fn save_gc_task(&mut self, index: usize, task: Pending) {
+        self.sys[index].push_back(task);
+    }
+
+    /// Port of erts/emulator/beam/erl_process.c:11843-11925 (erts_set_gc_state, "Move delayed
+    /// gc tasks into sys tasks queues"), OTP-29.1.1: delayed tasks go in front of the queued
+    /// ones, as they have already made it to the front once.
+    pub(crate) fn push_delayed_front(&mut self, delayed: SysTaskQueues) {
+        for (queue, mut delayed) in self.sys.iter_mut().zip(delayed.sys) {
+            delayed.append(queue);
+            *queue = delayed;
+        }
     }
 
     /// The highest-priority queued check_process_code task.
@@ -1158,7 +1181,7 @@ impl SysTaskQueues {
     /// Port of erts/emulator/beam/erl_process.c:10646 (fetch_sys_task), OTP-29.1.1:
     /// highest priority first; a waiting low-priority task runs after `RESCHEDULE_LOW`
     /// normal ones (erl_process.h:373).
-    fn fetch_sys_task(&mut self) -> Option<Pending> {
+    fn fetch_sys_task(&mut self) -> Option<(usize, Pending)> {
         const RESCHEDULE_LOW: u8 = 8;
         const NORMAL: usize = 2;
         const LOW: usize = 3;
@@ -1179,7 +1202,7 @@ impl SysTaskQueues {
         if self.is_empty() {
             self.ncount = 0;
         }
-        task
+        task.map(|task| (index, task))
     }
 }
 
@@ -1354,30 +1377,38 @@ pub(crate) fn handle_sys_task(
     else {
         return Ok(());
     };
-    run_request(process, ctx, pending)?;
+    run_request(process, ctx, sys_index(Priority::Max), pending)?;
     clear_sys_task_priority_if_idle(process, ctx);
     Ok(())
 }
 
-/// Run one fetched request: a GC request may be saved or moved to a dirty scheduler first.
+/// Run one fetched system task of priority queue `index`: a GC task may be saved or moved to
+/// a dirty scheduler first.
 fn run_request(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
+    index: usize,
     pending: Pending,
 ) -> Result<(), VmError> {
-    // Port of erts/emulator/beam/erl_process.c:10831 (save_gc_task), OTP-29.1.1:
-    // a garbage_collect request waits (reply included) until GC is enabled again.
-    if !process.heap.gc_enabled && matches!(pending.op, RemoteOp::Collect { .. }) {
+    // Port of erts/emulator/beam/erl_process.c:10829-10833 and 10878-10895 (execute_sys_tasks,
+    // F_DISABLE_GC with ERTS_PSTT_GC_MAJOR/MINOR/CLA), OTP-29.1.1: the task waits (reply
+    // included) in the delayed queue until `erts_set_gc_state(1)` moves it back.
+    if !process.heap.gc_enabled
+        && matches!(
+            pending.op,
+            RemoteOp::Collect { .. } | RemoteOp::CopyLiteralArea { .. }
+        )
+    {
         process
-            .slice_mut()
-            .delayed_gc
-            .push(crate::proc_create::DelayedGc::Request(pending));
+            .cold_mut()
+            .delayed_gc_tasks
+            .save_gc_task(index, pending);
         return Ok(());
     }
     // Port of erts/emulator/beam/erl_gc.c:688-715 (check_for_possibly_long_gc) as called for
     // the ERTS_PSTT_GC system task (erl_process.c:11018-11040), OTP-29.1.1: a potentially
-    // long collection runs on a dirty CPU scheduler, so it cannot hold up the processes
-    // queued on this one.
+    // long collection runs on a dirty CPU scheduler (`save_dirty_task`), so it cannot hold
+    // up the processes queued on this one.
     if let RemoteOp::Collect { major, .. } = &pending.op
         && !ctx.scheduler_type().is_dirty()
         && process
@@ -1386,15 +1417,28 @@ fn run_request(
             .is_some_and(|cold| cold.sys_task_point)
         && potentially_long_gc(process, *major)
     {
-        {
-            let mut work = process.slice_mut();
-            work.delayed_gc
-                .push(crate::proc_create::DelayedGc::Request(pending));
-            work.dirty_sys_gc = true;
-        }
+        process.cold_mut().dirty_sys_tasks.push(pending);
+        process.slice_mut().dirty_sys_gc = true;
         return Err(VmError::Dirty(arinsal_sched::DirtyKind::Cpu));
     }
     reply_request(process, ctx, pending)
+}
+
+/// Port of erts/emulator/beam/erl_process.c:11196-11250 (erts_execute_dirty_system_task, the
+/// `c_p->dirty_sys_tasks` loop), OTP-29.1.1: answer the tasks saved for the dirty scheduler.
+pub(crate) fn execute_dirty_sys_tasks(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+) -> Result<(), VmError> {
+    let tasks = process
+        .cold
+        .as_mut()
+        .map(|cold| std::mem::take(&mut cold.dirty_sys_tasks))
+        .unwrap_or_default();
+    for pending in tasks {
+        reply_request(process, ctx, pending)?;
+    }
+    Ok(())
 }
 
 /// Port of erts/emulator/beam/erl_gc.c:688-715 (check_for_possibly_long_gc), OTP-29.1.1.
@@ -1421,11 +1465,11 @@ pub(crate) fn execute_sys_tasks(
             .cold
             .as_mut()
             .and_then(|cold| cold.sys_tasks.fetch_sys_task());
-        let Some(pending) = pending else {
+        let Some((index, pending)) = pending else {
             clear_sys_task_priority_if_idle(process, ctx);
             return Ok(());
         };
-        run_request(process, ctx, pending)?;
+        run_request(process, ctx, index, pending)?;
     }
 }
 
@@ -1491,6 +1535,23 @@ pub(crate) fn reply_request(
     if matches!(pending.op, RemoteOp::PrioSig) {
         return Ok(());
     }
+    // Port of erts/emulator/beam/erl_process.c:10878-10920 (ERTS_PSTT_CLA in execute_sys_tasks):
+    // the process is switched out, so `erts_copy_literals_gc` roots `c_p->arity` registers.
+    if let RemoteOp::CopyLiteralArea {
+        area_id,
+        request,
+        how,
+    } = pending.op
+    {
+        return crate::natives::sys::copy_literal_area(
+            process,
+            ctx,
+            area_id,
+            request,
+            how,
+            pending.from,
+        );
+    }
     let message = if let RemoteOp::Collect { request_id, major } = pending.op {
         crate::natives::proc::fulfill_collect(process, ctx, request_id, major)?
     } else {
@@ -1549,16 +1610,29 @@ pub(crate) fn sys_task_signal_failed(
     let Some(task) = signal.task.lock().unwrap().take() else {
         return;
     };
-    if matches!(task.op, RemoteOp::PrioSig) {
-        return;
+    fail_sys_task(process, ctx, task);
+}
+
+/// Port of erts/emulator/beam/erl_process.c:11039 (cleanup_sys_tasks), OTP-29.1.1: the failure
+/// reply of a system task the process will never run.
+fn fail_sys_task(process: &mut Process, ctx: &mut RunCtx<'_, Message>, task: Pending) {
+    match task.op {
+        RemoteOp::PrioSig => {}
+        // ERTS_PSTT_CLA of an exiting process answers `ok`.
+        RemoteOp::CopyLiteralArea { request, .. } => {
+            let _ =
+                crate::natives::sys::reply_exiting_literal_area(process, ctx, request, task.from);
+        }
+        op => {
+            let Ok(reply) = crate::natives::proc::failure_reply(process, task.id, op) else {
+                return;
+            };
+            let Ok(message) = Message::copy_from(reply) else {
+                return;
+            };
+            let _ = ctx.send(task.from, message);
+        }
     }
-    let Ok(reply) = crate::natives::proc::failure_reply(process, task.id, task.op) else {
-        return;
-    };
-    let Ok(message) = Message::copy_from(reply) else {
-        return;
-    };
-    let _ = ctx.send(task.from, message);
 }
 
 /// Reply `false` / `undefined` / `badarg` for requests this process will never run.
@@ -1579,35 +1653,13 @@ pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Messag
         for queue in std::mem::take(&mut cold.sys_tasks).sys {
             pending.extend(queue);
         }
-    }
-    {
-        for task in process.take_delayed_gc() {
-            match task {
-                crate::proc_create::DelayedGc::Request(request) => pending.push_back(request),
-                // Port of erts/emulator/beam/erl_process.c:11039-11041 (cleanup_sys_tasks),
-                // OTP-29.1.1: a saved literal-area copy task of an exiting process answers `ok`.
-                crate::proc_create::DelayedGc::Literal {
-                    request, requester, ..
-                } => {
-                    let _ = crate::natives::sys::reply_exiting_literal_area(
-                        process, ctx, request, requester,
-                    );
-                }
-                crate::proc_create::DelayedGc::Collect => {}
-            }
+        for queue in std::mem::take(&mut cold.delayed_gc_tasks).sys {
+            pending.extend(queue);
         }
+        pending.extend(std::mem::take(&mut cold.dirty_sys_tasks));
     }
     for pending in pending {
-        if matches!(pending.op, RemoteOp::PrioSig) {
-            continue;
-        }
-        let Ok(reply) = crate::natives::proc::failure_reply(process, pending.id, pending.op) else {
-            continue;
-        };
-        let Ok(message) = Message::copy_from(reply) else {
-            continue;
-        };
-        let _ = ctx.send(pending.from, message);
+        fail_sys_task(process, ctx, pending);
     }
 }
 

@@ -2597,7 +2597,8 @@ pub(crate) fn collect_heap(
         process.heap.set_fullsweep_after(0);
     }
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:8257 (message queue GC scan), OTP-29.1.1.
-    let live = process.gc_live;
+    // erl_process.c execute_sys_tasks runs with the process switched out: `c_p->arity`.
+    let live = crate::process::switched_out_live(process);
     let collected = process.collect_arg_reg(live, keep, 0);
     process.heap.set_fullsweep_after(fullsweep_after);
     let stats = collected?;
@@ -2717,8 +2718,9 @@ pub(crate) fn fulfill_request(
                 .unwrap_or_else(|_| Term::atom(arinsal_term::atoms::BADARG));
             make_tuple(process, &[reference, previous])
         }
-        crate::signals::RemoteOp::Collect { .. } => Err(VmError::Unsupported(
-            "garbage_collect system task is answered by fulfill_collect".into(),
+        crate::signals::RemoteOp::Collect { .. }
+        | crate::signals::RemoteOp::CopyLiteralArea { .. } => Err(VmError::Unsupported(
+            "garbage_collect and copy-literal-area tasks are answered by reply_request".into(),
         )),
         crate::signals::RemoteOp::SystemTaskTest { request_id } => {
             let request_id = request_id.decode_into(process)?;
@@ -2806,6 +2808,9 @@ pub(crate) fn failure_reply(
             let request_id = request_id.decode_into(process)?;
             gc_message(process, request_id, false)
         }
+        crate::signals::RemoteOp::CopyLiteralArea { .. } => Err(VmError::Unsupported(
+            "copy-literal-area failure is answered by fail_sys_task".into(),
+        )),
         crate::signals::RemoteOp::SystemTaskTest { request_id } => {
             let request_id = request_id.decode_into(process)?;
             make_tuple(

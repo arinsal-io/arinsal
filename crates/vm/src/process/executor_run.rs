@@ -116,6 +116,7 @@ impl Executor {
                         }
                         process.slice_mut().dirty_sys_gc = false;
                         process.run_dirty_gc()?;
+                        crate::signals::execute_dirty_sys_tasks(process, ctx)?;
                         // The signals are handled on the normal scheduler the process returns to.
                         break 'execution Ok(RunState::Yield);
                     }
@@ -129,7 +130,6 @@ impl Executor {
                     if !signals_handled
                         && (ctx.sys_task_run()
                             || !process.sig_cont_empty()
-                            || process.delayed_gc_due()
                             || ctx.has_pending_nmsg())
                     {
                         schedule_in_signals(process, ctx)?;
@@ -589,9 +589,7 @@ impl Executor {
         // new input, so the rest is handled before it sleeps. Messages it produces end the
         // wait like a new message would.
         let result = match result {
-            Ok(RunState::Wait { timeout_pos })
-                if !process.sig_cont_empty() || process.delayed_gc_due() =>
-            {
+            Ok(RunState::Wait { timeout_pos }) if !process.sig_cont_empty() => {
                 let queued = process.inbox.len();
                 match process.handle_local_signals(ctx) {
                     Ok(()) if process.inbox.len() == queued => Ok(RunState::Wait { timeout_pos }),

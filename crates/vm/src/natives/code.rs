@@ -1616,16 +1616,36 @@ fn send_copy_request(
     };
     let target = Pid::from_term(args[0]).expect("validated pid");
     let request = crate::process::Message::literal_copy_request(args[1], how, target)?;
-    let signal_result = ctx.signal(
-        target,
-        Signal::LiteralAreaCopy(Box::new(arinsal_sched::LiteralAreaCopyRequest {
+    // Port of erts/emulator/beam/beam_bif_load.c:1750 (erts_literal_area_collector_send_copy_request_3):
+    // `init` is the ERTS_SIG_Q_OP_CLA signal, `check_gc` / `need_gc` schedule a system task
+    // (erts_schedule_cla_gc) at the target's user priority.
+    let signal_result = if how == LiteralCopyHow::Init {
+        ctx.signal(
+            target,
+            Signal::LiteralAreaCopy(Box::new(arinsal_sched::LiteralAreaCopyRequest {
+                area_id,
+                request,
+                how,
+                requester: ctx.pid(),
+            })),
+        )
+        .is_ok()
+    } else {
+        let priority = ctx
+            .process_priority(target)
+            .unwrap_or(arinsal_sched::Priority::Normal);
+        let op = crate::signals::RemoteOp::CopyLiteralArea {
             area_id,
             request,
             how,
-            requester: ctx.pid(),
-        })),
-    );
-    if signal_result.is_err() {
+        };
+        let requester = ctx.pid();
+        matches!(
+            crate::signals::submit_sys_task(process, ctx, requester, target, op, priority)?,
+            crate::signals::Submit::Sent
+        )
+    };
+    if !signal_result {
         super::sys::reply_failed_literal_area_request(process, ctx, args[1], how, target)?;
     }
     Ok(Term::atom(arinsal_term::atoms::OK))

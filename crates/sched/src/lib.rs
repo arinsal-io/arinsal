@@ -769,8 +769,6 @@ pub enum Signal<M: SignalMessage> {
     Alias(u64),
     /// Alias deactivation.
     Unalias(u64),
-    /// Ask a process to collect its heap at its next signal safe point.
-    GarbageCollect,
     /// Ask a process to copy terms from a retiring literal area.
     /// Boxed: the request is rare and would otherwise widen every queued event.
     LiteralAreaCopy(Box<LiteralAreaCopyRequest<M>>),

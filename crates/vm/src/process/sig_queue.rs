@@ -110,14 +110,6 @@ impl Process {
         }
     }
 
-    /// Whether GC was enabled again with delayed GC tasks saved: erts moves them back to the
-    /// system task queue and sets `ERTS_PSFLG_ACTIVE_SYS`, so they run at the next
-    /// scheduling point even when the process waits.
-    // Port of erts/emulator/beam/erl_process.c:11823-11935 (erts_set_gc_state), OTP-29.1.1.
-    pub(crate) fn delayed_gc_due(&self) -> bool {
-        self.heap.gc_enabled && self.slice().is_some_and(|work| !work.delayed_gc.is_empty())
-    }
-
     /// Handle the signals of the middle queue (`sig_cont`) for at most `*reds` reductions
     /// (and `max_reds` when the limit is stretched), after fetching the outer queue unless
     /// `local_only`. Messages before the next unhandled signal move to the message queue; the
@@ -134,24 +126,6 @@ impl Process {
     ) -> Result<bool, VmError> {
         if !local_only {
             self.fetch_signals(ctx)?;
-        }
-        if self.delayed_gc_due() {
-            for task in self.take_delayed_gc() {
-                match task {
-                    crate::proc_create::DelayedGc::Collect => self.force_gc()?,
-                    crate::proc_create::DelayedGc::Request(pending) => {
-                        crate::signals::reply_request(self, ctx, pending)?
-                    }
-                    crate::proc_create::DelayedGc::Literal {
-                        area_id,
-                        request,
-                        how,
-                        requester,
-                    } => crate::natives::sys::copy_literal_area(
-                        self, ctx, area_id, request, how, requester,
-                    )?,
-                }
-            }
         }
         let limit_in = *reds;
         *reds = 0;
@@ -723,16 +697,6 @@ impl Process {
             arinsal_sched::Signal::Alias(_) | arinsal_sched::Signal::Unalias(_) => {
                 return Err(VmError::Unsupported("process aliases".into()));
             }
-            arinsal_sched::Signal::GarbageCollect => {
-                if self.heap.gc_enabled {
-                    self.force_gc()?;
-                } else {
-                    self.slice_mut()
-                        .delayed_gc
-                        .push(crate::proc_create::DelayedGc::Collect);
-                }
-                0
-            }
             arinsal_sched::Signal::LiteralAreaCopy(copy) => {
                 let arinsal_sched::LiteralAreaCopyRequest {
                     area_id,
@@ -740,20 +704,9 @@ impl Process {
                     how,
                     requester,
                 } = *copy;
-                if !self.heap.gc_enabled && how != arinsal_sched::LiteralCopyHow::Init {
-                    self.slice_mut()
-                        .delayed_gc
-                        .push(crate::proc_create::DelayedGc::Literal {
-                            area_id,
-                            request,
-                            how,
-                            requester,
-                        });
-                } else {
-                    crate::natives::sys::copy_literal_area(
-                        self, ctx, area_id, request, how, requester,
-                    )?;
-                }
+                crate::natives::sys::copy_literal_area(
+                    self, ctx, area_id, request, how, requester,
+                )?;
                 0
             }
         };

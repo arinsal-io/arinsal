@@ -365,16 +365,12 @@ fn binary_to_list_chunk(
             bif_ret(c_p, i, Err(trap))
         }
         Ok(Some(value)) => {
-            if gc_disabled {
-                process.set_gc_enabled(true);
-                if process.delayed_gc_due() {
-                    // ERTS_BIF_PREP_YIELD_RETURN: ERTS_VBUMP_ALL_REDS, then bif_return_trap.
-                    crate::bif_traps::vbump_all_reds(process);
-                    let undefined = Term::atom(arinsal_term::atoms::UNDEFINED);
-                    let trap =
-                        bif_trap(process, "erlang:bif_return_trap/2", vec![value, undefined]);
-                    return bif_ret(c_p, i, Err(trap));
-                }
+            if gc_disabled && process.erts_set_gc_state_enable() {
+                // ERTS_BIF_PREP_YIELD_RETURN: ERTS_VBUMP_ALL_REDS, then bif_return_trap.
+                crate::bif_traps::vbump_all_reds(process);
+                let undefined = Term::atom(arinsal_term::atoms::UNDEFINED);
+                let trap = bif_trap(process, "erlang:bif_return_trap/2", vec![value, undefined]);
+                return bif_ret(c_p, i, Err(trap));
             }
             crate::native_hooks::raw(value)
         }
