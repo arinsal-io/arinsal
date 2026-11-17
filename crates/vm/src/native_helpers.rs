@@ -464,14 +464,19 @@ pub(crate) const BOUND_NIF: usize = 0;
 // copies them there), OTP-29.1.1: the site of the function holds the operands itself.
 pub(crate) struct NativeNifSite {
     arity: u8,
+    /// `ErtsCodeMFA` of the function: `beam_jit_call_nif` stores it in `c_p->current`.
+    mfa: usize,
     /// The `call_nif` operands, written once by `load_nif` before the body is enabled.
     call: std::sync::OnceLock<crate::natives::nif::NativeFn>,
 }
 
 impl NativeNifSite {
-    pub(crate) fn new(_module: String, _function: String, arity: u8) -> Box<Self> {
+    pub(crate) fn new(module: String, function: String, arity: u8) -> Box<Self> {
+        let mfa = crate::beamasm_integration::bif_mfa_export(&module, &function, arity)
+            .map_or(0, |export| std::ptr::from_ref(export.mfa()) as usize);
         Box::new(Self {
             arity,
+            mfa,
             call: std::sync::OnceLock::new(),
         })
     }
@@ -676,6 +681,13 @@ pub extern "C" fn arinsal_beamasm_static_nif(
     if nif.module == "prim_tty" {
         crate::natives::tty::note_caller_native(process);
     }
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:635 (beam_jit_call_nif): `current` is
+    // set "to please handle_error" before the NIF runs.
+    if let Some(export) =
+        crate::beamasm_integration::bif_mfa_export(&nif.module, &nif.function, nif.arity)
+    {
+        process.heap.abi.current = std::ptr::from_ref(export.mfa()).cast();
+    }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::calls::call_bif(&mut process.heap, nif.entry, &reg[..usize::from(nif.arity)])
     }));
@@ -704,6 +716,8 @@ pub extern "C" fn arinsal_beamasm_call_nif(
         crate::native_hooks::set_error(process, "undef");
         return 0;
     };
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:635 (beam_jit_call_nif).
+    process.heap.abi.current = site.mfa as *const std::ffi::c_void;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::natives::nif::call_native(&mut process.heap, native, &reg[..usize::from(site.arity)])
     }));

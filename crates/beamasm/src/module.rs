@@ -2197,7 +2197,10 @@ impl BeamModuleAssembler {
             e.br(Gpr::x(17))
         })?;
         self.code.bind(not_trap)?;
-        self.error_if_nonzero(Gpr::x(9))?;
+        // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:709-717 (emit_bif_nif_epilogue):
+        // the error path hands `c_p->current`, which beam_jit_call_nif set, to
+        // raise_exception_shared as `bif_mfa`.
+        self.error_if_nonzero_with_bif_context(Gpr::x(9))?;
         self.code.bind(resume)?;
         self.emit_leave_frame()?;
         self.code.emit(|e| e.ret(Gpr::x(30)))?;
