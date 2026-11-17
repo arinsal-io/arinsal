@@ -79,10 +79,13 @@ pub(crate) struct RunQueueBalance {
     pub(crate) check_balance_reds: AtomicI64,
     /// The scheduler of this run queue sleeps waiting for work (`rq->waiting`).
     pub(crate) waiting: AtomicBool,
+    /// The global `no_empty_run_queues` of a normal run queue; `None` for a dirty one, which
+    /// erts leaves out of that count (`ERTS_RUNQ_IX_IS_DIRTY`).
+    no_empty_run_queues: Option<Arc<AtomicI32>>,
 }
 
 impl RunQueueBalance {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(no_empty_run_queues: Option<Arc<AtomicI32>>) -> Self {
         Self {
             len: std::array::from_fn(|_| AtomicI32::new(0)),
             max_len: std::array::from_fn(|_| AtomicI32::new(0)),
@@ -92,12 +95,18 @@ impl RunQueueBalance {
             flags: AtomicU32::new(FLG_NONEMPTY),
             check_balance_reds: AtomicI64::new(CALL_CHECK_BALANCE_REDS),
             waiting: AtomicBool::new(false),
+            no_empty_run_queues,
         }
     }
 
-    /// Port of erts/emulator/beam/erl_process.h:798 (erts_add_runq_len), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_process.h:798 (erts_add_runq_len), OTP-29.1.1: the
+    /// run queue's first entry marks it non-empty (`erts_non_empty_runq`).
     pub(crate) fn add_len(&self, prio: usize, n: i32) {
-        let len = self.total_len.fetch_add(n, Ordering::Relaxed) + n;
+        let previous = self.total_len.fetch_add(n, Ordering::Relaxed);
+        if previous == 0 {
+            self.non_empty_runq();
+        }
+        let len = previous + n;
         raise(&self.total_max_len, len);
         let len = self.len[prio].fetch_add(n, Ordering::Relaxed) + n;
         raise(&self.max_len[prio], len);
@@ -107,6 +116,31 @@ impl RunQueueBalance {
     pub(crate) fn sub_len(&self, prio: usize, n: i32) {
         self.total_len.fetch_sub(n, Ordering::Relaxed);
         self.len[prio].fetch_sub(n, Ordering::Relaxed);
+    }
+
+    /// Port of erts/emulator/beam/erl_process.c:2977 (empty_runq / empty_runq_aux), OTP-29.1.1:
+    /// the scheduler of this run queue declares itself out of work. Returns the old flags.
+    pub(crate) fn empty_runq(&self) -> u32 {
+        let old = self.flags.fetch_and(!FLG_NONEMPTY, Ordering::AcqRel);
+        if old & FLG_NONEMPTY != 0
+            && let Some(count) = &self.no_empty_run_queues
+        {
+            count.fetch_add(1, Ordering::AcqRel);
+        }
+        old
+    }
+
+    /// Port of erts/emulator/beam/erl_process.c:2993 (non_empty_runq), OTP-29.1.1.
+    pub(crate) fn non_empty_runq(&self) {
+        if self.flags.load(Ordering::Relaxed) & FLG_NONEMPTY != 0 {
+            return;
+        }
+        let old = self.flags.fetch_or(FLG_NONEMPTY, Ordering::AcqRel);
+        if old & FLG_NONEMPTY == 0
+            && let Some(count) = &self.no_empty_run_queues
+        {
+            count.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     /// Processes and ports queued on this run queue (`rq->len`).
@@ -289,7 +323,7 @@ pub(crate) struct Balance<T: Task> {
     paths: crate::run_queue::raw::MigrationPaths,
     compact_load: bool,
     /// Run queues whose scheduler declared itself out of work (`no_empty_run_queues`).
-    no_empty_run_queues: AtomicI32,
+    no_empty_run_queues: Arc<AtomicI32>,
 }
 
 impl<T: Task> Balance<T> {
@@ -302,8 +336,11 @@ impl<T: Task> Balance<T> {
         compact_load: bool,
         progress: Arc<crate::thr_progress::ThrProgress>,
     ) -> Self {
+        let no_empty_run_queues = Arc::new(AtomicI32::new(0));
         Self {
-            rqs: (0..schedulers).map(|_| ProcQueues::new()).collect(),
+            rqs: (0..schedulers)
+                .map(|_| ProcQueues::new(Some(Arc::clone(&no_empty_run_queues))))
+                .collect(),
             checking_balance: AtomicBool::new(false),
             halftime: AtomicBool::new(true),
             state: Mutex::new(BalanceState {
@@ -320,29 +357,19 @@ impl<T: Task> Balance<T> {
             no_used_runqs: AtomicUsize::new(online),
             paths: crate::run_queue::raw::MigrationPaths::new(schedulers, Arc::clone(&progress)),
             compact_load,
-            no_empty_run_queues: AtomicI32::new(0),
+            no_empty_run_queues,
         }
     }
 
     /// Port of erts/emulator/beam/erl_process.c:2977 (empty_runq / empty_runq_aux), OTP-29.1.1:
     /// the scheduler of run queue `ix` declares itself out of work. Returns the old flags.
     pub(crate) fn empty_runq(&self, ix: usize) -> u32 {
-        let old = self.rq(ix).flags.fetch_and(!FLG_NONEMPTY, Ordering::AcqRel);
-        if old & FLG_NONEMPTY != 0 {
-            self.no_empty_run_queues.fetch_add(1, Ordering::AcqRel);
-        }
-        old
+        self.rq(ix).empty_runq()
     }
 
     /// Port of erts/emulator/beam/erl_process.c:2993 (non_empty_runq), OTP-29.1.1.
     pub(crate) fn non_empty_runq(&self, ix: usize) {
-        if self.rq(ix).flags.load(Ordering::Relaxed) & FLG_NONEMPTY != 0 {
-            return;
-        }
-        let old = self.rq(ix).flags.fetch_or(FLG_NONEMPTY, Ordering::AcqRel);
-        if old & FLG_NONEMPTY == 0 {
-            self.no_empty_run_queues.fetch_sub(1, Ordering::AcqRel);
-        }
+        self.rq(ix).non_empty_runq();
     }
 
     /// `erts_atomic32_read_acqb(&no_empty_run_queues)`.

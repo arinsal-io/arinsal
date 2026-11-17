@@ -3016,7 +3016,7 @@ impl<T: Task> DirtyPool<T> {
 
     fn new(threads: usize) -> Self {
         Self {
-            procs: run_queue::ProcQueues::new(),
+            procs: run_queue::ProcQueues::new(None),
             queue: Mutex::new(DirtyQueue {
                 sleepers: VecDeque::new(),
             }),
@@ -8408,7 +8408,7 @@ mod dirty_state_tests {
         let scheduler = Scheduler::<Idle>::new(Config::default());
         let pid = scheduler.spawn(Idle).unwrap();
         let process = scheduler.inner.table.lookup(pid).unwrap();
-        let rq = run_queue::ProcQueues::<Idle>::new();
+        let rq = run_queue::ProcQueues::<Idle>::new(None);
         let normal = queue_index(Priority::Normal.index());
         let high = queue_index(Priority::High.index());
         rq.push(Scheduled::at_prio(process.clone(), Enqueue::Real, normal));
