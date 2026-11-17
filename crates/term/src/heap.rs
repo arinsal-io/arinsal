@@ -2078,6 +2078,193 @@ impl ProcessHeap {
         Term::from_ptr(hp, 2)
     }
 
+    /// Port the tuple BIF's `HAlloc`, `sys_memcpy`, and indexed replacement sequence.
+    // Port of erts/emulator/beam/bif.c:2976-3000 (setelement_3), OTP-29.1.1.
+    #[inline(always)]
+    pub fn setelement(&mut self, source: crate::raw::Tuple<'_>, ix: usize, value: Term) -> Term {
+        let size = source.arity() + 1;
+        let hp = self
+            .alloc_halloc(size)
+            .unwrap_or_else(|| self.heap_fragment(size));
+        crate::raw::copy_words(
+            (source.term().bits() as usize).wrapping_sub(2),
+            hp as usize,
+            size,
+        );
+        store(hp.wrapping_add(ix), value.bits());
+        Term::from_ptr(hp, 2)
+    }
+
+    /// Port `append_element_2`'s one allocation and forward element copy.
+    // Port of erts/emulator/beam/bif.c:3083-3108 (append_element_2), OTP-29.1.1.
+    pub fn append_element(&mut self, source: crate::raw::Tuple<'_>, value: Term) -> Term {
+        let arity = source.arity();
+        let words = arity + 2;
+        let hp = self
+            .alloc_halloc(words)
+            .unwrap_or_else(|| self.heap_fragment(words));
+        store(hp, (((arity + 1) as u64) << 6) | ARITY);
+        for (index, element) in source.elements().enumerate() {
+            store(hp.wrapping_add(index + 1), element.bits());
+        }
+        store(hp.wrapping_add(words - 1), value.bits());
+        Term::from_ptr(hp, 2)
+    }
+
+    /// Port `delete_element_2`'s one allocation and forward copy around the removed element.
+    // Port of erts/emulator/beam/bif.c:3144-3180 (delete_element_2), OTP-29.1.1.
+    pub fn delete_element(&mut self, source: crate::raw::Tuple<'_>, index: usize) -> Term {
+        let arity = source.arity();
+        if arity == 1 {
+            return crate::global_empty_tuple();
+        }
+        let words = arity;
+        let hp = self
+            .alloc_halloc(words)
+            .unwrap_or_else(|| self.heap_fragment(words));
+        store(hp, (((arity - 1) as u64) << 6) | ARITY);
+        let mut elements = source.elements();
+        let mut dst = 1;
+        for _ in 1..index {
+            store(hp.wrapping_add(dst), elements.next().unwrap().bits());
+            dst += 1;
+        }
+        let _removed = elements.next().unwrap();
+        for element in elements {
+            store(hp.wrapping_add(dst), element.bits());
+            dst += 1;
+        }
+        Term::from_ptr(hp, 2)
+    }
+
+    /// Port `insert_element_3`'s one allocation and two forward copy loops.
+    // Port of erts/emulator/beam/bif.c:3110-3141 (insert_element_3), OTP-29.1.1.
+    pub fn insert_element(
+        &mut self,
+        source: crate::raw::Tuple<'_>,
+        index: usize,
+        value: Term,
+    ) -> Term {
+        let arity = source.arity();
+        let words = arity + 2;
+        let hp = self
+            .alloc_halloc(words)
+            .unwrap_or_else(|| self.heap_fragment(words));
+        store(hp, (((arity + 1) as u64) << 6) | ARITY);
+        let slot = index - 1;
+        let mut elements = source.elements();
+        let mut dst = 1;
+        for _ in 0..slot {
+            store(hp.wrapping_add(dst), elements.next().unwrap().bits());
+            dst += 1;
+        }
+        store(hp.wrapping_add(dst), value.bits());
+        dst += 1;
+        for element in elements {
+            store(hp.wrapping_add(dst), element.bits());
+            dst += 1;
+        }
+        Term::from_ptr(hp, 2)
+    }
+
+    /// Port `tuple_to_list_1`'s reverse cons loop into one HAlloc reservation.
+    // Port of erts/emulator/beam/bif.c:3762-3786 (tuple_to_list_1), OTP-29.1.1.
+    pub fn tuple_to_list(&mut self, source: crate::raw::Tuple<'_>) -> Term {
+        let arity = source.arity();
+        let words = arity * 2;
+        let hp = self
+            .alloc_halloc(words)
+            .unwrap_or_else(|| self.heap_fragment(words));
+        let mut list = Term::NIL;
+        for at in (0..arity).rev() {
+            let cell = hp.wrapping_add((arity - 1 - at) * 2);
+            store(cell, source.get(at).unwrap().bits());
+            store(cell.wrapping_add(1), list.bits());
+            list = Term::from_ptr(cell, 1);
+        }
+        list
+    }
+
+    /// Port `list_to_tuple_1`'s allocation and cons-chain copy after length validation.
+    // Port of erts/emulator/beam/bif.c:3789-3814 (list_to_tuple_1), OTP-29.1.1.
+    pub fn list_to_tuple(&mut self, mut list: Term, len: usize) -> Term {
+        if len == 0 {
+            return crate::global_empty_tuple();
+        }
+        let words = len + 1;
+        let hp = self
+            .alloc_halloc(words)
+            .unwrap_or_else(|| self.heap_fragment(words));
+        store(hp, ((len as u64) << 6) | ARITY);
+        for at in 0..len {
+            let cons = crate::raw::Cons::try_from(list).unwrap();
+            store(hp.wrapping_add(at + 1), cons.head().bits());
+            list = cons.tail();
+        }
+        Term::from_ptr(hp, 2)
+    }
+
+    /// Port `make_tuple_2`'s allocation and initialization loop after size validation.
+    // Port of erts/emulator/beam/bif.c:3006-3024 (make_tuple_2), OTP-29.1.1.
+    pub fn make_tuple(&mut self, len: usize, initial: Term) -> Term {
+        if len == 0 {
+            return crate::global_empty_tuple();
+        }
+        let words = len + 1;
+        let hp = self
+            .alloc_halloc(words)
+            .unwrap_or_else(|| self.heap_fragment(words));
+        store(hp, ((len as u64) << 6) | ARITY);
+        for at in 0..len {
+            store(hp.wrapping_add(at + 1), initial.bits());
+        }
+        Term::from_ptr(hp, 2)
+    }
+
+    /// Port `make_tuple_3`'s allocation, initialization, and update-list traversal order.
+    // Port of erts/emulator/beam/bif.c:3027-3077 (make_tuple_3), OTP-29.1.1.
+    pub fn make_tuple_with_list(
+        &mut self,
+        len: usize,
+        initial: Term,
+        mut list: Term,
+    ) -> Result<Term, TermError> {
+        let tuple = if len == 0 {
+            crate::global_empty_tuple()
+        } else {
+            let words = len + 1;
+            let hp = self
+                .alloc_halloc(words)
+                .unwrap_or_else(|| self.heap_fragment(words));
+            store(hp, ((len as u64) << 6) | ARITY);
+            for at in 0..len {
+                store(hp.wrapping_add(at + 1), initial.bits());
+            }
+            Term::from_ptr(hp, 2)
+        };
+        let tuple_ptr = (tuple.bits().wrapping_sub(2)) as *mut u64;
+        while let Ok(cons) = crate::raw::Cons::try_from(list) {
+            list = cons.tail();
+            let entry = crate::raw::Tuple::try_from(cons.head())
+                .ok()
+                .filter(|entry| entry.arity() == 2)
+                .ok_or(TermError::BadArg)?;
+            let index = entry
+                .get(0)
+                .and_then(Term::as_small)
+                .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| index.checked_sub(1))
+                .filter(|index| *index < len)
+                .ok_or(TermError::BadArg)?;
+            let value = entry.get(1).ok_or(TermError::BadArg)?;
+            store(tuple_ptr.wrapping_add(index + 1), value.bits());
+        }
+        if list != Term::NIL {
+            return Err(TermError::BadArg);
+        }
+        Ok(tuple)
+    }
+
     /// Allocate `words` while keeping `extra` words available for native stores.
     // Port of `HeapWordsLeft` and `HAlloc` in erts/emulator/beam/erl_vm.h, OTP-29.1.1.
     #[inline(always)]

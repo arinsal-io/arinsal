@@ -80,15 +80,6 @@ pub(crate) fn bif_system_limit(c_p: *mut ProcessHeader) -> u64 {
     arinsal_term::THE_NON_VALUE
 }
 
-/// `BIF_RET` of a term built on the process heap, or `BIF_ERROR(c_p, SYSTEM_LIMIT)`.
-#[inline(always)]
-fn heap_ret(c_p: *mut ProcessHeader, built: Result<Term, arinsal_term::TermError>) -> u64 {
-    match built {
-        Ok(term) => crate::native_hooks::raw(term),
-        Err(_) => bif_system_limit(c_p),
-    }
-}
-
 /// `monitor/2`.
 // Port of erts/emulator/beam/bif.c (monitor_2), OTP-29.1.1.
 pub(crate) extern "C" fn monitor_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
@@ -1847,7 +1838,7 @@ pub(crate) extern "C" fn tuple_size_1(c_p: *mut ProcessHeader, reg: *mut u64, _i
 
 /// `setelement/3`: one `HAlloc` of `arity + 1` words, the copy of the tuple, then the replaced
 /// element.
-// Port of erts/emulator/beam/bif.c (setelement_3), OTP-29.1.1.
+// Port of erts/emulator/beam/bif.c:2976-3000 (setelement_3), OTP-29.1.1.
 pub(crate) extern "C" fn setelement_3(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
@@ -2390,7 +2381,7 @@ fn valid_raise_stacktrace(stacktrace: Term) -> bool {
 const ERTS_MAX_TUPLE_SIZE: usize = (1 << 24) - 1;
 
 /// `tuple_to_list/1`: `n` cons cells, filled from the last element to the first.
-// Port of erts/emulator/beam/bif.c (tuple_to_list_1), OTP-29.1.1.
+// Port of erts/emulator/beam/bif.c:3762-3786 (tuple_to_list_1), OTP-29.1.1.
 pub(crate) extern "C" fn tuple_to_list_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
@@ -2400,38 +2391,24 @@ pub(crate) extern "C" fn tuple_to_list_1(c_p: *mut ProcessHeader, reg: *mut u64,
     let Ok(tuple) = arinsal_term::raw::Tuple::try_from(term) else {
         return bif_badarg(c_p);
     };
-    let n = tuple.arity();
-    if n == 0 {
-        return crate::native_hooks::raw(Term::NIL);
-    }
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let built = arinsal_term::TermBuilder::new(&mut heap)
-        .reserve_cons_list(n)
-        .and_then(|cells| {
-            cells.prepend_exact_with_tail(
-                (0..n).rev().map(|at| tuple.get(at).unwrap_or(Term::NIL)),
-                Term::NIL,
-            )
-        });
-    heap_ret(c_p, built)
+    crate::native_hooks::raw(process.heap.tuple_to_list(tuple))
 }
 
 /// `list_to_tuple/1`.
-// Port of erts/emulator/beam/bif.c (list_to_tuple_1), OTP-29.1.1.
+// Port of erts/emulator/beam/bif.c:3789-3814 (list_to_tuple_1), OTP-29.1.1.
 pub(crate) extern "C" fn list_to_tuple_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
     let [list] = bif_args::<1>(reg);
-    let Ok(list) = arinsal_term::raw::ProperList::try_from(list) else {
+    let Ok(proper_list) = arinsal_term::raw::ProperList::try_from(list) else {
         return bif_badarg(c_p);
     };
-    if list.len() > ERTS_MAX_TUPLE_SIZE {
+    if proper_list.len() > ERTS_MAX_TUPLE_SIZE {
         return bif_badarg(c_p);
     }
-    let built = list.to_tuple(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap));
-    heap_ret(c_p, built)
+    crate::native_hooks::raw(process.heap.list_to_tuple(list, proper_list.len()))
 }
 
 /// The arity argument of `make_tuple/2,3`, `None` for `BADARG`.
@@ -2442,7 +2419,7 @@ fn make_tuple_arity(n: Term) -> Option<usize> {
 }
 
 /// `make_tuple/2`.
-// Port of erts/emulator/beam/bif.c (make_tuple_2), OTP-29.1.1.
+// Port of erts/emulator/beam/bif.c:3006-3024 (make_tuple_2), OTP-29.1.1.
 pub(crate) extern "C" fn make_tuple_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
@@ -2452,61 +2429,28 @@ pub(crate) extern "C" fn make_tuple_2(c_p: *mut ProcessHeader, reg: *mut u64, _i
     let Some(n) = make_tuple_arity(n) else {
         return bif_badarg(c_p);
     };
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let built = arinsal_term::TermBuilder::new(&mut heap).tuple_from_fn(n, |_, _| initial);
-    heap_ret(c_p, built)
+    crate::native_hooks::raw(process.heap.make_tuple(n, initial))
 }
 
 /// `make_tuple/3`: the tuple of `BIF_ARG_2`, then each `{Index, Value}` of the list stored.
-// Port of erts/emulator/beam/bif.c (make_tuple_3), OTP-29.1.1.
+// Port of erts/emulator/beam/bif.c:3027-3077 (make_tuple_3), OTP-29.1.1.
 pub(crate) extern "C" fn make_tuple_3(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
-    use arinsal_term::raw::{Cons, Tuple};
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let [n, initial, mut list] = bif_args::<3>(reg);
+    let [n, initial, list] = bif_args::<3>(reg);
     let Some(limit) = make_tuple_arity(n) else {
         return bif_badarg(c_p);
     };
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut builder = arinsal_term::TermBuilder::new(&mut heap);
-    let mut tuple = if limit == 0 {
-        None
-    } else {
-        match builder.reserve_tuple(limit, initial) {
-            Ok(tuple) => Some(tuple),
-            Err(_) => return bif_system_limit(c_p),
-        }
-    };
-    while let Ok(cons) = Cons::try_from(list) {
-        list = cons.tail();
-        let entry = Tuple::try_from(cons.head())
-            .ok()
-            .filter(|entry| entry.arity() == 2);
-        let slot = entry
-            .and_then(|entry| entry.get(0)?.as_small())
-            .and_then(|index| usize::try_from(index).ok()?.checked_sub(1))
-            .filter(|slot| *slot < limit);
-        let stored = match (slot, entry.and_then(|entry| entry.get(1)), tuple.as_mut()) {
-            (Some(slot), Some(value), Some(tuple)) => tuple.set(slot, value).is_ok(),
-            _ => false,
-        };
-        if !stored {
-            return bif_badarg(c_p);
-        }
-    }
-    if list != Term::NIL {
-        return bif_badarg(c_p);
-    }
-    match tuple {
-        Some(tuple) => crate::native_hooks::raw(tuple.finish()),
-        None => heap_ret(c_p, builder.tuple_from_fn(0, |_, _| Term::NIL)),
+    match process.heap.make_tuple_with_list(limit, initial, list) {
+        Ok(tuple) => crate::native_hooks::raw(tuple),
+        Err(_) => bif_badarg(c_p),
     }
 }
 
 /// `append_element/2`.
-// Port of erts/emulator/beam/bif.c (append_element_2), OTP-29.1.1.
+// Port of erts/emulator/beam/bif.c:3083-3108 (append_element_2), OTP-29.1.1.
 pub(crate) extern "C" fn append_element_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
@@ -2519,70 +2463,45 @@ pub(crate) extern "C" fn append_element_2(c_p: *mut ProcessHeader, reg: *mut u64
     else {
         return bif_badarg(c_p);
     };
-    let arity = source.arity();
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let built = arinsal_term::TermBuilder::new(&mut heap).tuple_from_fn(arity + 1, |at, _| {
-        if at == arity {
-            value
-        } else {
-            source.get(at).unwrap_or(Term::NIL)
-        }
-    });
-    heap_ret(c_p, built)
+    crate::native_hooks::raw(process.heap.append_element(source, value))
 }
 
 /// `delete_element/2`.
-// Port of erts/emulator/beam/bif.c (delete_element_2), OTP-29.1.1.
+// Port of erts/emulator/beam/bif.c:3144-3180 (delete_element_2), OTP-29.1.1.
 pub(crate) extern "C" fn delete_element_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
     let [index, tuple] = bif_args::<2>(reg);
-    let Some((slot, source)) = index
+    let Ok(source) = arinsal_term::raw::Tuple::try_from(tuple) else {
+        return bif_badarg(c_p);
+    };
+    let Some(ix) = index
         .as_small()
-        .zip(arinsal_term::raw::Tuple::try_from(tuple).ok())
-        .filter(|(ix, source)| *ix >= 1 && *ix as usize <= source.arity())
-        .map(|(ix, source)| (ix as usize - 1, source))
+        .filter(|ix| *ix >= 1 && *ix as usize <= source.arity())
     else {
         return bif_badarg(c_p);
     };
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let built =
-        arinsal_term::TermBuilder::new(&mut heap).tuple_from_fn(source.arity() - 1, |at, _| {
-            source
-                .get(if at < slot { at } else { at + 1 })
-                .unwrap_or(Term::NIL)
-        });
-    heap_ret(c_p, built)
+    crate::native_hooks::raw(process.heap.delete_element(source, ix as usize))
 }
 
 /// `insert_element/3`.
-// Port of erts/emulator/beam/bif.c (insert_element_3), OTP-29.1.1.
+// Port of erts/emulator/beam/bif.c:3110-3141 (insert_element_3), OTP-29.1.1.
 pub(crate) extern "C" fn insert_element_3(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
     let [index, tuple, value] = bif_args::<3>(reg);
-    let Some((slot, source)) = index
+    let Ok(source) = arinsal_term::raw::Tuple::try_from(tuple) else {
+        return bif_badarg(c_p);
+    };
+    let Some(ix) = index
         .as_small()
-        .zip(arinsal_term::raw::Tuple::try_from(tuple).ok())
-        .filter(|(ix, source)| {
-            *ix >= 1 && *ix as usize <= source.arity() + 1 && source.arity() < ERTS_MAX_TUPLE_SIZE
-        })
-        .map(|(ix, source)| (ix as usize - 1, source))
+        .filter(|ix| *ix >= 1 && *ix as usize <= source.arity() + 1)
     else {
         return bif_badarg(c_p);
     };
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let built = arinsal_term::TermBuilder::new(&mut heap).tuple_from_fn(
-        source.arity() + 1,
-        |at, _| match at.cmp(&slot) {
-            std::cmp::Ordering::Less => source.get(at).unwrap_or(Term::NIL),
-            std::cmp::Ordering::Equal => value,
-            std::cmp::Ordering::Greater => source.get(at - 1).unwrap_or(Term::NIL),
-        },
-    );
-    heap_ret(c_p, built)
+    crate::native_hooks::raw(process.heap.insert_element(source, ix as usize, value))
 }
