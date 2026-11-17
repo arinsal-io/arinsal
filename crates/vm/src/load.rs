@@ -1041,15 +1041,23 @@ impl Vm {
             native.unpublish();
         }
         let mut module = module;
-        let _ = self.compile_native(&mut module, &mut meta);
+        let compile_error = self.compile_native(&mut module, &mut meta);
         if meta.beamasm.is_none() {
             staging.abort();
             return Err(VmError::Load(format!(
-                "{name}: native code generation failed"
+                "{name}: {}",
+                compile_error
+                    .map(|cause| cause.to_string())
+                    .unwrap_or_else(|| "native code generation failed".into())
             )));
         }
         self.release_loaded_tables(&mut meta);
-        let _ = self.install_native(&module, &mut meta, false);
+        if !self.install_native(&module, &mut meta, false) {
+            staging.abort();
+            return Err(VmError::Load(format!(
+                "{name}: native code installation failed"
+            )));
+        }
         let module = Arc::new(module);
         let id = staging.with(|tables| {
             let id = tables.alloc(module, Some(meta));
@@ -1113,18 +1121,26 @@ impl Vm {
         staging.with(|tables| {
             tables.intern_fun_entries(&mut module);
         });
-        let _ = self.compile_native(&mut module, &mut meta);
+        let compile_error = self.compile_native(&mut module, &mut meta);
         if meta.beamasm.is_none() {
             // Port of erts/emulator/beam/beam_load.c:417 (load_code failing): the JIT
             // flavor has no other way to run the module.
             staging.abort();
             return Err(VmError::Load(format!(
-                "{module_name}: native code generation failed"
+                "{module_name}: {}",
+                compile_error
+                    .map(|cause| cause.to_string())
+                    .unwrap_or_else(|| "native code generation failed".into())
             )));
         }
         self.release_loaded_tables(&mut meta);
         let on_load = meta.on_load.is_some();
-        let _ = self.install_native(&module, &mut meta, on_load);
+        if !self.install_native(&module, &mut meta, on_load) {
+            staging.abort();
+            return Err(VmError::Load(format!(
+                "{module_name}: native code installation failed"
+            )));
+        }
         let module = Arc::new(module);
         let name = module.name.clone();
         let id = staging.with(|tables| {
@@ -1195,7 +1211,10 @@ impl Vm {
             staging.with(|tables| {
                 tables.intern_fun_entries(&mut module);
             });
-            let _ = self.install_native(&module, &mut meta, pending);
+            if !self.install_native(&module, &mut meta, pending) {
+                staging.abort();
+                return Err(("badfile", vec![name]));
+            }
             let module = Arc::new(module);
             staging.with(|tables| {
                 let id = tables.alloc(module, Some(meta));

@@ -379,6 +379,34 @@ fn assert_native_matches(test: &str, module: &str, source: &str, env: &[(&str, &
 }
 
 #[test]
+fn large_select_val_loads_and_runs_like_erts() {
+    if run_child_case() {
+        return;
+    }
+    let clauses = (0..5_000)
+        .map(|value| {
+            let writes = (0..16)
+                .map(|index| format!("put({{native_large_select, {index}}}, X)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{value} -> begin {writes}, {value} end")
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let source = format!(
+        "-module(native_large_select).\n-export([run/0, f/1]).\n\
+         f(X) -> case X of {clauses}; _ -> miss end.\n\
+         run() -> {{f(0), f(2500), f(4999), f(-1)}}.\n"
+    );
+    assert_native_matches(
+        "large_select_val_loads_and_runs_like_erts",
+        "native_large_select",
+        &source,
+        &[],
+    );
+}
+
+#[test]
 #[cfg(target_arch = "aarch64")]
 fn native_regressions_match_otp() {
     if run_child_case() {
