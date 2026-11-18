@@ -23,6 +23,7 @@ fn asmjit_names(err: &EncodeError) -> &'static [&'static str] {
         EncodeError::InvalidAddressIndex => &["InvalidAddressIndex"],
         EncodeError::AmbiguousOperandSize => &["AmbiguousOperandSize"],
         EncodeError::InvalidInstruction => &["InvalidInstruction"],
+        EncodeError::InvalidAlignment => &["InvalidArgument"],
     }
 }
 
