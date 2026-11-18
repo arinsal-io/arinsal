@@ -447,10 +447,9 @@ impl PortTable {
         }
     }
 
-    /// `erts_ptab_count(&erts_port)`: the live ports plus the standard I/O port that Arinsal keeps
-    /// outside the table.
+    /// `erts_ptab_count(&erts_port)`: the live ports, the forker port (port 0) among them.
     pub(crate) fn live_count(&self) -> usize {
-        self.count.load(Ordering::Relaxed).saturating_add(1)
+        self.count.load(Ordering::Relaxed)
     }
 
     /// Ids of the live ports in table order.

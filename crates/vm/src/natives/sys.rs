@@ -1104,7 +1104,7 @@ pub(crate) fn system_info_process_item(
             process
                 .runtime
                 .as_ref()
-                .map_or(1, |runtime| runtime.ports.live_count()) as u64,
+                .map_or(0, |runtime| runtime.ports.live_count()) as u64,
         )),
         // Port of erts/emulator/beam/erl_bif_info.c:3521, OTP-29.1.1.
         Some("atom_count") => Some(non_neg(process, global_atoms().len() as u64)),
