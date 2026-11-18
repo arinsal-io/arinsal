@@ -583,13 +583,15 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
     let mut resume_saved = ctx.started;
     ctx.started = true;
     let mut depth = ctx.depth;
+    // Port of the local `sp` cursor in erl_map.c:1584-1599, OTP-29.1.1.
+    let mut cursor = ctx.stack.cursor_at(depth - 1);
     let mut loop_reds = *reds;
     'traverse: loop {
         if !resume_saved {
             // Port of the `recurse` label in erl_map.c:1608-1679, OTP-29.1.1.
             let lvl = ctx.lvl;
             let root_pending = ctx.root_pending;
-            let sp = &mut ctx.stack[depth - 1];
+            let sp = cursor.top_mut();
             if root_pending {
                 ctx.root_pending = false;
             } else {
@@ -637,22 +639,23 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
                     }
                     ctx.lvl -= 1;
                     depth -= 1;
-                    let child_mix = ctx.stack[depth].mix;
-                    let sp = &mut ctx.stack[depth - 1];
-                    sp.children.write(sp.ix, bits(child));
-                    sp.ix += 1;
-                    sp.mix |= child_mix;
-                    if sp.rbm != 0 {
-                        sp.src_a.advance();
-                        sp.src_b.advance();
+                    let child_mix = cursor.top_mut().mix;
+                    cursor.retreat();
+                    let parent = cursor.top_mut();
+                    parent.children.write(parent.ix, bits(child));
+                    parent.ix += 1;
+                    parent.mix |= child_mix;
+                    if parent.rbm != 0 {
+                        parent.src_a.advance();
+                        parent.src_b.advance();
                     }
                 } else if ctx.lvl < HAMT_MAX_LEVEL {
-                    let sp = &mut ctx.stack[depth - 1];
+                    let sp = cursor.top_mut();
                     sp.ix = 0;
                     sp.rbm = sp.abm | sp.bbm;
                     debug_assert!(!(sp.rbm == 0 && ctx.lvl > 0));
                 } else {
-                    let sp = &mut ctx.stack[depth - 1];
+                    let sp = cursor.top_mut();
                     res = Some(
                         match merge_collision_node(
                             sp.src_a,
@@ -687,7 +690,7 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
 
             // Port of the `resume_from_trap` label in erl_map.c:1727-1804.
             let lvl = ctx.lvl;
-            let sp = &mut ctx.stack[depth - 1];
+            let sp = cursor.top_mut();
             let mut clash = false;
             while sp.rbm != 0 {
                 let next = sp.rbm & (sp.rbm - 1);
@@ -711,11 +714,11 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
             if clash {
                 let (src_a, src_b) = (sp.src_a, sp.src_b);
                 ctx.lvl += 1;
-                if depth == ctx.stack.len() {
-                    ctx.stack
-                        .push(Frame::new(Term::NIL, Term::NIL, src_a, src_b));
+                if depth == cursor.len() {
+                    cursor.push(Frame::new(Term::NIL, Term::NIL, src_a, src_b));
                 } else {
-                    let child = &mut ctx.stack[depth];
+                    cursor.advance();
+                    let child = cursor.top_mut();
                     child.src_a = src_a;
                     child.src_b = src_b;
                     child.mix = 0;

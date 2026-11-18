@@ -80,6 +80,20 @@ impl<T, const N: usize> WStack<T, N> {
         self.sp = sp + 1;
     }
 
+    /// The top entry pointer used by `PSTACK_TOP`; callers retain it while walking the stack.
+    ///
+    /// Port of erts/emulator/beam/global.h (`PSTACK_TOP`), OTP-29.1.1.
+    #[inline(always)]
+    pub fn cursor_at(&mut self, index: usize) -> WStackCursor<'_, T, N> {
+        assert!(index < self.sp);
+        let top = NonNull::new(self.start_mut().wrapping_add(index)).expect("stack pointer");
+        WStackCursor {
+            stack: self,
+            top,
+            index,
+        }
+    }
+
     /// ESTACK_POP: `*--sp`, `None` when empty.
     #[inline(always)]
     pub fn pop(&mut self) -> Option<T> {
@@ -173,6 +187,65 @@ impl<T, const N: usize> WStack<T, N> {
     }
 }
 
+/// A pointer cursor over initialized work-stack entries.
+///
+/// Port of erts/emulator/beam/global.h (`PSTACK_TOP`, `PSTACK_PUSH`, `PSTACK_POP`), OTP-29.1.1.
+pub struct WStackCursor<'a, T, const N: usize> {
+    stack: &'a mut WStack<T, N>,
+    top: NonNull<T>,
+    index: usize,
+}
+
+impl<T, const N: usize> WStackCursor<'_, T, N> {
+    /// The current top frame.
+    #[inline(always)]
+    pub fn top_mut(&mut self) -> &mut T {
+        // SAFETY: cursor_at points inside the initialized prefix; advance, retreat, and push
+        // preserve that invariant, and the cursor exclusively borrows the stack.
+        unsafe { self.top.as_mut() }
+    }
+
+    /// Number of initialized stack entries.
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.stack.sp
+    }
+
+    /// Whether the work stack has no initialized entries.
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.stack.sp == 0
+    }
+
+    /// Advance to the next already initialized frame.
+    #[inline(always)]
+    pub fn advance(&mut self) {
+        assert!(self.index + 1 < self.stack.sp);
+        self.index += 1;
+        // SAFETY: the next index is within the initialized prefix.
+        self.top = unsafe { NonNull::new_unchecked(self.top.as_ptr().add(1)) };
+    }
+
+    /// Return to the parent frame.
+    #[inline(always)]
+    pub fn retreat(&mut self) {
+        assert!(self.index > 0);
+        self.index -= 1;
+        // SAFETY: index is still within the initialized prefix.
+        self.top = unsafe { NonNull::new_unchecked(self.top.as_ptr().sub(1)) };
+    }
+
+    /// Push a new top frame and refresh the cursor if the stack grows.
+    #[inline(always)]
+    pub fn push(&mut self, value: T) {
+        self.stack.push(value);
+        self.index += 1;
+        // `push` may grow and relocate the active array, so reacquire its start here.
+        let top = self.stack.start_mut().wrapping_add(self.index);
+        self.top = NonNull::new(top).expect("stack pointer");
+    }
+}
+
 impl<T, const N: usize> Drop for WStack<T, N> {
     /// DESTROY_ESTACK: the entries are dropped and a grown block is freed.
     fn drop(&mut self) {
@@ -180,5 +253,23 @@ impl<T, const N: usize> Drop for WStack<T, N> {
         if let Some(start) = self.grown {
             arinsal_alloc::typed::estack_free(start.cast(), self.end * std::mem::size_of::<T>());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WStack;
+
+    #[test]
+    fn cursor_tracks_frames_across_growth_and_parent_steps() {
+        let mut stack = WStack::<usize, 1>::new();
+        stack.push(10);
+        let mut cursor = stack.cursor_at(0);
+        cursor.push(20);
+        assert_eq!(*cursor.top_mut(), 20);
+        cursor.retreat();
+        assert_eq!(*cursor.top_mut(), 10);
+        cursor.advance();
+        assert_eq!(*cursor.top_mut(), 20);
     }
 }
