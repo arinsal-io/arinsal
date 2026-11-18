@@ -475,6 +475,7 @@ name = "arinsal-x64"
 version = "0.0.1"
 dependencies = [
  "libc",
+ "similar-asserts",
 ]
 
 [[package]]

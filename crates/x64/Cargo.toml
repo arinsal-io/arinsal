@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[dev-dependencies]
+similar-asserts = "2"
+
 [lints]
 workspace = true
 

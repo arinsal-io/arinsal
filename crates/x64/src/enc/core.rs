@@ -15,15 +15,7 @@ pub(crate) enum Pp {
     #[default]
     None,
     P66,
-    #[expect(
-        dead_code,
-        reason = "first used by the SSE scalar family (E22); remove then"
-    )]
     PF3,
-    #[expect(
-        dead_code,
-        reason = "first used by the SSE scalar family (E22); remove then"
-    )]
     PF2,
 }
 
@@ -55,10 +47,6 @@ pub(crate) enum Map {
     Legacy,
     M0F,
     M0F38,
-    #[expect(
-        dead_code,
-        reason = "first used by vpermilpd/vpinsrq (E25); remove then"
-    )]
     M0F3A,
 }
 
@@ -109,10 +97,6 @@ impl Opcode {
         }
     }
     /// `0F 3A xx` opcode.
-    #[expect(
-        dead_code,
-        reason = "first used by vpermilpd/vpinsrq (E25); remove then"
-    )]
     pub const fn m0f3a(byte: u8) -> Self {
         Self {
             map: Map::M0F3A,
@@ -437,6 +421,26 @@ impl Emitter {
         self.bytes.extend(rex);
         self.put_map_and_opcode(opcode);
         self.put_imm(imm);
+        self.last_rip = None;
+        Ok(())
+    }
+
+    /// asmjit `EmitVexOp`: VEX opcode without ModRM (`vzeroupper` / `vzeroall`).
+    pub(crate) fn vex_op(&mut self, opcode: Opcode, l256: bool) -> Result<(), EncodeError> {
+        if opcode.map == Map::Legacy || opcode.w {
+            return Err(EncodeError::InvalidInstruction);
+        }
+        if opcode.map == Map::M0F {
+            self.bytes
+                .extend_from_slice(&[0xC5, 0xF8 | ((l256 as u8) << 2) | opcode.pp.vex()]);
+        } else {
+            self.bytes.extend_from_slice(&[
+                0xC4,
+                0xE0 | opcode.map.vex(),
+                0x78 | ((l256 as u8) << 2) | opcode.pp.vex(),
+            ]);
+        }
+        self.bytes.push(opcode.byte);
         self.last_rip = None;
         Ok(())
     }

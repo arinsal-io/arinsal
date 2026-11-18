@@ -12,14 +12,17 @@
 
 mod alu;
 mod avx;
+mod bmi;
 mod branch;
 mod cond;
 mod core;
+pub mod cpu;
 mod misc;
 mod mov;
 mod muldiv;
 mod operand;
 mod shift;
+mod sse;
 mod stack;
 
 pub use cond::CondCode;
