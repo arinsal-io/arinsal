@@ -274,6 +274,51 @@ unsafe extern "C" {
     ) -> u64;
 }
 
+// Port of erts/emulator/beam/jit/beam_jit_common.hpp, global.h and beam_bp.h, OTP-29.1.1:
+// runtime entries called by the x86 BIF, NIF and export-breakpoint fragments.
+unsafe extern "C" {
+    /// `Eterm beam_jit_call_bif(Process *, Eterm *, ErtsCodePtr, ErtsBifFunc, Uint)`.
+    pub safe fn beam_jit_call_bif(
+        c_p: *mut crate::ProcessHeader,
+        reg: *mut u64,
+        instruction: usize,
+        function: usize,
+        arity: usize,
+    ) -> u64;
+    /// `Eterm beam_jit_call_nif(Process *, ErtsCodePtr, Eterm *, BeamJitNifF *,
+    /// struct erl_module_nif *)`.
+    pub safe fn beam_jit_call_nif(
+        c_p: *mut crate::ProcessHeader,
+        instruction: usize,
+        reg: *mut u64,
+        function: usize,
+        nif_module: usize,
+    ) -> u64;
+    /// `ErtsCodePtr erts_call_nif_early(Process *, const ErtsCodeInfo *)`.
+    pub safe fn erts_call_nif_early(
+        c_p: *mut crate::ProcessHeader,
+        code_info: *const super::beam_asm_module::ErtsCodeInfo,
+    ) -> usize;
+    /// `ErtsCodePtr erts_printable_return_address(const Process *, const Eterm *)`.
+    pub safe fn erts_printable_return_address(
+        c_p: *const crate::ProcessHeader,
+        e: *const u64,
+    ) -> usize;
+    /// `BeamInstr erts_generic_breakpoint(Process *, ErtsCodeInfo *, Eterm *)`.
+    pub safe fn erts_generic_breakpoint(
+        c_p: *mut crate::ProcessHeader,
+        code_info: *mut super::beam_asm_module::ErtsCodeInfo,
+        reg: *mut u64,
+    ) -> usize;
+    /// `int erts_call_dirty_nif(ErtsSchedulerData *, Process *, ErtsCodePtr, const Eterm *)`.
+    pub safe fn erts_call_dirty_nif(
+        scheduler_data: *mut c_void,
+        c_p: *mut crate::ProcessHeader,
+        instruction: usize,
+        reg: *const u64,
+    ) -> i32;
+}
+
 // Port of erts/emulator/beam/jit/x86/instr_bs.cpp (`extern "C" { #include "erl_binary.h"
 // #include "erl_bits.h" #include "beam_common.h" }` and the beam_jit_bs_* helpers of
 // jit/beam_jit_common.hpp), OTP-29.1.1: the runtime functions the bit syntax emitters and
@@ -808,6 +853,59 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The differential byte tests take these runtime addresses but never execute them.
+    #[unsafe(no_mangle)]
+    extern "C" fn beam_jit_call_bif(
+        _: *mut crate::ProcessHeader,
+        _: *mut u64,
+        _: usize,
+        _: usize,
+        _: usize,
+    ) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn call_error_handler(
+        _: *mut crate::ProcessHeader,
+        _: *const arinsal_term::ErtsCodeMfa,
+        _: *mut u64,
+        _: u64,
+    ) -> usize {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn beam_jit_call_nif(
+        _: *mut crate::ProcessHeader,
+        _: usize,
+        _: *mut u64,
+        _: usize,
+        _: usize,
+    ) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_call_nif_early(
+        _: *mut crate::ProcessHeader,
+        _: *const super::super::beam_asm_module::ErtsCodeInfo,
+    ) -> usize {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_printable_return_address(
+        _: *const crate::ProcessHeader,
+        _: *const u64,
+    ) -> usize {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_generic_breakpoint(
+        _: *mut crate::ProcessHeader,
+        _: *mut super::super::beam_asm_module::ErtsCodeInfo,
+        _: *mut u64,
+    ) -> usize {
+        unreachable!("byte-test fixture")
+    }
 
     // Runtime symbols referenced by map fragment byte comparisons.
     #[unsafe(no_mangle)]

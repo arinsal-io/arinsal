@@ -238,8 +238,26 @@ pub(crate) fn matches_with_global_jumps(
     ours: &[u8],
     unbound: &[&str],
 ) -> Option<bool> {
+    // `emit_leave_runtime<eCodeIndex>` loads `the_active_code_index` by its process-local
+    // address. This symbol moves between the short-lived reference `erl` and this test process.
+    let active_code_index = &raw const crate::x86::rt::the_active_code_index as u64;
+    let normalized: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            if line.starts_with("mov rdi, ")
+                && lines
+                    .get(index + 1)
+                    .is_some_and(|next| next == "mov edi, dword ptr [rdi]")
+            {
+                format!("movabs rdi, {active_code_index}")
+            } else {
+                line.clone()
+            }
+        })
+        .collect();
     let placeholder = |fill: u8, all_near: bool| -> Vec<String> {
-        lines
+        normalized
             .iter()
             .map(|line| {
                 // `runtime_call` / `abs_jmp`: asmjit's 6-byte `REX call/jmp rel32` to an

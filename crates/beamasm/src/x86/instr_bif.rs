@@ -1,17 +1,22 @@
-//! Port of erts/emulator/beam/jit/x86/instr_bif.cpp, OTP-29.1.1: so far the light-BIF call,
-//! `call_light_bif` and its global fragment `call_light_bif_shared`.
+//! Port of erts/emulator/beam/jit/x86/instr_bif.cpp, OTP-29.1.1: light and regular BIF calls,
+//! NIF calls, and their shared global fragments. The export trampoline from
+//! `beam_asm_global.cpp` also lives here because it enters `call_bif_shared`.
 
 use arinsal_x64::enc::{CondCode, Mem, byte_ptr, dword_ptr, qword_ptr};
 
 use super::beam_asm::register::{
-    ACTIVE_CODE_IX, ARG1, ARG2, ARG2D, ARG3, ARG4, ARG5, ARG5D, C_P, E, FCALLS, HTOP, RET,
+    ACTIVE_CODE_IX, ARG1, ARG1D, ARG2, ARG2D, ARG3, ARG4, ARG5, ARG5D, ARG6, C_P, E, FCALLS, HTOP,
+    RET,
 };
 use super::beam_asm::{
     AsmError, ERTS_SAVE_CALLS_CODE_IX, Update, get_x_ref, process, process_ref, tmp_mem_q,
 };
-use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
-use super::beam_asm_module::BeamModuleAssembler;
-pub use super::rt::erts_gc_after_bif_call_lhf;
+use super::beam_asm_global::{BEAM_ASM_FUNC_PROLOGUE_SIZE, BeamGlobalAssembler, GlobalLabels};
+use super::beam_asm_module::{BeamModuleAssembler, ErtsCodeInfo, arg_word};
+pub use super::rt::{
+    beam_jit_call_bif, beam_jit_call_nif, erts_call_nif_early, erts_gc_after_bif_call_lhf,
+    erts_printable_return_address,
+};
 use crate::common::args::ArgVal;
 
 /// `offsetof(Export, is_bif_traced)`.
@@ -23,6 +28,21 @@ const EXPORT_MFA: i32 = arinsal_term::EXPORT_MFA_OFFSET as i32;
 /// `offsetof(Export, info.mfa.arity)`.
 const EXPORT_MFA_ARITY: i32 =
     EXPORT_MFA + core::mem::offset_of!(arinsal_term::ErtsCodeMfa, arity) as i32;
+/// `offsetof(Export, trampoline.common.op)`.
+const EXPORT_TRAMPOLINE_OP: i32 = arinsal_term::EXPORT_TRAMPOLINE_OP_OFFSET as i32;
+/// `offsetof(Export, trampoline.bif.address)`.
+const EXPORT_TRAMPOLINE_BIF_ADDRESS: i32 =
+    (core::mem::offset_of!(arinsal_term::ExportEntry, trampoline)
+        + core::mem::offset_of!(arinsal_term::ExportTrampoline, address)) as i32;
+
+/// `BEAM_ASM_NFUNC_SIZE` for x86-64.
+// Port of erts/emulator/beam/jit/beam_asm.h:132-136 (BEAM_ASM_NFUNC_SIZE), OTP-29.1.1.
+const BEAM_ASM_NFUNC_SIZE: i32 = BEAM_ASM_FUNC_PROLOGUE_SIZE as i32 + 8;
+/// `offsetof(ErtsNativeFunc, trampoline.info.mfa) - offsetof(...call_bif_nif)`.
+const NATIVE_FUNC_MFA_FROM_CALL: i32 =
+    core::mem::offset_of!(ErtsCodeInfo, mfa) as i32 - core::mem::size_of::<ErtsCodeInfo>() as i32;
+/// `offsetof(ErtsNativeFunc, trampoline.dfunc) - offsetof(...call_bif_nif)`.
+const NATIVE_FUNC_DFUNC_FROM_CALL: i32 = BEAM_ASM_NFUNC_SIZE;
 
 /// `F_FORCE_GC | F_DISABLE_GC` of `c_p->flags`.
 // Port of erts/emulator/beam/erl_process.h (F_FORCE_GC, F_DISABLE_GC), OTP-29.1.1.
@@ -192,9 +212,312 @@ impl BeamGlobalAssembler {
             a.jmp(context_switch_simplified)
         }
     }
+
+    /// Completes a BIF or NIF call: dispatches a value, trap, hibernate, or exception result.
+    // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:711-817 (emit_bif_nif_epilogue),
+    // OTP-29.1.1. Release build with `NATIVE_ERLANG_STACK`; no `ERTS_MSACC_EXTENDED_STATES`.
+    pub(crate) fn emit_bif_nif_epilogue(&mut self) -> Result<(), AsmError> {
+        let (check_trap, trap, error) = (
+            self.asm.new_label(),
+            self.asm.new_label(),
+            self.asm.new_label(),
+        );
+        let do_schedule = self.label(GlobalLabels::DoSchedule);
+        let context_switch = self.label(GlobalLabels::ContextSwitchSimplified);
+        let raise_exception = self.label(GlobalLabels::RaiseExceptionShared);
+        let a = &mut self.asm;
+
+        a.emit_leave_runtime(
+            Update::REDUCTIONS
+                .union(Update::STACK)
+                .union(Update::HEAP)
+                .union(Update::CODE_INDEX),
+        )?;
+        a.emit_test_the_non_value(RET)?;
+        a.short_jcc(CondCode::E, check_trap)?;
+        a.emit(|e| e.mov_mr(get_x_ref(0, 8), RET))?;
+        a.emit_leave_frame()?;
+        a.emit(|e| e.ret())?;
+
+        a.bind(check_trap)?;
+        a.emit(|e| {
+            e.cmp_mi(
+                process_ref(process::FREASON, 8),
+                arinsal_term::exc::TRAP as i64,
+            )
+        })?;
+        a.jcc(CondCode::NE, error)?;
+        a.emit(|e| e.mov_rm(ARG1D, process_ref(process::FLAGS, 4)))?;
+        a.emit(|e| e.mov_rr(ARG2D, ARG1D))?;
+        a.emit(|e| e.and_ri(ARG2D, arinsal_term::pflags::F_HIBERNATE_SCHED as i64))?;
+        a.short_jcc(CondCode::E, trap)?;
+        a.emit(|e| {
+            e.and_ri(
+                ARG1D,
+                (!arinsal_term::pflags::F_HIBERNATE_SCHED) as i32 as i64,
+            )
+        })?;
+        a.emit(|e| e.mov_mr(process_ref(process::FLAGS, 4), ARG1D))?;
+        a.jmp(do_schedule)?;
+
+        a.bind(trap)?;
+        a.emit(|e| e.mov_rm(ARG3, process_ref(process::I, 8)))?;
+        a.jmp(context_switch)?;
+
+        a.bind(error)?;
+        a.emit(|e| e.mov_rr(ARG2, E))?;
+        a.emit_enter_runtime(Update::STACK)?;
+        a.emit(|e| e.mov_rr(ARG1, C_P))?;
+        a.runtime_call(erts_printable_return_address as *const () as usize)?;
+        a.emit_leave_runtime(Update::STACK)?;
+        a.emit(|e| e.mov_rr(ARG2, RET))?;
+        a.emit(|e| e.mov_rm(ARG4, process_ref(process::CURRENT, 8)))?;
+        a.jmp(raise_exception)
+    }
+
+    /// Calls a BIF through `beam_jit_call_bif(c_p, reg, I, func, arity)`.
+    // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:819-870 (emit_call_bif_shared),
+    // OTP-29.1.1. Release build without `ERTS_MSACC_EXTENDED_STATES`.
+    pub(crate) fn emit_call_bif_shared(&mut self) -> Result<(), AsmError> {
+        {
+            let a = &mut self.asm;
+            a.emit(|e| e.mov_mr(process_ref(process::CURRENT, 8), ARG2))?;
+            a.emit(|e| {
+                e.movzx_rm(
+                    ARG5D,
+                    byte_ptr(
+                        ARG2,
+                        core::mem::offset_of!(arinsal_term::ErtsCodeMfa, arity) as i32,
+                    ),
+                )
+            })?;
+            a.emit(|e| e.mov_mr(process_ref(process::ARITY, 1), ARG5.r8()))?;
+            a.emit(|e| e.mov_mr(process_ref(process::I, 8), ARG3))?;
+
+            let spec = Update::REDUCTIONS.union(Update::STACK).union(Update::HEAP);
+            a.emit_enter_runtime(spec)?;
+            a.emit(|e| e.mov_rr(ARG1, C_P))?;
+            a.load_x_reg_array(ARG2)?;
+            a.runtime_call(beam_jit_call_bif as *const () as usize)?;
+        }
+        self.emit_bif_nif_epilogue()
+    }
+
+    /// Unpacks an `ErtsNativeFunc` BIF trampoline and tail-calls `call_bif_shared`.
+    // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:872-889 (emit_dispatch_bif),
+    // OTP-29.1.1.
+    pub(crate) fn emit_dispatch_bif(&mut self) -> Result<(), AsmError> {
+        let target = self.label(GlobalLabels::CallBifShared);
+        let a = &mut self.asm;
+        a.emit(|e| e.mov_rm(ARG3, process_ref(process::I, 8)))?;
+        a.emit(|e| e.lea(ARG2, Mem::base_disp(ARG3, NATIVE_FUNC_MFA_FROM_CALL, 8)))?;
+        a.emit(|e| e.mov_rm(ARG4, qword_ptr(ARG3, NATIVE_FUNC_DFUNC_FROM_CALL)))?;
+        a.jmp(target)
+    }
+
+    /// Runs the early NIF loader on the function whose breakpoint trampoline called here.
+    // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:929-976 (emit_call_nif_early),
+    // OTP-29.1.1. Release build; no `DEBUG` alignment trap.
+    pub(crate) fn emit_call_nif_early(&mut self) -> Result<(), AsmError> {
+        let call_nif_shared = self.label(GlobalLabels::CallNifShared);
+        let a = &mut self.asm;
+        a.emit(|e| e.mov_rm(ARG2, qword_ptr(arinsal_x64::enc::RSP, 0)))?;
+        a.emit(|e| e.sub_ri(ARG2, (8 + core::mem::size_of::<ErtsCodeInfo>()) as i64))?;
+        a.emit_enter_runtime(Update::NONE)?;
+        a.emit(|e| e.mov_rr(ARG1, C_P))?;
+        a.runtime_call(erts_call_nif_early as *const () as usize)?;
+        a.emit_leave_runtime(Update::NONE)?;
+        a.emit(|e| e.add_ri(arinsal_x64::enc::RSP, 8))?;
+        a.emit_enter_frame()?;
+        a.emit(|e| e.mov_rr(ARG3, RET))?;
+        a.jmp(call_nif_shared)
+    }
+
+    /// Calls the NIF function and passes its result through the common epilogue.
+    // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:978-1013 (emit_call_nif_shared),
+    // OTP-29.1.1. Release build without `ERTS_MSACC_EXTENDED_STATES`.
+    pub(crate) fn emit_call_nif_shared(&mut self) -> Result<(), AsmError> {
+        {
+            let a = &mut self.asm;
+            let spec = Update::REDUCTIONS.union(Update::STACK).union(Update::HEAP);
+            a.emit_enter_runtime(spec)?;
+            a.emit(|e| e.mov_rr(ARG1, C_P))?;
+            a.emit(|e| e.mov_rr(ARG2, ARG3))?;
+            a.load_x_reg_array(ARG3)?;
+            a.emit(|e| {
+                e.mov_rm(
+                    ARG4,
+                    qword_ptr(ARG2, 8 + BEAM_ASM_FUNC_PROLOGUE_SIZE as i32),
+                )
+            })?;
+            a.emit(|e| {
+                e.mov_rm(
+                    ARG5,
+                    qword_ptr(ARG2, 16 + BEAM_ASM_FUNC_PROLOGUE_SIZE as i32),
+                )
+            })?;
+            a.emit(|e| {
+                e.mov_rm(
+                    ARG6,
+                    qword_ptr(ARG2, 24 + BEAM_ASM_FUNC_PROLOGUE_SIZE as i32),
+                )
+            })?;
+            a.runtime_call(beam_jit_call_nif as *const () as usize)?;
+        }
+        self.emit_bif_nif_epilogue()
+    }
+
+    /// Dispatches an `ErtsNativeFunc` NIF trampoline through the shared NIF caller.
+    // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:1015-1025 (emit_dispatch_nif),
+    // OTP-29.1.1.
+    pub(crate) fn emit_dispatch_nif(&mut self) -> Result<(), AsmError> {
+        let target = self.label(GlobalLabels::CallNifShared);
+        let a = &mut self.asm;
+        a.emit(|e| e.mov_rm(ARG3, process_ref(process::I, 8)))?;
+        a.jmp(target)
+    }
+
+    /// Checks reductions before entering a NIF and switches to the scheduler on exhaustion.
+    // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:1027-1057
+    // (emit_call_nif_yield_helper), OTP-29.1.1. Arinsal has no code-atag runtime option.
+    pub(crate) fn emit_call_nif_yield_helper(&mut self) -> Result<(), AsmError> {
+        let (yield_label, shared) = (
+            self.asm.new_label(),
+            self.label(GlobalLabels::CallNifShared),
+        );
+        let context_switch = self.label(GlobalLabels::ContextSwitchSimplified);
+        let a = &mut self.asm;
+
+        a.emit(|e| e.dec_r(FCALLS))?;
+        a.short_jcc(CondCode::L, yield_label)?;
+        a.jmp(shared)?;
+
+        a.bind(yield_label)?;
+        let arity_offset = NATIVE_FUNC_MFA_FROM_CALL
+            + core::mem::offset_of!(arinsal_term::ErtsCodeMfa, arity) as i32;
+        a.emit(|e| e.movzx_rm(ARG1D, byte_ptr(ARG3, arity_offset)))?;
+        a.emit(|e| e.mov_mr(process_ref(process::ARITY, 1), ARG1.r8()))?;
+        a.emit(|e| e.lea(ARG1, Mem::base_disp(ARG3, NATIVE_FUNC_MFA_FROM_CALL, 8)))?;
+        a.emit(|e| e.mov_mr(process_ref(process::CURRENT, 8), ARG1))?;
+        a.emit(|e| e.add_ri(ARG3, (BEAM_ASM_NFUNC_SIZE + 3 * 8) as i64))?;
+        a.jmp(context_switch)
+    }
+
+    /// Routes export trampoline entries to generic breakpoints, BIFs, or the error handler.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:170-263
+    // (emit_export_trampoline), OTP-29.1.1. Release build with `NATIVE_ERLANG_STACK`.
+    pub(crate) fn emit_export_trampoline(&mut self) -> Result<(), AsmError> {
+        let (call_bif, error_handler) = (self.asm.new_label(), self.asm.new_label());
+        let generic_bp = self.label(GlobalLabels::GenericBpGlobal);
+        let call_bif_shared = self.label(GlobalLabels::CallBifShared);
+        let raise_exception = self.label(GlobalLabels::RaiseException);
+        let a = &mut self.asm;
+
+        a.emit(|e| e.mov_rm(ARG1, qword_ptr(RET, EXPORT_TRAMPOLINE_OP)))?;
+        a.emit(|e| e.cmp_ri(ARG1, arinsal_term::OP_I_GENERIC_BREAKPOINT as i64))?;
+        a.jcc(CondCode::E, generic_bp)?;
+        a.emit(|e| e.cmp_ri(ARG1, arinsal_term::OP_CALL_BIF_W as i64))?;
+        a.jcc(CondCode::E, call_bif)?;
+        a.emit(|e| e.cmp_ri(ARG1, arinsal_term::OP_CALL_ERROR_HANDLER as i64))?;
+        a.jcc(CondCode::E, error_handler)?;
+        a.emit(|e| e.ud2())?;
+
+        a.bind(call_bif)?;
+        a.emit(|e| e.lea(ARG2, qword_ptr(RET, EXPORT_MFA)))?;
+        a.emit(|e| e.mov_rm(ARG3, process_ref(process::I, 8)))?;
+        a.emit(|e| e.mov_rm(ARG4, qword_ptr(RET, EXPORT_TRAMPOLINE_BIF_ADDRESS)))?;
+        a.emit_enter_frame()?;
+        a.jmp(call_bif_shared)?;
+
+        a.bind(error_handler)?;
+        a.emit(|e| e.lea(ARG2, qword_ptr(RET, EXPORT_MFA)))?;
+        a.emit(|e| e.mov_mr(tmp_mem_q(0), ARG2))?;
+        a.emit_enter_frame()?;
+        a.emit_enter_runtime(Update::REDUCTIONS.union(Update::HEAP_ALLOC))?;
+        a.emit(|e| e.mov_rr(ARG1, C_P))?;
+        a.load_x_reg_array(ARG3)?;
+        a.mov_imm(
+            ARG4,
+            arinsal_term::Term::atom(arinsal_term::atoms::UNDEFINED_FUNCTION).word(),
+        )?;
+        a.runtime_call(super::rt::call_error_handler as *const () as usize)?;
+        a.emit_leave_runtime(Update::REDUCTIONS.union(Update::HEAP_ALLOC))?;
+        a.emit_leave_frame()?;
+        a.emit(|e| e.mov_rm(ARG4, tmp_mem_q(0)))?;
+        a.emit(|e| e.test_rr(RET, RET))?;
+        a.jcc(CondCode::E, raise_exception)?;
+        let destination = a.emit_setup_dispatchable_call_active(RET)?;
+        a.emit(|e| e.jmp_m(destination))
+    }
 }
 
 impl BeamModuleAssembler {
+    /// Emits the heavy-BIF entry and its module-local dispatch thunk.
+    // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:891-910 (emit_call_bif), OTP-29.1.1.
+    pub fn emit_call_bif(&mut self, function: ArgVal) -> Result<(), AsmError> {
+        let function = arg_word(function)?;
+        let current = self
+            .current_label()
+            .ok_or(AsmError::Operand("call_bif without function label"))?;
+        let entry = self.asm.new_label();
+        let mfa_offset = -(core::mem::size_of::<arinsal_term::ErtsCodeMfa>() as i32);
+
+        self.asm.emit_enter_frame()?;
+        self.asm.bind(entry)?;
+        self.asm
+            .a
+            .emit_rip_label(current, |e| e.lea(ARG2, Mem::rip(mfa_offset, 8)))?;
+        self.asm
+            .a
+            .emit_rip_label(entry, |e| e.lea(ARG3, Mem::rip(0, 8)))?;
+        self.asm.mov_imm(ARG4, function)?;
+        let fragment = self.ga_get(GlobalLabels::CallBifShared)?;
+        let target = self.resolve_fragment(fragment);
+        self.asm.jmp(target)
+    }
+
+    /// Emits the position-independent `call_nif` stub with its three native-function words.
+    // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:1059-1093 (emit_call_nif), OTP-29.1.1.
+    pub fn emit_call_nif(
+        &mut self,
+        function: ArgVal,
+        nif_module: ArgVal,
+        dirty_function: ArgVal,
+    ) -> Result<(), AsmError> {
+        let (function, nif_module, dirty_function) = (
+            arg_word(function)?,
+            arg_word(nif_module)?,
+            arg_word(dirty_function)?,
+        );
+        let current = self
+            .current_label()
+            .ok_or(AsmError::Operand("call_nif without function label"))?;
+        let current_offset = self
+            .current_label_offset()
+            .ok_or(AsmError::Operand("call_nif without function label"))?;
+        let entry = self.asm.new_label();
+        let dispatch = self.asm.new_label();
+
+        self.asm.bind(entry)?;
+        self.asm.emit_enter_frame()?;
+        self.asm.short_jmp(dispatch)?;
+        self.asm.align_code(8)?;
+        self.asm.a.embed_u64(function)?;
+        self.asm.a.embed_u64(nif_module)?;
+        self.asm.a.embed_u64(dirty_function)?;
+        debug_assert_eq!(
+            self.asm.a.offset() - current_offset,
+            (BEAM_ASM_NFUNC_SIZE + 3 * 8) as usize
+        );
+
+        self.asm.bind(dispatch)?;
+        self.asm
+            .a
+            .emit_rip_label(current, |e| e.lea(ARG3, Mem::rip(0, 8)))?;
+        self.asm
+            .pic_jmp(self.ga_get(GlobalLabels::CallNifYieldHelper)?)
+    }
+
     /// `call_light_bif(Bif, Exp)`: `Bif` is the address of the BIF's `(c_p, reg, I)` function,
     /// `Exp` its import.
     // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:673-689 (emit_call_light_bif),
@@ -281,6 +604,164 @@ mod tests {
             out.push((bif.expect("BIF address"), text));
         }
         out
+    }
+
+    fn op_body(dump: &str, op: &str) -> Option<Vec<String>> {
+        let target = format!("# {op}");
+        let mut active = false;
+        let mut body = Vec::new();
+        for line in dump.lines().map(str::trim) {
+            if active && let Some(header) = line.strip_prefix("# ") {
+                let token = header.split_whitespace().next().unwrap_or_default();
+                if !token.is_empty()
+                    && token
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                {
+                    break;
+                }
+            }
+            if line == target {
+                active = true;
+            } else if active && !line.is_empty() && !line.starts_with('#') {
+                body.push(line.to_owned());
+            }
+        }
+        active.then_some(body)
+    }
+
+    fn module_with_function(call_nif_helper: Option<usize>) -> BeamModuleAssembler {
+        let mut addresses: Vec<_> = GLOBAL_LABELS
+            .iter()
+            .enumerate()
+            .map(|(index, _)| Some(0x7000_0000 + 64 * index))
+            .collect();
+        if let Some(helper) = call_nif_helper {
+            addresses[GlobalLabels::CallNifYieldHelper as usize] = Some(helper);
+        }
+        let mut module = BeamModuleAssembler::with_fragment_addresses(16, addresses);
+        module
+            .emit_i_func_info(
+                ArgVal::Word(1),
+                ArgVal::Immediate(0),
+                ArgVal::Immediate(0),
+                ArgVal::Word(0),
+            )
+            .unwrap();
+        module.emit_i_func_label(ArgVal::Label(1)).unwrap();
+        module.emit_i_breakpoint_trampoline().unwrap();
+        module
+    }
+
+    #[test]
+    fn call_bif_matches_erts_dump() {
+        let Some(dump) = erts_dump("code") else {
+            eprintln!("skipping: `erl +JDdump true` unavailable");
+            return;
+        };
+        let body = op_body(&dump, "call_bif_mfa_aaI").expect("code module has a call_bif");
+        let function = body
+            .iter()
+            .find_map(|line| {
+                line.strip_prefix("mov rcx, ")
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .expect("call_bif dump has the BIF function address");
+        let entry = body
+            .first()
+            .and_then(|line| line.strip_suffix(':'))
+            .expect("call_bif starts with its entry label");
+        let expected = vec![
+            "mfa:".to_owned(),
+            ".zero 32".to_owned(),
+            format!("{entry}:"),
+            "lea rsi, [rip+mfa]".to_owned(),
+            format!("lea rdx, [rip+{entry}]"),
+            format!("movabs rcx, {function}"),
+            "{disp32} jmp thunk".to_owned(),
+            "thunk:".to_owned(),
+        ];
+        if crate::x86::jdump::gnu_as(&[]).is_none() {
+            eprintln!("skipping byte comparison: GNU binutils unavailable");
+            return;
+        }
+        let mut expected = crate::x86::jdump::gnu_as(&expected).unwrap();
+        expected.drain(..32);
+        let expected_len = expected.len();
+        expected[expected_len - 4..].fill(0);
+
+        let mut module = module_with_function(None);
+        let start = module.asm.a.offset();
+        module.emit_call_bif(ArgVal::Word(function)).unwrap();
+        let end = module.asm.a.offset();
+        module.emit_dispatch_table().unwrap();
+        let mut actual = module.asm.a.bytes(Section::Code)[start..end].to_vec();
+        let actual_len = actual.len();
+        actual[actual_len - 4..].fill(0);
+        assert_eq!(actual, expected, "{body:?}");
+    }
+
+    #[test]
+    fn call_nif_matches_erts_dump() {
+        let Some(dump) = erts_dump("erl_tracer") else {
+            eprintln!("skipping: `erl +JDdump true` unavailable");
+            return;
+        };
+        let body = op_body(&dump, "call_nif_WWW").expect("erl_tracer has a call_nif");
+        let words: Vec<u64> = body
+            .iter()
+            .filter_map(|line| line.strip_prefix(".dq "))
+            .map(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).unwrap())
+            .collect();
+        assert_eq!(words.len(), 3, "{body:?}");
+        let helper = body
+            .iter()
+            .find_map(|line| {
+                line.strip_prefix("mov r9, ")
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .expect("call_nif dump has its helper address");
+        let expected: Vec<String> = vec![
+            "function:".to_owned(),
+            ".zero 8".to_owned(),
+            "entry:".to_owned(),
+            "short jmp dispatch".to_owned(),
+            "align 8".to_owned(),
+            format!(".quad {:#x}", words[0]),
+            format!(".quad {:#x}", words[1]),
+            format!(".quad {:#x}", words[2]),
+            "dispatch:".to_owned(),
+            "lea rdx, [rip+function]".to_owned(),
+            format!("movabs r9, {helper}"),
+            "jmp r9".to_owned(),
+        ]
+        .into_iter()
+        .map(|line| match line.as_str() {
+            "align 8" => ".balign 8".to_owned(),
+            _ if line.starts_with(".quad ") => line,
+            _ if line.starts_with(".dq ") => line.replacen(".dq ", ".quad ", 1),
+            _ => crate::x86::jdump::erts_to_arinsal(&line),
+        })
+        .collect();
+        if crate::x86::jdump::gnu_as(&[]).is_none() {
+            eprintln!("skipping byte comparison: GNU binutils unavailable");
+            return;
+        }
+        let mut expected = crate::x86::jdump::gnu_as(&expected).unwrap();
+        expected.drain(..8);
+
+        let mut module = module_with_function(Some(helper as usize));
+        let start = module.asm.a.offset();
+        module
+            .emit_call_nif(
+                ArgVal::Word(words[0]),
+                ArgVal::Word(words[1]),
+                ArgVal::Word(words[2]),
+            )
+            .unwrap();
+        let end = module.asm.a.offset();
+        let actual = module.asm.a.bytes(Section::Code)[start..end].to_vec();
+        assert_eq!(actual, expected, "{body:?}");
     }
 
     // Differential check against erts: every `call_light_bif` site of a few boot modules

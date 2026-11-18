@@ -19,6 +19,7 @@ pub mod instr_guard_bifs;
 pub mod instr_map;
 pub mod instr_msg;
 pub mod instr_select;
+pub mod instr_trace;
 #[cfg(test)]
 mod jdump;
 pub mod process_main;

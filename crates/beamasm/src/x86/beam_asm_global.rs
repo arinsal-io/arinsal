@@ -516,7 +516,16 @@ impl BeamGlobalAssembler {
         use GlobalLabels as G;
         Some(match label {
             G::GarbageCollect => Self::emit_garbage_collect,
+            G::BifNifEpilogue => Self::emit_bif_nif_epilogue,
+            G::CallBifShared => Self::emit_call_bif_shared,
             G::CallLightBifShared => Self::emit_call_light_bif_shared,
+            G::CallNifEarly => Self::emit_call_nif_early,
+            G::CallNifShared => Self::emit_call_nif_shared,
+            G::CallNifYieldHelper => Self::emit_call_nif_yield_helper,
+            G::DispatchBif => Self::emit_dispatch_bif,
+            G::DispatchNif => Self::emit_dispatch_nif,
+            G::ExportTrampoline => Self::emit_export_trampoline,
+            G::GenericBpGlobal => Self::emit_generic_bp_global,
             G::ProcessMain => Self::emit_process_main,
             G::ILoopRecShared => Self::emit_i_loop_rec_shared,
             G::ApplyFunShared => Self::emit_apply_fun_shared,
@@ -1225,8 +1234,8 @@ mod tests {
     }
 
     #[test]
-    fn unported_fragments_are_absent() {
-        assert!(BeamGlobalAssembler::emit_ptr(GlobalLabels::ExportTrampoline).is_none());
+    fn internal_labels_are_not_fragments() {
+        assert!(BeamGlobalAssembler::emit_ptr(GlobalLabels::ExportTrampoline).is_some());
         // Bound inside process_main, not fragments of their own.
         assert!(BeamGlobalAssembler::emit_ptr(GlobalLabels::ContextSwitch).is_none());
     }
