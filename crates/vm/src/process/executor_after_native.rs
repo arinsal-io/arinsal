@@ -15,6 +15,7 @@ impl Executor {
     ) -> Result<Flow, VmError> {
         match outcome {
             arinsal_beamasm::ExitReason::Yield => {
+                #[cfg(target_arch = "aarch64")]
                 crate::beamasm_integration::count_native_yield();
                 let exit_kind = std::mem::take(&mut process.native_exit_kind);
                 if exit_kind != crate::proc_create::NativeExit::None {
@@ -49,6 +50,7 @@ impl Executor {
                 }
                 return Ok(Flow::Break(Ok(RunState::Yield)));
             }
+            #[cfg(target_arch = "aarch64")]
             arinsal_beamasm::ExitReason::CallUnported {
                 target_pc,
                 resume_pc,
@@ -910,6 +912,16 @@ impl Executor {
                     }
                 }
                 return Ok(Flow::Continue);
+            }
+            // The arm exit protocol: a native call site hands its call to the scheduler.
+            // x86 call sites call the runtime symbols directly, as erts' jit/x86 does, and
+            // nothing on x86 leaves native code with this kind.
+            #[cfg(not(target_arch = "aarch64"))]
+            arinsal_beamasm::ExitReason::CallUnported { target_pc, .. } => {
+                let _ = code_ptr;
+                return Err(VmError::Unsupported(format!(
+                    "x86 native code left with the arm call exit: {target_pc:#x}"
+                )));
             }
             arinsal_beamasm::ExitReason::Returned => {
                 if !resume_after_native_return(process) {

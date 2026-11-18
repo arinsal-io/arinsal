@@ -988,8 +988,8 @@ pub fn run_native(
     }
     process.native_error_pc = 0;
     registers.tmp_mem[6] = 0;
-    registers.tmp_mem[5] =
-        crate::native_helpers::arinsal_beamasm_native_trace_return as *const () as usize as u64;
+    #[cfg(target_arch = "aarch64")]
+    crate::beamasm_integration::set_trace_return_hook(registers);
     let resuming_continuation = std::mem::take(&mut process.native_continuation_resume);
     // A resumed call return has only x0 live and an exception handler x0..x3, whatever
     // the arity of the function the native code belongs to.

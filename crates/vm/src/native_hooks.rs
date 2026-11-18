@@ -5,7 +5,9 @@ use arinsal_arith::{ArithError, ArithResult};
 use arinsal_beamasm::{ProcessHeader, SchedulerRegisters};
 use arinsal_bifs::BifError;
 use arinsal_maps::MapError;
-use arinsal_term::{Term, TermBuilder, TermKind, cmp, cmp_exact, exact_eq, loose_eq};
+use arinsal_term::{Term, TermBuilder, TermKind, cmp, cmp_exact};
+#[cfg(target_arch = "aarch64")]
+use arinsal_term::{exact_eq, loose_eq};
 use num_traits::ToPrimitive;
 use std::cmp::Ordering;
 
@@ -162,7 +164,7 @@ pub(crate) fn enter_heap_runtime<'a>(header: *mut ProcessHeader) -> Option<&'a m
     process_from_header(header)
 }
 
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, target_arch = "aarch64"))]
 thread_local! {
     static HELPER_RING: std::cell::RefCell<std::collections::VecDeque<String>> =
         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
@@ -170,7 +172,7 @@ thread_local! {
 
 /// Debug aid: the last native helper entries of this thread, printed when the generated code's
 /// cursor validation fails.
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, target_arch = "aarch64"))]
 pub(crate) extern "C" fn dump_helper_ring() {
     HELPER_RING.with(|ring| {
         for entry in ring.borrow().iter() {
@@ -188,7 +190,7 @@ pub(crate) fn process_from_header<'a>(header: *mut ProcessHeader) -> Option<&'a 
     // SAFETY: ProcessHeader is the first repr(C) field of Process; native entry
     // passes the active process header for the duration of the helper call.
     let process = unsafe { &mut *header.cast::<Process>() };
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, target_arch = "aarch64"))]
     {
         let location = std::panic::Location::caller();
         let (htop, heap) = (process.heap.abi.htop, process.heap.abi.heap);
@@ -272,6 +274,7 @@ fn with_fragment_alloc(
 }
 
 #[inline(always)]
+#[cfg(target_arch = "aarch64")]
 fn beamasm_mixed_times(process: &mut Process, left: Term, right: Term, quiet: bool) -> u64 {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:526-530 and
     // erts/emulator/beam/erl_arith.c:716-858 (emit_mul_body_shared, erts_mixed_times).
@@ -313,6 +316,7 @@ fn beamasm_mixed_times(process: &mut Process, left: Term, right: Term, quiet: bo
 /// # Safety
 /// `header` must be the active `ProcessHeader` and publish the live scheduler
 /// register area for the current native frame.
+#[cfg(target_arch = "aarch64")]
 pub unsafe extern "C" fn arinsal_beamasm_arith(
     header: *mut ProcessHeader,
     op: u32,
@@ -556,6 +560,7 @@ pub(crate) fn integer_float(term: Term) -> Result<f64, ArithError> {
 /// # Safety
 /// `header` must be the active `ProcessHeader` and publish the live scheduler
 /// register area for the current native frame.
+#[cfg(target_arch = "aarch64")]
 pub unsafe extern "C" fn arinsal_beamasm_guard(
     header: *mut ProcessHeader,
     op: u32,

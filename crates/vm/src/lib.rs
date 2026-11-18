@@ -77,6 +77,7 @@ mod natives;
 pub use bif_table::has_function as bif_table_has_function;
 pub use calls::call_bif;
 pub use native_bridge::install_crash_dump;
+#[cfg(target_arch = "aarch64")]
 pub use native_hooks::{
     arinsal_beamasm_arith, arinsal_beamasm_bif_mfa, arinsal_beamasm_gc, arinsal_beamasm_guard,
     arinsal_beamasm_guard3, arinsal_beamasm_map_lookup,
@@ -330,6 +331,7 @@ fn cli_help_non_pollable_registration_fires_once() {
 /// Port of erts/emulator/beam/erl_init.c (erts_exit): the one place a node's OS process ends,
 /// where the BeamAsm statistics are printed before `exit`.
 pub fn erts_exit(status: i32) -> ! {
+    #[cfg(target_arch = "aarch64")]
     beamasm_integration::print_stats();
     std::process::exit(status)
 }

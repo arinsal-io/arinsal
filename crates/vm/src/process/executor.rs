@@ -199,6 +199,7 @@ impl Executor {
                     Err(error) => return Some(Err(error)),
                 }
             }
+            #[cfg(target_arch = "aarch64")]
             crate::beamasm_integration::count_native_call();
             *ran = true;
             process.native_transfer = false;
@@ -260,11 +261,13 @@ impl Executor {
             }
             match process.native_exit_kind {
                 crate::proc_create::NativeExit::None => {
+                    #[cfg(target_arch = "aarch64")]
                     crate::beamasm_integration::count_native_yield();
                     process.native_exit_kind = crate::proc_create::NativeExit::None;
                     return Some(Ok(RunState::Yield));
                 }
                 crate::proc_create::NativeExit::Wait if process.native_wait.is_some() => {
+                    #[cfg(target_arch = "aarch64")]
                     crate::beamasm_integration::count_native_yield();
                     process.native_exit_kind = crate::proc_create::NativeExit::None;
                     let timeout_pos = process.native_wait.take().expect("checked above");
@@ -278,6 +281,7 @@ impl Executor {
                     return Some(Ok(RunState::Wait { timeout_pos }));
                 }
                 crate::proc_create::NativeExit::Exiting => {
+                    #[cfg(target_arch = "aarch64")]
                     crate::beamasm_integration::count_native_yield();
                     process.native_exit_kind = crate::proc_create::NativeExit::None;
                     // The native receive helper handled a signal that ends the process.
@@ -498,10 +502,12 @@ pub(super) fn new_executor(runtime: &'static Runtime) -> Box<Executor> {
         hub_bound: false,
         vm: Vm::shared_replica(&runtime.paths),
         native_registers: {
+            #[cfg_attr(not(target_arch = "aarch64"), allow(unused_mut))]
             let mut registers = SchedulerRegisters::default();
-            // The trace-return stub address is a per-scheduler constant (process_main sets it once).
-            registers.tmp_mem[5] = crate::native_helpers::arinsal_beamasm_native_trace_return
-                as *const () as usize as u64;
+            // The arm trace-return stub address is a per-scheduler constant (process_main sets
+            // it once).
+            #[cfg(target_arch = "aarch64")]
+            crate::beamasm_integration::set_trace_return_hook(&mut registers);
             registers
         },
     })

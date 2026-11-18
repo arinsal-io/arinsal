@@ -1548,6 +1548,21 @@ fn raw_word(term: Term) -> u64 {
     term.tagged_word()
 }
 
+/// Installs the arm trace-return hook in `tmp_mem[5]`: arm's `return_trace`,
+/// `i_return_to_trace` and `i_call_trace_return` stubs call it (erts calls
+/// `beam_jit_return_to_trace` and friends by address instead).
+pub(crate) fn set_trace_return_hook(registers: &mut arinsal_beamasm::SchedulerRegisters) {
+    registers.tmp_mem[5] =
+        crate::native_helpers::arinsal_beamasm_native_trace_return as *const () as usize as u64;
+}
+
+/// The return address of a raising call when `pc` carries arm's
+/// [`arinsal_beamasm::module::RETURN_SITE_TAG`].
+pub(crate) fn tagged_return_site(pc: usize) -> Option<usize> {
+    let tag = arinsal_beamasm::module::RETURN_SITE_TAG;
+    (pc & tag != 0).then_some(pc & !tag)
+}
+
 pub(crate) fn count_native_call() {
     // Debug statistics only: a counter shared by every scheduler thread is a contended
     // cache line on the scheduling path.

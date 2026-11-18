@@ -236,6 +236,7 @@ fn run_bound_nif(process: &mut crate::Process, reg: &[Term]) -> Result<Term, cra
 
 /// Returns the result of a native call-NIF body to native code: the result term, a trap to
 /// the dirty scheduler executor or an exception.
+#[cfg(target_arch = "aarch64")]
 fn leave_native_nif(
     process: &mut crate::Process,
     reg: &mut [Term],
@@ -268,6 +269,7 @@ fn leave_native_nif(
 
 /// Calls a static NIF body through the same BIF function used by NativeBody.
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:863-900, OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 pub extern "C" fn arinsal_beamasm_static_nif(
     header: *mut ProcessHeader,
     identity: u64,
@@ -317,6 +319,7 @@ pub extern "C" fn arinsal_beamasm_static_nif(
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:863-900 (call_nif_shared loads Func and
 // NifMod from the function's code) and erts/emulator/beam/jit/beam_jit_common.cpp:623-677
 // (beam_jit_call_nif), OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 pub extern "C" fn arinsal_beamasm_call_nif(
     header: *mut ProcessHeader,
     site: u64,
@@ -394,6 +397,7 @@ pub(crate) fn moves_to_dirty(
 /// Leave native code through the dirty NIF dispatch trap; the executor runs NIF
 /// `identity` (or the process's pending continuation) on a scheduler of `class` and
 /// resumes after the native call with the result in x0.
+#[cfg(target_arch = "aarch64")]
 fn trap_to_dirty_nif(
     process: &mut crate::Process,
     identity: usize,
@@ -411,6 +415,7 @@ fn trap_to_dirty_nif(
 
 /// Dispatches a BIF export from the shared export trampoline.
 // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:164-210, OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 pub(crate) extern "C" fn arinsal_beamasm_export_trampoline(
     header: *mut ProcessHeader,
     identity: u64,
@@ -490,6 +495,7 @@ pub(crate) extern "C" fn arinsal_beamasm_save_calls_export(
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471, OTP-29.1.1.
 // The call site passes the Export*; the send and
 // breakpoint identities pass none.
+#[cfg(target_arch = "aarch64")]
 pub(crate) extern "C" fn arinsal_beamasm_call_light_bif_shared(
     header: *mut ProcessHeader,
     identity: u64,
@@ -505,6 +511,7 @@ pub(crate) extern "C" fn arinsal_beamasm_call_light_bif_shared(
 /// The shared fragment's general path. Out of line so a counter BIF does not
 /// pay this function's prologue.
 #[inline(never)]
+#[cfg(target_arch = "aarch64")]
 fn call_light_bif_body(
     header: *mut ProcessHeader,
     reg: *mut u64,
@@ -556,6 +563,7 @@ pub(crate) extern "C" fn persistent_term_get_2_light(
 /// tracer context: the return then leaves native code like a trapped call.
 // Port of erts/emulator/beam/jit/arm/instr_trace.cpp (emit_return_trace,
 // emit_i_return_to_trace, emit_i_call_trace_return), OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 pub extern "C" fn arinsal_beamasm_native_trace_return(
     header: *mut ProcessHeader,
     kind: u64,
@@ -884,6 +892,7 @@ fn thin_bif_failed(
 // a plain BIF is called straight away; save_calls, tracing and the
 // breakpoint and send identities branch off to the slow path.
 #[inline(always)]
+#[cfg(target_arch = "aarch64")]
 fn invoke_dispatch_bif(
     header: *mut ProcessHeader,
     reg: *mut u64,
@@ -981,6 +990,7 @@ fn native_breakpoint_accounted(
 
 #[cold]
 #[inline(never)]
+#[cfg(target_arch = "aarch64")]
 fn invoke_dispatch_bif_slow(
     process: &mut crate::Process,
     registers: &mut arinsal_beamasm::SchedulerRegisters,
@@ -2066,6 +2076,7 @@ fn apply_bif_error_adjustment(
 /// Export* in ARG1), a native entry, or the fragment that lets the interpreter apply.
 // Port of erts/emulator/beam/jit/arm/instr_call.cpp:263-320 (emit_fixed_apply) and
 // erts/emulator/beam/beam_common.c (fixed_apply), OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 pub extern "C" fn arinsal_beamasm_apply_resolver(
     header: *mut ProcessHeader,
     arity: u32,
@@ -2173,6 +2184,7 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(
 /// `current` erlang:apply/3, which the JIT raises with (`emit_raise_exception(&apply3_mfa)`).
 // Port of erts/emulator/beam/beam_common.c:1450-1460 (apply: error, error2) and
 // jit/arm/instr_call.cpp:205-244 (emit_variable_apply), OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 fn apply_error(
     process: &mut crate::Process,
     registers: &mut arinsal_beamasm::SchedulerRegisters,
@@ -2186,6 +2198,7 @@ fn apply_error(
     registers.x_reg_array[1] = function;
     registers.x_reg_array[2] = args;
     // Port of erts/emulator/beam/jit/arm/instr_call.cpp:211 (`static ErtsCodeMFA apply3_mfa`).
+    #[cfg(target_arch = "aarch64")]
     static APPLY3_MFA: std::sync::OnceLock<arinsal_term::ErtsCodeMfa> = std::sync::OnceLock::new();
     let mfa = APPLY3_MFA.get_or_init(|| arinsal_term::ErtsCodeMfa {
         module: Term::atom(arinsal_term::atoms::ERLANG).word(),
@@ -2200,6 +2213,7 @@ fn apply_error(
 /// the fragment that lets the interpreter apply (and raise) with X0..X2 untouched.
 // Port of erts/emulator/beam/jit/arm/instr_call.cpp:205-244 (emit_variable_apply) and
 // erts/emulator/beam/beam_common.c:1434-1530 (apply), OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 pub extern "C" fn arinsal_beamasm_apply3_resolver(
     header: *mut ProcessHeader,
     return_ip: u64,
@@ -2213,6 +2227,7 @@ pub extern "C" fn arinsal_beamasm_apply3_resolver(
 }
 
 // Port of erts/emulator/beam/beam_common.c:1434-1530 (apply), OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 fn apply3(
     process: &mut crate::Process,
     registers: &mut arinsal_beamasm::SchedulerRegisters,
@@ -2640,6 +2655,7 @@ pub extern "C" fn arinsal_beamasm_map_get(
 
 /// Generic fallback for a batch of map lookups staged at X6.
 // Port of erts/emulator/beam/jit/beam_jit_common.cpp:706-760, OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 pub extern "C" fn arinsal_beamasm_map_get_elements(
     header: *mut ProcessHeader,
     map: u64,

@@ -628,6 +628,20 @@ pub(crate) fn export_dispatch(identity: usize) -> Option<ExportDispatch> {
     target_for_identity(identity)
 }
 
+/// The return address of a raising call when the native pc names its call site: arm's BIF
+/// call sites tag that pc (`arm::tagged_return_site`); x86 call sites pass the plain return
+/// address, as erts does on both.
+#[inline]
+pub(crate) fn native_return_site(pc: usize) -> Option<usize> {
+    #[cfg(target_arch = "aarch64")]
+    return arm::tagged_return_site(pc);
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = pc;
+        None
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 mod x86;
 #[cfg(target_arch = "x86_64")]

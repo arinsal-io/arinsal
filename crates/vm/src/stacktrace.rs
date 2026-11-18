@@ -481,13 +481,11 @@ pub(super) fn capture(
     // erts' single `prev`: the raising pc, compared with each return address.
     let mut previous_native: Option<usize> = None;
     if let Some(pc) = native_pc {
-        let tag = arinsal_beamasm::module::RETURN_SITE_TAG;
-        if pc & tag != 0 {
+        if let Some(address) = crate::beamasm_integration::native_return_site(pc) {
             // Port of erts/emulator/beam/beam_common.c:791-835 (gather_stacktrace), OTP-29.1.1:
             // the raising pc is the call's return address and seeds `prev`, so the identical
             // continuation is skipped before it can take a `max_depth` slot; the pc's line is
             // looked up inside the call instruction.
-            let address = pc & !tag;
             raw.native_top = Some(address - 1);
             previous_native = Some(address);
         } else {
@@ -669,8 +667,7 @@ pub(super) fn save_stacktrace(
         cold.apply_frame_released = 0;
     }
     let (native_top, previous_native) = match native_pc {
-        Some(pc) if pc & arinsal_beamasm::module::RETURN_SITE_TAG != 0 => {
-            let address = pc & !arinsal_beamasm::module::RETURN_SITE_TAG;
+        Some(pc) if let Some(address) = crate::beamasm_integration::native_return_site(pc) => {
             (Some(address.wrapping_sub(1)), Some(address))
         }
         // Port of erts/emulator/beam/beam_common.c:791-835 (`gather_stacktrace`),
