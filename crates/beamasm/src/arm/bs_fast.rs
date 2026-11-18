@@ -3,9 +3,10 @@
 //! Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1076-2494, OTP-29.1.1.
 
 use crate::bs_construct::{BsCreateBinHelpers, BsSegment, BsSegmentKind};
-use crate::common::bs::{AccSeg, Group, combine};
+use crate::common::bs::{BscAction, BscSegment, beam_jit_bsc_combine_segments};
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
 use arinsal_a64::enc::{Cond, Gpr, Shift, Shifted};
+use arinsal_term::{Term, atoms};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const HTOP: Gpr = Gpr::x(23);
@@ -70,20 +71,20 @@ struct FixedPlan {
     header: u64,
     heap_words: u32,
     data_bytes: u32,
-    groups: Vec<Group>,
+    segments: Vec<BscSegment>,
 }
 
 struct PrivatePlan {
     bin: ArgVal,
     extra_bits: u64,
-    groups: Vec<Group>,
+    segments: Vec<BscSegment>,
 }
 
 struct AppendPlan {
     bin: ArgVal,
     unit: u64,
     extra_bits: u64,
-    groups: Vec<Group>,
+    segments: Vec<BscSegment>,
 }
 
 /// Emits a specialized construction when the segment list matches one BeamAsm fast shape.
@@ -136,12 +137,11 @@ fn private_plan(segments: &[BsSegment]) -> Option<PrivatePlan> {
     if !is_all(first) {
         return None;
     }
-    let raw = integer_group(rest)?;
-    let groups = combine(&raw.segs);
+    let (extra_bits, segments) = integer_group(rest)?;
     Some(PrivatePlan {
         bin: first.src,
-        extra_bits: raw.bits,
-        groups,
+        extra_bits,
+        segments,
     })
 }
 
@@ -156,18 +156,17 @@ fn append_plan(segments: &[BsSegment]) -> Option<AppendPlan> {
     {
         return None;
     }
-    let tail = integer_group(rest)?;
+    let (extra_bits, segments) = integer_group(rest)?;
     Some(AppendPlan {
         bin: first.src,
         unit: u64::from(first.unit),
-        extra_bits: tail.bits,
-        groups: combine(&tail.segs),
+        extra_bits,
+        segments,
     })
 }
 
 fn fixed_plan(segments: &[BsSegment], alloc: u32) -> Option<FixedPlan> {
-    let group_src = integer_group(segments)?;
-    let bits = group_src.bits;
+    let (bits, combined) = integer_group(segments)?;
     if bits > ONHEAP_BITS {
         return None;
     }
@@ -176,13 +175,12 @@ fn fixed_plan(segments: &[BsSegment], alloc: u32) -> Option<FixedPlan> {
         .checked_add(alloc)?
         .checked_add(arinsal_term::S_RESERVED as u32)?;
     // One group when the fields fit in the accumulator; otherwise several stores.
-    let groups = combine(&group_src.segs);
     Some(FixedPlan {
         bits,
         header,
         heap_words,
         data_bytes,
-        groups,
+        segments: combined,
     })
 }
 
@@ -209,7 +207,7 @@ fn append_binary_plan(segments: &[BsSegment]) -> Option<(u32, u32)> {
     }
 }
 
-fn integer_group(segments: &[BsSegment]) -> Option<Group> {
+fn integer_group(segments: &[BsSegment]) -> Option<(u64, Vec<BscSegment>)> {
     if segments.is_empty() {
         return None;
     }
@@ -221,16 +219,22 @@ fn integer_group(segments: &[BsSegment]) -> Option<Group> {
         }
         let width = integer_bits(seg)?;
         bits = bits.checked_add(width)?;
-        segs.push(AccSeg {
+        segs.push(BscSegment {
+            type_: ArgVal::Immediate(Term::atom(atoms::INTEGER).word()),
+            unit: u64::from(seg.unit),
+            flags: u64::from(seg.flags),
             src: seg.src,
-            bits: width,
-            offset: 0,
+            size: seg.size,
+            error_info: 0,
+            offset_in_accumulator: 0,
+            effective_size: width as i64,
+            action: BscAction::Direct,
         });
     }
     if bits == 0 || bits > ONHEAP_BITS {
         return None;
     }
-    Some(Group { bits, segs })
+    Some((bits, beam_jit_bsc_combine_segments(&segs)))
 }
 
 fn integer_bits(seg: &BsSegment) -> Option<u64> {
@@ -280,8 +284,11 @@ fn emit_private(
 ) -> Result<(), ModuleError> {
     let slow = asm.code.new_label();
     let done = asm.code.new_label();
-    for group in &plan.groups {
-        for seg in &group.segs {
+    for seg in &plan.segments {
+        if matches!(
+            seg.action,
+            BscAction::AccumulateFirst | BscAction::Accumulate
+        ) {
             emit_is_small(asm, seg.src, slow)?;
         }
     }
@@ -319,8 +326,15 @@ fn emit_private(
         e.mov_reg(Gpr::x(14), Gpr::x(8))
     })?;
     let mut bit_at = 0u64;
-    for group in &plan.groups {
+    for group in plan
+        .segments
+        .split_inclusive(|seg| seg.action == BscAction::Store)
+    {
         emit_group(asm, group)?;
+        let bits = group
+            .last()
+            .expect("stored accumulator group")
+            .effective_size as u64;
         let ptr = if bit_at == 0 {
             Gpr::x(14)
         } else {
@@ -330,8 +344,8 @@ fn emit_private(
         };
         // Room is the field itself: the resized buffer has no spare byte past this group
         // when the following group, or the end, begins at the next byte.
-        emit_store(asm, ptr, group.bits, group.bits)?;
-        bit_at += group.bits;
+        emit_store(asm, ptr, bits, bits)?;
+        bit_at += bits;
     }
     reload_boxed(asm, dst, TMP_MEM0)?;
     asm.code.bind(done)?;
@@ -359,8 +373,11 @@ fn emit_append(
     let slow = asm.code.new_label();
     let failed = asm.code.new_label();
     let done = asm.code.new_label();
-    for group in &plan.groups {
-        for seg in &group.segs {
+    for seg in &plan.segments {
+        if matches!(
+            seg.action,
+            BscAction::AccumulateFirst | BscAction::Accumulate
+        ) {
             emit_is_small(asm, seg.src, slow)?;
         }
     }
@@ -406,8 +423,15 @@ fn emit_append(
         e.mov_reg(Gpr::x(14), Gpr::x(8))
     })?;
     let mut bit_at = 0u64;
-    for group in &plan.groups {
+    for group in plan
+        .segments
+        .split_inclusive(|seg| seg.action == BscAction::Store)
+    {
         emit_group(asm, group)?;
+        let bits = group
+            .last()
+            .expect("stored accumulator group")
+            .effective_size as u64;
         let ptr = if bit_at == 0 {
             Gpr::x(14)
         } else {
@@ -415,8 +439,8 @@ fn emit_append(
                 .emit(|e| e.add_imm(TMP, Gpr::x(14), (bit_at / 8) as u16, false))?;
             TMP
         };
-        emit_store(asm, ptr, group.bits, group.bits)?;
-        bit_at += group.bits;
+        emit_store(asm, ptr, bits, bits)?;
+        bit_at += bits;
     }
     reload_boxed(asm, dst, TMP_MEM0)?;
     asm.code.bind(done)?;
@@ -462,21 +486,33 @@ fn emit_fixed(
         e.str_uoff(Gpr::x(0), SCHEDULER_REGS, saved)
     })?;
     let mut bit_at = 0u64;
-    for group in &plan.groups {
+    for group in plan
+        .segments
+        .split_inclusive(|seg| seg.action == BscAction::Store)
+    {
         // Port of instr_bs.cpp:2116-2192: the small test and bfi run after the
         // header store, so that store-to-load of erts_current_bin is covered by
         // the same instructions. A non-small still takes the generic builder;
         // the header already bumped is an unreachable heap bitstring the next
         // GC skips (erts instead extracts via get_sint64 into this binary).
-        for seg in &group.segs {
-            emit_is_small(asm, seg.src, slow)?;
-            emit_accumulate(asm, seg)?;
+        for seg in group {
+            if matches!(
+                seg.action,
+                BscAction::AccumulateFirst | BscAction::Accumulate
+            ) {
+                emit_is_small(asm, seg.src, slow)?;
+                emit_accumulate(asm, seg)?;
+            }
         }
+        let bits = group
+            .last()
+            .expect("stored accumulator group")
+            .effective_size as u64;
         // Port of instr_bs.cpp:1102-1119 (update_bin_state, byte-aligned) and
         // 2260-2318 (one store of the accumulator).
         asm.code.emit(|e| {
             e.ldr_uoff(Gpr::x(8), SCHEDULER_REGS, ebs)?;
-            e.mov_const(Gpr::x(9), bit_at + group.bits)?;
+            e.mov_const(Gpr::x(9), bit_at + bits)?;
             e.str_uoff(Gpr::x(9), SCHEDULER_REGS, ebs + 8)?;
             if bit_at != 0 {
                 e.add_imm(Gpr::x(8), Gpr::x(8), (bit_at / 8) as u16, false)?;
@@ -484,8 +520,8 @@ fn emit_fixed(
             Ok(())
         })?;
         let room = plan.data_bytes as u64 * 8 - bit_at;
-        emit_store(asm, Gpr::x(8), group.bits, room)?;
-        bit_at += group.bits;
+        emit_store(asm, Gpr::x(8), bits, room)?;
+        bit_at += bits;
     }
     reload_boxed(asm, dst, saved)?;
     // The generic builder and the GC stub are emitted with the yield stubs, after this
@@ -959,37 +995,47 @@ fn emit_is_small(
     }
 }
 
-fn emit_group(asm: &mut BeamModuleAssembler, group: &Group) -> Result<(), ModuleError> {
+fn emit_group(asm: &mut BeamModuleAssembler, group: &[BscSegment]) -> Result<(), ModuleError> {
     // erts does not clear ARG8 when the inserted field covers the only byte
     // `strb` writes (instr_bs.cpp append: bfi at bit 52, rev64, strb).
-    let covered =
-        group.segs.len() == 1 && group.bits <= 8 && group.segs[0].offset + group.segs[0].bits == 64;
+    let stored = group.last().expect("group ends in a STORE action");
+    let accumulates = &group[..group.len() - 1];
+    let covered = accumulates.len() == 1
+        && stored.effective_size <= 8
+        && accumulates[0].offset_in_accumulator + accumulates[0].effective_size as u64 == 64;
     if !covered {
         asm.code.emit(|e| e.mov_reg(ACC, Gpr::xzr()))?;
     }
-    for seg in &group.segs {
-        emit_accumulate(asm, seg)?;
+    for seg in accumulates {
+        if matches!(
+            seg.action,
+            BscAction::AccumulateFirst | BscAction::Accumulate
+        ) {
+            emit_accumulate(asm, seg)?;
+        }
     }
     Ok(())
 }
 
 // Port of instr_bs.cpp:2164-2212 (accumulate a small integer into ARG8).
-fn emit_accumulate(asm: &mut BeamModuleAssembler, seg: &AccSeg) -> Result<(), ModuleError> {
+fn emit_accumulate(asm: &mut BeamModuleAssembler, seg: &BscSegment) -> Result<(), ModuleError> {
     let reg = asm.source_reg(seg.src)?;
-    if seg.bits == 64 {
+    let bits = seg.effective_size as u64;
+    let offset = seg.offset_in_accumulator;
+    if bits == 64 {
         asm.code.emit(|e| e.asr_imm(ACC, reg, 4))?;
         return Ok(());
     }
-    if seg.offset >= 4 {
-        let lsb = (seg.offset - 4) as u8;
-        let width = (seg.bits + 4) as u8;
+    if offset >= 4 {
+        let lsb = (offset - 4) as u8;
+        let width = (bits + 4) as u8;
         asm.code.emit(|e| e.bfi(ACC, reg, lsb, width))?;
-    } else if seg.offset == 0 && seg.bits <= 60 {
-        asm.code.emit(|e| e.bfxil(ACC, reg, 4, seg.bits as u8))?;
+    } else if offset == 0 && bits <= 60 {
+        asm.code.emit(|e| e.bfxil(ACC, reg, 4, bits as u8))?;
     } else {
         asm.code.emit(|e| {
             e.asr_imm(Gpr::x(11), reg, 4)?;
-            e.bfi(ACC, Gpr::x(11), seg.offset as u8, seg.bits as u8)
+            e.bfi(ACC, Gpr::x(11), offset as u8, bits as u8)
         })?;
     }
     Ok(())

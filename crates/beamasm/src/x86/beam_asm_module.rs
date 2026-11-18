@@ -163,6 +163,8 @@ pub struct BeamModuleAssembler {
     /// `ga`: the address of every global fragment (`ga->get_<fragment>()`), indexed by
     /// [`GlobalLabels`]; empty for an assembler made without the global code.
     ga: Vec<Option<usize>>,
+    /// Runtime `Process` field offsets shared with the global assembler.
+    pub(crate) offsets: crate::common::process_offsets::ProcessOffsets,
     /// `catches`: the `catch` patch sites and their handlers.
     pub catches: Vec<PatchCatch>,
     /// `functions`: the label of every function seen so far (`i_func_info`).
@@ -371,6 +373,14 @@ impl BeamModuleAssembler {
             dispatch_table: HashMap::new(),
             last_error_offset: 0,
             ga: Vec::new(),
+            #[cfg(test)]
+            offsets: crate::common::process_offsets::ProcessOffsets::ERTS_X86_64,
+            #[cfg(not(test))]
+            offsets: crate::common::process_offsets::ProcessOffsets {
+                state: 0,
+                sig_qs_save: 0,
+                message_term: 0,
+            },
             catches: Vec::new(),
             functions: Vec::new(),
             current_label: None,
@@ -395,6 +405,7 @@ impl BeamModuleAssembler {
         lambdas: impl IntoIterator<Item = (u32, u32, u32)>,
     ) -> Result<Self, AsmError> {
         let mut m = Self::with_fragment_addresses(num_labels, ga.ptrs().to_vec());
+        m.offsets = ga.offsets;
         m.beam_types = beam_types;
         for (index, label, num_free) in lambdas {
             let trampoline = if num_free > 0 {
@@ -435,7 +446,9 @@ impl BeamModuleAssembler {
     // (BeamModuleAssembler::BeamModuleAssembler(BeamGlobalAssembler *ga, ...)), OTP-29.1.1.
     pub fn with_global(num_labels: u32, ga: &BeamGlobalAssembler, ga_base: usize) -> Self {
         let addresses = GLOBAL_LABELS.iter().map(|l| ga.get(ga_base, *l)).collect();
-        Self::with_fragment_addresses(num_labels, addresses)
+        let mut assembler = Self::with_fragment_addresses(num_labels, addresses);
+        assembler.offsets = ga.offsets;
+        assembler
     }
 
     /// A module assembler whose `ga->get_<fragment>()` is `addresses[fragment]`, indexed by

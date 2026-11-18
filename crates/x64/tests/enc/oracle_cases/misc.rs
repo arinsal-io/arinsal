@@ -47,6 +47,7 @@ pub fn cases(out: &mut Vec<OCase>) {
     }
     out.push(case("stosq", |e| e.stosq()));
     out.push(case("rep stosq", |e| e.rep_stosq()));
+    out.push(case("rep stos byte ptr [rdi], al", |e| e.rep_stosb()));
     out.push(case("ud2", |e| e.ud2()));
     out.push(case("hlt", |e| e.hlt()));
     out.push(case("int3", |e| e.int3()));

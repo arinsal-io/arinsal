@@ -8,30 +8,35 @@
 //! jit/beam_jit_bs.cpp in `common::bs`.
 
 use arinsal_x64::buf::Label;
-use arinsal_x64::enc::{self, CondCode, Gp, Mem, byte_ptr, dword_ptr, qword_ptr};
+use arinsal_x64::enc::{self, CondCode, Gp, Mem, byte_ptr, dword_ptr, qword_ptr, word_ptr};
 
 use super::beam_asm::register::{
-    ARG1, ARG2, ARG2D, ARG3, ARG3D, ARG4, ARG4D, ARG5, ARG5D, ARG6, ARG6D, C_P, HTOP, RET, RETB,
-    RETD,
+    ACTIVE_CODE_IX, ARG1, ARG1D, ARG2, ARG2D, ARG3, ARG3D, ARG4, ARG4D, ARG5, ARG5D, ARG6, ARG6D,
+    C_P, HTOP, RET, RETB, RETD,
 };
 use super::beam_asm::{
     AsmError, BeamAssembler, CpuFeature, Distance, TAG_PRIMARY_BOXED, Update, emit_boxed_val,
-    get_x_ref, process, tmp_mem_q,
+    get_scheduler_reg_ref, get_x_ref, process, tmp_mem_q,
 };
 use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
 use super::beam_asm_module::{BeamModuleAssembler, arg_label, arg_word};
+use super::process_main::ERTS_PSFLG_EXITING;
 pub use super::rt::{
     beam_jit_bs_construct_fail_info, beam_jit_bs_field_size_argument_error,
-    beam_jit_bs_get_integer, beam_jit_bs_init_bits, erts_bs_get_binary_2, erts_bs_get_float_2,
-    erts_bs_get_integer_2, erts_bs_get_utf8, erts_bs_get_utf16, erts_bs_init_writable,
-    erts_bs_start_match_3, erts_build_sub_bitstring, erts_cmp_bits,
+    beam_jit_bs_get_integer, beam_jit_bs_init_bits, beam_jit_bs_put_binary_all,
+    erts_bs_append_checked, erts_bs_get_binary_2, erts_bs_get_float_2, erts_bs_get_integer_2,
+    erts_bs_get_utf8, erts_bs_get_utf16, erts_bs_init_writable, erts_bs_private_append_checked,
+    erts_bs_put_binary, erts_bs_put_binary_all, erts_bs_put_float, erts_bs_put_integer_be,
+    erts_bs_put_integer_le, erts_bs_put_string, erts_bs_put_utf16, erts_bs_start_match_3,
+    erts_build_sub_bitstring, erts_cmp_bits,
 };
 use crate::common::args::ArgVal;
 use crate::common::bs::{
-    Action, BUILD_SUB_BITSTRING_HEAP_NEED, ERL_ONHEAP_BITS_LIMIT, ERL_SUB_BITS_SIZE, SMALL_BITS,
-    beam_jit_bsm_init, heap_bits_size, opt_bsm_segments,
+    Action, BUILD_SUB_BITSTRING_HEAP_NEED, BscAction, BscInfo, BscReason, BscValue,
+    ERL_ONHEAP_BITS_LIMIT, ERL_SUB_BITS_SIZE, SMALL_BITS, beam_jit_bsc_combine_segments,
+    beam_jit_bsc_init, beam_jit_bsm_init, heap_bits_size, opt_bsm_segments, update_bsc_reason_info,
 };
-use crate::common::types::BeamModuleAssemblerCommon;
+use crate::common::types::{BeamModuleAssemblerCommon, type_id};
 use arinsal_term::{Atom, Term, atoms};
 
 // erl_term.h, erl_bits.h, big.h (64-bit, OTP-29.1.1).
@@ -39,6 +44,7 @@ const TAG_IMMED1_SIZE: i64 = 4;
 const TAG_IMMED1_MASK: i64 = 0x0f;
 const TAG_IMMED1_SMALL: i64 = 0x0f;
 const TAG_PRIMARY_MASK: i64 = 0x3;
+const TAG_PRIMARY_LIST: i64 = 0x1;
 /// `TAG_PTR_MASK__` (erl_term.h, `ARCH_64`).
 const TAG_PTR_MASK: i64 = 0x7;
 const TAG_HEADER_MASK: i64 = 0x3f;
@@ -62,6 +68,15 @@ const FLOAT_SIZE_OBJECT: u64 = 2;
 const BSF_LITTLE: u64 = 2;
 const BSF_SIGNED: u64 = 4;
 const BSF_NATIVE: u64 = 16;
+
+// Port of std::gcd use in erts/emulator/beam/jit/x86/instr_bs.cpp:1639-2672,
+// (emit_i_bs_create_bin), OTP-29.1.1.
+fn gcd_u64(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
+}
 
 /// `ArgAtom(atom)`.
 fn atom_arg(atom: Atom) -> ArgVal {
@@ -1592,6 +1607,861 @@ impl BeamModuleAssembler {
     }
 }
 
+impl BeamModuleAssembler {
+    /// Emits `i_bs_create_bin`, including its size checks, allocation, and segment stores.
+    // Port of erts/emulator/beam/jit/x86/instr_bs.cpp:1639-2672
+    // (emit_i_bs_create_bin), OTP-29.1.1.
+    pub fn emit_i_bs_create_bin(
+        &mut self,
+        fail: ArgVal,
+        alloc: ArgVal,
+        live0: ArgVal,
+        dst: ArgVal,
+        args: &[ArgVal],
+    ) -> Result<(), AsmError> {
+        let fail = arg_label(fail)?;
+        let alloc = arg_word(alloc)?;
+        let mut live = u32::try_from(arg_word(live0)?)
+            .map_err(|_| AsmError::Operand("bs_create_bin live count"))?;
+        let mut num_bits = 0u64;
+        let mut segments = beam_jit_bsc_init(args);
+        let error = self.asm.new_label();
+        let mut size_reg = None;
+        let mut allocated_size = -1i64;
+        let mut need_error_handler = false;
+        let mut runtime_entered = false;
+
+        for seg in &mut segments {
+            if seg.type_ == atom_arg(atoms::APPEND) {
+                if !(self.exact_type(seg.src, type_id::BITSTRING)
+                    && gcd_u64(seg.unit, u64::from(self.get_size_unit(seg.src))) == seg.unit)
+                {
+                    need_error_handler = true;
+                }
+            } else if seg.type_ == atom_arg(atoms::BINARY) {
+                if !(seg.size == atom_arg(atoms::ALL)
+                    && self.exact_type(seg.src, type_id::BITSTRING)
+                    && gcd_u64(seg.unit, u64::from(self.get_size_unit(seg.src))) == seg.unit)
+                {
+                    need_error_handler = true;
+                }
+            } else if seg.type_ == atom_arg(atoms::INTEGER) {
+                if !self.exact_type(seg.src, type_id::INTEGER) {
+                    need_error_handler = true;
+                }
+            } else if seg.type_ != atom_arg(atoms::PRIVATE_APPEND)
+                && seg.type_ != atom_arg(atoms::STRING)
+            {
+                need_error_handler = true;
+            }
+
+            if seg.src.is_y_register() {
+                let reg = ArgVal::typed_x(live, seg.src.type_index());
+                self.mov_arg(reg, seg.src, ARG1)?;
+                live += 1;
+                seg.src = reg;
+            }
+            if seg.size.is_y_register() {
+                let reg = ArgVal::typed_x(live, seg.size.type_index());
+                self.mov_arg(reg, seg.size, ARG1)?;
+                live += 1;
+                seg.size = reg;
+            }
+
+            if let Some(size) = seg.size.small_signed()
+                && seg.unit != 0
+            {
+                let unsigned_size = size as u64;
+                if unsigned_size >> 56 == 0 {
+                    let segment_size = seg.unit.wrapping_mul(unsigned_size);
+                    seg.effective_size = segment_size as i64;
+                    num_bits = num_bits.wrapping_add(segment_size);
+                }
+            }
+
+            if seg.effective_size < 0
+                && seg.type_ != atom_arg(atoms::APPEND)
+                && seg.type_ != atom_arg(atoms::PRIVATE_APPEND)
+            {
+                size_reg = Some(ACTIVE_CODE_IX);
+                need_error_handler = true;
+            }
+        }
+
+        if size_reg.is_none()
+            && num_bits <= ERL_ONHEAP_BITS_LIMIT
+            && segments[0].type_ != atom_arg(atoms::APPEND)
+            && segments[0].type_ != atom_arg(atoms::PRIVATE_APPEND)
+        {
+            let state = core::mem::offset_of!(crate::SchedulerRegisters, erl_bits_state);
+            let mem_bin_base = get_scheduler_reg_ref(state, 8);
+            let mem_bin_offset = get_scheduler_reg_ref(state + 8, 8);
+            let heap_size = heap_bits_size(num_bits);
+
+            allocated_size = ((heap_size - heap_bits_size(0)) * 8) as i64;
+            self.emit_gc_test(0, heap_size.wrapping_add(alloc), u64::from(live))?;
+            self.asm
+                .emit(|e| e.lea(RET, qword_ptr(HTOP, TAG_PRIMARY_BOXED as i32)))?;
+            self.asm.emit(|e| e.mov_mr(tmp_mem_q(0), RET))?;
+            self.asm
+                .emit(|e| e.mov_mi(qword_ptr(HTOP, 0), header_heap_bits(num_bits)))?;
+            self.asm
+                .emit(|e| e.mov_mi(qword_ptr(HTOP, 8), num_bits as i64))?;
+            self.asm.emit(|e| e.add_ri(HTOP, 16))?;
+            self.asm.emit(|e| e.mov_mr(mem_bin_base, HTOP))?;
+            self.asm.emit(|e| e.mov_mi(mem_bin_offset, 0))?;
+            self.asm.emit(|e| e.add_ri(HTOP, allocated_size))?;
+        }
+
+        if need_error_handler {
+            let past_error = self.asm.new_label();
+            runtime_entered = self.bs_maybe_enter_runtime(false)?;
+            self.asm.short_jmp(past_error)?;
+            self.asm.bind(error)?;
+            self.bs_maybe_leave_runtime(runtime_entered)?;
+            if let Some(size_reg) = size_reg {
+                self.asm.emit(|e| e.mov_rm(size_reg, tmp_mem_q(4)))?;
+            }
+            if fail != 0 {
+                let fail = self
+                    .resolve_beam_label(fail)
+                    .ok_or(AsmError::Operand("bs_create_bin fail label"))?;
+                self.asm.jmp(fail)?;
+            } else {
+                let fragment = self.ga_get(GlobalLabels::BsCreateBinErrorShared)?;
+                self.safe_fragment_call(fragment)?;
+            }
+            self.asm.bind(past_error)?;
+        }
+
+        if let Some(size_reg) = size_reg {
+            self.asm.emit(|e| e.mov_mr(tmp_mem_q(4), size_reg))?;
+            self.asm.mov_imm(size_reg, num_bits)?;
+        }
+
+        for seg in segments.iter().copied() {
+            if seg.effective_size >= 0
+                || seg.type_ == atom_arg(atoms::APPEND)
+                || seg.type_ == atom_arg(atoms::PRIVATE_APPEND)
+            {
+                continue;
+            }
+
+            if seg.type_ == atom_arg(atoms::BINARY) && seg.size == atom_arg(atoms::ALL) {
+                runtime_entered = self.bs_maybe_enter_runtime(runtime_entered)?;
+                self.mov_arg_to_reg(ARG1, seg.src)?;
+
+                if !self.exact_type(seg.src, type_id::BITSTRING) {
+                    if fail == 0 {
+                        self.asm.mov_imm(
+                            ARG4,
+                            update_bsc_reason_info(
+                                seg.error_info,
+                                BscReason::Badarg,
+                                BscInfo::Type,
+                                BscValue::Arg1,
+                            ),
+                        )?;
+                    }
+                    self.emit_is_boxed_source(error, seg.src, ARG1, Distance::Long)?;
+                }
+
+                let next = self.asm.new_label();
+                let not_sub_bits = self.asm.new_label();
+                let boxed_ptr = self.asm.emit_ptr_val(ARG3, ARG1);
+                self.asm
+                    .emit(|e| e.mov_rm(RETD, emit_boxed_val(boxed_ptr, 0, 4)))?;
+                self.asm
+                    .emit(|e| e.mov_rm(ARG2D, emit_boxed_val(boxed_ptr, 8, 4)))?;
+                self.asm.emit(|e| e.cmp_ri(RETD, HEADER_SUB_BITS))?;
+                self.asm.short_jcc(CondCode::NE, not_sub_bits)?;
+                self.asm
+                    .emit(|e| e.mov_rm(ARG2, emit_boxed_val(boxed_ptr, SUB_BITS_END, 8)))?;
+                self.asm
+                    .emit(|e| e.sub_rm(ARG2, emit_boxed_val(boxed_ptr, SUB_BITS_START, 8)))?;
+                if self.masked_types(seg.src, type_id::MAYBE_BOXED) == type_id::BITSTRING {
+                } else {
+                    self.asm.short_jmp(next)?;
+                }
+                self.asm.bind(not_sub_bits)?;
+                if self.masked_types(seg.src, type_id::MAYBE_BOXED) != type_id::BITSTRING {
+                    self.asm.emit(|e| e.and_ri(RETB, BITSTRING_TAG_MASK))?;
+                    self.asm
+                        .emit(|e| e.cmp_ri(RETB, TAG_HEADER_HEAP_BITS as i64))?;
+                    self.asm.jcc(CondCode::NE, error)?;
+                }
+                self.asm.bind(next)?;
+                self.asm
+                    .emit(|e| e.add_rr(size_reg.expect("dynamic size register"), ARG2))?;
+            } else if seg.unit != 0 {
+                let mut can_fail = true;
+                if self.always_small(seg.size) && self.get_clamped_range(seg.size).0 >= 0 {
+                    can_fail = false;
+                }
+                if can_fail && fail == 0 {
+                    self.asm.mov_imm(
+                        ARG4,
+                        update_bsc_reason_info(
+                            seg.error_info,
+                            BscReason::Depends,
+                            BscInfo::Size,
+                            BscValue::Arg1,
+                        ),
+                    )?;
+                }
+                self.mov_arg_to_reg(ARG1, seg.size)?;
+                if !self.always_small(seg.size) && self.always_one_of(seg.size, type_id::NUMBER) {
+                    self.asm.emit(|e| e.test_ri(ARG1.r8(), TAG_PRIMARY_LIST))?;
+                    self.asm.jcc(CondCode::E, error)?;
+                } else if !self.always_small(seg.size) {
+                    self.asm.emit(|e| e.mov_rr(RETD, ARG1D))?;
+                    self.asm.emit(|e| e.and_ri(RETB, TAG_IMMED1_MASK))?;
+                    self.asm.emit(|e| e.cmp_ri(RETB, TAG_IMMED1_SMALL))?;
+                    self.asm.jcc(CondCode::NE, error)?;
+                }
+                self.asm.emit(|e| e.mov_rr(RET, ARG1))?;
+                self.asm.emit(|e| e.sar_ri(RET, TAG_IMMED1_SIZE))?;
+                if can_fail {
+                    self.asm.jcc(CondCode::S, error)?;
+                }
+                if seg.unit != 1 {
+                    if fail == 0 {
+                        self.asm.mov_imm(
+                            ARG4,
+                            update_bsc_reason_info(
+                                seg.error_info,
+                                BscReason::SystemLimit,
+                                BscInfo::Size,
+                                BscValue::Arg1,
+                            ),
+                        )?;
+                    }
+                    self.asm.emit(|e| e.imul_rri(RET, RET, seg.unit as i64))?;
+                    self.asm.jcc(CondCode::O, error)?;
+                }
+                self.asm
+                    .emit(|e| e.add_rr(size_reg.expect("dynamic size register"), RET))?;
+            } else if seg.type_ == atom_arg(atoms::UTF8) {
+                let next = self.asm.new_label();
+                self.mov_arg_to_reg(ARG1, seg.src)?;
+                if fail == 0 {
+                    self.asm.mov_imm(
+                        ARG4,
+                        update_bsc_reason_info(
+                            seg.error_info,
+                            BscReason::Badarg,
+                            BscInfo::Type,
+                            BscValue::Arg1,
+                        ),
+                    )?;
+                }
+                if !self.always_small(seg.src)
+                    && self.always_one_of(seg.src, type_id::INTEGER | type_id::ALWAYS_BOXED)
+                {
+                    self.asm.emit_is_not_boxed(error, ARG1, Distance::Long)?;
+                } else if !self.always_small(seg.src) {
+                    self.asm.emit(|e| e.mov_rr(RETD, ARG1D))?;
+                    self.asm.emit(|e| e.and_ri(RETB, TAG_IMMED1_MASK))?;
+                    self.asm.emit(|e| e.cmp_ri(RETB, TAG_IMMED1_SMALL))?;
+                    self.asm.jcc(CondCode::NE, error)?;
+                }
+                self.asm.mov_imm(RET, 0)?;
+                self.asm.emit(|e| e.mov_ri(RETB, 1))?;
+                self.asm.emit(|e| e.cmp_ri(ARG1, make_small(0x80)))?;
+                self.asm.short_jcc(CondCode::B, next)?;
+                self.asm.emit(|e| e.mov_ri(RETB, 2))?;
+                self.asm.emit(|e| e.cmp_ri(ARG1, make_small(0x800)))?;
+                self.asm.short_jcc(CondCode::B, next)?;
+                self.asm.emit(|e| {
+                    e.mov_rr(ARG2, ARG1)?;
+                    e.sar_ri(ARG2, 11 + TAG_IMMED1_SIZE)?;
+                    e.cmp_ri(ARG2, 0x1b)
+                })?;
+                self.asm.jcc(CondCode::E, error)?;
+                self.asm.emit(|e| e.cmp_ri(ARG1, make_small(0x10000)))?;
+                self.asm.emit(|e| e.setcc_r(CondCode::AE, RETB))?;
+                self.asm.emit(|e| e.add_ri(RETB, 3))?;
+                let (min, max) = self.get_clamped_range(seg.src);
+                if !(0 <= min && max < 0x110000) {
+                    self.asm.emit(|e| e.cmp_ri(ARG1, make_small(0x110000)))?;
+                    self.asm.jcc(CondCode::AE, error)?;
+                }
+                self.asm.bind(next)?;
+                self.asm.emit(|e| {
+                    e.lea(
+                        size_reg.expect("dynamic size register"),
+                        Mem::base_index(size_reg.expect("dynamic size register"), RET, 3, 0, 8),
+                    )
+                })?;
+            } else if seg.type_ == atom_arg(atoms::UTF16) {
+                self.mov_arg_to_reg(ARG1, seg.src)?;
+                self.asm.mov_imm(RET, 2 * 8)?;
+                self.asm.mov_imm(ARG2, 4 * 8)?;
+                self.asm.emit(|e| e.cmp_ri(ARG1, make_small(0x10000)))?;
+                self.asm.emit(|e| e.cmovcc_rr(CondCode::AE, RET, ARG2))?;
+                self.asm
+                    .emit(|e| e.add_rr(size_reg.expect("dynamic size register"), RET))?;
+            } else if seg.type_ == atom_arg(atoms::UTF32) {
+                let next = self.asm.new_label();
+                self.mov_arg_to_reg(ARG1, seg.src)?;
+                if fail == 0 {
+                    self.asm.mov_imm(
+                        ARG4,
+                        update_bsc_reason_info(
+                            seg.error_info,
+                            BscReason::Badarg,
+                            BscInfo::Type,
+                            BscValue::Arg1,
+                        ),
+                    )?;
+                }
+                self.asm
+                    .emit(|e| e.add_ri(size_reg.expect("dynamic size register"), 4 * 8))?;
+                self.asm.emit(|e| e.mov_rr(RETD, ARG1D))?;
+                self.asm.emit(|e| e.and_ri(RETB, TAG_IMMED1_MASK))?;
+                self.asm.emit(|e| e.cmp_ri(RETB, TAG_IMMED1_SMALL))?;
+                self.asm.jcc(CondCode::NE, error)?;
+                self.asm.emit(|e| e.cmp_ri(ARG1, make_small(0xd800)))?;
+                self.asm.short_jcc(CondCode::B, next)?;
+                self.asm.emit(|e| e.cmp_ri(ARG1, make_small(0xdfff)))?;
+                self.asm.jcc(CondCode::BE, error)?;
+                self.asm.emit(|e| e.cmp_ri(ARG1, make_small(0x10ffff)))?;
+                self.asm.jcc(CondCode::A, error)?;
+                self.asm.bind(next)?;
+            }
+        }
+
+        segments = beam_jit_bsc_combine_segments(&segments);
+
+        if segments[0].type_ == atom_arg(atoms::APPEND) {
+            let all_good = self.asm.new_label();
+            let schedule = self.resolve_fragment(self.ga_get(GlobalLabels::DoSchedule)?);
+            let seg = segments[0];
+            runtime_entered = self.bs_maybe_enter_runtime(runtime_entered)?;
+            self.asm.mov_imm(ARG3, u64::from(live))?;
+            if let Some(size_reg) = size_reg {
+                self.asm.emit(|e| e.mov_rr(ARG4, size_reg))?;
+            } else {
+                self.asm.mov_imm(ARG4, num_bits)?;
+            }
+            self.asm.mov_imm(ARG5, alloc)?;
+            self.asm.mov_imm(ARG6, seg.unit)?;
+            let append_source = seg
+                .src
+                .copy(live)
+                .ok_or(AsmError::Operand("bs_create_bin append source"))?;
+            self.mov_arg(append_source, seg.src, ARG1)?;
+            self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
+            self.asm.load_x_reg_array(ARG2)?;
+            self.asm
+                .runtime_call(erts_bs_append_checked as *const () as usize)?;
+
+            if self.exact_type(seg.src, type_id::BITSTRING)
+                && gcd_u64(seg.unit, u64::from(self.get_size_unit(seg.src))) == seg.unit
+            {
+                self.asm.emit_test_the_non_value(RET)?;
+                self.asm.short_jcc(CondCode::NE, all_good)?;
+                self.bs_maybe_leave_runtime(runtime_entered)?;
+                self.asm.jmp(schedule)?;
+            } else {
+                self.asm.emit_test_the_non_value(RET)?;
+                self.asm.short_jcc(CondCode::NE, all_good)?;
+                if fail == 0 {
+                    self.mov_arg_to_reg(ARG1, append_source)?;
+                    self.asm.mov_imm(
+                        ARG4,
+                        update_bsc_reason_info(
+                            seg.error_info,
+                            BscReason::Badarg,
+                            BscInfo::Fvalue,
+                            BscValue::Arg1,
+                        ),
+                    )?;
+                }
+                self.asm.emit(|e| {
+                    e.mov_rm(
+                        ARG2D,
+                        super::beam_asm::process_ref(self.offsets.state as i32, 4),
+                    )
+                })?;
+                self.asm
+                    .emit(|e| e.test_ri(ARG2D, i64::from(ERTS_PSFLG_EXITING)))?;
+                self.asm.jcc(CondCode::E, error)?;
+                self.bs_maybe_leave_runtime(runtime_entered)?;
+                self.asm.jmp(schedule)?;
+            }
+            self.asm.bind(all_good)?;
+            self.asm.emit(|e| e.mov_mr(tmp_mem_q(0), RET))?;
+        } else if segments[0].type_ == atom_arg(atoms::PRIVATE_APPEND) {
+            let seg = segments[0];
+            debug_assert_eq!(alloc, 0);
+            runtime_entered = self.bs_maybe_enter_runtime(runtime_entered)?;
+            self.mov_arg_to_reg(ARG3, seg.src)?;
+            if let Some(size_reg) = size_reg {
+                self.asm.emit(|e| e.mov_rr(ARG4, size_reg))?;
+            } else {
+                self.asm.mov_imm(ARG4, num_bits)?;
+            }
+            self.asm.emit(|e| e.mov_rr(ARG2, C_P))?;
+            self.asm.load_erl_bits_state(ARG1)?;
+            self.asm
+                .runtime_call(erts_bs_private_append_checked as *const () as usize)?;
+            self.asm.emit(|e| e.mov_mr(tmp_mem_q(0), RET))?;
+        } else if allocated_size < 0 {
+            runtime_entered = self.bs_maybe_enter_runtime(runtime_entered)?;
+            self.asm.mov_imm(ARG5, alloc)?;
+            self.asm.mov_imm(ARG6, u64::from(live))?;
+            if let Some(size_reg) = size_reg {
+                self.asm.emit(|e| e.mov_rr(ARG4, size_reg))?;
+            } else {
+                debug_assert!(num_bits > ERL_ONHEAP_BITS_LIMIT);
+                self.asm.mov_imm(ARG4, num_bits)?;
+            }
+            let init_bits = self.ga_get(GlobalLabels::BsInitBitsShared)?;
+            let init_bits = self.resolve_fragment(init_bits);
+            self.asm.fragment_call(init_bits)?;
+            self.asm.emit(|e| e.mov_mr(tmp_mem_q(0), RET))?;
+        }
+
+        let mut bit_offset = 0i64;
+        let mut is_byte_aligned = true;
+        for seg in segments.iter().copied() {
+            if seg.type_ == atom_arg(atoms::APPEND) || seg.type_ == atom_arg(atoms::PRIVATE_APPEND)
+            {
+                bit_offset = -1;
+            } else if seg.type_ == atom_arg(atoms::BINARY) {
+                let mut can_fail = true;
+                runtime_entered = self.bs_maybe_enter_runtime(runtime_entered)?;
+                let error_info = if seg.effective_size >= 0 {
+                    self.asm.mov_imm(ARG4, seg.effective_size as u64)?;
+                    self.mov_arg_to_reg(ARG3, seg.src)?;
+                    self.asm.emit(|e| e.mov_rr(ARG2, C_P))?;
+                    self.asm.load_erl_bits_state(ARG1)?;
+                    self.asm
+                        .runtime_call(erts_bs_put_binary as *const () as usize)?;
+                    update_bsc_reason_info(
+                        seg.error_info,
+                        BscReason::Badarg,
+                        BscInfo::Depends,
+                        BscValue::Fvalue,
+                    )
+                } else if seg.size == atom_arg(atoms::ALL) {
+                    can_fail = !(self.exact_type(seg.src, type_id::BITSTRING)
+                        && gcd_u64(seg.unit, u64::from(self.get_size_unit(seg.src))) == seg.unit);
+                    if can_fail {
+                        self.asm.mov_imm(ARG4, seg.unit)?;
+                    }
+                    self.mov_arg_to_reg(ARG3, seg.src)?;
+                    self.asm.emit(|e| e.mov_rr(ARG2, C_P))?;
+                    self.asm.load_erl_bits_state(ARG1)?;
+                    if can_fail {
+                        self.asm
+                            .runtime_call(erts_bs_put_binary_all as *const () as usize)?;
+                    } else {
+                        self.asm
+                            .runtime_call(beam_jit_bs_put_binary_all as *const () as usize)?;
+                    }
+                    update_bsc_reason_info(
+                        seg.error_info,
+                        BscReason::Badarg,
+                        BscInfo::Unit,
+                        BscValue::Fvalue,
+                    )
+                } else {
+                    self.mov_arg_to_reg(ARG4, seg.size)?;
+                    self.asm.emit(|e| e.sar_ri(ARG4, TAG_IMMED1_SIZE))?;
+                    if seg.unit != 1 {
+                        self.asm.mov_imm(RET, seg.unit)?;
+                        self.asm.emit(|e| e.mul_r(ARG4))?;
+                        self.asm.emit(|e| e.mov_rr(ARG4, RET))?;
+                    }
+                    self.mov_arg_to_reg(ARG3, seg.src)?;
+                    self.asm.emit(|e| e.mov_rr(ARG2, C_P))?;
+                    self.asm.load_erl_bits_state(ARG1)?;
+                    self.asm
+                        .runtime_call(erts_bs_put_binary as *const () as usize)?;
+                    update_bsc_reason_info(
+                        seg.error_info,
+                        BscReason::Badarg,
+                        BscInfo::Depends,
+                        BscValue::Fvalue,
+                    )
+                };
+                if can_fail {
+                    if fail == 0 {
+                        self.asm.mov_imm(ARG4, error_info)?;
+                    }
+                    self.asm.emit(|e| e.test_rr(RETD, RETD))?;
+                    self.asm.jcc(CondCode::E, error)?;
+                }
+            } else if seg.type_ == atom_arg(atoms::FLOAT) {
+                runtime_entered = self.bs_maybe_enter_runtime(runtime_entered)?;
+                if seg.effective_size >= 0 {
+                    self.asm.mov_imm(ARG4, seg.effective_size as u64)?;
+                } else {
+                    self.mov_arg_to_reg(ARG4, seg.size)?;
+                    self.asm.emit(|e| e.sar_ri(ARG4, TAG_IMMED1_SIZE))?;
+                    if seg.unit != 1 {
+                        self.asm.mov_imm(RET, seg.unit)?;
+                        self.asm.emit(|e| e.mul_r(ARG4))?;
+                        self.asm.emit(|e| e.mov_rr(ARG4, RET))?;
+                    }
+                }
+                self.mov_arg_to_reg(ARG3, seg.src)?;
+                self.asm.mov_imm(ARG5, seg.flags)?;
+                self.asm.emit(|e| e.mov_rr(ARG2, C_P))?;
+                self.asm.load_erl_bits_state(ARG1)?;
+                self.asm
+                    .runtime_call(erts_bs_put_float as *const () as usize)?;
+                if fail == 0 {
+                    self.asm.mov_imm(
+                        ARG4,
+                        update_bsc_reason_info(
+                            seg.error_info,
+                            BscReason::Badarg,
+                            BscInfo::Fvalue,
+                            BscValue::Arg1,
+                        ),
+                    )?;
+                }
+                self.asm.emit(|e| e.mov_rr(ARG1, RET))?;
+                self.asm.emit_test_the_non_value(RET)?;
+                self.asm.jcc(CondCode::NE, error)?;
+            } else if seg.type_ == atom_arg(atoms::INTEGER) {
+                match seg.action {
+                    BscAction::AccumulateFirst | BscAction::Accumulate => {
+                        let accumulate = self.asm.new_label();
+                        let value_is_small = self.asm.new_label();
+                        let tmp = ARG4;
+                        let bin_data = ARG5;
+                        if seg.action != BscAction::AccumulateFirst && seg.effective_size < 64 {
+                            self.asm.emit(|e| e.shl_ri(bin_data, seg.effective_size))?;
+                        }
+                        if !seg.src.is_small() {
+                            self.mov_arg_to_reg(ARG1, seg.src)?;
+                        }
+                        if !self.always_small(seg.src) {
+                            if self.always_one_of(seg.src, type_id::INTEGER | type_id::ALWAYS_BOXED)
+                            {
+                                self.asm
+                                    .emit_is_not_boxed(value_is_small, ARG1, Distance::Long)?;
+                            } else {
+                                self.asm.emit(|e| {
+                                    e.mov_rr(ARG2D, ARG1D)?;
+                                    e.and_ri(ARG2D, TAG_IMMED1_MASK)?;
+                                    e.cmp_ri(ARG2D, TAG_IMMED1_SMALL)
+                                })?;
+                                self.asm.short_jcc(CondCode::E, value_is_small)?;
+                            }
+
+                            let get_sint64 = self.ga_get(GlobalLabels::GetSint64Shared)?;
+                            self.safe_fragment_call(get_sint64)?;
+                            if self.exact_type(seg.src, type_id::INTEGER) {
+                                self.asm.short_jmp(accumulate)?;
+                            } else {
+                                self.asm.short_jcc(CondCode::NE, accumulate)?;
+                                if fail == 0 {
+                                    self.asm.mov_imm(
+                                        ARG4,
+                                        update_bsc_reason_info(
+                                            seg.error_info,
+                                            BscReason::Badarg,
+                                            BscInfo::Type,
+                                            BscValue::Arg1,
+                                        ),
+                                    )?;
+                                }
+                                self.asm.jmp(error)?;
+                            }
+                        }
+                        self.asm.bind(value_is_small)?;
+                        if let Some(small) = seg.src.small_signed() {
+                            self.asm.mov_imm(ARG1, small as u64)?;
+                        } else if seg.effective_size + TAG_IMMED1_SIZE <= 32 {
+                            self.asm.emit(|e| e.shr_ri(ARG1D, TAG_IMMED1_SIZE))?;
+                        } else {
+                            self.asm.emit(|e| e.sar_ri(ARG1, TAG_IMMED1_SIZE))?;
+                        }
+                        self.asm.bind(accumulate)?;
+                        self.emit_accumulate(
+                            seg.src,
+                            seg.effective_size,
+                            bin_data,
+                            tmp,
+                            ARG1,
+                            seg.action == BscAction::AccumulateFirst,
+                        )?;
+                    }
+                    BscAction::Store => {
+                        let store = self.asm.new_label();
+                        let done = self.asm.new_label();
+                        let bin_ptr = ARG1;
+                        let bin_offset = ARG3;
+                        let tmp = ARG4;
+                        let bin_data = ARG5;
+                        if seg.effective_size % 8 != 0 {
+                            let complete_bytes = 8 * (seg.effective_size / 8);
+                            let num_partial = seg.effective_size % 8;
+                            if seg.flags & 2 == 0 {
+                                self.asm.emit(|e| {
+                                    e.shl_ri(bin_data, 64 - seg.effective_size)?;
+                                    e.bswap(bin_data)
+                                })?;
+                            } else {
+                                let mask = (1i64 << complete_bytes) - 1;
+                                self.asm.emit(|e| e.mov_rr(RET, bin_data))?;
+                                self.asm.emit(|e| e.shr_ri(RET, complete_bytes))?;
+                                self.asm
+                                    .emit(|e| e.and_ri(RETD, (1u64 << num_partial) as i64 - 1))?;
+                                self.asm
+                                    .emit(|e| e.shl_ri(RET, complete_bytes + 8 - num_partial))?;
+                                if i32::try_from(mask).is_ok() {
+                                    self.asm.emit(|e| e.and_ri(bin_data, mask))?;
+                                } else {
+                                    self.asm.mov_imm(tmp, mask as u64)?;
+                                    self.asm.emit(|e| e.and_rr(bin_data, tmp))?;
+                                }
+                                self.asm.emit(|e| e.or_rr(bin_data, RET))?;
+                            }
+                        } else if seg.flags & 2 == 0 {
+                            match seg.effective_size {
+                                8 => {}
+                                32 => {
+                                    self.asm.emit(|e| e.bswap(bin_data.r32()))?;
+                                }
+                                64 => {
+                                    self.asm.emit(|e| e.bswap(bin_data))?;
+                                }
+                                _ => {
+                                    self.asm.emit(|e| {
+                                        e.bswap(bin_data)?;
+                                        e.shr_ri(bin_data, 64 - seg.effective_size)
+                                    })?;
+                                }
+                            }
+                        }
+
+                        self.update_bin_state(
+                            Some(bin_offset),
+                            bin_ptr,
+                            bit_offset,
+                            seg.effective_size,
+                            None,
+                        )?;
+                        if !is_byte_aligned {
+                            if bit_offset < 0 {
+                                self.asm.emit(|e| e.and_ri(bin_offset, 7))?;
+                                self.asm.short_jcc(CondCode::E, store)?;
+                            } else if bit_offset >= 0 {
+                                self.asm.mov_imm(bin_offset, (bit_offset & 7) as u64)?;
+                            }
+                            self.asm.mov_imm(ARG4, seg.effective_size as u64)?;
+                            let store_unaligned = self.ga_get(GlobalLabels::StoreUnaligned)?;
+                            self.safe_fragment_call(store_unaligned)?;
+                            if bit_offset < 0 {
+                                self.asm.short_jmp(done)?;
+                            }
+                        }
+                        self.asm.bind(store)?;
+                        if bit_offset <= 0 || is_byte_aligned {
+                            let mut num_bytes = (seg.effective_size + 7) / 8;
+                            match num_bytes {
+                                3 if bit_offset >= 0 && allocated_size * 8 - bit_offset >= 32 => {
+                                    num_bytes = 4;
+                                }
+                                5..=7
+                                    if bit_offset >= 0 && allocated_size * 8 - bit_offset >= 64 =>
+                                {
+                                    num_bytes = 8;
+                                }
+                                _ => {}
+                            }
+                            while num_bytes > 0 {
+                                match num_bytes {
+                                    1 => self
+                                        .asm
+                                        .emit(|e| e.mov_mr(byte_ptr(bin_ptr, 0), bin_data.r8()))?,
+                                    2 => self.asm.emit(|e| {
+                                        e.mov_mr(enc::word_ptr(bin_ptr, 0), bin_data.r16())
+                                    })?,
+                                    3 => {
+                                        self.asm.emit(|e| {
+                                            e.mov_mr(enc::word_ptr(bin_ptr, 0), bin_data.r16())
+                                        })?;
+                                        self.asm.emit(|e| e.shr_ri(bin_data, 16))?;
+                                        self.asm.emit(|e| {
+                                            e.mov_mr(byte_ptr(bin_ptr, 2), bin_data.r8())
+                                        })?;
+                                    }
+                                    4 => self.asm.emit(|e| {
+                                        e.mov_mr(dword_ptr(bin_ptr, 0), bin_data.r32())
+                                    })?,
+                                    5..=7 => {
+                                        self.asm.emit(|e| {
+                                            e.mov_mr(dword_ptr(bin_ptr, 0), bin_data.r32())
+                                        })?;
+                                        self.asm.emit(|e| e.add_ri(bin_ptr, 4))?;
+                                        self.asm.emit(|e| e.shr_ri(bin_data, 32))?;
+                                    }
+                                    8 => {
+                                        self.asm
+                                            .emit(|e| e.mov_mr(qword_ptr(bin_ptr, 0), bin_data))?;
+                                        num_bytes = 0;
+                                    }
+                                    _ => unreachable!("erts accumulator store width"),
+                                }
+                                num_bytes -= 4;
+                            }
+                        }
+                        self.asm.bind(done)?;
+                    }
+                    BscAction::Direct => {
+                        if seg.effective_size >= 0 {
+                            self.asm.mov_imm(ARG3, seg.effective_size as u64)?;
+                        } else {
+                            self.mov_arg_to_reg(ARG3, seg.size)?;
+                            self.asm.emit(|e| e.sar_ri(ARG3, TAG_IMMED1_SIZE))?;
+                            if seg.unit.is_power_of_two() {
+                                let trailing_bits = seg.unit.trailing_zeros();
+                                if trailing_bits != 0 {
+                                    self.asm
+                                        .emit(|e| e.shl_ri(ARG3, i64::from(trailing_bits)))?;
+                                }
+                            } else {
+                                self.asm.mov_imm(RET, seg.unit)?;
+                                self.asm.emit(|e| e.mul_r(ARG3))?;
+                                self.asm.emit(|e| e.mov_rr(ARG3, RET))?;
+                            }
+                        }
+                        if is_byte_aligned && seg.src.small_signed() == Some(0) {
+                            self.set_zero(seg.effective_size)?;
+                        } else {
+                            runtime_entered = self.bs_maybe_enter_runtime(runtime_entered)?;
+                            self.mov_arg_to_reg(ARG2, seg.src)?;
+                            self.asm.load_erl_bits_state(ARG1)?;
+                            if seg.flags & 2 != 0 {
+                                self.asm
+                                    .runtime_call(erts_bs_put_integer_le as *const () as usize)?;
+                            } else {
+                                self.asm
+                                    .runtime_call(erts_bs_put_integer_be as *const () as usize)?;
+                            }
+                            if !self.exact_type(seg.src, type_id::INTEGER) {
+                                if fail == 0 {
+                                    self.mov_arg_to_reg(ARG1, seg.src)?;
+                                    self.asm.mov_imm(
+                                        ARG4,
+                                        update_bsc_reason_info(
+                                            seg.error_info,
+                                            BscReason::Badarg,
+                                            BscInfo::Type,
+                                            BscValue::Arg1,
+                                        ),
+                                    )?;
+                                }
+                                self.asm.emit(|e| e.test_rr(RETD, RETD))?;
+                                self.asm.jcc(CondCode::E, error)?;
+                            }
+                        }
+                    }
+                }
+            } else if seg.type_ == atom_arg(atoms::STRING) {
+                runtime_entered = self.bs_maybe_enter_runtime(runtime_entered)?;
+                debug_assert!(seg.effective_size >= 0);
+                self.asm.mov_imm(ARG3, (seg.effective_size / 8) as u64)?;
+                self.mov_arg_to_reg(ARG2, seg.src)?;
+                self.asm.load_erl_bits_state(ARG1)?;
+                self.asm
+                    .runtime_call(erts_bs_put_string as *const () as usize)?;
+            } else if seg.type_ == atom_arg(atoms::UTF8) {
+                runtime_entered = self.bs_maybe_enter_runtime(runtime_entered)?;
+                self.emit_construct_utf8(seg.src, bit_offset, is_byte_aligned)?;
+            } else if seg.type_ == atom_arg(atoms::UTF16) {
+                runtime_entered = self.bs_maybe_enter_runtime(runtime_entered)?;
+                self.mov_arg_to_reg(ARG2, seg.src)?;
+                self.asm.emit(|e| e.mov_ri(ARG3, seg.flags as i64))?;
+                self.asm.load_erl_bits_state(ARG1)?;
+                self.asm
+                    .runtime_call(erts_bs_put_utf16 as *const () as usize)?;
+                if fail == 0 {
+                    self.mov_arg_to_reg(ARG1, seg.src)?;
+                    self.asm.mov_imm(
+                        ARG4,
+                        update_bsc_reason_info(
+                            seg.error_info,
+                            BscReason::Badarg,
+                            BscInfo::Type,
+                            BscValue::Arg1,
+                        ),
+                    )?;
+                }
+                self.asm.emit(|e| e.test_rr(RETD, RETD))?;
+                self.asm.jcc(CondCode::E, error)?;
+            } else if seg.type_ == atom_arg(atoms::UTF32) {
+                runtime_entered = self.bs_maybe_enter_runtime(runtime_entered)?;
+                self.mov_arg_to_reg(ARG2, seg.src)?;
+                self.asm.mov_imm(ARG3, 4 * 8)?;
+                self.asm.load_erl_bits_state(ARG1)?;
+                if seg.flags & 2 != 0 {
+                    self.asm
+                        .runtime_call(erts_bs_put_integer_le as *const () as usize)?;
+                } else {
+                    self.asm
+                        .runtime_call(erts_bs_put_integer_be as *const () as usize)?;
+                }
+                if fail == 0 {
+                    self.mov_arg_to_reg(ARG1, seg.src)?;
+                    self.asm.mov_imm(
+                        ARG4,
+                        update_bsc_reason_info(
+                            seg.error_info,
+                            BscReason::Badarg,
+                            BscInfo::Type,
+                            BscValue::Arg1,
+                        ),
+                    )?;
+                }
+                self.asm.emit(|e| e.test_rr(RETD, RETD))?;
+                self.asm.jcc(CondCode::E, error)?;
+            }
+
+            if bit_offset >= 0
+                && (seg.action == BscAction::Direct || seg.action == BscAction::Store)
+            {
+                if seg.effective_size >= 0 {
+                    bit_offset += seg.effective_size;
+                } else {
+                    bit_offset = -1;
+                }
+            }
+
+            if seg.type_ == atom_arg(atoms::APPEND) || seg.type_ == atom_arg(atoms::PRIVATE_APPEND)
+            {
+                if !self.exact_type(seg.src, type_id::BITSTRING)
+                    || gcd_u64(u64::from(self.get_size_unit(seg.src)), 8) != 8
+                {
+                    is_byte_aligned = false;
+                }
+            } else if bit_offset % 8 == 0 {
+                is_byte_aligned = true;
+            } else if seg.effective_size >= 0 {
+                if seg.effective_size % 8 != 0 {
+                    is_byte_aligned = false;
+                }
+            } else if gcd_u64(seg.unit, 8) != 8 {
+                is_byte_aligned = false;
+            }
+        }
+
+        self.bs_maybe_leave_runtime(runtime_entered)?;
+        if let Some(size_reg) = size_reg {
+            self.asm.emit(|e| e.mov_rm(size_reg, tmp_mem_q(4)))?;
+        }
+        self.asm.emit(|e| e.mov_rm(RET, tmp_mem_q(0)))?;
+        self.mov_arg_from_reg(dst, RET)
+    }
+}
+
 impl BeamGlobalAssembler {
     /// Sets the error reason of a failed size check.
     // Port of erts/emulator/beam/jit/x86/instr_bs.cpp:128-136 (emit_bs_size_check_shared),
@@ -1953,6 +2823,266 @@ impl BeamGlobalAssembler {
     }
 }
 
+impl BeamModuleAssembler {
+    /// Updates `erl_bits_state` to point at the segment's current byte and bit end.
+    // Port of erts/emulator/beam/jit/x86/instr_bs.cpp:1174-1223 (update_bin_state),
+    // OTP-29.1.1.
+    fn update_bin_state(
+        &mut self,
+        bin_offset: Option<enc::Gp>,
+        current_byte: enc::Gp,
+        bit_offset: i64,
+        size: i64,
+        size_reg: Option<enc::Gp>,
+    ) -> Result<(), AsmError> {
+        let state = core::mem::offset_of!(crate::SchedulerRegisters, erl_bits_state);
+        let mem_bin_base = get_scheduler_reg_ref(state, 8);
+        let mem_bin_offset = get_scheduler_reg_ref(state + 8, 8);
+        let size_fits = bit_offset
+            .checked_add(size)
+            .and_then(|sum| i32::try_from(sum).ok())
+            .is_some();
+
+        if bit_offset % 8 != 0 || !size_fits {
+            self.asm.emit(|e| e.mov_rm(current_byte, mem_bin_offset))?;
+            self.asm.emit(|e| e.mov_rm(RET, mem_bin_base))?;
+            if let Some(bin_offset) = bin_offset {
+                self.asm
+                    .emit(|e| e.mov_rr(bin_offset.r32(), current_byte.r32()))?;
+            }
+            if let Some(size_reg) = size_reg {
+                self.asm.emit(|e| e.add_mr(mem_bin_offset, size_reg))?;
+            } else {
+                self.asm.emit(|e| e.add_mi(mem_bin_offset, size))?;
+            }
+            self.asm.emit(|e| e.shr_ri(current_byte, 3))?;
+            self.asm.emit(|e| e.add_rr(current_byte, RET))?;
+        } else {
+            debug_assert!(size >= 0 || size_reg.is_some());
+            debug_assert_eq!(bit_offset % 8, 0);
+            self.asm.emit(|e| e.mov_rm(current_byte, mem_bin_base))?;
+            if bit_offset != 0 {
+                self.asm.emit(|e| e.add_ri(current_byte, bit_offset >> 3))?;
+            }
+            if let Some(size_reg) = size_reg {
+                self.asm.emit(|e| e.add_mr(mem_bin_offset, size_reg))?;
+            } else {
+                self.asm
+                    .emit(|e| e.mov_mi(mem_bin_offset, bit_offset + size))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a value's tracked range requires truncation before accumulation.
+    // Port of erts/emulator/beam/jit/x86/instr_bs.cpp:1225-1235 (need_mask), OTP-29.1.1.
+    fn need_mask(&self, value: ArgVal, size: i64) -> bool {
+        if size == 64 {
+            false
+        } else {
+            let (min, max) = self.get_clamped_range(value);
+            !(0 <= min && (max >> size as u32) == 0)
+        }
+    }
+
+    /// Clears the requested number of bits at the binary cursor; ARG3 contains the size.
+    // Port of erts/emulator/beam/jit/x86/instr_bs.cpp:1237-1302 (set_zero), OTP-29.1.1.
+    fn set_zero(&mut self, effective_size: i64) -> Result<(), AsmError> {
+        self.update_bin_state(Some(ARG2), ARG1, -1, -1, Some(ARG3))?;
+        self.asm.mov_imm(RET, 0)?;
+
+        if !(0..=128).contains(&effective_size) {
+            let done = self.asm.new_label();
+            if effective_size < 0 {
+                self.asm.emit(|e| e.test_rr(ARG3, ARG3))?;
+                self.asm.short_jcc(CondCode::E, done)?;
+            }
+            if ARG1 != enc::RDI {
+                self.asm.emit(|e| e.mov_rr(enc::RDI, ARG1))?;
+            }
+            self.asm.emit(|e| e.mov_rr(enc::RCX, ARG3))?;
+            self.asm.emit(|e| e.add_ri(enc::RCX, 7))?;
+            self.asm.emit(|e| e.shr_ri(enc::RCX, 3))?;
+            self.asm.emit(|e| e.rep_stosb())?;
+            self.asm.bind(done)?;
+        } else {
+            let mut offset = 0i32;
+            if effective_size == 128 {
+                self.asm
+                    .emit(|e| e.mov_mr(Mem::base_disp(ARG1, offset, 8), RET))?;
+                offset += 8;
+            }
+            if effective_size >= 64 {
+                self.asm
+                    .emit(|e| e.mov_mr(Mem::base_disp(ARG1, offset, 8), RET))?;
+                offset += 8;
+            }
+            if effective_size & 63 >= 32 {
+                self.asm
+                    .emit(|e| e.mov_mr(Mem::base_disp(ARG1, offset, 4), RETD))?;
+                offset += 4;
+            }
+            if effective_size & 31 >= 16 {
+                self.asm
+                    .emit(|e| e.mov_mr(Mem::base_disp(ARG1, offset, 2), RET.r16()))?;
+                offset += 2;
+            }
+            if effective_size & 15 >= 8 {
+                self.asm
+                    .emit(|e| e.mov_mr(Mem::base_disp(ARG1, offset, 1), RETB))?;
+                offset += 1;
+            }
+            if effective_size & 7 > 0 {
+                self.asm
+                    .emit(|e| e.mov_mr(Mem::base_disp(ARG1, offset, 1), RETB))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Packs an integer segment into the accumulator using the smallest erts instruction form.
+    // Port of erts/emulator/beam/jit/x86/instr_bs.cpp:1304-1350 (emit_accumulate), OTP-29.1.1.
+    fn emit_accumulate(
+        &mut self,
+        src: ArgVal,
+        effective_size: i64,
+        bin_data: enc::Gp,
+        tmp: enc::Gp,
+        value: enc::Gp,
+        is_first: bool,
+    ) -> Result<(), AsmError> {
+        if is_first {
+            if effective_size > 32 {
+                self.asm.emit(|e| e.mov_rr(bin_data, value))?;
+            } else {
+                self.asm.emit(|e| e.mov_rr(bin_data.r32(), value.r32()))?;
+            }
+            return Ok(());
+        }
+
+        debug_assert!(effective_size < 64);
+        if !self.need_mask(src, effective_size) {
+            // erts emits no mask when the range proves that all bits fit.
+        } else if effective_size == 32 {
+            self.asm.emit(|e| e.mov_rr(value.r32(), value.r32()))?;
+        } else if effective_size == 16 {
+            self.asm.emit(|e| e.movzx_rr(value.r32(), value.r16()))?;
+        } else if effective_size == 8 {
+            self.asm.emit(|e| e.movzx_rr(value.r32(), value.r8()))?;
+        } else if effective_size < 32 {
+            self.asm
+                .emit(|e| e.and_ri(value.r32(), (1u64 << effective_size) as i64 - 1))?;
+        } else {
+            self.asm.mov_imm(tmp, (1u64 << effective_size) - 1)?;
+            self.asm.emit(|e| e.and_rr(value, tmp))?;
+        }
+        self.asm.emit(|e| e.or_rr(bin_data, value))?;
+        Ok(())
+    }
+
+    fn bs_maybe_enter_runtime(&mut self, entered: bool) -> Result<bool, AsmError> {
+        if !entered {
+            self.asm
+                .emit_enter_runtime(Update::REDUCTIONS.union(Update::HEAP_ALLOC))?;
+        }
+        Ok(true)
+    }
+
+    fn bs_maybe_leave_runtime(&mut self, entered: bool) -> Result<(), AsmError> {
+        if entered {
+            self.asm
+                .emit_leave_runtime(Update::REDUCTIONS.union(Update::HEAP_ALLOC))?;
+        }
+        Ok(())
+    }
+
+    /// Emits UTF-8 code point construction and stores it at the current bit cursor.
+    // Port of erts/emulator/beam/jit/x86/instr_bs.cpp:1419-1486 (emit_construct_utf8),
+    // OTP-29.1.1.
+    fn emit_construct_utf8(
+        &mut self,
+        src: ArgVal,
+        bit_offset: i64,
+        is_byte_aligned: bool,
+    ) -> Result<(), AsmError> {
+        let prepare_store = self.asm.new_label();
+        let store = self.asm.new_label();
+        let next = self.asm.new_label();
+        #[cfg(windows)]
+        let (bin_ptr, bin_offset) = (ARG4, (!is_byte_aligned).then_some(ARG1));
+        #[cfg(not(windows))]
+        let (bin_ptr, bin_offset) = (ARG1, (!is_byte_aligned).then_some(ARG4));
+        debug_assert!(bin_offset.is_none_or(|reg| reg == enc::RCX));
+
+        let code_point = ARG3;
+        let size_reg = ARG2;
+        self.mov_arg_to_reg(code_point, src)?;
+        self.asm
+            .emit(|e| e.shr_ri(code_point.r32(), TAG_IMMED1_SIZE))?;
+        self.asm.mov_imm(size_reg, 8)?;
+        self.asm.emit(|e| e.cmp_ri(code_point, 0x80))?;
+        self.asm.jcc(CondCode::B, prepare_store)?;
+
+        let construct_utf8 = self.ga_get(GlobalLabels::ConstructUtf8Shared)?;
+        self.safe_fragment_call(construct_utf8)?;
+        self.asm.bind(prepare_store)?;
+
+        self.update_bin_state(bin_offset, bin_ptr, bit_offset, -1, Some(size_reg))?;
+        if !is_byte_aligned {
+            let bin_offset = bin_offset.expect("unaligned UTF-8 path has a bit offset register");
+            self.asm.emit(|e| e.and_ri(bin_offset.r32(), 7))?;
+            self.asm.jcc(CondCode::E, store)?;
+            self.asm.emit(|e| e.movzx_rm(RETD, byte_ptr(bin_ptr, 0)))?;
+            self.asm.emit(|e| e.bswap(code_point))?;
+            self.asm.emit(|e| e.shr_rr(code_point, bin_offset.r8()))?;
+            self.asm.emit(|e| e.bswap(code_point))?;
+            self.asm.emit(|e| e.shl_rr(RETD, bin_offset.r8()))?;
+            self.asm.emit(|e| e.and_ri(RETD, !0xff))?;
+            self.asm.emit(|e| e.shr_rr(RETD, bin_offset.r8()))?;
+            self.asm.emit(|e| e.or_rr(code_point, RET))?;
+            self.asm.emit(|e| e.add_ri(size_reg.r32(), 8))?;
+        }
+
+        self.asm.bind(store)?;
+        if bit_offset % 32 == 0 {
+            self.asm
+                .emit(|e| e.mov_mr(dword_ptr(bin_ptr, 0), code_point.r32()))?;
+        } else {
+            let do_store_1 = self.asm.new_label();
+            let do_store_2 = self.asm.new_label();
+            self.asm.emit(|e| e.cmp_ri(size_reg.r8(), 8))?;
+            self.asm.jcc(CondCode::NE, do_store_1)?;
+            self.asm
+                .emit(|e| e.mov_mr(byte_ptr(bin_ptr, 0), code_point.r8()))?;
+            self.asm.jmp(next)?;
+
+            self.asm.bind(do_store_1)?;
+            self.asm.emit(|e| e.cmp_ri(size_reg.r8(), 24))?;
+            self.asm.jcc(CondCode::A, do_store_2)?;
+            self.asm
+                .emit(|e| e.mov_mr(word_ptr(bin_ptr, 0), code_point.r16()))?;
+            self.asm.emit(|e| e.cmp_ri(size_reg.r8(), 16))?;
+            self.asm.jcc(CondCode::E, next)?;
+            self.asm.emit(|e| e.shr_ri(code_point.r32(), 16))?;
+            self.asm
+                .emit(|e| e.mov_mr(byte_ptr(bin_ptr, 2), code_point.r8()))?;
+            self.asm.jmp(next)?;
+
+            self.asm.bind(do_store_2)?;
+            self.asm
+                .emit(|e| e.mov_mr(dword_ptr(bin_ptr, 0), code_point.r32()))?;
+            if !is_byte_aligned {
+                self.asm.emit(|e| e.cmp_ri(size_reg.r8(), 32))?;
+                self.asm.jcc(CondCode::E, next)?;
+                self.asm.emit(|e| e.shr_ri(code_point, 32))?;
+                self.asm
+                    .emit(|e| e.mov_mr(byte_ptr(bin_ptr, 4), code_point.r8()))?;
+            }
+        }
+        self.asm.bind(next)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2055,32 +3185,131 @@ mod tests {
     /// The bytes erts emitted for `block`, or `None` for a block whose shape the byte test
     /// cannot reproduce (a short jump to a label outside the block).
     fn expected(block: &[String]) -> Option<Vec<u8>> {
+        expected_with_pad(block, 0, false)
+    }
+
+    fn expected_with_pad(
+        block: &[String],
+        start_pad: usize,
+        align_absolute_calls: bool,
+    ) -> Option<Vec<u8>> {
+        fn branch_placeholder(line: &str) -> Option<String> {
+            let short = line.starts_with("short ");
+            let line = line.strip_prefix("short ").unwrap_or(line);
+            let (op, target) = line.split_once(' ')?;
+            if !(target.starts_with('L') || target.starts_with("label_")) {
+                return None;
+            }
+            if op == "jmp" {
+                return Some(if short {
+                    ".byte 0xeb, 0".to_string()
+                } else {
+                    ".byte 0xe9, 0, 0, 0, 0".to_string()
+                });
+            }
+            let condition = match op {
+                "jo" => 0x70,
+                "jno" => 0x71,
+                "jb" | "jc" | "jnae" => 0x72,
+                "jae" | "jnb" | "jnc" => 0x73,
+                "je" | "jz" => 0x74,
+                "jne" | "jnz" => 0x75,
+                "jbe" | "jna" => 0x76,
+                "ja" | "jnbe" => 0x77,
+                "js" => 0x78,
+                "jns" => 0x79,
+                "jp" | "jpe" => 0x7a,
+                "jnp" | "jpo" => 0x7b,
+                "jl" | "jnge" => 0x7c,
+                "jge" | "jnl" => 0x7d,
+                "jle" | "jng" => 0x7e,
+                "jg" | "jnle" => 0x7f,
+                _ => return None,
+            };
+            Some(if short {
+                format!(".byte {condition:#04x}, 0")
+            } else {
+                format!(".byte 0x0f, {:#04x}, 0, 0, 0, 0", condition + 0x10)
+            })
+        }
+
         let lines = instrs(block);
         let local: Vec<&str> = lines.iter().filter_map(|l| l.strip_suffix(':')).collect();
-        let mut out: Vec<String> = Vec::new();
+        let mut out = vec![".byte 0x90".to_string(); start_pad];
+        let mut measured = out.clone();
+        let mut aligned_call_pending = false;
+        let mut test_heap_fragment_call = false;
+        let mut allocated_fragment_call = false;
         let is_call_alignment_nop = |line: &str| {
             matches!(
                 line.to_ascii_lowercase().replace(' ', "").as_str(),
-                ".byte0x90" | ".byte0x66,0x90" | ".byte0x0f,0x1f,0x00"
+                ".byte0x90"
+                    | ".byte0x66,0x90"
+                    | ".byte0x0f,0x1f,0x00"
+                    | ".db0x90"
+                    | ".db0x66,0x90"
+                    | ".db0x0f,0x1f,0x00"
             )
         };
-        let mut test_heap_fragment_call = false;
         for line in block {
-            if line.starts_with("# test_heap ") {
-                test_heap_fragment_call = true;
+            if line.starts_with('#') {
+                test_heap_fragment_call |= line.starts_with("# test_heap ");
+                allocated_fragment_call |=
+                    line == "# allocate heap bitstring" || line == "# allocate binary";
+                aligned_call_pending |=
+                    line == "# allocate heap bitstring" || line == "# allocate binary";
                 continue;
             }
-            if line.starts_with('#') {
+            if line.ends_with(':') {
+                out.push(line.to_string());
+                measured.push(line.to_string());
+                continue;
+            }
+            let target = line.rsplit(' ').next().unwrap_or("");
+            if let Some(placeholder) = branch_placeholder(line) {
+                measured.push(placeholder);
+                let external = (target.starts_with('L') || target.starts_with("label_"))
+                    && !local.contains(&target);
+                if line.starts_with("short ") && external {
+                    if !align_absolute_calls {
+                        return None;
+                    }
+                    let opcode = match line.strip_prefix("short ")?.split_once(' ')?.0 {
+                        "jmp" => 0xeb,
+                        "jo" => 0x70,
+                        "jno" => 0x71,
+                        "jb" | "jc" | "jnae" => 0x72,
+                        "jae" | "jnb" | "jnc" => 0x73,
+                        "je" | "jz" => 0x74,
+                        "jne" | "jnz" => 0x75,
+                        "jbe" | "jna" => 0x76,
+                        "ja" | "jnbe" => 0x77,
+                        "js" => 0x78,
+                        "jns" => 0x79,
+                        "jp" | "jpe" => 0x7a,
+                        "jnp" | "jpo" => 0x7b,
+                        "jl" | "jnge" => 0x7c,
+                        "jge" | "jnl" => 0x7d,
+                        "jle" | "jng" => 0x7e,
+                        "jg" | "jnle" => 0x7f,
+                        _ => return None,
+                    };
+                    out.push(format!(".byte {opcode:#04x}, 0"));
+                } else {
+                    let mut line = erts_to_arinsal(line);
+                    if line.starts_with('j') && external && !line.starts_with('{') {
+                        line = format!("{{disp32}} {line}");
+                    }
+                    out.push(line);
+                }
                 continue;
             }
             let target = line.rsplit(' ').next().unwrap_or("");
             let external = (target.starts_with('L') || target.starts_with("label_"))
                 && !local.contains(&target);
-            if line.starts_with("short ") && external {
-                return None;
-            }
-            if let Some(address) = line.strip_prefix("call ")
-                && address.parse::<u64>().is_ok()
+            if let Some(target) = line.strip_prefix("call ")
+                && (target.parse::<u64>().is_ok()
+                    || align_absolute_calls && !local.contains(&target))
             {
                 let mut last_instruction = out.len();
                 while last_instruction > 0 && is_call_alignment_nop(&out[last_instruction - 1]) {
@@ -2092,27 +3321,418 @@ mod tests {
                         .is_some_and(|line| {
                             line.starts_with("mov ecx, ") || line == "xor ecx, ecx"
                         });
-                if garbage_collect_call {
-                    // `emit_gc_test` passes Live in ECX, then calls the module thunk with a
-                    // five-byte CP call. Its reference dump padding is for a six-byte call.
+                let module_fragment_call =
+                    allocated_fragment_call || garbage_collect_call || external;
+                if module_fragment_call {
                     while out.last().is_some_and(|line| is_call_alignment_nop(line)) {
                         out.pop();
                     }
+                    while measured
+                        .last()
+                        .is_some_and(|line| is_call_alignment_nop(line))
+                    {
+                        measured.pop();
+                    }
                     out.push(".byte 0xe8, 0, 0, 0, 0".to_string());
-                    test_heap_fragment_call = false;
+                    measured.push(".byte 0xe8, 0, 0, 0, 0".to_string());
                 } else {
-                    // runtime_call / fragment_call(ga->get_x()): `REX call rel32`, relocated.
+                    if align_absolute_calls && aligned_call_pending && target.parse::<u64>().is_ok()
+                    {
+                        // `aligned_call(FuncPtr *)` aligns the return address before its
+                        // six-byte absolute call.
+                        let offset = gnu_as(&measured)?.len();
+                        let nop_count = (4 - (offset + 6) % 4) % 4;
+                        let nops = match nop_count {
+                            0 => None,
+                            1 => Some(".byte 0x90"),
+                            2 => Some(".byte 0x66, 0x90"),
+                            3 => Some(".byte 0x0f, 0x1f, 0x00"),
+                            _ => unreachable!(),
+                        };
+                        if let Some(nops) = nops {
+                            out.push(nops.to_string());
+                            measured.push(nops.to_string());
+                        }
+                    }
+                    // `runtime_call` emits an absolute, relocated six-byte call.
                     out.push(".byte 0x40, 0xe8, 0, 0, 0, 0".to_string());
+                    measured.push(".byte 0x40, 0xe8, 0, 0, 0, 0".to_string());
                 }
+                aligned_call_pending = false;
+                test_heap_fragment_call = false;
+                allocated_fragment_call = false;
                 continue;
             }
+            if let Some(target) = line.strip_prefix("call ") {
+                aligned_call_pending = false;
+                test_heap_fragment_call = false;
+                allocated_fragment_call = false;
+                if local.contains(&target) {
+                    measured.push(".byte 0xe8, 0, 0, 0, 0".to_string());
+                } else {
+                    measured.push(".byte 0x40, 0xe8, 0, 0, 0, 0".to_string());
+                }
+            } else {
+                measured.push(erts_to_arinsal(line));
+            }
             let mut line = erts_to_arinsal(line);
+            // erts stores the two erl_bits_state words at [registers-16] and [registers-8].
+            // Arinsal's scheduler register prefix places that pair at ERL_BITS_STATE_DISP.
+            if align_absolute_calls {
+                let erts_second_bits_word = "[rbx-8]";
+                if line.contains(erts_second_bits_word) {
+                    line = line.replace(
+                        erts_second_bits_word,
+                        &format!("[rbx{}]", crate::ERL_BITS_STATE_DISP + 8),
+                    );
+                }
+            }
             if line.starts_with('j') && external && !line.starts_with('{') {
                 line = format!("{{disp32}} {line}");
             }
             out.push(line);
         }
-        gnu_as(&out)
+        let bytes = gnu_as(&out)?;
+        Some(bytes[start_pad..].to_vec())
+    }
+
+    const BS_CREATE_BIN_FIXTURE: &str = r#"
+-module(bs_create_bin_fixture).
+-export([integer_literal/1, integer_variable/2, integer_unit/2, float32/1,
+         binary_variable/2, utf8/1, utf16/1, utf32/1, string_segment/1,
+         append/2, private_append/1, errors/2, zero_small/0, zero_large/0]).
+integer_literal(A) -> <<A:9, 3:7>>.
+integer_variable(A, N) -> <<A:N>>.
+integer_unit(A, N) -> <<A:N/unit:8>>.
+float32(F) -> <<F:32/float>>.
+binary_variable(B, N) -> <<B:N/binary>>.
+utf8(C) -> <<C/utf8>>.
+utf16(C) -> <<C/utf16>>.
+utf32(C) -> <<C/utf32>>.
+string_segment(A) -> <<A:8, "abcdefghijk">>.
+append(A, B) -> <<A/binary, B/binary>>.
+private_append(A) -> <<(<<>>)/binary, A:8>>.
+errors(A, N) -> <<A:N/unit:3>>.
+zero_small() -> <<0:8>>.
+zero_large() -> <<0:1024>>.
+"#;
+
+    fn create_bin_fixture() -> Option<(arinsal_beam::BeamFile, String)> {
+        let root =
+            std::env::temp_dir().join(format!("arinsal-x86-bs-create-bin-{}", std::process::id()));
+        let dump = root.join("dump");
+        std::fs::create_dir_all(&dump).ok()?;
+        let source = root.join("bs_create_bin_fixture.erl");
+        std::fs::write(&source, BS_CREATE_BIN_FIXTURE).ok()?;
+        let compiled = Command::new("erlc")
+            .arg("-o")
+            .arg(&root)
+            .arg(&source)
+            .status();
+        let Ok(compiled) = compiled else {
+            let _ = std::fs::remove_dir_all(&root);
+            return None;
+        };
+        assert!(
+            compiled.success(),
+            "erlc failed to compile bs_create_bin fixture"
+        );
+
+        let loaded = Command::new("erl")
+            .args(["+JDdump", "true", "-pa"])
+            .arg(&root)
+            .args([
+                "-noshell",
+                "-eval",
+                "code:ensure_loaded(bs_create_bin_fixture), halt().",
+            ])
+            .current_dir(&dump)
+            .status();
+        let Ok(loaded) = loaded else {
+            let _ = std::fs::remove_dir_all(&root);
+            return None;
+        };
+        assert!(
+            loaded.success(),
+            "erl +JDdump failed to load bs_create_bin fixture"
+        );
+
+        let beam = std::fs::read(root.join("bs_create_bin_fixture.beam")).ok()?;
+        let beam = arinsal_beam::parse(&beam).expect("OTP-29 fixture BEAM must parse");
+        let dump = std::fs::read_to_string(dump.join("bs_create_bin_fixture.asm")).ok()?;
+        let _ = std::fs::remove_dir_all(&root);
+        Some((beam, dump))
+    }
+
+    fn fixture_atom(name: &str) -> arinsal_term::Atom {
+        match name {
+            "integer" => atoms::INTEGER,
+            "float" => atoms::FLOAT,
+            "binary" => atoms::BINARY,
+            "utf8" => atoms::UTF8,
+            "utf16" => atoms::UTF16,
+            "utf32" => atoms::UTF32,
+            "string" => atoms::STRING,
+            "append" => atoms::APPEND,
+            "private_append" => atoms::PRIVATE_APPEND,
+            "all" => atoms::ALL,
+            "undefined" => atoms::UNDEFINED,
+            other => panic!("unexpected bs_create_bin fixture atom {other}"),
+        }
+    }
+
+    fn fixture_reg(operand: &arinsal_beam::Operand) -> ArgVal {
+        use arinsal_beam::Operand;
+        match operand {
+            Operand::X(reg) => ArgVal::X(*reg),
+            Operand::Y(reg) => ArgVal::Y(*reg),
+            Operand::TypedReg { reg, type_index } => match reg.as_ref() {
+                Operand::X(reg) => ArgVal::typed_x(*reg, *type_index),
+                Operand::Y(reg) => ArgVal::typed_y(*reg, *type_index),
+                other => panic!("typed bs_create_bin operand is not a register: {other:?}"),
+            },
+            other => panic!("unexpected bs_create_bin register operand {other:?}"),
+        }
+    }
+
+    fn fixture_immediate(beam: &arinsal_beam::BeamFile, operand: &arinsal_beam::Operand) -> ArgVal {
+        use arinsal_beam::Operand;
+        match operand {
+            Operand::Int(value) => ArgVal::Immediate(make_small(*value as u64) as u64),
+            Operand::U(value) => ArgVal::Immediate(make_small(*value) as u64),
+            Operand::Atom(index) => {
+                let name = beam.atom(*index).expect("bs_create_bin atom index");
+                atom_arg(fixture_atom(name))
+            }
+            Operand::Nil => ArgVal::Immediate(Term::NIL.word()),
+            other => panic!("unexpected bs_create_bin immediate {other:?}"),
+        }
+    }
+
+    fn fixture_segments(
+        beam: &arinsal_beam::BeamFile,
+        operand: &arinsal_beam::Operand,
+    ) -> Vec<ArgVal> {
+        use arinsal_beam::Operand;
+        let Operand::List(items) = operand else {
+            panic!("bs_create_bin segments must be a BEAM list")
+        };
+        let mut args = Vec::with_capacity(items.len());
+        for fields in items.as_chunks::<6>().0 {
+            let Operand::Atom(type_index) = fields[0] else {
+                panic!("bs_create_bin segment type must be an atom")
+            };
+            let type_name = beam.atom(type_index).expect("bs_create_bin type atom");
+            args.push(atom_arg(fixture_atom(type_name)));
+            args.push(ArgVal::Word(operand_word(&fields[1])));
+            args.push(ArgVal::Word(operand_word(&fields[2])));
+            assert!(
+                matches!(fields[3], Operand::Nil),
+                "fixture uses no binary flags"
+            );
+            args.push(ArgVal::Word(0));
+            if type_name == "string" {
+                let Operand::U(offset) = &fields[4] else {
+                    panic!("string segment must use a string-table offset")
+                };
+                args.push(ArgVal::BytePtr(*offset));
+            } else {
+                args.push(match &fields[4] {
+                    Operand::X(_) | Operand::Y(_) | Operand::TypedReg { .. } => {
+                        fixture_reg(&fields[4])
+                    }
+                    Operand::Int(_) | Operand::U(_) | Operand::Atom(_) | Operand::Nil => {
+                        fixture_immediate(beam, &fields[4])
+                    }
+                    other => panic!("unexpected bs_create_bin source {other:?}"),
+                });
+            }
+            args.push(match &fields[5] {
+                Operand::X(_) | Operand::Y(_) | Operand::TypedReg { .. } => fixture_reg(&fields[5]),
+                Operand::Int(_) | Operand::U(_) | Operand::Atom(_) | Operand::Nil => {
+                    fixture_immediate(beam, &fields[5])
+                }
+                other => panic!("unexpected bs_create_bin size {other:?}"),
+            });
+        }
+        assert_eq!(
+            args.len(),
+            items.len(),
+            "bs_create_bin fixture segment arity"
+        );
+        args
+    }
+
+    fn operand_word(operand: &arinsal_beam::Operand) -> u64 {
+        match operand {
+            arinsal_beam::Operand::U(value) => *value,
+            arinsal_beam::Operand::Int(value) => *value as u64,
+            other => panic!("expected bs_create_bin ArgWord, got {other:?}"),
+        }
+    }
+
+    fn create_bin_blocks(dump: &str) -> Vec<Vec<String>> {
+        let mut blocks = Vec::new();
+        let mut current: Option<Vec<String>> = None;
+        for line in dump.lines() {
+            let header = line.strip_prefix("# ").is_some_and(|name| {
+                !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            });
+            if (header && line != "# done")
+                || line.starts_with("label_")
+                || line.ends_with(':') && !line.starts_with('L') && !line.starts_with(' ')
+            {
+                blocks.extend(current.take());
+                if line == "# i_bs_create_bin_jItd" {
+                    current = Some(Vec::new());
+                }
+            } else if let Some(block) = current.as_mut() {
+                block.push(line.trim().to_string());
+            }
+        }
+        blocks.extend(current);
+        blocks
+    }
+
+    fn fixture_arg_types(beam: &arinsal_beam::BeamFile) -> Vec<ArgType> {
+        beam.types
+            .as_ref()
+            .map(|table| {
+                table
+                    .entries
+                    .iter()
+                    .map(|ty| ArgType {
+                        union_bits: ty.union_bits,
+                        min: ty.lower_bound,
+                        max: ty.upper_bound,
+                        unit: ty.unit,
+                    })
+                    .collect()
+            })
+            .filter(|entries: &Vec<ArgType>| !entries.is_empty())
+            .unwrap_or_else(|| vec![ArgType::ANY])
+    }
+
+    #[test]
+    fn bs_create_bin_segments_match_erts_dump() {
+        let Some((beam, dump)) = create_bin_fixture() else {
+            eprintln!("skipping: OTP 29 erl/erlc unavailable");
+            return;
+        };
+        if gnu_as(&[]).is_none() {
+            eprintln!("skipping: GNU binutils unavailable");
+            return;
+        }
+
+        let blocks = create_bin_blocks(&dump);
+        let instructions: Vec<_> = beam
+            .code
+            .instructions
+            .iter()
+            .filter(|instruction| instruction.op.name() == "bs_create_bin")
+            .collect();
+        assert_eq!(blocks.len(), instructions.len());
+
+        let mut segment_kinds = std::collections::HashSet::new();
+        let mut saw_literal_size = false;
+        let mut saw_variable_size = false;
+        let mut saw_non_unit_one = false;
+        let mut saw_error_path = false;
+        for (instruction, block) in instructions.iter().zip(&blocks) {
+            let operands = &instruction.args;
+            assert_eq!(operands.len(), 6, "bs_create_bin generic operand count");
+            let fail = match operands[0] {
+                arinsal_beam::Operand::Label(label) => ArgVal::Label(label),
+                ref operand => panic!("unexpected bs_create_bin fail operand {operand:?}"),
+            };
+            let alloc = ArgVal::Word(operand_word(&operands[1]));
+            let live = ArgVal::Word(operand_word(&operands[2]));
+            let dst = fixture_reg(&operands[4]);
+            let segments = fixture_segments(&beam, &operands[5]);
+            if let arinsal_beam::Operand::List(fields) = &operands[5] {
+                for segment in fields.as_chunks::<6>().0 {
+                    let arinsal_beam::Operand::Atom(type_index) = segment[0] else {
+                        panic!("bs_create_bin segment type must be an atom")
+                    };
+                    let type_name = beam.atom(type_index).unwrap();
+                    segment_kinds.insert(type_name.to_owned());
+                    saw_non_unit_one |= operand_word(&segment[2]) != 1;
+                    saw_literal_size |= matches!(
+                        segment[5],
+                        arinsal_beam::Operand::Int(_) | arinsal_beam::Operand::U(_)
+                    );
+                    saw_variable_size |= matches!(
+                        segment[5],
+                        arinsal_beam::Operand::X(_)
+                            | arinsal_beam::Operand::Y(_)
+                            | arinsal_beam::Operand::TypedReg { .. }
+                    );
+                }
+            }
+            saw_error_path |= block.iter().any(|line| line == "# handle error");
+            let mut matched = false;
+            let mut mismatch = None;
+            for pad in 0..4 {
+                let expected = expected_with_pad(block, pad, true)
+                    .expect("GNU binutils must assemble erts block");
+                let mut module =
+                    BeamModuleAssembler::with_fragment_addresses(4096, fragment_addresses());
+                module.beam_types = fixture_arg_types(&beam);
+                for _ in 0..pad {
+                    module.asm.emit(|e| e.nop()).unwrap();
+                }
+                let start = module.asm.a.offset();
+                module
+                    .emit_i_bs_create_bin(fail, alloc, live, dst, &segments)
+                    .unwrap();
+                let actual = module.asm.a.bytes(Section::Code)[start..].to_vec();
+                if actual == expected {
+                    matched = true;
+                    break;
+                }
+                mismatch = Some((actual, expected));
+            }
+            if let Some((actual, expected)) = mismatch.filter(|_| !matched) {
+                let first = actual
+                    .iter()
+                    .zip(&expected)
+                    .position(|(left, right)| left != right)
+                    .unwrap_or(actual.len().min(expected.len()));
+                eprintln!(
+                    "BSC first byte mismatch {first}; lengths {} vs {}",
+                    actual.len(),
+                    expected.len()
+                );
+                eprintln!(
+                    "actual: {:?}",
+                    &actual[first.saturating_sub(8)..(first + 32).min(actual.len())]
+                );
+                eprintln!(
+                    "expected: {:?}",
+                    &expected[first.saturating_sub(8)..(first + 32).min(expected.len())]
+                );
+            }
+            assert!(matched, "i_bs_create_bin bytes differ: {block:#?}");
+        }
+
+        for kind in [
+            "integer",
+            "float",
+            "binary",
+            "utf8",
+            "utf16",
+            "utf32",
+            "string",
+            "append",
+            "private_append",
+        ] {
+            assert!(segment_kinds.contains(kind), "fixture omits {kind} segment");
+        }
+        assert!(saw_literal_size, "fixture omits literal segment sizes");
+        assert!(saw_variable_size, "fixture omits variable segment sizes");
+        assert!(saw_non_unit_one, "fixture omits a segment with unit != 1");
+        assert!(saw_error_path, "fixture omits generated error handling");
+        eprintln!("compared {} i_bs_create_bin blocks", instructions.len());
     }
 
     /// The BEAM registers a block reads or writes, in order of appearance.

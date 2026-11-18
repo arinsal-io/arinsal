@@ -25,6 +25,7 @@ fn prefix_string_atomic_and_trap_forms() {
         }),
         ("stosq", |e| e.stosq()),
         ("rep stosq", |e| e.rep_stosq()),
+        ("rep stosb", |e| e.rep_stosb()),
         ("ud2", |e| e.ud2()),
         ("hlt", |e| e.hlt()),
         ("int3", |e| e.int3()),

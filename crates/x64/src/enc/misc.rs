@@ -100,6 +100,11 @@ impl Emitter {
         self.x86_op_with_prefix(Some(0xF3), Opcode::legacy(0xAB).with_w(true), Imm::NONE)
     }
 
+    /// `rep stosb` (asmjit `a.rep().stosb()`), clearing the byte range at `[RDI]`.
+    pub fn rep_stosb(&mut self) -> Result<(), EncodeError> {
+        self.x86_op_with_prefix(Some(0xF3), Opcode::legacy(0xAA), Imm::NONE)
+    }
+
     /// `lock inc qword ptr [mem]` (asmjit `a.lock().inc(Mem)`).
     pub fn lock_inc_m(&mut self, dst: Mem) -> Result<(), EncodeError> {
         if dst.size == 0 {

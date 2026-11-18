@@ -362,6 +362,151 @@ unsafe extern "C" {
     ) -> u64;
 }
 
+// Port of erts/emulator/beam/jit/x86/instr_bs.cpp (emit_i_bs_create_bin), OTP-29.1.1.
+// These are the erts bit-syntax construction entry points addressed by `runtime_call`.
+unsafe extern "C" {
+    /// `Eterm erts_bs_append_checked(Process *p, Eterm *reg, Uint live, Uint size,
+    /// Uint extra_words, Uint unit)` (erl_bits.h).
+    pub safe fn erts_bs_append_checked(
+        c_p: *mut crate::ProcessHeader,
+        reg: *mut u64,
+        live: u64,
+        size: u64,
+        extra_words: u64,
+        unit: u64,
+    ) -> u64;
+    /// `Eterm erts_bs_private_append_checked(ErlBitsState *EBS, Process *p, Eterm bin,
+    /// Uint size)` (erl_bits.h).
+    pub safe fn erts_bs_private_append_checked(
+        ebs: *mut u64,
+        c_p: *mut crate::ProcessHeader,
+        bin: u64,
+        size: u64,
+    ) -> u64;
+    /// `int erts_bs_put_binary(ErlBitsState *EBS, Process *p, Eterm bin, Uint num_bits)`
+    /// (erl_bits.h).
+    pub safe fn erts_bs_put_binary(
+        ebs: *mut u64,
+        c_p: *mut crate::ProcessHeader,
+        bin: u64,
+        num_bits: u64,
+    ) -> i32;
+    /// `int erts_bs_put_binary_all(ErlBitsState *EBS, Process *p, Eterm bin, Uint unit)`
+    /// (erl_bits.h).
+    pub safe fn erts_bs_put_binary_all(
+        ebs: *mut u64,
+        c_p: *mut crate::ProcessHeader,
+        bin: u64,
+        unit: u64,
+    ) -> i32;
+    /// `void beam_jit_bs_put_binary_all(ErlBitsState *EBS, Process *p, Eterm bin)`
+    /// (beam_jit_common.hpp).
+    pub safe fn beam_jit_bs_put_binary_all(ebs: *mut u64, c_p: *mut crate::ProcessHeader, bin: u64);
+    /// `Eterm erts_bs_put_float(ErlBitsState *EBS, Process *p, Eterm float, Uint num_bits,
+    /// int flags)` (erl_bits.h).
+    pub safe fn erts_bs_put_float(
+        ebs: *mut u64,
+        c_p: *mut crate::ProcessHeader,
+        float: u64,
+        num_bits: u64,
+        flags: i32,
+    ) -> u64;
+    /// `int erts_bs_put_integer_be(ErlBitsState *EBS, Eterm integer, Uint num_bits)`
+    /// (erl_bits.h).
+    pub safe fn erts_bs_put_integer_be(ebs: *mut u64, integer: u64, num_bits: u64) -> i32;
+    /// `int erts_bs_put_integer_le(ErlBitsState *EBS, Eterm integer, Uint num_bits)`
+    /// (erl_bits.h).
+    pub safe fn erts_bs_put_integer_le(ebs: *mut u64, integer: u64, num_bits: u64) -> i32;
+    /// `int erts_bs_put_utf16(ErlBitsState *EBS, Eterm integer, Uint flags)` (erl_bits.h).
+    pub safe fn erts_bs_put_utf16(ebs: *mut u64, integer: u64, flags: u64) -> i32;
+    /// `void erts_bs_put_string(ErlBitsState *EBS, byte *iptr, Uint num_bytes)` (erl_bits.h).
+    pub safe fn erts_bs_put_string(ebs: *mut u64, string: *const u8, num_bytes: u64);
+}
+
+// These link-only entry points let the code emitter tests run without linking the VM.
+#[cfg(test)]
+#[allow(unsafe_code)]
+mod bs_create_bin_test_symbols {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn erts_bs_append_checked(
+        _c_p: *mut crate::ProcessHeader,
+        _reg: *mut u64,
+        _live: u64,
+        _size: u64,
+        _extra_words: u64,
+        _unit: u64,
+    ) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn erts_bs_private_append_checked(
+        _ebs: *mut u64,
+        _c_p: *mut crate::ProcessHeader,
+        _bin: u64,
+        _size: u64,
+    ) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn erts_bs_put_binary(
+        _ebs: *mut u64,
+        _c_p: *mut crate::ProcessHeader,
+        _bin: u64,
+        _num_bits: u64,
+    ) -> i32 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn erts_bs_put_binary_all(
+        _ebs: *mut u64,
+        _c_p: *mut crate::ProcessHeader,
+        _bin: u64,
+        _unit: u64,
+    ) -> i32 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn beam_jit_bs_put_binary_all(
+        _ebs: *mut u64,
+        _c_p: *mut crate::ProcessHeader,
+        _bin: u64,
+    ) {
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn erts_bs_put_float(
+        _ebs: *mut u64,
+        _c_p: *mut crate::ProcessHeader,
+        _float: u64,
+        _num_bits: u64,
+        _flags: i32,
+    ) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn erts_bs_put_integer_be(_ebs: *mut u64, _integer: u64, _num_bits: u64) -> i32 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn erts_bs_put_integer_le(_ebs: *mut u64, _integer: u64, _num_bits: u64) -> i32 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn erts_bs_put_utf16(_ebs: *mut u64, _integer: u64, _flags: u64) -> i32 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn erts_bs_put_string(_ebs: *mut u64, _string: *const u8, _num_bytes: u64) {}
+}
+
 // Port of erts/emulator/beam/jit/x86/instr_msg.cpp (`extern "C" { #include "bif.h"
 // #include "code_ix.h" #include "erl_proc_sig_queue.h" }` and the beam_jit_* receive helpers
 // of jit/beam_jit_common.hpp) and jit/x86/process_main.cpp (`copy_out_registers` of
