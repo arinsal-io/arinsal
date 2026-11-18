@@ -50,22 +50,21 @@ impl BeamModuleAssembler {
 
     /// Whether the cache describes the registers at the current code position.
     pub(crate) fn cache_valid(&self) -> bool {
-        self.reg_cache.position == Some(self.cache_here())
+        self.reg_cache.valid_at(self.cache_here())
     }
 
     /// Drops the cache unless it is valid at the current position, then pins it here.
     // Port of beam_jit_register_cache.hpp:64-70 (consolidate), OTP-29.1.1.
     pub(crate) fn cache_consolidate(&mut self) {
-        if !self.cache_valid() {
-            self.reg_cache.invalidate_all();
-        }
-        self.reg_cache.position = Some(self.cache_here());
+        let here = self.cache_here();
+        self.reg_cache.consolidate(here);
     }
 
     /// Declares the cache valid after the instructions emitted so far.
     // Port of beam_jit_register_cache.hpp:218-220 (update), OTP-29.1.1.
     pub(crate) fn cache_update(&mut self) {
-        self.reg_cache.position = Some(self.cache_here());
+        let here = self.cache_here();
+        self.reg_cache.update(here);
     }
 
     /// Removes `words` from the top of the frame and renumbers the cached Y slots, keeping the
@@ -93,12 +92,8 @@ impl BeamModuleAssembler {
     /// The register that currently holds `slot`, if any.
     // Port of beam_jit_register_cache.hpp:72-87 (find), OTP-29.1.1.
     pub(crate) fn cache_find(&mut self, slot: Slot) -> Option<Gpr> {
-        self.cache_consolidate();
-        self.reg_cache
-            .entries
-            .iter()
-            .find(|(mem, _)| *mem == slot)
-            .map(|(_, reg)| *reg)
+        let here = self.cache_here();
+        self.reg_cache.find(here, slot)
     }
 
     // Port of beam_asm.hpp:982-988 (reg_cache_put), OTP-29.1.1.

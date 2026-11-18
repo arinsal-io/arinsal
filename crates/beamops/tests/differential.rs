@@ -99,7 +99,9 @@ fn otp29_jit_specific_op_names_and_argument_types() {
         );
         let transformed = transform_module(&beam).unwrap();
         let ours_ops = transformed.into_iter().flatten().collect::<Vec<_>>();
-        let dump = fs::read_to_string(dir.join(format!("{module}.asm"))).unwrap();
+        // Atom and string comments may hold bytes that are not UTF-8.
+        let dump = String::from_utf8_lossy(&fs::read(dir.join(format!("{module}.asm"))).unwrap())
+            .into_owned();
         let expected_ops = dump
             .lines()
             .filter_map(|line| line.trim().strip_prefix("# "))
@@ -187,7 +189,11 @@ fn declarations() -> &'static HashMap<&'static str, Vec<Vec<&'static str>>> {
     static DECLARATIONS: OnceLock<HashMap<&'static str, Vec<Vec<&'static str>>>> = OnceLock::new();
     DECLARATIONS.get_or_init(|| {
         let mut declarations = HashMap::new();
-        for raw in include_str!("../tab/ops.tab").lines() {
+        #[cfg(target_arch = "aarch64")]
+        let ops = include_str!("../tab/arm/ops.tab");
+        #[cfg(target_arch = "x86_64")]
+        let ops = include_str!("../tab/x86/ops.tab");
+        for raw in ops.lines() {
             let line = raw.split('#').next().unwrap_or("").trim();
             if line.is_empty() || line.contains("=>") {
                 continue;

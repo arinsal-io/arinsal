@@ -89,9 +89,16 @@ fn module_hashes(ebin: &Path, hashes: &mut BTreeMap<String, (u64, u64)>) {
     }
 }
 
+/// The fixture of the target's JIT: the specific ops differ between `jit/arm` and `jit/x86`.
 fn fixture(name: &str) -> PathBuf {
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86"
+    } else {
+        "arm"
+    };
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
+        .join(arch)
         .join(name)
 }
 

@@ -158,6 +158,25 @@ impl CacheMem<Gp> for Mem {
     }
 }
 
+/// `ArgWord::get()`: an untagged word operand (`u`/`t`/`I`), which the loader passes as
+/// [`ArgVal::Immediate`].
+// Port of erts/emulator/beam/jit/beam_jit_args.hpp (ArgWord), OTP-29.1.1.
+pub fn arg_word(arg: ArgVal) -> Result<u64, AsmError> {
+    match arg {
+        ArgVal::Immediate(word) => Ok(word),
+        _ => Err(AsmError::Operand("word operand")),
+    }
+}
+
+/// `ArgLabel::get()`.
+// Port of erts/emulator/beam/jit/beam_jit_args.hpp (ArgLabel), OTP-29.1.1.
+pub fn arg_label(arg: ArgVal) -> Result<u32, AsmError> {
+    match arg {
+        ArgVal::Label(label) => Ok(label),
+        _ => Err(AsmError::Operand("label operand")),
+    }
+}
+
 /// asmjit `Support::is_int_n<32>`.
 const fn is_int32(value: i64) -> bool {
     value as i32 as i64 == value

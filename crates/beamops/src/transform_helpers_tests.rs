@@ -169,16 +169,19 @@ fn registers_compare_without_their_type_index() {
     assert!(predicates::equal(&mut st, typed, arg(TAG_X, 3)));
     assert!(!predicates::distinct(&mut st, typed, arg(TAG_X, 3)));
     assert!(predicates::equal(&mut st, arg(TAG_N, 0), arg(TAG_N, 5)));
-    assert!(predicates::consecutive_xregs(
-        &mut st,
-        arg(TAG_X, 6),
-        arg(TAG_X, 7)
-    ));
-    assert!(!predicates::consecutive_xregs(
-        &mut st,
-        arg(TAG_X, 5),
-        arg(TAG_X, 6)
-    ));
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(predicates::consecutive_xregs(
+            &mut st,
+            arg(TAG_X, 6),
+            arg(TAG_X, 7)
+        ));
+        assert!(!predicates::consecutive_xregs(
+            &mut st,
+            arg(TAG_X, 5),
+            arg(TAG_X, 6)
+        ));
+    }
 }
 
 #[test]

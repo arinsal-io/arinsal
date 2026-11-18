@@ -7,7 +7,7 @@ use super::beam_asm::register::{ARG1, ARG2};
 use super::beam_asm::{
     AsmError, BeamAssembler, CpuFeature, get_arg_ref, get_y_ref, process, process_ref,
 };
-use super::beam_asm_module::BeamModuleAssembler;
+use super::beam_asm_module::{BeamModuleAssembler, arg_label, arg_word};
 use crate::common::args::ArgVal;
 use crate::common::args::{Relation, memory_relation};
 
@@ -23,8 +23,19 @@ impl BeamModuleAssembler {
     /// of consecutive ones.
     // Port of erts/emulator/beam/jit/x86/instr_common.cpp:569-648 (emit_init_yregs),
     // OTP-29.1.1.
-    pub fn emit_init_yregs(&mut self, ys: &[u32]) -> Result<(), AsmError> {
+    pub fn emit_init_yregs(&mut self, size: ArgVal, args: &[ArgVal]) -> Result<(), AsmError> {
         const NIL: u64 = 0x3b;
+        let ys = args
+            .iter()
+            .map(|arg| match arg {
+                ArgVal::Y(y) => Ok(*y),
+                _ => Err(AsmError::Operand("init_yregs takes Y registers")),
+            })
+            .collect::<Result<Vec<u32>, AsmError>>()?;
+        if arg_word(size)? != ys.len() as u64 {
+            return Err(AsmError::Operand("init_yregs size"));
+        }
+        let ys = ys.as_slice();
         if let [y] = ys {
             return self.mov_arg_word(ArgVal::Y(*y), NIL, ARG1);
         }
@@ -142,7 +153,9 @@ impl BeamModuleAssembler {
 
     /// `i_trim Words`.
     // Port of erts/emulator/beam/jit/x86/instr_common.cpp:650-652 (emit_i_trim), OTP-29.1.1.
-    pub fn emit_i_trim(&mut self, words: u32) -> Result<(), AsmError> {
+    pub fn emit_i_trim(&mut self, words: ArgVal) -> Result<(), AsmError> {
+        let words =
+            u32::try_from(arg_word(words)?).map_err(|_| AsmError::Operand("i_trim word count"))?;
         self.trim_preserve_cache(words)
     }
 
@@ -159,9 +172,9 @@ impl BeamModuleAssembler {
 
     /// `jump Fail`.
     // Port of erts/emulator/beam/jit/x86/instr_common.cpp:1140-1142 (emit_jump), OTP-29.1.1.
-    pub fn emit_jump(&mut self, fail: u32) -> Result<(), AsmError> {
+    pub fn emit_jump(&mut self, fail: ArgVal) -> Result<(), AsmError> {
         let label = self
-            .resolve_beam_label(fail)
+            .resolve_beam_label(arg_label(fail)?)
             .ok_or(AsmError::Operand("jump to an unknown label"))?;
         self.asm.jmp(label)
     }
@@ -237,7 +250,11 @@ mod tests {
                     .unwrap()
                     / 8;
                 let expected = gnu_as(&block).unwrap();
-                assert_eq!(emitted(|m| m.emit_i_trim(words)), expected, "{block:?}");
+                assert_eq!(
+                    emitted(|m| m.emit_i_trim(ArgVal::Immediate(u64::from(words)))),
+                    expected,
+                    "{block:?}"
+                );
                 trims += 1;
             }
         }
@@ -376,7 +393,9 @@ mod tests {
                     _ => panic!(),
                 })
                 .collect();
-            assert_matches(&block, emitted(|m| m.emit_init_yregs(&ys)));
+            let args: Vec<ArgVal> = ys.iter().map(|y| ArgVal::Y(*y)).collect();
+            let size = ArgVal::Immediate(args.len() as u64);
+            assert_matches(&block, emitted(|m| m.emit_init_yregs(size, &args)));
             compared += 1;
         }
         assert!(compared > 50, "compared {compared}");

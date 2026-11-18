@@ -203,6 +203,9 @@ impl TransformArena {
 
 include!(concat!(env!("OUT_DIR"), "/specific_ops.rs"));
 
+// `beamasm_emit!` and `BEAMASM_PROTOS`: the BeamAsm dispatch glue of the target JIT.
+include!(concat!(env!("OUT_DIR"), "/beamasm_emit.rs"));
+
 /// Loads the code of a module like `load_code` of erts: the operations go to `sink` one by one,
 /// as the engine produces them.
 // Port of erts/emulator/beam/beam_load.c:load_code, OTP-29.1.1.

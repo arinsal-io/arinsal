@@ -2,8 +2,10 @@
 //! In erts they are C blocks of the `.tab` files that `beam_makeops` copies into
 //! `beam_opcodes.c` as `static int name(LoaderState* S, ...)` and `static BeamOp* name(...)`;
 //! here they are ported by hand under the same names and parameter order (OTP-29.1.1:
-//! beam/predicates.tab, beam/generators.tab, beam/jit/arm/predicates.tab,
-//! beam/jit/arm/generators.tab, beam/beam_transform_helpers.c).
+//! beam/predicates.tab, beam/generators.tab, beam/jit/{arm,x86}/predicates.tab,
+//! beam/jit/{arm,x86}/generators.tab, beam/beam_transform_helpers.c). The two JIT tables are
+//! copies of each other except for the bodies marked with a `target_arch`: the build takes the
+//! target's tables as erts' Makefile takes `beam/jit/$(JIT_ARCH)/*.tab`.
 
 use crate::beam_op::*;
 use crate::erts_tables::*;
@@ -131,10 +133,26 @@ fn is_erlang_function_of_arity_2(st: &LoaderState, bif: BeamOpArg, function: u64
 pub(crate) mod predicates {
     use super::*;
 
+    // Port of erts/emulator/beam/jit/arm/predicates.tab (consecutive_words), OTP-29.1.1.
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn consecutive_words(_st: &mut LoaderState, a1: BeamOpArg, a2: BeamOpArg) -> bool {
         a1.ty == a2.ty && a1.val + 1 == a2.val
     }
 
+    // Port of erts/emulator/beam/jit/x86/predicates.tab (consecutive_words), OTP-29.1.1.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn consecutive_words(
+        _st: &mut LoaderState,
+        s1: BeamOpArg,
+        d1: BeamOpArg,
+        s2: BeamOpArg,
+        d2: BeamOpArg,
+    ) -> bool {
+        s1.ty == s2.ty && s1.val + 1 == s2.val && d1.ty == d2.ty && d1.val + 1 == d2.val
+    }
+
+    // Port of erts/emulator/beam/jit/arm/predicates.tab (consecutive_xregs), OTP-29.1.1.
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn consecutive_xregs(_st: &mut LoaderState, a1: BeamOpArg, a2: BeamOpArg) -> bool {
         // The following value must be the same as in beam_asm.hpp.
         const NUM_REGISTER_BACKED_XREGS: u64 = 6;
@@ -412,6 +430,27 @@ fn beam_load_map_key_sort(st: &mut LoaderState, size: BeamOpArg, rest: RestArgs)
 #[allow(clippy::too_many_arguments)]
 pub(crate) mod generators {
     use super::*;
+
+    /// `append_cons Len Hd` followed by `store_cons Len+1 Dst`.
+    // Port of erts/emulator/beam/jit/x86/generators.tab:389-407 (combine_conses), OTP-29.1.1.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn combine_conses(
+        st: &mut LoaderState,
+        len: BeamOpArg,
+        dst: BeamOpArg,
+        hd: BeamOpArg,
+    ) -> Option<OpId> {
+        let cons = st.new_op(GENOP_APPEND_CONS_2, 2);
+        let tail = st.new_op(GENOP_STORE_CONS_2, 2);
+        let c = st.ops.op_mut(cons);
+        c.set_a(0, len);
+        c.set_a(1, hd);
+        c.next = Some(tail);
+        let t = st.ops.op_mut(tail);
+        t.set_a(0, arg(TAG_U, len.val + 1));
+        t.set_a(1, dst);
+        Some(cons)
+    }
 
     pub(crate) fn bs_match(
         st: &mut LoaderState,
@@ -820,6 +859,8 @@ pub(crate) mod generators {
         Some(op)
     }
 
+    // Port of erts/emulator/beam/jit/arm/generators.tab (init_yregs_move), OTP-29.1.1.
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn init_yregs_move(
         st: &mut LoaderState,
         size: BeamOpArg,
@@ -841,9 +882,28 @@ pub(crate) mod generators {
         size: BeamOpArg,
         rest: RestArgs,
     ) -> Option<OpId> {
-        // The rule in ops.tab must ensure that there are more than two values.
+        // arm: the rule in ops.tab must ensure that there are more than two values.
+        #[cfg(target_arch = "aarch64")]
         debug_assert!(size.val > 2);
         debug_assert!(size.val.is_multiple_of(2));
+
+        // x86: don't generate a jump table if there's only one choice.
+        // Port of erts/emulator/beam/jit/x86/generators.tab:162-189 (jump_tab), OTP-29.1.1.
+        #[cfg(target_arch = "x86_64")]
+        if size.val == 2 {
+            let op = st.new_op(GENOP_IS_NE_EXACT_3, 3);
+            let jump = st.new_op(GENOP_JUMP_1, 1);
+            let (value, label) = (rest.get(st, 1), rest.get(st, 0));
+            let o = st.ops.op_mut(op);
+            o.set_a(0, value);
+            o.set_a(1, src);
+            o.set_a(2, label);
+            o.next = Some(jump);
+            let j = st.ops.op_mut(jump);
+            j.set_a(0, fail);
+            j.next = None;
+            return Some(op);
+        }
 
         // Calculate the minimum and maximum values and size of jump table.
         debug_assert!(rest.get(st, 0).ty == TAG_I);

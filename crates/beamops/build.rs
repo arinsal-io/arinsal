@@ -9,23 +9,29 @@ mod makeops;
 #[path = "build/transform.rs"]
 mod transform;
 
+/// The JIT architecture whose tables the build uses, as erts' Makefile picks
+/// `beam/jit/$(JIT_ARCH)/{ops,predicates,generators}.tab` for the target
+/// (erts/emulator/Makefile.in:73-76, OTP-29.1.1).
+fn jit_arch() -> &'static str {
+    match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("x86_64") => "x86",
+        Ok("aarch64") => "arm",
+        other => panic!("BeamAsm has no JIT for target architecture {other:?}"),
+    }
+}
+
 fn main() {
     generate_erts_tables();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let ops = fs::read_to_string(root.join("tab/ops.tab")).expect("ops.tab");
-    let _predicates = fs::read_to_string(root.join("tab/predicates.tab")).expect("predicates.tab");
-    let _common_predicates =
-        fs::read_to_string(root.join("tab/common_predicates.tab")).expect("common predicates.tab");
-    let _generators = fs::read_to_string(root.join("tab/generators.tab")).expect("generators.tab");
-    let _common_generators =
-        fs::read_to_string(root.join("tab/common_generators.tab")).expect("common generators.tab");
+    let arch = jit_arch();
+    let ops = fs::read_to_string(root.join("tab").join(arch).join("ops.tab")).expect("ops.tab");
     for path in [
-        "ops.tab",
-        "predicates.tab",
-        "common_predicates.tab",
-        "generators.tab",
-        "common_generators.tab",
-        "genop.tab",
+        format!("{arch}/ops.tab"),
+        format!("{arch}/predicates.tab"),
+        "common_predicates.tab".to_owned(),
+        format!("{arch}/generators.tab"),
+        "common_generators.tab".to_owned(),
+        "genop.tab".to_owned(),
     ] {
         println!(
             "cargo:rerun-if-changed={}",
@@ -55,7 +61,7 @@ fn main() {
         }
     }
     let mut out = String::from(
-        "// The operation names declared in OTP-29.1.1 ops.tab.\n/// All operation names declared in OTP's ARM64 ops table.\npub static SPECIFIC_OP_NAMES: &[&str] = &[\n",
+        "// The operation names declared in OTP-29.1.1 ops.tab.\n/// All operation names declared in the target's JIT ops table.\npub static SPECIFIC_OP_NAMES: &[&str] = &[\n",
     );
     for name in &names {
         out.push_str(&format!("{name:?},\n"));
@@ -70,16 +76,18 @@ fn main() {
 
 /// The generic and specific instruction tables of `beam_makeops` (`gen_opc[]`, `opc[]`,
 /// `genop_*`), built from the tables in the order the OTP build gives them to the script:
-/// genop.tab, the shared predicates and generators, then the arm64 ops, predicates and generators.
+/// genop.tab, the shared predicates and generators, then the target JIT's ops, predicates and
+/// generators.
 fn generate_erts_tables() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let arch = jit_arch();
     let names = [
-        "genop.tab",
-        "common_predicates.tab",
-        "common_generators.tab",
-        "ops.tab",
-        "predicates.tab",
-        "generators.tab",
+        "genop.tab".to_owned(),
+        "common_predicates.tab".to_owned(),
+        "common_generators.tab".to_owned(),
+        format!("{arch}/ops.tab"),
+        format!("{arch}/predicates.tab"),
+        format!("{arch}/generators.tab"),
     ];
     let texts: Vec<String> = names
         .iter()
@@ -88,7 +96,7 @@ fn generate_erts_tables() {
     let files: Vec<(&str, &str)> = names
         .iter()
         .zip(&texts)
-        .map(|(name, text)| (*name, text.as_str()))
+        .map(|(name, text)| (name.as_str(), text.as_str()))
         .collect();
     // The definitions of the OTP build: 64-bit, no VM probes.
     let defs = [("ARCH_32", 0), ("ARCH_64", 1), ("USE_VM_PROBES", 0)]
@@ -99,6 +107,11 @@ fn generate_erts_tables() {
     fs::write(
         PathBuf::from(env::var("OUT_DIR").unwrap()).join("erts_tables.rs"),
         tables.emit_tables(),
+    )
+    .unwrap();
+    fs::write(
+        PathBuf::from(env::var("OUT_DIR").unwrap()).join("beamasm_emit.rs"),
+        tables.emit_beamasm_glue(),
     )
     .unwrap();
     let programs = tables.tr_gen();

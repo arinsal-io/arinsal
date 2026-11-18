@@ -27,6 +27,8 @@ thread_local! {
 }
 
 mod eq_literal;
+#[cfg(target_arch = "x86_64")]
+pub mod x86;
 use eq_literal::classify_eq_literal;
 
 /// Runtime values and helper entry points needed while compiling a module.
