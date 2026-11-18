@@ -14,8 +14,8 @@
 //! sets to its own frame.
 
 use crate::{
-    ACTIVE_CODE_IX_OFFSET, ENTRY_RETURN_OFFSET, ExitReason, ProcessHeader, RUNTIME_STACK_OFFSET,
-    SchedulerRegisters,
+    ACTIVE_CODE_IX_DISP, ENTRY_RETURN_DISP, ExitReason, ProcessHeader, RUNTIME_STACK_DISP,
+    SchedulerRegisters, X_REG_ARRAY_OFFSET, tmp_mem_disp,
 };
 use core::ffi::c_void;
 
@@ -81,14 +81,16 @@ unsafe extern "C" {
     );
 }
 
-/// Offsets the bridge shares with native fragments and the VM, as on arm64.
-const TMP_MEM: usize = core::mem::offset_of!(SchedulerRegisters, tmp_mem);
+/// Displacements (from `registers`) the bridge shares with native fragments and the VM, as on
+/// arm64. `tmp_mem[0..2]`: the exit target and resume address a trace hook leaves.
+const TMP_MEM0: i32 = tmp_mem_disp(0);
+const TMP_MEM1: i32 = tmp_mem_disp(1);
 /// `tmp_mem[3]`: the exit kind marker a fragment leaves before jumping to the exit fragment.
-const EXIT_MARKER: usize = TMP_MEM + 3 * 8;
+const EXIT_MARKER: i32 = tmp_mem_disp(3);
 /// `tmp_mem[4]`: the exit fragment address, for runtime error fragments.
-const EXIT_FRAGMENT: usize = TMP_MEM + 4 * 8;
+const EXIT_FRAGMENT: i32 = tmp_mem_disp(4);
 /// `tmp_mem[5]`: the Rust trace return hook.
-const TRACE_HOOK: usize = TMP_MEM + 5 * 8;
+const TRACE_HOOK: i32 = tmp_mem_disp(5);
 
 const HTOP: usize = core::mem::offset_of!(ProcessHeader, htop);
 const STOP: usize = core::mem::offset_of!(ProcessHeader, stop);
@@ -148,15 +150,16 @@ core::arch::global_asm!(
     "mov r14d, [r13 + {fcalls}]",
     // A hook that hands the return to the scheduler leaves the exit target and resume
     // address in tmp_mem[0..2] and returns the exit fragment; ARG2/ARG3 are free at a return.
-    "mov rsi, [rbx + {tmp_mem}]",
-    "mov rdx, [rbx + {tmp_mem} + 8]",
+    "mov rsi, [rbx + {tmp_mem0}]",
+    "mov rdx, [rbx + {tmp_mem1}]",
     "jmp rax",
     htop = const HTOP,
     stop = const STOP,
     fcalls = const FCALLS,
-    runtime_stack = const RUNTIME_STACK_OFFSET,
+    runtime_stack = const RUNTIME_STACK_DISP,
     trace_hook = const TRACE_HOOK,
-    tmp_mem = const TMP_MEM,
+    tmp_mem0 = const TMP_MEM0,
+    tmp_mem1 = const TMP_MEM1,
 );
 
 core::arch::global_asm!(
@@ -174,8 +177,8 @@ core::arch::global_asm!(
     "push r14",
     "push r15",
     "push rcx",
-    // `registers` is exactly x_reg_array's address; c_p is r13.
-    "mov rbx, rsi",
+    // `registers` points at x_reg_array (process_main.cpp:72-77); c_p is r13.
+    "lea rbx, [rsi + {x_reg_array}]",
     "mov r13, rdi",
     // The runtime stack every emit_enter_runtime switches back to is this frame.
     "mov [rbx + {runtime_stack}], rsp",
@@ -237,9 +240,10 @@ core::arch::global_asm!(
     htop = const HTOP,
     stop = const STOP,
     fcalls = const FCALLS,
-    runtime_stack = const RUNTIME_STACK_OFFSET,
-    active_code_ix = const ACTIVE_CODE_IX_OFFSET,
-    entry_return = const ENTRY_RETURN_OFFSET,
+    x_reg_array = const X_REG_ARRAY_OFFSET,
+    runtime_stack = const RUNTIME_STACK_DISP,
+    active_code_ix = const ACTIVE_CODE_IX_DISP,
+    entry_return = const ENTRY_RETURN_DISP,
     exit_fragment = const EXIT_FRAGMENT,
     exit_marker = const EXIT_MARKER,
 );
@@ -327,7 +331,7 @@ mod tests {
         exit_marker = const EXIT_MARKER,
         exit_fragment = const EXIT_FRAGMENT,
         stop = const STOP,
-        runtime_stack = const RUNTIME_STACK_OFFSET,
+        runtime_stack = const RUNTIME_STACK_DISP,
         hook = sym runtime_hook,
     );
 

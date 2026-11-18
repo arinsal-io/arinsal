@@ -40,7 +40,7 @@ impl BeamModuleAssembler {
         dst: Option<ArgVal>,
         helper: BsMatchCmdHelper,
     ) -> Result<(), ModuleError> {
-        let staging = std::mem::offset_of!(crate::SchedulerRegisters, match_staging) as u32;
+        let staging = crate::MATCH_STAGING_DISP as u32;
         for (index, operand) in staged.iter().copied().enumerate() {
             let register = self.source_reg(operand)?;
             let offset = staging + index as u32 * 8;

@@ -32,7 +32,7 @@ extern "C" fn writable_hook(_process: *mut ProcessHeader, value: u64) -> u64 {
 
 extern "C" fn construct_init_hook(
     _process: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _registers: *mut u64,
     bits: u64,
     alloc: u64,
     live: u64,
@@ -43,7 +43,7 @@ extern "C" fn construct_init_hook(
 
 extern "C" fn construct_size_hook(
     _process: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _registers: *mut u64,
     _source: u64,
     _index: u64,
 ) -> u64 {
@@ -52,7 +52,7 @@ extern "C" fn construct_size_hook(
 
 extern "C" fn construct_put_hook(
     _process: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _registers: *mut u64,
     source: u64,
     bits: u64,
     flags: u64,
@@ -68,7 +68,7 @@ extern "C" fn construct_put_hook(
 
 extern "C" fn construct_fail_hook(
     _process: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _registers: *mut u64,
     _packed: u64,
     _arg3: u64,
     _arg1: u64,
@@ -78,7 +78,7 @@ extern "C" fn construct_fail_hook(
 
 extern "C" fn construct_append_hook(
     _process: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _registers: *mut u64,
     _source: u64,
     _bits: u64,
     _unit: u64,
@@ -90,7 +90,7 @@ extern "C" fn construct_append_hook(
 
 extern "C" fn construct_private_append_hook(
     _process: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _registers: *mut u64,
     _source: u64,
     _bits: u64,
 ) -> u64 {

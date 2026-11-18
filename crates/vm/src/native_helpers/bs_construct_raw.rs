@@ -9,16 +9,17 @@ use arinsal_term::TermBuilder;
 // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1808-1858, OTP-29.1.1.
 pub(crate) extern "C" fn append_checked(
     header: *mut ProcessHeader,
-    registers: *mut SchedulerRegisters,
+    reg: *mut u64,
     source_index: u64,
     extra_bits: u64,
     unit: u64,
     live: u64,
     alloc: u64,
 ) -> u64 {
-    if header.is_null() || registers.is_null() {
+    if header.is_null() || reg.is_null() {
         return 0;
     }
+    let registers = SchedulerRegisters::from_reg(reg);
     debug_assert_eq!(source_index, live, "append source is reg[live]");
     // SAFETY: native code passes its scheduler register area, which only this scheduler
     // touches while the helper runs.
@@ -31,13 +32,14 @@ pub(crate) extern "C" fn append_checked(
 // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1865-1880, OTP-29.1.1.
 pub(crate) extern "C" fn private_append(
     header: *mut ProcessHeader,
-    registers: *mut SchedulerRegisters,
+    reg: *mut u64,
     source: u64,
     extra_bits: u64,
 ) -> u64 {
-    if header.is_null() || registers.is_null() {
+    if header.is_null() || reg.is_null() {
         return 0;
     }
+    let registers = SchedulerRegisters::from_reg(reg);
     // SAFETY: native code passes the live process header and its scheduler register area.
     unsafe {
         let state = std::ptr::addr_of_mut!((*registers).erl_bits_state).cast::<u64>();
@@ -54,14 +56,15 @@ pub(crate) extern "C" fn private_append(
 // Port of instr_bs.cpp:1855-1979 (`emit_bs_init_bits_shared`), OTP-29.1.1.
 pub(crate) extern "C" fn init_bits(
     header: *mut ProcessHeader,
-    registers: *mut SchedulerRegisters,
+    reg: *mut u64,
     bits: u64,
     alloc: u64,
     live: u64,
 ) -> u64 {
-    if header.is_null() || registers.is_null() {
+    if header.is_null() || reg.is_null() {
         return 0;
     }
+    let registers = SchedulerRegisters::from_reg(reg);
     // SAFETY: generated code passes the active process header and its scheduler register area.
     let Some((process, registers)) = (unsafe {
         crate::native_hooks::enter_runtime_with_registers(&mut *header, &mut *registers)
@@ -106,7 +109,7 @@ pub(crate) extern "C" fn init_bits(
 // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1011 (`beam_jit_bs_bit_size`), OTP-29.1.1.
 pub(crate) extern "C" fn bit_size(
     header: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _reg: *mut u64,
     source: u64,
     _index: u64,
 ) -> u64 {
@@ -125,7 +128,7 @@ pub(crate) extern "C" fn bit_size(
 /// Returns an encoded UTF segment size in bits or raises badarg.
 pub(crate) extern "C" fn utf8_size(
     header: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _reg: *mut u64,
     source: u64,
     _index: u64,
 ) -> u64 {
@@ -135,7 +138,7 @@ pub(crate) extern "C" fn utf8_size(
 /// Returns an encoded UTF-16 segment size in bits or raises badarg.
 pub(crate) extern "C" fn utf16_size(
     header: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _reg: *mut u64,
     source: u64,
     _index: u64,
 ) -> u64 {
@@ -145,7 +148,7 @@ pub(crate) extern "C" fn utf16_size(
 /// Returns an encoded UTF-32 segment size in bits or raises badarg.
 pub(crate) extern "C" fn utf32_size(
     header: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _reg: *mut u64,
     source: u64,
     _index: u64,
 ) -> u64 {
@@ -176,7 +179,7 @@ fn utf_size(header: *mut ProcessHeader, source: u64, unit_bits: u64) -> u64 {
 // Port of erts/emulator/beam/jit/beam_jit_common.cpp:911-1010 (`beam_jit_bs_construct_fail_info`), OTP-29.1.1.
 pub(crate) extern "C" fn fail(
     header: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _reg: *mut u64,
     packed: u64,
     arg3: u64,
     arg1: u64,
@@ -262,7 +265,7 @@ pub(crate) extern "C" fn fail(
 #[allow(clippy::too_many_arguments)]
 fn put_segment(
     header: *mut ProcessHeader,
-    registers: *mut SchedulerRegisters,
+    reg: *mut u64,
     kind: SegType,
     source: u64,
     bits: u64,
@@ -270,9 +273,10 @@ fn put_segment(
     index: u64,
     total_bits: u64,
 ) -> u64 {
-    if header.is_null() || registers.is_null() {
+    if header.is_null() || reg.is_null() {
         return 0;
     }
+    let registers = SchedulerRegisters::from_reg(reg);
     // SAFETY: generated code passes the active process header and its scheduler register area.
     let Some((process, registers)) = (unsafe {
         crate::native_hooks::enter_runtime_with_registers(&mut *header, &mut *registers)
@@ -374,7 +378,7 @@ macro_rules! put_primitive {
     ($name:ident, $kind:ident) => {
         pub(crate) extern "C" fn $name(
             header: *mut ProcessHeader,
-            registers: *mut SchedulerRegisters,
+            reg: *mut u64,
             source: u64,
             bits: u64,
             metadata: u64,
@@ -383,7 +387,7 @@ macro_rules! put_primitive {
         ) -> u64 {
             put_segment(
                 header,
-                registers,
+                reg,
                 SegType::$kind,
                 source,
                 bits,

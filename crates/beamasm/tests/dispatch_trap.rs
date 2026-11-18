@@ -87,7 +87,11 @@ fn run(
             // `bl`/`blr` leaves x30 at this instruction. A real function saved the
             // scheduler bridge on E in the breakpoint trampoline; this caller did not,
             // so the continuation returns through the bridge slot enter_native published.
-            encoder.ldr_uoff(Gpr::x(30), Gpr::x(19), 16_416)?;
+            encoder.ldur(
+                Gpr::x(30),
+                Gpr::x(19),
+                arinsal_beamasm::tmp_mem_disp(4) as i16,
+            )?;
             encoder.br(Gpr::x(30))
         })
         .unwrap();

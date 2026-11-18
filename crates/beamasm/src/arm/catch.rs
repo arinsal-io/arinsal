@@ -4,7 +4,7 @@ use arinsal_a64::enc::Gpr;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::{
-    ProcessHeader, SchedulerRegisters,
+    ProcessHeader,
     module::{ArgVal, BeamModuleAssembler, ModuleError},
 };
 
@@ -51,8 +51,7 @@ pub fn reserve_catch_indices(count: usize) -> Result<u32, ModuleError> {
 
 /// Resolves an exception against the process catch chain and returns a native handler address.
 /// A zero result means that the exception is uncaught and should return to the runtime.
-pub type ExceptionResolver =
-    extern "C" fn(*mut ProcessHeader, *mut SchedulerRegisters, *mut u64, u64) -> usize;
+pub type ExceptionResolver = extern "C" fn(*mut ProcessHeader, *mut u64, *mut u64, u64) -> usize;
 /// Runtime callback that pairs an error reason with its materialized stacktrace.
 pub type AddStacktraceHook = extern "C" fn(*mut ProcessHeader, u64, u64) -> u64;
 /// Runtime callback that materializes a raw stacktrace term.
@@ -421,7 +420,7 @@ impl BeamModuleAssembler {
         self.code.bind(here)?;
         self.code.adr(Gpr::x(8), here)?;
         self.code
-            .emit(|e| e.str_uoff(Gpr::x(8), SCHEDULER_REGS, 16_432))?;
+            .emit(|e| e.stur(Gpr::x(8), SCHEDULER_REGS, crate::tmp_mem_disp(6) as i16))?;
         // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:311-326, OTP-29.1.1.
         let update = crate::Update::HEAP_ALLOC.union(crate::Update::X_REGS);
         crate::emit_enter_runtime(&mut self.code, 6, update)?;
@@ -441,7 +440,7 @@ impl BeamModuleAssembler {
         // the caller's LR (nested native frames would re-enter and spin).
         self.code.emit(|e| {
             e.mov_reg(Gpr::x(0), Gpr::xzr())?;
-            e.ldr_uoff(Gpr::x(30), SCHEDULER_REGS, 16_416)?;
+            e.ldur(Gpr::x(30), SCHEDULER_REGS, crate::tmp_mem_disp(4) as i16)?;
             e.br(Gpr::x(30))
         })?;
         self.code.bind(caught)?;

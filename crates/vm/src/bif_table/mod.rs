@@ -115,7 +115,9 @@ pub(crate) fn call_from_executor(
     let reg_ptr = reg.as_mut_ptr().cast::<u64>();
     // The call fragment keeps `I` in TMP_MEM1q for the BIF (call_light_bif_shared); the executor
     // stores its call site there, or the BIF would read the previous call's `I`.
-    if let Some(registers) = crate::native_hooks::registers_at(reg_ptr.cast()) {
+    if let Some(registers) =
+        crate::native_hooks::registers_at(arinsal_beamasm::SchedulerRegisters::from_reg(reg_ptr))
+    {
         registers.tmp_mem[6] = process.native_call_pc as u64;
     }
     let c_p = std::ptr::from_mut(process).cast::<ProcessHeader>();

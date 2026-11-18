@@ -11,13 +11,7 @@ extern "C" fn raise_class_for_test(_header: *mut ProcessHeader, trace: u64, _val
 }
 use arinsal_term::{ProcessHeap, Term, TermBuilder, global_atoms};
 
-extern "C" fn gc_stub(
-    _: *mut ProcessHeader,
-    _: *mut SchedulerRegisters,
-    _: usize,
-    _: usize,
-    _: i32,
-) -> i32 {
+extern "C" fn gc_stub(_: *mut ProcessHeader, _: *mut u64, _: usize, _: usize, _: i32) -> i32 {
     0
 }
 
@@ -25,18 +19,13 @@ extern "C" fn add_stacktrace_stub(_: *mut ProcessHeader, reason: u64, _: u64) ->
     reason
 }
 
-extern "C" fn uncaught(
-    _: *mut ProcessHeader,
-    _: *mut SchedulerRegisters,
-    _: *mut u64,
-    _: u64,
-) -> usize {
+extern "C" fn uncaught(_: *mut ProcessHeader, _: *mut u64, _: *mut u64, _: u64) -> usize {
     0
 }
 
 extern "C" fn route_to_header_handler(
     process: *mut ProcessHeader,
-    _: *mut SchedulerRegisters,
+    _: *mut u64,
     _: *mut u64,
     _: u64,
 ) -> usize {
@@ -45,7 +34,7 @@ extern "C" fn route_to_header_handler(
 
 extern "C" fn unwind_and_route_to_header_handler(
     process: *mut ProcessHeader,
-    _: *mut SchedulerRegisters,
+    _: *mut u64,
     _: *mut u64,
     _: u64,
 ) -> usize {

@@ -31,7 +31,7 @@ extern "C" fn arithmetic_fallback(
 
 extern "C" fn moving_gc(
     header_pointer: *mut ProcessHeader,
-    regs_pointer: *mut SchedulerRegisters,
+    regs_pointer: *mut u64,
     need_words: usize,
     live: usize,
     _fcalls: i32,
@@ -78,7 +78,7 @@ extern "C" fn moving_gc(
 
 extern "C" fn moving_gc_with_y_root(
     header_pointer: *mut ProcessHeader,
-    regs_pointer: *mut SchedulerRegisters,
+    regs_pointer: *mut u64,
     need_words: usize,
     live: usize,
     _fcalls: i32,

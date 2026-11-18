@@ -3,7 +3,7 @@
 
 use arinsal_beam::{self as beam, BeamFile};
 use arinsal_beamasm::{
-    NativeEntry, ProcessHeader, SchedulerRegisters,
+    NativeEntry, ProcessHeader,
     arith::ArithHelper,
     construct::GcHook,
     fun::FunCallTag,
@@ -357,7 +357,7 @@ extern "C" fn unused_record_field(
 
 extern "C" fn unused_record_create(
     _p: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _reg: *mut u64,
     _id: u64,
     _live: u64,
     _count: u64,
@@ -368,7 +368,7 @@ extern "C" fn unused_record_create(
 
 extern "C" fn unused_record_elements(
     _p: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _reg: *mut u64,
     _src: u64,
     _count: u64,
     _base: u64,
@@ -423,11 +423,10 @@ extern "C" fn unused_fun_resolver(
 
 /// Runtime lookup for map element instructions.
 pub type MapLookupHelper =
-    unsafe extern "C" fn(*mut ProcessHeader, *mut SchedulerRegisters, u64, u64, u64, u64) -> u64;
+    unsafe extern "C" fn(*mut ProcessHeader, *mut u64, u64, u64, u64, u64) -> u64;
 
 /// Runtime dispatcher for BIF entry functions.
-pub type BifMfaHelper =
-    unsafe extern "C" fn(*mut ProcessHeader, *mut SchedulerRegisters, u64, u64, u64) -> u64;
+pub type BifMfaHelper = unsafe extern "C" fn(*mut ProcessHeader, *mut u64, u64, u64, u64) -> u64;
 
 /// The one authoritative table of specific operations currently emitted here.
 #[derive(Clone, Copy, Debug)]

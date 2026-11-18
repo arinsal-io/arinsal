@@ -66,14 +66,15 @@ pub fn process_header_mut<R>(
     unsafe { f(&mut *pointer) }
 }
 
-/// Exposes scheduler registers to a C ABI hook during its call.
+/// Exposes the scheduler registers behind the `reg` pointer (x19, `x_reg_array`) native code
+/// passed to a C ABI hook during its call.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn scheduler_registers_mut<R>(
-    pointer: *mut SchedulerRegisters,
+    reg: *mut u64,
     f: impl FnOnce(&mut SchedulerRegisters) -> R,
 ) -> R {
-    // SAFETY: x19 points to the unique live register area for this invocation.
-    unsafe { f(&mut *pointer) }
+    // SAFETY: x19 points into the unique live register area for this invocation.
+    unsafe { f(&mut *SchedulerRegisters::from_reg(reg)) }
 }
 
 /// Copies initialized test heap words into a new allocation.
@@ -247,7 +248,7 @@ core::arch::global_asm!(
     "mov x0, x21",
     // `reg`: the hook roots and reloads the X registers through it.
     "mov x2, x19",
-    "ldr x16, [x19, #16424]",
+    "ldr x16, [x19, #{trace_hook}]",
     "blr x16",
     "mov x14, x0",
     "ldr x20, [x21, #8]",
@@ -263,9 +264,12 @@ core::arch::global_asm!(
     "ldp d14, d15, [x17, #48]",
     // A hook that hands the return to the scheduler leaves the exit target and resume
     // address in tmp_mem[0..2] and returns the exit fragment; x1/x2 are free at a return.
-    "ldr x1, [x19, #16384]",
-    "ldr x2, [x19, #16392]",
+    "ldr x1, [x19, #{tmp_mem0}]",
+    "ldr x2, [x19, #{tmp_mem1}]",
     "br x14",
+    trace_hook = const crate::tmp_mem_disp(5),
+    tmp_mem0 = const crate::tmp_mem_disp(0),
+    tmp_mem1 = const crate::tmp_mem_disp(1),
 );
 
 #[cfg(target_arch = "aarch64")]
@@ -287,15 +291,15 @@ core::arch::global_asm!(
     "stp d14, d15, [sp, #-16]!",
     "sub sp, sp, #16",
     "str x3, [sp, #0]",
-    // x19 is exactly x_reg_array's address; x21 is c_p.
-    "mov x19, x1",
+    // x19 points at x_reg_array, past the auxiliary registers; x21 is c_p.
+    "add x19, x1, #{x_reg_array}",
     "mov x21, x0",
     "ldr x20, [x21, #8]",
     "ldr w22, [x21, #32]",
     "ldr x23, [x21, #0]",
     // Port of erts/emulator/beam/jit/arm/process_main.cpp:236-247, OTP-29.1.1: the runtime
     // already resolved the process's code index (save_calls or the active one).
-    "ldr x24, [x19, #16480]",
+    "ldr x24, [x19, #{active_code_ix}]",
     "ldp x25, x26, [x19, #0]",
     "ldp x27, x28, [x19, #16]",
     "ldp x15, x16, [x19, #32]",
@@ -307,13 +311,13 @@ core::arch::global_asm!(
     // The native function's RET lands at the ABI exit fragment.
     asm_load_enter_native_return!(),
     // Runtime error fragments use this slot after runtime hooks replace x30.
-    "str x30, [x19, #16416]",
+    "str x30, [x19, #{exit_fragment}]",
     // A call entered from the scheduler returns to its caller's continuation, so the
     // callee's frame holds that real CP instead of the bridge (`entry_return`).
-    "ldr x9, [x19, #16488]",
+    "ldr x9, [x19, #{entry_return}]",
     "cbz x9, 1f",
     "mov x30, x9",
-    "str xzr, [x19, #16488]",
+    "str xzr, [x19, #{entry_return}]",
     // Port of erts/emulator/beam/jit/arm/process_main.cpp:284-288, OTP-29.1.1.
     // A scheduler re-entry can target a BIF continuation, whose result is in XREG0.
     "ldr x0, [x19]",
@@ -329,9 +333,9 @@ core::arch::global_asm!(
     concat!(".global ", asm_sym!("arinsal_enter_native_return")),
     concat!(asm_sym!("arinsal_enter_native_return"), ":"),
     // The marker distinguishes an interpreter handoff without adding work to each BEAM return.
-    "ldr x9, [x19, #16408]",
+    "ldr x9, [x19, #{exit_marker}]",
     // Consume the marker so a later plain return is not taken for a handoff.
-    "str xzr, [x19, #16408]",
+    "str xzr, [x19, #{exit_marker}]",
     "cbnz x9, 1f",
     "mov x0, xzr",
     "b 2f",
@@ -366,4 +370,9 @@ core::arch::global_asm!(
     "ldp x19, x20, [sp], #16",
     "ldp x29, x30, [sp], #16",
     "ret",
+    x_reg_array = const crate::X_REG_ARRAY_OFFSET,
+    active_code_ix = const crate::ACTIVE_CODE_IX_DISP,
+    entry_return = const crate::ENTRY_RETURN_DISP,
+    exit_fragment = const crate::tmp_mem_disp(4),
+    exit_marker = const crate::tmp_mem_disp(3),
 );

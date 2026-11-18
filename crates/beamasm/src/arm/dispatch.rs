@@ -941,7 +941,7 @@ fn emit_export_fragment(
         // site. A tail call site's x30 is the caller's continuation, which is also where erts
         // attributes it.
         encoder.orr_imm(Gpr::x(9), Gpr::x(30), crate::module::RETURN_SITE_TAG as u64)?;
-        encoder.str_uoff(Gpr::x(9), Gpr::x(19), tmp_mem_offset(6))?;
+        encoder.stur(Gpr::x(9), Gpr::x(19), tmp_mem_offset(6))?;
         // Interpreted targets have no native prologue to save this continuation.
         encoder.str_pre(Gpr::x(30), Gpr::x(20), -8)?;
         encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -32)?;
@@ -1131,7 +1131,7 @@ fn emit_export_fragment(
         encoder.ldr_uoff(Gpr::x(17), Gpr::sp(), 16)?;
         encoder.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 32)?;
         encoder.mov_const(Gpr::x(0), 2)?;
-        encoder.str_uoff(Gpr::x(0), Gpr::x(19), 16_408)?;
+        encoder.stur(Gpr::x(0), Gpr::x(19), crate::tmp_mem_disp(3) as i16)?;
         encoder.mov_reg(Gpr::x(1), Gpr::x(17))?;
         // The native call site is the CP pushed on entry; it names the calling module.
         encoder.ldr_uoff(Gpr::x(2), Gpr::x(20), 0)?;
@@ -1293,7 +1293,7 @@ fn emit_raise_exception_fragment(
     code.emit(|encoder| {
         encoder.ldr_uoff(Gpr::x(20), Gpr::x(21), 8)?;
         encoder.ldr_uoff(Gpr::x(23), Gpr::x(21), 0)?;
-        encoder.str_uoff(Gpr::x(0), Gpr::x(19), 16_408)?;
+        encoder.stur(Gpr::x(0), Gpr::x(19), crate::tmp_mem_disp(3) as i16)?;
         encoder.mov_const(Gpr::x(17), arinsal_enter_native_return as *const () as u64)?;
         encoder.br(Gpr::x(17))
     })
@@ -1348,7 +1348,7 @@ fn emit_call_light_bif_shared(
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:384-387, OTP-29.1.1:
     // spill the entry before the trace check. The trace path never returns here, and
     // the scheduler names the caller from this slot (`native_error_pc` / `tmp_mem[6]`).
-    code.emit(|encoder| encoder.str_uoff(Gpr::x(2), Gpr::x(19), 16_432))?;
+    code.emit(|encoder| encoder.stur(Gpr::x(2), Gpr::x(19), crate::tmp_mem_disp(6) as i16))?;
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:388-397, OTP-29.1.1:
     // a traced BIF, or a process saving calls, dispatches through the export entry.
     code.emit(|encoder| {
@@ -1461,7 +1461,7 @@ fn emit_call_light_bif_shared(
         encoder.ldr_uoff(Gpr::x(20), Gpr::x(21), 8)?;
         encoder.ldr_uoff(Gpr::x(23), Gpr::x(21), 0)?;
         encoder.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 32)?;
-        encoder.ldr_uoff(Gpr::x(30), Gpr::x(19), 16_416)?;
+        encoder.ldur(Gpr::x(30), Gpr::x(19), crate::tmp_mem_disp(4) as i16)?;
         encoder.br(Gpr::x(30))
     })?;
     code.bind(store)?;
@@ -1531,7 +1531,7 @@ fn emit_call_light_bif_shared(
     emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
         encoder.mov_const(Gpr::x(0), 1)?;
-        encoder.str_uoff(Gpr::x(0), Gpr::x(19), 16_408)?;
+        encoder.stur(Gpr::x(0), Gpr::x(19), crate::tmp_mem_disp(3) as i16)?;
         encoder.mov_const(Gpr::x(30), arinsal_enter_native_return as *const () as u64)?;
         encoder.ret(Gpr::x(30))
     })?;
@@ -1562,7 +1562,7 @@ fn emit_breakpoint_shared(
         .union(Update::X_REGS);
     let error = code.new_label();
     code.emit(|encoder| {
-        encoder.str_uoff(Gpr::x(30), Gpr::x(19), crate::TRAP_RETURN_OFFSET as u32)?;
+        encoder.str_uoff(Gpr::x(30), Gpr::x(19), crate::TRAP_RETURN_DISP as u32)?;
         encoder.mov_const(Gpr::x(13), BREAKPOINT_DISPATCH_IDENTITY as u64)?;
         encoder.mov_reg(Gpr::x(14), Gpr::x(30))
     })?;
@@ -1577,7 +1577,7 @@ fn emit_breakpoint_shared(
     code.bl(helper)?;
     emit_leave_runtime(code, 6, UPDATE)?;
     code.emit(|encoder| {
-        encoder.str_uoff(Gpr::xzr(), Gpr::x(19), crate::TRAP_RETURN_OFFSET as u32)?;
+        encoder.str_uoff(Gpr::xzr(), Gpr::x(19), crate::TRAP_RETURN_DISP as u32)?;
         encoder.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
         encoder.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)
     })?;
@@ -1586,9 +1586,9 @@ fn emit_breakpoint_shared(
     code.bind(error)?;
     code.emit(|encoder| {
         encoder.sub_imm(Gpr::x(30), Gpr::x(30), 4, false)?;
-        encoder.str_uoff(Gpr::x(30), Gpr::x(19), 16_432)?;
+        encoder.stur(Gpr::x(30), Gpr::x(19), crate::tmp_mem_disp(6) as i16)?;
         encoder.mov_reg(Gpr::x(0), Gpr::xzr())?;
-        encoder.ldr_uoff(Gpr::x(30), Gpr::x(19), 16_416)?;
+        encoder.ldur(Gpr::x(30), Gpr::x(19), crate::tmp_mem_disp(4) as i16)?;
         encoder.br(Gpr::x(30))
     })
 }
@@ -1631,8 +1631,8 @@ fn emit_helper_fragment(
         // The context switch resumes at c_p->i; its caller continuation stays on E.
         // That continuation is the call site's trap return, where the trap target
         // returns its result in XREG0; sites without one resume behind this call.
-        encoder.ldr_uoff(Gpr::x(17), Gpr::x(19), crate::TRAP_RETURN_OFFSET as u32)?;
-        encoder.str_uoff(Gpr::xzr(), Gpr::x(19), crate::TRAP_RETURN_OFFSET as u32)?;
+        encoder.ldr_uoff(Gpr::x(17), Gpr::x(19), crate::TRAP_RETURN_DISP as u32)?;
+        encoder.str_uoff(Gpr::xzr(), Gpr::x(19), crate::TRAP_RETURN_DISP as u32)?;
         Ok(())
     })?;
     let continuation = code.new_label();
@@ -1676,12 +1676,12 @@ fn emit_line_breakpoint_shared(
         // This Erlang frame keeps the call site's native continuation on E while the
         // breakpoint handler runs or yields.
         encoder.str_pre(Gpr::x(30), Gpr::x(20), -8)?;
-        encoder.str_uoff(Gpr::x(8), Gpr::x(19), live_slot)?;
+        encoder.stur(Gpr::x(8), Gpr::x(19), live_slot)?;
         encoder.sub_imm(Gpr::x(0), Gpr::x(30), 8, false)?;
-        encoder.str_uoff(Gpr::x(0), Gpr::x(19), pc_slot)?;
-        encoder.str_uoff(Gpr::x(0), Gpr::x(19), native_error_pc_slot)?;
+        encoder.stur(Gpr::x(0), Gpr::x(19), pc_slot)?;
+        encoder.stur(Gpr::x(0), Gpr::x(19), native_error_pc_slot)?;
         encoder.lsl_imm(Gpr::x(9), Gpr::x(8), 3)?;
-        encoder.str_uoff(Gpr::x(9), Gpr::x(19), stack_needed_slot)?;
+        encoder.stur(Gpr::x(9), Gpr::x(19), stack_needed_slot)?;
         encoder.add_imm(
             Gpr::x(10),
             Gpr::x(9),
@@ -1700,7 +1700,7 @@ fn emit_line_breakpoint_shared(
     code.emit(|encoder| {
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
         encoder.mov_reg(Gpr::x(1), Gpr::x(19))?;
-        encoder.ldr_uoff(Gpr::x(2), Gpr::x(19), live_slot)?;
+        encoder.ldur(Gpr::x(2), Gpr::x(19), live_slot)?;
         encoder.mov_reg(Gpr::x(3), Gpr::x(2))?;
         encoder.mov_reg(Gpr::w(4), Gpr::w(22))?;
         encoder.mov_const(Gpr::x(17), helpers.garbage_collect as u64)?;
@@ -1716,15 +1716,15 @@ fn emit_line_breakpoint_shared(
 
     code.bind(after_gc)?;
     code.emit(|encoder| {
-        encoder.ldr_uoff(Gpr::x(9), Gpr::x(19), stack_needed_slot)?;
+        encoder.ldur(Gpr::x(9), Gpr::x(19), stack_needed_slot)?;
         encoder.sub_reg(Gpr::x(20), Gpr::x(20), Gpr::x(9), Shift::Lsl, 0)
     })?;
 
     emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
-        encoder.ldr_uoff(Gpr::x(1), Gpr::x(19), pc_slot)?;
-        encoder.ldr_uoff(Gpr::x(2), Gpr::x(19), live_slot)?;
+        encoder.ldur(Gpr::x(1), Gpr::x(19), pc_slot)?;
+        encoder.ldur(Gpr::x(2), Gpr::x(19), live_slot)?;
         encoder.mov_reg(Gpr::x(3), Gpr::x(19))?;
         encoder.mov_const(Gpr::x(17), helpers.prepare_call as u64)?;
         encoder.blr(Gpr::x(17))
@@ -1752,7 +1752,7 @@ fn emit_line_breakpoint_shared(
 
     code.bind(no_handler)?;
     code.emit(|encoder| {
-        encoder.ldr_uoff(Gpr::x(9), Gpr::x(19), stack_needed_slot)?;
+        encoder.ldur(Gpr::x(9), Gpr::x(19), stack_needed_slot)?;
         encoder.add_reg(Gpr::x(20), Gpr::x(20), Gpr::x(9), Shift::Lsl, 0)
     })?;
     code.bind(exit)?;
@@ -1770,8 +1770,8 @@ fn emit_line_breakpoint_shared(
     Ok(cleanup)
 }
 
-fn tmp_mem_offset(index: u32) -> u32 {
-    std::mem::offset_of!(crate::SchedulerRegisters, tmp_mem) as u32 + index * 8
+fn tmp_mem_offset(index: usize) -> i16 {
+    crate::tmp_mem_disp(index) as i16
 }
 
 // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:context_switch_simplified,
@@ -1784,7 +1784,7 @@ fn emit_restore_and_exit(code: &mut CodeBuffer) -> Result<(), BufferError> {
 fn emit_restore_and_exit_frame(code: &mut CodeBuffer, frame_bytes: u16) -> Result<(), BufferError> {
     code.emit(|encoder| {
         encoder.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), frame_bytes as i16)?;
-        encoder.str_uoff(Gpr::x(0), Gpr::x(19), 16_408)?;
+        encoder.stur(Gpr::x(0), Gpr::x(19), crate::tmp_mem_disp(3) as i16)?;
         encoder.mov_const(Gpr::x(17), arinsal_enter_native_return as *const () as u64)?;
         encoder.br(Gpr::x(17))
     })?;

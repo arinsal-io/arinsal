@@ -39,7 +39,7 @@ const M_TMP3: Gpr = Gpr::x(10);
 const M_TMP4: Gpr = Gpr::x(11);
 
 /// Scheduler `tmp_mem[1]`, where the fused div/rem helper publishes the remainder.
-const TMP_MEM_REM: u32 = 16_392;
+const TMP_MEM_REM: i16 = crate::tmp_mem_disp(1) as i16;
 
 /// Base and byte offset of an operand that lives in memory (not a cached X register).
 fn mem_operand(arg: ArgVal) -> Option<(Gpr, i64)> {
@@ -1466,8 +1466,7 @@ impl BeamModuleAssembler {
                 fail,
                 std::ptr::from_ref(bif_mfa) as usize,
             )?;
-            self.code
-                .emit(|e| e.ldr_uoff(ARG2, Gpr::x(19), TMP_MEM_REM))?;
+            self.code.emit(|e| e.ldur(ARG2, Gpr::x(19), TMP_MEM_REM))?;
         } else {
             let op = if need_div {
                 BinaryOp::Div

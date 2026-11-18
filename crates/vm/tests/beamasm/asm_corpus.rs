@@ -1,5 +1,5 @@
 use arinsal_beam::BeamFile;
-use arinsal_beamasm::{ProcessHeader, SchedulerRegisters};
+use arinsal_beamasm::ProcessHeader;
 use arinsal_beamjit::{ModuleEnv, compile_module_with_env};
 use arinsal_term::{FunEntry, Term, TermBuilder, VecHeap, from_owned, global_atoms};
 use std::cell::RefCell;
@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 extern "C" fn bs_create_bin_append(
     _header: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _registers: *mut u64,
     _source: u64,
     _bits: u64,
     _unit: u64,
@@ -21,7 +21,7 @@ extern "C" fn bs_create_bin_append(
 
 extern "C" fn bs_create_bin_private_append(
     _header: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _registers: *mut u64,
     _source: u64,
     _bits: u64,
 ) -> u64 {
@@ -30,7 +30,7 @@ extern "C" fn bs_create_bin_private_append(
 
 extern "C" fn bs_create_bin_init(
     _header: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _registers: *mut u64,
     _bits: u64,
     _alloc: u64,
     _live: u64,
@@ -40,7 +40,7 @@ extern "C" fn bs_create_bin_init(
 
 extern "C" fn bs_create_bin_size(
     _header: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _registers: *mut u64,
     _source: u64,
     _index: u64,
 ) -> u64 {
@@ -49,7 +49,7 @@ extern "C" fn bs_create_bin_size(
 
 extern "C" fn bs_create_bin_fail(
     _header: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _registers: *mut u64,
     _packed: u64,
     _arg3: u64,
     _arg1: u64,
@@ -59,7 +59,7 @@ extern "C" fn bs_create_bin_fail(
 
 extern "C" fn bs_create_bin_put(
     _header: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _registers: *mut u64,
     _source: u64,
     _bits: u64,
     _flags: u64,
@@ -375,18 +375,12 @@ extern "C" fn guard(_: *mut ProcessHeader, _: u32, _: u64, _: u64) -> u64 {
 extern "C" fn guard3(_: *mut ProcessHeader, _: u32, _: u64, _: u64, _: u64) -> u64 {
     0
 }
-extern "C" fn gc(
-    _: *mut ProcessHeader,
-    _: *mut SchedulerRegisters,
-    _: usize,
-    _: usize,
-    _: i32,
-) -> i32 {
+extern "C" fn gc(_: *mut ProcessHeader, _: *mut u64, _: usize, _: usize, _: i32) -> i32 {
     0
 }
 extern "C" fn map_lookup(
     _: *mut ProcessHeader,
-    _: *mut SchedulerRegisters,
+    _: *mut u64,
     _: u64,
     _: u64,
     _: u64,
@@ -394,13 +388,7 @@ extern "C" fn map_lookup(
 ) -> u64 {
     0
 }
-extern "C" fn bif_mfa(
-    _: *mut ProcessHeader,
-    _: *mut SchedulerRegisters,
-    _: u64,
-    _: u64,
-    _: u64,
-) -> u64 {
+extern "C" fn bif_mfa(_: *mut ProcessHeader, _: *mut u64, _: u64, _: u64, _: u64) -> u64 {
     0
 }
 extern "C" fn bs_match(_: *mut ProcessHeader, _: u32, _: u64, _: u64, _: u64) -> u64 {
@@ -419,12 +407,7 @@ extern "C" fn map_many(
 ) -> u64 {
     0
 }
-extern "C" fn exception(
-    _: *mut ProcessHeader,
-    _: *mut SchedulerRegisters,
-    _: *mut u64,
-    _: u64,
-) -> usize {
+extern "C" fn exception(_: *mut ProcessHeader, _: *mut u64, _: *mut u64, _: u64) -> usize {
     0
 }
 extern "C" fn fun(_: *mut ProcessHeader, _: u64, _: u32, _: *mut u64) -> usize {

@@ -7,7 +7,7 @@
 //! `map_key_sort`, and these helpers merge them with the definition's keys in atom-index order.
 
 use crate::{Process, native_hooks, native_hooks::enter_runtime};
-use arinsal_beamasm::{ProcessHeader, SchedulerRegisters};
+use arinsal_beamasm::ProcessHeader;
 use arinsal_term::{Atom, Term, TermBuilder, global_atoms, term_sequence};
 
 /// Why a record operation failed, reported as `error:{Tag, Value}`.
@@ -120,16 +120,14 @@ fn exported_definition(id: Term) -> Option<Term> {
 /// erl_create_native_record), OTP-29.1.1.
 fn create(
     header: *mut ProcessHeader,
-    registers: *mut SchedulerRegisters,
+    reg: *mut u64,
     id: u64,
     live: u64,
     count: u64,
     base: u64,
     external: bool,
 ) -> u64 {
-    let Some((process, registers)) =
-        native_hooks::enter_runtime_reg(header, registers.cast::<u64>())
-    else {
+    let Some((process, registers)) = native_hooks::enter_runtime_reg(header, reg) else {
         return 0;
     };
     let (Ok(live), Ok(count), Ok(base)) = (
@@ -209,39 +207,37 @@ fn create_record(
 /// Runtime helper of `i_create_local_native_record`.
 pub extern "C" fn arinsal_beamasm_create_local_record(
     header: *mut ProcessHeader,
-    registers: *mut SchedulerRegisters,
+    reg: *mut u64,
     definition: u64,
     live: u64,
     count: u64,
     base: u64,
 ) -> u64 {
-    create(header, registers, definition, live, count, base, false)
+    create(header, reg, definition, live, count, base, false)
 }
 
 /// Runtime helper of `i_create_native_record`.
 pub extern "C" fn arinsal_beamasm_create_record(
     header: *mut ProcessHeader,
-    registers: *mut SchedulerRegisters,
+    reg: *mut u64,
     id: u64,
     live: u64,
     count: u64,
     base: u64,
 ) -> u64 {
-    create(header, registers, id, live, count, base, true)
+    create(header, reg, id, live, count, base, true)
 }
 
 /// Port of erts/emulator/beam/erl_record.c:381-468 (erl_update_native_record), OTP-29.1.1.
 pub extern "C" fn arinsal_beamasm_update_record(
     header: *mut ProcessHeader,
-    registers: *mut SchedulerRegisters,
+    reg: *mut u64,
     source: u64,
     live: u64,
     count: u64,
     base: u64,
 ) -> u64 {
-    let Some((process, registers)) =
-        native_hooks::enter_runtime_reg(header, registers.cast::<u64>())
-    else {
+    let Some((process, registers)) = native_hooks::enter_runtime_reg(header, reg) else {
         return 0;
     };
     let (Ok(live), Ok(count), Ok(base)) = (
@@ -314,14 +310,12 @@ fn update_record(
 /// every key was found.
 pub extern "C" fn arinsal_beamasm_get_record_elements(
     header: *mut ProcessHeader,
-    registers: *mut SchedulerRegisters,
+    reg: *mut u64,
     source: u64,
     count: u64,
     base: u64,
 ) -> u64 {
-    let Some((process, registers)) =
-        native_hooks::enter_runtime_reg(header, registers.cast::<u64>())
-    else {
+    let Some((process, registers)) = native_hooks::enter_runtime_reg(header, reg) else {
         return 0;
     };
     let (Ok(count), Ok(base)) = (usize::try_from(count), usize::try_from(base)) else {

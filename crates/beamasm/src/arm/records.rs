@@ -3,7 +3,7 @@
 use arinsal_a64::enc::{Cond, Gpr};
 
 use crate::{
-    ProcessHeader, SchedulerRegisters, Update, emit_enter_runtime, emit_leave_runtime,
+    ProcessHeader, Update, emit_enter_runtime, emit_leave_runtime,
     module::{ArgVal, BeamModuleAssembler, ModuleError},
 };
 
@@ -40,16 +40,15 @@ pub type GetRecordFieldHook = extern "C" fn(*mut ProcessHeader, u64, u64, u64, u
 /// Runtime helper for record creation: process, registers, id (or definition literal), live
 /// registers, staged word count and the first staged X register. Zero means an error was set.
 pub type CreateNativeRecordHook =
-    extern "C" fn(*mut ProcessHeader, *mut SchedulerRegisters, u64, u64, u64, u64) -> u64;
+    extern "C" fn(*mut ProcessHeader, *mut u64, u64, u64, u64, u64) -> u64;
 /// Runtime helper for record element extraction: process, registers, record, key count and
 /// the first staged X register, which holds the keys on entry and the values on success.
 /// Zero means the operation failed.
-pub type GetRecordElementsHook =
-    extern "C" fn(*mut ProcessHeader, *mut SchedulerRegisters, u64, u64, u64) -> u64;
+pub type GetRecordElementsHook = extern "C" fn(*mut ProcessHeader, *mut u64, u64, u64, u64) -> u64;
 /// Runtime helper for native record updates, same arguments as [`CreateNativeRecordHook`] but
 /// receiving the source record.
 pub type UpdateNativeRecordHook =
-    extern "C" fn(*mut ProcessHeader, *mut SchedulerRegisters, u64, u64, u64, u64) -> u64;
+    extern "C" fn(*mut ProcessHeader, *mut u64, u64, u64, u64, u64) -> u64;
 
 /// Helpers corresponding to OTP's native record runtime entry points.
 #[derive(Clone, Copy)]

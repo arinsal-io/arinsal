@@ -31,19 +31,36 @@ const _: () = assert!(std::mem::offset_of!(ProcessHeader, fcalls) == 0x20);
 const _: () = assert!(std::mem::offset_of!(ProcessHeader, exc) == 0x28);
 const _: () = assert!(std::mem::offset_of!(ProcessHeader, catches) == 0x40);
 const _: () = assert!(std::mem::offset_of!(ProcessHeader, high_water) == 0x70);
-const _: () = assert!(std::mem::offset_of!(SchedulerRegisters, x_reg_array) == 0);
-
-/// Register backing storage addressed by BeamAsm's x19.
-#[repr(C)]
+/// Scheduler register file, erts `ErtsSchedulerRegisters`: the auxiliary registers first, in
+/// one cache line pair, then the X and float register arrays, then seldom-used data. The JIT's
+/// register base (x19 on arm64, rbx on x86-64) points at `x_reg_array`, so the auxiliary
+/// registers are reached with short negative displacements and X registers with
+/// `index * 8`; [`scheduler_reg_disp`] maps a field offset to that displacement.
+// Port of erts/emulator/beam/erl_process.h:626-685 (ErtsSchedulerRegisters), OTP-29.1.1.
+#[repr(C, align(64))]
 pub struct SchedulerRegisters {
-    /// X register array; x19 points to element zero. Typed like erts' `Eterm *reg`, so the
-    /// runtime hands BIFs `&reg[..arity]` as their arguments without a copy.
+    /// `aux_regs.d.runtime_stack`: on x86-64 the Erlang stack is the native stack, so native
+    /// code switches `rsp` back to the runtime (scheduler thread) stack held here before every
+    /// runtime call. Unused on arm64, where `E` is a separate register, as in erts.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp (getRuntimeStackRef), OTP-29.1.1.
+    pub runtime_stack: u64,
+    /// `aux_regs.d.TMP_MEM`: scratch words of instructions and fragments. erts has five; the
+    /// native bridge also keeps its exit marker (3), exit fragment (4), trace hook (5) and the
+    /// pc of a native error (6) here.
+    pub tmp_mem: [u64; 8],
+    /// `aux_regs.d.erl_bits_state`: binary construction cursor (`erts_current_bin`,
+    /// `erts_bin_offset`).
+    // Port of erts/emulator/beam/erl_bits.h:181 (struct erl_bits_state), OTP-29.1.1.
+    pub erl_bits_state: [u64; 2],
+    /// `aux_regs.align__`: pads the auxiliary registers to whole cache lines.
+    _aux_align: [u64; 5],
+    /// X register array; the JIT register base points to element zero. Typed like erts'
+    /// `Eterm *reg`, so the runtime hands BIFs `&reg[..arity]` as their arguments without a
+    /// copy.
     // Port of erts/emulator/beam/bif.h:33-40 (BIF_ARG_n is reg[n]), OTP-29.1.1.
     pub x_reg_array: [arinsal_term::Term; 1024],
     /// Floating point register array.
     pub f_reg_array: [f64; 1024],
-    /// Scratch words accessed by runtime fragments; word 6 records the pc of a native error.
-    pub tmp_mem: [u64; 8],
     /// Operands of a `bs_match` command for its runtime hook. They are kept out of the X
     /// register array, whose registers above the command's live count may still be in use.
     pub match_staging: [u64; 4],
@@ -63,46 +80,91 @@ pub struct SchedulerRegisters {
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:527-540, OTP-29.1.1: erts pushes the
     // call site's return address, behind which the BIF result is in XREG0.
     pub trap_return: u64,
-    /// Binary construction cursor (`erts_current_bin`, `erts_bin_offset`).
-    /// Appended after the frozen prefix so existing BeamAsm offsets stay put.
-    // Port of erts/emulator/beam/erl_bits.h:181 (struct erl_bits_state), OTP-29.1.1.
-    pub erl_bits_state: [u64; 2],
-    /// `aux_regs.d.runtime_stack`: on x86-64 the Erlang stack is the native stack, so native
-    /// code switches `rsp` back to the runtime (scheduler thread) stack held here before every
-    /// runtime call. Unused on arm64, where `E` is a separate register, as in erts.
-    // Port of erts/emulator/beam/erl_process.h (ErtsSchedulerRegisters.aux_regs.d.runtime_stack)
-    // and erts/emulator/beam/jit/x86/beam_asm.hpp (getRuntimeStackRef), OTP-29.1.1.
-    pub runtime_stack: u64,
 }
 
-/// Offset of `SchedulerRegisters::active_code_ix`, read by the native entry trampoline.
-pub const ACTIVE_CODE_IX_OFFSET: usize = std::mem::offset_of!(SchedulerRegisters, active_code_ix);
-const _: () = assert!(ACTIVE_CODE_IX_OFFSET == 16480);
+/// Offset of `x_reg_array`, the field the JIT register base points at.
+pub const X_REG_ARRAY_OFFSET: usize = std::mem::offset_of!(SchedulerRegisters, x_reg_array);
 
-/// Offset of `SchedulerRegisters::entry_return`, read by the native entry trampoline.
-pub const ENTRY_RETURN_OFFSET: usize = std::mem::offset_of!(SchedulerRegisters, entry_return);
-const _: () = assert!(ENTRY_RETURN_OFFSET == 16488);
+/// Displacement from the JIT register base (`x_reg_array`) of the field at `offset`.
+// Port of erts/emulator/beam/jit/x86/beam_asm.hpp:232-242 (getSchedulerRegRef), OTP-29.1.1.
+pub const fn scheduler_reg_disp(offset: usize) -> i32 {
+    offset as i32 - X_REG_ARRAY_OFFSET as i32
+}
 
-/// Offset of `SchedulerRegisters::trap_return`, read by the shared helper fragment.
-pub const TRAP_RETURN_OFFSET: usize = std::mem::offset_of!(SchedulerRegisters, trap_return);
-const _: () = assert!(TRAP_RETURN_OFFSET == 16496);
+/// Displacement of `tmp_mem[index]` from the JIT register base.
+pub const fn tmp_mem_disp(index: usize) -> i32 {
+    scheduler_reg_disp(std::mem::offset_of!(SchedulerRegisters, tmp_mem) + index * 8)
+}
 
-/// Offset of `SchedulerRegisters::runtime_stack`, the x86-64 runtime stack slot.
-pub const RUNTIME_STACK_OFFSET: usize = std::mem::offset_of!(SchedulerRegisters, runtime_stack);
-const _: () = assert!(RUNTIME_STACK_OFFSET == 16520);
+/// Displacement of `erl_bits_state` from the JIT register base.
+pub const ERL_BITS_STATE_DISP: i32 =
+    scheduler_reg_disp(std::mem::offset_of!(SchedulerRegisters, erl_bits_state));
+/// Displacement of `runtime_stack` from the JIT register base.
+pub const RUNTIME_STACK_DISP: i32 =
+    scheduler_reg_disp(std::mem::offset_of!(SchedulerRegisters, runtime_stack));
+/// Displacement of `f_reg_array` from the JIT register base.
+pub const F_REG_ARRAY_DISP: i32 =
+    scheduler_reg_disp(std::mem::offset_of!(SchedulerRegisters, f_reg_array));
+/// Displacement of `match_staging` from the JIT register base.
+pub const MATCH_STAGING_DISP: i32 =
+    scheduler_reg_disp(std::mem::offset_of!(SchedulerRegisters, match_staging));
+/// Displacement of `active_code_ix`, read by the native entry trampoline.
+pub const ACTIVE_CODE_IX_DISP: i32 =
+    scheduler_reg_disp(std::mem::offset_of!(SchedulerRegisters, active_code_ix));
+/// Displacement of `entry_return`, read by the native entry trampoline.
+pub const ENTRY_RETURN_DISP: i32 =
+    scheduler_reg_disp(std::mem::offset_of!(SchedulerRegisters, entry_return));
+/// Displacement of `trap_return`, read by the shared helper fragment.
+pub const TRAP_RETURN_DISP: i32 =
+    scheduler_reg_disp(std::mem::offset_of!(SchedulerRegisters, trap_return));
+
+// Port of erts/emulator/beam/jit/x86/beam_asm.hpp:236-239 (getSchedulerRegRef), OTP-29.1.1:
+// the whole aux_regs field is addressable with an 8-bit displacement from the register base.
+const _: () = {
+    assert!(X_REG_ARRAY_OFFSET <= 128);
+    assert!(X_REG_ARRAY_OFFSET.is_multiple_of(64));
+    assert!(RUNTIME_STACK_DISP == -128);
+    assert!(tmp_mem_disp(0) == -120);
+    assert!(ERL_BITS_STATE_DISP == -56);
+    assert!(F_REG_ARRAY_DISP == 8192);
+    assert!(MATCH_STAGING_DISP == 16384);
+    assert!(ACTIVE_CODE_IX_DISP == 16416);
+    assert!(ENTRY_RETURN_DISP == 16424);
+    assert!(TRAP_RETURN_DISP == 16432);
+};
+
+impl SchedulerRegisters {
+    /// The register file whose `x_reg_array` starts at `reg`, the `reg` pointer native code
+    /// passes to BIFs and runtime helpers (erts reaches the same struct through
+    /// `erts_proc_sched_data(c_p)->registers`).
+    pub fn from_reg<T>(reg: *mut T) -> *mut SchedulerRegisters {
+        reg.cast::<u8>()
+            .wrapping_sub(X_REG_ARRAY_OFFSET)
+            .cast::<SchedulerRegisters>()
+    }
+
+    /// The `reg` pointer (`x_reg_array`) native code addresses this register file through.
+    pub fn reg_ptr(registers: *mut SchedulerRegisters) -> *mut u64 {
+        registers
+            .cast::<u8>()
+            .wrapping_add(X_REG_ARRAY_OFFSET)
+            .cast::<u64>()
+    }
+}
 
 impl Default for SchedulerRegisters {
     fn default() -> Self {
         Self {
+            runtime_stack: 0,
+            tmp_mem: [0; 8],
+            erl_bits_state: [0, 0],
+            _aux_align: [0; 5],
             x_reg_array: [arinsal_term::Term::NIL; 1024],
             f_reg_array: [0.0; 1024],
-            tmp_mem: [0; 8],
             match_staging: [0; 4],
             active_code_ix: 0,
             entry_return: 0,
             trap_return: 0,
-            erl_bits_state: [0, 0],
-            runtime_stack: 0,
         }
     }
 }
@@ -137,7 +199,7 @@ const _: () = {
     assert!(core::mem::offset_of!(ProcessHeader, current) == 0x58);
     assert!(core::mem::offset_of!(ProcessHeader, flags) == 0x60);
     assert!(core::mem::offset_of!(ProcessHeader, self_pid) == 0x68);
-    assert!(core::mem::offset_of!(SchedulerRegisters, x_reg_array) == 0);
-    assert!(core::mem::offset_of!(SchedulerRegisters, f_reg_array) == 8192);
-    assert!(core::mem::offset_of!(SchedulerRegisters, tmp_mem) == 16384);
+    assert!(core::mem::offset_of!(SchedulerRegisters, x_reg_array) == 128);
+    assert!(core::mem::offset_of!(SchedulerRegisters, f_reg_array) == 8320);
+    assert!(core::mem::offset_of!(SchedulerRegisters, tmp_mem) == 8);
 };

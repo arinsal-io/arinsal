@@ -9,7 +9,7 @@ use arinsal_beamasm::{
 use arinsal_term::{ProcessHeap, Term, TermBuilder};
 
 thread_local! { static RESULT: Cell<u64> = const { Cell::new(0) }; static HASHMAP_VALUE: Cell<u64> = const { Cell::new(0) }; static HASHMAP_STAGE: Cell<u64> = const { Cell::new(0) }; }
-static ACTIVE_REGS: AtomicPtr<SchedulerRegisters> = AtomicPtr::new(std::ptr::null_mut());
+static ACTIVE_REGS: AtomicPtr<u64> = AtomicPtr::new(std::ptr::null_mut());
 
 extern "C" fn panic_get(_p: *mut ProcessHeader, _map: u64, _key: u64, _stage: u64) -> u64 {
     panic!("flatmap lookup must stay inline")
@@ -125,7 +125,10 @@ fn run(
     let mut regs = SchedulerRegisters::default();
     regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(regs0);
     regs.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(regs1);
-    ACTIVE_REGS.store(&mut regs, std::sync::atomic::Ordering::Relaxed);
+    ACTIVE_REGS.store(
+        SchedulerRegisters::reg_ptr(&mut regs),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let reason = enter_native(&mut header, &mut regs, &module.entry(1).unwrap());
     ACTIVE_REGS.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
     assert_eq!(reason, ExitReason::Returned);

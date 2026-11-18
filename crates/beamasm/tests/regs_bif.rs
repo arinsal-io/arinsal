@@ -65,7 +65,7 @@ fn record(process: *mut ProcessHeader) {
         SEEN_STOP.store(header.stop as usize, Ordering::Relaxed);
         SEEN_FCALLS.store(header.fcalls as usize, Ordering::Relaxed);
     });
-    let regs = SCHEDULER_REGS.load(Ordering::Relaxed) as *mut SchedulerRegisters;
+    let regs = SCHEDULER_REGS.load(Ordering::Relaxed) as *mut u64;
     arinsal_beamasm::rt::scheduler_registers_mut(regs, |registers| {
         for (index, seen) in SEEN_XREGS.iter().enumerate() {
             seen.store(

@@ -6,7 +6,10 @@
 //! Registers are named by their hardware number (the ModRM/REX encoding), as the x86-64
 //! encoder addresses them; `FCALLS` is the 32-bit view of its register, as in erts.
 
-use crate::{ProcessHeader, SchedulerRegisters};
+use crate::{
+    F_REG_ARRAY_DISP, ProcessHeader, RUNTIME_STACK_DISP, X_REG_ARRAY_OFFSET, scheduler_reg_disp,
+    tmp_mem_disp,
+};
 
 /// x86-64 general purpose register numbers.
 pub mod gp {
@@ -134,39 +137,26 @@ impl Update {
     }
 }
 
-const X_REG_OFFSET: usize = core::mem::offset_of!(SchedulerRegisters, x_reg_array);
-
-/// Displacement from `registers` of a `SchedulerRegisters` field at `offset`.
-// Port of erts/emulator/beam/jit/x86/beam_asm.hpp:232-242 (getSchedulerRegRef), OTP-29.1.1.
-pub const fn scheduler_reg_disp(offset: usize) -> i32 {
-    offset as i32 - X_REG_OFFSET as i32
-}
-
 /// Displacement from `registers` of X register `index` (`getXRef`).
 // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:252-258 (getXRef), OTP-29.1.1.
 pub const fn x_ref_disp(index: u32) -> i32 {
     assert!(index < 1024);
-    scheduler_reg_disp(X_REG_OFFSET + index as usize * 8)
+    scheduler_reg_disp(X_REG_ARRAY_OFFSET + index as usize * 8)
 }
 
 /// Displacement from `registers` of float register `index` (`getFRef`).
 // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:244-250 (getFRef), OTP-29.1.1.
 pub const fn f_ref_disp(index: u32) -> i32 {
     assert!(index < 1024);
-    scheduler_reg_disp(core::mem::offset_of!(SchedulerRegisters, f_reg_array) + index as usize * 8)
+    F_REG_ARRAY_DISP + index as i32 * 8
 }
 
 /// Displacement from `registers` of `TMP_MEM{index+1}q`.
 // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:183-207 (TMP_MEM1q..TMP_MEM5q), OTP-29.1.1.
-pub const fn tmp_mem_disp(index: u32) -> i32 {
+pub const fn tmp_mem_q_disp(index: u32) -> i32 {
     assert!(index < 5);
-    scheduler_reg_disp(core::mem::offset_of!(SchedulerRegisters, tmp_mem) + index as usize * 8)
+    tmp_mem_disp(index as usize)
 }
-
-/// Displacement from `registers` of the runtime stack slot (`getRuntimeStackRef`).
-// Port of erts/emulator/beam/jit/x86/beam_asm.hpp:212-216 (getRuntimeStackRef), OTP-29.1.1.
-pub const RUNTIME_STACK_DISP: i32 =
-    scheduler_reg_disp(core::mem::offset_of!(SchedulerRegisters, runtime_stack));
 
 /// Displacement from `E` of Y register `index` (`getYRef`). With `NATIVE_ERLANG_STACK` the
 /// return address sits above the Y registers, so Y0 is at `E` itself.
@@ -191,13 +181,12 @@ const _: () = {
         core::mem::offset_of!(ProcessHeader, stop) - core::mem::offset_of!(ProcessHeader, htop)
             == 8
     );
-    // `registers` points at x_reg_array, which every getXRef/getFRef/getSchedulerRegRef
-    // displacement above is relative to.
-    assert!(X_REG_OFFSET == 0);
+    // `registers` points at x_reg_array; the auxiliary registers before it take 8-bit
+    // displacements (getSchedulerRegRef's ERTS_CT_ASSERT(x_reg_offset <= 128)).
     assert!(x_ref_disp(0) == 0);
     assert!(f_ref_disp(0) == 8192);
-    assert!(tmp_mem_disp(0) == 16384);
-    assert!(RUNTIME_STACK_DISP == 16520);
+    assert!(tmp_mem_q_disp(4) >= -128 && tmp_mem_q_disp(4) < 0);
+    assert!(RUNTIME_STACK_DISP >= -128);
 };
 
 #[cfg(test)]
@@ -237,7 +226,7 @@ mod tests {
     fn stack_and_register_displacements() {
         assert_eq!(x_ref_disp(1023), 1023 * 8);
         assert_eq!(f_ref_disp(1), 8200);
-        assert_eq!(tmp_mem_disp(4), 16384 + 32);
+        assert_eq!(tmp_mem_q_disp(4), -120 + 32);
         assert_eq!(y_ref_disp(3), 24);
     }
 }

@@ -13,45 +13,28 @@ pub type BsInitWritableHelper = extern "C" fn(*mut crate::ProcessHeader, u64) ->
 
 /// Allocates the final bitstring and initializes `erl_bits_state` after the emitted GC check.
 pub type BsInitBitsHelper =
-    extern "C" fn(*mut crate::ProcessHeader, *mut crate::SchedulerRegisters, u64, u64, u64) -> u64;
+    extern "C" fn(*mut crate::ProcessHeader, *mut u64, u64, u64, u64) -> u64;
 
 /// A per-segment `erts_bs_put_*` equivalent writing at the current bit cursor.
-pub type BsPutSegmentHelper = extern "C" fn(
-    *mut crate::ProcessHeader,
-    *mut crate::SchedulerRegisters,
-    u64,
-    u64,
-    u64,
-    u64,
-    u64,
-) -> u64;
+pub type BsPutSegmentHelper =
+    extern "C" fn(*mut crate::ProcessHeader, *mut u64, u64, u64, u64, u64, u64) -> u64;
 
 /// `beam_jit_bs_bit_size` for a register or literal bitstring.
-pub type BsBitSizeHelper =
-    extern "C" fn(*mut crate::ProcessHeader, *mut crate::SchedulerRegisters, u64, u64) -> u64;
+pub type BsBitSizeHelper = extern "C" fn(*mut crate::ProcessHeader, *mut u64, u64, u64) -> u64;
 
 /// Size helper for UTF codepoint segments.
-pub type BsUtfSizeHelper =
-    extern "C" fn(*mut crate::ProcessHeader, *mut crate::SchedulerRegisters, u64, u64) -> u64;
+pub type BsUtfSizeHelper = extern "C" fn(*mut crate::ProcessHeader, *mut u64, u64, u64) -> u64;
 
 /// Builds the extended failure information for a failed construction segment.
-pub type BsFailHelper =
-    extern "C" fn(*mut crate::ProcessHeader, *mut crate::SchedulerRegisters, u64, u64, u64) -> u64;
+pub type BsFailHelper = extern "C" fn(*mut crate::ProcessHeader, *mut u64, u64, u64, u64) -> u64;
 
 /// Checked append allocation helper from `erts_bs_append_checked`.
-pub type BsAppendCheckedHelper = extern "C" fn(
-    *mut crate::ProcessHeader,
-    *mut crate::SchedulerRegisters,
-    u64,
-    u64,
-    u64,
-    u64,
-    u64,
-) -> u64;
+pub type BsAppendCheckedHelper =
+    extern "C" fn(*mut crate::ProcessHeader, *mut u64, u64, u64, u64, u64, u64) -> u64;
 
 /// Checked private append helper from `erts_bs_private_append_checked`.
 pub type BsPrivateAppendHelper =
-    extern "C" fn(*mut crate::ProcessHeader, *mut crate::SchedulerRegisters, u64, u64) -> u64;
+    extern "C" fn(*mut crate::ProcessHeader, *mut u64, u64, u64) -> u64;
 
 /// Runtime primitives used by the generic `bs_create_bin` emitter.
 #[derive(Clone, Copy)]
@@ -141,9 +124,8 @@ const BITS: Gpr = Gpr::x(10);
 const SEG_BITS: Gpr = Gpr::x(11);
 const SCRATCH: Gpr = Gpr::x(12);
 const RELOADED_ARG: Gpr = Gpr::x(9);
-const TMP_MEMORY: u32 = std::mem::offset_of!(crate::SchedulerRegisters, tmp_mem) as u32;
-const SAVED_BITS: u32 = TMP_MEMORY;
-const SAVED_RESULT: u32 = TMP_MEMORY + 8;
+const SAVED_BITS: i16 = crate::tmp_mem_disp(0) as i16;
+const SAVED_RESULT: i16 = crate::tmp_mem_disp(1) as i16;
 
 #[derive(Clone, Copy)]
 struct SegmentFailureLabels {
@@ -286,7 +268,7 @@ fn emit_bs_create_bin_generic(
     }
 
     asm.code
-        .emit(|e| e.str_uoff(BITS, SCHEDULER_REGS, SAVED_BITS))?;
+        .emit(|e| e.stur(BITS, SCHEDULER_REGS, SAVED_BITS))?;
     asm.code.emit(|e| {
         e.mov_const(Gpr::x(3), u64::from(alloc))?;
         e.mov_const(Gpr::x(4), u64::from(live))
@@ -332,12 +314,12 @@ fn emit_bs_create_bin_generic(
         }
         asm.code.b(route_failure)?;
         asm.code.bind(append_ok)?;
-        let bits_state = std::mem::offset_of!(crate::SchedulerRegisters, erl_bits_state) as u32;
+        let bits_state = crate::ERL_BITS_STATE_DISP as i16;
         asm.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(8), SCHEDULER_REGS, bits_state + 8)?;
-            e.ldr_uoff(BITS, SCHEDULER_REGS, SAVED_BITS)?;
+            e.ldur(Gpr::x(8), SCHEDULER_REGS, bits_state + 8)?;
+            e.ldur(BITS, SCHEDULER_REGS, SAVED_BITS)?;
             e.add_reg(BITS, BITS, Gpr::x(8), Shift::Lsl, 0)?;
-            e.str_uoff(BITS, SCHEDULER_REGS, SAVED_BITS)
+            e.stur(BITS, SCHEDULER_REGS, SAVED_BITS)
         })?;
     } else if let Some(segment) = segments
         .first()
@@ -355,13 +337,13 @@ fn emit_bs_create_bin_generic(
         )?;
         asm.code.cbz(Gpr::x(0), route_failure)?;
         asm.code
-            .emit(|e| e.str_uoff(Gpr::x(0), SCHEDULER_REGS, SAVED_RESULT))?;
-        let bits_state = std::mem::offset_of!(crate::SchedulerRegisters, erl_bits_state) as u32;
+            .emit(|e| e.stur(Gpr::x(0), SCHEDULER_REGS, SAVED_RESULT))?;
+        let bits_state = crate::ERL_BITS_STATE_DISP as i16;
         asm.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(8), SCHEDULER_REGS, bits_state + 8)?;
-            e.ldr_uoff(BITS, SCHEDULER_REGS, SAVED_BITS)?;
+            e.ldur(Gpr::x(8), SCHEDULER_REGS, bits_state + 8)?;
+            e.ldur(BITS, SCHEDULER_REGS, SAVED_BITS)?;
             e.add_reg(BITS, BITS, Gpr::x(8), Shift::Lsl, 0)?;
-            e.str_uoff(BITS, SCHEDULER_REGS, SAVED_BITS)
+            e.stur(BITS, SCHEDULER_REGS, SAVED_BITS)
         })?;
     } else {
         emit_bs_helper_call(
@@ -376,7 +358,7 @@ fn emit_bs_create_bin_generic(
     }
     asm.code.cbz(Gpr::x(0), route_failure)?;
     asm.code
-        .emit(|e| e.str_uoff(Gpr::x(0), SCHEDULER_REGS, SAVED_RESULT))?;
+        .emit(|e| e.stur(Gpr::x(0), SCHEDULER_REGS, SAVED_RESULT))?;
 
     for (segment, &segment_failures) in segments.iter().zip(&failures) {
         if matches!(
@@ -404,7 +386,7 @@ fn emit_bs_create_bin_generic(
             e.mov_reg(Gpr::x(3), SEG_BITS)?;
             e.mov_const(Gpr::x(4), metadata)?;
             e.mov_const(Gpr::x(5), u64::from(segment.index))?;
-            e.ldr_uoff(Gpr::x(6), SCHEDULER_REGS, SAVED_BITS)
+            e.ldur(Gpr::x(6), SCHEDULER_REGS, SAVED_BITS)
         })?;
         emit_bs_helper_call(
             asm,
@@ -416,8 +398,8 @@ fn emit_bs_create_bin_generic(
         asm.code.cbz(Gpr::x(0), route_failure)?;
     }
     asm.code.emit(|e| {
-        e.ldr_uoff(Gpr::x(0), SCHEDULER_REGS, SAVED_RESULT)?;
-        e.str_uoff(Gpr::xzr(), SCHEDULER_REGS, SAVED_RESULT)
+        e.ldur(Gpr::x(0), SCHEDULER_REGS, SAVED_RESULT)?;
+        e.stur(Gpr::xzr(), SCHEDULER_REGS, SAVED_RESULT)
     })?;
     asm.store_register(dst, Gpr::x(0))?;
     asm.code.b(success)?;
@@ -578,7 +560,7 @@ fn emit_segment_size(
         };
         if accumulate {
             asm.code
-                .emit(|e| e.str_uoff(BITS, SCHEDULER_REGS, SAVED_BITS))?;
+                .emit(|e| e.stur(BITS, SCHEDULER_REGS, SAVED_BITS))?;
         }
         asm.code
             .emit(|e| e.mov_const(Gpr::x(3), u64::from(segment.index)))?;
@@ -597,7 +579,7 @@ fn emit_segment_size(
         asm.code.emit(|e| e.mov_reg(SEG_BITS, Gpr::x(0)))?;
         if accumulate {
             asm.code
-                .emit(|e| e.ldr_uoff(BITS, SCHEDULER_REGS, SAVED_BITS))?;
+                .emit(|e| e.ldur(BITS, SCHEDULER_REGS, SAVED_BITS))?;
             asm.code
                 .emit(|e| e.adds_reg(BITS, BITS, SEG_BITS, Shift::Lsl, 0))?;
             branch_if_condition(asm, Cond::Cs, failures.system_limit)?;
@@ -613,7 +595,7 @@ fn emit_segment_size(
         };
         if accumulate {
             asm.code
-                .emit(|e| e.str_uoff(BITS, SCHEDULER_REGS, SAVED_BITS))?;
+                .emit(|e| e.stur(BITS, SCHEDULER_REGS, SAVED_BITS))?;
         }
         asm.code
             .emit(|e| e.mov_const(Gpr::x(3), u64::from(segment.index)))?;
@@ -632,7 +614,7 @@ fn emit_segment_size(
         asm.code.emit(|e| e.mov_reg(SEG_BITS, Gpr::x(0)))?;
         if accumulate {
             asm.code
-                .emit(|e| e.ldr_uoff(BITS, SCHEDULER_REGS, SAVED_BITS))?;
+                .emit(|e| e.ldur(BITS, SCHEDULER_REGS, SAVED_BITS))?;
             asm.code
                 .emit(|e| e.adds_reg(BITS, BITS, SEG_BITS, Shift::Lsl, 0))?;
             branch_if_condition(asm, Cond::Cs, failures.system_limit)?;

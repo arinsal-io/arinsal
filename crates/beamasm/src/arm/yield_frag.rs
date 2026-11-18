@@ -80,7 +80,7 @@ impl YieldFragments {
         .map_err(fail)?;
         code.emit(|e| {
             e.mov_const(Gpr::x(0), 1)?;
-            e.str_uoff(Gpr::x(0), SCHEDULER_REGS, 16_408)?;
+            e.stur(Gpr::x(0), SCHEDULER_REGS, crate::tmp_mem_disp(3) as i16)?;
             e.mov_const(Gpr::x(30), arinsal_enter_native_return as *const () as u64)?;
             e.ret(Gpr::x(30))
         })

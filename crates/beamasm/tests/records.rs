@@ -44,7 +44,7 @@ extern "C" fn get_field(
 
 extern "C" fn create_record(
     _header: *mut ProcessHeader,
-    regs: *mut SchedulerRegisters,
+    regs: *mut u64,
     _id: u64,
     _live: u64,
     count: u64,
@@ -56,7 +56,7 @@ extern "C" fn create_record(
 
 extern "C" fn get_elements(
     _header: *mut ProcessHeader,
-    regs: *mut SchedulerRegisters,
+    regs: *mut u64,
     source: u64,
     _count: u64,
     start: u64,
@@ -73,7 +73,7 @@ extern "C" fn get_elements(
 
 extern "C" fn update_record(
     _header: *mut ProcessHeader,
-    regs: *mut SchedulerRegisters,
+    regs: *mut u64,
     source: u64,
     _live: u64,
     count: u64,
@@ -88,7 +88,7 @@ extern "C" fn update_record(
     build_record(Term::small((value as i64) >> 4).unwrap())
 }
 
-fn staged_value(regs: *mut SchedulerRegisters, count: u64, start: u64) -> Option<u64> {
+fn staged_value(regs: *mut u64, count: u64, start: u64) -> Option<u64> {
     if count == 0 {
         return None;
     }

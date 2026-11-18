@@ -15,7 +15,7 @@ use std::cmp::Ordering;
 /// The pointers must be the active process header and scheduler registers.
 pub extern "C" fn arinsal_beamasm_map_lookup(
     header: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _reg: *mut u64,
     map: u64,
     key: u64,
     _hash: u64,
@@ -59,7 +59,7 @@ pub extern "C" fn arinsal_beamasm_guard3(
 /// The pointers must refer to the active process header and scheduler registers.
 pub extern "C" fn arinsal_beamasm_bif_mfa(
     header: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _reg: *mut u64,
     _module: u64,
     _function: u64,
     _arity: u64,
@@ -96,8 +96,8 @@ pub(crate) fn enter_runtime_reg<'a>(
 ) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
     let process = process_from_header(header)?;
     process.heap.note_bif_entry();
-    // `x_reg_array` is the first field of the `repr(C)` register file, so `reg` is its address.
-    scheduler_registers_at(process, reg.cast::<SchedulerRegisters>())
+    // `reg` is the register file's `x_reg_array`, which the JIT register base points at.
+    scheduler_registers_at(process, SchedulerRegisters::from_reg(reg))
 }
 
 /// [`enter_runtime_reg`] for the collection that follows a BIF: it must not take a new
@@ -107,7 +107,7 @@ pub(crate) fn enter_runtime_after_bif<'a>(
     reg: *mut u64,
 ) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
     let process = process_from_header(header)?;
-    scheduler_registers_at(process, reg.cast::<SchedulerRegisters>())
+    scheduler_registers_at(process, SchedulerRegisters::from_reg(reg))
 }
 
 /// Process and register base passed by a BeamAsm helper that already has `x19`'s reg pointer.
@@ -126,7 +126,7 @@ pub(crate) fn enter_runtime_with_registers<'a>(
 // TMP_MEM1q, passed as ARG3), OTP-29.1.1.
 pub(crate) fn note_call_site(process: &mut Process, reg: *mut u64) {
     if let Some((process, registers)) =
-        scheduler_registers_at(process, reg.cast::<SchedulerRegisters>())
+        scheduler_registers_at(process, SchedulerRegisters::from_reg(reg))
     {
         process.native_call_pc = registers.tmp_mem[6] as usize;
     }
@@ -792,14 +792,15 @@ pub(crate) fn collect_native(
 /// pointers supplied by generated BeamAsm code.
 pub unsafe extern "C" fn arinsal_beamasm_gc(
     header: *mut ProcessHeader,
-    registers: *mut SchedulerRegisters,
+    reg: *mut u64,
     need_words: usize,
     live: usize,
     _fcalls: i32,
 ) -> i32 {
-    if header.is_null() || registers.is_null() {
+    if header.is_null() || reg.is_null() {
         return 0;
     }
+    let registers = SchedulerRegisters::from_reg(reg);
     // SAFETY: ProcessHeader is at offset zero and both pointers are published by the native bridge.
     let process = unsafe { &mut *header.cast::<Process>() };
     // SAFETY: The scheduler register pointer is live for the current native call.

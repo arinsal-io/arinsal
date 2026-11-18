@@ -219,11 +219,13 @@ impl ArgRegs {
     }
 
     /// The scheduler register file the X array belongs to while attached, null otherwise.
-    /// `x_reg_array` is the first field of the `repr(C)` struct, so its address is the
-    /// struct's. Port of `esdp->registers` (erts reaches it through `esdp`, not `c_p`).
+    /// Port of `esdp->registers` (erts reaches it through `esdp`, not `c_p`).
     #[inline]
     pub fn scheduler_registers(&self) -> *mut arinsal_beamasm::SchedulerRegisters {
-        self.attached as *mut arinsal_beamasm::SchedulerRegisters
+        if self.attached == 0 {
+            return std::ptr::null_mut();
+        }
+        arinsal_beamasm::SchedulerRegisters::from_reg(self.attached as *mut u64)
     }
 
     /// The scheduler's float register array while attached (`f_reg_array`, 1024 long), or

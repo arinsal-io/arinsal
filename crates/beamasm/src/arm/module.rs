@@ -17,11 +17,11 @@ const E: Gpr = Gpr::x(20);
 const FCALLS: Gpr = Gpr::w(22);
 const C_P: Gpr = Gpr::x(21);
 const SCHEDULER_REGS: Gpr = Gpr::x(19);
-const TMP_MEM_ARITH_ARGS: u32 = 16_384;
-const TMP_MEM_ARITH_MUL_ADD_PRODUCT: u32 = TMP_MEM_ARITH_ARGS + 16;
+const TMP_MEM_ARITH_ARGS: i16 = crate::tmp_mem_disp(0) as i16;
+const TMP_MEM_ARITH_MUL_ADD_PRODUCT: i16 = crate::tmp_mem_disp(2) as i16;
 // tmp_mem[7]: tmp_mem[3] (ARITH_ARGS + 24) is the native exit marker, which a stored addend
 // would turn into a bogus exit kind when the raise is caught.
-const TMP_MEM_ARITH_MUL_ADDEND: u32 = TMP_MEM_ARITH_ARGS + 56;
+const TMP_MEM_ARITH_MUL_ADDEND: i16 = crate::tmp_mem_disp(7) as i16;
 const XREGS: [Gpr; 6] = [
     Gpr::x(25),
     Gpr::x(26),
@@ -304,7 +304,7 @@ pub const FUNC_INFO_BYTES: usize = 40;
 
 type BsColdEmit = Box<dyn FnOnce(&mut BeamModuleAssembler) -> Result<(), ModuleError>>;
 /// `tmp_mem[6]`: the native pc an exception is attributed to.
-const NATIVE_ERROR_PC_SLOT: u32 = 16_432;
+const NATIVE_ERROR_PC_SLOT: i16 = crate::tmp_mem_disp(6) as i16;
 /// Low bit of a recorded native error pc that is a call's return address (code is 4-aligned).
 pub const RETURN_SITE_TAG: usize = 1;
 
@@ -925,7 +925,7 @@ impl BeamModuleAssembler {
         self.code.bind(call_site)?;
         self.code.adr(Gpr::x(9), call_site)?;
         self.code
-            .emit(|e| e.str_uoff(Gpr::x(9), SCHEDULER_REGS, NATIVE_ERROR_PC_SLOT))?;
+            .emit(|e| e.stur(Gpr::x(9), SCHEDULER_REGS, NATIVE_ERROR_PC_SLOT))?;
         Ok(())
     }
 
@@ -937,7 +937,7 @@ impl BeamModuleAssembler {
         self.code.adr(Gpr::x(9), ret)?;
         self.code.emit(|e| {
             e.orr_imm(Gpr::x(9), Gpr::x(9), RETURN_SITE_TAG as u64)?;
-            e.str_uoff(Gpr::x(9), SCHEDULER_REGS, NATIVE_ERROR_PC_SLOT)
+            e.stur(Gpr::x(9), SCHEDULER_REGS, NATIVE_ERROR_PC_SLOT)
         })?;
         Ok(())
     }
@@ -1132,8 +1132,8 @@ impl BeamModuleAssembler {
         self.code.emit(|e| {
             // Preserve the BEAM call arguments before returning the interpreter
             // call target to the scheduler in x0/x1.
-            e.str_uoff(XREGS[0], SCHEDULER_REGS, 16_384)?;
-            e.str_uoff(XREGS[1], SCHEDULER_REGS, 16_392)?;
+            e.stur(XREGS[0], SCHEDULER_REGS, crate::tmp_mem_disp(0) as i16)?;
+            e.stur(XREGS[1], SCHEDULER_REGS, crate::tmp_mem_disp(1) as i16)?;
             Ok(())
         })?;
         self.code.adr(Gpr::x(2), continuation)?;
@@ -1147,7 +1147,7 @@ impl BeamModuleAssembler {
         self.code.emit(|e| {
             e.mov_const(Gpr::x(1), target_pc as u64)?;
             e.mov_const(Gpr::x(0), 2)?;
-            e.str_uoff(Gpr::x(0), SCHEDULER_REGS, 16_408)?;
+            e.stur(Gpr::x(0), SCHEDULER_REGS, crate::tmp_mem_disp(3) as i16)?;
             e.ret(Gpr::x(30))
         })?;
         self.code.bind(continuation)?;
@@ -2180,7 +2180,7 @@ impl BeamModuleAssembler {
                 crate::dispatch::DIRTY_NIF_DISPATCH_IDENTITY as u64,
             )?;
             e.mov_const(Gpr::x(0), 2)?;
-            e.str_uoff(Gpr::x(0), SCHEDULER_REGS, 16_408)?;
+            e.stur(Gpr::x(0), SCHEDULER_REGS, crate::tmp_mem_disp(3) as i16)?;
             e.mov_const(Gpr::x(17), arinsal_enter_native_return as *const () as u64)?;
             e.br(Gpr::x(17))
         })?;
@@ -2398,13 +2398,13 @@ impl BeamModuleAssembler {
                 // (`emit_plus_body_shared`), OTP-29.1.1: keep source args in TMP_MEM1q while
                 // the shared helper runs, and restore them only when it raises.
                 self.code.emit(|e| {
-                    e.str_uoff(Gpr::x(14), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS)?;
+                    e.stur(Gpr::x(14), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS)?;
                     if !unary {
-                        e.str_uoff(Gpr::x(17), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS + 8)?;
+                        e.stur(Gpr::x(17), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS + 8)?;
                     }
                     if op & 0xff == 13 {
                         // Port of beam_asm.hpp TMP_MEM4q in `emit_mul_add_body_shared`.
-                        e.str_uoff(Gpr::x(3), SCHEDULER_REGS, TMP_MEM_ARITH_MUL_ADDEND)?;
+                        e.stur(Gpr::x(3), SCHEDULER_REGS, TMP_MEM_ARITH_MUL_ADDEND)?;
                     }
                     Ok(())
                 })?;
@@ -2442,12 +2442,12 @@ impl BeamModuleAssembler {
                     // a product failure names `times/2`; otherwise the failing stage is `plus/2`.
                     let multiply_failed = self.code.new_label();
                     self.code.emit(|e| {
-                        e.ldr_uoff(Gpr::x(12), SCHEDULER_REGS, TMP_MEM_ARITH_MUL_ADD_PRODUCT)
+                        e.ldur(Gpr::x(12), SCHEDULER_REGS, TMP_MEM_ARITH_MUL_ADD_PRODUCT)
                     })?;
                     self.code.cbz(Gpr::x(12), multiply_failed)?;
                     self.code.emit(|e| {
                         e.mov_reg(Gpr::x(25), Gpr::x(12))?;
-                        e.ldr_uoff(Gpr::x(26), SCHEDULER_REGS, TMP_MEM_ARITH_MUL_ADDEND)?;
+                        e.ldur(Gpr::x(26), SCHEDULER_REGS, TMP_MEM_ARITH_MUL_ADDEND)?;
                         e.mov_const(
                             Gpr::x(3),
                             std::ptr::from_ref(&crate::bif::ERLANG_PLUS_MFA) as u64,
@@ -2456,8 +2456,8 @@ impl BeamModuleAssembler {
                     self.code.b(self.error_label)?;
                     self.code.bind(multiply_failed)?;
                     self.code.emit(|e| {
-                        e.ldr_uoff(Gpr::x(25), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS)?;
-                        e.ldr_uoff(Gpr::x(26), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS + 8)?;
+                        e.ldur(Gpr::x(25), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS)?;
+                        e.ldur(Gpr::x(26), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS + 8)?;
                         e.mov_const(
                             Gpr::x(3),
                             std::ptr::from_ref(&crate::bif::ERLANG_TIMES_MFA) as u64,
@@ -2466,10 +2466,10 @@ impl BeamModuleAssembler {
                     self.code.b(self.error_label)?;
                 } else {
                     self.code.emit(|e| {
-                        e.ldr_uoff(Gpr::x(10), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS)?;
+                        e.ldur(Gpr::x(10), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS)?;
                         e.mov_reg(Gpr::x(25), Gpr::x(10))?;
                         if !unary {
-                            e.ldr_uoff(Gpr::x(11), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS + 8)?;
+                            e.ldur(Gpr::x(11), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS + 8)?;
                             e.mov_reg(Gpr::x(26), Gpr::x(11))?;
                         }
                         if bif_mfa == 0 {
@@ -2504,7 +2504,7 @@ impl BeamModuleAssembler {
             )?;
             self.code.emit(|e| {
                 e.mov_const(Gpr::x(0), 1)?;
-                e.str_uoff(Gpr::x(0), SCHEDULER_REGS, 16_408)?;
+                e.stur(Gpr::x(0), SCHEDULER_REGS, crate::tmp_mem_disp(3) as i16)?;
                 e.mov_const(Gpr::x(30), arinsal_enter_native_return as *const () as u64)?;
                 e.ret(Gpr::x(30))
             })?;
@@ -2516,7 +2516,7 @@ impl BeamModuleAssembler {
         // returning to the scheduler.
         self.code.emit(|e| {
             e.str_pre(Gpr::x(30), E, -8)?;
-            e.str_uoff(Gpr::x(30), SCHEDULER_REGS, NATIVE_ERROR_PC_SLOT)
+            e.stur(Gpr::x(30), SCHEDULER_REGS, NATIVE_ERROR_PC_SLOT)
         })?;
         let error_update = crate::Update::HEAP_ALLOC.union(crate::Update::X_REGS);
         crate::emit_enter_runtime(&mut self.code, 6, error_update)?;
@@ -2537,7 +2537,7 @@ impl BeamModuleAssembler {
         }
         self.code.bind(scheduler_exit)?;
         self.code.emit(|e| {
-            e.str_uoff(Gpr::xzr(), SCHEDULER_REGS, 16_408)?;
+            e.stur(Gpr::xzr(), SCHEDULER_REGS, crate::tmp_mem_disp(3) as i16)?;
             e.mov_const(Gpr::x(30), arinsal_enter_native_return as *const () as u64)?;
             e.br(Gpr::x(30))
         })?;
@@ -2704,10 +2704,7 @@ fn has_lse_at_runtime() -> bool {
 mod runtime_sync_tests {
     use super::*;
 
-    extern "C" fn update_runtime_state(
-        header: *mut crate::ProcessHeader,
-        registers: *mut crate::SchedulerRegisters,
-    ) {
+    extern "C" fn update_runtime_state(header: *mut crate::ProcessHeader, registers: *mut u64) {
         crate::rt::process_header_mut(header, |header| {
             header.htop = 0x1234usize as *mut u64;
             header.stop = 0x5678usize as *mut u64;

@@ -3,7 +3,7 @@
 use arinsal_a64::enc::{Cond, Gpr, VecReg};
 
 use crate::{
-    ProcessHeader, SchedulerRegisters,
+    ProcessHeader,
     module::{ArgVal, BeamModuleAssembler, ModuleError},
 };
 
@@ -38,8 +38,7 @@ const MAX_REGISTER_X: usize = 6;
 
 /// GC callback used by emitted heap checks. It receives the raw allocation
 /// need and the live X register count; the reserve belongs to the heap check.
-pub type GcHook =
-    unsafe extern "C" fn(*mut ProcessHeader, *mut SchedulerRegisters, usize, usize, i32) -> i32;
+pub type GcHook = unsafe extern "C" fn(*mut ProcessHeader, *mut u64, usize, usize, i32) -> i32;
 
 impl BeamModuleAssembler {
     /// Builds a cons cell in the young heap and writes its tagged list pointer.

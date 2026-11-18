@@ -228,7 +228,7 @@ extern "C" fn map_update_helper(
 
 extern "C" fn bs_create_bin_init(
     _process: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _registers: *mut u64,
     _bits: u64,
     _alloc: u64,
     _live: u64,
@@ -238,7 +238,7 @@ extern "C" fn bs_create_bin_init(
 
 extern "C" fn bs_create_bin_append(
     _process: *mut arinsal_beamasm::ProcessHeader,
-    _registers: *mut arinsal_beamasm::SchedulerRegisters,
+    _registers: *mut u64,
     _source: u64,
     _bits: u64,
     _unit: u64,
@@ -250,7 +250,7 @@ extern "C" fn bs_create_bin_append(
 
 extern "C" fn bs_create_bin_private_append(
     _process: *mut arinsal_beamasm::ProcessHeader,
-    _registers: *mut arinsal_beamasm::SchedulerRegisters,
+    _registers: *mut u64,
     _source: u64,
     _bits: u64,
 ) -> u64 {
@@ -259,7 +259,7 @@ extern "C" fn bs_create_bin_private_append(
 
 extern "C" fn bs_create_bin_size(
     _process: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _registers: *mut u64,
     _source: u64,
     _index: u64,
 ) -> u64 {
@@ -268,7 +268,7 @@ extern "C" fn bs_create_bin_size(
 
 extern "C" fn bs_create_bin_fail(
     _process: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _registers: *mut u64,
     _packed: u64,
     _arg3: u64,
     _arg1: u64,
@@ -278,7 +278,7 @@ extern "C" fn bs_create_bin_fail(
 
 extern "C" fn bs_create_bin_put(
     _process: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _registers: *mut u64,
     _source: u64,
     _bits: u64,
     _flags: u64,
@@ -290,7 +290,7 @@ extern "C" fn bs_create_bin_put(
 
 extern "C" fn exception_resolver(
     _process: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _registers: *mut u64,
     _stack: *mut u64,
     _bif_info: u64,
 ) -> usize {
@@ -308,7 +308,7 @@ extern "C" fn fun_resolver(
 
 extern "C" fn map_lookup_helper(
     _process: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _registers: *mut u64,
     _map: u64,
     key: u64,
     _hash: u64,
@@ -320,7 +320,7 @@ extern "C" fn map_lookup_helper(
 
 extern "C" fn bif_mfa_helper(
     _process: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _registers: *mut u64,
     _module: u64,
     _function: u64,
     _arity: u64,
@@ -360,7 +360,7 @@ extern "C" fn guard_helper3(
 
 extern "C" fn gc_hook(
     _header: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _registers: *mut u64,
     _words: usize,
     _live: usize,
     _fcalls: i32,

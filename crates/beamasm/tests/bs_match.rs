@@ -36,7 +36,7 @@ extern "C" fn match_helper(
 
 extern "C" fn gc_helper(
     _header: *mut ProcessHeader,
-    _registers: *mut SchedulerRegisters,
+    _registers: *mut u64,
     _need_words: usize,
     _live: usize,
     _fcalls: i32,

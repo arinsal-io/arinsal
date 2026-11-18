@@ -34,7 +34,7 @@ enum TargetFrame {
     Keep,
 }
 
-static ACTIVE_REGS: AtomicPtr<SchedulerRegisters> = AtomicPtr::new(std::ptr::null_mut());
+static ACTIVE_REGS: AtomicPtr<u64> = AtomicPtr::new(std::ptr::null_mut());
 static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 static ASSERTION_INDEX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -94,7 +94,7 @@ extern "C" fn record_get(process: *mut ProcessHeader, _: u64, _: u64, _: u64, _:
 
 extern "C" fn record_create(
     process: *mut ProcessHeader,
-    _: *mut SchedulerRegisters,
+    _: *mut u64,
     _: u64,
     _: u64,
     _: u64,
@@ -106,7 +106,7 @@ extern "C" fn record_create(
 
 extern "C" fn record_get_elements(
     process: *mut ProcessHeader,
-    registers: *mut SchedulerRegisters,
+    registers: *mut u64,
     _: u64,
     _: u64,
     base: u64,
@@ -120,7 +120,7 @@ extern "C" fn record_get_elements(
 
 extern "C" fn record_update(
     process: *mut ProcessHeader,
-    _: *mut SchedulerRegisters,
+    _: *mut u64,
     _: u64,
     _: u64,
     _: u64,
@@ -229,7 +229,7 @@ fn run(
     };
     let mut regs = SchedulerRegisters::default();
     rt::set_fixture_words(&mut regs.x_reg_array[..6], &initial);
-    ACTIVE_REGS.store(&mut regs, Ordering::Relaxed);
+    ACTIVE_REGS.store(SchedulerRegisters::reg_ptr(&mut regs), Ordering::Relaxed);
     assert_eq!(
         enter_native(&mut header, &mut regs, &module.entry(1).unwrap()),
         ExitReason::Returned

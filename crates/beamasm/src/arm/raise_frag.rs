@@ -28,8 +28,8 @@ const PROCESS_FREASON: u32 = 40;
 const PROCESS_FVALUE: u32 = 48;
 const PROCESS_I: u32 = 72;
 const PROCESS_HTOP_STOP: u32 = 8;
-const NATIVE_ERROR_PC_SLOT: u32 = 16_432;
-const SCHEDULER_RETURN_SLOT: u32 = 16_416;
+const NATIVE_ERROR_PC_SLOT: i16 = crate::tmp_mem_disp(6) as i16;
+const SCHEDULER_RETURN_SLOT: i16 = crate::tmp_mem_disp(4) as i16;
 
 /// Exception fragments: `raise_shared` (the `raise/2` instruction) and `raise_exception`.
 pub struct RaiseFragments {
@@ -85,7 +85,7 @@ impl RaiseFragments {
             // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp,
             // OTP-29.1.1: the fake CP makes a catch in the raising frame visible to handle_error.
             e.str_pre(Gpr::x(30), E, -8)?;
-            e.str_uoff(Gpr::x(30), SCHEDULER_REGS, NATIVE_ERROR_PC_SLOT)
+            e.stur(Gpr::x(30), SCHEDULER_REGS, NATIVE_ERROR_PC_SLOT)
         })
         .map_err(fail)?;
         let update = Update::HEAP_ALLOC.union(Update::X_REGS);
@@ -107,7 +107,7 @@ impl RaiseFragments {
         code.cbnz(ARG1, caught).map_err(fail)?;
         code.emit(|e| {
             e.mov_reg(ARG1, Gpr::xzr())?;
-            e.ldr_uoff(Gpr::x(30), SCHEDULER_REGS, SCHEDULER_RETURN_SLOT)?;
+            e.ldur(Gpr::x(30), SCHEDULER_REGS, SCHEDULER_RETURN_SLOT)?;
             e.br(Gpr::x(30))
         })
         .map_err(fail)?;

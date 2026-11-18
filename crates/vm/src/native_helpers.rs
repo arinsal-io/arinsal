@@ -972,14 +972,12 @@ pub extern "C" fn arinsal_beamasm_native_trace_return(
 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:90-122 and beam_asm_global.cpp:102-140, OTP-29.1.1.
 pub extern "C" fn arinsal_beamasm_gc_sync(
     header: *mut ProcessHeader,
-    scheduler_registers: *mut arinsal_beamasm::SchedulerRegisters,
+    reg: *mut u64,
     need_words: usize,
     live: usize,
     fcalls: i32,
 ) -> i32 {
-    let Some((process, registers)) =
-        crate::native_hooks::enter_runtime_reg(header, scheduler_registers.cast::<u64>())
-    else {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
         return 0;
     };
     // The generated code holds FCALLS in a register; a delayed collection reads what is left.
@@ -2338,7 +2336,7 @@ fn take_explicit_raise(process: &mut crate::Process) -> Option<Term> {
 /// handler executes `build_stacktrace`.
 pub extern "C" fn arinsal_beamasm_exception_resolver(
     header: *mut ProcessHeader,
-    reg: *mut arinsal_beamasm::SchedulerRegisters,
+    reg: *mut u64,
     _stack: *mut u64,
     bif_info: u64,
 ) -> usize {
@@ -2366,8 +2364,10 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     // The heap indexes are those stored cursors (`c_p->htop`, `c_p->stop`).
     // `handle_error(c_p, pc, reg, bif_mfa)`: the BIF arguments are read from the register array
     // the fragment passed, the one the failing BIF or instruction was called with.
-    let Some((process, registers)) = crate::native_hooks::scheduler_registers_at(process, reg)
-    else {
+    let Some((process, registers)) = crate::native_hooks::scheduler_registers_at(
+        process,
+        arinsal_beamasm::SchedulerRegisters::from_reg(reg),
+    ) else {
         return 0;
     };
     // Port of erts/emulator/beam/beam_common.c:449-570 (`handle_error`), OTP-29.1.1, in its

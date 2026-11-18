@@ -26,7 +26,7 @@ const XREGS: [Gpr; 6] = [
 const ONHEAP_BITS: u64 = 64 * 8;
 const HEAP_BITS_TAG: u64 = 0x20;
 const BSF_LITTLE_OR_NATIVE: u32 = 2;
-const TMP_MEM0: u32 = 16384;
+const TMP_MEM0: i16 = crate::tmp_mem_disp(0) as i16;
 
 static APPEND_BINARY: AtomicUsize = AtomicUsize::new(0);
 static APPEND_CHECKED: AtomicUsize = AtomicUsize::new(0);
@@ -57,12 +57,12 @@ fn gc_addr() -> usize {
     BS_GC.load(Ordering::Relaxed)
 }
 
-fn tmp_at(index: u32) -> u32 {
-    std::mem::offset_of!(crate::SchedulerRegisters, tmp_mem) as u32 + index * 8
+fn tmp_at(index: usize) -> i16 {
+    crate::tmp_mem_disp(index) as i16
 }
 
-fn bits_state() -> u32 {
-    std::mem::offset_of!(crate::SchedulerRegisters, erl_bits_state) as u32
+fn bits_state() -> i16 {
+    crate::ERL_BITS_STATE_DISP as i16
 }
 
 struct FixedPlan {
@@ -287,13 +287,12 @@ fn emit_private(
     }
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1865-1880 (`am_private_append`), OTP-29.1.1.
     let bin = asm.source_reg(plan.bin)?;
-    let ebs = std::mem::offset_of!(crate::SchedulerRegisters, erl_bits_state) as u64;
+    let ebs = crate::ERL_BITS_STATE_DISP.unsigned_abs() as u16;
     let update = crate::Update::HEAP_ALLOC
         .union(crate::Update::X_REGS)
         .union(crate::Update::REDUCTIONS);
     asm.code.emit(|e| {
-        e.mov_const(Gpr::x(0), ebs)?;
-        e.add_reg(Gpr::x(0), SCHEDULER_REGS, Gpr::x(0), Shift::Lsl, 0)?;
+        e.sub_imm(Gpr::x(0), SCHEDULER_REGS, ebs, false)?;
         e.mov_reg(Gpr::x(1), C_P)?;
         e.mov_reg(Gpr::x(2), bin)?;
         e.mov_const(Gpr::x(3), plan.extra_bits)
@@ -303,11 +302,11 @@ fn emit_private(
     crate::emit_leave_runtime(&mut asm.code, live as usize, update)?;
     asm.code.cbz(Gpr::x(0), slow)?;
     asm.code
-        .emit(|e| e.str_uoff(Gpr::x(0), SCHEDULER_REGS, TMP_MEM0))?;
-    let ebs_off = std::mem::offset_of!(crate::SchedulerRegisters, erl_bits_state) as u32;
+        .emit(|e| e.stur(Gpr::x(0), SCHEDULER_REGS, TMP_MEM0))?;
+    let ebs_off = crate::ERL_BITS_STATE_DISP as i16;
     asm.code.emit(|e| {
-        e.ldr_uoff(Gpr::x(8), SCHEDULER_REGS, ebs_off)?;
-        e.ldr_uoff(Gpr::x(9), SCHEDULER_REGS, ebs_off + 8)?;
+        e.ldur(Gpr::x(8), SCHEDULER_REGS, ebs_off)?;
+        e.ldur(Gpr::x(9), SCHEDULER_REGS, ebs_off + 8)?;
         e.lsr_imm(TMP, Gpr::x(9), 3)?;
         e.add_reg(Gpr::x(8), Gpr::x(8), TMP, Shift::Lsl, 0)?;
         e.add_imm(
@@ -316,7 +315,7 @@ fn emit_private(
             u16::try_from(plan.extra_bits).unwrap_or(0),
             false,
         )?;
-        e.str_uoff(Gpr::x(9), SCHEDULER_REGS, ebs_off + 8)?;
+        e.stur(Gpr::x(9), SCHEDULER_REGS, ebs_off + 8)?;
         e.mov_reg(Gpr::x(14), Gpr::x(8))
     })?;
     let mut bit_at = 0u64;
@@ -390,11 +389,11 @@ fn emit_append(
     asm.code.emit(|e| e.cmn_imm(Gpr::x(0), 1, false))?;
     asm.code.b_cond(Cond::Eq, failed)?;
     asm.code
-        .emit(|e| e.str_uoff(Gpr::x(0), SCHEDULER_REGS, TMP_MEM0))?;
-    let ebs_off = std::mem::offset_of!(crate::SchedulerRegisters, erl_bits_state) as u32;
+        .emit(|e| e.stur(Gpr::x(0), SCHEDULER_REGS, TMP_MEM0))?;
+    let ebs_off = crate::ERL_BITS_STATE_DISP as i16;
     asm.code.emit(|e| {
-        e.ldr_uoff(Gpr::x(8), SCHEDULER_REGS, ebs_off)?;
-        e.ldr_uoff(Gpr::x(9), SCHEDULER_REGS, ebs_off + 8)?;
+        e.ldur(Gpr::x(8), SCHEDULER_REGS, ebs_off)?;
+        e.ldur(Gpr::x(9), SCHEDULER_REGS, ebs_off + 8)?;
         e.lsr_imm(TMP, Gpr::x(9), 3)?;
         e.add_reg(Gpr::x(8), Gpr::x(8), TMP, Shift::Lsl, 0)?;
         e.add_imm(
@@ -403,7 +402,7 @@ fn emit_append(
             u16::try_from(plan.extra_bits).unwrap_or(0),
             false,
         )?;
-        e.str_uoff(Gpr::x(9), SCHEDULER_REGS, ebs_off + 8)?;
+        e.stur(Gpr::x(9), SCHEDULER_REGS, ebs_off + 8)?;
         e.mov_reg(Gpr::x(14), Gpr::x(8))
     })?;
     let mut bit_at = 0u64;
@@ -457,10 +456,10 @@ fn emit_fixed(
         e.mov_const(Gpr::x(9), plan.bits)?;
         e.add_imm(Gpr::x(0), HTOP, 2, false)?;
         e.stp_post(Gpr::x(8), Gpr::x(9), HTOP, 16)?;
-        e.str_uoff(HTOP, SCHEDULER_REGS, ebs)?;
-        e.str_uoff(Gpr::xzr(), SCHEDULER_REGS, ebs + 8)?;
+        e.stur(HTOP, SCHEDULER_REGS, ebs)?;
+        e.stur(Gpr::xzr(), SCHEDULER_REGS, ebs + 8)?;
         e.add_imm(HTOP, HTOP, plan.data_bytes as u16, false)?;
-        e.str_uoff(Gpr::x(0), SCHEDULER_REGS, saved)
+        e.stur(Gpr::x(0), SCHEDULER_REGS, saved)
     })?;
     let mut bit_at = 0u64;
     for group in &plan.groups {
@@ -476,9 +475,9 @@ fn emit_fixed(
         // Port of instr_bs.cpp:1102-1119 (update_bin_state, byte-aligned) and
         // 2260-2318 (one store of the accumulator).
         asm.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(8), SCHEDULER_REGS, ebs)?;
+            e.ldur(Gpr::x(8), SCHEDULER_REGS, ebs)?;
             e.mov_const(Gpr::x(9), bit_at + group.bits)?;
-            e.str_uoff(Gpr::x(9), SCHEDULER_REGS, ebs + 8)?;
+            e.stur(Gpr::x(9), SCHEDULER_REGS, ebs + 8)?;
             if bit_at != 0 {
                 e.add_imm(Gpr::x(8), Gpr::x(8), (bit_at / 8) as u16, false)?;
             }
@@ -608,12 +607,12 @@ fn emit_utf8(
         e.add_imm(Gpr::x(8), Gpr::x(10), 96, false)?;
         e.add_imm(Gpr::x(0), HTOP, 2, false)?;
         e.stp_post(Gpr::x(8), Gpr::x(7), HTOP, 16)?;
-        e.str_uoff(HTOP, SCHEDULER_REGS, ebs)?;
-        e.str_uoff(Gpr::xzr(), SCHEDULER_REGS, ebs + 8)?;
+        e.stur(HTOP, SCHEDULER_REGS, ebs)?;
+        e.stur(Gpr::xzr(), SCHEDULER_REGS, ebs + 8)?;
         // The 4-byte store below covers only the low half of a rounded word.
         e.str_uoff(Gpr::xzr(), HTOP, 0)?;
         e.add_reg(HTOP, HTOP, Gpr::x(10), Shift::Lsr, 3)?;
-        e.str_uoff(Gpr::x(0), SCHEDULER_REGS, saved)
+        e.stur(Gpr::x(0), SCHEDULER_REGS, saved)
     })?;
 
     // Port of instr_bs.cpp:1268-1352 (emit_construct_utf8). load_source runs at
@@ -629,11 +628,11 @@ fn emit_utf8(
     asm.code.bl(shared)?;
     asm.code.bind(prepare)?;
     asm.code.emit(|e| {
-        e.ldr_uoff(Gpr::x(8), SCHEDULER_REGS, ebs)?;
-        e.str_uoff(Gpr::x(3), SCHEDULER_REGS, ebs + 8)?;
+        e.ldur(Gpr::x(8), SCHEDULER_REGS, ebs)?;
+        e.stur(Gpr::x(3), SCHEDULER_REGS, ebs + 8)?;
         e.str_uoff(Gpr::w(0), Gpr::x(8), 0)?;
-        e.ldr_uoff(Gpr::x(0), SCHEDULER_REGS, saved)?;
-        e.str_uoff(Gpr::xzr(), SCHEDULER_REGS, saved)
+        e.ldur(Gpr::x(0), SCHEDULER_REGS, saved)?;
+        e.stur(Gpr::xzr(), SCHEDULER_REGS, saved)
     })?;
     asm.store_register(dst, Gpr::x(0))?;
     asm.code.bind(done)?;
@@ -864,22 +863,22 @@ fn emit_gc_stub(asm: &mut BeamModuleAssembler, live: u32, hook: usize) -> Result
     Ok(())
 }
 
-/// `ldr Xdst, [scheduler, saved]` — erts reloads the boxed pointer straight into the
-/// destination (`ldr x25, [x19, #8]`), not via a scratch and a move.
+/// `ldur Xdst, [scheduler, saved]` — erts reloads the boxed pointer straight into the
+/// destination (`ldr x25, TMP_MEM1q`), not via a scratch and a move.
 fn reload_boxed(
     asm: &mut BeamModuleAssembler,
     dst: ArgVal,
-    offset: u32,
+    offset: i16,
 ) -> Result<(), ModuleError> {
     match dst {
         ArgVal::X(index) if index < 6 => {
             asm.code
-                .emit(|e| e.ldr_uoff(XREGS[index as usize], SCHEDULER_REGS, offset))?;
+                .emit(|e| e.ldur(XREGS[index as usize], SCHEDULER_REGS, offset))?;
             Ok(())
         }
         _ => {
             asm.code
-                .emit(|e| e.ldr_uoff(Gpr::x(0), SCHEDULER_REGS, offset))?;
+                .emit(|e| e.ldur(Gpr::x(0), SCHEDULER_REGS, offset))?;
             asm.store_register(dst, Gpr::x(0))
         }
     }
@@ -895,14 +894,14 @@ fn emit_gc_call(
     keep: &[Gpr],
 ) -> Result<(), ModuleError> {
     asm.code
-        .emit(|e| e.str_uoff(words, SCHEDULER_REGS, tmp_at(3)))?;
-    let mut slot = 0u32;
+        .emit(|e| e.stur(words, SCHEDULER_REGS, tmp_at(3)))?;
+    let mut slot = 0usize;
     for reg in keep {
         if slot == 2 || slot == 3 {
             slot = 4;
         }
         asm.code
-            .emit(|e| e.str_uoff(*reg, SCHEDULER_REGS, tmp_at(slot)))?;
+            .emit(|e| e.stur(*reg, SCHEDULER_REGS, tmp_at(slot)))?;
         slot += 1;
     }
     let update = crate::Update::HEAP_ALLOC.union(crate::Update::X_REGS);
@@ -910,7 +909,7 @@ fn emit_gc_call(
     asm.code.emit(|e| {
         e.mov_reg(Gpr::x(0), C_P)?;
         e.mov_reg(Gpr::x(1), SCHEDULER_REGS)?;
-        e.ldr_uoff(Gpr::x(2), SCHEDULER_REGS, tmp_at(3))?;
+        e.ldur(Gpr::x(2), SCHEDULER_REGS, tmp_at(3))?;
         e.mov_const(Gpr::x(3), u64::from(live))?;
         e.mov_reg(Gpr::w(4), Gpr::w(22))
     })?;
@@ -918,20 +917,20 @@ fn emit_gc_call(
     // The word count lived in tmp_mem[3], which the native-return bridge treats
     // as a handoff marker. A leftover count would be consumed as that marker.
     asm.code
-        .emit(|e| e.str_uoff(Gpr::xzr(), SCHEDULER_REGS, tmp_at(3)))?;
+        .emit(|e| e.stur(Gpr::xzr(), SCHEDULER_REGS, tmp_at(3)))?;
     crate::emit_leave_runtime(&mut asm.code, live as usize, update)?;
     asm.code.emit(|e| {
         e.sub_reg(Gpr::w(22), Gpr::w(22), Gpr::w(0), Shift::Lsl, 0)?;
         e.ldr_uoff(Gpr::x(9), C_P, 40)
     })?;
     asm.error_if_nonzero(Gpr::x(9))?;
-    let mut slot = 0u32;
+    let mut slot = 0usize;
     for reg in keep {
         if slot == 2 || slot == 3 {
             slot = 4;
         }
         asm.code
-            .emit(|e| e.ldr_uoff(*reg, SCHEDULER_REGS, tmp_at(slot)))?;
+            .emit(|e| e.ldur(*reg, SCHEDULER_REGS, tmp_at(slot)))?;
         slot += 1;
     }
     Ok(())

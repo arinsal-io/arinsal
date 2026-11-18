@@ -1136,13 +1136,13 @@ fn emit_update_map_single_exact_body_shared(
     helper: MapUpdateHelper,
 ) -> Result<(), BufferError> {
     let error = code.new_label();
-    let tmp_mem1 = std::mem::offset_of!(crate::SchedulerRegisters, tmp_mem) as u32;
-    let tmp_mem2 = tmp_mem1 + 8;
-    let native_error_pc = tmp_mem1 + 6 * 8;
-    let native_return = tmp_mem1 + 4 * 8;
+    let tmp_mem1 = crate::tmp_mem_disp(0) as i16;
+    let tmp_mem2 = crate::tmp_mem_disp(1) as i16;
+    let native_error_pc = crate::tmp_mem_disp(6) as i16;
+    let native_return = crate::tmp_mem_disp(4) as i16;
     let freason = std::mem::offset_of!(crate::ProcessHeader, exc.freason) as u32;
 
-    code.emit(|e| e.str_uoff(Gpr::x(1), Gpr::x(19), tmp_mem2))?;
+    code.emit(|e| e.stur(Gpr::x(1), Gpr::x(19), tmp_mem2))?;
     code.emit(|e| {
         e.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16)?;
         e.mov_reg(Gpr::x(29), Gpr::sp())
@@ -1150,7 +1150,7 @@ fn emit_update_map_single_exact_body_shared(
     emit_enter_runtime(code, 6, Update::HEAP_ALLOC)?;
     code.emit(|e| {
         e.mov_reg(Gpr::x(0), Gpr::x(21))?;
-        e.add_imm(Gpr::x(4), Gpr::x(19), (tmp_mem1 >> 12) as u16, true)?;
+        e.sub_imm(Gpr::x(4), Gpr::x(19), tmp_mem1.unsigned_abs(), false)?;
         e.mov_reg(Gpr::x(5), Gpr::x(19))?;
         e.mov_const(Gpr::x(17), helper as usize as u64)?;
         e.blr(Gpr::x(17))
@@ -1158,17 +1158,17 @@ fn emit_update_map_single_exact_body_shared(
     emit_leave_runtime(code, 6, Update::HEAP_ALLOC)?;
     code.emit(|e| e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16))?;
     code.cbz(Gpr::w(0), error)?;
-    code.emit(|e| e.ldr_uoff(Gpr::x(0), Gpr::x(19), tmp_mem1))?;
+    code.emit(|e| e.ldur(Gpr::x(0), Gpr::x(19), tmp_mem1))?;
     code.emit(|e| e.ret(Gpr::x(30)))?;
 
     code.bind(error)?;
     code.emit(|e| {
-        e.ldr_uoff(Gpr::x(9), Gpr::x(19), tmp_mem2)?;
+        e.ldur(Gpr::x(9), Gpr::x(19), tmp_mem2)?;
         e.mov_const(Gpr::x(8), crate::guard::EXC_BADKEY)?;
         e.stp(Gpr::x(8), Gpr::x(9), Gpr::x(21), freason as i16)?;
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
-        e.str_uoff(Gpr::x(30), Gpr::x(19), native_error_pc)?;
-        e.ldr_uoff(Gpr::x(30), Gpr::x(19), native_return)?;
+        e.stur(Gpr::x(30), Gpr::x(19), native_error_pc)?;
+        e.ldur(Gpr::x(30), Gpr::x(19), native_return)?;
         e.br(Gpr::x(30))
     })
 }
@@ -1209,8 +1209,8 @@ fn emit_update_map_shared(
         });
     }
     let error = code.new_label();
-    let native_error_pc = std::mem::offset_of!(crate::SchedulerRegisters, tmp_mem) as u32 + 6 * 8;
-    let scheduler_return = 16_416;
+    let native_error_pc = crate::tmp_mem_disp(6) as i16;
+    let scheduler_return = crate::tmp_mem_disp(4) as i16;
     code.emit(|e| {
         e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)?;
         e.ldr_uoff(TMP2, Gpr::x(21), 40)
@@ -1220,9 +1220,9 @@ fn emit_update_map_shared(
     code.bind(error)?;
     code.emit(|e| {
         e.sub_imm(TMP1, Gpr::x(30), 4, false)?;
-        e.str_uoff(TMP1, Gpr::x(19), native_error_pc)?;
+        e.stur(TMP1, Gpr::x(19), native_error_pc)?;
         e.mov_reg(ARG1, Gpr::xzr())?;
-        e.ldr_uoff(Gpr::x(30), Gpr::x(19), scheduler_return)?;
+        e.ldur(Gpr::x(30), Gpr::x(19), scheduler_return)?;
         e.br(Gpr::x(30))
     })
 }

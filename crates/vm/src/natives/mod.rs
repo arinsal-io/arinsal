@@ -119,8 +119,10 @@ impl NativeArgs<'_> {
 
     /// The registers, read when the native asks for them (a collection may have moved them).
     fn register_window<'r>(reg: usize, arity: usize) -> &'r [Term] {
-        crate::native_hooks::registers_at(reg as *mut arinsal_beamasm::SchedulerRegisters)
-            .map_or(&[], |registers| &registers.x_reg_array[..arity])
+        crate::native_hooks::registers_at(arinsal_beamasm::SchedulerRegisters::from_reg(
+            reg as *mut u64,
+        ))
+        .map_or(&[], |registers| &registers.x_reg_array[..arity])
     }
 
     #[inline]
