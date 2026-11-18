@@ -661,6 +661,9 @@ pub(crate) fn trap_function(module: &str, function: &str, arity: u8) -> Option<u
         }
         ("maps", "merge_trap", 1) => bif!(erl_map::maps_merge_trap_1),
         ("ets", "delete_trap", 1) => bif!(erl_db::ets_delete_trap_1),
+        ("ets", "select_trap", 1) => bif!(erl_db::ets_select_trap_1),
+        ("ets", "count_trap", 1) => bif!(erl_db::ets_count_trap_1),
+        ("ets", "reverse", 3) => bif!(erl_db::ets_reverse_3),
         ("erlang", "length", 3) => bif!(erl_bif_guard::erlang_length_trap),
         ("erts_internal", "term_to_binary_trap", 1) => bif!(external::term_to_binary_trap_1),
         ("erts_internal", "binary_to_term_trap", 1) => bif!(external::binary_to_term_trap_1),

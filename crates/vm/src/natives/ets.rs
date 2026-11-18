@@ -1,6 +1,6 @@
 //! ETS BIFs whose storage and access policy belong to the scheduled runtime.
 
-use crate::proc_create::{EtsInsert, SelectStage};
+use crate::proc_create::EtsInsert;
 use crate::process::Message;
 use crate::{Process, VmError};
 use arinsal_ets::match_spec::MatchDialect;
@@ -1490,13 +1490,6 @@ impl arinsal_ets::match_spec::MatchContext for ProcessMatchContext {
     }
 }
 
-/// Charge `used` reductions to the process and the scheduler quantum.
-///
-/// Port of erts/emulator/beam/erl_bif_info.c (BUMP_REDS), OTP-29.1.1.
-fn bump_reds(process: &mut Process, _ctx: &mut RunCtx<'_, Message>, used: isize) {
-    bump_direct(process, used);
-}
-
 /// Charge `used` reductions from a BIF that runs from native code, where the live counter is
 /// the one in the process header.
 ///
@@ -1802,10 +1795,12 @@ struct Start {
     backwards: bool,
     position: Option<arinsal_ets::ScanPosition>,
     got: usize,
-    saved: arinsal_ets::SavedMatches,
+    accum: (Term, usize),
     safety: arinsal_ets::IterSafety,
     plan: ScanPlan,
     continued: bool,
+    /// A trap continuation: the call is the resumption of a trapped traversal.
+    trapped: bool,
 }
 
 /// What an ordered table's chunk does after a cycle.
@@ -1861,7 +1856,6 @@ fn tree_chunk_next(
 /// db_select_count_continue_tree_common, ets_select_reverse), OTP-29.1.1.
 fn hash_select(
     process: &mut Process,
-    mut ctx: Option<&mut RunCtx<'_, Message>>,
     caller_pid: Pid,
     function: EtsBif,
     args: &[Term],
@@ -1870,36 +1864,7 @@ fn hash_select(
     let caller = caller_pid.to_term().ok_or_else(badarg)?;
     let rt = process.runtime.ok_or_else(badarg)?;
     let count = function == EtsBif::SelectCount;
-    if ctx.is_none()
-        && process
-            .cold
-            .as_ref()
-            .is_some_and(|cold| cold.ets_select.is_some())
-    {
-        return Err(VmError::Yield);
-    }
-    let mut resumed = process
-        .cold
-        .as_mut()
-        .and_then(|cold| cold.ets_select.take().map(|boxed| *boxed));
-    if let Some(ctx) = ctx.as_deref_mut()
-        && let Some(state) = resumed.as_mut()
-        && let Some(charged) = state.pending_charge.take()
-    {
-        // The traversal trapped in a call made from native code: charge it and yield once.
-        bump_reds(process, ctx, charged);
-        process.cold_mut().ets_select = resumed.take().map(Box::new);
-        return Err(VmError::Yield);
-    }
-    if resumed
-        .as_ref()
-        .is_some_and(|state| matches!(state.stage, SelectStage::Reverse { .. }))
-    {
-        let state = resumed.ok_or_else(badarg)?;
-        return reverse_trap(process, ctx, state).map(Some);
-    }
-    let was_resumed = resumed.is_some();
-    let items = if resumed.is_none() && args.len() == 1 {
+    let items = if args.len() == 1 {
         if end_of_table(args[0]) {
             return Ok(Some(Term::atom(arinsal_term::atoms::EOT)));
         }
@@ -1921,47 +1886,26 @@ fn hash_select(
     // Cycle under the table's read lock.
     let (start, hash, cycle) = {
         let registry = rt.ets.read().unwrap();
-        let tid = match (resumed.as_ref(), items.as_ref()) {
-            (Some(state), _) => state.tid,
-            (None, Some(items)) => handle(&registry, items[0])?,
-            (None, None) => handle(&registry, args[0])?,
+        let tid = match items.as_ref() {
+            Some(items) => handle(&registry, items[0])?,
+            None => handle(&registry, args[0])?,
         };
         let table = match registry.get_shared(tid) {
             Ok(table) => table,
-            Err(EtsError::Busy) => {
-                if let Some(state) = resumed {
-                    process.cold_mut().ets_select = Some(Box::new(state));
-                }
-                return Err(VmError::Yield);
-            }
+            // The trap target runs again with the same continuation once the table is idle.
+            Err(EtsError::Busy) => return Err(VmError::Yield),
             Err(error) => return Err(err(error)),
         };
         if !allowed(&table, caller, false) {
             return Err(badarg_cause("access"));
         }
         let hash = table.is_hash();
-        let start = match resumed {
-            Some(state) => Start {
-                tid,
-                plan: if hash {
-                    ScanPlan::Hash(arinsal_ets::HashScanPlan::all_slots())
-                } else {
-                    ScanPlan::Tree(table.tree_scan_plan(&state.program))
-                },
-                program: state.program,
-                program_owner: state.program_owner,
-                count: state.count,
-                chunk: state.chunk,
-                backwards: state.backwards,
-                position: Some(state.position),
-                got: state.got,
-                saved: state.saved,
-                safety: state.safety,
-                continued: true,
-            },
-            None if items.is_some() => {
+        let start = match () {
+            _ if items.is_some() => {
                 let items = items.as_deref().ok_or_else(badarg)?;
-                let run = if hash {
+                let run = if count {
+                    select_chunk::decode_count(&registry, hash, items)?
+                } else if hash {
                     select_chunk::decode_hash(&registry, items)?
                 } else {
                     select_chunk::decode_tree(&registry, items)?
@@ -1975,21 +1919,22 @@ fn hash_select(
                     },
                     program: run.program,
                     program_owner: run.program_owner,
-                    count: false,
+                    count: run.count,
                     chunk: run.chunk,
                     backwards: run.backwards,
                     position: Some(run.position),
-                    got: 0,
-                    saved: run.saved,
-                    safety: if hash {
-                        table.iteration_safety(caller)
-                    } else {
-                        IterSafety::Safe
+                    got: run.got,
+                    accum: run.accum,
+                    safety: match run.safety {
+                        Some(safety) => safety,
+                        None if hash => table.iteration_safety(caller),
+                        None => IterSafety::Safe,
                     },
                     continued: true,
+                    trapped: run.safety.is_some(),
                 }
             }
-            None => {
+            _ => {
                 let chunk = match args.get(2) {
                     Some(limit) => limit
                         .as_small()
@@ -2058,9 +2003,10 @@ fn hash_select(
                     },
                     position: None,
                     got: 0,
-                    saved: arinsal_ets::SavedMatches::new(),
+                    accum: (Term::NIL, 0),
                     safety,
                     continued: false,
+                    trapped: false,
                 }
             }
         };
@@ -2068,7 +2014,7 @@ fn hash_select(
             count: start.count,
             backwards: start.backwards,
             chunk: start.chunk,
-            held: start.saved.len(),
+            held: start.accum.1,
             from: start.position.as_ref(),
         };
         // The results are built on the process heap in both modes; a direct call that has to
@@ -2079,17 +2025,18 @@ fn hash_select(
     };
     let Start {
         tid,
-        program,
+        program: _,
         program_owner,
         count,
         chunk,
         backwards,
         position: _,
         got,
-        mut saved,
+        accum,
         safety,
         plan,
         continued,
+        trapped: was_resumed,
     } = start;
     let mut cycle = match cycle {
         Ok(cycle) => cycle,
@@ -2133,39 +2080,69 @@ fn hash_select(
     let used = iterations - cycle.iterations_left.min(iterations);
     match next {
         Next::Trap(position) => {
-            saved.extend(&cycle.results).map_err(err)?;
             let tree = matches!(position, ScanPosition::After(_));
-            process.cold_mut().ets_select = Some(Box::new(crate::proc_create::EtsSelect {
-                tid,
-                program,
-                count,
-                position,
-                backwards,
-                got: if chunk > 0 {
-                    cycle.held
-                } else {
-                    got + cycle.counted
-                },
-                saved,
-                safety,
-                chunk,
-                program_owner,
-                stage: SelectStage::Scan,
-                end: None,
-                pending_charge: None,
-            }));
+            let got = got + cycle.counted;
             // A hash traversal charges all the reductions it has left (BUMP_ALL_REDS), an
-            // ordered one the objects it visited. A call made from native code leaves the
-            // continuation in the process and declines; the scheduler path resumes it.
-            let charged = if tree { used } else { isize::MAX };
-            let pending_charge = trap_charge(process, ctx.as_deref_mut(), charged);
-            if let Some(state) = process.cold_mut().ets_select.as_mut() {
-                state.pending_charge = pending_charge;
-            }
-            return Err(VmError::Yield);
+            // ordered one the objects it visited.
+            bump_direct(process, if tree { used } else { isize::MAX });
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+            let tid_term = rt
+                .ets
+                .read()
+                .unwrap()
+                .tid_term(tid, &mut heap)
+                .map_err(err)?;
+            // The matches so far, newest first: an unchunked call conses the cycle's onto the
+            // list it got, a chunk is rebuilt from the at most one page it holds.
+            let matches = if count {
+                (Term::NIL, 0)
+            } else {
+                accumulated(&mut heap, accum, &cycle.results)?
+            };
+            let (continuation, export) = match (&position, count) {
+                (_, true) => (
+                    select_chunk::count_trap_continuation(
+                        &mut heap,
+                        tid_term,
+                        &program_owner,
+                        &position,
+                        got,
+                        safety,
+                    )?,
+                    "ets:count_trap/1",
+                ),
+                (ScanPosition::Slot(slot), false) => (
+                    select_chunk::hash_trap_continuation(
+                        &mut heap,
+                        tid_term,
+                        &program_owner,
+                        *slot,
+                        chunk,
+                        matches,
+                        safety,
+                    )?,
+                    "ets:select_trap/1",
+                ),
+                (ScanPosition::After(key), false) => (
+                    select_chunk::tree_trap_continuation(
+                        &mut heap,
+                        tid_term,
+                        &program_owner,
+                        chunk,
+                        backwards,
+                        key,
+                        matches,
+                    )?,
+                    "ets:select/1",
+                ),
+            };
+            return Err(VmError::TrapExport(crate::ExportTrap::new(
+                process,
+                export,
+                vec![continuation],
+            )));
         }
         Next::Reverse(key) => {
-            saved.extend(&cycle.results).map_err(err)?;
             let end = match (&plan, &key) {
                 (ScanPlan::Tree(plan), Some(_)) => plan
                     .end_condition_term(backwards)
@@ -2174,39 +2151,41 @@ fn hash_select(
                     .map_err(err)?,
                 _ => None,
             };
-            let eot = key.is_none();
-            process.cold_mut().ets_select = Some(Box::new(crate::proc_create::EtsSelect {
-                tid,
-                program,
-                count,
-                position: key
-                    .map(ScanPosition::After)
-                    .unwrap_or(ScanPosition::Slot(usize::MAX)),
-                backwards,
-                got: cycle.held,
-                saved,
-                safety,
-                chunk,
-                program_owner,
-                stage: SelectStage::Reverse { done: 0, eot },
-                end,
-                pending_charge: None,
-            }));
-            let pending_charge = trap_charge(process, ctx.as_deref_mut(), used);
-            if let Some(state) = process.cold_mut().ets_select.as_mut() {
-                state.pending_charge = pending_charge;
-            }
-            return Err(VmError::Yield);
+            bump_direct(process, used);
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+            let tid_term = rt
+                .ets
+                .read()
+                .unwrap()
+                .tid_term(tid, &mut heap)
+                .map_err(err)?;
+            let continuation = match &key {
+                Some(key) => select_chunk::tree_continuation(
+                    &mut heap,
+                    tid_term,
+                    &program_owner,
+                    chunk,
+                    backwards,
+                    key,
+                    end.as_ref(),
+                )?,
+                None => Term::atom(arinsal_term::atoms::EOT),
+            };
+            // `bif_trap3(&ets_select_reverse_exp, p, sc.accum, NIL, continuation)`: the
+            // results newest first.
+            let (accum, _) = accumulated(&mut heap, accum, &cycle.results)?;
+            return Err(VmError::TrapExport(crate::ExportTrap::new(
+                process,
+                "ets:reverse/3",
+                vec![accum, Term::NIL, continuation],
+            )));
         }
         Next::Return => {}
     }
     let unfix = was_resumed && safety != IterSafety::Safe;
     let nothing_visited = !continued && cycle.iterations_left == iterations;
     if !(hash && chunk > 0 && nothing_visited) {
-        match ctx {
-            Some(ctx) => bump_reds(process, ctx, used),
-            None => bump_direct(process, used),
-        }
+        bump_direct(process, used);
     }
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     if count {
@@ -2218,13 +2197,16 @@ fn hash_select(
             .map(Some)
             .map_err(|_| badarg());
     }
-    let mut values = saved.into_terms();
-    values.extend(cycle.results);
     let result = if chunk == 0 {
-        values.reverse();
-        TermBuilder::new(&mut heap)
-            .list_from_iter(values)
-            .map_err(|_| badarg())?
+        // The list of an unchunked call is newest first: the results of this cycle go on the
+        // front of what the trapped cycles left.
+        let mut list = accum.0;
+        for result in cycle.results {
+            list = TermBuilder::new(&mut heap)
+                .cons(result, list)
+                .map_err(|_| badarg())?;
+        }
+        list
     } else if !hash || nothing_visited {
         Term::atom(arinsal_term::atoms::EOT)
     } else {
@@ -2234,6 +2216,9 @@ fn hash_select(
             .unwrap()
             .tid_term(tid, &mut heap)
             .map_err(err)?;
+        // The accumulator is newest first; the chunk's results are in visit order.
+        let mut values = select_chunk::expand(accum.0)?;
+        values.extend(cycle.results);
         select_chunk::hash_loop_ended(
             &mut heap,
             tid_term,
@@ -2250,80 +2235,22 @@ fn hash_select(
     Ok(Some(result))
 }
 
-/// A pass of `ets:reverse/3`, to which an ordered table's chunk trapped with its results: it
-/// reverses up to 40000 cells and traps again, or returns the page and the continuation.
-///
-/// Port of erts/emulator/beam/erl_db_tree.c, ets_select_reverse, OTP-29.1.1.
-fn reverse_trap(
-    process: &mut Process,
-    ctx: Option<&mut RunCtx<'_, Message>>,
-    mut state: crate::proc_create::EtsSelect,
-) -> Result<Term, VmError> {
-    let SelectStage::Reverse { done, eot } = state.stage else {
-        return Err(badarg());
-    };
-    match select_chunk::reverse_pass(state.saved.len() - done) {
-        select_chunk::ReversePass::Trap { cells } => {
-            state.stage = SelectStage::Reverse {
-                done: done + cells,
-                eot,
-            };
-            process.cold_mut().ets_select = Some(Box::new(state));
-            let ctx = ctx.ok_or_else(needs_context)?;
-            bump_reds(process, ctx, isize::MAX);
-            Err(VmError::Yield)
-        }
-        select_chunk::ReversePass::Done { reds } => {
-            let ctx = ctx.ok_or_else(needs_context)?;
-            bump_reds(process, ctx, reds);
-            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-            let values = state.saved.terms().to_vec();
-            let list = TermBuilder::new(&mut heap)
-                .list_from_iter(values)
-                .map_err(|_| badarg())?;
-            let tid_term = process
-                .runtime
-                .as_ref()
-                .ok_or_else(badarg)?
-                .ets
-                .read()
-                .unwrap()
-                .tid_term(state.tid, &mut heap)
-                .map_err(err)?;
-            let continuation = match (&state.position, eot) {
-                (arinsal_ets::ScanPosition::After(key), false) => select_chunk::tree_continuation(
-                    &mut heap,
-                    tid_term,
-                    &state.program_owner,
-                    state.chunk,
-                    state.backwards,
-                    key,
-                    state.end.as_ref(),
-                )?,
-                _ => Term::atom(arinsal_term::atoms::EOT),
-            };
-            TermBuilder::new(&mut heap)
-                .tuple(&[list, continuation])
-                .map_err(|_| badarg())
-        }
+/// The matches a trapping traversal hands on, newest first, and how many there are: the cycle's
+/// results consed onto the list the call got, which is never rebuilt.
+// Port of erts/emulator/beam/erl_db_hash.c (select_chunk_on_trap: `ctx->match_list`),
+// OTP-29.1.1.
+fn accumulated<H: HeapAlloc>(
+    heap: &mut H,
+    accum: (Term, usize),
+    results: &[Term],
+) -> Result<(Term, usize), VmError> {
+    let mut list = accum.0;
+    for &result in results {
+        list = TermBuilder::new(heap)
+            .cons(result, list)
+            .map_err(|_| badarg())?;
     }
-}
-
-/// Charge the reductions of a traversal that trapped. The scheduler path charges them now; a
-/// call made from native code leaves them to the scheduler path that resumes the trap, which
-/// yields then (erts charges at the trap and reschedules at the trap target's entry).
-fn trap_charge(
-    process: &mut Process,
-    ctx: Option<&mut RunCtx<'_, Message>>,
-    charged: isize,
-) -> Option<isize> {
-    match ctx {
-        Some(ctx) => {
-            bump_reds(process, ctx, charged);
-            None
-        }
-        None => Some(charged),
-    }
+    Ok((list, accum.1 + results.len()))
 }
 
 /// Release the fixation a trapped traversal held.
@@ -2624,8 +2551,8 @@ fn call_inner(
         ) | (
             EtsBif::Select | EtsBif::SelectReverse | EtsBif::Match | EtsBif::MatchObject,
             1 | 3
-        )
-    ) && let Some(value) = hash_select(process, ctx.as_deref_mut(), caller_pid, function, args)?
+        ) | (EtsBif::SelectCount, 1)
+    ) && let Some(value) = hash_select(process, caller_pid, function, args)?
     {
         return Ok(value);
     }

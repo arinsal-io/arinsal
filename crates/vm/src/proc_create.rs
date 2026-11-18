@@ -1413,8 +1413,6 @@ pub(crate) struct ProcessCold {
     /// Breakpoint update a trace BIF caller finishes between code barriers while it holds
     /// the code modification permission.
     pub(crate) trace_finish: Option<Box<crate::trace_bp::TraceFinish>>,
-    /// Progress of a trapped `ets:select/2`, `match/2`, `match_object/2` or `select_count/2`.
-    pub(crate) ets_select: Option<Box<EtsSelect>>,
     /// Operand registers of `apply` calls in progress. A callee may collect before it
     /// yields back to re-execute the apply, so these stay GC roots until it returns.
     pub(crate) apply_roots: Vec<Term>,
@@ -2239,44 +2237,6 @@ pub(crate) enum DirtyGc {
     Major,
     /// erts `F_DIRTY_MINOR_GC`.
     Minor,
-}
-
-/// Port of erts/emulator/beam/erl_db_hash.c (select_chunk_on_trap and select_count_on_trap),
-/// OTP-29.1.1: the continuation a trapped hash table traversal resumes
-/// from (`ets:select_trap/1` and `ets:count_trap/1`).
-pub(crate) struct EtsSelect {
-    pub(crate) tid: arinsal_ets::Tid,
-    pub(crate) program: std::sync::Arc<arinsal_ets::match_spec::MatchProgram>,
-    pub(crate) program_owner: arinsal_term::MagicBin,
-    /// `select_count/2` instead of a result list.
-    pub(crate) count: bool,
-    /// Where the traversal resumes.
-    pub(crate) position: arinsal_ets::ScanPosition,
-    /// An ordered table is traversed from its last key downward, `select_reverse/2` upward.
-    pub(crate) backwards: bool,
-    /// Objects counted so far (`select_count/2`).
-    pub(crate) got: usize,
-    /// Results of the earlier cycles.
-    pub(crate) saved: arinsal_ets::SavedMatches,
-    pub(crate) safety: arinsal_ets::IterSafety,
-    /// The chunk size of `select/3` and its relatives; zero for the calls that return every
-    /// result.
-    pub(crate) chunk: usize,
-    pub(crate) stage: SelectStage,
-    /// The end of the key range an ordered table's continuation names.
-    pub(crate) end: Option<arinsal_ets::SavedKey>,
-    /// Reductions a call made from native code still has to charge: the trap happens there,
-    /// the scheduler path charges them and yields once, as the BIF trap does in erts.
-    pub(crate) pending_charge: Option<isize>,
-}
-
-/// Where a trapped chunked traversal of an ordered table is.
-pub(crate) enum SelectStage {
-    /// The traversal runs on.
-    Scan,
-    /// The results wait in `ets:reverse/3`, which has `done` of them behind it; `eot` when no
-    /// continuation follows.
-    Reverse { done: usize, eot: bool },
 }
 
 /// Port of erts/emulator/beam/erl_db.c:2161-2330 (ets_insert_2_list_info), OTP-29.1.1: the state a

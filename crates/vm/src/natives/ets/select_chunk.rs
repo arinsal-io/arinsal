@@ -10,30 +10,37 @@
 use super::{badarg, list, tuple_items};
 use crate::VmError;
 use arinsal_ets::match_spec::MatchProgram;
-use arinsal_ets::{SavedKey, SavedMatches, ScanPosition};
+use arinsal_ets::{IterSafety, SavedKey, ScanPosition};
 use arinsal_term::{HeapAlloc, MagicBin, Term, TermBuilder, copy_term};
 use std::sync::Arc;
 
-/// Reductions of `ets:reverse/3` per `CONTEXT_REDS` worth of list cells (it charges one per ten).
-const REVERSE_CELLS: usize = 40_000;
-
 /// What a call starts from: a continuation the caller handed in.
 pub(super) struct Run {
+    /// `select_count/2` continuation.
+    pub(super) count: bool,
+    /// Objects counted so far (`select_count/2`).
+    pub(super) got: usize,
+    /// The iteration safety a trap continuation carries; a chunk continuation has none.
+    pub(super) safety: Option<IterSafety>,
     pub(super) program: Arc<MatchProgram>,
     pub(super) program_owner: MagicBin,
     pub(super) chunk: usize,
     pub(super) backwards: bool,
     pub(super) position: ScanPosition,
-    pub(super) saved: SavedMatches,
+    /// The results so far, newest first, and how many: the list of the continuation, which
+    /// grows without being rebuilt.
+    pub(super) accum: (Term, usize),
 }
 
 fn small(term: Term) -> Option<i64> {
     term.as_small()
 }
 
-/// The results a continuation holds, newest first, as a list of terms.
-fn held(list_term: Term) -> Option<Vec<Term>> {
-    list(list_term)
+/// The results a continuation holds, oldest first, from their list (newest first).
+pub(super) fn expand(list_term: Term) -> Result<Vec<Term>, VmError> {
+    let mut items = list(list_term).ok_or_else(badarg)?;
+    items.reverse();
+    Ok(items)
 }
 
 /// Decode the continuation of a hash table: a 6-tuple, or a 7-tuple trap continuation.
@@ -48,26 +55,95 @@ pub(super) fn decode_hash(
     }
     let slot = small(items[1]).ok_or_else(badarg)?;
     let chunk = small(items[2]).ok_or_else(badarg)?;
-    let rest = held(items[4]).ok_or_else(badarg)?;
     let got = small(items[5]).ok_or_else(badarg)?;
-    if chunk < 0 || got < 0 || rest.len() != got as usize {
+    if chunk < 0 || got < 0 {
         return Err(badarg());
     }
+    let accum = accumulator(items[4], got as usize)?;
     let program = registry
         .match_program(items[3])
         .or_else(|| super::compiled_match_program(items[3]))
         .ok_or_else(badarg)?;
     let program_owner = match_program_owner(items[3], &program);
-    let mut saved = SavedMatches::new();
-    let oldest_first: Vec<Term> = rest.into_iter().rev().collect();
-    saved.extend(&oldest_first).map_err(super::err)?;
+    let safety = match items.get(6) {
+        Some(&safety) => Some(decode_safety(safety)?),
+        None => None,
+    };
     Ok(Run {
+        count: false,
+        got: 0,
+        safety,
         program,
         program_owner,
         chunk: chunk as usize,
         backwards: false,
         position: ScanPosition::Slot(if slot < 0 { usize::MAX } else { slot as usize }),
-        saved,
+        accum,
+    })
+}
+
+fn accumulator(list: Term, got: usize) -> Result<(Term, usize), VmError> {
+    if list != Term::NIL && list.classify() != arinsal_term::TermKind::List {
+        return Err(badarg());
+    }
+    Ok((list, got))
+}
+
+/// `make_small(ctx->safety)` of a trap continuation.
+fn decode_safety(term: Term) -> Result<IterSafety, VmError> {
+    match small(term) {
+        Some(0) => Ok(IterSafety::Unsafe),
+        Some(1) => Ok(IterSafety::SafeLocked),
+        Some(2) => Ok(IterSafety::Safe),
+        _ => Err(badarg()),
+    }
+}
+
+fn encode_safety(safety: IterSafety) -> i64 {
+    match safety {
+        IterSafety::Unsafe => 0,
+        IterSafety::SafeLocked => 1,
+        IterSafety::Safe => 2,
+    }
+}
+
+/// Decode the continuation `ets:count_trap/1` receives: `{Tid, Slot|Key, MatchProgram, Got,
+/// Safety}`.
+// Port of erts/emulator/beam/erl_db_hash.c (unpack_simple_continuation), OTP-29.1.1.
+pub(super) fn decode_count(
+    registry: &arinsal_ets::Registry,
+    hash: bool,
+    items: &[Term],
+) -> Result<Run, VmError> {
+    if items.len() != 5 {
+        return Err(badarg());
+    }
+    let got = small(items[3]).ok_or_else(badarg)?;
+    if got < 0 {
+        return Err(badarg());
+    }
+    let safety = decode_safety(items[4])?;
+    let program = registry
+        .match_program(items[2])
+        .or_else(|| super::compiled_match_program(items[2]))
+        .ok_or_else(badarg)?;
+    let program_owner = match_program_owner(items[2], &program);
+    let position = if hash {
+        let slot = small(items[1]).ok_or_else(badarg)?;
+        ScanPosition::Slot(if slot < 0 { usize::MAX } else { slot as usize })
+    } else {
+        ScanPosition::After(SavedKey::new(items[1]).map_err(super::err)?)
+    };
+    Ok(Run {
+        count: true,
+        got: got as usize,
+        safety: Some(safety),
+        program,
+        program_owner,
+        chunk: 0,
+        backwards: false,
+        position,
+        accum: (Term::NIL, 0),
     })
 }
 
@@ -81,7 +157,6 @@ pub(super) fn decode_tree(
         return Err(badarg());
     }
     let chunk = small(items[3]).ok_or_else(badarg)?;
-    let accum = held(items[5]).ok_or_else(badarg)?;
     let reverse = small(items[6]).ok_or_else(badarg)?;
     let got = small(items[7]).ok_or_else(badarg)?;
     let program = registry
@@ -89,20 +164,21 @@ pub(super) fn decode_tree(
         .or_else(|| super::compiled_match_program(items[4]))
         .ok_or_else(badarg)?;
     let program_owner = match_program_owner(items[4], &program);
-    if chunk <= 0 || got < 0 || accum.len() != got as usize {
+    if chunk < 0 || got < 0 {
         return Err(badarg());
     }
     let key = SavedKey::new(items[1]).map_err(super::err)?;
-    let mut saved = SavedMatches::new();
-    let oldest_first: Vec<Term> = accum.into_iter().rev().collect();
-    saved.extend(&oldest_first).map_err(super::err)?;
+    let accum = accumulator(items[5], got as usize)?;
     Ok(Run {
+        count: false,
+        got: 0,
+        safety: None,
         program,
         program_owner,
         chunk: chunk as usize,
         backwards: reverse != 0,
         position: ScanPosition::After(key),
-        saved,
+        accum,
     })
 }
 
@@ -208,29 +284,6 @@ pub(super) fn tree_continuation<H: HeapAlloc>(
         .map_err(|_| badarg())
 }
 
-/// Where `ets:reverse/3` stands: the cells it takes another trap for, or the cells it
-/// reverses in its last pass and what that costs.
-pub(super) enum ReversePass {
-    /// This pass reverses `cells` and traps again.
-    Trap { cells: usize },
-    /// This pass reverses the last `cells` and returns, for `reds` reductions.
-    Done { reds: isize },
-}
-
-/// How `ets:reverse/3` treats a list with `left` cells to go.
-// Port of erts/emulator/beam/erl_db_tree.c, ets_select_reverse, OTP-29.1.1.
-pub(super) fn reverse_pass(left: usize) -> ReversePass {
-    if left >= REVERSE_CELLS {
-        ReversePass::Trap {
-            cells: REVERSE_CELLS - 1,
-        }
-    } else {
-        ReversePass::Done {
-            reds: left.div_ceil(10) as isize,
-        }
-    }
-}
-
 /// The data of a compiled match specification's magic binary.
 pub(crate) struct MatchProgRef(pub(crate) Arc<MatchProgram>);
 // erl_db_util.c: erts_db_match_prog_destructor.
@@ -259,5 +312,96 @@ pub(super) fn new_match_program_owner(program: &Arc<MatchProgram>) -> MagicBin {
 fn match_program_reference<H: HeapAlloc>(heap: &mut H, owner: &MagicBin) -> Result<Term, VmError> {
     TermBuilder::new(heap)
         .magic_ref(MagicBin::clone(owner))
+        .map_err(|_| badarg())
+}
+
+/// The continuation a trapped hash traversal passes to `ets:select_trap/1`: `{Tid, Slot,
+/// Chunk, MatchProgram, MatchList, Got, Safety}`, the list newest first.
+// Port of erts/emulator/beam/erl_db_hash.c (select_chunk_on_trap), OTP-29.1.1.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn hash_trap_continuation<H: HeapAlloc>(
+    heap: &mut H,
+    tid: Term,
+    program_owner: &MagicBin,
+    slot: usize,
+    chunk: usize,
+    (list, got): (Term, usize),
+    safety: IterSafety,
+) -> Result<Term, VmError> {
+    let reference = match_program_reference(heap, program_owner)?;
+    TermBuilder::new(heap)
+        .tuple(&[
+            tid,
+            Term::small(if slot == usize::MAX { -1 } else { slot as i64 }).ok_or_else(badarg)?,
+            Term::small(chunk as i64).ok_or_else(badarg)?,
+            reference,
+            list,
+            Term::small(got as i64).ok_or_else(badarg)?,
+            Term::small(encode_safety(safety)).ok_or_else(badarg)?,
+        ])
+        .map_err(|_| badarg())
+}
+
+/// The continuation an ordered table's traversal passes to `ets:select/1`: `{Tid, Key, End,
+/// Chunk, MatchProgram, Accum, Reverse, Got}`, the accumulator newest first.
+// Port of erts/emulator/beam/erl_db_tree.c (db_select_chunk_tree_common, db_select_tree_common),
+// OTP-29.1.1.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn tree_trap_continuation<H: HeapAlloc>(
+    heap: &mut H,
+    tid: Term,
+    program_owner: &MagicBin,
+    chunk: usize,
+    reverse: bool,
+    key: &SavedKey,
+    (list, got): (Term, usize),
+) -> Result<Term, VmError> {
+    let key = copy_term(key.term(), heap).map_err(|_| badarg())?;
+    let reference = match_program_reference(heap, program_owner)?;
+    TermBuilder::new(heap)
+        .tuple(&[
+            tid,
+            key,
+            Term::NIL,
+            Term::small(chunk as i64).ok_or_else(badarg)?,
+            reference,
+            list,
+            Term::small(i64::from(reverse)).ok_or_else(badarg)?,
+            Term::small(got as i64).ok_or_else(badarg)?,
+        ])
+        .map_err(|_| badarg())
+}
+
+/// The continuation of a trapped `select_count`: `{Tid, Slot|Key, MatchProgram, Got, Safety}`.
+// Port of erts/emulator/beam/erl_db_hash.c (on_simple_trap), OTP-29.1.1.
+pub(super) fn count_trap_continuation<H: HeapAlloc>(
+    heap: &mut H,
+    tid: Term,
+    program_owner: &MagicBin,
+    position: &ScanPosition,
+    got: usize,
+    safety: IterSafety,
+) -> Result<Term, VmError> {
+    let position = match position {
+        ScanPosition::Slot(slot) => Term::small(if *slot == usize::MAX {
+            -1
+        } else {
+            *slot as i64
+        })
+        .ok_or_else(badarg)?,
+        ScanPosition::After(key) => copy_term(key.term(), heap).map_err(|_| badarg())?,
+    };
+    let reference = match_program_reference(heap, program_owner)?;
+    let got = TermBuilder::new(heap)
+        .int_from_i128(got as i128)
+        .map_err(|_| badarg())?;
+    TermBuilder::new(heap)
+        .tuple(&[
+            tid,
+            position,
+            reference,
+            got,
+            Term::small(encode_safety(safety)).ok_or_else(badarg)?,
+        ])
         .map_err(|_| badarg())
 }

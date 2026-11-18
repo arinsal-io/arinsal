@@ -68,10 +68,6 @@ impl Process {
                 cold.persistent_get_all.is_none()
                     && cold.apply_roots.is_empty()
                     && cold.nif_pending.is_none()
-                    && cold
-                        .ets_select
-                        .as_ref()
-                        .is_none_or(|state| state.saved.is_empty())
                     && cold.call_memory.is_empty()
             })
             && !self.has_dirty_result_roots()
@@ -200,9 +196,6 @@ impl Process {
             roots.push(&mut cold.apply_roots);
             if let Some(pending) = cold.nif_pending.as_mut() {
                 roots.push(pending.roots_mut());
-            }
-            if let Some(state) = cold.ets_select.as_mut() {
-                roots.push(state.saved.roots_mut());
             }
             for root in crate::dirty::dirty_root_slots(
                 &mut cold.dirty_bif,

@@ -522,3 +522,60 @@ pub(crate) extern "C" fn ets_delete_trap_1(c_p: *mut ProcessHeader, reg: *mut u6
         }
     }
 }
+
+// `ets:select_trap/1` and `ets:count_trap/1`, the hidden exports a trapped traversal continues
+// in. Port of erts/emulator/beam/erl_db.c (ets_select_trap_1, ets_select_count_1), OTP-29.1.1.
+ets_bif!(ets_select_trap_1, Select, "ets", "select_trap", 1);
+ets_bif!(ets_count_trap_1, SelectCount, "ets", "count_trap", 1);
+
+/// `CONTEXT_REDS * 10` list cells per pass of `ets:reverse/3`.
+const REVERSE_CELLS: i64 = 40_000;
+const CONTEXT_REDS: i64 = 4_000;
+
+/// `ets:reverse/3`: move the cells of the first list onto the second, then return
+/// `{Result, Continuation}`; trap to itself every 40000 cells.
+// Port of erts/emulator/beam/erl_db_tree.c (ets_select_reverse), OTP-29.1.1.
+pub(crate) extern "C" fn ets_reverse_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [a1, a2, a3] = bif_args::<3>(reg);
+    let mut heap = ProcessHeapHandle(&mut process.heap);
+    if a1 == Term::NIL {
+        return match TermBuilder::new(&mut heap).tuple(&[a2, a3]) {
+            Ok(pair) => crate::native_hooks::raw(pair),
+            Err(_) => crate::natives::bif::bif_system_limit(c_p),
+        };
+    }
+    let mut max_iter = REVERSE_CELLS;
+    let mut list = a1;
+    let mut result = a2;
+    // SAFETY: the lists are terms of the running process's live heap.
+    while let Some((head, tail)) = unsafe { list.cons_ref() } {
+        max_iter -= 1;
+        if max_iter == 0 {
+            ets::bump_direct(process, isize::MAX);
+            let trap = VmError::TrapExport(crate::ExportTrap::new(
+                process,
+                "ets:reverse/3",
+                vec![list, result, a3],
+            ));
+            return crate::native_helpers::bif_return_current(c_p, i, trap);
+        }
+        let Ok(cell) = TermBuilder::new(&mut heap).cons(head, result) else {
+            return crate::natives::bif::bif_system_limit(c_p);
+        };
+        result = cell;
+        list = tail;
+    }
+    if list != Term::NIL {
+        return crate::natives::bif::bif_badarg(c_p);
+    }
+    ets::bump_direct(process, (CONTEXT_REDS - max_iter / 10) as isize);
+    let mut heap = ProcessHeapHandle(&mut process.heap);
+    match TermBuilder::new(&mut heap).tuple(&[result, a3]) {
+        Ok(pair) => crate::native_hooks::raw(pair),
+        Err(_) => crate::natives::bif::bif_system_limit(c_p),
+    }
+}

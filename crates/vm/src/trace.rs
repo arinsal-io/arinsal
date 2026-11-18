@@ -3789,20 +3789,6 @@ pub(crate) fn running_mfa(process: &mut Process, subject: Pid) -> Result<Option<
         });
     // Port of erts/emulator/beam/erl_db.c:3075 (BIF_TRAP1 ets_delete_continue_exp) and :3275
     // (BIF_TRAP2 ets_internal_delete_all_2), OTP-29.1.1: a trapped call runs as the trap export.
-    // Port of erts/emulator/beam/erl_db.c (init_db: ets_select_continue_exp and
-    // ets_select_count_continue_exp), OTP-29.1.1.
-    let ets_trap = process
-        .cold
-        .as_ref()
-        .and_then(|cold| cold.ets_select.as_ref())
-        .map(|state| match (state.count, &state.position) {
-            _ if matches!(state.stage, crate::proc_create::SelectStage::Reverse { .. }) => {
-                ("ets", "reverse", 3)
-            }
-            (false, arinsal_ets::ScanPosition::Slot(_)) => ("ets", "select_trap", 1),
-            (false, arinsal_ets::ScanPosition::After(_)) => ("ets", "select", 1),
-            (true, _) => ("ets", "count_trap", 1),
-        });
     // Port of erts/emulator/beam/erl_process.c:12604 (`p->current = &p->u.initial`) and
     // erl_trace.c:752-760 (trace_sched_session), OTP-29.1.1: a process that has not run yet
     // is at its initial function.
@@ -3832,8 +3818,6 @@ pub(crate) fn running_mfa(process: &mut Process, subject: Pid) -> Result<Option<
         .and_then(crate::native_bridge::native_function_at);
     let (module, function, arity) = if let Some(finalizer) = dirty_finalizer {
         finalizer
-    } else if let Some(trap) = ets_trap {
-        trap
     } else if let Some(bif) = dirty_bif {
         bif
     } else if let Some(continuation) = continuation {

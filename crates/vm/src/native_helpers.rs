@@ -1273,18 +1273,16 @@ fn invoke_dispatch_bif(
     export_call: bool,
 ) -> Option<u64> {
     let (process, registers) = crate::native_hooks::enter_runtime_reg(header, reg)?;
-    if let Some(export) = export {
-        if export_call {
-            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:729-745:
-            // call_bif_shared stores the export's MFA in c_p->current before the BIF call.
-            process.heap.abi.current = if export.is_bif_export() {
-                std::ptr::from_ref(export.mfa()).cast()
-            } else {
-                std::ptr::null()
-            };
-        }
-        // The light-BIF fragment already loaded `Export.is_bif_traced` and compared
-        // `active_code_ix` (instr_bif.cpp:391-397). An export-entry call has not.
+    if let Some(export) = export
+        && export_call
+    {
+        // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:729-745:
+        // call_bif_shared stores the export's MFA in c_p->current before the BIF call.
+        process.heap.abi.current = if export.is_bif_export() {
+            std::ptr::from_ref(export.mfa()).cast()
+        } else {
+            std::ptr::null()
+        };
     }
     if let Some(export) = export
         && let Some(bif) = export.light_process_bif
