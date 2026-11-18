@@ -1,5 +1,6 @@
 //! Map construction, lookup, update, and boolean emitters.
 
+use super::beam_asm::NUM_REGISTER_BACKED_XREGS;
 use arinsal_a64::{
     buf::{BufferError, CodeBuffer, Label},
     enc::{Cond, Gpr, Shift, Shifted, VecReg},
@@ -654,8 +655,7 @@ impl BeamModuleAssembler {
                     _ => return Err(ModuleError::InvalidOperand("map lookup hash is not static")),
                 };
                 let destination = match triple[1] {
-                    ArgVal::X(index) => MapLookupDestination::X(u32::from(index)),
-                    ArgVal::XMemory(index) => MapLookupDestination::X(index),
+                    ArgVal::X(index) => MapLookupDestination::X(index),
                     ArgVal::Y(index) => MapLookupDestination::Y(index),
                     _ => {
                         return Err(ModuleError::InvalidOperand(
@@ -1056,12 +1056,8 @@ impl BeamModuleAssembler {
         values: Gpr,
         index: Gpr,
     ) -> Result<(), ModuleError> {
-        if let ArgVal::X(register) = dst {
-            let Some(destination) = X.get(register as usize).copied() else {
-                return Err(ModuleError::InvalidOperand(
-                    "map destination must be X or Y register",
-                ));
-            };
+        if let ArgVal::X(register @ 0..NUM_REGISTER_BACKED_XREGS) = dst {
+            let destination = X[register as usize];
             return self
                 .code
                 .emit(|e| e.ldr_regoff(destination, values, index, 3))
@@ -1076,7 +1072,7 @@ impl BeamModuleAssembler {
         match dst {
             ArgVal::X(i) if i < 6 => self.code.emit(|e| e.mov_reg(X[i as usize], src))?,
             ArgVal::Y(i) => self.code.emit(|e| e.str_uoff(src, E, i * 8))?,
-            ArgVal::XMemory(i) => self.code.emit(|e| e.str_uoff(src, Gpr::x(19), i * 8))?,
+            ArgVal::X(i) => self.code.emit(|e| e.str_uoff(src, Gpr::x(19), i * 8))?,
             _ => {
                 return Err(ModuleError::InvalidOperand(
                     "map destination must be X or Y register",
@@ -1118,7 +1114,7 @@ fn emit_map_type_check(code: &mut CodeBuffer, map: Gpr, not_map: Label) -> Resul
 
 /// OTP's `SCRATCH_X_REG` (X1023): a destination whose value is not wanted.
 fn is_scratch_x(dst: ArgVal) -> bool {
-    matches!(dst, ArgVal::XMemory(1023))
+    matches!(dst, ArgVal::X(1023))
 }
 
 // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:459-601, OTP-29.1.1.

@@ -261,7 +261,7 @@ impl BeamModuleAssembler {
         let fail = self.label(fail);
         self.code.tbz(Gpr::w(0), 0, fail)?;
         for (index, dst) in dsts.iter().copied().enumerate() {
-            if matches!(dst, ArgVal::XMemory(SCRATCH_X)) {
+            if matches!(dst, ArgVal::X(SCRATCH_X)) {
                 continue;
             }
             let offset = (base + index as u32) * 8;
@@ -377,7 +377,7 @@ impl BeamModuleAssembler {
                     .emit(|e| e.mov_reg(X[index as usize], Gpr::x(0)))?;
                 Ok(())
             }
-            ArgVal::XMemory(index) if index < 1024 => {
+            ArgVal::X(index) if index < 1024 => {
                 self.code
                     .emit(|e| e.str_uoff(Gpr::x(0), SCHEDULER_REGS, index * 8))?;
                 Ok(())

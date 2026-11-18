@@ -1,5 +1,6 @@
 //! AArch64 emitters for BEAM bit syntax matching.
 
+use super::beam_asm::is_register_backed;
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
 use arinsal_a64::enc::{Cond, Gpr};
 
@@ -83,18 +84,13 @@ impl BeamModuleAssembler {
         hook: crate::construct::GcHook,
     ) -> Result<(), ModuleError> {
         let index = match ctx {
-            ArgVal::X(index) => u32::from(index),
-            ArgVal::XMemory(index) => index,
+            ArgVal::X(index) => index,
             _ => return self.emit_test_heap(need, live, hook),
         };
         if index < live {
             return self.emit_test_heap(need, live, hook);
         }
-        let parked = if live < 6 {
-            ArgVal::X(live as u8)
-        } else {
-            ArgVal::XMemory(live)
-        };
+        let parked = ArgVal::X(live);
         let value = self.source_reg(ctx)?;
         self.store_x(parked, value)?;
         self.emit_test_heap(need, live + 1, hook)?;
@@ -205,7 +201,7 @@ impl BeamModuleAssembler {
     /// are copied to `CTX` so a later field read can address them with `ldur`/`stur`.
     fn tagged_context(&mut self, ctx: ArgVal) -> Result<Gpr, ModuleError> {
         let source = self.source_reg(ctx)?;
-        if matches!(ctx, ArgVal::X(_)) || source == CTX {
+        if is_register_backed(ctx) || source == CTX {
             return Ok(source);
         }
         self.code.emit(|e| e.mov_reg(CTX, source))?;

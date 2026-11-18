@@ -1,5 +1,6 @@
 //! AArch64 emitters for BEAM bit syntax construction.
 
+use super::beam_asm::NUM_REGISTER_BACKED_XREGS;
 pub use crate::bs_fast::{
     install_bs_append_binary, install_bs_append_checked, install_bs_gc, install_bs_private_append,
 };
@@ -221,8 +222,8 @@ fn source_reg_after_allocation(
     source: ArgVal,
 ) -> Result<Gpr, ModuleError> {
     match source {
-        ArgVal::X(index) => asm.source_reg(ArgVal::X(index)),
-        ArgVal::XMemory(index) if index < 1024 => {
+        ArgVal::X(index) if index < NUM_REGISTER_BACKED_XREGS => asm.source_reg(source),
+        ArgVal::X(index) if index < 1024 => {
             let offset = index
                 .checked_mul(8)
                 .ok_or(ModuleError::InvalidOperand("X register offset overflow"))?;
@@ -292,11 +293,7 @@ fn emit_bs_create_bin_generic(
     })?;
     if let Some(segment) = segments.first().filter(|s| s.kind == BsSegmentKind::Append) {
         let source = asm.source_reg(segment.src)?;
-        let append_source = if live < 6 {
-            ArgVal::X(live as u8)
-        } else {
-            ArgVal::XMemory(live)
-        };
+        let append_source = ArgVal::X(live);
         asm.store_register(append_source, source)?;
         asm.code.emit(|e| {
             e.mov_const(Gpr::x(2), u64::from(live))?;

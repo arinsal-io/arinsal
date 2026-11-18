@@ -1,5 +1,6 @@
 //! Module-local BeamAsm code generation for calls, frames, and register moves.
 
+use super::beam_asm::{NUM_REGISTER_BACKED_XREGS, is_register_backed};
 use arinsal_a64::buf::IdMap;
 use std::path::Path;
 
@@ -45,7 +46,9 @@ pub(super) struct PairVar {
 fn memory_slot(arg: ArgVal) -> Option<(Gpr, u32)> {
     match arg {
         ArgVal::Y(i) => i.checked_mul(8).map(|offset| (E, offset)),
-        ArgVal::XMemory(i) => i.checked_mul(8).map(|offset| (SCHEDULER_REGS, offset)),
+        ArgVal::X(i) if i >= NUM_REGISTER_BACKED_XREGS => {
+            i.checked_mul(8).map(|offset| (SCHEDULER_REGS, offset))
+        }
         _ => None,
     }
 }
@@ -879,7 +882,7 @@ impl BeamModuleAssembler {
         deallocate: u32,
     ) -> Result<(), ModuleError> {
         if let ArgVal::Y(src_index) = src
-            && matches!(dst, ArgVal::X(_) | ArgVal::XMemory(_))
+            && matches!(dst, ArgVal::X(_))
         {
             let bytes = u64::from(deallocate) * 8;
             if src_index == 0 && deallocate == 1 {
@@ -1513,7 +1516,7 @@ impl BeamModuleAssembler {
                 self.cache_invalidate_reg(to);
                 Ok(())
             }
-            ArgVal::Y(_) | ArgVal::XMemory(_) => {
+            ArgVal::Y(_) | ArgVal::X(_) => {
                 let from = self.source_reg_into(src, Gpr::x(17))?;
                 self.store_operand(dst, from)
             }
@@ -1549,8 +1552,10 @@ impl BeamModuleAssembler {
         src2: ArgVal,
         dst2: ArgVal,
     ) -> Result<(), ModuleError> {
-        if matches!(dst1, ArgVal::Y(_) | ArgVal::XMemory(_))
-            && matches!(dst2, ArgVal::Y(_) | ArgVal::XMemory(_))
+        if !is_register_backed(dst1)
+            && matches!(dst1, ArgVal::Y(_) | ArgVal::X(_))
+            && !is_register_backed(dst2)
+            && matches!(dst2, ArgVal::Y(_) | ArgVal::X(_))
         {
             let (first, second) = self.load_two_sources(src1, Gpr::x(8), src2, Gpr::x(9))?;
             let first = PairVar {
@@ -1578,7 +1583,7 @@ impl BeamModuleAssembler {
                 reg: XREGS[i as usize],
                 slot: None,
             }),
-            ArgVal::Y(_) | ArgVal::XMemory(_) => Ok(PairVar {
+            ArgVal::Y(_) | ArgVal::X(_) => Ok(PairVar {
                 reg: tmp,
                 slot: Some(dst),
             }),
@@ -1835,7 +1840,7 @@ impl BeamModuleAssembler {
             ArgVal::X(i) if i < 6 => Ok(XREGS[i as usize]),
             // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:252-259
             // (getXRef), OTP-29.1.1.
-            ArgVal::XMemory(i) if i < 1024 => {
+            ArgVal::X(i) if i < 1024 => {
                 let offset = i
                     .checked_mul(8)
                     .ok_or(ModuleError::InvalidOperand("X register offset overflow"))?;
@@ -2195,14 +2200,14 @@ impl BeamModuleAssembler {
     pub fn swap(&mut self, left: ArgVal, right: ArgVal) -> Result<(), ModuleError> {
         let left = self.register_value(left)?;
         let right = self.register_value(right)?;
-        if let ArgVal::X(index) = left {
+        if let ArgVal::X(index @ 0..NUM_REGISTER_BACKED_XREGS) = left {
             let register = XREGS[index as usize];
             self.load_register(right, TMP)?;
             self.store_register(right, register)?;
             self.code.emit(|e| e.mov_reg(register, TMP))?;
             return Ok(());
         }
-        if matches!(right, ArgVal::X(_)) {
+        if is_register_backed(right) {
             return self.swap(right, left);
         }
         let second_tmp = Gpr::x(10);
@@ -2237,7 +2242,7 @@ impl BeamModuleAssembler {
         match arg {
             ArgVal::X(i) if i < 6 => Ok(arg),
             ArgVal::Y(_) => Ok(arg),
-            ArgVal::XMemory(i) if i < 1024 => Ok(arg),
+            ArgVal::X(i) if i < 1024 => Ok(arg),
             _ => Err(ModuleError::InvalidOperand(
                 "swap operands must be X or Y registers",
             )),
@@ -2264,7 +2269,7 @@ impl BeamModuleAssembler {
                     })?;
                 }
             }
-            ArgVal::XMemory(i) if i < 1024 => {
+            ArgVal::X(i) if i < 1024 => {
                 self.ldr_cached(
                     dst,
                     crate::regcache::Slot {
@@ -2301,7 +2306,7 @@ impl BeamModuleAssembler {
                     })?;
                 }
             }
-            ArgVal::XMemory(i) if i < 1024 => {
+            ArgVal::X(i) if i < 1024 => {
                 self.str_cache(
                     src,
                     crate::regcache::Slot {

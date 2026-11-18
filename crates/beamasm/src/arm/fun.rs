@@ -40,11 +40,7 @@ pub enum FunCallTag {
 /// The register holding the fun of an `i_call_fun`: X registers above the register cache
 /// live in the scheduler's X array.
 fn fun_register(arity: u8) -> ArgVal {
-    if arity < 6 {
-        ArgVal::X(arity)
-    } else {
-        ArgVal::XMemory(u32::from(arity))
-    }
+    ArgVal::X(u32::from(arity))
 }
 
 impl BeamModuleAssembler {
@@ -52,7 +48,7 @@ impl BeamModuleAssembler {
     fn fun_destination(&self, dst: ArgVal) -> Result<(Gpr, bool), ModuleError> {
         match dst {
             ArgVal::X(index) if index < 6 => Ok((XREGS[index as usize], false)),
-            ArgVal::Y(_) | ArgVal::XMemory(_) => Ok((Gpr::x(8), true)),
+            ArgVal::Y(_) | ArgVal::X(_) => Ok((Gpr::x(8), true)),
             _ => Err(ModuleError::InvalidOperand(
                 "fun destination must be an X or Y register",
             )),

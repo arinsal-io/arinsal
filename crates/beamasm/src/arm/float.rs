@@ -173,10 +173,12 @@ impl BeamModuleAssembler {
         let loc = freg(source)?;
         let src = self.float_source(loc, VecReg(0))?;
         let boxed = match destination {
-            ArgVal::X(index) if index < 6 => {
-                Gpr::x(if index < 4 { 25 + index } else { 11 + index })
-            }
-            ArgVal::Y(_) | ArgVal::XMemory(_) => {
+            ArgVal::X(index) if index < 6 => Gpr::x(if index < 4 {
+                25 + index as u8
+            } else {
+                11 + index as u8
+            }),
+            ArgVal::Y(_) | ArgVal::X(_) => {
                 self.code
                     .emit(|e| e.add_imm(Gpr::x(9), HTOP, TAG_PRIMARY_BOXED as u16, false))?;
                 self.code.emit(|e| {

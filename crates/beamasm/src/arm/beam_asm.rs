@@ -30,6 +30,16 @@ pub mod register {
     pub const TMP: [&str; 6] = ["x8", "x9", "x10", "x11", "x12", "x13"];
 }
 
+/// X registers arm64 keeps in machine registers (`num_register_backed_xregs`).
+// Port of erts/emulator/beam/jit/arm/beam_asm.hpp:136-139, OTP-29.1.1.
+pub(crate) const NUM_REGISTER_BACKED_XREGS: u32 = 6;
+
+/// Whether `arg` is an X register cached in a machine register.
+// Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1460-1469 (isRegisterBacked), OTP-29.1.1.
+pub(crate) fn is_register_backed(arg: crate::common::args::ArgVal) -> bool {
+    matches!(arg, crate::common::args::ArgVal::X(index) if index < NUM_REGISTER_BACKED_XREGS)
+}
+
 /// Selects process fields synchronized at a native/runtime boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Update(u8);

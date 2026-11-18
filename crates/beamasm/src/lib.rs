@@ -1,8 +1,9 @@
 //! Runtime ABI for BeamAsm native code.
 //!
 //! As erts builds erts/emulator/beam/jit/ with exactly one of jit/arm or jit/x86, the crate
-//! holds the architecture-neutral port of jit/beam_jit_*.{cpp,hpp} in `common` and the
-//! AArch64 emitters in `arm`, re-exported here as the single public facade.
+//! holds the architecture-neutral port of jit/beam_jit_*.{cpp,hpp} in `common`, the AArch64
+//! emitters in `arm` and the x86-64 ABI and native entry in `x86`, re-exported here as the
+//! single public facade.
 
 #![deny(unsafe_code)]
 
@@ -15,6 +16,11 @@ pub use common::types;
 mod arm;
 #[cfg(target_arch = "aarch64")]
 pub use arm::*;
+
+#[cfg(target_arch = "x86_64")]
+mod x86;
+#[cfg(target_arch = "x86_64")]
+pub use x86::*;
 
 /// C-layout process header consumed directly by BeamAsm generated code.
 ///
@@ -61,6 +67,12 @@ pub struct SchedulerRegisters {
     /// Appended after the frozen prefix so existing BeamAsm offsets stay put.
     // Port of erts/emulator/beam/erl_bits.h:181 (struct erl_bits_state), OTP-29.1.1.
     pub erl_bits_state: [u64; 2],
+    /// `aux_regs.d.runtime_stack`: on x86-64 the Erlang stack is the native stack, so native
+    /// code switches `rsp` back to the runtime (scheduler thread) stack held here before every
+    /// runtime call. Unused on arm64, where `E` is a separate register, as in erts.
+    // Port of erts/emulator/beam/erl_process.h (ErtsSchedulerRegisters.aux_regs.d.runtime_stack)
+    // and erts/emulator/beam/jit/x86/beam_asm.hpp (getRuntimeStackRef), OTP-29.1.1.
+    pub runtime_stack: u64,
 }
 
 /// Offset of `SchedulerRegisters::active_code_ix`, read by the native entry trampoline.
@@ -75,6 +87,10 @@ const _: () = assert!(ENTRY_RETURN_OFFSET == 16488);
 pub const TRAP_RETURN_OFFSET: usize = std::mem::offset_of!(SchedulerRegisters, trap_return);
 const _: () = assert!(TRAP_RETURN_OFFSET == 16496);
 
+/// Offset of `SchedulerRegisters::runtime_stack`, the x86-64 runtime stack slot.
+pub const RUNTIME_STACK_OFFSET: usize = std::mem::offset_of!(SchedulerRegisters, runtime_stack);
+const _: () = assert!(RUNTIME_STACK_OFFSET == 16520);
+
 impl Default for SchedulerRegisters {
     fn default() -> Self {
         Self {
@@ -86,6 +102,7 @@ impl Default for SchedulerRegisters {
             entry_return: 0,
             trap_return: 0,
             erl_bits_state: [0, 0],
+            runtime_stack: 0,
         }
     }
 }

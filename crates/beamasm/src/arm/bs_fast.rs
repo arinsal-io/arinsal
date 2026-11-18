@@ -251,8 +251,7 @@ fn is_all(seg: &BsSegment) -> bool {
 
 fn x_index(src: ArgVal) -> Option<u32> {
     match src {
-        ArgVal::X(index) => Some(u32::from(index)),
-        ArgVal::XMemory(index) => Some(index),
+        ArgVal::X(index) => Some(index),
         _ => None,
     }
 }
@@ -369,11 +368,7 @@ fn emit_append(
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1810-1845 (`am_append`), OTP-29.1.1:
     // `mov_arg(ArgXRegister(Live), src)`, then `erts_bs_append_checked(c_p, reg, Live, ...)`
     // with `Live + 1` X registers synced. The helper collects with exactly those roots.
-    let append_source = if live < 6 {
-        ArgVal::X(live as u8)
-    } else {
-        ArgVal::XMemory(live)
-    };
+    let append_source = ArgVal::X(live);
     let source = asm.source_reg(plan.bin)?;
     asm.store_register(append_source, source)?;
     let update = crate::Update::HEAP_ALLOC

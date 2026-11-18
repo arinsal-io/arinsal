@@ -2141,12 +2141,11 @@ fn fun_call_tag(value: Option<&SpecificOperand>) -> Result<FunCallTag, EmitError
     }
 }
 
-/// `ArgXRegister(index)`: cached below 6, otherwise in the scheduler's X register array.
+/// `ArgXRegister(index)`, within the scheduler's X register array; the target assembler
+/// decides which X registers it keeps in machine registers.
 fn x_register(index: u32) -> Result<ArgVal, String> {
     match index {
-        0..6 => Ok(ArgVal::X(index as u8)),
-        // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:252-259 (getXRef), OTP-29.1.1.
-        6..1024 => Ok(ArgVal::XMemory(index)),
+        0..1024 => Ok(ArgVal::X(index)),
         _ => Err("X register index exceeds scheduler register array".to_owned()),
     }
 }

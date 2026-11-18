@@ -927,7 +927,7 @@ impl BeamModuleAssembler {
                 Gpr::x(10 + 5),
                 Gpr::x(10 + 6),
             ][index as usize]),
-            ArgVal::Y(_) | ArgVal::XMemory(_) => Ok(Gpr::x(17)),
+            ArgVal::Y(_) | ArgVal::X(_) => Ok(Gpr::x(17)),
             _ => Err(ModuleError::InvalidOperand(
                 "guard BIF destination must be X or Y",
             )),
@@ -946,7 +946,7 @@ impl BeamModuleAssembler {
                     self.code.emit(|e| e.mov_reg(target, result))?;
                 }
             }
-            ArgVal::Y(_) | ArgVal::XMemory(_) => self.store_operand(destination, result)?,
+            ArgVal::Y(_) | ArgVal::X(_) => self.store_operand(destination, result)?,
             _ => {
                 return Err(ModuleError::InvalidOperand(
                     "guard BIF destination must be X or Y",
@@ -2955,25 +2955,20 @@ fn exact_immediate_operand(lhs: ArgVal, rhs: ArgVal) -> Option<(ArgVal, u64)> {
 
 fn small_comparison_immediate(lhs: ArgVal, rhs: ArgVal) -> Option<(ArgVal, u64, bool)> {
     match (lhs, rhs) {
-        (ArgVal::X(_) | ArgVal::XMemory(_) | ArgVal::Y(_), ArgVal::Immediate(word))
-            if word & 15 == 15 =>
-        {
+        (ArgVal::X(_) | ArgVal::Y(_), ArgVal::Immediate(word)) if word & 15 == 15 => {
             Some((lhs, word, false))
         }
-        (ArgVal::Immediate(word), ArgVal::X(_) | ArgVal::XMemory(_) | ArgVal::Y(_))
-            if word & 15 == 15 =>
-        {
+        (ArgVal::Immediate(word), ArgVal::X(_) | ArgVal::Y(_)) if word & 15 == 15 => {
             Some((rhs, word, true))
         }
         _ => None,
     }
 }
 
-/// The X register `index`: cached below 6, else in the register array.
+/// The X register `index`, within the scheduler register array.
 fn x_slot(index: u32) -> Result<ArgVal, ModuleError> {
     match index {
-        0..6 => Ok(ArgVal::X(index as u8)),
-        6..1024 => Ok(ArgVal::XMemory(index)),
+        0..1024 => Ok(ArgVal::X(index)),
         _ => Err(ModuleError::InvalidOperand(
             "X register index exceeds scheduler register array",
         )),

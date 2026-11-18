@@ -340,7 +340,7 @@ fn runtime_calls_in_fun_map_and_records_keep_register_state() {
     // Only the first destination is wanted; the rest is OTP's scratch X register.
     let mut large_args = [ArgVal::Immediate(0); 24];
     for triplet in large_args.as_chunks_mut::<3>().0 {
-        triplet[1] = ArgVal::XMemory(1023);
+        triplet[1] = ArgVal::X(1023);
     }
     large_args[1] = ArgVal::X(0);
     let (seen, after, header) = run(

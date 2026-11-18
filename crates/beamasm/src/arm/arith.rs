@@ -1,5 +1,6 @@
 //! Integer arithmetic emission for BeamAsm modules.
 
+use super::beam_asm::NUM_REGISTER_BACKED_XREGS;
 use arinsal_a64::buf::Label;
 use arinsal_a64::enc::{Cond, Gpr, Shift, Shifted, is_logical_immediate};
 
@@ -43,7 +44,9 @@ const TMP_MEM_REM: u32 = 16_392;
 /// Base and byte offset of an operand that lives in memory (not a cached X register).
 fn mem_operand(arg: ArgVal) -> Option<(Gpr, i64)> {
     match arg {
-        ArgVal::XMemory(index) if index < 1024 => Some((Gpr::x(19), i64::from(index) * 8)),
+        ArgVal::X(index) if (NUM_REGISTER_BACKED_XREGS..1024).contains(&index) => {
+            Some((Gpr::x(19), i64::from(index) * 8))
+        }
         ArgVal::Y(index) => index
             .checked_mul(8)
             .map(|offset| (Gpr::x(20), i64::from(offset))),

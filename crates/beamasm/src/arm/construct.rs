@@ -148,8 +148,7 @@ impl BeamModuleAssembler {
                 self.check_pending_stubs()?;
             }
             let (first, second) = (data(index), data(index + 1));
-            let is_register =
-                |arg: ArgVal| matches!(arg, ArgVal::X(_) | ArgVal::XMemory(_) | ArgVal::Y(_));
+            let is_register = |arg: ArgVal| matches!(arg, ArgVal::X(_) | ArgVal::Y(_));
             let (left, right) = if !is_register(first) && first == second {
                 if value != Some(first) {
                     value = Some(first);

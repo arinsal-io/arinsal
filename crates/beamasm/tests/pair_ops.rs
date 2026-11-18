@@ -68,7 +68,7 @@ fn load_two_xregs_is_one_ldp_for_register_backed_destinations() {
                 m.emit_load_two_xregs(ArgVal::Y(0), ArgVal::X(2), ArgVal::Y(1), ArgVal::X(3))
                     .unwrap();
             }));
-            m.move_(ArgVal::XMemory(6), ArgVal::Y(2)).unwrap();
+            m.move_(ArgVal::X(6), ArgVal::Y(2)).unwrap();
         },
         |_, regs| {
             regs.x_reg_array[0] = rt::fixture_term(fixture(0x11));
@@ -87,13 +87,8 @@ fn load_two_xregs_into_memory_destinations_stores_one_pair() {
             m.move_(ArgVal::X(0), ArgVal::Y(0)).unwrap();
             m.move_(ArgVal::X(1), ArgVal::Y(1)).unwrap();
             size.set(emitted_bytes(m, |m| {
-                m.emit_load_two_xregs(
-                    ArgVal::Y(0),
-                    ArgVal::XMemory(6),
-                    ArgVal::Y(1),
-                    ArgVal::XMemory(7),
-                )
-                .unwrap();
+                m.emit_load_two_xregs(ArgVal::Y(0), ArgVal::X(6), ArgVal::Y(1), ArgVal::X(7))
+                    .unwrap();
             }));
         },
         |_, regs| {
@@ -175,7 +170,7 @@ fn get_two_tuple_elements_is_one_ldp_from_the_tuple_pointer() {
                 m.emit_get_two_tuple_elements(ArgVal::X(0), 8, ArgVal::X(1), ArgVal::X(2))
                     .unwrap();
             }));
-            m.emit_get_two_tuple_elements(ArgVal::X(0), 8, ArgVal::XMemory(6), ArgVal::XMemory(7))
+            m.emit_get_two_tuple_elements(ArgVal::X(0), 8, ArgVal::X(6), ArgVal::X(7))
                 .unwrap();
         },
         |area, regs| {

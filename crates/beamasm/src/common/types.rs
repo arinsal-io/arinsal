@@ -145,7 +145,7 @@ impl TypedArg {
 
     /// `ArgSource::isRegister`.
     pub fn is_register(&self) -> bool {
-        matches!(self.val, ArgVal::X(_) | ArgVal::XMemory(_) | ArgVal::Y(_))
+        matches!(self.val, ArgVal::X(_) | ArgVal::Y(_))
     }
 
     /// `getTypeUnion`.

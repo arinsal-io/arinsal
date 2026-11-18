@@ -617,7 +617,7 @@ impl BeamModuleAssembler {
             self.code.emit(|e| e.mov_reg(regs[index], source))?;
         }
         for (index, reg) in regs.iter().copied().enumerate().take(args.len()) {
-            self.store_operand(ArgVal::X(index as u8), reg)?;
+            self.store_operand(ArgVal::X(index as u32), reg)?;
         }
         Ok(())
     }
