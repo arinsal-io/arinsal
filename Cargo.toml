@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/a64",
+    "crates/x64",
     "crates/alloc",
     "crates/beamasm",
     "crates/beamops",
