@@ -2140,68 +2140,83 @@ fn float_options(args: &[Term]) -> Option<arinsal_float::FloatFormatOpts> {
     (tail == Term::NIL).then_some(options)
 }
 
-fn float_buffer(args: &[Term]) -> Option<([u8; arinsal_float::FLOAT_BUFFER_SIZE], usize)> {
+fn float_buffer(
+    args: &[Term],
+    buffer: &mut [u8; arinsal_float::FLOAT_BUFFER_SIZE],
+) -> Option<usize> {
     let value = crate::natives::raw::float(args[0])?;
     let options = float_options(args)?;
-    let mut buffer = [0; arinsal_float::FLOAT_BUFFER_SIZE];
-    let length = arinsal_float::float_to_buffer(value, &options, &mut buffer).ok()?;
-    Some((buffer, length))
+    arinsal_float::float_to_buffer(value, &options, buffer).ok()
 }
 
 /// `float_to_list/1` and `/2`.
 // Port of erts/emulator/beam/bif.c (do_float_to_charbuf, do_float_to_list), OTP-29.1.1.
 pub(crate) extern "C" fn float_to_list_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let args = bif_args::<1>(reg);
-    float_to_output(c_p, &args, false)
+    float_to_list_output(c_p, &args)
 }
 
 /// `float_to_list/2`.
 // Port of erts/emulator/beam/bif.c (float_to_list_2), OTP-29.1.1.
 pub(crate) extern "C" fn float_to_list_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let args = bif_args::<2>(reg);
-    float_to_output(c_p, &args, false)
+    float_to_list_output(c_p, &args)
 }
 
 /// `float_to_binary/1` and `/2`.
 // Port of erts/emulator/beam/bif.c (do_float_to_charbuf, do_float_to_binary), OTP-29.1.1.
 pub(crate) extern "C" fn float_to_binary_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let args = bif_args::<1>(reg);
-    float_to_output(c_p, &args, true)
+    float_to_binary_output(c_p, &args)
 }
 
 /// `float_to_binary/2`.
 // Port of erts/emulator/beam/bif.c (float_to_binary_2), OTP-29.1.1.
 pub(crate) extern "C" fn float_to_binary_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let args = bif_args::<2>(reg);
-    float_to_output(c_p, &args, true)
+    float_to_binary_output(c_p, &args)
 }
 
-fn float_to_output(c_p: *mut ProcessHeader, args: &[Term], binary: bool) -> u64 {
+/// `do_float_to_list`.
+// Port of erts/emulator/beam/bif.c (do_float_to_list), OTP-29.1.1.
+fn float_to_list_output(c_p: *mut ProcessHeader, args: &[Term]) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
-    let Some((buffer, length)) = float_buffer(args) else {
+    let mut buffer = [0; arinsal_float::FLOAT_BUFFER_SIZE];
+    let Some(length) = float_buffer(args, &mut buffer) else {
         return bif_badarg(c_p);
     };
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let mut builder = TermBuilder::new(&mut heap);
-    let result = if binary {
-        builder.binary(&buffer[..length])
-    } else {
-        let list = match builder.reserve_cons_list(length) {
-            Ok(list) => list,
-            Err(_) => return bif_system_limit(c_p),
-        };
-        let values = buffer[..length]
-            .iter()
-            .rev()
-            .map(|byte| Term::small(i64::from(*byte)).expect("ASCII byte is a small integer"));
-        return match list.prepend_exact_with_tail(values, Term::NIL) {
-            Ok(result) => crate::native_hooks::raw(result),
-            Err(_) => bif_system_limit(c_p),
-        };
+    let list = match builder.reserve_cons_list(length) {
+        Ok(list) => list,
+        Err(_) => return bif_system_limit(c_p),
     };
+    let values = buffer[..length]
+        .iter()
+        .rev()
+        .map(|byte| Term::small(i64::from(*byte)).expect("ASCII byte is a small integer"));
+    match list.prepend_exact_with_tail(values, Term::NIL) {
+        Ok(result) => crate::native_hooks::raw(result),
+        Err(_) => bif_system_limit(c_p),
+    }
+}
+
+/// `do_float_to_binary`.
+// Port of erts/emulator/beam/bif.c (do_float_to_binary), OTP-29.1.1.
+fn float_to_binary_output(c_p: *mut ProcessHeader, args: &[Term]) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let mut buffer = [0; arinsal_float::FLOAT_BUFFER_SIZE];
+    let Some(length) = float_buffer(args, &mut buffer) else {
+        return bif_badarg(c_p);
+    };
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let result = TermBuilder::new(&mut heap).binary(&buffer[..length]);
     match result {
         Ok(result) => crate::native_hooks::raw(result),
         Err(_) => bif_system_limit(c_p),

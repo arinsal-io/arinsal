@@ -1348,3 +1348,17 @@ pub use crate::bits::UninitBitstring;
 pub fn finish_iolist_binary_output(term: Term) {
     crate::writable_finalize(term);
 }
+
+/// Return the payload pointer handed out as `datap` by OTP's binary allocator.
+///
+/// # Safety
+/// `term` must be the active, uniquely owned iolist binary writer, and the caller must keep it
+/// alive and avoid heap movement, finalization, or any other access until its writes finish.
+// Port of erts/emulator/beam/erl_bits.c (`erts_new_bitstring` output pointer), OTP-29.1.1.
+pub unsafe fn iolist_binary_output_ptr(
+    output: &mut crate::bits::UninitBitstring,
+) -> Option<(*mut u8, usize)> {
+    // SAFETY: the caller guarantees this is the active exclusive writer; the callback ends
+    // before the pointer is returned and performs no allocation.
+    output.with_bytes_mut(|bytes| (bytes.as_mut_ptr(), bytes.len()))
+}

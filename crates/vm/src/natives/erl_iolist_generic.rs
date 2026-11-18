@@ -9,6 +9,7 @@
 //! and `VecThreshold == ERTS_UINT_MAX` (usize::MAX) switches the iovec logic off.
 
 use crate::natives::erl_iolist::charge;
+mod raw;
 use arinsal_bifs::ProcessHeapHandle;
 use arinsal_term::raw::{BinRef, Cons, UninitBitstring};
 use arinsal_term::{ConsHeapChain, EStack, Term, TermBuilder};
@@ -365,101 +366,5 @@ pub(crate) fn generic_iolist_copy<const UNIT: usize>(
     process: &mut crate::Process,
     threshold: usize,
 ) -> IolistAction {
-    let CopyState {
-        iolist,
-        vec,
-        from,
-        to_base,
-        to_offset,
-    } = copy;
-    if iolist.reds_left <= 0 {
-        return IolistAction::Yield;
-    }
-    let init = YIELDS_PER_RED * iolist.reds_left;
-    let start = iolist.obj;
-    let mut pass = |base: &mut [u8]| -> (Option<Term>, i64) {
-        // The cursor and the yield count are locals of the pass, not captured state.
-        let mut yield_count = init;
-        let mut obj = start;
-        let mut resume = true;
-        let mut offset = *to_offset;
-        let stopped = 'pass: loop {
-            if !resume {
-                match iolist.estack.pop() {
-                    Some(next) => obj = next,
-                    None => break None,
-                }
-            }
-            resume = false;
-            while let Ok(cons) = Cons::try_from(obj) {
-                yield_count -= 1;
-                if yield_count <= 0 {
-                    break 'pass Some(obj);
-                }
-                let (head, tail) = cons.pair();
-                obj = head;
-                if let Some(byte) = as_byte(obj) {
-                    let byte_offset = offset / 8;
-                    let shift = if UNIT == 8 { 0 } else { offset % 8 };
-                    if shift == 0 {
-                        base[byte_offset] = byte;
-                    } else {
-                        let leading_bits = base[byte_offset];
-                        base[byte_offset] =
-                            (byte >> shift) | ((leading_bits >> (8 - shift)) << (8 - shift));
-                        base[byte_offset + 1] = byte << (8 - shift);
-                    }
-                    offset += 8;
-                    // A run of bytes stays in this loop: the next cell is the tail.
-                    obj = tail;
-                    continue;
-                } else if let Some((start, bits)) = bitstring_geometry(obj) {
-                    if should_copy::<UNIT>(threshold, start, bits) {
-                        if copy_bitstring(from, base, &mut offset, obj, &mut yield_count) {
-                            iolist.estack.push(tail);
-                            break 'pass Some(obj);
-                        }
-                    } else {
-                        vec_enqueue(vec, offset, process, obj);
-                    }
-                } else if Cons::try_from(obj).is_ok() {
-                    iolist.estack.push(tail);
-                    continue;
-                }
-                obj = tail;
-            }
-            yield_count -= 1;
-            if yield_count <= 0 {
-                break 'pass Some(obj);
-            } else if let Some((start, bits)) = bitstring_geometry(obj) {
-                if should_copy::<UNIT>(threshold, start, bits) {
-                    if copy_bitstring(from, base, &mut offset, obj, &mut yield_count) {
-                        break 'pass Some(obj);
-                    }
-                } else {
-                    vec_enqueue(vec, offset, process, obj);
-                }
-            }
-        };
-        *to_offset = offset;
-        (stopped, yield_count)
-    };
-    // A copy pass over a list of only empty leaves has no target. For the off-heap kind the
-    // payload does not move when the pass allocates (iovec); a heap bitstring is only used by the
-    // list_to_bitstring family, whose pass allocates nothing.
-    let (stopped, yield_count) = match to_base.as_mut() {
-        Some(output) => output.with_bytes_mut(&mut pass).expect("a sized copy pass"),
-        None => pass(&mut []),
-    };
-    match stopped {
-        None => {
-            if threshold < NO_VEC {
-                vec_enqueue(vec, *to_offset, process, Term::NIL);
-            }
-            iolist.estack = EStack::new();
-            iolist.finish_reds(process, init, yield_count);
-            IolistAction::Ok
-        }
-        Some(obj) => iolist.yield_pass(process, obj),
-    }
+    raw::generic_iolist_copy::<UNIT>(copy, process, threshold)
 }
