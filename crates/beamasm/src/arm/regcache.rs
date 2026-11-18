@@ -34,15 +34,6 @@ impl crate::common::register_cache::CacheMem<Gpr> for Slot {
     }
 }
 
-impl RegCache {
-    /// An empty cache over X slots addressed from `xregs` and Y slots from `yregs`, with no
-    /// temporaries to allocate from.
-    // Port of beam_jit_register_cache.hpp:66-70 (RegisterCache::RegisterCache), OTP-29.1.1.
-    pub(crate) fn new(xregs: Gpr, yregs: Gpr) -> Self {
-        Self::with_temporaries(xregs, yregs, &[])
-    }
-}
-
 impl BeamModuleAssembler {
     fn cache_here(&self) -> (usize, u64) {
         (self.code.offset(), self.code.bind_count())

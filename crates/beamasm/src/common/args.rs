@@ -9,23 +9,40 @@ pub enum ArgVal {
     X(u32),
     /// Erlang stack Y value, numbered from the current stack pointer.
     Y(u32),
-    /// An immediate machine word.
+    /// A tagged immediate term (erts `ArgImmed`: NIL, an atom, a small integer or an arity
+    /// value).
     Immediate(u64),
+    /// An untagged machine word (erts `ArgWord`, `TAG_u`): the `t`/`I`/`W`/`A`/`P`/`b`
+    /// operands of the loader and the untagged elements of variable argument lists.
+    Word(u64),
     /// A literal machine word.
     Literal(u64),
     /// A module label number.
     Label(u32),
     /// An export table index (external call emission is currently unported).
     Export(u32),
+    /// A float register (erts `ArgFRegister`, `l`), as the loader massages it: the register
+    /// number times `sizeof(FloatDef)`.
+    FReg(u32),
+    /// A byte offset into the module's string table (erts `ArgBytePtr`, `M`).
+    BytePtr(u64),
+    /// An exception handler label (erts `ArgCatch`, `H`).
+    Catch(u32),
+    /// A lambda table index (erts `ArgLambda`, `F`).
+    FunEntry(u32),
 }
 
-/// The operand a destination becomes once `words` have been trimmed from the frame.
-// Port of erts/emulator/beam/jit/beam_jit_args.hpp (ArgVal::trimmed), OTP-29.1.1.
-pub(crate) fn trimmed_arg(dst: ArgVal, words: u32) -> Option<ArgVal> {
-    match dst {
-        ArgVal::Y(index) => index.checked_sub(words).map(ArgVal::Y),
-        ArgVal::X(_) => Some(dst),
-        _ => None,
+impl ArgVal {
+    /// `ArgRegister::trimmed(n)`: the register a destination becomes once `words` have been
+    /// trimmed from the frame; `None` for a Y register trimmed away or a non-register.
+    // Port of erts/emulator/beam/jit/beam_jit_args.hpp:257-263 (ArgRegister::trimmed),
+    // OTP-29.1.1.
+    pub fn trimmed(self, words: u32) -> Option<ArgVal> {
+        match self {
+            ArgVal::Y(index) => index.checked_sub(words).map(ArgVal::Y),
+            ArgVal::X(_) => Some(self),
+            _ => None,
+        }
     }
 }
 

@@ -1,3 +1,6 @@
+// The arm module assembler driver: AArch64 code run through its ModuleEnv hooks.
+#![cfg(target_arch = "aarch64")]
+
 use arinsal_a64::enc::Gpr;
 use arinsal_beam::BeamFile;
 use arinsal_beamasm::{

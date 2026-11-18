@@ -24,7 +24,10 @@ pub(crate) struct RegisterCache<const SIZE: usize, M, Reg, P = usize> {
     pub(crate) entries: Vec<(M, Reg)>,
     /// `position`.
     pub(crate) position: Option<P>,
-    /// `temporaries`, in preference order.
+    /// `temporaries`, in preference order. Only x86-64 allocates temporaries from the cache
+    /// (`alloc_temp_reg`); arm64 instantiates the template with none (`{}`) and never calls
+    /// `allocate`, which C++ then never instantiates, so they exist on x86-64 only.
+    #[cfg(target_arch = "x86_64")]
     temporaries: Vec<Reg>,
     xregs_base: Reg,
     yregs_base: Reg,
@@ -33,8 +36,23 @@ pub(crate) struct RegisterCache<const SIZE: usize, M, Reg, P = usize> {
 impl<const SIZE: usize, M: CacheMem<Reg>, Reg: Copy + Eq, P: Copy + Eq>
     RegisterCache<SIZE, M, Reg, P>
 {
+    /// `RegisterCache(xregs, yregs, {})`: the arm64 instantiation, without temporaries.
+    // Port of beam_jit_register_cache.hpp:66-70 (RegisterCache::RegisterCache) and
+    // erts/emulator/beam/jit/arm/beam_asm.hpp:979-980 (reg_cache), OTP-29.1.1.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn new(xregs: Reg, yregs: Reg) -> Self {
+        Self {
+            entries: Vec::with_capacity(SIZE),
+            position: None,
+            xregs_base: xregs,
+            yregs_base: yregs,
+        }
+    }
+
     /// `RegisterCache(xregs, yregs, tmps)`: [`Self::allocate`] picks from `tmps`.
-    // Port of beam_jit_register_cache.hpp:66-70 (RegisterCache::RegisterCache), OTP-29.1.1.
+    // Port of beam_jit_register_cache.hpp:66-70 (RegisterCache::RegisterCache) and
+    // erts/emulator/beam/jit/x86/beam_asm.hpp:1138-1142 (reg_cache), OTP-29.1.1.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn with_temporaries(xregs: Reg, yregs: Reg, tmps: &[Reg]) -> Self {
         Self {
             entries: Vec::with_capacity(SIZE),
@@ -46,6 +64,7 @@ impl<const SIZE: usize, M: CacheMem<Reg>, Reg: Copy + Eq, P: Copy + Eq>
     }
 
     // Port of beam_jit_register_cache.hpp:58-62 (isCached), OTP-29.1.1.
+    #[cfg(target_arch = "x86_64")]
     fn is_cached(&self, reg: Reg) -> bool {
         self.entries.iter().any(|(_, cached)| *cached == reg)
     }
@@ -119,6 +138,7 @@ impl<const SIZE: usize, M: CacheMem<Reg>, Reg: Copy + Eq, P: Copy + Eq>
 
     /// `allocate(offset)`: a temporary register, preferring one not in the cache.
     // Port of beam_jit_register_cache.hpp:151-172 (allocate), OTP-29.1.1.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn allocate(&mut self, offset: P) -> Reg {
         self.consolidate(offset);
         match self.temporaries.iter().find(|reg| !self.is_cached(**reg)) {
@@ -185,7 +205,10 @@ mod tests {
 
     #[test]
     fn erts_cache_semantics() {
+        #[cfg(target_arch = "x86_64")]
         let mut cache = Cache::with_temporaries(1, 2, &[10, 11, 12]);
+        #[cfg(target_arch = "aarch64")]
+        let mut cache = Cache::new(1, 2);
         let x0 = Slot { base: 1, offset: 0 };
         let y1 = Slot { base: 2, offset: 8 };
         assert_eq!(cache.find(0, x0), None);
@@ -194,6 +217,7 @@ mod tests {
         assert_eq!(cache.entries.len(), 1);
         cache.update(4);
         assert_eq!(cache.find(4, x0), Some(10));
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(cache.allocate(4), 11);
         // Any other position drops the cache.
         assert_eq!(cache.find(5, x0), None);
@@ -201,6 +225,7 @@ mod tests {
         cache.put(y1, 11);
         cache.put(Slot { base: 1, offset: 8 }, 12);
         assert_eq!(cache.entries[0], (Slot { base: 1, offset: 8 }, 12));
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(cache.allocate(5), 10);
         cache.trim_yregs(8);
         assert_eq!(cache.entries[1], (Slot { base: 2, offset: 0 }, 11));

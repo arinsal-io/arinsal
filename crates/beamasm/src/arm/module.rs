@@ -5,7 +5,6 @@ use arinsal_a64::buf::IdMap;
 use std::path::Path;
 
 pub use crate::common::args::ArgVal;
-use crate::common::args::trimmed_arg;
 use crate::rt::arinsal_enter_native_return;
 use arinsal_a64::{
     buf::{BufferError, CodeBuffer, Label},
@@ -1377,7 +1376,7 @@ impl BeamModuleAssembler {
             .and_then(|bytes| i16::try_from(bytes).ok())
             .filter(|bytes| *bytes < 256);
         if let (ArgVal::Y(0), Some(trim)) = (src, trim)
-            && let Some(trimmed) = trimmed_arg(dst, words)
+            && let Some(trimmed) = dst.trimmed(words)
         {
             let to = self.pair_destination(trimmed, Gpr::x(8))?;
             self.code.emit(|e| e.ldr_post(to.reg, E, trim))?;
@@ -1418,8 +1417,7 @@ impl BeamModuleAssembler {
         let second = self.pair_destination(dst2, Gpr::x(9))?;
         if src1 == 0
             && let Some(trim) = trim
-            && let (Some(trimmed1), Some(trimmed2)) =
-                (trimmed_arg(dst1, words), trimmed_arg(dst2, words))
+            && let (Some(trimmed1), Some(trimmed2)) = (dst1.trimmed(words), dst2.trimmed(words))
         {
             self.code
                 .emit(|e| e.ldp_post(first.reg, second.reg, E, trim))?;

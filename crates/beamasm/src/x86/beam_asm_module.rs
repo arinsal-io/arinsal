@@ -158,12 +158,12 @@ impl CacheMem<Gp> for Mem {
     }
 }
 
-/// `ArgWord::get()`: an untagged word operand (`u`/`t`/`I`), which the loader passes as
-/// [`ArgVal::Immediate`].
+/// `ArgWord::get()`: an untagged word operand (`t`/`I`/`W`/`A`/`P`), which the loader passes
+/// as [`ArgVal::Word`].
 // Port of erts/emulator/beam/jit/beam_jit_args.hpp (ArgWord), OTP-29.1.1.
 pub fn arg_word(arg: ArgVal) -> Result<u64, AsmError> {
     match arg {
-        ArgVal::Immediate(word) => Ok(word),
+        ArgVal::Word(word) => Ok(word),
         _ => Err(AsmError::Operand("word operand")),
     }
 }
@@ -385,6 +385,9 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:1672-1719 (mov_arg), OTP-29.1.1.
     pub fn mov_arg_to_reg(&mut self, to: Gp, from: ArgVal) -> Result<(), AsmError> {
         match from {
+            ArgVal::BytePtr(offset) => {
+                Self::make_move_patch(&mut self.asm, to, &mut self.strings, offset as usize)
+            }
             ArgVal::Export(index) => {
                 let mut patches = self.imports.remove(&index).unwrap_or_default();
                 let result = Self::make_move_patch(&mut self.asm, to, &mut patches, 0);
@@ -394,6 +397,12 @@ impl BeamModuleAssembler {
             ArgVal::Immediate(value) => {
                 self.preserve_cache(&[to], &[], |m| m.asm.mov_imm(to, value))
             }
+            ArgVal::FunEntry(index) => self.preserve_cache(&[to], &[], |m| {
+                let mut patches = m.lambdas.remove(&index).unwrap_or_default();
+                let result = Self::make_move_patch(&mut m.asm, to, &mut patches, 0);
+                m.lambdas.insert(index, patches);
+                result
+            }),
             ArgVal::Literal(term) => self.preserve_cache(&[to], &[], |m| {
                 let mut patches = m.literals.remove(&term).unwrap_or_default();
                 let result = Self::make_move_patch(&mut m.asm, to, &mut patches, 0);
@@ -404,7 +413,10 @@ impl BeamModuleAssembler {
                 let mem = Self::arg_ref(from)?;
                 self.load_cached(to, mem)
             }
-            ArgVal::Label(_) => Err(AsmError::Operand("mov_arg with incompatible type")),
+            ArgVal::Word(value) => self.preserve_cache(&[to], &[], |m| m.asm.mov_imm(to, value)),
+            ArgVal::Label(_) | ArgVal::FReg(_) | ArgVal::Catch(_) => {
+                Err(AsmError::Operand("mov_arg with incompatible type"))
+            }
         }
     }
 

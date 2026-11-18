@@ -171,6 +171,19 @@ struct ReferenceOp {
 }
 
 fn parse_reference_op(text: &str) -> Option<ReferenceOp> {
+    // An instruction without operands is printed as its bare name (`timeout_locked`), which
+    // must not be read as `timeout` with the suffix `locked`.
+    // The commands of `i_bs_match` print as comments with operands (`test_heap 14`) and are
+    // not instructions.
+    if let Some(name) = SPECIFIC_OP_NAMES
+        .iter()
+        .find(|name| **name == text.trim_end())
+    {
+        return Some(ReferenceOp {
+            name: (*name).to_owned(),
+            suffix: String::new(),
+        });
+    }
     let name = SPECIFIC_OP_NAMES
         .iter()
         .filter(|name| text.starts_with(&format!("{name}_")))

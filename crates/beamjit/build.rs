@@ -1,9 +1,15 @@
 use arinsal_beamops::{specific_op_count, specific_op_info};
 use std::{collections::BTreeMap, env, fs, path::PathBuf};
 
+/// The arm module assembler driver still dispatches through its `EmitterKind` table
+/// (`src/arm/mod.rs`); x86 dispatches through the generated `beamasm_emit!` and needs nothing
+/// from here.
 fn main() {
-    println!("cargo:rerun-if-changed=src/lib.rs");
-    let source = fs::read_to_string("src/lib.rs").expect("beamjit source");
+    println!("cargo:rerun-if-changed=src/arm/mod.rs");
+    if env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("aarch64") {
+        return;
+    }
+    let source = fs::read_to_string("src/arm/mod.rs").expect("beamjit arm source");
     let emitters = parse_emitters(&source);
     let emitter_ids = parse_emitter_ids(&source);
     let mut generated =
@@ -46,7 +52,7 @@ fn main() {
         }\n",
     );
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
-    fs::write(out.join("specific_dispatch.rs"), generated).expect("specific dispatch");
+    fs::write(out.join("arm_specific_dispatch.rs"), generated).expect("specific dispatch");
 }
 
 fn parse_emitter_ids(source: &str) -> BTreeMap<String, u8> {

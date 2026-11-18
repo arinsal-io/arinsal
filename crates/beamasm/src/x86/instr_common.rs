@@ -251,7 +251,7 @@ mod tests {
                     / 8;
                 let expected = gnu_as(&block).unwrap();
                 assert_eq!(
-                    emitted(|m| m.emit_i_trim(ArgVal::Immediate(u64::from(words)))),
+                    emitted(|m| m.emit_i_trim(ArgVal::Word(u64::from(words)))),
                     expected,
                     "{block:?}"
                 );
@@ -394,7 +394,7 @@ mod tests {
                 })
                 .collect();
             let args: Vec<ArgVal> = ys.iter().map(|y| ArgVal::Y(*y)).collect();
-            let size = ArgVal::Immediate(args.len() as u64);
+            let size = ArgVal::Word(args.len() as u64);
             assert_matches(&block, emitted(|m| m.emit_init_yregs(size, &args)));
             compared += 1;
         }
