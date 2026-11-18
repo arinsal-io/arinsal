@@ -5,9 +5,11 @@
 pub mod beam_asm;
 pub mod beam_asm_global;
 pub mod beam_asm_module;
+pub mod instr_arith;
 pub mod instr_call;
 pub mod instr_common;
 pub mod instr_fun;
+pub mod instr_select;
 #[cfg(test)]
 mod jdump;
 #[allow(unsafe_code)]
