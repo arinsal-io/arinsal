@@ -4,3 +4,5 @@
 
 pub mod buf;
 pub mod enc;
+#[cfg(target_arch = "x86_64")]
+pub mod exec;
