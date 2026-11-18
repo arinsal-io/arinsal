@@ -1,13 +1,49 @@
 //! Prefix, atomic, string, trap, and code-padding forms.
 //!
-//! Port of `x86::Assembler::_emit` cases `kEncodingX86Xchg`, `kEncodingX86M_Only`, and the
-//! lock/rep prefix emission in `erts/emulator/asmjit/x86/x86assembler.cpp`, plus
-//! `x86::Assembler::align`'s optimized code fill, OTP-29.1.1.
+//! Port of `x86::Assembler::_emit` cases `kEncodingX86Bt` (line 1138), `kEncodingX86Xchg`,
+//! `kEncodingX86M_Only`, and the lock/rep prefix emission in
+//! `erts/emulator/asmjit/x86/x86assembler.cpp`, plus `x86::Assembler::align`'s optimized code
+//! fill, OTP-29.1.1.
 
 use super::core::{ByteRex, Imm, Opcode, Rm};
 use super::{Emitter, EncodeError, Gp, Mem};
 
 impl Emitter {
+    /// `bt dst, bit` (asmjit `a.bt(Gp, Gp)`).
+    pub fn bt_rr(&mut self, dst: Gp, bit: Gp) -> Result<(), EncodeError> {
+        let size = Self::same_size(dst, bit)?;
+        if !matches!(size, 2 | 4 | 8) {
+            return Err(EncodeError::InvalidInstruction);
+        }
+        let mut rex = ByteRex::default();
+        let dst = Self::gp_id(dst, &mut rex)?;
+        let bit = Self::gp_id(bit, &mut rex)?;
+        self.x86_rm(
+            Opcode::m0f(0xA3).prefix_by_size(size),
+            bit,
+            Rm::Reg(dst),
+            rex,
+            Imm::NONE,
+        )
+    }
+
+    /// `bt reg, imm` (asmjit `a.bt(Gp, Imm)`).
+    pub fn bt_ri(&mut self, dst: Gp, bit: i64) -> Result<(), EncodeError> {
+        let size = dst.size();
+        if !matches!(size, 2 | 4 | 8) {
+            return Err(EncodeError::InvalidInstruction);
+        }
+        let mut rex = ByteRex::default();
+        let dst = Self::gp_id(dst, &mut rex)?;
+        self.x86_rm(
+            Opcode::m0f(0xBA).prefix_by_size(size),
+            4,
+            Rm::Reg(dst),
+            rex,
+            Imm::new(bit as u64, 1),
+        )
+    }
+
     /// `xchg reg, reg` (asmjit `a.xchg(Gp, Gp)`).
     pub fn xchg_rr(&mut self, dst: Gp, src: Gp) -> Result<(), EncodeError> {
         let size = Self::same_size(dst, src)?;

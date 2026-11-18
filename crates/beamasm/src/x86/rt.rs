@@ -412,9 +412,128 @@ core::arch::global_asm!(
     exit_marker = const EXIT_MARKER,
 );
 
+// Port of erts/emulator/beam/jit/x86/instr_map.cpp runtime call prototypes, OTP-29.1.1.
+unsafe extern "C" {
+    /// `Eterm erts_gc_new_map(Process *, Eterm *, Uint, Uint, const Eterm *)`.
+    pub safe fn erts_gc_new_map(
+        c_p: *mut crate::ProcessHeader,
+        reg: *mut u64,
+        live: u64,
+        n: u64,
+        data: *const u64,
+    ) -> u64;
+    /// `Eterm erts_gc_update_map_assoc(Process *, Eterm *, Uint, Uint, const Eterm *)`.
+    pub safe fn erts_gc_update_map_assoc(
+        c_p: *mut crate::ProcessHeader,
+        reg: *mut u64,
+        live: u64,
+        n: u64,
+        data: *const u64,
+    ) -> u64;
+    /// `Eterm erts_gc_update_map_exact(Process *, Eterm *, Uint, Uint, const Eterm *)`.
+    pub safe fn erts_gc_update_map_exact(
+        c_p: *mut crate::ProcessHeader,
+        reg: *mut u64,
+        live: u64,
+        n: u64,
+        data: *const u64,
+    ) -> u64;
+    /// `Eterm get_map_element(Eterm, Eterm)`.
+    pub safe fn get_map_element(map: u64, key: u64) -> u64;
+    /// `Eterm get_map_element_hash(Eterm, Eterm, erts_ihash_t)`.
+    pub safe fn get_map_element_hash(map: u64, key: u64, hash: u64) -> u64;
+    /// `Uint beam_jit_get_map_elements(Eterm, Eterm *, Eterm *, Uint, Eterm *)`.
+    pub safe fn beam_jit_get_map_elements(
+        map: u64,
+        reg: *mut u64,
+        stack: *mut u64,
+        n: u64,
+        fs: *mut u64,
+    ) -> u64;
+    /// `Eterm erts_maps_put(Process *, Eterm, Eterm, Eterm)`.
+    pub safe fn erts_maps_put(
+        c_p: *mut crate::ProcessHeader,
+        key: u64,
+        value: u64,
+        map: u64,
+    ) -> u64;
+    /// `int erts_maps_update(Process *, Eterm, Eterm, Eterm, Eterm *)`.
+    pub safe fn erts_maps_update(
+        c_p: *mut crate::ProcessHeader,
+        key: u64,
+        value: u64,
+        map: u64,
+        result: *mut u64,
+    ) -> i32;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Runtime symbols referenced by map fragment byte comparisons.
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_gc_new_map(
+        _: *mut crate::ProcessHeader,
+        _: *mut u64,
+        _: u64,
+        _: u64,
+        _: *const u64,
+    ) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_gc_update_map_assoc(
+        _: *mut crate::ProcessHeader,
+        _: *mut u64,
+        _: u64,
+        _: u64,
+        _: *const u64,
+    ) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_gc_update_map_exact(
+        _: *mut crate::ProcessHeader,
+        _: *mut u64,
+        _: u64,
+        _: u64,
+        _: *const u64,
+    ) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_maps_put(_: *mut crate::ProcessHeader, _: u64, _: u64, _: u64) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_maps_update(
+        _: *mut crate::ProcessHeader,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: *mut u64,
+    ) -> i32 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn beam_jit_get_map_elements(
+        _: u64,
+        _: *mut u64,
+        _: *mut u64,
+        _: u64,
+        _: *mut u64,
+    ) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn get_map_element(_: u64, _: u64) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn get_map_element_hash(_: u64, _: u64, _: u64) -> u64 {
+        unreachable!("byte-test fixture")
+    }
 
     /// Fixture for the VM's `the_active_code_index`, so byte tests of
     /// `emit_leave_runtime(Update::CODE_INDEX)` link.

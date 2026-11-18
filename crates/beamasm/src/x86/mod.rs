@@ -13,6 +13,7 @@ pub mod instr_bs;
 pub mod instr_call;
 pub mod instr_common;
 pub mod instr_fun;
+pub mod instr_map;
 pub mod instr_select;
 #[cfg(test)]
 mod jdump;

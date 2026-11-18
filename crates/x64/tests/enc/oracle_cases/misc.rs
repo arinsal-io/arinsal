@@ -7,6 +7,13 @@ type XchgRm = fn(&mut Emitter, Gp, Mem) -> Result<(), EncodeError>;
 type XchgMr = fn(&mut Emitter, Mem, Gp) -> Result<(), EncodeError>;
 
 pub fn cases(out: &mut Vec<OCase>) {
+    out.push(case("bt ax, r13w", |e| e.bt_rr(AX, R13W)));
+    out.push(case("bt r9d, r11d", |e| e.bt_rr(R9D, R11D)));
+    out.push(case("bt r15, rcx", |e| e.bt_rr(R15, RCX)));
+    out.push(case("bt rax, 3", |e| e.bt_ri(RAX, 3)));
+    out.push(case("bt ax, 7", |e| e.bt_ri(AX, 7)));
+    out.push(case("bt r9, 31", |e| e.bt_ri(R9, 31)));
+    out.push(case("bt r15, 63", |e| e.bt_ri(R15, 63)));
     let xchg_rr: XchgR = Emitter::xchg_rr;
     let xchg_rm: XchgRm = Emitter::xchg_rm;
     let xchg_mr: XchgMr = Emitter::xchg_mr;

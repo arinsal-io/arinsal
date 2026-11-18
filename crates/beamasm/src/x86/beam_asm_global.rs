@@ -539,6 +539,15 @@ impl BeamGlobalAssembler {
             G::GetSint64Shared => Self::emit_get_sint64_shared,
             G::ConstructUtf8Shared => Self::emit_construct_utf8_shared,
             G::StoreUnaligned => Self::emit_store_unaligned,
+            // Port of erts/emulator/beam/jit/x86/instr_map.cpp map fragments, OTP-29.1.1.
+            G::IGetMapElementShared => Self::emit_i_get_map_element_shared,
+            G::IGetMapElementHashShared => Self::emit_i_get_map_element_hash_shared,
+            G::NewMapShared => Self::emit_new_map_shared,
+            G::UpdateMapAssocShared => Self::emit_update_map_assoc_shared,
+            G::UpdateMapSingleAssocShared => Self::emit_update_map_single_assoc_shared,
+            G::UpdateMapExactGuardShared => Self::emit_update_map_exact_guard_shared,
+            G::UpdateMapExactBodyShared => Self::emit_update_map_exact_body_shared,
+            G::UpdateMapSingleExactBodyShared => Self::emit_update_map_single_exact_body_shared,
             _ => return None,
         })
     }
