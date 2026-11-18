@@ -119,6 +119,48 @@ unsafe extern "C" {
     ) -> i32;
 }
 
+// Port of erts/emulator/beam/jit/x86/instr_arith.cpp runtime-call declarations, OTP-29.1.1.
+unsafe extern "C" {
+    /// `Eterm erts_band(Process *p, Eterm arg1, Eterm arg2)`.
+    pub safe fn erts_band(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    /// `Eterm erts_bnot(Process *p, Eterm arg)`.
+    pub safe fn erts_bnot(c_p: *mut crate::ProcessHeader, arg: u64) -> u64;
+    /// `Eterm erts_bor(Process *p, Eterm arg1, Eterm arg2)`.
+    pub safe fn erts_bor(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    /// `Eterm erts_bsl(Process *p, Eterm arg1, Eterm arg2)`.
+    pub safe fn erts_bsl(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    /// `Eterm erts_bsr(Process *p, Eterm arg1, Eterm arg2)`.
+    pub safe fn erts_bsr(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    /// `Eterm erts_bxor(Process *p, Eterm arg1, Eterm arg2)`.
+    pub safe fn erts_bxor(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    /// `int erts_int_div_rem(Process *p, Eterm arg1, Eterm arg2, Eterm *q, Eterm *r)`.
+    pub safe fn erts_int_div_rem(
+        c_p: *mut crate::ProcessHeader,
+        arg1: u64,
+        arg2: u64,
+        quotient: *mut u64,
+        remainder: *mut u64,
+    ) -> i32;
+    /// `Eterm erts_mixed_div(Process *p, Eterm arg1, Eterm arg2)`.
+    pub safe fn erts_mixed_div(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    /// `Eterm erts_mixed_minus(Process *p, Eterm arg1, Eterm arg2)`.
+    pub safe fn erts_mixed_minus(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    /// `Eterm erts_mixed_plus(Process *p, Eterm arg1, Eterm arg2)`.
+    pub safe fn erts_mixed_plus(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    /// `Eterm erts_mixed_times(Process *p, Eterm arg1, Eterm arg2)`.
+    pub safe fn erts_mixed_times(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    /// `Eterm erts_mul_add(Process *p, Eterm arg1, Eterm arg2, Eterm arg3, Eterm *pp)`.
+    pub safe fn erts_mul_add(
+        c_p: *mut crate::ProcessHeader,
+        arg1: u64,
+        arg2: u64,
+        arg3: u64,
+        result: *mut u64,
+    ) -> u64;
+    /// `Eterm erts_unary_minus(Process *p, Eterm arg1)`.
+    pub safe fn erts_unary_minus(c_p: *mut crate::ProcessHeader, arg1: u64) -> u64;
+}
+
 // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:397-399 (i_emit_nyi) and
 // erts/emulator/beam/beam_catches.h:38 (beam_catches_cons), OTP-29.1.1. erts defines
 // `i_emit_nyi` static in beam_asm_module.cpp around `erts_exit(ERTS_ERROR_EXIT, "NYI: %s\n",
@@ -533,6 +575,72 @@ mod tests {
     #[unsafe(no_mangle)]
     extern "C" fn get_map_element_hash(_: u64, _: u64, _: u64) -> u64 {
         unreachable!("byte-test fixture")
+    }
+    // The global arithmetic-fragment byte comparison only takes these erts function
+    // addresses; it never runs the generated fragments.
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_band(_: *mut crate::ProcessHeader, _: u64, _: u64) -> u64 {
+        unreachable!("arithmetic byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_bnot(_: *mut crate::ProcessHeader, _: u64) -> u64 {
+        unreachable!("arithmetic byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_bor(_: *mut crate::ProcessHeader, _: u64, _: u64) -> u64 {
+        unreachable!("arithmetic byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_bsl(_: *mut crate::ProcessHeader, _: u64, _: u64) -> u64 {
+        unreachable!("arithmetic byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_bsr(_: *mut crate::ProcessHeader, _: u64, _: u64) -> u64 {
+        unreachable!("arithmetic byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_bxor(_: *mut crate::ProcessHeader, _: u64, _: u64) -> u64 {
+        unreachable!("arithmetic byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_int_div_rem(
+        _: *mut crate::ProcessHeader,
+        _: u64,
+        _: u64,
+        _: *mut u64,
+        _: *mut u64,
+    ) -> i32 {
+        unreachable!("arithmetic byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_mixed_div(_: *mut crate::ProcessHeader, _: u64, _: u64) -> u64 {
+        unreachable!("arithmetic byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_mixed_minus(_: *mut crate::ProcessHeader, _: u64, _: u64) -> u64 {
+        unreachable!("arithmetic byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_mixed_plus(_: *mut crate::ProcessHeader, _: u64, _: u64) -> u64 {
+        unreachable!("arithmetic byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_mixed_times(_: *mut crate::ProcessHeader, _: u64, _: u64) -> u64 {
+        unreachable!("arithmetic byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_mul_add(
+        _: *mut crate::ProcessHeader,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: *mut u64,
+    ) -> u64 {
+        unreachable!("arithmetic byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_unary_minus(_: *mut crate::ProcessHeader, _: u64) -> u64 {
+        unreachable!("arithmetic byte-test fixture")
     }
 
     /// Fixture for the VM's `the_active_code_index`, so byte tests of

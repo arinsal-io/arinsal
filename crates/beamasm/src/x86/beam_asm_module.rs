@@ -1326,6 +1326,23 @@ impl BeamModuleAssembler {
     }
 }
 
+impl BeamModuleAssembler {
+    /// Loads the exception MFA and calls the shared raise fragment, recording the throwing PC.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:264-271
+    // (BeamModuleAssembler::emit_raise_exception(const ErtsCodeMFA *)), OTP-29.1.1.
+    pub(crate) fn emit_raise_exception(
+        &mut self,
+        mfa: &'static arinsal_term::ErtsCodeMfa,
+    ) -> Result<(), AsmError> {
+        self.asm
+            .mov_imm(ARG4, std::ptr::from_ref(mfa) as usize as u64)?;
+        let fragment = self.ga_get(GlobalLabels::RaiseException)?;
+        self.safe_fragment_call(fragment)?;
+        self.last_error_offset = self.asm.a.offset();
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

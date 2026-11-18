@@ -548,6 +548,32 @@ impl BeamGlobalAssembler {
             G::UpdateMapExactGuardShared => Self::emit_update_map_exact_guard_shared,
             G::UpdateMapExactBodyShared => Self::emit_update_map_exact_body_shared,
             G::UpdateMapSingleExactBodyShared => Self::emit_update_map_single_exact_body_shared,
+            // Port of erts/emulator/beam/jit/x86/instr_arith.cpp fragment registrations,
+            // OTP-29.1.1.
+            G::IBandBodyShared => Self::emit_i_band_body_shared,
+            G::IBandGuardShared => Self::emit_i_band_guard_shared,
+            G::IBorBodyShared => Self::emit_i_bor_body_shared,
+            G::IBorGuardShared => Self::emit_i_bor_guard_shared,
+            G::IBnotBodyShared => Self::emit_i_bnot_body_shared,
+            G::IBnotGuardShared => Self::emit_i_bnot_guard_shared,
+            G::IBslBodyShared => Self::emit_i_bsl_body_shared,
+            G::IBslGuardShared => Self::emit_i_bsl_guard_shared,
+            G::IBsrBodyShared => Self::emit_i_bsr_body_shared,
+            G::IBsrGuardShared => Self::emit_i_bsr_guard_shared,
+            G::IBxorBodyShared => Self::emit_i_bxor_body_shared,
+            G::IBxorGuardShared => Self::emit_i_bxor_guard_shared,
+            G::IntDivRemBodyShared => Self::emit_int_div_rem_body_shared,
+            G::IntDivRemGuardShared => Self::emit_int_div_rem_guard_shared,
+            G::MinusBodyShared => Self::emit_minus_body_shared,
+            G::MinusGuardShared => Self::emit_minus_guard_shared,
+            G::MulAddBodyShared => Self::emit_mul_add_body_shared,
+            G::MulAddGuardShared => Self::emit_mul_add_guard_shared,
+            G::MulBodyShared => Self::emit_mul_body_shared,
+            G::MulGuardShared => Self::emit_mul_guard_shared,
+            G::PlusBodyShared => Self::emit_plus_body_shared,
+            G::PlusGuardShared => Self::emit_plus_guard_shared,
+            G::UnaryMinusBodyShared => Self::emit_unary_minus_body_shared,
+            G::UnaryMinusGuardShared => Self::emit_unary_minus_guard_shared,
             _ => return None,
         })
     }
@@ -843,11 +869,18 @@ mod tests {
 
     /// Rewrites erts' static addresses to Arinsal's: the MFA or `the_active_code_index` an
     /// absolute `mov` loads (asmjit's `mov r64, imm` is 32-bit when the value fits).
-    fn rewrite(line: &str, address: Option<u64>) -> String {
+    fn rewrite(line: &str, addresses: &mut std::vec::IntoIter<u64>) -> String {
         let line = crate::x86::jdump::erts_to_arinsal(line);
-        if let Some(address) = address
-            && let Some((dst, value)) = line.strip_prefix("mov ").and_then(|r| r.split_once(", "))
+        if line
+            .strip_prefix("call ")
+            .and_then(|target| target.parse::<u64>().ok())
+            .is_some()
+        {
+            return ".byte 0x40, 0xe8, 0, 0, 0, 0".to_owned();
+        }
+        if let Some((dst, value)) = line.strip_prefix("mov ").and_then(|r| r.split_once(", "))
             && value.parse::<u64>().is_ok_and(|v| v > u64::from(u32::MAX))
+            && let Some(address) = addresses.next()
         {
             let reg = arinsal_x64::enc::Gp::q(match dst {
                 "rcx" => 1,
@@ -895,18 +928,35 @@ mod tests {
         assert_eq!(dumped, fragments);
 
         let active = &raw const crate::x86::rt::the_active_code_index as u64;
-        let address = |label: GlobalLabels| -> Option<u64> {
+        let addresses = |label: GlobalLabels| -> Vec<u64> {
             use GlobalLabels as G;
-            Some(match label {
-                G::HandleElementError => mfa_address(&ELEMENT_MFA),
-                G::HandleHdError => mfa_address(&HD_MFA),
-                G::HandleMapGetBadkey => mfa_address(&MAP_GET_BADKEY_MFA),
-                G::HandleMapGetBadmap => mfa_address(&MAP_GET_BADMAP_MFA),
-                G::HandleMapSizeError => mfa_address(&MAP_SIZE_MFA),
-                G::HandleNodeError => mfa_address(&NODE_MFA),
-                G::DispatchSaveCallsFun | G::DispatchSaveCallsExport | G::UnloadedFun => active,
-                _ => return None,
-            })
+            match label {
+                G::HandleElementError => vec![mfa_address(&ELEMENT_MFA)],
+                G::HandleHdError => vec![mfa_address(&HD_MFA)],
+                G::HandleMapGetBadkey => vec![mfa_address(&MAP_GET_BADKEY_MFA)],
+                G::HandleMapGetBadmap => vec![mfa_address(&MAP_GET_BADMAP_MFA)],
+                G::HandleMapSizeError => vec![mfa_address(&MAP_SIZE_MFA)],
+                G::HandleNodeError => vec![mfa_address(&NODE_MFA)],
+                G::DispatchSaveCallsFun | G::DispatchSaveCallsExport | G::UnloadedFun => {
+                    vec![active]
+                }
+                G::PlusBodyShared => vec![mfa_address(&crate::x86::instr_arith::PLUS_MFA)],
+                G::MinusBodyShared => vec![mfa_address(&crate::x86::instr_arith::MINUS_MFA)],
+                G::UnaryMinusBodyShared => {
+                    vec![mfa_address(&crate::x86::instr_arith::UNARY_MINUS_MFA)]
+                }
+                G::MulAddBodyShared => vec![
+                    mfa_address(&crate::x86::instr_arith::PLUS_MFA),
+                    mfa_address(&crate::x86::instr_arith::TIMES_MFA),
+                ],
+                G::IBandBodyShared => vec![mfa_address(&crate::x86::instr_arith::BAND_MFA)],
+                G::IBorBodyShared => vec![mfa_address(&crate::x86::instr_arith::BOR_MFA)],
+                G::IBxorBodyShared => vec![mfa_address(&crate::x86::instr_arith::BXOR_MFA)],
+                G::IBnotBodyShared => vec![mfa_address(&crate::x86::instr_arith::BNOT_MFA)],
+                G::IBslBodyShared => vec![mfa_address(&crate::x86::instr_arith::BSL_MFA)],
+                G::IBsrBodyShared => vec![mfa_address(&crate::x86::instr_arith::BSR_MFA)],
+                _ => Vec::new(),
+            }
         };
         if crate::x86::jdump::gnu_as(&[]).is_none() {
             eprintln!("skipping byte comparison: GNU binutils unavailable");
@@ -923,9 +973,10 @@ mod tests {
         assert!(ranges.len() >= 21);
         for (label, range) in ranges {
             assert_eq!(range.start % 8, 0);
+            let mut static_addresses = addresses(label).into_iter();
             let lines: Vec<String> = fragment_lines(&dump, label.name())
                 .into_iter()
-                .map(|l| rewrite(l, address(label)))
+                .map(|l| rewrite(l, &mut static_addresses))
                 // `offsetof(Export, info.mfa)`: 64 in erts, Arinsal's `ExportEntry.mfa`.
                 .map(|l| match (label, l.as_str()) {
                     (GlobalLabels::BifExportTrap, "sub rax, 64") => {
