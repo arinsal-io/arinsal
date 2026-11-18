@@ -15,8 +15,12 @@ mod avx;
 mod branch;
 mod cond;
 mod core;
+mod misc;
 mod mov;
+mod muldiv;
 mod operand;
+mod shift;
+mod stack;
 
 pub use cond::CondCode;
 pub use operand::*;
@@ -43,6 +47,8 @@ pub enum EncodeError {
     InvalidAddressIndex,
     /// Memory operand without a size where the form needs one (asmjit `kAmbiguousOperandSize`).
     AmbiguousOperandSize,
+    /// Code alignment is not a power of two from 1 through 64 (asmjit `kInvalidArgument`).
+    InvalidAlignment,
     /// Operand combination the instruction has no encoding for (asmjit `kInvalidInstruction`).
     InvalidInstruction,
 }

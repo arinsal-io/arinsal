@@ -421,7 +421,18 @@ impl Emitter {
 
     /// asmjit `EmitX86Op`: `[pp] [REX] [map] opcode [imm]`, no ModRM.
     pub(crate) fn x86_op(&mut self, opcode: Opcode, imm: Imm) -> Result<(), EncodeError> {
+        self.x86_op_with_prefix(None, opcode, imm)
+    }
+
+    /// asmjit `_emit` legacy lock/rep prefix placement before ordinary opcode emission.
+    pub(crate) fn x86_op_with_prefix(
+        &mut self,
+        prefix: Option<u8>,
+        opcode: Opcode,
+        imm: Imm,
+    ) -> Result<(), EncodeError> {
         let rex = Self::rex_byte(opcode.w, 0, 0, 0, ByteRex::default())?;
+        self.bytes.extend(prefix);
         self.bytes.extend(opcode.pp.byte());
         self.bytes.extend(rex);
         self.put_map_and_opcode(opcode);
@@ -460,9 +471,23 @@ impl Emitter {
         byte_rex: ByteRex,
         imm: Imm,
     ) -> Result<(), EncodeError> {
+        self.x86_rm_with_prefix(None, opcode, reg, rm, byte_rex, imm)
+    }
+
+    /// asmjit `_emit` legacy lock/rep prefix placement before ModRM instruction emission.
+    pub(crate) fn x86_rm_with_prefix(
+        &mut self,
+        prefix: Option<u8>,
+        opcode: Opcode,
+        reg: u8,
+        rm: Rm<'_>,
+        byte_rex: ByteRex,
+        imm: Imm,
+    ) -> Result<(), EncodeError> {
         match rm {
             Rm::Reg(rb) => {
                 let rex = Self::rex_byte(opcode.w, reg >> 3, 0, rb >> 3, byte_rex)?;
+                self.bytes.extend(prefix);
                 self.bytes.extend(opcode.pp.byte());
                 self.bytes.extend(rex);
                 self.put_map_and_opcode(opcode);
@@ -473,12 +498,48 @@ impl Emitter {
             Rm::Mem(mem) => {
                 let enc = Self::encode_mem(mem, reg)?;
                 let rex = Self::rex_byte(opcode.w, reg >> 3, enc.x, enc.b, byte_rex)?;
+                self.bytes.extend(prefix);
                 self.bytes.extend(opcode.pp.byte());
                 self.bytes.extend(rex);
                 self.put_map_and_opcode(opcode);
                 self.put_mem_tail(&enc, imm);
             }
         }
+        Ok(())
+    }
+
+    /// Port of asmjit `x86::Assembler::align` with `kOptimizedAlign` for code sections.
+    pub(crate) fn code_align(&mut self, alignment: u32) -> Result<(), EncodeError> {
+        if alignment <= 1 {
+            return Ok(());
+        }
+        if alignment > 64 || !alignment.is_power_of_two() {
+            return Err(EncodeError::InvalidAlignment);
+        }
+
+        const NOPS: [&[u8]; 9] = [
+            &[0x90],
+            &[0x66, 0x90],
+            &[0x0F, 0x1F, 0x00],
+            &[0x0F, 0x1F, 0x40, 0x00],
+            &[0x0F, 0x1F, 0x44, 0x00, 0x00],
+            &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],
+            &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],
+            &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+            &[0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        ];
+
+        let mut remaining =
+            (alignment as usize - self.bytes.len() % alignment as usize) % alignment as usize;
+        if remaining == 0 {
+            return Ok(());
+        }
+        while remaining > 0 {
+            let chunk = remaining.min(NOPS.len());
+            self.bytes.extend_from_slice(NOPS[chunk - 1]);
+            remaining -= chunk;
+        }
+        self.last_rip = None;
         Ok(())
     }
 
