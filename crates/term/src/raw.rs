@@ -14,6 +14,80 @@ use std::num::NonZeroUsize;
 pub mod estack;
 pub mod magic_bin;
 
+/// Copy one self-contained table block word by word, offsetting its pointers and linking its
+/// off-heap things into `dst` (the caller checked the block with `shallow_copyable`).
+// Port of erts/emulator/beam/copy.c (`copy_shallow_x`), OTP-29.1.1.
+pub(crate) fn copy_shallow<H: HeapAlloc + ?Sized>(
+    root: Term,
+    block: &[u64],
+    dst: &mut H,
+) -> Result<Term, TermError> {
+    let base = dst.alloc(block.len()).ok_or(TermError::HeapFull)?;
+    let source = block.as_ptr();
+    let offset = (base as u64).wrapping_sub(source as u64);
+    let empty = crate::global_empty_tuple().0;
+    let mut index = 0;
+    while index < block.len() {
+        let value = block[index];
+        match value & 3 {
+            1 | 2 if value != empty => {
+                crate::heap::store(base.wrapping_add(index), value.wrapping_add(offset));
+                index += 1;
+            }
+            0 => {
+                let kind = value & 63;
+                let words = if kind == ARITY || kind == crate::RECORD {
+                    1
+                } else {
+                    crate::copy::copy_scan_skip(value)
+                };
+                for word in 0..words {
+                    crate::heap::store(base.wrapping_add(index + word), block[index + word]);
+                }
+                let thing = base.wrapping_add(index);
+                match kind {
+                    SUB_BITS => {
+                        crate::heap::store(
+                            thing.wrapping_add(4),
+                            block[index + 4].wrapping_add(offset),
+                        );
+                    }
+                    BIN_REF => {
+                        // erts: erts_refc_inc(&br->val->intern.refc) and ERTS_BR_OVERHEAD.
+                        // SAFETY: `source + index` is a BinRef of the live table block, whose
+                        // Binary its owner list retains; the token goes straight to `dst`.
+                        unsafe {
+                            let (ptr, flags, overhead, owner) = crate::bits::clone_binary_owner(
+                                Term::from_ptr(source.wrapping_add(index).cast_mut(), 2),
+                            )?;
+                            crate::bits::retain_cloned_binary_owner(
+                                dst, thing, ptr, flags, overhead, owner,
+                            )?;
+                        }
+                    }
+                    crate::EXTERNAL_PID | crate::EXTERNAL_PORT | crate::EXTERNAL_REF => {
+                        let node = crate::Node::ref_raw(block[index + 1]);
+                        crate::heap::store(thing.wrapping_add(2), 0);
+                        dst.link_node(thing, node);
+                    }
+                    crate::REF if crate::is_magic_ref_thing_with_hdr(value, block[index + 1]) => {
+                        let owner = crate::MagicBin::thing_owner(block[index + 1], true);
+                        crate::heap::store(thing.wrapping_add(2), 0);
+                        dst.link_magic_ref(thing, owner)?;
+                    }
+                    _ => {}
+                }
+                index += words;
+            }
+            _ => {
+                crate::heap::store(base.wrapping_add(index), value);
+                index += 1;
+            }
+        }
+    }
+    Ok(Term(root.0.wrapping_add(offset)))
+}
+
 /// Allocate an ordinary local reference before invoking the callback that returns its numbers.
 // Port of erts/emulator/beam/erl_bif_unique.c (`make_ref_0`), OTP-29.1.1.
 pub fn local_ref_with_ids(

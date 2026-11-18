@@ -1056,8 +1056,7 @@ impl StoredTerm {
             }
             Ok(tuple)
         })?;
-        let shallow = replacement.off_heap().is_none()
-            && arinsal_term::shallow_copyable(replacement.term(), replacement.words());
+        let shallow = arinsal_term::shallow_copyable(replacement.term(), replacement.words());
         replacement.set_uncompressed_meta(prefix_words, nwords, shallow);
         std::mem::swap(&mut old.prefix, &mut replacement.prefix);
         std::mem::swap(old, &mut replacement);
@@ -1111,8 +1110,7 @@ impl StoredTerm {
             let block = store(old, fresh, size, |heap| {
                 arinsal_term::copy_struct(term, heap, size).map_err(EtsError::from)
             })?;
-            let shallow = block.off_heap().is_none()
-                && arinsal_term::shallow_copyable(block.term(), block.words());
+            let shallow = arinsal_term::shallow_copyable(block.term(), block.words());
             block.set_uncompressed_meta(prefix_words, size, shallow);
             return Ok(());
         }
@@ -1195,8 +1193,7 @@ impl StoredTerm {
         // A compressed object stores a placeholder tuple; its copy size is that of the stored
         // term, not of the uncompressed source.
         let term_size_words = arinsal_term::size_object(block.term());
-        let shallow = block.off_heap().is_none()
-            && nwords == term_size_words
+        let shallow = nwords == term_size_words
             && arinsal_term::shallow_copyable(block.term(), block.words());
         let db_size_words =
             Self::accounted_words(object, keypos, true, prefix_words, compressed_bytes);
@@ -1243,8 +1240,7 @@ impl StoredTerm {
         let mut copy = dbterm::build_block::<P>(size, |heap| {
             arinsal_term::copy_struct(self.term(), heap, size).map_err(EtsError::from)
         })?;
-        let shallow =
-            copy.off_heap().is_none() && arinsal_term::shallow_copyable(copy.term(), copy.words());
+        let shallow = arinsal_term::shallow_copyable(copy.term(), copy.words());
         copy.set_copied_meta(self.prefix_words(), size, self.db_size_words(), shallow);
         Ok(copy)
     }
@@ -1682,6 +1678,41 @@ impl<H: HeapAlloc> HeapAlloc for ObjectAndListHeap<'_, H> {
 
     fn link_node(&mut self, thing: *mut u64, node: TermNode) {
         self.dst.link_node(thing, node);
+    }
+
+    fn link_bin_ref(
+        &mut self,
+        bin_ref: *mut u64,
+        writable: bool,
+        overhead_words: u64,
+        owner: Option<arinsal_term::OwnedBinaryRef>,
+    ) -> Result<(), TermError> {
+        self.dst
+            .link_bin_ref(bin_ref, writable, overhead_words, owner)
+    }
+
+    fn add_bin_vheap(&mut self, words: u64) {
+        self.dst.add_bin_vheap(words);
+    }
+
+    fn link_external_binary(
+        &mut self,
+        bin_ref: *mut u64,
+        binary: Arc<ExternalBinary>,
+    ) -> Result<(), TermError> {
+        self.dst.link_external_binary(bin_ref, binary)
+    }
+
+    fn supports_external_binary(&self) -> bool {
+        self.dst.supports_external_binary()
+    }
+
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: MagicBin) -> Result<(), TermError> {
+        self.dst.link_magic_ref(thing, owner)
+    }
+
+    fn supports_magic(&self) -> bool {
+        self.dst.supports_magic()
     }
 }
 
@@ -7184,9 +7215,8 @@ mod stored_size_tests {
         assert!(arinsal_term::exact_eq(copy, object));
     }
 
-    /// `copy_shallow` of a stored block equals the structural copy for every plain term kind,
-    /// and objects that need owner links (reference-counted binaries, magic references) are
-    /// not shallow-copied.
+    /// `copy_shallow` of a stored block equals the structural copy for every term kind,
+    /// including those whose owners it links into the destination (reference-counted binaries).
     #[test]
     fn shallow_copy_out_matches_structural_copy() {
         use arinsal_term::{ExportEntry, FunEntry};
@@ -7229,7 +7259,7 @@ mod stored_size_tests {
         object!("float", true, |b| b.float(1.5).unwrap());
         object!("bignum", true, |b| b.int_from_i128(1 << 100).unwrap());
         object!("heap binary", true, |b| b.binary(b"abc").unwrap());
-        object!("refc binary", false, |b| b.binary(&[7u8; 200]).unwrap());
+        object!("refc binary", true, |b| b.binary(&[7u8; 200]).unwrap());
         object!("ordinary reference", true, |b| b
             .local_ref([1, 2, 3])
             .unwrap());

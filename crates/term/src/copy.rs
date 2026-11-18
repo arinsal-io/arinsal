@@ -106,9 +106,9 @@ pub fn copy_ets_element<H: HeapAlloc + ?Sized>(
 }
 
 /// Whether `block` is a self-contained heap block that [`copy_shallow`] can copy word by word:
-/// `root` is its first word, every pointer stays inside it (or is the empty tuple literal) and
-/// it holds no off-heap thing (binary references, sub-bitstrings, external or magic things),
-/// whose copy must link an owner into the destination.
+/// `root` is its first word and every term pointer stays inside it (or is the empty tuple
+/// literal). Off-heap things (BinRefs, external and magic things) are allowed: the copy links
+/// their owners into the destination.
 // Port of the block contract of erts/emulator/beam/copy.c (copy_shallow_x), OTP-29.1.1: a term
 // "guaranteed to be contained in a single heap block", here checked once when the block is made.
 pub fn shallow_copyable(root: Term, block: &[u64]) -> bool {
@@ -117,15 +117,17 @@ pub fn shallow_copyable(root: Term, block: &[u64]) -> bool {
         return false;
     }
     let empty = crate::global_empty_tuple().0;
+    let inside = |word: u64| {
+        let target = word & !7;
+        word == empty || (target >= base && (target - base) < (block.len() as u64) * 8)
+    };
     let mut i = 0;
     while i < block.len() {
         let word = block[i];
         match word & 3 {
             3 => i += 1,
             1 | 2 => {
-                let target = word & !7;
-                if word != empty && !(target >= base && (target - base) < (block.len() as u64) * 8)
-                {
+                if !inside(word) {
                     return false;
                 }
                 i += 1;
@@ -136,18 +138,33 @@ pub fn shallow_copyable(root: Term, block: &[u64]) -> bool {
                     i += 1;
                     continue;
                 }
-                let plain_thing = matches!(
+                let thing = matches!(
                     kind,
-                    crate::POS_BIG | crate::NEG_BIG | crate::FLOAT | HEAP_BITS | MAP | FUN
+                    crate::POS_BIG
+                        | crate::NEG_BIG
+                        | crate::FLOAT
+                        | HEAP_BITS
+                        | MAP
+                        | FUN
+                        | REF
+                        | BIN_REF
+                        | EXTERNAL_PID
+                        | EXTERNAL_PORT
+                        | EXTERNAL_REF
                 );
-                let ordinary_ref = kind == REF
-                    && block
-                        .get(i + 1)
-                        .is_some_and(|next| !crate::is_magic_ref_thing_with_hdr(word, *next));
-                if !(plain_thing || ordinary_ref) {
+                let skip = copy_scan_skip(word);
+                if i + skip > block.len() {
                     return false;
                 }
-                i += copy_scan_skip(word);
+                if kind == SUB_BITS {
+                    // The sub-bitstring's original names a BinRef of this block.
+                    if skip != 5 || block[i + 4] & 3 != 2 || !inside(block[i + 4]) {
+                        return false;
+                    }
+                } else if !thing {
+                    return false;
+                }
+                i += skip;
             }
         }
     }
@@ -155,7 +172,8 @@ pub fn shallow_copyable(root: Term, block: &[u64]) -> bool {
 }
 
 /// Copy the heap block `block` (see [`shallow_copyable`]) word by word into `dst`, offsetting
-/// every pointer to its new location; returns the copy of `root`.
+/// every pointer to its new location and linking off-heap owners into `dst`; returns the copy
+/// of `root`.
 // Port of erts/emulator/beam/copy.c (copy_shallow_x, copy_shallow_obj_x), OTP-29.1.1, as used by
 // erl_db_util.h (db_copy_object_from_ets).
 pub fn copy_shallow<H: HeapAlloc + ?Sized>(
@@ -163,37 +181,7 @@ pub fn copy_shallow<H: HeapAlloc + ?Sized>(
     block: &[u64],
     dst: &mut H,
 ) -> Result<Term, TermError> {
-    let base = dst.alloc(block.len()).ok_or(TermError::HeapFull)?;
-    // SAFETY: `alloc` returned `block.len()` writable words that do not alias `block`, a live
-    // table-owned block.
-    let out = unsafe { std::slice::from_raw_parts_mut(base, block.len()) };
-    let offset = (base as u64).wrapping_sub(block.as_ptr() as u64);
-    let empty = crate::global_empty_tuple().0;
-    let mut i = 0;
-    while i < block.len() {
-        let word = block[i];
-        match word & 3 {
-            1 | 2 if word != empty => {
-                out[i] = word.wrapping_add(offset);
-                i += 1;
-            }
-            0 => {
-                let kind = word & 63;
-                let skip = if kind == ARITY || kind == RECORD {
-                    1
-                } else {
-                    copy_scan_skip(word)
-                };
-                out[i..i + skip].copy_from_slice(&block[i..i + skip]);
-                i += skip;
-            }
-            _ => {
-                out[i] = word;
-                i += 1;
-            }
-        }
-    }
-    Ok(Term(root.0.wrapping_add(offset)))
+    crate::raw::copy_shallow(root, block, dst)
 }
 
 /// Copy a nonempty tuple whose elements are all immediates in one pass, without sizing it first.
@@ -740,7 +728,7 @@ fn header_is_thing(hdr: u64) -> bool {
 }
 
 #[inline]
-fn copy_scan_skip(hdr: u64) -> usize {
+pub(crate) fn copy_scan_skip(hdr: u64) -> usize {
     // Port of erl_term.h:310 (`header_arity`) and copy.c:951-956, OTP-29.1.1.
     // Flatmaps store MAP_HEADER_FLATMAP, so the arity field is 1 and this skip
     // covers the header plus the raw size word. HAMT nodes store arity 0.
@@ -1089,12 +1077,13 @@ mod shallow_tests {
     }
 
     #[test]
-    fn rejects_off_heap_things() {
-        // A magic reference thing needs an owner link in the destination.
+    fn accepts_off_heap_things_and_rejects_foreign_originals() {
         let block = [crate::REF_THING_HEADER, 0, 0];
-        assert!(!shallow_copyable(block_root(&block), &block));
-        // A BinRef likewise.
+        assert!(shallow_copyable(block_root(&block), &block));
         let block = [(2 << 6) | BIN_REF, 0, 0];
+        assert!(shallow_copyable(block_root(&block), &block));
+        // A sub-bitstring whose original lies outside the block is not self-contained.
+        let block = [(4 << 6) | SUB_BITS, 0, 0, 0, Term::small(1).unwrap().0];
         assert!(!shallow_copyable(block_root(&block), &block));
     }
 
