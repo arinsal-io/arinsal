@@ -1147,7 +1147,7 @@ fn native_exit(
         process.heap.abi.exc.freason == 1 << 10 && matches!(exit, ExitReason::CallUnported { .. });
     if trapped_bif {
         process.heap.abi.exc.freason = 0;
-    } else if process.heap.abi.exc.freason == arinsal_beamasm::module::EXC_FUNCTION_CLAUSE {
+    } else if process.heap.abi.exc.freason == arinsal_term::exc::EXC_FUNCTION_CLAUSE {
         // Port of erts/emulator/beam/beam_common.c (save_stacktrace, EXC_FUNCTION_CLAUSE):
         // the top frame carries the current function's MFA and arguments. Keep the native pc
         // through the initial save; raw_raise marks its serialized trace locationless on rethrow.
@@ -1234,7 +1234,7 @@ fn native_exit(
         let class =
             crate::stacktrace::class_from_freason(freason).unwrap_or(arinsal_bifs::Class::Error);
         return Err(exceptions::raise_from_ftrace(process, class, reason, trace));
-    } else if process.heap.abi.exc.freason & arinsal_beamasm::catch::RERAISE != 0 {
+    } else if process.heap.abi.exc.freason & arinsal_term::exc::EXF_RESTORE_NFUNC != 0 {
         // Port of erts/emulator/beam/beam_common.c (`handle_error`) and `i_raise`, OTP-29.1.1.
         // `raw_raise` clears EXF_SAVETRACE; its exact sanitized class is handled above.
         // EXF_HAS_EXT_INFO remains ordinary error metadata and must not select this path.

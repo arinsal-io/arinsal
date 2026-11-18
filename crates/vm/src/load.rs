@@ -321,7 +321,7 @@ pub(crate) struct ExportIndex {
 struct ExportIndexEntry {
     /// The shared `Export` object of this MFA (erts: the export blob every code index's entry
     /// points at). Set by `erts_export_put`; an MFA only noted for `module_info` has none yet.
-    dispatch: Option<&'static Arc<arinsal_beamasm::bif::ExportEntry>>,
+    dispatch: Option<&'static Arc<arinsal_term::ExportEntry>>,
 }
 
 impl ExportIndex {
@@ -449,7 +449,7 @@ impl ExportIndex {
     pub(crate) fn put_export(
         &mut self,
         key: (Atom, Atom, u8),
-        export: &'static Arc<arinsal_beamasm::bif::ExportEntry>,
+        export: &'static Arc<arinsal_term::ExportEntry>,
     ) {
         self.entries.entry(key).or_default().dispatch = Some(export);
     }
@@ -459,14 +459,14 @@ impl ExportIndex {
     pub(crate) fn dispatch(
         &self,
         key: (Atom, Atom, u8),
-    ) -> Option<&'static arinsal_beamasm::bif::ExportEntry> {
+    ) -> Option<&'static arinsal_term::ExportEntry> {
         self.find_arc(key).map(|export| &**export)
     }
 
     /// Every export object of this table (`export_list`).
     pub(crate) fn exports(
         &self,
-    ) -> impl Iterator<Item = &'static Arc<arinsal_beamasm::bif::ExportEntry>> + '_ {
+    ) -> impl Iterator<Item = &'static Arc<arinsal_term::ExportEntry>> + '_ {
         self.entries.values().filter_map(|entry| entry.dispatch)
     }
 
@@ -475,7 +475,7 @@ impl ExportIndex {
     pub(crate) fn exports_of(
         &self,
         module: Atom,
-    ) -> impl Iterator<Item = &'static Arc<arinsal_beamasm::bif::ExportEntry>> + '_ {
+    ) -> impl Iterator<Item = &'static Arc<arinsal_term::ExportEntry>> + '_ {
         self.entries
             .iter()
             .filter(move |(key, _)| key.0 == module)
@@ -486,7 +486,7 @@ impl ExportIndex {
     pub(crate) fn find_arc(
         &self,
         key: (Atom, Atom, u8),
-    ) -> Option<&'static Arc<arinsal_beamasm::bif::ExportEntry>> {
+    ) -> Option<&'static Arc<arinsal_term::ExportEntry>> {
         self.entries.get(&key)?.dispatch
     }
 }
@@ -586,7 +586,7 @@ impl CodeTables {
         let export_table = exports.order.capacity() * export_key
             + exports.seen.capacity() * (export_key + 1)
             + exports.entries.capacity() * (export_key + size_of::<ExportIndexEntry>() + 1);
-        let export_list = exports.order.len() * size_of::<arinsal_beamasm::bif::ExportEntry>();
+        let export_list = exports.order.len() * size_of::<arinsal_term::ExportEntry>();
         let fun_table =
             self.funs.capacity() * (size_of::<FunKey>() + size_of::<Arc<FunEntry>>() + 1);
         let fun_list = self.funs.len() * (ARC + size_of::<FunEntry>());

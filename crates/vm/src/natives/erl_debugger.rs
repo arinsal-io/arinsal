@@ -752,7 +752,7 @@ fn notify_breakpoint_hit(
         return Err(badarg());
     };
     if !matches!(resume.classify(), TermKind::Fun)
-        || arinsal_beamasm::rt::fun_ref(resume).is_none_or(|view| match view {
+        || crate::raw::beam_common_ffi::fun_ref(resume).is_none_or(|view| match view {
             arinsal_term::FunRef::Local { entry, .. } => entry.arity != 0,
             arinsal_term::FunRef::Export { entry } => entry.arity() != 0,
         })

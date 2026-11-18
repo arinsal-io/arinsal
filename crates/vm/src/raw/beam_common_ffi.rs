@@ -59,3 +59,30 @@ pub(crate) fn export_mfa(address: usize) -> Option<(arinsal_term::Atom, arinsal_
         u8::try_from(mfa.arity).ok()?,
     ))
 }
+
+/// Reads the `ErtsCodeMFA` at `info`: the `bif_mfa` that `handle_error` and the BIF error
+/// paths receive from native code (`Export.info.mfa` or a file-static MFA of instr_*.cpp).
+// Port of erts/emulator/beam/beam_common.c (handle_error, save_stacktrace read `bif_mfa`),
+// OTP-29.1.1.
+pub(crate) fn code_mfa(info: u64) -> Option<(arinsal_term::Atom, arinsal_term::Atom, u8)> {
+    let info = usize::try_from(info).ok()?;
+    if info == 0 || !info.is_multiple_of(core::mem::align_of::<arinsal_term::ErtsCodeMfa>()) {
+        return None;
+    }
+    // SAFETY: native code passes only addresses of live `ErtsCodeMfa`s (export entries, which
+    // the code index keeps alive, and the static MFAs of the emitters), as erts' `bif_mfa`.
+    let mfa = unsafe { (info as *const arinsal_term::ErtsCodeMfa).read() };
+    Some((
+        crate::native_hooks::from_raw(mfa.module).as_atom()?,
+        crate::native_hooks::from_raw(mfa.function).as_atom()?,
+        u8::try_from(mfa.arity).ok()?,
+    ))
+}
+
+/// The fun view of a term native code handed to the runtime; the process heap holding it is
+/// live for the whole runtime call.
+pub(crate) fn fun_ref(term: arinsal_term::Term) -> Option<arinsal_term::FunRef<'static>> {
+    // SAFETY: the term comes from a live process heap (registers, stack or message) that is
+    // not collected while the runtime function borrowing the view runs.
+    unsafe { term.fun_ref() }
+}

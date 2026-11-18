@@ -4,7 +4,7 @@
 //! The symbols take C pointers by erts' signatures; the callers stay safe by going through
 //! these functions. Every function states what the generated code guarantees.
 
-use arinsal_beamasm::bif::ExportEntry;
+use arinsal_term::ExportEntry;
 
 /// Writes `value` through a C out-pointer (`int *get_outp`, `ErtsMessage **msgpp`,
 /// `double *resp`).

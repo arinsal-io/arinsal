@@ -255,7 +255,7 @@ pub extern "C" fn arinsal_cmp_compound(a: u64, b: u64, exact: i32, _eq_only: i32
 
 /// Fun view for native ABI terms already recovered via [`from_raw`].
 pub(crate) fn fun_view(term: Term) -> Option<arinsal_term::FunRef<'static>> {
-    arinsal_beamasm::rt::fun_ref(term)
+    crate::raw::beam_common_ffi::fun_ref(term)
 }
 
 // Port of erts/emulator/beam/erl_arith.c:358-405 (erts_mixed_plus), OTP-29.1.1.

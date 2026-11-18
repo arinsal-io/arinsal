@@ -1834,7 +1834,7 @@ pub(crate) fn fun_info_arity_light(
         return None;
     }
     let arity = {
-        let view = arinsal_beamasm::rt::fun_ref(*fun)?;
+        let view = crate::raw::beam_common_ffi::fun_ref(*fun)?;
         match view {
             arinsal_term::FunRef::Local { entry, .. } => entry.arity,
             arinsal_term::FunRef::Export { entry } => entry.arity(),

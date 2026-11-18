@@ -199,7 +199,7 @@ pub enum VmError {
 #[derive(Debug)]
 pub struct ExportTrap {
     /// The stable export entry that dispatches the continuation after code replacement.
-    pub entry: std::sync::Arc<arinsal_beamasm::bif::ExportEntry>,
+    pub entry: std::sync::Arc<arinsal_term::ExportEntry>,
     /// Parsed continuation metadata for Arinsal's interpreter and trap handler.
     pub(crate) target: &'static crate::bif_traps::ContinuationTarget,
     /// Arguments, X0 onwards.

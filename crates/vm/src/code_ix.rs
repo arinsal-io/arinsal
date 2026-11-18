@@ -19,7 +19,7 @@ use raw::{RawSlot, RetireOp};
 use crate::load::CodeTables;
 use arinsal_term::FunEntry;
 
-pub(crate) use arinsal_beamasm::bif::{ERTS_NUM_CODE_IX, ERTS_SAVE_CALLS_CODE_IX};
+pub(crate) use arinsal_term::{ERTS_NUM_CODE_IX, ERTS_SAVE_CALLS_CODE_IX};
 
 /// Identity of one published version of a code index's tables. Interpreter caches (resolved
 /// imports, fun dispatch, return addresses) are only valid for the generation they were made

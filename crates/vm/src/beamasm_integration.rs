@@ -116,7 +116,7 @@ impl NativeTargetCache {
 #[repr(C)]
 pub(crate) struct DispatchTarget {
     /// The node's export entry; export funs of this MFA hold it too (`Export.lambda`).
-    slot: &'static Arc<arinsal_beamasm::bif::ExportEntry>,
+    slot: &'static Arc<arinsal_term::ExportEntry>,
     pub module: String,
     pub function: String,
     pub module_atom: arinsal_term::Atom,
@@ -156,12 +156,12 @@ impl DispatchTarget {
     }
 
     /// `Export.info.mfa` of this export.
-    pub(crate) fn mfa(&self) -> &'static arinsal_beamasm::bif::ErtsCodeMfa {
-        &self.slot.mfa()
+    pub(crate) fn mfa(&self) -> &'static arinsal_term::ErtsCodeMfa {
+        self.slot.mfa()
     }
 
     /// The shared owner of this MFA's `Export`, which the code indexes' export tables hold.
-    pub(crate) fn export_object(&self) -> &'static Arc<arinsal_beamasm::bif::ExportEntry> {
+    pub(crate) fn export_object(&self) -> &'static Arc<arinsal_term::ExportEntry> {
         self.slot
     }
 
@@ -201,9 +201,9 @@ fn new_export_slot(
     mfa: Mfa,
     address: usize,
     save_calls: usize,
-) -> &'static Arc<arinsal_beamasm::bif::ExportEntry> {
+) -> &'static Arc<arinsal_term::ExportEntry> {
     let export = Box::leak(Box::new(Arc::new(
-        arinsal_beamasm::bif::ExportEntry::with_addresses(mfa.0, mfa.1, mfa.2, address, save_calls),
+        arinsal_term::ExportEntry::with_addresses(mfa.0, mfa.1, mfa.2, address, save_calls),
     )));
     // Port of erts/emulator/beam/jit/beam_jit_main.cpp (install_bifs: `ep->bif_number = i`
     // for every BIF table entry), OTP-29.1.1.
@@ -538,7 +538,7 @@ fn map_fragments() -> Option<&'static arinsal_beamasm::map::MapFragments> {
 /// that, as `export_staged_put` / `export_staged_upsert` insert the blob erts allocates here.
 // Port of erts/emulator/beam/export.c:73-98 (export_init) and erl_code_staged.h (the blob
 // allocation of put/upsert), OTP-29.1.1.
-pub(crate) fn make_export(mfa: Mfa) -> Option<&'static Arc<arinsal_beamasm::bif::ExportEntry>> {
+pub(crate) fn make_export(mfa: Mfa) -> Option<&'static Arc<arinsal_term::ExportEntry>> {
     if let Ok(registry) = dispatch_registry().read()
         && let Some(entry) = registry.exports.dispatch.get(&mfa)
     {
@@ -571,9 +571,7 @@ pub(crate) fn make_export(mfa: Mfa) -> Option<&'static Arc<arinsal_beamasm::bif:
 /// Export descriptor returned by the native line-breakpoint prepare helper.
 // Port of erts/emulator/beam/beam_bp.c:1828-1830
 // (erts_line_breakpoint_hit__prepare_call), OTP-29.1.1.
-pub(crate) fn line_breakpoint_export(
-    code_ix: usize,
-) -> Option<&'static arinsal_beamasm::bif::ExportEntry> {
+pub(crate) fn line_breakpoint_export(code_ix: usize) -> Option<&'static arinsal_term::ExportEntry> {
     let atoms = arinsal_term::global_atoms();
     let mfa = (
         atoms.intern("erts_internal").ok()?,
@@ -587,7 +585,7 @@ pub(crate) fn line_breakpoint_export(
 /// export table of the code index, which the install makes.
 type ImportEntries = (
     Vec<usize>,
-    Vec<(Mfa, &'static Arc<arinsal_beamasm::bif::ExportEntry>)>,
+    Vec<(Mfa, &'static Arc<arinsal_term::ExportEntry>)>,
 );
 
 fn import_entries(module: &arinsal_loader::Module) -> Option<ImportEntries> {
@@ -671,7 +669,7 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
 fn publish_module(
     module: &arinsal_loader::Module,
     native: &[(Mfa, usize)],
-    imports: &[(Mfa, &'static Arc<arinsal_beamasm::bif::ExportEntry>)],
+    imports: &[(Mfa, &'static Arc<arinsal_term::ExportEntry>)],
     deferred: bool,
 ) {
     let trampoline = fragments().map_or(0, DispatchFragments::export_trampoline);
@@ -837,7 +835,7 @@ pub(crate) struct CompiledVersion {
     pub(crate) on_load: Option<(String, u8)>,
     /// The dispatch entry of each import, put into the export table when the version is
     /// installed (`erts_export_put` of `beam_load_finalize_code`).
-    import_bindings: Vec<(Mfa, &'static Arc<arinsal_beamasm::bif::ExportEntry>)>,
+    import_bindings: Vec<(Mfa, &'static Arc<arinsal_term::ExportEntry>)>,
     /// Functions of the module BeamAsm could not compile: they run in the interpreter.
     module_handle: u64,
     installed: AtomicBool,

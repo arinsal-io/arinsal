@@ -116,7 +116,7 @@ pub(crate) fn call_from_executor(
     // Port of erts/emulator/beam/beam_common.c (handle_error, save_stacktrace): the failure
     // names `c_p->current` (the called export, or the BIF that first trapped after
     // `ERTS_BIF_PREP_ERROR_TRAPPED*`) with the arguments in the X registers.
-    let named = arinsal_beamasm::bif::static_bif_mfa(process.heap.abi.current as usize as u64)
+    let named = crate::raw::beam_common_ffi::code_mfa(process.heap.abi.current as usize as u64)
         .and_then(|(module, function, arity)| {
             let atoms = arinsal_term::global_atoms();
             Some((

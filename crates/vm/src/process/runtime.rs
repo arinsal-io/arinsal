@@ -10,7 +10,7 @@ pub(crate) struct Runtime {
     /// Runtime-owned stable exports indexed by the target id interned with each continuation.
     /// The entry remains the indirection when a module replaces code, as in erts' export table.
     pub(super) trap_exports:
-        [OnceLock<Arc<arinsal_beamasm::bif::ExportEntry>>; crate::bif_traps::TRAP_EXPORT_CAPACITY],
+        [OnceLock<Arc<arinsal_term::ExportEntry>>; crate::bif_traps::TRAP_EXPORT_CAPACITY],
     pub(crate) system_processes: Mutex<std::collections::HashSet<Pid>>,
     pub(super) otp_root: Option<std::path::PathBuf>,
     pub(crate) dirty_signal_handlers: Mutex<std::collections::HashSet<Pid>>,
@@ -173,10 +173,10 @@ impl Process {
     pub(crate) fn trap_export_entry(
         &self,
         target: &'static crate::bif_traps::ContinuationTarget,
-    ) -> Arc<arinsal_beamasm::bif::ExportEntry> {
+    ) -> Arc<arinsal_term::ExportEntry> {
         self.runtime.map_or_else(
             || {
-                Arc::new(arinsal_beamasm::bif::ExportEntry::new(
+                Arc::new(arinsal_term::ExportEntry::new(
                     target.module_atom,
                     target.function_atom,
                     target.arity as u8,
@@ -192,7 +192,7 @@ impl Runtime {
     pub(crate) fn trap_export_entry(
         &self,
         target: &'static crate::bif_traps::ContinuationTarget,
-    ) -> Arc<arinsal_beamasm::bif::ExportEntry> {
+    ) -> Arc<arinsal_term::ExportEntry> {
         let mfa = (target.module_atom, target.function_atom, target.arity as u8);
         let export = self
             .trap_exports
@@ -208,7 +208,7 @@ impl Runtime {
                     crate::export::export_get_or_make_stub(mfa)
                 };
                 export.unwrap_or_else(|| {
-                    Arc::new(arinsal_beamasm::bif::ExportEntry::new(mfa.0, mfa.1, mfa.2))
+                    Arc::new(arinsal_term::ExportEntry::new(mfa.0, mfa.1, mfa.2))
                 })
             });
         Arc::clone(export)
@@ -234,7 +234,7 @@ impl Runtime {
         &self,
         mfa: (arinsal_term::Atom, arinsal_term::Atom, u8),
         code_ix: usize,
-    ) -> Option<&'static arinsal_beamasm::bif::ExportEntry> {
+    ) -> Option<&'static arinsal_term::ExportEntry> {
         crate::export::find_export_entry(&self.code, mfa, code_ix)
     }
 }

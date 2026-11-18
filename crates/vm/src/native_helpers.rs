@@ -41,7 +41,7 @@ pub extern "C" fn arinsal_beamasm_raise_class(
     });
     // Port of erts/emulator/beam/beam_common.c (erts_sanitize_freason), OTP-29.1.1: a valid
     // stacktrace is re-raised as is.
-    let reraise = arinsal_beamasm::catch::RERAISE;
+    let reraise = arinsal_term::exc::EXF_RESTORE_NFUNC;
     match class {
         Some(arinsal_bifs::Class::Error) => reraise | arinsal_beamasm::exc::EXTAG_ERROR,
         Some(arinsal_bifs::Class::Exit) => reraise | arinsal_beamasm::exc::EXTAG_EXIT,
@@ -688,7 +688,7 @@ pub extern "C" fn arinsal_beamasm_line_breakpoint_prepare(
     ];
     registers.x_reg_array[..4].copy_from_slice(&args);
     process.heap.abi.arity = 4;
-    export as *const arinsal_beamasm::bif::ExportEntry as usize as u64
+    export as *const arinsal_term::ExportEntry as usize as u64
 }
 
 /// Restores the live X register prefix from the stack below a returning breakpoint handler.
@@ -1783,7 +1783,7 @@ pub(crate) fn native_exception_class(
         EXC_ERROR, EXC_EXIT, EXC_INDEXBITS, EXC_THROWN, EXF_ARGLIST, EXF_HAS_EXT_INFO,
         EXF_SAVETRACE,
     };
-    if freason == arinsal_beamasm::module::EXC_FUNCTION_CLAUSE {
+    if freason == arinsal_term::exc::EXC_FUNCTION_CLAUSE {
         return None;
     }
     let handled = if freason & EXC_INDEXBITS != 0 {
@@ -1850,7 +1850,7 @@ pub(crate) fn native_bif_top(
             && info.classify() == arinsal_term::TermKind::Map)
             .then_some(TopFrame::CurrentArgsInfoTerm(None, info));
     }
-    let (module, function, arity) = arinsal_beamasm::bif::static_bif_mfa(bif_info)?;
+    let (module, function, arity) = crate::raw::beam_common_ffi::code_mfa(bif_info)?;
     if module == arinsal_term::atoms::ERLANG {
         if (function == arinsal_term::atoms::ERROR
             || function == arinsal_term::atoms::EXIT

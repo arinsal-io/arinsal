@@ -111,11 +111,11 @@ unsafe extern "C" {
     /// `ErtsCodeIndex the_active_code_index` (code_ix.h): the node's active code index,
     /// read by `emit_leave_runtime<eCodeIndex>`.
     pub safe static the_active_code_index: u32;
-    /// `int erts_garbage_collect_nobump(Process *p, int need, Eterm *objv, int nobj,
-    /// int fcalls)` (erl_gc.h): reductions spent.
+    /// `int erts_garbage_collect_nobump(Process *p, Uint need, Eterm *objv, int nobj,
+    /// int fcalls)` (erl_gc.h:171): reductions spent.
     pub safe fn erts_garbage_collect_nobump(
         c_p: *mut crate::ProcessHeader,
-        need: i32,
+        need: usize,
         objv: *mut u64,
         nobj: i32,
         fcalls: i32,
@@ -441,19 +441,6 @@ const TRACE_HOOK: i32 = tmp_mem_disp(5);
 const HTOP: usize = core::mem::offset_of!(ProcessHeader, htop);
 const STOP: usize = core::mem::offset_of!(ProcessHeader, stop);
 const FCALLS: usize = core::mem::offset_of!(ProcessHeader, fcalls);
-
-// Port of erts/emulator/beam/erl_gc.h:171, OTP-29.1.1.
-unsafe extern "C" {
-    /// `int erts_garbage_collect_nobump(Process *p, Uint need, Eterm *objv, int nobj,
-    /// int fcalls)`; `Uint` has the machine word width.
-    pub safe fn erts_garbage_collect_nobump(
-        c_p: *mut ProcessHeader,
-        need: usize,
-        objv: *mut u64,
-        nobj: i32,
-        fcalls: i32,
-    ) -> i32;
-}
 
 #[cfg(windows)]
 compile_error!("the x86-64 BeamAsm entry bridge implements the System V ABI only");
@@ -822,7 +809,7 @@ mod tests {
     #[unsafe(no_mangle)]
     extern "C" fn erts_garbage_collect_nobump(
         _: *mut crate::ProcessHeader,
-        _: i32,
+        _: usize,
         _: *mut u64,
         _: i32,
         _: i32,

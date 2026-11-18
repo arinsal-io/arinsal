@@ -179,7 +179,7 @@ fn pending_purge_lambda(
 fn lambda_handler_call(
     process: &mut crate::Process,
     registers: &mut arinsal_beamasm::SchedulerRegisters,
-    handler_export: &arinsal_beamasm::bif::ExportEntry,
+    handler_export: &arinsal_term::ExportEntry,
     module: arinsal_term::Atom,
     fun: Term,
     arity: u32,
@@ -204,7 +204,7 @@ fn lambda_handler_call(
     registers.x_reg_array[1] = fun;
     registers.x_reg_array[2] = crate::native_hooks::from_raw(list);
     registers.x_reg_array[3] = Term::NIL;
-    handler_export as *const arinsal_beamasm::bif::ExportEntry as usize
+    handler_export as *const arinsal_term::ExportEntry as usize
 }
 
 /// Removes the current message from the mailbox (`remove_message`).

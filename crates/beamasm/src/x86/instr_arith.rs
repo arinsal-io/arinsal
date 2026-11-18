@@ -13,7 +13,7 @@ use super::beam_asm::{
     BeamAssembler, CpuFeature, Distance, Update, process, process_ref, tmp_mem_q,
 };
 use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
-use super::beam_asm_module::BeamModuleAssembler;
+use super::beam_asm_module::{BeamModuleAssembler, arg_label};
 pub use super::rt::{
     erts_band, erts_bnot, erts_bor, erts_bsl, erts_bsr, erts_bxor, erts_int_div_rem,
     erts_mixed_div, erts_mixed_minus, erts_mixed_plus, erts_mixed_times, erts_mul_add,
@@ -60,7 +60,9 @@ fn fits_i32(value: i64) -> bool {
     value as i32 as i64 == value
 }
 
-fn beam_label(m: &BeamModuleAssembler, index: u32) -> Result<Option<Label>, AsmError> {
+/// `ArgLabel` of an arithmetic instruction: label 0 means no fail label (body context).
+fn beam_label(m: &BeamModuleAssembler, fail: ArgVal) -> Result<Option<Label>, AsmError> {
+    let index = arg_label(fail)?;
     if index == 0 {
         Ok(None)
     } else {
@@ -501,7 +503,7 @@ impl BeamModuleAssembler {
         &mut self,
         lhs: ArgVal,
         rhs: ArgVal,
-        fail: u32,
+        fail: ArgVal,
         dst: ArgVal,
     ) -> Result<(), AsmError> {
         let small_result = self.is_sum_small_if_args_are_small(lhs, rhs);
@@ -570,7 +572,7 @@ impl BeamModuleAssembler {
         &mut self,
         lhs: ArgVal,
         rhs: ArgVal,
-        fail: u32,
+        fail: ArgVal,
         dst: ArgVal,
     ) -> Result<(), AsmError> {
         let small_result = self.is_diff_small_if_args_are_small(lhs, rhs);
@@ -636,7 +638,7 @@ impl BeamModuleAssembler {
     pub fn emit_i_unary_minus(
         &mut self,
         src: ArgVal,
-        fail: u32,
+        fail: ArgVal,
         dst: ArgVal,
     ) -> Result<(), AsmError> {
         let small_result =
@@ -771,7 +773,7 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/x86/instr_arith.cpp:682-822 (emit_div_rem), OTP-29.1.1.
     fn emit_div_rem(
         &mut self,
-        fail: u32,
+        fail: ArgVal,
         lhs: ArgVal,
         rhs: ArgVal,
         error_mfa: &'static ErtsCodeMfa,
@@ -890,7 +892,7 @@ impl BeamModuleAssembler {
         &mut self,
         lhs: ArgVal,
         rhs: ArgVal,
-        fail: u32,
+        fail: ArgVal,
         remainder: ArgVal,
         quotient: ArgVal,
     ) -> Result<(), AsmError> {
@@ -905,7 +907,7 @@ impl BeamModuleAssembler {
         &mut self,
         lhs: ArgVal,
         rhs: ArgVal,
-        fail: u32,
+        fail: ArgVal,
         quotient: ArgVal,
         remainder: ArgVal,
     ) -> Result<(), AsmError> {
@@ -918,7 +920,7 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/x86/instr_arith.cpp:850-859 (emit_i_int_div), OTP-29.1.1.
     pub fn emit_i_int_div(
         &mut self,
-        fail: u32,
+        fail: ArgVal,
         lhs: ArgVal,
         rhs: ArgVal,
         quotient: ArgVal,
@@ -933,7 +935,7 @@ impl BeamModuleAssembler {
         &mut self,
         lhs: ArgVal,
         rhs: ArgVal,
-        fail: u32,
+        fail: ArgVal,
         remainder: ArgVal,
     ) -> Result<(), AsmError> {
         self.emit_div_rem(fail, lhs, rhs, &REM_MFA, false, true)?;
@@ -944,7 +946,7 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/x86/instr_arith.cpp:872-913 (emit_i_m_div), OTP-29.1.1.
     pub fn emit_i_m_div(
         &mut self,
-        fail: u32,
+        fail: ArgVal,
         lhs: ArgVal,
         rhs: ArgVal,
         dst: ArgVal,
@@ -1092,7 +1094,7 @@ impl BeamModuleAssembler {
     // (emit_i_mul_add), OTP-29.1.1.
     pub fn emit_i_mul_add(
         &mut self,
-        fail: u32,
+        fail: ArgVal,
         src1: ArgVal,
         src2: ArgVal,
         src3: ArgVal,
@@ -1259,7 +1261,7 @@ impl BeamModuleAssembler {
         &mut self,
         lhs: ArgVal,
         rhs: ArgVal,
-        fail: u32,
+        fail: ArgVal,
         dst: ArgVal,
     ) -> Result<(), AsmError> {
         if self.always_small(lhs) && self.always_small(rhs) {
@@ -1300,7 +1302,7 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/x86/instr_arith.cpp:1357-1401 (emit_i_bor), OTP-29.1.1.
     pub fn emit_i_bor(
         &mut self,
-        fail: u32,
+        fail: ArgVal,
         lhs: ArgVal,
         rhs: ArgVal,
         dst: ArgVal,
@@ -1339,7 +1341,7 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/x86/instr_arith.cpp:1417-1473 (emit_i_bxor), OTP-29.1.1.
     pub fn emit_i_bxor(
         &mut self,
-        fail: u32,
+        fail: ArgVal,
         lhs: ArgVal,
         rhs: ArgVal,
         dst: ArgVal,
@@ -1382,7 +1384,7 @@ impl BeamModuleAssembler {
 
     /// Emits tagged-small bitwise not with the generic runtime fragment.
     // Port of erts/emulator/beam/jit/x86/instr_arith.cpp:1535-1570 (emit_i_bnot), OTP-29.1.1.
-    pub fn emit_i_bnot(&mut self, fail: u32, src: ArgVal, dst: ArgVal) -> Result<(), AsmError> {
+    pub fn emit_i_bnot(&mut self, fail: ArgVal, src: ArgVal, dst: ArgVal) -> Result<(), AsmError> {
         let next = self.asm.new_label();
         self.mov_arg_to_reg(RET, src)?;
         self.asm.emit(|e| e.xor_ri(RET, !TAG_IMMED1_MASK))?;
@@ -1411,7 +1413,7 @@ impl BeamModuleAssembler {
         &mut self,
         lhs: ArgVal,
         rhs: ArgVal,
-        fail: u32,
+        fail: ArgVal,
         dst: ArgVal,
     ) -> Result<(), AsmError> {
         let generic = self.asm.new_label();
@@ -1470,7 +1472,7 @@ impl BeamModuleAssembler {
         &mut self,
         lhs: ArgVal,
         rhs: ArgVal,
-        fail: u32,
+        fail: ArgVal,
         dst: ArgVal,
     ) -> Result<(), AsmError> {
         if self.is_bsl_small(lhs, rhs) {
@@ -1975,7 +1977,7 @@ mod tests {
                     ..crate::common::types::ArgType::ANY
                 },
             );
-            assembler.emit_i_plus(lhs, rhs, 0, dst)
+            assembler.emit_i_plus(lhs, rhs, ArgVal::Label(0), dst)
         }));
     }
 
@@ -2006,7 +2008,7 @@ mod tests {
             };
             let lhs = assembler.typed_arg(ArgVal::X(2), ty);
             let rhs = assembler.typed_arg(ArgVal::X(4), ty);
-            assembler.emit_i_minus(lhs, rhs, 1, ArgVal::X(1))
+            assembler.emit_i_minus(lhs, rhs, ArgVal::Label(1), ArgVal::X(1))
         }));
     }
 
@@ -2026,7 +2028,7 @@ mod tests {
             })
             .expect("counters dump contains a unary minus block");
         assert!(module_block_matches(&block, None, |assembler| {
-            assembler.emit_i_unary_minus(ArgVal::X(2), 0, ArgVal::X(0))
+            assembler.emit_i_unary_minus(ArgVal::X(2), ArgVal::Label(0), ArgVal::X(0))
         }));
     }
 
@@ -2049,7 +2051,7 @@ mod tests {
             })
             .expect("rand dump contains a generic band block");
         assert!(module_block_matches(&block, None, |assembler| {
-            assembler.emit_i_band(ArgVal::Y(3), ArgVal::Y(2), 0, ArgVal::X(2))
+            assembler.emit_i_band(ArgVal::Y(3), ArgVal::Y(2), ArgVal::Label(0), ArgVal::X(2))
         }));
     }
 
@@ -2078,7 +2080,7 @@ mod tests {
             };
             let lhs = assembler.typed_arg(ArgVal::X(1), ty);
             let rhs = assembler.typed_arg(ArgVal::X(2), ty);
-            assembler.emit_i_bor(0, lhs, rhs, ArgVal::X(0))
+            assembler.emit_i_bor(ArgVal::Label(0), lhs, rhs, ArgVal::X(0))
         }));
     }
 
@@ -2111,7 +2113,7 @@ mod tests {
             };
             let lhs = assembler.typed_arg(ArgVal::X(1), ty);
             let rhs = assembler.typed_arg(ArgVal::X(3), ty);
-            assembler.emit_i_bxor(0, lhs, rhs, ArgVal::X(1))
+            assembler.emit_i_bxor(ArgVal::Label(0), lhs, rhs, ArgVal::X(1))
         }));
     }
 
@@ -2143,7 +2145,7 @@ mod tests {
                         ..crate::common::types::ArgType::ANY
                     },
                 );
-                assembler.emit_i_bnot(0, src, ArgVal::X(6))
+                assembler.emit_i_bnot(ArgVal::Label(0), src, ArgVal::X(6))
             }
         ));
     }
@@ -2171,7 +2173,7 @@ mod tests {
             };
             let lhs = assembler.typed_arg(ArgVal::X(0), ty);
             let rhs = assembler.typed_arg(ArgVal::X(4), ty);
-            assembler.emit_i_bsr(lhs, rhs, 0, ArgVal::X(0))
+            assembler.emit_i_bsr(lhs, rhs, ArgVal::Label(0), ArgVal::X(0))
         }));
     }
 
@@ -2192,7 +2194,12 @@ mod tests {
             })
             .expect("rand dump contains a LZCNT bsl block");
         assert!(module_block_matches(&block, None, |assembler| {
-            assembler.emit_i_bsl(ArgVal::Immediate(31), ArgVal::X(6), 0, ArgVal::X(6))
+            assembler.emit_i_bsl(
+                ArgVal::Immediate(31),
+                ArgVal::X(6),
+                ArgVal::Label(0),
+                ArgVal::X(6),
+            )
         }));
     }
 
@@ -2221,7 +2228,7 @@ mod tests {
                 },
             );
             assembler.emit_i_mul_add(
-                0,
+                ArgVal::Label(0),
                 lhs,
                 ArgVal::Immediate(tagged_small(10) as u64),
                 ArgVal::X(0),
@@ -2252,7 +2259,13 @@ mod tests {
             })
             .expect("net_kernel dump contains a generic div_rem block");
         assert!(module_block_matches(&block, Some(&DIV_MFA), |assembler| {
-            assembler.emit_i_div_rem(ArgVal::X(4), ArgVal::X(0), 0, ArgVal::X(6), ArgVal::X(7))
+            assembler.emit_i_div_rem(
+                ArgVal::X(4),
+                ArgVal::X(0),
+                ArgVal::Label(0),
+                ArgVal::X(6),
+                ArgVal::X(7),
+            )
         }));
     }
 
@@ -2288,7 +2301,7 @@ mod tests {
                 assembler.emit_i_rem_div(
                     lhs,
                     ArgVal::Immediate(tagged_small(1_000_000) as u64),
-                    0,
+                    ArgVal::Label(0),
                     ArgVal::X(2),
                     ArgVal::X(0),
                 )
@@ -2323,7 +2336,7 @@ mod tests {
                 },
             );
             assembler.emit_i_int_div(
-                0,
+                ArgVal::Label(0),
                 lhs,
                 ArgVal::Immediate(tagged_small(2) as u64),
                 ArgVal::X(1),
@@ -2362,7 +2375,7 @@ mod tests {
                 assembler.emit_i_rem(
                     lhs,
                     ArgVal::Immediate(tagged_small(2) as u64),
-                    0,
+                    ArgVal::Label(0),
                     ArgVal::X(0),
                 )
             }

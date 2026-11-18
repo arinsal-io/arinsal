@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use arinsal_beamasm::bif::ExportEntry;
+use arinsal_term::ExportEntry;
 use arinsal_term::{Atom, OP_CALL_ERROR_HANDLER, OP_I_GENERIC_BREAKPOINT, TRAMPOLINE_NONE};
 
 type Mfa = (Atom, Atom, u8);
@@ -38,7 +38,7 @@ pub(crate) fn find_export_entry(
     mfa: Mfa,
     code_ix: usize,
 ) -> Option<&'static ExportEntry> {
-    if code_ix >= arinsal_beamasm::bif::ERTS_ADDRESSV_SIZE {
+    if code_ix >= arinsal_term::ERTS_ADDRESSV_SIZE {
         return None;
     }
     code.with_tables_for_code_ix(code_ix, |tables| tables.exports.dispatch(mfa))

@@ -158,7 +158,7 @@ pub extern "C" fn call_error_handler(
     func: u64,
 ) -> usize {
     let mfa_pointer = mfa;
-    let Some(mfa) = arinsal_beamasm::bif::static_bif_mfa(mfa_pointer as usize as u64) else {
+    let Some(mfa) = crate::raw::beam_common_ffi::code_mfa(mfa_pointer as usize as u64) else {
         return 0;
     };
     let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(c_p, reg) else {
