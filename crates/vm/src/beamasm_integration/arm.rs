@@ -469,14 +469,14 @@ impl CompiledVersion {
     // jit/asm_load.c:1175 (`inst_p->catches = beamasm_patch_catches`), OTP-29.1.1: every catch of
     // the module is consed onto the staging pool and its tag written into the `mov` that loads it.
     fn patch_catches(&self) {
-        let code = crate::code_ix::global();
         let mut catch_no = crate::beam_catches::BEAM_CATCHES_NIL;
         let mut memory = self
             .memory
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for &(patch, handler) in &self.catches {
-            catch_no = crate::beam_catches::beam_catches_cons(code, handler, catch_no);
+            catch_no =
+                crate::beam_catches::beam_catches_cons(handler, catch_no, std::ptr::null_mut());
             let tag = arinsal_beamasm::catch::make_catch(catch_no);
             // With the current tag scheme, more than 33 million catches can exist at once.
             assert!(tag >> 31 == 0, "catch table exhausted");

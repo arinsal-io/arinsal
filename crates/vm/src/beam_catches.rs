@@ -101,10 +101,14 @@ pub(crate) fn beam_catches_end_staging(code: &CodeIndexes, _commit: bool) {
 }
 
 // Port of erts/emulator/beam/beam_catches.c:107-144 (beam_catches_cons), OTP-29.1.1.
-// The `cppp` out parameter is dropped: every caller (beam_jit_common.cpp, emu_load.c) passes NULL.
-/// Adds a catch with handler `cp` to the staging pool in front of the list `cdr`; returns its
-/// slot number.
-pub(crate) fn beam_catches_cons(code: &CodeIndexes, cp: usize, cdr: u32) -> u32 {
+// `cdrpp` is never written: every caller (beam_jit_common.cpp patchCatches, emu_load.c) passes
+// NULL. The x86 module assembler's `patch_catches` calls this symbol.
+/// `unsigned beam_catches_cons(ErtsCodePtr cp, unsigned cdr, ErtsCodePtr **cdrpp)`: adds a
+/// catch with handler `cp` to the staging pool in front of the list `cdr`; returns its slot
+/// number.
+#[unsafe(no_mangle)]
+pub extern "C" fn beam_catches_cons(cp: usize, cdr: u32, _cdrpp: *mut *mut usize) -> u32 {
+    let code = crate::code_ix::global();
     let mut pools = code.bccix().pools();
     let p = &mut pools[code.staging()];
     debug_assert!(p.is_staging);

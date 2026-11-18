@@ -628,6 +628,11 @@ pub(crate) fn export_dispatch(identity: usize) -> Option<ExportDispatch> {
     target_for_identity(identity)
 }
 
+#[cfg(target_arch = "x86_64")]
+mod x86;
+#[cfg(target_arch = "x86_64")]
+pub(crate) use x86::*;
+
 #[cfg(target_arch = "aarch64")]
 mod arm;
 #[cfg(target_arch = "aarch64")]

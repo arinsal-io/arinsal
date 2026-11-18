@@ -80,6 +80,9 @@ pub(crate) fn beamasm_init() {
 }
 
 #[cfg(target_arch = "x86_64")]
+pub(crate) use x86::bga;
+
+#[cfg(target_arch = "x86_64")]
 mod x86 {
     use arinsal_beamasm::beam_asm_global::{GlobalLabels, ProcessOffsets};
     use std::sync::OnceLock;
@@ -87,6 +90,13 @@ mod x86 {
     /// `static BeamGlobalAssembler *bga` of beam_jit_main.cpp:49, with the executable memory
     /// of its code.
     static BGA: OnceLock<arinsal_beamjit::BeamAsm> = OnceLock::new();
+
+    /// `bga` once `beamasm_init` has run: every module assembler resolves its fragment calls
+    /// against it.
+    pub(crate) fn bga() -> &'static arinsal_beamjit::BeamAsm {
+        BGA.get()
+            .expect("beamasm_init runs before any module is loaded")
+    }
 
     // Port of erts/emulator/beam/jit/beam_jit_main.cpp:243-397 (beamasm_init), OTP-29.1.1.
     pub(super) fn beamasm_init() {

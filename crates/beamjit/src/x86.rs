@@ -10,6 +10,9 @@
 //! An emitter the x86 `BeamModuleAssembler` does not have yet is a compile error naming it:
 //! the remaining I-box inventory.
 
+// The `op_*` constants keep the names beam_makeops generates.
+#![allow(non_upper_case_globals)]
+
 use crate::beam_asm::{
     CompileError, LoaderEnv, beam_load_emit_op, resolve_new_literal, with_transform_arena,
 };
@@ -24,7 +27,7 @@ use arinsal_beamops::beam_opcodes::{
     op_i_func_info_IaaI, op_i_test_yield, op_int_code_end, op_line_I, op_nif_start,
 };
 use arinsal_beamops::{self as beamops, NewLiteral, OpSink, SpecificOperand};
-use arinsal_x64::exec::CodeMemory;
+pub use arinsal_x64::exec::CodeMemory;
 
 /// erts' process-wide JIT state after `beamasm_init`: the global assembler `bga`, whose
 /// fragments live in `global_code` for as long as the emulator runs. The VM owns it; erts
@@ -116,6 +119,12 @@ pub fn beamasm_codegen(
 // Port of erts/emulator/beam/jit/beam_jit_main.cpp:588-591 (beamasm_get_code), OTP-29.1.1.
 pub fn beamasm_get_code(ba: &BeamModuleAssembler, label: u32) -> Option<usize> {
     ba.get_code(label)
+}
+
+/// `beamasm_get_lambda(instance, index)`: the code of the lambda `index` (its trampoline).
+// Port of erts/emulator/beam/jit/beam_jit_main.cpp:593-596 (beamasm_get_lambda), OTP-29.1.1.
+pub fn beamasm_get_lambda(ba: &BeamModuleAssembler, index: u32) -> Option<usize> {
+    ba.asm.get_code(ba.lambda_trampoline(index).ok()?)
 }
 
 /// `beamasm_get_header(instance, &hdr)`: the executable code header and the code size.
