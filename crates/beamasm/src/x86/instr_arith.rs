@@ -7,7 +7,8 @@ use arinsal_x64::enc::Gp;
 use super::beam_asm::AsmError;
 use super::beam_asm::register::{ARG1, ARG1D, RET, RETB, RETD};
 use super::beam_asm_module::BeamModuleAssembler;
-use crate::common::types::{TypedArg, type_id};
+use crate::common::args::ArgVal;
+use crate::common::types::{BeamModuleAssemblerCommon, type_id};
 
 const TAG_PRIMARY_LIST: i64 = 1;
 const TAG_IMMED1_MASK: i64 = 0x0f;
@@ -16,12 +17,12 @@ const TAG_IMMED1_SMALL: i64 = 0x0f;
 impl BeamModuleAssembler {
     /// Emits the small-integer test used by arithmetic fast paths.
     // Port of erts/emulator/beam/jit/x86/instr_arith.cpp:39-60 (emit_is_small), OTP-29.1.1.
-    pub fn emit_is_small(&mut self, fail: Label, arg: TypedArg, reg: Gp) -> Result<(), AsmError> {
+    pub fn emit_is_small(&mut self, fail: Label, arg: ArgVal, reg: Gp) -> Result<(), AsmError> {
         assert_ne!(ARG1, reg);
 
-        if arg.always_small() {
+        if self.always_small(arg) {
             // The type range proves the check.
-        } else if arg.always_one_of(type_id::NUMBER) {
+        } else if self.always_one_of(arg, type_id::NUMBER) {
             self.asm.emit(|e| e.test_ri(reg.r8(), TAG_PRIMARY_LIST))?;
             self.asm.short_jcc(arinsal_x64::enc::CondCode::E, fail)?;
         } else {
@@ -39,22 +40,22 @@ impl BeamModuleAssembler {
     pub fn emit_are_both_small(
         &mut self,
         fail: Label,
-        lhs: TypedArg,
+        lhs: ArgVal,
         a: Gp,
-        rhs: TypedArg,
+        rhs: ArgVal,
         b: Gp,
     ) -> Result<(), AsmError> {
         assert_ne!(ARG1, a);
         assert_ne!(ARG1, b);
 
-        if lhs.always_small() && rhs.always_small() {
+        if self.always_small(lhs) && self.always_small(rhs) {
             return Ok(());
         }
 
-        if lhs.always_one_of(type_id::NUMBER) && rhs.always_one_of(type_id::NUMBER) {
-            if rhs.always_small() {
+        if self.always_one_of(lhs, type_id::NUMBER) && self.always_one_of(rhs, type_id::NUMBER) {
+            if self.always_small(rhs) {
                 self.asm.emit(|e| e.test_ri(a.r8(), TAG_PRIMARY_LIST))?;
-            } else if lhs.always_small() {
+            } else if self.always_small(lhs) {
                 self.asm.emit(|e| e.test_ri(b.r8(), TAG_PRIMARY_LIST))?;
             } else if a != RET && b != RET {
                 self.asm.emit(|e| e.mov_rr(RETD, a.r32()))?;
@@ -66,7 +67,7 @@ impl BeamModuleAssembler {
                 self.asm.emit(|e| e.test_ri(ARG1.r8(), TAG_PRIMARY_LIST))?;
             }
             self.asm.short_jcc(arinsal_x64::enc::CondCode::E, fail)?;
-        } else if lhs.always_small() {
+        } else if self.always_small(lhs) {
             if a == RET || b == RET {
                 self.emit_is_small(fail, rhs, b)?;
             } else {
@@ -75,7 +76,7 @@ impl BeamModuleAssembler {
                 self.asm.emit(|e| e.cmp_ri(RETB, TAG_IMMED1_SMALL))?;
                 self.asm.short_jcc(arinsal_x64::enc::CondCode::NE, fail)?;
             }
-        } else if rhs.always_small() {
+        } else if self.always_small(rhs) {
             if a == RET || b == RET {
                 self.emit_is_small(fail, lhs, a)?;
             } else {
@@ -292,24 +293,16 @@ mod tests {
             == expected[prefix_bytes.len()..prefix_bytes.len() + helper_len]
     }
 
-    fn any_arg() -> TypedArg {
-        TypedArg::new(
-            crate::common::args::ArgVal::X(0),
-            ArgType {
-                union_bits: type_id::ANY,
-                min: None,
-                max: None,
-            },
-        )
+    fn any_arg(m: &mut BeamModuleAssembler) -> ArgVal {
+        m.typed_arg(ArgVal::X(0), ArgType::ANY)
     }
 
-    fn number_arg() -> TypedArg {
-        TypedArg::new(
-            crate::common::args::ArgVal::X(0),
+    fn number_arg(m: &mut BeamModuleAssembler) -> ArgVal {
+        m.typed_arg(
+            ArgVal::X(0),
             ArgType {
                 union_bits: type_id::NUMBER,
-                min: None,
-                max: None,
+                ..ArgType::ANY
             },
         )
     }
@@ -334,7 +327,8 @@ mod tests {
                     continue;
                 };
                 if !verify_helper_prefix(&block, start, |assembler, fail| {
-                    assembler.emit_is_small(fail, any_arg(), ARG2)
+                    let arg = any_arg(assembler);
+                    assembler.emit_is_small(fail, arg, ARG2)
                 }) {
                     panic!("i_bsr small test differs: {block:#?}");
                 }
@@ -364,7 +358,8 @@ mod tests {
                     continue;
                 };
                 if !verify_helper_prefix(&block, start, |assembler, fail| {
-                    assembler.emit_are_both_small(fail, number_arg(), ARG2, number_arg(), ARG3)
+                    let (lhs, rhs) = (number_arg(assembler), number_arg(assembler));
+                    assembler.emit_are_both_small(fail, lhs, ARG2, rhs, ARG3)
                 }) {
                     panic!("i_plus pair small test differs: {block:#?}");
                 }

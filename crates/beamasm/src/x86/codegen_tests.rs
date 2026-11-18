@@ -19,7 +19,7 @@ use super::beam_asm_global::{BeamGlobalAssembler, GLOBAL_LABELS};
 use super::beam_asm_module::{BeamCodeHeader, BeamModuleAssembler};
 use super::jdump::gnu_as;
 use crate::common::args::ArgVal;
-use crate::common::types::{ArgType, TypedArg};
+use crate::common::types::ArgType;
 use crate::{ExitReason, ProcessHeader, SchedulerRegisters};
 
 const SOURCE: &str = "-module(x86_first).
@@ -126,17 +126,6 @@ fn massage(sign: &str, operands: &[SpecificOperand]) -> Result<Vec<ArgVal>, Stri
 }
 
 /// An operand without type information (type index zero).
-fn any(arg: ArgVal) -> TypedArg {
-    TypedArg::new(arg, ArgType::ANY)
-}
-
-fn size(arg: ArgVal) -> usize {
-    match arg {
-        ArgVal::Word(word) => word as usize,
-        other => panic!("size operand {other:?}"),
-    }
-}
-
 struct Loader<'a> {
     ba: &'a mut BeamModuleAssembler,
     emitted: Vec<&'static str>,
@@ -181,10 +170,10 @@ impl OpSink for Loader<'_> {
             "i_call_only" => m.emit_i_call_only(a[0]),
             "is_nonempty_list_get_hd" => m.emit_is_nonempty_list_get_hd(a[0], a[1], a[2]),
             "is_nonempty_list_get_tl" => m.emit_is_nonempty_list_get_tl(a[0], a[1], a[2]),
-            "i_select_val_lins" => m.emit_i_select_val_lins(any(a[0]), a[1], size(a[2]), &a[3..]),
-            "i_select_val_bins" => m.emit_i_select_val_bins(any(a[0]), a[1], size(a[2]), &a[3..]),
-            "i_is_tuple_of_arity" => m.emit_i_is_tuple_of_arity(a[0], any(a[1]), a[2]),
-            "i_get_tuple_element" => m.emit_i_get_tuple_element(any(a[0]), a[1], a[2]),
+            "i_select_val_lins" => m.emit_i_select_val_lins(a[0], a[1], a[2], &a[3..]),
+            "i_select_val_bins" => m.emit_i_select_val_bins(a[0], a[1], a[2], &a[3..]),
+            "i_is_tuple_of_arity" => m.emit_i_is_tuple_of_arity(a[0], a[1], a[2]),
+            "i_get_tuple_element" => m.emit_i_get_tuple_element(a[0], a[1], a[2]),
             "current_tuple" => Ok(()),
             "i_func_info" => {
                 self.function = a[2];
@@ -265,6 +254,7 @@ fn erlc_module_runs_as_x86_native_code() {
         &ga,
         beam.code.label_count,
         beam.code.function_count as usize,
+        vec![ArgType::ANY],
     )
     .unwrap();
     let mut loader = Loader {
@@ -385,7 +375,7 @@ fn erlc_module_runs_as_x86_native_code() {
 #[test]
 fn patches_reach_the_running_code() {
     let (ga, _global) = global_assembler();
-    let mut m = BeamModuleAssembler::new_module(&ga, 3, 1).unwrap();
+    let mut m = BeamModuleAssembler::new_module(&ga, 3, 1, vec![ArgType::ANY]).unwrap();
     let (module, function) = (atom_word("x86_first"), atom_word("loaded"));
     m.emit_i_func_label(ArgVal::Label(1)).unwrap();
     m.emit_i_func_info(
@@ -569,7 +559,7 @@ fn function_prologues_match_erts_dump() {
             return;
         };
 
-        let mut m = BeamModuleAssembler::new_module(&ga, 3, 1).unwrap();
+        let mut m = BeamModuleAssembler::new_module(&ga, 3, 1, vec![ArgType::ANY]).unwrap();
         let at = m.asm.a.offset();
         emit_prologue(&mut m, mfa);
         let mut ours = m.asm.a.bytes(arinsal_x64::buf::Section::Code)[at..].to_vec();
@@ -678,7 +668,7 @@ init() -> erlang:load_nif(\"nonexistent\", 0).
     let header_zeros = lines[2].matches("0x00").count();
     let functions = lines.iter().filter(|l| **l == "# i_func_info_IaaI").count();
     let (ga, _global) = global_assembler();
-    let m = BeamModuleAssembler::new_module(&ga, 3, functions).unwrap();
+    let m = BeamModuleAssembler::new_module(&ga, 3, functions, vec![ArgType::ANY]).unwrap();
     assert_eq!(m.asm.a.offset(), header_zeros);
     assert_eq!(
         header_zeros,
@@ -700,7 +690,7 @@ init() -> erlang:load_nif(\"nonexistent\", 0).
         return;
     };
 
-    let mut m = BeamModuleAssembler::new_module(&ga, 3, functions).unwrap();
+    let mut m = BeamModuleAssembler::new_module(&ga, 3, functions, vec![ArgType::ANY]).unwrap();
     let at = m.asm.a.offset();
     emit_prologue(&mut m, block_mfa(block));
     m.emit_return().unwrap();
@@ -758,7 +748,7 @@ f(X) ->
             return;
         };
 
-        let mut m = BeamModuleAssembler::new_module(&ga, 1, 0).unwrap();
+        let mut m = BeamModuleAssembler::new_module(&ga, 1, 0, vec![ArgType::ANY]).unwrap();
         // `i_debug_line` ends 8-byte aligned.
         m.asm.align_code(8).unwrap();
         let at = m.asm.a.offset();

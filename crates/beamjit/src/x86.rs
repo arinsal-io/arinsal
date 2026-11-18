@@ -18,6 +18,7 @@ use arinsal_beamasm::beam_asm::AsmError;
 use arinsal_beamasm::beam_asm_global::BeamGlobalAssembler;
 use arinsal_beamasm::beam_asm_module::{BeamCodeHeader, BeamModuleAssembler};
 use arinsal_beamasm::common::args::ArgVal;
+use arinsal_beamasm::common::types::ArgType;
 use arinsal_beamops::beam_opcodes::{
     op_empty_func_line, op_executable_line_II, op_func_line_I, op_i_debug_line_IIt,
     op_i_func_info_IaaI, op_i_test_yield, op_int_code_end, op_line_I, op_nif_start,
@@ -58,7 +59,28 @@ pub fn beamasm_new_assembler(
         &jit.bga,
         beam.code.label_count,
         beam.code.function_count as usize,
+        beam_types(beam),
     )
+}
+
+/// `beam->types.entries`: the module's type table, or `init_fallback_type_table`'s single
+/// `any` entry when the module has no `Type` chunk.
+// Port of erts/emulator/beam/beam_file.c:607-705 (init_fallback_type_table,
+// parse_type_chunk_data), OTP-29.1.1.
+fn beam_types(beam: &BeamFile) -> Vec<ArgType> {
+    match beam.types.as_ref() {
+        Some(table) => table
+            .entries
+            .iter()
+            .map(|entry| ArgType {
+                union_bits: entry.union_bits,
+                min: entry.lower_bound,
+                max: entry.upper_bound,
+                unit: entry.unit,
+            })
+            .collect(),
+        None => vec![ArgType::ANY],
+    }
 }
 
 /// `beamasm_emit(instance, specific_op, op)` after the operands are converted to `ArgVal`s:

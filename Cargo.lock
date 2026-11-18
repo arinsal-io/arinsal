@@ -71,6 +71,8 @@ name = "arinsal-beamasm"
 version = "0.0.1"
 dependencies = [
  "arinsal-a64",
+ "arinsal-beam",
+ "arinsal-beamops",
  "arinsal-bifs",
  "arinsal-term",
  "arinsal-x64",
@@ -87,6 +89,7 @@ dependencies = [
  "arinsal-beamops",
  "arinsal-etf",
  "arinsal-spec",
+ "arinsal-x64",
  "smallvec",
  "thiserror",
 ]

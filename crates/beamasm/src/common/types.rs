@@ -4,6 +4,7 @@
 //! erts/emulator/beam/jit/beam_jit_types.hpp (BeamTypeId, BeamArgType), OTP-29.1.1.
 
 use crate::common::args::ArgVal;
+use arinsal_term::{Term, TermKind, raw::term_from_bits};
 
 /// Type-union bits, the `BEAM_TYPE_*` values of erts/emulator/beam/beam_types.h.
 pub mod type_id {
@@ -58,23 +59,30 @@ fn is_ssmall(value: i64) -> bool {
     (MIN_SMALL..=MAX_SMALL).contains(&value)
 }
 
-/// One entry of the `Type` chunk: a type union and optional integer bounds.
+/// One entry of the module's type table (`BeamArgType`, `beam->types.entries[i]`): a type
+/// union, optional integer bounds and the size unit of a bitstring.
+// Port of erts/emulator/beam/jit/beam_jit_types.hpp:119-150 (BeamArgType), OTP-29.1.1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArgType {
     /// `BEAM_TYPE_*` union bits.
     pub union_bits: u16,
-    /// Inclusive lower bound, when the type chunk records one.
+    /// Inclusive lower bound, when the type chunk records one (`hasLowerBound`).
     pub min: Option<i64>,
-    /// Inclusive upper bound, when the type chunk records one.
+    /// Inclusive upper bound, when the type chunk records one (`hasUpperBound`).
     pub max: Option<i64>,
+    /// `size_unit`: 1 unless the type chunk records a unit (`hasUnit`).
+    pub unit: u16,
 }
 
 impl ArgType {
-    /// The entry every untyped operand uses (type index zero).
+    /// The entry of `init_fallback_type_table`, the only entry of a module without a type
+    /// chunk, and the type of every untyped operand.
+    // Port of erts/emulator/beam/beam_file.c:607-623 (init_fallback_type_table), OTP-29.1.1.
     pub const ANY: ArgType = ArgType {
         union_bits: type_id::ANY,
         min: None,
         max: None,
+        unit: 1,
     };
 }
 
@@ -226,6 +234,186 @@ impl TypedArg {
     }
 }
 
+/// The type union of a constant operand (`getTypeUnion` on an `ArgImmed` or an `ArgLiteral`):
+/// the `BeamTypeId` of the term's `tag_val_def`.
+// Port of erts/emulator/beam/jit/beam_jit_common.hpp:208-249 (getTypeUnion, constants),
+// OTP-29.1.1.
+fn constant_type_union(constant: Term) -> u16 {
+    match constant.classify() {
+        TermKind::Atom => type_id::ATOM,
+        TermKind::Bitstring => type_id::BITSTRING,
+        TermKind::Number if constant.float_value().is_some() => type_id::FLOAT,
+        TermKind::Number => type_id::INTEGER,
+        TermKind::Fun => type_id::FUN,
+        TermKind::List => type_id::CONS,
+        TermKind::Map => type_id::MAP,
+        TermKind::Nil => type_id::NIL,
+        TermKind::Pid => type_id::PID,
+        TermKind::Port => type_id::PORT,
+        TermKind::Ref => type_id::REFERENCE,
+        TermKind::Tuple => type_id::TUPLE,
+        // `ERTS_ASSERT(!"tag_val_def error")`.
+        other => panic!("getTypeUnion: no type for a {other:?} constant"),
+    }
+}
+
+/// The type helpers of `BeamModuleAssemblerCommon`, which every architecture's
+/// `BeamModuleAssembler` inherits: they read an operand's type through the type index its
+/// `ArgVal` carries, from the module's type table (`beam->types`).
+// Port of erts/emulator/beam/jit/beam_jit_common.hpp:199-430 (BeamModuleAssemblerCommon,
+// getTypeEntry .. hasUpperBound), OTP-29.1.1.
+pub trait BeamModuleAssemblerCommon {
+    /// `beam->types.entries`.
+    fn beam_types(&self) -> &[ArgType];
+
+    /// `getTypeEntry`: entry 0 for a constant.
+    fn get_type_entry(&self, arg: ArgVal) -> ArgType {
+        let type_index = if arg.is_register() {
+            arg.type_index()
+        } else {
+            0
+        };
+        // `ASSERT(typeIndex < beam->types.count)`: the loader only packs indices of the table.
+        self.beam_types()[type_index as usize]
+    }
+
+    /// `getTypeUnion`.
+    fn get_type_union(&self, arg: ArgVal) -> u16 {
+        match arg {
+            // `beamfile_get_literal`: the loader resolved the literal to its term in the
+            // module's literal area, live for as long as the module.
+            ArgVal::Immediate(term) | ArgVal::Literal(term) => {
+                constant_type_union(term_from_bits(term))
+            }
+            _ => self.get_type_entry(arg).union_bits,
+        }
+    }
+
+    /// `getClampedRange`.
+    fn get_clamped_range(&self, arg: ArgVal) -> (i64, i64) {
+        if let Some(value) = arg.small_signed() {
+            (value, value)
+        } else {
+            let entry = self.get_type_entry(arg);
+            (
+                entry.min.unwrap_or(MIN_SMALL),
+                entry.max.unwrap_or(MAX_SMALL),
+            )
+        }
+    }
+
+    /// `always_small`.
+    fn always_small(&self, arg: ArgVal) -> bool {
+        if arg.is_small() {
+            return true;
+        } else if !self.exact_type(arg, type_id::INTEGER) {
+            return false;
+        }
+        let entry = self.get_type_entry(arg);
+        match (entry.min, entry.max) {
+            (Some(min), Some(max)) => is_ssmall(min) && is_ssmall(max),
+            _ => false,
+        }
+    }
+
+    /// `always_immediate`.
+    fn always_immediate(&self, arg: ArgVal) -> bool {
+        self.always_one_of(arg, type_id::ALWAYS_IMMEDIATE) || self.always_small(arg)
+    }
+
+    /// `always_same_types`.
+    fn always_same_types(&self, lhs: ArgVal, rhs: ArgVal) -> bool {
+        let lhs_types = self.get_type_union(lhs);
+        let rhs_types = self.get_type_union(rhs);
+        // Only certain to be the same when there is one possible type: a number and an
+        // integer could differ if the former is a float.
+        if lhs_types & lhs_types.wrapping_sub(1) == 0 {
+            return lhs_types == rhs_types;
+        }
+        false
+    }
+
+    /// `never_one_of<Types...>`.
+    fn never_one_of(&self, arg: ArgVal, types: u16) -> bool {
+        self.get_type_union(arg) & types == type_id::NONE
+    }
+
+    /// `maybe_one_of<Types...>`.
+    fn maybe_one_of(&self, arg: ArgVal, types: u16) -> bool {
+        !self.never_one_of(arg, types)
+    }
+
+    /// `always_one_of<Types...>`.
+    fn always_one_of(&self, arg: ArgVal, types: u16) -> bool {
+        let type_union = self.get_type_union(arg);
+        type_union == type_union & types
+    }
+
+    /// `exact_type<Type>`.
+    fn exact_type(&self, arg: ArgVal, ty: u16) -> bool {
+        let type_union = self.get_type_union(arg);
+        type_union == type_union & ty
+    }
+
+    /// `masked_types<Mask>`.
+    fn masked_types(&self, arg: ArgVal, mask: u16) -> u16 {
+        self.get_type_union(arg) & mask
+    }
+
+    /// `is_sum_small_if_args_are_small`.
+    fn is_sum_small_if_args_are_small(&self, lhs: ArgVal, rhs: ArgVal) -> bool {
+        let (min1, max1) = self.get_clamped_range(lhs);
+        let (min2, max2) = self.get_clamped_range(rhs);
+        is_ssmall(min1 + min2) && is_ssmall(max1 + max2)
+    }
+
+    /// `is_diff_small_if_args_are_small`.
+    fn is_diff_small_if_args_are_small(&self, lhs: ArgVal, rhs: ArgVal) -> bool {
+        let (min1, max1) = self.get_clamped_range(lhs);
+        let (min2, max2) = self.get_clamped_range(rhs);
+        is_ssmall(min1 - max2) && is_ssmall(max1 - min2)
+    }
+
+    /// `is_product_small_if_args_are_small`.
+    fn is_product_small_if_args_are_small(&self, lhs: ArgVal, rhs: ArgVal) -> bool {
+        let (min1, max1) = self.get_clamped_range(lhs);
+        let (min2, max2) = self.get_clamped_range(rhs);
+        let mag1 = min1.abs().max(max1.abs());
+        let mag2 = min2.abs().max(max2.abs());
+        // mag1 * mag2 <= MAX_SMALL, i.e. mag1 <= MAX_SMALL / mag2 when mag2 != 0.
+        mag2 == 0 || mag1 <= MAX_SMALL / mag2
+    }
+
+    /// `is_bsl_small`.
+    fn is_bsl_small(&self, lhs: ArgVal, rhs: ArgVal) -> bool {
+        if !(self.always_small(lhs) && self.always_small(rhs)) {
+            return false;
+        }
+        let (min1, max1) = self.get_clamped_range(lhs);
+        let (min2, max2) = self.get_clamped_range(rhs);
+        if min1 < 0 || max1 == 0 || min2 < 0 {
+            return false;
+        }
+        // _TAG_IMMED1_SIZE is 4.
+        max2 < i64::from(max1.leading_zeros()) - 4
+    }
+
+    /// `getSizeUnit`.
+    fn get_size_unit(&self, arg: ArgVal) -> u16 {
+        self.get_type_entry(arg).unit
+    }
+
+    /// `hasLowerBound`.
+    fn has_lower_bound(&self, arg: ArgVal) -> bool {
+        self.get_type_entry(arg).min.is_some()
+    }
+
+    /// `hasUpperBound`.
+    fn has_upper_bound(&self, arg: ArgVal) -> bool {
+        self.get_type_entry(arg).max.is_some()
+    }
+}
+
 impl From<ArgVal> for TypedArg {
     fn from(val: ArgVal) -> Self {
         Self::new(val, ArgType::ANY)
@@ -274,49 +462,72 @@ pub fn is_bsl_small(lhs: &TypedArg, rhs: &TypedArg) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArgType, MAX_SMALL, TypedArg, type_id};
+    use super::{ArgType, BeamModuleAssemblerCommon, MAX_SMALL, type_id};
     use crate::common::args::ArgVal;
 
-    fn typed(union_bits: u16) -> TypedArg {
-        TypedArg::new(
-            ArgVal::X(0),
-            ArgType {
-                union_bits,
-                min: None,
-                max: None,
-            },
-        )
+    /// A module's type table, as the assemblers hold it.
+    struct Types(Vec<ArgType>);
+
+    impl BeamModuleAssemblerCommon for Types {
+        fn beam_types(&self) -> &[ArgType] {
+            &self.0
+        }
+    }
+
+    fn entry(union_bits: u16) -> ArgType {
+        ArgType {
+            union_bits,
+            ..ArgType::ANY
+        }
     }
 
     #[test]
     fn immediate_and_boxed_elisions_match_beam_type_unions() {
-        assert_eq!(
-            TypedArg::from(ArgVal::Immediate(0x03)).type_union(),
-            type_id::PID
-        );
-        assert_eq!(
-            TypedArg::from(ArgVal::Immediate(0x07)).type_union(),
-            type_id::PORT
-        );
-        assert_eq!(
-            TypedArg::from(ArgVal::Immediate(0x101)).type_union(),
-            type_id::CONS
-        );
-        assert!(typed(type_id::ATOM).always_immediate());
-        assert!(typed(type_id::NIL).always_immediate());
-        assert!(!typed(type_id::CONS).always_immediate());
-        assert!(typed(type_id::TUPLE).always_boxed());
-        assert!(typed(type_id::MAP).always_boxed());
-        assert!(!typed(type_id::INTEGER).always_boxed());
-
-        let bounded_bigint = TypedArg::new(
-            ArgVal::X(0),
+        let types = Types(vec![
+            ArgType::ANY,
+            entry(type_id::ATOM),
+            entry(type_id::NIL),
+            entry(type_id::CONS),
+            entry(type_id::TUPLE),
+            entry(type_id::MAP),
+            entry(type_id::INTEGER),
             ArgType {
                 union_bits: type_id::INTEGER,
                 min: Some(MAX_SMALL + 1),
-                max: None,
+                ..ArgType::ANY
             },
+        ]);
+        let reg = |type_index| ArgVal::typed_x(3, type_index);
+        assert_eq!(types.get_type_union(ArgVal::Immediate(0x03)), type_id::PID);
+        assert_eq!(types.get_type_union(ArgVal::Immediate(0x07)), type_id::PORT);
+        assert_eq!(types.get_type_union(ArgVal::Immediate(0x3b)), type_id::NIL);
+        assert_eq!(
+            types.get_type_union(ArgVal::Immediate(0x1f)),
+            type_id::INTEGER
         );
-        assert!(!bounded_bigint.always_boxed());
+        assert_eq!(types.get_type_union(ArgVal::X(3)), type_id::ANY);
+        assert!(types.always_immediate(reg(1)));
+        assert!(types.always_immediate(reg(2)));
+        assert!(!types.always_immediate(reg(3)));
+        assert!(types.always_one_of(reg(4), type_id::ALWAYS_BOXED));
+        assert!(types.always_one_of(reg(5), type_id::ALWAYS_BOXED));
+        assert!(!types.always_one_of(reg(6), type_id::ALWAYS_BOXED));
+        assert!(!types.always_one_of(reg(7), type_id::ALWAYS_BOXED));
+        assert!(!types.always_small(reg(7)));
+        assert_eq!(types.get_clamped_range(reg(7)), (MAX_SMALL + 1, MAX_SMALL));
+    }
+
+    #[test]
+    fn register_operands_carry_the_type_index_above_reg_mask() {
+        let arg = ArgVal::typed_y(5, 9);
+        assert_eq!(arg, ArgVal::Y(5 | (9 << 10)));
+        assert_eq!((arg.reg(), arg.type_index()), (Some(5), 9));
+        // `ArgRegister::trimmed` drops the type index of a Y register.
+        assert_eq!(arg.trimmed(2), Some(ArgVal::Y(3)));
+        assert_eq!(arg.copy(1), Some(ArgVal::typed_y(1, 9)));
+        assert_eq!(
+            crate::common::args::memory_relation(ArgVal::typed_x(1, 4), ArgVal::X(2)),
+            crate::common::args::Relation::Consecutive
+        );
     }
 }

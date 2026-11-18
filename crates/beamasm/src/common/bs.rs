@@ -88,7 +88,26 @@ impl Segment {
     }
 }
 
-/// Port of beam_jit_bs.cpp:287-364 (beam_jit_bsm_init).
+/// `erts_extracted_bitstring_size` (erl_bits.h:585-593) for fields the segments extract
+/// inline (at most 64 bits, always a heap bitstring).
+///
+/// Wider fields go through `TermBuilder::sub_binary`, which allocates a BinRef plus a
+/// SubBits (8 words) over a refc owner instead of erts' single SubBits, so the reservation
+/// uses that builder's bound until the binary owner layout is the erts one.
+fn extracted_bitstring_size(bits: u64) -> u64 {
+    if bits <= 64 {
+        heap_bits_size(bits)
+    } else if bits <= ERL_ONHEAP_BITS_LIMIT {
+        heap_bits_size(bits).max(8)
+    } else {
+        8.max(ERL_SUB_BITS_SIZE)
+    }
+}
+
+/// The segments of the arm64 loader's decoded `bs_match` commands (`BsmCommand`); the
+/// x86-64 emitter reads the loader's `ArgVal` list with [`beam_jit_bsm_init`] as erts does.
+// Port of erts/emulator/beam/jit/beam_jit_bs.cpp:287-364 (beam_jit_bsm_init), OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn bsm_init(commands: &[BsmCommand]) -> Vec<Segment> {
     commands
         .iter()
@@ -149,20 +168,120 @@ pub(crate) fn bsm_init(commands: &[BsmCommand]) -> Vec<Segment> {
         .collect()
 }
 
-/// `erts_extracted_bitstring_size` (erl_bits.h:585-593) for fields the segments extract
-/// inline (at most 64 bits, always a heap bitstring).
-///
-/// Wider fields go through `TermBuilder::sub_binary`, which allocates a BinRef plus a
-/// SubBits (8 words) over a refc owner instead of erts' single SubBits, so the reservation
-/// uses that builder's bound until the binary owner layout is the erts one.
-fn extracted_bitstring_size(bits: u64) -> u64 {
-    if bits <= 64 {
-        heap_bits_size(bits)
-    } else if bits <= ERL_ONHEAP_BITS_LIMIT {
-        heap_bits_size(bits).max(8)
+/// `bs_get_flags(beam, val)`: the flags of a `bs_match` segment, NIL, a flag list literal
+/// or a word (from `bs_get_integer2`).
+// Port of erts/emulator/beam/jit/beam_jit_bs.cpp:255-285 (bs_get_flags), OTP-29.1.1.
+#[cfg(target_arch = "x86_64")]
+fn bs_get_flags(val: ArgVal) -> Result<u64, &'static str> {
+    if val.is_nil() {
+        Ok(0)
+    } else if let Some(word) = val.word() {
+        Ok(word)
+    } else if val.is_literal() {
+        // Walking the flag list (`am_little`/`am_native` -> BSF_LITTLE, `am_signed` ->
+        // BSF_SIGNED) needs a safe cons view in `arinsal_term::raw`, which it lacks.
+        Err("bs_match flag list literal (no safe cons view in arinsal_term::raw)")
     } else {
-        8.max(ERL_SUB_BITS_SIZE)
+        Err("bs_match flags")
     }
+}
+
+/// `seg.live = current[0]`: NIL or a word.
+#[cfg(target_arch = "x86_64")]
+fn bsm_live(val: ArgVal) -> Result<Option<u32>, &'static str> {
+    if val.is_nil() {
+        Ok(None)
+    } else {
+        val.word()
+            .map(|live| Some(live as u32))
+            .ok_or("bs_match live")
+    }
+}
+
+/// `beam_jit_bsm_init(beam, List)`: the segments of an `i_bs_match` command list, as the
+/// loader hands it to the emitter (`{atom, operands...}` flattened).
+// Port of erts/emulator/beam/jit/beam_jit_bs.cpp:287-364 (beam_jit_bsm_init), OTP-29.1.1.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn beam_jit_bsm_init(list: &[ArgVal]) -> Result<Vec<Segment>, &'static str> {
+    use arinsal_term::{Term, atoms};
+    let atom = |a| Term::atom(a).word();
+    let word = |val: ArgVal| val.word().ok_or("bs_match word operand");
+    let mut segments = Vec::new();
+    let mut current = 0;
+    let arg = |index: usize| list.get(index).copied().ok_or("bs_match list too short");
+    while current < list.len() {
+        let cmd = arg(current)?.immed().ok_or("bs_match command")?;
+        current += 1;
+        let seg = if cmd == atom(atoms::ENSURE_AT_LEAST) {
+            current += 2;
+            Segment {
+                size: word(arg(current - 2)?)?,
+                unit: word(arg(current - 1)?)?,
+                ..Segment::new(Action::EnsureAtLeast)
+            }
+        } else if cmd == atom(atoms::ENSURE_EXACTLY) {
+            current += 1;
+            Segment {
+                size: word(arg(current - 1)?)?,
+                ..Segment::new(Action::EnsureExactly)
+            }
+        } else if cmd == atom(atoms::BINARY) || cmd == atom(atoms::INTEGER) {
+            let size = word(arg(current + 2)?)?;
+            let unit = word(arg(current + 3)?)?;
+            let action = if cmd == atom(atoms::INTEGER) {
+                Action::GetInteger
+            } else {
+                Action::GetBitstring
+            };
+            let dst = arg(current + 4)?;
+            if !dst.is_register() {
+                return Err("bs_match destination");
+            }
+            let seg = Segment {
+                live: bsm_live(arg(current)?)?,
+                size: size * unit,
+                unit,
+                flags: bs_get_flags(arg(current + 1)?)?,
+                dst: Some(dst),
+                ..Segment::new(action)
+            };
+            current += 5;
+            seg
+        } else if cmd == atom(atoms::GET_TAIL) {
+            let dst = arg(current + 2)?;
+            if !dst.is_register() {
+                return Err("bs_match destination");
+            }
+            let seg = Segment {
+                live: Some(word(arg(current)?)? as u32),
+                dst: Some(dst),
+                ..Segment::new(Action::GetTail)
+            };
+            current += 3;
+            seg
+        } else if cmd == atom(atoms::SKIP) {
+            current += 1;
+            Segment {
+                size: word(arg(current - 1)?)?,
+                flags: 0,
+                ..Segment::new(Action::Skip)
+            }
+        } else if cmd == atom(atoms::EQ) {
+            let seg = Segment {
+                live: bsm_live(arg(current)?)?,
+                size: word(arg(current + 1)?)?,
+                unit: word(arg(current + 2)?)?,
+                ..Segment::new(Action::Eq)
+            };
+            current += 3;
+            seg
+        } else {
+            // `abort()`.
+            return Err("unknown bs_match command");
+        };
+        segments.push(seg);
+    }
+    Ok(segments)
 }
 
 /// `heap_bits_size` (erl_bits.h:155-161).

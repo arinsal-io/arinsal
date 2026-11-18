@@ -565,6 +565,7 @@ fn typed_power_of_two_multiply_and_mul_add_stay_on_the_fast_path() {
         union_bits: arinsal_beamasm::types::type_id::INTEGER,
         min: Some(min),
         max: Some(max),
+        unit: 1,
     };
     let eight = tagged(8).unwrap();
     let mut asm = BeamModuleAssembler::new();

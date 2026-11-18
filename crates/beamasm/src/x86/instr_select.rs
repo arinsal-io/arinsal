@@ -8,9 +8,9 @@ use super::beam_asm::{
     AsmError, Distance, emit_boxed_val,
     register::{ARG1, ARG2, ARG2D, RET},
 };
-use super::beam_asm_module::BeamModuleAssembler;
+use super::beam_asm_module::{BeamModuleAssembler, arg_label, arg_word};
 use crate::common::args::ArgVal;
-use crate::common::types::{TypedArg, type_id};
+use crate::common::types::{BeamModuleAssemblerCommon, type_id};
 
 const TAG_HEADER_MASK: i64 = 0x3f;
 const TAG_IMMED1_MASK: i64 = 0x0f;
@@ -23,18 +23,20 @@ impl BeamModuleAssembler {
     // OTP-29.1.1.
     pub fn emit_i_select_tuple_arity(
         &mut self,
-        src: TypedArg,
-        fail: u32,
-        size: usize,
+        src: ArgVal,
+        fail: ArgVal,
+        size: ArgVal,
         args: &[ArgVal],
     ) -> Result<(), AsmError> {
+        let fail = arg_label(fail)?;
+        let size = arg_word(size)? as usize;
         validate_size(size, args)?;
         let fail = self
             .resolve_beam_label(fail)
             .ok_or(AsmError::Operand("tuple arity select fail label"))?;
 
-        self.mov_arg_to_reg(ARG2, src.val)?;
-        if !src.always_boxed() {
+        self.mov_arg_to_reg(ARG2, src)?;
+        if !self.always_one_of(src, type_id::ALWAYS_BOXED) {
             self.emit_is_boxed(fail, ARG2, Distance::Long)?;
         }
 
@@ -42,7 +44,7 @@ impl BeamModuleAssembler {
         self.asm
             .emit(|e| e.mov_rm(ARG2D, emit_boxed_val(boxed_ptr, 0, 4)))?;
 
-        if src.masked_types(type_id::MAYBE_BOXED) != type_id::TUPLE {
+        if self.masked_types(src, type_id::MAYBE_BOXED) != type_id::TUPLE {
             self.asm.emit(|e| e.test_ri(ARG2.r8(), TAG_HEADER_MASK))?;
             self.asm.jcc(CondCode::NE, fail)?;
         }
@@ -65,13 +67,14 @@ impl BeamModuleAssembler {
     // (emit_linear_search, emit_i_select_val_lins), OTP-29.1.1.
     pub fn emit_i_select_val_lins(
         &mut self,
-        src: TypedArg,
+        src: ArgVal,
         fail: ArgVal,
-        size: usize,
+        size: ArgVal,
         args: &[ArgVal],
     ) -> Result<(), AsmError> {
+        let size = arg_word(size)? as usize;
         validate_size(size, args)?;
-        self.mov_arg_to_reg(ARG2, src.val)?;
+        self.mov_arg_to_reg(ARG2, src)?;
         let fail = self.resolve_optional_fail(fail)?;
         self.emit_linear_search(ARG2, fail, args)
     }
@@ -81,11 +84,12 @@ impl BeamModuleAssembler {
     // (emit_i_select_val_bins, emit_binsearch_nodes), OTP-29.1.1.
     pub fn emit_i_select_val_bins(
         &mut self,
-        src: TypedArg,
+        src: ArgVal,
         fail: ArgVal,
-        size: usize,
+        size: ArgVal,
         args: &[ArgVal],
     ) -> Result<(), AsmError> {
+        let size = arg_word(size)? as usize;
         validate_size(size, args)?;
         let count = args.len() / 2;
         if count == 0 {
@@ -102,7 +106,7 @@ impl BeamModuleAssembler {
             _ => return Err(AsmError::Operand("select fail must be label or nil")),
         };
 
-        self.mov_arg_to_reg(ARG2, src.val)?;
+        self.mov_arg_to_reg(ARG2, src)?;
         self.emit_binsearch_nodes(0, count - 1, fail, fail_is_label, args)?;
         if !fail_is_label {
             self.asm.bind(fail)?;
@@ -115,17 +119,19 @@ impl BeamModuleAssembler {
     // OTP-29.1.1.
     pub fn emit_i_jump_on_val(
         &mut self,
-        src: TypedArg,
+        src: ArgVal,
         fail: ArgVal,
-        base: u64,
-        size: usize,
+        base: ArgVal,
+        size: ArgVal,
         args: &[ArgVal],
     ) -> Result<(), AsmError> {
+        let base = arg_word(base)?;
+        let size = arg_word(size)? as usize;
         if size != args.len() {
             return Err(AsmError::Operand("jump table size does not match labels"));
         }
 
-        self.mov_arg_to_reg(ARG1, src.val)?;
+        self.mov_arg_to_reg(ARG1, src)?;
         self.asm.emit(|e| e.mov_rr(RET.r32(), ARG1.r32()))?;
         self.asm.emit(|e| e.and_ri(RET.r8(), TAG_IMMED1_MASK))?;
         self.asm.emit(|e| e.cmp_ri(RET.r8(), TAG_IMMED1_SMALL))?;
@@ -602,7 +608,7 @@ mod tests {
         Some((source, fail, args))
     }
 
-    fn parse_tuple(block: &[String]) -> Option<(TypedArg, u32, Vec<ArgVal>)> {
+    fn parse_tuple(block: &[String]) -> Option<((ArgVal, ArgType), u32, Vec<ArgVal>)> {
         let source = first_source(block)?;
         let has_header_test = block.iter().any(|line| {
             line.trim_start_matches("rex ").starts_with("test ") && line.ends_with(", 63")
@@ -617,12 +623,11 @@ mod tests {
         } else {
             type_id::ANY
         };
-        let src = TypedArg::new(
+        let src = (
             source,
             ArgType {
                 union_bits: union,
-                min: None,
-                max: None,
+                ..ArgType::ANY
             },
         );
 
@@ -756,7 +761,7 @@ mod tests {
                     continue;
                 };
                 compared += assert_block_matches_erts(&block, |m| {
-                    m.emit_i_select_val_lins(TypedArg::from(source), fail, args.len(), &args)
+                    m.emit_i_select_val_lins(source, fail, ArgVal::Word(args.len() as u64), &args)
                 });
             }
         }
@@ -781,7 +786,7 @@ mod tests {
                     continue;
                 };
                 compared += assert_block_matches_erts(&block, |m| {
-                    m.emit_i_select_val_bins(TypedArg::from(source), fail, args.len(), &args)
+                    m.emit_i_select_val_bins(source, fail, ArgVal::Word(args.len() as u64), &args)
                 });
             }
         }
@@ -811,7 +816,13 @@ mod tests {
                     continue;
                 };
                 compared += assert_block_matches_erts(&block, |m| {
-                    m.emit_i_select_tuple_arity(source, fail, args.len(), &args)
+                    let source = m.typed_arg(source.0, source.1);
+                    m.emit_i_select_tuple_arity(
+                        source,
+                        ArgVal::Label(fail),
+                        ArgVal::Word(args.len() as u64),
+                        &args,
+                    )
                 });
             }
         }
@@ -856,10 +867,10 @@ mod tests {
                 let mut assembler = BeamModuleAssembler::new(label_count);
                 assembler
                     .emit_i_jump_on_val(
-                        TypedArg::from(source),
+                        source,
                         ArgVal::Label(fail),
-                        base,
-                        size,
+                        ArgVal::Word(base),
+                        ArgVal::Word(size as u64),
                         &args,
                     )
                     .unwrap();

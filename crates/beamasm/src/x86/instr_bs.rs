@@ -19,7 +19,7 @@ use super::beam_asm::{
     get_x_ref, process, tmp_mem_q,
 };
 use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
-use super::beam_asm_module::BeamModuleAssembler;
+use super::beam_asm_module::{BeamModuleAssembler, arg_label, arg_word};
 pub use super::rt::{
     beam_jit_bs_construct_fail_info, beam_jit_bs_field_size_argument_error,
     beam_jit_bs_get_integer, erts_bs_get_binary_2, erts_bs_get_float_2, erts_bs_get_integer_2,
@@ -28,10 +28,11 @@ pub use super::rt::{
 };
 use crate::common::args::ArgVal;
 use crate::common::bs::{
-    Action, BUILD_SUB_BITSTRING_HEAP_NEED, BsmCommand, ERL_ONHEAP_BITS_LIMIT, ERL_SUB_BITS_SIZE,
-    SMALL_BITS, bsm_init, heap_bits_size, opt_bsm_segments,
+    Action, BUILD_SUB_BITSTRING_HEAP_NEED, ERL_ONHEAP_BITS_LIMIT, ERL_SUB_BITS_SIZE, SMALL_BITS,
+    beam_jit_bsm_init, heap_bits_size, opt_bsm_segments,
 };
-use crate::common::types::TypedArg;
+use crate::common::types::BeamModuleAssemblerCommon;
+use arinsal_term::{Atom, Term, atoms};
 
 // erl_term.h, erl_bits.h, big.h (64-bit, OTP-29.1.1).
 const TAG_IMMED1_SIZE: i64 = 4;
@@ -61,6 +62,11 @@ const FLOAT_SIZE_OBJECT: u64 = 2;
 const BSF_LITTLE: u64 = 2;
 const BSF_SIGNED: u64 = 4;
 const BSF_NATIVE: u64 = 16;
+
+/// `ArgAtom(atom)`.
+fn atom_arg(atom: Atom) -> ArgVal {
+    ArgVal::Immediate(Term::atom(atom).word())
+}
 
 /// `offsetof(ErlSubBits, field)` (erl_bits.h): `thing_word`, `base_flags`, `start`, `end`,
 /// `orig`, one word each.
@@ -117,15 +123,14 @@ impl BeamModuleAssembler {
     // OTP-29.1.1.
     fn emit_bs_get_field_size(
         &mut self,
-        size: TypedArg,
+        size: ArgVal,
         unit: u64,
         fail: Label,
         out: Gp,
         max_size: u64,
     ) -> Result<i32, AsmError> {
         if size.is_immed() {
-            if size.is_small() {
-                let sval = size.small_value();
+            if let Some(sval) = size.small_signed() {
                 let limit = MAX_SMALL
                     .checked_div(unit as i64)
                     .ok_or(AsmError::Operand("bit syntax unit zero"))?;
@@ -141,9 +146,9 @@ impl BeamModuleAssembler {
         }
 
         let mut can_fail = true;
-        self.mov_arg_to_reg(RET, size.val)?;
-        if size.always_small() {
-            let (min, max) = size.clamped_range();
+        self.mov_arg_to_reg(RET, size)?;
+        if self.always_small(size) {
+            let (min, max) = self.get_clamped_range(size);
             can_fail = !(0 <= min && (max >> (SMALL_BITS - ERL_UNIT_BITS)) == 0);
         } else {
             self.asm.emit(|e| e.mov_rr(ARG3D, RETD))?;
@@ -201,13 +206,15 @@ impl BeamModuleAssembler {
     // OTP-29.1.1.
     pub fn emit_i_bs_start_match3(
         &mut self,
-        src: TypedArg,
-        live: u64,
-        fail: u32,
+        src: ArgVal,
+        live: ArgVal,
+        fail: ArgVal,
         dst: ArgVal,
     ) -> Result<(), AsmError> {
+        let live = arg_word(live)?;
+        let fail = arg_label(fail)?;
         let next = self.asm.new_label();
-        self.mov_arg_to_reg(ARG2, src.val)?;
+        self.mov_arg_to_reg(ARG2, src)?;
         if fail != 0 {
             let fail = self.beam_label(fail)?;
             self.emit_is_boxed_source(fail, src, ARG2, Distance::Long)?;
@@ -235,7 +242,7 @@ impl BeamModuleAssembler {
             self.asm.jcc(CondCode::NE, fail)?;
         }
 
-        self.emit_gc_test_preserve(ERL_SUB_BITS_SIZE, live, src.val, ARG2)?;
+        self.emit_gc_test_preserve(ERL_SUB_BITS_SIZE, live, src, ARG2)?;
         self.asm.emit_enter_runtime(Update::HEAP_ONLY_ALLOC)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         // ARG2 was set above.
@@ -255,10 +262,12 @@ impl BeamModuleAssembler {
     pub fn emit_i_bs_match_string(
         &mut self,
         ctx: ArgVal,
-        fail: u32,
-        bits: u64,
+        fail: ArgVal,
+        bits: ArgVal,
         ptr: ArgVal,
     ) -> Result<(), AsmError> {
+        let fail = arg_label(fail)?;
+        let bits = arg_word(bits)?;
         let size = bits;
         let fail = self.beam_label(fail)?;
         self.mov_arg_to_reg(ARG1, ctx)?;
@@ -325,7 +334,7 @@ impl BeamModuleAssembler {
         &mut self,
         fail: Label,
         ctx: ArgVal,
-        sz: TypedArg,
+        sz: ArgVal,
         unit: u64,
         flags: u64,
     ) -> Result<(), AsmError> {
@@ -353,7 +362,7 @@ impl BeamModuleAssembler {
         fail: Label,
         ctx: ArgVal,
         live: u64,
-        sz: TypedArg,
+        sz: ArgVal,
         unit: u64,
         flags: u64,
     ) -> Result<(), AsmError> {
@@ -384,36 +393,42 @@ impl BeamModuleAssembler {
     #[allow(clippy::too_many_arguments)]
     pub fn emit_bs_get_integer2(
         &mut self,
-        fail: u32,
+        fail: ArgVal,
         ctx: ArgVal,
-        live: u64,
-        sz: TypedArg,
-        unit: u64,
-        flags: u64,
+        live: ArgVal,
+        sz: ArgVal,
+        unit: ArgVal,
+        flags: ArgVal,
         dst: ArgVal,
     ) -> Result<(), AsmError> {
+        let unit = arg_word(unit)?;
+        let flags = arg_word(flags)?;
         let mut flags = flags;
         if flags & BSF_NATIVE != 0 {
             flags &= !BSF_NATIVE;
             flags |= BSF_LITTLE;
         }
-        let size = (sz.small_value() as u64).wrapping_mul(unit);
-        if sz.is_small() && (sz.small_value() as u64) < 64 && size < 64 {
+        // `Sz.as<ArgSmall>().getUnsigned()`.
+        let small = sz.small_signed().map(|value| value as u64);
+        let size = small.map_or(0, |value| value.wrapping_mul(unit));
+        if small.is_some_and(|value| value < 64) && size < 64 {
             // A segment of a fixed size supported by bs_match.
             let commands = [
-                BsmCommand::EnsureAtLeast { size, unit: 1 },
-                BsmCommand::Integer {
-                    live: Some(live as u32),
-                    flags,
-                    size,
-                    unit: 1,
-                    dst,
-                },
+                atom_arg(atoms::ENSURE_AT_LEAST),
+                ArgVal::Word(size),
+                ArgVal::Word(1),
+                atom_arg(atoms::INTEGER),
+                live,
+                ArgVal::Word(flags),
+                ArgVal::Word(size),
+                ArgVal::Word(1),
+                dst,
             ];
             self.emit_i_bs_match(fail, ctx, &commands)
         } else {
-            let fail = self.beam_label(fail)?;
-            let max = sz.clamped_range().1;
+            let fail = self.beam_label(arg_label(fail)?)?;
+            let live = arg_word(live)?;
+            let max = self.get_clamped_range(sz).1;
             let potential_gc =
                 max >= SMALL_BITS as i64 || (max as u64).wrapping_mul(unit) >= SMALL_BITS;
             if potential_gc {
@@ -431,11 +446,11 @@ impl BeamModuleAssembler {
     // OTP-29.1.1.
     pub fn emit_bs_test_tail2(
         &mut self,
-        fail: u32,
+        fail: ArgVal,
         ctx: ArgVal,
-        offset: u64,
+        offset: ArgVal,
     ) -> Result<(), AsmError> {
-        self.emit_i_bs_match(fail, ctx, &[BsmCommand::EnsureExactly { size: offset }])
+        self.emit_i_bs_match(fail, ctx, &[atom_arg(atoms::ENSURE_EXACTLY), offset])
     }
 
     /// `bs_set_position Ctx Pos`.
@@ -457,17 +472,20 @@ impl BeamModuleAssembler {
     pub fn emit_i_bs_get_binary_all2(
         &mut self,
         ctx: ArgVal,
-        fail: u32,
-        live: u64,
-        unit: u64,
+        fail: ArgVal,
+        live: ArgVal,
+        unit: ArgVal,
         dst: ArgVal,
     ) -> Result<(), AsmError> {
+        let unit = arg_word(unit)?;
         let commands = [
-            BsmCommand::EnsureAtLeast { size: 0, unit },
-            BsmCommand::GetTail {
-                live: Some(live as u32),
-                dst,
-            },
+            atom_arg(atoms::ENSURE_AT_LEAST),
+            ArgVal::Word(0),
+            ArgVal::Word(unit),
+            atom_arg(atoms::GET_TAIL),
+            live,
+            ArgVal::Word(unit),
+            dst,
         ];
         self.emit_i_bs_match(fail, ctx, &commands)
     }
@@ -478,8 +496,9 @@ impl BeamModuleAssembler {
         &mut self,
         ctx: ArgVal,
         dst: ArgVal,
-        live: u64,
+        live: ArgVal,
     ) -> Result<(), AsmError> {
+        let live = arg_word(live)?;
         self.mov_arg_to_reg(ARG1, ctx)?;
         self.emit_gc_test_preserve(BUILD_SUB_BITSTRING_HEAP_NEED, live, ctx, ARG1)?;
         self.safe_fragment_call_ga(GlobalLabels::BsGetTailShared)?;
@@ -506,10 +525,12 @@ impl BeamModuleAssembler {
     pub fn emit_i_bs_skip_bits2(
         &mut self,
         ctx: ArgVal,
-        bits: TypedArg,
-        fail: u32,
-        unit: u64,
+        bits: ArgVal,
+        fail: ArgVal,
+        unit: ArgVal,
     ) -> Result<(), AsmError> {
+        let fail = arg_label(fail)?;
+        let unit = arg_word(unit)?;
         let fail_label = self.beam_label(fail)?;
         if self.emit_bs_get_field_size(bits, unit, fail_label, RET, 0)? >= 0 {
             self.emit_bs_skip_bits(fail, ctx)?;
@@ -526,7 +547,7 @@ impl BeamModuleAssembler {
         ctx: ArgVal,
         fail: u32,
         live: u64,
-        size: TypedArg,
+        size: ArgVal,
         unit: u64,
         dst: ArgVal,
     ) -> Result<(), AsmError> {
@@ -557,12 +578,15 @@ impl BeamModuleAssembler {
     pub fn emit_i_bs_get_binary2(
         &mut self,
         ctx: ArgVal,
-        fail: u32,
-        live: u64,
-        size: TypedArg,
-        unit: u64,
+        fail: ArgVal,
+        live: ArgVal,
+        size: ArgVal,
+        unit: ArgVal,
         dst: ArgVal,
     ) -> Result<(), AsmError> {
+        let fail = arg_label(fail)?;
+        let live = arg_word(live)?;
+        let unit = arg_word(unit)?;
         self.emit_bs_get_binary(
             BUILD_SUB_BITSTRING_HEAP_NEED,
             ctx,
@@ -581,13 +605,16 @@ impl BeamModuleAssembler {
     pub fn emit_i_bs_get_bin_and_tail(
         &mut self,
         ctx: ArgVal,
-        fail: u32,
-        live: u64,
-        size: TypedArg,
-        unit: u64,
+        fail: ArgVal,
+        live: ArgVal,
+        size: ArgVal,
+        unit: ArgVal,
         dst1: ArgVal,
         dst2: ArgVal,
     ) -> Result<(), AsmError> {
+        let fail = arg_label(fail)?;
+        let live = arg_word(live)?;
+        let unit = arg_word(unit)?;
         self.emit_bs_get_binary(
             2 * BUILD_SUB_BITSTRING_HEAP_NEED,
             ctx,
@@ -608,12 +635,15 @@ impl BeamModuleAssembler {
     pub fn emit_i_bs_get_float2(
         &mut self,
         ctx: ArgVal,
-        fail: u32,
-        live: u64,
-        sz: TypedArg,
-        flags: u64,
+        fail: ArgVal,
+        live: ArgVal,
+        sz: ArgVal,
+        flags: ArgVal,
         dst: ArgVal,
     ) -> Result<(), AsmError> {
+        let fail = arg_label(fail)?;
+        let live = arg_word(live)?;
+        let flags = arg_word(flags)?;
         let fail = self.beam_label(fail)?;
         let unit = flags >> 3;
         self.mov_arg_to_reg(ARG4, ctx)?;
@@ -713,9 +743,10 @@ impl BeamModuleAssembler {
     pub fn emit_i_bs_get_utf8(
         &mut self,
         ctx: ArgVal,
-        fail: u32,
+        fail: ArgVal,
         dst: ArgVal,
     ) -> Result<(), AsmError> {
+        let fail = arg_label(fail)?;
         self.emit_bs_get_utf8(ctx, fail)?;
         self.mov_arg_from_reg(dst, RET)
     }
@@ -723,7 +754,8 @@ impl BeamModuleAssembler {
     /// `i_bs_skip_utf8 Ctx Fail`.
     // Port of erts/emulator/beam/jit/x86/instr_bs.cpp:992-995 (emit_i_bs_skip_utf8),
     // OTP-29.1.1.
-    pub fn emit_i_bs_skip_utf8(&mut self, ctx: ArgVal, fail: u32) -> Result<(), AsmError> {
+    pub fn emit_i_bs_skip_utf8(&mut self, ctx: ArgVal, fail: ArgVal) -> Result<(), AsmError> {
+        let fail = arg_label(fail)?;
         self.emit_bs_get_utf8(ctx, fail)
     }
 
@@ -748,10 +780,12 @@ impl BeamModuleAssembler {
     pub fn emit_i_bs_get_utf16(
         &mut self,
         ctx: ArgVal,
-        fail: u32,
-        flags: u64,
+        fail: ArgVal,
+        flags: ArgVal,
         dst: ArgVal,
     ) -> Result<(), AsmError> {
+        let fail = arg_label(fail)?;
+        let flags = arg_word(flags)?;
         self.emit_bs_get_utf16(ctx, fail, flags)?;
         self.mov_arg_from_reg(dst, RET)
     }
@@ -762,9 +796,11 @@ impl BeamModuleAssembler {
     pub fn emit_i_bs_skip_utf16(
         &mut self,
         ctx: ArgVal,
-        fail: u32,
-        flags: u64,
+        fail: ArgVal,
+        flags: ArgVal,
     ) -> Result<(), AsmError> {
+        let fail = arg_label(fail)?;
+        let flags = arg_word(flags)?;
         self.emit_bs_get_utf16(ctx, fail, flags)
     }
 
@@ -797,10 +833,11 @@ impl BeamModuleAssembler {
     // (emit_i_bs_validate_unicode_retract), OTP-29.1.1.
     pub fn emit_i_bs_validate_unicode_retract(
         &mut self,
-        fail: u32,
+        fail: ArgVal,
         src: ArgVal,
         ms: ArgVal,
     ) -> Result<(), AsmError> {
+        let fail = arg_label(fail)?;
         let fail_label = self.asm.new_label();
         let next = self.asm.new_label();
         self.mov_arg_to_reg(ARG1, src)?;
@@ -1259,11 +1296,11 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/x86/instr_bs.cpp:3108-3112 (emit_i_bs_match), OTP-29.1.1.
     pub fn emit_i_bs_match(
         &mut self,
-        fail: u32,
+        fail: ArgVal,
         ctx: ArgVal,
-        list: &[BsmCommand],
+        list: &[ArgVal],
     ) -> Result<(), AsmError> {
-        self.emit_i_bs_match_test_heap(fail, ctx, 0, 0, list)
+        self.emit_i_bs_match_test_heap(fail, ctx, ArgVal::Word(0), ArgVal::Word(0), list)
     }
 
     /// `i_bs_match_test_heap Fail Ctx Need Live {commands}`: the segments of a binary match,
@@ -1272,13 +1309,17 @@ impl BeamModuleAssembler {
     // OTP-29.1.1.
     pub fn emit_i_bs_match_test_heap(
         &mut self,
-        fail: u32,
+        fail: ArgVal,
         ctx_arg: ArgVal,
-        need: u64,
-        live: u64,
-        list: &[BsmCommand],
+        need: ArgVal,
+        live: ArgVal,
+        list: &[ArgVal],
     ) -> Result<(), AsmError> {
-        let segments = opt_bsm_segments(&bsm_init(list), need, live as u32);
+        let fail = arg_label(fail)?;
+        let need = arg_word(need)?;
+        let live = arg_word(live)?;
+        let segments = beam_jit_bsm_init(list).map_err(AsmError::Operand)?;
+        let segments = opt_bsm_segments(&segments, need, live as u32);
 
         // bin_position must be RCX: only CL can be a variable shift count without BMI2's SHLX.
         let bin_position = ARG4;
@@ -2156,6 +2197,7 @@ mod tests {
             union_bits: type_id::INTEGER,
             min: Some(min),
             max: Some(max),
+            unit: 1,
         };
         [
             ArgType::ANY,
@@ -2262,9 +2304,14 @@ mod tests {
                 for &dst in slots {
                     for live in lives(block) {
                         for ty in types() {
-                            let src = TypedArg::new(src, ty);
                             out.push(Box::new(move |m| {
-                                m.emit_i_bs_start_match3(src, live, fail, dst)
+                                let src = m.typed_arg(src, ty);
+                                m.emit_i_bs_start_match3(
+                                    src,
+                                    ArgVal::Word(live),
+                                    ArgVal::Label(fail),
+                                    dst,
+                                )
                             }));
                         }
                     }
@@ -2321,7 +2368,12 @@ mod tests {
             let mut out: Vec<Emit> = Vec::new();
             for &ctx in slots {
                 out.push(Box::new(move |m| {
-                    m.emit_i_bs_match_string(ctx, fail, bits, ArgVal::BytePtr(0))
+                    m.emit_i_bs_match_string(
+                        ctx,
+                        ArgVal::Label(fail),
+                        ArgVal::Word(bits),
+                        ArgVal::BytePtr(0),
+                    )
                 }));
             }
             out
@@ -2353,7 +2405,9 @@ mod tests {
             for &ctx in slots {
                 for &dst in slots {
                     for live in lives(block) {
-                        out.push(Box::new(move |m| m.emit_bs_get_tail(ctx, dst, live)));
+                        out.push(Box::new(move |m| {
+                            m.emit_bs_get_tail(ctx, dst, ArgVal::Word(live))
+                        }));
                     }
                 }
             }
@@ -2366,9 +2420,14 @@ mod tests {
                 for bits in sizes(block, slots, unit, "eax") {
                     for &ctx in slots {
                         for ty in types() {
-                            let bits = TypedArg::new(bits, ty);
                             out.push(Box::new(move |m| {
-                                m.emit_i_bs_skip_bits2(ctx, bits, fail, unit)
+                                let bits = m.typed_arg(bits, ty);
+                                m.emit_i_bs_skip_bits2(
+                                    ctx,
+                                    bits,
+                                    ArgVal::Label(fail),
+                                    ArgVal::Word(unit),
+                                )
                             }));
                         }
                     }
@@ -2389,9 +2448,16 @@ mod tests {
                         for &dst in slots {
                             for live in lives(block) {
                                 for ty in types() {
-                                    let size = TypedArg::new(size, ty);
                                     out.push(Box::new(move |m| {
-                                        m.emit_i_bs_get_binary2(ctx, fail, live, size, unit, dst)
+                                        let size = m.typed_arg(size, ty);
+                                        m.emit_i_bs_get_binary2(
+                                            ctx,
+                                            ArgVal::Label(fail),
+                                            ArgVal::Word(live),
+                                            size,
+                                            ArgVal::Word(unit),
+                                            dst,
+                                        )
                                     }));
                                 }
                             }
@@ -2411,10 +2477,16 @@ mod tests {
                             for &dst2 in slots {
                                 for live in lives(block) {
                                     for ty in types() {
-                                        let size = TypedArg::new(size, ty);
                                         out.push(Box::new(move |m| {
+                                            let size = m.typed_arg(size, ty);
                                             m.emit_i_bs_get_bin_and_tail(
-                                                ctx, fail, live, size, unit, dst1, dst2,
+                                                ctx,
+                                                ArgVal::Label(fail),
+                                                ArgVal::Word(live),
+                                                size,
+                                                ArgVal::Word(unit),
+                                                dst1,
+                                                dst2,
                                             )
                                         }));
                                     }
@@ -2435,9 +2507,16 @@ mod tests {
                     for &dst in slots {
                         for live in lives(block) {
                             for ty in types() {
-                                let sz = TypedArg::new(sz, ty);
                                 out.push(Box::new(move |m| {
-                                    m.emit_i_bs_get_float2(ctx, fail, live, sz, flags, dst)
+                                    let sz = m.typed_arg(sz, ty);
+                                    m.emit_i_bs_get_float2(
+                                        ctx,
+                                        ArgVal::Label(fail),
+                                        ArgVal::Word(live),
+                                        sz,
+                                        ArgVal::Word(flags),
+                                        dst,
+                                    )
                                 }));
                             }
                         }
@@ -2455,7 +2534,9 @@ mod tests {
             let mut out: Vec<Emit> = Vec::new();
             for &ctx in slots {
                 for &dst in slots {
-                    out.push(Box::new(move |m| m.emit_i_bs_get_utf8(ctx, fail, dst)));
+                    out.push(Box::new(move |m| {
+                        m.emit_i_bs_get_utf8(ctx, ArgVal::Label(fail), dst)
+                    }));
                 }
             }
             out
@@ -2464,7 +2545,9 @@ mod tests {
             let fail = fail_label(block);
             let mut out: Vec<Emit> = Vec::new();
             for &ctx in slots {
-                out.push(Box::new(move |m| m.emit_i_bs_skip_utf8(ctx, fail)));
+                out.push(Box::new(move |m| {
+                    m.emit_i_bs_skip_utf8(ctx, ArgVal::Label(fail))
+                }));
             }
             out
         });
@@ -2482,7 +2565,7 @@ mod tests {
             for &ctx in slots {
                 for &dst in slots {
                     out.push(Box::new(move |m| {
-                        m.emit_i_bs_get_utf16(ctx, fail, flags, dst)
+                        m.emit_i_bs_get_utf16(ctx, ArgVal::Label(fail), ArgVal::Word(flags), dst)
                     }));
                 }
             }
@@ -2493,7 +2576,9 @@ mod tests {
             let flags = utf16_flags(block);
             let mut out: Vec<Emit> = Vec::new();
             for &ctx in slots {
-                out.push(Box::new(move |m| m.emit_i_bs_skip_utf16(ctx, fail, flags)));
+                out.push(Box::new(move |m| {
+                    m.emit_i_bs_skip_utf16(ctx, ArgVal::Label(fail), ArgVal::Word(flags))
+                }));
             }
             out
         });
@@ -2503,7 +2588,7 @@ mod tests {
             for &src in slots {
                 for &ms in slots {
                     out.push(Box::new(move |m| {
-                        m.emit_i_bs_validate_unicode_retract(fail, src, ms)
+                        m.emit_i_bs_validate_unicode_retract(ArgVal::Label(fail), src, ms)
                     }));
                 }
             }
@@ -2540,10 +2625,16 @@ mod tests {
                             for live in lives(block) {
                                 for flags in [0, 2, 4, 6, 16, 20] {
                                     for ty in types() {
-                                        let sz = TypedArg::new(sz, ty);
                                         out.push(Box::new(move |m| {
+                                            let sz = m.typed_arg(sz, ty);
                                             m.emit_bs_get_integer2(
-                                                fail, ctx, live, sz, unit, flags, dst,
+                                                ArgVal::Label(fail),
+                                                ctx,
+                                                ArgVal::Word(live),
+                                                sz,
+                                                ArgVal::Word(unit),
+                                                ArgVal::Word(flags),
+                                                dst,
                                             )
                                         }));
                                     }
@@ -2562,7 +2653,7 @@ mod tests {
     /// `get_tail` one each; `read` and `test_heap` are planned by `beam_jit_opt_bsm_segments`.
     /// Integer flags are not in the dump, so every combination is listed. Returns the lists
     /// and the trailing test_heap's live count, or `None` for a block with an unknown comment.
-    fn match_commands(block: &[String]) -> Option<(Vec<Vec<BsmCommand>>, u64, u64)> {
+    fn match_commands(block: &[String]) -> Option<(Vec<Vec<ArgVal>>, u64, u64)> {
         let mut actions: Vec<(String, Vec<&str>)> = Vec::new();
         const ACTIONS: [&str; 13] = [
             "ensure_at_least ",
@@ -2604,23 +2695,32 @@ mod tests {
             }
         };
         let num = |s: &str| s.parse::<i64>().ok().map(|v| v as u64);
-        let mut commands: Vec<BsmCommand> = Vec::new();
+        // The loader's flattened `{Command, Operands...}` list.
+        let word = ArgVal::Word;
+        let live_arg = |live: Option<u32>| {
+            live.map_or(ArgVal::Immediate(Term::NIL.word()), |l| word(l.into()))
+        };
+        let mut commands: Vec<Vec<ArgVal>> = Vec::new();
         let mut integers: Vec<usize> = Vec::new();
         let mut live: Option<u32> = None;
         let mut test_heaps: Vec<(u64, u64)> = Vec::new();
         for (comment, lines) in &actions {
             let args: Vec<&str> = comment.split(' ').collect();
             let command = match args.as_slice() {
-                ["ensure_at_least", size, unit] => BsmCommand::EnsureAtLeast {
-                    size: num(size)?,
-                    unit: num(unit)?,
-                },
-                ["ensure_exactly", size] => BsmCommand::EnsureExactly { size: num(size)? },
-                ["=:=", size, value] => BsmCommand::Eq {
-                    live,
-                    size: num(size)?,
-                    value: num(value)?,
-                },
+                ["ensure_at_least", size, unit] => vec![
+                    atom_arg(atoms::ENSURE_AT_LEAST),
+                    word(num(size)?),
+                    word(num(unit)?),
+                ],
+                ["ensure_exactly", size] => {
+                    vec![atom_arg(atoms::ENSURE_EXACTLY), word(num(size)?)]
+                }
+                ["=:=", size, value] => vec![
+                    atom_arg(atoms::EQ),
+                    live_arg(live),
+                    word(num(size)?),
+                    word(num(value)?),
+                ],
                 ["test_heap", size] => {
                     let l = gc_live(lines)?;
                     live = Some(l as u32);
@@ -2632,32 +2732,38 @@ mod tests {
                 | ["read", "integer", size]
                 | ["get", "integer", size] => {
                     integers.push(commands.len());
-                    BsmCommand::Integer {
-                        live,
-                        flags: 0,
-                        size: num(size)?,
-                        unit: 1,
-                        dst: store(lines).unwrap_or(ArgVal::X(1023)),
-                    }
+                    vec![
+                        atom_arg(atoms::INTEGER),
+                        live_arg(live),
+                        word(0),
+                        word(num(size)?),
+                        word(1),
+                        store(lines).unwrap_or(ArgVal::X(1023)),
+                    ]
                 }
-                ["extract", "binary", size] | ["get", "binary", size] => BsmCommand::Binary {
-                    live,
-                    flags: 0,
-                    size: num(size)?,
-                    unit: 1,
-                    dst: store(lines)?,
-                },
-                ["get_tail"] => BsmCommand::GetTail {
-                    live,
-                    dst: store(lines)?,
-                },
-                ["skip", size] | ["drop", size] => BsmCommand::Skip { size: num(size)? },
+                ["extract", "binary", size] | ["get", "binary", size] => vec![
+                    atom_arg(atoms::BINARY),
+                    live_arg(live),
+                    word(0),
+                    word(num(size)?),
+                    word(1),
+                    store(lines)?,
+                ],
+                ["get_tail"] => vec![
+                    atom_arg(atoms::GET_TAIL),
+                    live_arg(live),
+                    word(1),
+                    store(lines)?,
+                ],
+                ["skip", size] | ["drop", size] => {
+                    vec![atom_arg(atoms::SKIP), word(num(size)?)]
+                }
                 _ => return None,
             };
             commands.push(command);
         }
         // Need: the test_heap total minus what the commands themselves need.
-        let planned = opt_bsm_segments(&bsm_init(&commands), 0, 0);
+        let planned = opt_bsm_segments(&beam_jit_bsm_init(&commands.concat()).ok()?, 0, 0);
         let own: u64 = planned
             .iter()
             .filter(|s| s.action == Action::TestHeap)
@@ -2673,11 +2779,10 @@ mod tests {
             let mut list = commands.clone();
             for (k, &index) in integers.iter().enumerate() {
                 let flags = flag_sets[(combo / flag_sets.len().pow(k.min(3) as u32)) % 4];
-                if let BsmCommand::Integer { flags: f, .. } = &mut list[index] {
-                    *f = flags;
-                }
+                // The flags operand of `{integer, Live, Flags, ...}`.
+                list[index][2] = word(flags);
             }
-            lists.push(list);
+            lists.push(list.concat());
         }
         Some((lists, need, trailing_live))
     }
@@ -2693,7 +2798,13 @@ mod tests {
                 for list in &lists {
                     let list = list.clone();
                     out.push(Box::new(move |m| {
-                        m.emit_i_bs_match_test_heap(fail, ctx, need, live, &list)
+                        m.emit_i_bs_match_test_heap(
+                            ArgVal::Label(fail),
+                            ctx,
+                            ArgVal::Word(need),
+                            ArgVal::Word(live),
+                            &list,
+                        )
                     }));
                 }
             }
@@ -2722,23 +2833,38 @@ mod tests {
         };
         let (ctx, dst) = (ArgVal::X(1), ArgVal::Y(2));
         assert_eq!(
-            bytes(&|m| m.emit_bs_test_tail2(1, ctx, 16)),
-            bytes(&|m| m.emit_i_bs_match(1, ctx, &[BsmCommand::EnsureExactly { size: 16 }]))
+            bytes(&|m| m.emit_bs_test_tail2(ArgVal::Label(1), ctx, ArgVal::Word(16))),
+            bytes(&|m| m.emit_i_bs_match(
+                ArgVal::Label(1),
+                ctx,
+                &[atom_arg(atoms::ENSURE_EXACTLY), ArgVal::Word(16)]
+            ))
         );
         assert_eq!(
-            bytes(&|m| m.emit_i_bs_get_binary_all2(ctx, 1, 3, 8, dst)),
+            bytes(&|m| m.emit_i_bs_get_binary_all2(
+                ctx,
+                ArgVal::Label(1),
+                ArgVal::Word(3),
+                ArgVal::Word(8),
+                dst
+            )),
             bytes(&|m| m.emit_i_bs_match(
-                1,
+                ArgVal::Label(1),
                 ctx,
                 &[
-                    BsmCommand::EnsureAtLeast { size: 0, unit: 8 },
-                    BsmCommand::GetTail { live: Some(3), dst },
+                    atom_arg(atoms::ENSURE_AT_LEAST),
+                    ArgVal::Word(0),
+                    ArgVal::Word(8),
+                    atom_arg(atoms::GET_TAIL),
+                    ArgVal::Word(3),
+                    ArgVal::Word(8),
+                    dst,
                 ]
             ))
         );
         // skip_utf16 is get_utf16 without the store.
-        let get = bytes(&|m| m.emit_i_bs_get_utf16(ctx, 1, 2, dst));
-        let skip = bytes(&|m| m.emit_i_bs_skip_utf16(ctx, 1, 2));
+        let get = bytes(&|m| m.emit_i_bs_get_utf16(ctx, ArgVal::Label(1), ArgVal::Word(2), dst));
+        let skip = bytes(&|m| m.emit_i_bs_skip_utf16(ctx, ArgVal::Label(1), ArgVal::Word(2)));
         assert!(get.starts_with(&skip) && get.len() > skip.len());
     }
 

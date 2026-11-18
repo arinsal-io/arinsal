@@ -2223,6 +2223,7 @@ fn operand_type(value: Option<&SpecificOperand>, beam: &BeamFile) -> ArgType {
                 union_bits: entry.union_bits,
                 min: entry.lower_bound,
                 max: entry.upper_bound,
+                unit: entry.unit,
             }),
         Some(SpecificOperand::Literal(index)) => {
             beam.literals
@@ -2231,6 +2232,7 @@ fn operand_type(value: Option<&SpecificOperand>, beam: &BeamFile) -> ArgType {
                     union_bits: literal_type_union(&literal.0),
                     min: None,
                     max: None,
+                    unit: 1,
                 })
         }
         _ => ArgType::ANY,

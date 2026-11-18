@@ -20,7 +20,7 @@ use super::beam_asm_module::{BeamModuleAssembler, arg_label, arg_word};
 pub use super::rt::{add_stacktrace, erts_sanitize_freason};
 use crate::common::args::ArgVal;
 use crate::common::args::{Relation, memory_relation};
-use crate::common::types::{TypedArg, type_id};
+use crate::common::types::{BeamModuleAssemblerCommon, type_id};
 
 const NIL: i64 = 0x3b;
 const TAG_IMMED1_MASK: i64 = 0x0f;
@@ -65,8 +65,8 @@ impl BeamModuleAssembler {
         const NIL: u64 = 0x3b;
         let ys = args
             .iter()
-            .map(|arg| match arg {
-                ArgVal::Y(y) => Ok(*y),
+            .map(|arg| match arg.reg() {
+                Some(y) if arg.is_y_register() => Ok(y),
                 _ => Err(AsmError::Operand("init_yregs takes Y registers")),
             })
             .collect::<Result<Vec<u32>, AsmError>>()?;
@@ -341,8 +341,8 @@ impl BeamModuleAssembler {
     /// Loads a tuple source into ARG2 and removes its boxed pointer tag.
     // Port of erts/emulator/beam/jit/x86/instr_common.cpp:450-454 (emit_load_tuple_ptr),
     // OTP-29.1.1.
-    pub fn emit_load_tuple_ptr(&mut self, term: TypedArg) -> Result<(), AsmError> {
-        self.mov_arg_to_reg(ARG2, term.val)?;
+    pub fn emit_load_tuple_ptr(&mut self, term: ArgVal) -> Result<(), AsmError> {
+        self.mov_arg_to_reg(ARG2, term)?;
         self.asm.emit_ptr_val(ARG2, ARG2);
         Ok(())
     }
@@ -352,7 +352,7 @@ impl BeamModuleAssembler {
     // (emit_i_get_tuple_element), OTP-29.1.1.
     pub fn emit_i_get_tuple_element(
         &mut self,
-        _src: TypedArg,
+        _src: ArgVal,
         element: ArgVal,
         dst: ArgVal,
     ) -> Result<(), AsmError> {
@@ -371,7 +371,7 @@ impl BeamModuleAssembler {
     // (emit_get_tuple_element_swap), OTP-29.1.1.
     pub fn emit_get_tuple_element_swap(
         &mut self,
-        _src: TypedArg,
+        _src: ArgVal,
         element: ArgVal,
         dst: ArgVal,
         other_dst: ArgVal,
@@ -392,7 +392,7 @@ impl BeamModuleAssembler {
     // (emit_get_two_tuple_elements), OTP-29.1.1.
     pub fn emit_get_two_tuple_elements(
         &mut self,
-        _src: TypedArg,
+        _src: ArgVal,
         element: ArgVal,
         dst1: ArgVal,
         dst2: ArgVal,
@@ -559,11 +559,11 @@ impl BeamModuleAssembler {
     pub(crate) fn emit_is_boxed_source(
         &mut self,
         fail: arinsal_x64::buf::Label,
-        source: TypedArg,
+        source: ArgVal,
         reg: arinsal_x64::enc::Gp,
         distance: Distance,
     ) -> Result<(), AsmError> {
-        if source.always_one_of(type_id::ALWAYS_BOXED) {
+        if self.always_one_of(source, type_id::ALWAYS_BOXED) {
             Ok(())
         } else {
             self.preserve_cache(&[], &[], |m| m.asm.emit_is_boxed(fail, reg, distance))
@@ -593,12 +593,12 @@ impl BeamModuleAssembler {
 
     /// Tests whether Src is an atom.
     // Port of erts/emulator/beam/jit/x86/instr_common.cpp:1144-1161 (emit_is_atom), OTP-29.1.1.
-    pub fn emit_is_atom(&mut self, fail: ArgVal, src: TypedArg) -> Result<(), AsmError> {
+    pub fn emit_is_atom(&mut self, fail: ArgVal, src: ArgVal) -> Result<(), AsmError> {
         let fail = self
             .resolve_beam_label(arg_label(fail)?)
             .ok_or(AsmError::Operand("atom test to an unknown label"))?;
-        self.mov_arg_to_reg(RET, src.val)?;
-        if src.always_one_of(type_id::ATOM | type_id::ALWAYS_BOXED) {
+        self.mov_arg_to_reg(RET, src)?;
+        if self.always_one_of(src, type_id::ATOM | type_id::ALWAYS_BOXED) {
             self.preserve_cache(&[], &[], |m| {
                 m.asm.emit_is_not_boxed(fail, RET, Distance::Long)
             })
@@ -614,11 +614,11 @@ impl BeamModuleAssembler {
     /// Tests whether Src is the `true` or `false` atom.
     // Port of erts/emulator/beam/jit/x86/instr_common.cpp:1163-1175 (emit_is_boolean),
     // OTP-29.1.1.
-    pub fn emit_is_boolean(&mut self, fail: ArgVal, src: TypedArg) -> Result<(), AsmError> {
+    pub fn emit_is_boolean(&mut self, fail: ArgVal, src: ArgVal) -> Result<(), AsmError> {
         let fail = self
             .resolve_beam_label(arg_label(fail)?)
             .ok_or(AsmError::Operand("boolean test to an unknown label"))?;
-        self.mov_arg_to_reg(ARG1, src.val)?;
+        self.mov_arg_to_reg(ARG1, src)?;
         self.asm
             .emit(|e| e.and_ri(ARG1, !(AM_TRUE & !TAG_IMMED2_MASK)))?;
         self.asm.emit(|e| e.cmp_ri(ARG1, AM_FALSE))?;
@@ -628,13 +628,13 @@ impl BeamModuleAssembler {
     /// Tests whether Src is any bitstring.
     // Port of erts/emulator/beam/jit/x86/instr_common.cpp:1177-1198
     // (emit_is_bitstring), OTP-29.1.1.
-    pub fn emit_is_bitstring(&mut self, fail: ArgVal, src: TypedArg) -> Result<(), AsmError> {
+    pub fn emit_is_bitstring(&mut self, fail: ArgVal, src: ArgVal) -> Result<(), AsmError> {
         let fail = self
             .resolve_beam_label(arg_label(fail)?)
             .ok_or(AsmError::Operand("bitstring test to an unknown label"))?;
-        self.mov_arg_to_reg(ARG1, src.val)?;
+        self.mov_arg_to_reg(ARG1, src)?;
         self.emit_is_boxed_source(fail, src, ARG1, Distance::Long)?;
-        if src.masked_types(type_id::MAYBE_BOXED) == type_id::BITSTRING {
+        if self.masked_types(src, type_id::MAYBE_BOXED) == type_id::BITSTRING {
             return Ok(());
         }
         let boxed_ptr = self.asm.emit_ptr_val(ARG1, ARG1);
@@ -650,12 +650,12 @@ impl BeamModuleAssembler {
     /// Tests whether Src is a byte-aligned binary.
     // Port of erts/emulator/beam/jit/x86/instr_common.cpp:1200-1261 (emit_is_binary),
     // OTP-29.1.1.
-    pub fn emit_is_binary(&mut self, fail: ArgVal, src: TypedArg) -> Result<(), AsmError> {
+    pub fn emit_is_binary(&mut self, fail: ArgVal, src: ArgVal) -> Result<(), AsmError> {
         let fail = self
             .resolve_beam_label(arg_label(fail)?)
             .ok_or(AsmError::Operand("binary test to an unknown label"))?;
         let not_sub_bits = self.asm.new_label();
-        self.mov_arg_to_reg(ARG1, src.val)?;
+        self.mov_arg_to_reg(ARG1, src)?;
         self.emit_is_boxed_source(fail, src, ARG1, Distance::Long)?;
         let boxed_ptr = self.asm.emit_ptr_val(ARG1, ARG1);
 
@@ -674,7 +674,7 @@ impl BeamModuleAssembler {
         self.asm.bind(not_sub_bits)?;
 
         self.preserve_cache(&[RET], &[], |m| m.asm.emit(|e| e.shl_ri(RETD, 32 - 3)))?;
-        if src.masked_types(type_id::MAYBE_BOXED) != type_id::BITSTRING {
+        if self.masked_types(src, type_id::MAYBE_BOXED) != type_id::BITSTRING {
             self.preserve_cache(&[ARG2], &[], |m| {
                 m.asm.emit(|e| e.and_ri(ARG2D, BITSTRING_TAG_MASK))?;
                 m.asm.emit(|e| e.or_rr(ARG2D, RETD))?;
@@ -686,13 +686,13 @@ impl BeamModuleAssembler {
 
     /// Tests whether Src is a float.
     // Port of erts/emulator/beam/jit/x86/instr_common.cpp:1263-1278 (emit_is_float), OTP-29.1.1.
-    pub fn emit_is_float(&mut self, fail: ArgVal, src: TypedArg) -> Result<(), AsmError> {
+    pub fn emit_is_float(&mut self, fail: ArgVal, src: ArgVal) -> Result<(), AsmError> {
         let fail = self
             .resolve_beam_label(arg_label(fail)?)
             .ok_or(AsmError::Operand("float test to an unknown label"))?;
-        self.mov_arg_to_reg(ARG1, src.val)?;
+        self.mov_arg_to_reg(ARG1, src)?;
         self.emit_is_boxed_source(fail, src, ARG1, Distance::Long)?;
-        if src.masked_types(type_id::MAYBE_BOXED) == type_id::FLOAT {
+        if self.masked_types(src, type_id::MAYBE_BOXED) == type_id::FLOAT {
             return Ok(());
         }
         let boxed_ptr = self.asm.emit_ptr_val(ARG1, ARG1);
@@ -706,13 +706,13 @@ impl BeamModuleAssembler {
     /// Tests whether Src is a function.
     // Port of erts/emulator/beam/jit/x86/instr_common.cpp:1280-1296 (emit_is_function),
     // OTP-29.1.1.
-    pub fn emit_is_function(&mut self, fail: ArgVal, src: TypedArg) -> Result<(), AsmError> {
+    pub fn emit_is_function(&mut self, fail: ArgVal, src: ArgVal) -> Result<(), AsmError> {
         let fail = self
             .resolve_beam_label(arg_label(fail)?)
             .ok_or(AsmError::Operand("function test to an unknown label"))?;
-        self.mov_arg_to_reg(RET, src.val)?;
+        self.mov_arg_to_reg(RET, src)?;
         self.emit_is_boxed_source(fail, src, RET, Distance::Long)?;
-        if src.masked_types(type_id::MAYBE_BOXED) == type_id::FUN {
+        if self.masked_types(src, type_id::MAYBE_BOXED) == type_id::FUN {
             return Ok(());
         }
         let boxed_ptr = self.asm.emit_ptr_val(RET, RET);
@@ -726,12 +726,12 @@ impl BeamModuleAssembler {
     /// Tests whether Src is a small or boxed integer.
     // Port of erts/emulator/beam/jit/x86/instr_common.cpp:1342-1396 (emit_is_integer),
     // OTP-29.1.1.
-    pub fn emit_is_integer(&mut self, fail: ArgVal, src: TypedArg) -> Result<(), AsmError> {
+    pub fn emit_is_integer(&mut self, fail: ArgVal, src: ArgVal) -> Result<(), AsmError> {
         let fail = self
             .resolve_beam_label(arg_label(fail)?)
             .ok_or(AsmError::Operand("integer test to an unknown label"))?;
-        if src.always_immediate() {
-            self.mov_arg_to_reg(RET, src.val)?;
+        if self.always_immediate(src) {
+            self.mov_arg_to_reg(RET, src)?;
             return self.preserve_cache(&[RET], &[], |m| {
                 m.asm.emit(|e| e.and_ri(RETB, TAG_IMMED1_MASK))?;
                 m.asm.emit(|e| e.cmp_ri(RETB, TAG_IMMED1_SMALL))?;
@@ -740,8 +740,8 @@ impl BeamModuleAssembler {
         }
 
         let next = self.asm.new_label();
-        self.mov_arg_to_reg(ARG1, src.val)?;
-        if src.always_one_of(type_id::INTEGER | type_id::ALWAYS_BOXED) {
+        self.mov_arg_to_reg(ARG1, src)?;
+        if self.always_one_of(src, type_id::INTEGER | type_id::ALWAYS_BOXED) {
             self.emit_is_boxed_source(next, src, ARG1, Distance::Long)?;
         } else {
             self.preserve_cache(&[RET], &[], |m| {
@@ -752,7 +752,7 @@ impl BeamModuleAssembler {
             })?;
             self.emit_is_boxed_source(fail, src, RET, Distance::Long)?;
         }
-        if src.masked_types(type_id::MAYBE_BOXED) != type_id::INTEGER {
+        if self.masked_types(src, type_id::MAYBE_BOXED) != type_id::INTEGER {
             let boxed_ptr = self.asm.emit_ptr_val(ARG1, ARG1);
             self.preserve_cache(&[RET], &[], |m| {
                 m.asm
@@ -767,12 +767,12 @@ impl BeamModuleAssembler {
 
     /// Tests whether Src is nil or a cons cell.
     // Port of erts/emulator/beam/jit/x86/instr_common.cpp:1398-1410 (emit_is_list), OTP-29.1.1.
-    pub fn emit_is_list(&mut self, fail: ArgVal, src: TypedArg) -> Result<(), AsmError> {
+    pub fn emit_is_list(&mut self, fail: ArgVal, src: ArgVal) -> Result<(), AsmError> {
         let fail = self
             .resolve_beam_label(arg_label(fail)?)
             .ok_or(AsmError::Operand("list test to an unknown label"))?;
         let next = self.asm.new_label();
-        self.mov_arg_to_reg(RET, src.val)?;
+        self.mov_arg_to_reg(RET, src)?;
         self.preserve_cache(&[], &[], |m| {
             m.asm.emit(|e| e.cmp_ri(RET, NIL))?;
             m.asm.short_jcc(CondCode::E, next)
@@ -783,13 +783,13 @@ impl BeamModuleAssembler {
 
     /// Tests whether Src is a map.
     // Port of erts/emulator/beam/jit/x86/instr_common.cpp:1412-1433 (emit_is_map), OTP-29.1.1.
-    pub fn emit_is_map(&mut self, fail: ArgVal, src: TypedArg) -> Result<(), AsmError> {
+    pub fn emit_is_map(&mut self, fail: ArgVal, src: ArgVal) -> Result<(), AsmError> {
         let fail = self
             .resolve_beam_label(arg_label(fail)?)
             .ok_or(AsmError::Operand("map test to an unknown label"))?;
-        self.mov_arg_to_reg(ARG1, src.val)?;
+        self.mov_arg_to_reg(ARG1, src)?;
         self.emit_is_boxed_source(fail, src, ARG1, Distance::Long)?;
-        if src.masked_types(type_id::MAYBE_BOXED) == type_id::MAP {
+        if self.masked_types(src, type_id::MAYBE_BOXED) == type_id::MAP {
             return Ok(());
         }
         let boxed_ptr = self.asm.emit_ptr_val(RET, ARG1);
@@ -818,13 +818,13 @@ impl BeamModuleAssembler {
     /// Tests whether Src is an integer or float.
     // Port of erts/emulator/beam/jit/x86/instr_common.cpp:1443-1479 (emit_is_number),
     // OTP-29.1.1.
-    pub fn emit_is_number(&mut self, fail: ArgVal, src: TypedArg) -> Result<(), AsmError> {
+    pub fn emit_is_number(&mut self, fail: ArgVal, src: ArgVal) -> Result<(), AsmError> {
         let fail = self
             .resolve_beam_label(arg_label(fail)?)
             .ok_or(AsmError::Operand("number test to an unknown label"))?;
         let next = self.asm.new_label();
-        self.mov_arg_to_reg(ARG1, src.val)?;
-        if src.always_one_of(type_id::INTEGER | type_id::ALWAYS_BOXED) {
+        self.mov_arg_to_reg(ARG1, src)?;
+        if self.always_one_of(src, type_id::INTEGER | type_id::ALWAYS_BOXED) {
             self.emit_is_boxed_source(next, src, ARG1, Distance::Long)?;
         } else {
             self.preserve_cache(&[RET], &[], |m| {
@@ -835,7 +835,7 @@ impl BeamModuleAssembler {
             })?;
             self.emit_is_boxed_source(fail, src, RET, Distance::Long)?;
         }
-        if src.masked_types(type_id::MAYBE_BOXED) != type_id::NUMBER {
+        if self.masked_types(src, type_id::MAYBE_BOXED) != type_id::NUMBER {
             let boxed_ptr = self.asm.emit_ptr_val(ARG1, ARG1);
             self.preserve_cache(&[ARG1], &[], |m| {
                 m.asm
@@ -853,13 +853,13 @@ impl BeamModuleAssembler {
 
     /// Tests whether Src is a local or external pid.
     // Port of erts/emulator/beam/jit/x86/instr_common.cpp:1481-1519 (emit_is_pid), OTP-29.1.1.
-    pub fn emit_is_pid(&mut self, fail: ArgVal, src: TypedArg) -> Result<(), AsmError> {
+    pub fn emit_is_pid(&mut self, fail: ArgVal, src: ArgVal) -> Result<(), AsmError> {
         let fail = self
             .resolve_beam_label(arg_label(fail)?)
             .ok_or(AsmError::Operand("pid test to an unknown label"))?;
         let next = self.asm.new_label();
-        self.mov_arg_to_reg(ARG1, src.val)?;
-        if src.always_one_of(type_id::PID | type_id::ALWAYS_BOXED) {
+        self.mov_arg_to_reg(ARG1, src)?;
+        if self.always_one_of(src, type_id::PID | type_id::ALWAYS_BOXED) {
             self.emit_is_boxed_source(next, src, ARG1, Distance::Long)?;
         } else {
             self.preserve_cache(&[RET], &[], |m| {
@@ -870,7 +870,7 @@ impl BeamModuleAssembler {
             })?;
             self.emit_is_boxed_source(fail, src, RET, Distance::Long)?;
         }
-        if src.masked_types(type_id::MAYBE_BOXED) != type_id::PID {
+        if self.masked_types(src, type_id::MAYBE_BOXED) != type_id::PID {
             let boxed_ptr = self.asm.emit_ptr_val(ARG1, ARG1);
             self.preserve_cache(&[RET], &[], |m| {
                 m.asm
@@ -885,13 +885,13 @@ impl BeamModuleAssembler {
 
     /// Tests whether Src is an external port.
     // Port of erts/emulator/beam/jit/x86/instr_common.cpp:1521-1551 (emit_is_port), OTP-29.1.1.
-    pub fn emit_is_port(&mut self, fail: ArgVal, src: TypedArg) -> Result<(), AsmError> {
+    pub fn emit_is_port(&mut self, fail: ArgVal, src: ArgVal) -> Result<(), AsmError> {
         let fail = self
             .resolve_beam_label(arg_label(fail)?)
             .ok_or(AsmError::Operand("port test to an unknown label"))?;
         let next = self.asm.new_label();
-        self.mov_arg_to_reg(ARG1, src.val)?;
-        if src.always_one_of(type_id::PORT | type_id::ALWAYS_BOXED) {
+        self.mov_arg_to_reg(ARG1, src)?;
+        if self.always_one_of(src, type_id::PORT | type_id::ALWAYS_BOXED) {
             self.emit_is_boxed_source(next, src, ARG1, Distance::Long)?;
         } else {
             self.preserve_cache(&[RET], &[], |m| {
@@ -902,7 +902,7 @@ impl BeamModuleAssembler {
             })?;
             self.emit_is_boxed_source(fail, src, RET, Distance::Long)?;
         }
-        if src.masked_types(type_id::MAYBE_BOXED) != type_id::PORT {
+        if self.masked_types(src, type_id::MAYBE_BOXED) != type_id::PORT {
             let boxed_ptr = self.asm.emit_ptr_val(ARG1, ARG1);
             self.preserve_cache(&[RET], &[], |m| {
                 m.asm
@@ -918,13 +918,13 @@ impl BeamModuleAssembler {
     /// Tests whether Src is a local or external reference.
     // Port of erts/emulator/beam/jit/x86/instr_common.cpp:1553-1578
     // (emit_is_reference), OTP-29.1.1.
-    pub fn emit_is_reference(&mut self, fail: ArgVal, src: TypedArg) -> Result<(), AsmError> {
+    pub fn emit_is_reference(&mut self, fail: ArgVal, src: ArgVal) -> Result<(), AsmError> {
         let fail = self
             .resolve_beam_label(arg_label(fail)?)
             .ok_or(AsmError::Operand("reference test to an unknown label"))?;
-        self.mov_arg_to_reg(ARG1, src.val)?;
+        self.mov_arg_to_reg(ARG1, src)?;
         self.emit_is_boxed_source(fail, src, ARG1, Distance::Long)?;
-        if src.masked_types(type_id::MAYBE_BOXED) != type_id::REFERENCE {
+        if self.masked_types(src, type_id::MAYBE_BOXED) != type_id::REFERENCE {
             let next = self.asm.new_label();
             let boxed_ptr = self.asm.emit_ptr_val(ARG1, ARG1);
             self.preserve_cache(&[RET], &[], |m| {
@@ -947,7 +947,7 @@ impl BeamModuleAssembler {
     pub fn emit_i_is_tagged_tuple(
         &mut self,
         fail: ArgVal,
-        src: TypedArg,
+        src: ArgVal,
         arity_word: ArgVal,
         tag_word: ArgVal,
     ) -> Result<(), AsmError> {
@@ -958,7 +958,7 @@ impl BeamModuleAssembler {
             .map_err(|_| AsmError::Operand("tuple arity word"))?;
         let tag_word =
             i64::try_from(arg_word(tag_word)?).map_err(|_| AsmError::Operand("tuple tag word"))?;
-        self.mov_arg_to_reg(ARG2, src.val)?;
+        self.mov_arg_to_reg(ARG2, src)?;
         self.emit_is_boxed_source(fail, src, ARG2, Distance::Long)?;
         let boxed_ptr = self.asm.emit_ptr_val(ARG2, ARG2);
         self.preserve_cache(&[], &[], |m| {
@@ -978,7 +978,7 @@ impl BeamModuleAssembler {
         &mut self,
         not_tuple: ArgVal,
         not_record: ArgVal,
-        src: TypedArg,
+        src: ArgVal,
         arity_word: ArgVal,
         tag_word: ArgVal,
     ) -> Result<(), AsmError> {
@@ -992,7 +992,7 @@ impl BeamModuleAssembler {
             .map_err(|_| AsmError::Operand("tuple arity word"))?;
         let tag_word =
             i64::try_from(arg_word(tag_word)?).map_err(|_| AsmError::Operand("tuple tag word"))?;
-        self.mov_arg_to_reg(ARG2, src.val)?;
+        self.mov_arg_to_reg(ARG2, src)?;
         self.emit_is_boxed_source(not_tuple, src, ARG2, Distance::Long)?;
         let boxed_ptr = self.asm.emit_ptr_val(ARG2, ARG2);
         self.asm
@@ -1009,12 +1009,12 @@ impl BeamModuleAssembler {
     /// Tests tuple boxedness and leaves its untagged pointer in ARG2.
     // Port of erts/emulator/beam/jit/x86/instr_common.cpp:1625-1653 (emit_i_is_tuple),
     // OTP-29.1.1.
-    pub fn emit_i_is_tuple(&mut self, fail: ArgVal, src: TypedArg) -> Result<(), AsmError> {
+    pub fn emit_i_is_tuple(&mut self, fail: ArgVal, src: ArgVal) -> Result<(), AsmError> {
         let fail = self
             .resolve_beam_label(arg_label(fail)?)
             .ok_or(AsmError::Operand("tuple test to an unknown label"))?;
-        self.mov_arg_to_reg(ARG2, src.val)?;
-        if src.masked_types(type_id::MAYBE_BOXED) == type_id::TUPLE {
+        self.mov_arg_to_reg(ARG2, src)?;
+        if self.masked_types(src, type_id::MAYBE_BOXED) == type_id::TUPLE {
             self.asm.emit_ptr_val(ARG2, ARG2);
             self.preserve_cache(&[], &[], |m| {
                 m.asm
@@ -1037,7 +1037,7 @@ impl BeamModuleAssembler {
     pub fn emit_i_is_tuple_of_arity(
         &mut self,
         fail: ArgVal,
-        src: TypedArg,
+        src: ArgVal,
         arity_word: ArgVal,
     ) -> Result<(), AsmError> {
         let fail = self
@@ -1045,7 +1045,7 @@ impl BeamModuleAssembler {
             .ok_or(AsmError::Operand("tuple arity test to an unknown label"))?;
         let arity_word = i64::try_from(arg_word(arity_word)?)
             .map_err(|_| AsmError::Operand("tuple arity word"))?;
-        self.mov_arg_to_reg(ARG2, src.val)?;
+        self.mov_arg_to_reg(ARG2, src)?;
         self.emit_is_boxed_source(fail, src, ARG2, Distance::Long)?;
         let boxed_ptr = self.asm.emit_ptr_val(ARG2, ARG2);
         self.preserve_cache(&[], &[], |m| {
@@ -1062,7 +1062,7 @@ impl BeamModuleAssembler {
         &mut self,
         not_tuple: ArgVal,
         bad_arity: ArgVal,
-        src: TypedArg,
+        src: ArgVal,
         arity_word: ArgVal,
     ) -> Result<(), AsmError> {
         let not_tuple = self
@@ -1073,9 +1073,9 @@ impl BeamModuleAssembler {
             .ok_or(AsmError::Operand("tuple arity test to an unknown label"))?;
         let arity_word = i64::try_from(arg_word(arity_word)?)
             .map_err(|_| AsmError::Operand("tuple arity word"))?;
-        self.mov_arg_to_reg(ARG2, src.val)?;
+        self.mov_arg_to_reg(ARG2, src)?;
         let boxed_ptr = self.asm.emit_ptr_val(ARG2, ARG2);
-        if src.masked_types(type_id::MAYBE_BOXED) == type_id::TUPLE {
+        if self.masked_types(src, type_id::MAYBE_BOXED) == type_id::TUPLE {
             self.asm.emit_is_boxed(not_tuple, ARG2, Distance::Long)?;
             self.preserve_cache(&[], &[], |m| {
                 m.asm
@@ -1101,7 +1101,7 @@ impl BeamModuleAssembler {
     pub fn emit_i_test_arity(
         &mut self,
         fail: ArgVal,
-        src: TypedArg,
+        src: ArgVal,
         arity_word: ArgVal,
     ) -> Result<(), AsmError> {
         let fail = self
@@ -1109,7 +1109,7 @@ impl BeamModuleAssembler {
             .ok_or(AsmError::Operand("tuple arity test to an unknown label"))?;
         let arity_word = i64::try_from(arg_word(arity_word)?)
             .map_err(|_| AsmError::Operand("tuple arity word"))?;
-        self.mov_arg_to_reg(ARG2, src.val)?;
+        self.mov_arg_to_reg(ARG2, src)?;
         let boxed_ptr = self.asm.emit_ptr_val(ARG2, ARG2);
         self.preserve_cache(&[], &[], |m| {
             m.asm
@@ -1214,7 +1214,7 @@ impl BeamModuleAssembler {
         self.asm.short_jcc(CondCode::BE, after_gc_check)?;
         let garbage_collect = self.ga_get(GlobalLabels::GarbageCollect)?;
         // The preserved term need not be stashed when it is currently live.
-        if !matches!(preserve, ArgVal::X(x) if u64::from(x) >= live) {
+        if !(preserve.is_x_register() && preserve.reg().is_some_and(|x| u64::from(x) >= live)) {
             self.asm.mov_imm(ARG4, live)?;
             self.asm.fragment_call_abs(garbage_collect)?;
             self.mov_arg_to_reg(preserve_reg, preserve)?;
@@ -1306,6 +1306,7 @@ impl BeamModuleAssembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::types::ArgType;
     use crate::x86::beam_asm::register::TMP1;
     use crate::x86::jdump::{beam_register, erts_dump, gnu_as, op_blocks};
     use arinsal_x64::buf::Section;
@@ -1861,7 +1862,7 @@ mod tests {
 
     fn assert_typed_source_op_matches(
         op: &str,
-        emit: impl Fn(&mut BeamModuleAssembler, &[String], u32, TypedArg) -> Result<(), AsmError>,
+        emit: impl Fn(&mut BeamModuleAssembler, &[String], u32, ArgVal) -> Result<(), AsmError>,
     ) {
         let Some(blocks) = dump_blocks(op) else {
             eprintln!("skipping: `erl +JDdump true` unavailable");
@@ -1872,15 +1873,14 @@ mod tests {
                 return false;
             };
             TYPE_VARIANTS.iter().copied().any(|union_bits| {
-                let src = TypedArg::new(
-                    src,
-                    crate::common::types::ArgType {
-                        union_bits,
-                        min: None,
-                        max: None,
-                    },
-                );
-                assert_block_matches(block, |m| emit(m, block, 1, src))
+                let ty = ArgType {
+                    union_bits,
+                    ..ArgType::ANY
+                };
+                assert_block_matches(block, |m| {
+                    let src = m.typed_arg(src, ty);
+                    emit(m, block, 1, src)
+                })
             })
         });
         assert!(matched, "no byte-identical erts dump block for {op}");
@@ -1888,7 +1888,7 @@ mod tests {
 
     fn assert_typed_two_label_op_matches(
         op: &str,
-        emit: impl Fn(&mut BeamModuleAssembler, u32, u32, TypedArg, &[u64]) -> Result<(), AsmError>,
+        emit: impl Fn(&mut BeamModuleAssembler, u32, u32, ArgVal, &[u64]) -> Result<(), AsmError>,
     ) {
         let Some(blocks) = dump_blocks(op) else {
             eprintln!("skipping: `erl +JDdump true` unavailable");
@@ -1900,18 +1900,15 @@ mod tests {
             };
             let immediates = cmp_immediates(block);
             TYPE_VARIANTS.iter().copied().any(|union_bits| {
-                let src = TypedArg::new(
-                    src,
-                    crate::common::types::ArgType {
-                        union_bits,
-                        min: None,
-                        max: None,
-                    },
-                );
+                let ty = ArgType {
+                    union_bits,
+                    ..ArgType::ANY
+                };
                 assert_block_matches_with_labels(block, |m, labels| {
                     if labels.len() != 2 {
                         return Err(AsmError::Operand("expected two external failure labels"));
                     }
+                    let src = m.typed_arg(src, ty);
                     emit(m, labels[0], labels[1], src, &immediates)
                 })
             })
@@ -2065,9 +2062,7 @@ mod tests {
         assert_source_pair_op_matches("get_list_Sdd", |m, _, src, hd, tl| {
             m.emit_get_list(src, hd, tl)
         });
-        assert_source_op_matches("load_tuple_ptr_s", |m, _, src| {
-            m.emit_load_tuple_ptr(TypedArg::from(src))
-        });
+        assert_source_op_matches("load_tuple_ptr_s", |m, _, src| m.emit_load_tuple_ptr(src));
         assert_source_pair_op_matches("is_nonempty_list_get_list_fSdd", |m, _, src, hd, tl| {
             m.emit_is_nonempty_list_get_list(ArgVal::Label(1), src, hd, tl)
         });
@@ -2096,11 +2091,7 @@ mod tests {
                 return false;
             };
             assert_block_matches(block, |m| {
-                m.emit_i_get_tuple_element(
-                    TypedArg::from(ArgVal::X(0)),
-                    ArgVal::Word(offset as u64),
-                    dst,
-                )
+                m.emit_i_get_tuple_element(ArgVal::X(0), ArgVal::Word(offset as u64), dst)
             })
         });
         assert!(
@@ -2122,7 +2113,7 @@ mod tests {
             };
             assert_block_matches(block, |m| {
                 m.emit_get_tuple_element_swap(
-                    TypedArg::from(ArgVal::X(0)),
+                    ArgVal::X(0),
                     ArgVal::Word(offset as u64),
                     *dst,
                     *other_dst,
@@ -2139,12 +2130,7 @@ mod tests {
             |m, block, src, dst1, dst2| {
                 let offset = tuple_element_offset(block)
                     .ok_or(AsmError::Operand("tuple field offset not found"))?;
-                m.emit_get_two_tuple_elements(
-                    TypedArg::from(src),
-                    ArgVal::Word(offset as u64),
-                    dst1,
-                    dst2,
-                )
+                m.emit_get_two_tuple_elements(src, ArgVal::Word(offset as u64), dst1, dst2)
             },
         );
 

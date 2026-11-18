@@ -12,7 +12,7 @@ use arinsal_x64::buf::{BufferError, CodeBuffer, FinalizedCode, Label};
 use arinsal_x64::enc::{self, CondCode, Emitter, EncodeError, Gp, Mem};
 use arinsal_x64::exec::CodeMemory;
 
-use crate::common::args::ArgVal;
+use crate::common::args::{ArgVal, REG_MASK};
 use crate::{
     F_REG_ARRAY_DISP, ProcessHeader, RUNTIME_STACK_DISP, SchedulerRegisters, X_REG_ARRAY_OFFSET,
     scheduler_reg_disp, tmp_mem_disp,
@@ -269,8 +269,8 @@ pub const fn tmp_mem_d(index: u32) -> Mem {
 // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:561-570 (getArgRef), OTP-29.1.1.
 pub const fn get_arg_ref(arg: ArgVal, size: u8) -> Option<Mem> {
     match arg {
-        ArgVal::X(index) => Some(get_x_ref(index, size)),
-        ArgVal::Y(index) => Some(get_y_ref(index, size)),
+        ArgVal::X(val) => Some(get_x_ref(val & REG_MASK, size)),
+        ArgVal::Y(val) => Some(get_y_ref(val & REG_MASK, size)),
         _ => None,
     }
 }

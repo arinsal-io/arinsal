@@ -15,8 +15,9 @@ use super::beam_asm_global::{
     BEAM_ASM_FUNC_PROLOGUE_SIZE, BeamGlobalAssembler, GLOBAL_LABELS, GlobalLabels,
 };
 pub use super::rt::{beam_catches_cons, i_emit_nyi};
-use crate::common::args::ArgVal;
+use crate::common::args::{ArgVal, REG_MASK};
 use crate::common::register_cache::{CacheMem, RegisterCache};
+use crate::common::types::{ArgType, BeamModuleAssemblerCommon};
 
 /// `struct patch`: a word in the code to fill in once the value is known, `ptr_offs` bytes
 /// after the label `where`, with `val_offs` added to the value.
@@ -160,6 +161,30 @@ pub struct BeamModuleAssembler {
     on_load: Option<Label>,
     /// `code_end`: the end of the last function; the dispatch table and data may follow.
     code_end: Option<Label>,
+    /// `beam->types.entries`: the module's type table, which the type index of a register
+    /// operand points into (`BeamModuleAssemblerCommon::getTypeEntry`).
+    pub beam_types: Vec<ArgType>,
+}
+
+impl BeamModuleAssemblerCommon for BeamModuleAssembler {
+    fn beam_types(&self) -> &[ArgType] {
+        &self.beam_types
+    }
+}
+
+#[cfg(test)]
+impl BeamModuleAssembler {
+    /// Test support: appends `ty` to the type table and returns the register `arg` carrying
+    /// its type index, as the loader packs a typed register; constants keep their own type.
+    pub(crate) fn typed_arg(&mut self, arg: ArgVal, ty: ArgType) -> ArgVal {
+        let index = self.beam_types.len() as u32;
+        self.beam_types.push(ty);
+        match (arg, arg.reg()) {
+            (ArgVal::X(_), Some(reg)) => ArgVal::typed_x(reg, index),
+            (ArgVal::Y(_), Some(reg)) => ArgVal::typed_y(reg, index),
+            _ => arg,
+        }
+    }
 }
 
 /// `struct patch_catch`: a `mov` whose 32-bit immediate is filled with the catch tag of
@@ -338,6 +363,7 @@ impl BeamModuleAssembler {
             code_header: None,
             on_load: None,
             code_end: None,
+            beam_types: vec![ArgType::ANY],
         }
     }
 
@@ -351,8 +377,10 @@ impl BeamModuleAssembler {
         ga: &BeamGlobalAssembler,
         num_labels: u32,
         num_functions: usize,
+        beam_types: Vec<ArgType>,
     ) -> Result<Self, AsmError> {
         let mut m = Self::with_fragment_addresses(num_labels, ga.ptrs().to_vec());
+        m.beam_types = beam_types;
         let code_header = m.asm.new_label();
         m.asm.align_code(8)?;
         m.asm.bind(code_header)?;
@@ -581,14 +609,15 @@ impl BeamModuleAssembler {
             for arg in args {
                 self.asm.a.align(8)?;
                 match *arg {
-                    ArgVal::X(index) => {
-                        self.asm
-                            .a
-                            .embed_u64((u64::from(index) << LOADER_TAG_SIZE) | LOADER_X_REG)?;
-                    }
-                    ArgVal::Y(index) => {
+                    ArgVal::X(val) => {
                         self.asm.a.embed_u64(
-                            (u64::from(index + y_offset) << LOADER_TAG_SIZE) | LOADER_Y_REG,
+                            (u64::from(val & REG_MASK) << LOADER_TAG_SIZE) | LOADER_X_REG,
+                        )?;
+                    }
+                    ArgVal::Y(val) => {
+                        self.asm.a.embed_u64(
+                            (u64::from((val & REG_MASK) + y_offset) << LOADER_TAG_SIZE)
+                                | LOADER_Y_REG,
                         )?;
                     }
                     ArgVal::Literal(term) => {

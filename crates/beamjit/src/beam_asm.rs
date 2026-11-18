@@ -6,7 +6,7 @@
 //! per target (`arm`, `x86`), as erts builds jit/ with exactly one of jit/arm or jit/x86.
 
 use arinsal_beam::BeamFile;
-use arinsal_beamasm::common::args::ArgVal;
+use arinsal_beamasm::common::args::{ArgVal, REG_MASK};
 use arinsal_beamops::{LiteralElement, NewLiteral, SpecificOperand, TransformArena};
 use std::cell::RefCell;
 
@@ -131,6 +131,42 @@ fn word(operand: &SpecificOperand, sign: char) -> Result<u64, String> {
     }
 }
 
+/// A `TAG_x` / `TAG_y` operand as `ArgVal`: the register number with the type index of a
+/// typed register (`{tr, Reg, Type}`) packed above `REG_MASK`, as the reader of the code
+/// chunk does; without a type table (stripped after compilation) a typed register is an
+/// ordinary one.
+// Port of erts/emulator/beam/beam_file.c:2415-2438 (read_code, register with type hint),
+// OTP-29.1.1.
+fn register(beam: &BeamFile, operand: &SpecificOperand) -> Result<ArgVal, String> {
+    let (index, type_index) = match *operand {
+        SpecificOperand::X(index) | SpecificOperand::Y(index) => (index, 0),
+        SpecificOperand::TypedX { index, type_index }
+        | SpecificOperand::TypedY { index, type_index } => {
+            let type_index = match beam.types.as_ref() {
+                Some(types) if (type_index as usize) < types.entries.len() => type_index,
+                Some(types) => {
+                    return Err(format!(
+                        "type index {type_index} out of range ({} entries)",
+                        types.entries.len()
+                    ));
+                }
+                None => 0,
+            };
+            (index, type_index)
+        }
+        _ => return Err(format!("{operand:?} is not a register")),
+    };
+    if index > REG_MASK {
+        return Err(format!("register {index} out of range"));
+    }
+    Ok(match operand {
+        SpecificOperand::X(_) | SpecificOperand::TypedX { .. } => {
+            ArgVal::typed_x(index, type_index)
+        }
+        _ => ArgVal::typed_y(index, type_index),
+    })
+}
+
 /// The operands of the specific instruction `specific` as `beamasm_emit` hands them to the
 /// module assembler: each operand verified and massaged according to the instruction's
 /// signature (`opc[specific_op].sign`), then the variable argument list by its primitive
@@ -151,14 +187,10 @@ pub fn beam_load_emit_op(
             .ok_or_else(|| format!("operand '{letter}' missing"))?;
         let arg = match (letter, curr) {
             ('n', SpecificOperand::Nil) => ArgVal::Immediate(NIL),
-            (
-                'x' | 'd' | 'S' | 's',
-                SpecificOperand::X(index) | SpecificOperand::TypedX { index, .. },
-            ) => ArgVal::X(*index),
-            (
-                'y' | 'd' | 'S' | 's',
-                SpecificOperand::Y(index) | SpecificOperand::TypedY { index, .. },
-            ) => ArgVal::Y(*index),
+            ('x' | 'd' | 'S' | 's', SpecificOperand::X(_) | SpecificOperand::TypedX { .. })
+            | ('y' | 'd' | 'S' | 's', SpecificOperand::Y(_) | SpecificOperand::TypedY { .. }) => {
+                register(beam, curr)?
+            }
             ('a' | 'c' | 's', SpecificOperand::Atom(index)) => {
                 ArgVal::Immediate(env.atom(beam, *index)?)
             }
@@ -211,8 +243,10 @@ pub fn beam_load_emit_op(
             SpecificOperand::Atom(index) => ArgVal::Immediate(env.atom(beam, *index)?),
             SpecificOperand::Unsigned(value) => ArgVal::Word(*value),
             SpecificOperand::Label(label) => ArgVal::Label(*label),
-            SpecificOperand::X(index) | SpecificOperand::TypedX { index, .. } => ArgVal::X(*index),
-            SpecificOperand::Y(index) | SpecificOperand::TypedY { index, .. } => ArgVal::Y(*index),
+            SpecificOperand::X(_)
+            | SpecificOperand::TypedX { .. }
+            | SpecificOperand::Y(_)
+            | SpecificOperand::TypedY { .. } => register(beam, curr)?,
             SpecificOperand::Literal(index) => ArgVal::Literal(env.literal(beam, *index)?),
             other => return Err(format!("unsupported primitive type {other:?}")),
         };
