@@ -191,23 +191,6 @@ pub(crate) const fn is_uint(value: i64, bits: u32) -> bool {
     value >= 0 && (value as u64) < (1u64 << bits)
 }
 
-/// Checks that `value` is representable in an operand of `size` bytes either as a signed or
-/// unsigned number. asmjit writes the low bytes without this check; rejecting values that do not
-/// fit keeps every accepted encoding identical to asmjit's while refusing silent truncation.
-pub(crate) fn check_imm(value: i64, size: u8) -> Result<(), EncodeError> {
-    let ok = match size {
-        1 => is_int(value, 8) || is_uint(value, 8),
-        2 => is_int(value, 16) || is_uint(value, 16),
-        4 => is_int(value, 32) || is_uint(value, 32),
-        _ => true,
-    };
-    if ok {
-        Ok(())
-    } else {
-        Err(EncodeError::InvalidImmediate(value))
-    }
-}
-
 /// ModRM.rm target after validation.
 enum Target {
     Reg(u8),

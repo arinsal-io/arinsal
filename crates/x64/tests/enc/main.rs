@@ -4,9 +4,12 @@
 mod golden;
 
 mod alu;
+mod asmjit_oracle;
 mod avx;
 mod branch;
 mod cond;
 mod mem;
 mod mov;
 mod operand;
+mod oracle_cases;
+mod oracle_run;

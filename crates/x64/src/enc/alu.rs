@@ -4,7 +4,7 @@
 //! `kEncodingX86M_GPB` and `kEncodingX86IncDec` in
 //! `erts/emulator/asmjit/x86/x86assembler.cpp`, OTP-29.1.1, with erts' `kOptimizeForSize`.
 
-use super::core::{ByteRex, Imm, Opcode, Rm, check_imm, is_int, is_uint};
+use super::core::{ByteRex, Imm, Opcode, Rm, is_int, is_uint};
 use super::{Emitter, EncodeError, Gp, Mem};
 
 /// `/n` of the eight arithmetic instructions; the reg/mem opcodes are `n * 8 + {0..3}`.
@@ -54,16 +54,11 @@ impl Emitter {
         let mut opcode = Opcode::legacy(0x80);
         let mut imm_size;
         if size == 1 {
-            check_imm(value, 1)?;
             imm_size = 1;
         } else {
             match size {
-                2 => {
-                    check_imm(value, 2)?;
-                    opcode = opcode.prefix_by_size(2);
-                }
+                2 => opcode = opcode.prefix_by_size(2),
                 4 => {
-                    check_imm(value, 4)?;
                     // Sign extend so is_int_n<8> returns the right result.
                     value = value as i32 as i64;
                 }
@@ -106,17 +101,9 @@ impl Emitter {
     fn arith_mi(&mut self, op: Arith, dst: &Mem, value: i64) -> Result<(), EncodeError> {
         let size = Self::mem_size(dst)?;
         let mut value = value;
-        match size {
-            8 => {
-                if !is_int(value, 32) {
-                    return Err(EncodeError::InvalidImmediate(value));
-                }
-            }
-            4 => {
-                check_imm(value, 4)?;
-                value = value as i32 as i64;
-            }
-            _ => check_imm(value, size)?,
+        // asmjit never rejects the immediate here: it writes the low `min(size, 4)` bytes.
+        if size == 4 {
+            value = value as i32 as i64;
         }
         let mut imm_size = size.min(4);
         if is_int(value, 8) {
@@ -202,13 +189,7 @@ impl Emitter {
         let mut rex = ByteRex::default();
         let rb = Self::gp_id(a, &mut rex)?;
         let size = a.size();
-        if size == 8 {
-            if !is_int(imm, 32) {
-                return Err(EncodeError::InvalidImmediate(imm));
-            }
-        } else {
-            check_imm(imm, size)?;
-        }
+        // asmjit writes the low `min(size, 4)` bytes without validating the value.
         let imm = Imm::new(imm as u64, size.min(4));
         let opcode = Opcode::legacy(0xF6).arith_by_size(size);
         // Short form - AL, AX, EAX, RAX.
@@ -225,13 +206,6 @@ impl Emitter {
     /// `test size ptr [mem], imm` (asmjit `a.test(Mem, Imm)`); `a.size` is required.
     pub fn test_mi(&mut self, a: Mem, imm: i64) -> Result<(), EncodeError> {
         let size = Self::mem_size(&a)?;
-        if size == 8 {
-            if !is_int(imm, 32) {
-                return Err(EncodeError::InvalidImmediate(imm));
-            }
-        } else {
-            check_imm(imm, size)?;
-        }
         let opcode = Opcode::legacy(0xF6).arith_by_size(size);
         self.x86_rm(
             opcode,

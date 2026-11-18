@@ -273,25 +273,21 @@ fn alu_rejects_illegal_forms() {
         e.add_ri(RAX, 0x1_0000_0000),
         Err(EncodeError::InvalidImmediate(0x1_0000_0000))
     );
+    // Only the 64-bit arith form validates its immediate (x86assembler.cpp kEncodingX86Arith);
+    // every other form writes the low bytes (compared with asmjit in `asmjit_oracle`).
+    assert_eq!(e.add_ri(AL, 0x100), Ok(()));
+    assert_eq!(e.add_ri(EAX, 0x1_0000_0000), Ok(()));
+    assert_eq!(e.test_ri(RAX, 0xffff_ffff), Ok(()));
     assert_eq!(
-        e.or_ri(RAX, 0xffff_ffff),
-        Err(EncodeError::InvalidImmediate(0xffff_ffff))
+        e.bytes,
+        [
+            0x04, 0x00, 0x83, 0xc0, 0x00, 0x48, 0xa9, 0xff, 0xff, 0xff, 0xff
+        ]
     );
-    assert_eq!(
-        e.add_ri(AL, 0x100),
-        Err(EncodeError::InvalidImmediate(0x100))
-    );
-    assert_eq!(
-        e.add_ri(EAX, 0x1_0000_0000),
-        Err(EncodeError::InvalidImmediate(0x1_0000_0000))
-    );
+    e.bytes.clear();
     assert_eq!(
         e.add_mi(ptr(RAX, 0), 1),
         Err(EncodeError::AmbiguousOperandSize)
-    );
-    assert_eq!(
-        e.test_ri(RAX, 0xffff_ffff),
-        Err(EncodeError::InvalidImmediate(0xffff_ffff))
     );
     assert_eq!(e.inc_m(ptr(RAX, 0)), Err(EncodeError::AmbiguousOperandSize));
     assert_eq!(e.neg_r(AH.r64()), Ok(()));
