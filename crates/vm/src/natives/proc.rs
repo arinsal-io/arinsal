@@ -1822,7 +1822,7 @@ pub(crate) fn fun_info_arity_light(
         let view = arinsal_beamasm::rt::fun_ref(*fun)?;
         match view {
             arinsal_term::FunRef::Local { entry, .. } => entry.arity,
-            arinsal_term::FunRef::Export { entry } => entry.arity,
+            arinsal_term::FunRef::Export { entry } => entry.arity(),
         }
     };
     // Port of erts/emulator/beam/erl_bif_info.c:3976 (`HAlloc(p, 3)`), OTP-29.1.1:
@@ -5567,9 +5567,9 @@ fn fun_info_mfa(vm: &Vm, process: &mut Process, fun: Term) -> Result<Term, VmErr
     let view = unsafe { fun.fun_ref() }.ok_or_else(badarg)?;
     let (module, name, arity) = match view {
         FunRef::Export { entry } => (
-            Term::atom(entry.module),
-            Term::atom(entry.function),
-            i64::from(entry.arity),
+            Term::atom(entry.module()),
+            Term::atom(entry.function()),
+            i64::from(entry.arity()),
         ),
         FunRef::Local { entry, .. } => {
             let module_name = global_atoms()

@@ -151,7 +151,7 @@ impl DispatchTarget {
 
     /// `Export.info.mfa` of this export.
     pub(crate) fn mfa(&self) -> &'static arinsal_beamasm::bif::ErtsCodeMfa {
-        &self.slot.mfa
+        &self.slot.mfa()
     }
 
     /// The shared owner of this MFA's `Export`, which the code indexes' export tables hold.
@@ -314,12 +314,6 @@ impl DispatchRegistry {
             {
                 target.slot.set_trampoline_op(arinsal_term::OP_CALL_BIF_W);
             }
-            // Port of erts/emulator/beam/export.h:38-58 (Export), OTP-29.1.1: the slot holds
-            // its descriptor's address, which generated code passes to the runtime helpers
-            // as a typed reference, like erts passes the Export* itself.
-            target
-                .slot
-                .set_info(std::ptr::from_ref::<DispatchTarget>(target) as usize);
             // Port of erts/emulator/beam/jit/beam_jit_main.cpp (install_bifs: `bif_table[i].f`
             // reached through `ep->bif_number = i`), OTP-29.1.1: the call fragments index the
             // table by the export's bif_number. An export outside bif.tab has no entry.
@@ -402,9 +396,8 @@ fn fragments() -> Option<&'static DispatchFragments> {
                     light_bif: crate::native_helpers::arinsal_beamasm_call_light_bif_shared
                         as *const () as usize,
                     bif_table: crate::bif_table::table_address(),
-                    light_bif_gc: crate::native_helpers::arinsal_beamasm_light_bif_gc as *const ()
+                    light_bif_gc: crate::raw::gc_ffi::erts_gc_after_bif_call_lhf as *const ()
                         as usize,
-                    light_gc: light_gc_offsets(),
                     exception_resolver: crate::native_helpers::arinsal_beamasm_exception_resolver
                         as *const () as usize,
                     save_calls_export: crate::native_helpers::arinsal_beamasm_save_calls_export
@@ -797,17 +790,6 @@ fn target_for_identity(identity: usize) -> Option<&'static DispatchTarget> {
 
 pub(crate) fn export_dispatch(identity: usize) -> Option<ExportDispatch> {
     target_for_identity(identity)
-}
-
-/// `Export.info` as the light-BIF fragment loaded it.
-// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:434-445, OTP-29.1.1.
-pub(crate) fn export_from_info(info: u64) -> Option<ExportDispatch> {
-    if info == 0 {
-        return None;
-    }
-    // SAFETY: `intern_identity` leaks this `DispatchTarget` and stores its
-    // address in `Export.info` before any generated call can run. The export table never frees it.
-    Some(unsafe { &*(info as *const DispatchTarget) })
 }
 
 static MODULES: AtomicU64 = AtomicU64::new(0);
@@ -1732,7 +1714,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
     fn plain_bif_mfa(&self, _beam: &BeamFile, index: u32) -> Option<usize> {
         let identity = *self.export_entries.get(index as usize)?;
         let target = target_for_identity(identity)?;
-        Some(std::ptr::addr_of!(target.slot.mfa) as usize)
+        Some(std::ptr::from_ref(target.slot.mfa()) as usize)
     }
     fn bs_match_cmd_helper(&self) -> arinsal_beamasm::bs_match::BsMatchCmdHelper {
         crate::native_helpers::arinsal_beamasm_bs_match_command
@@ -2280,19 +2262,5 @@ pub(crate) fn print_stats() {
     rows.sort_by(|a, b| b.1.cmp(a.1));
     for (name, count) in rows {
         eprintln!("ARINSAL_BEAMASM_STATS call_unported {count} {name}");
-    }
-}
-
-/// Offsets from `c_p` of the process fields the light-BIF fragment's collection test reads.
-// Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED) and
-// erts/emulator/beam/jit/arm/instr_bif.cpp:488-523, OTP-29.1.1: the native code reads
-// `mbuf_sz`, `bin_vheap_sz`, `off_heap.overhead` and `F_DISABLE_GC` from the process itself.
-fn light_gc_offsets() -> arinsal_beamasm::dispatch::LightGcOffsets {
-    let heap = std::mem::offset_of!(crate::Process, heap);
-    arinsal_beamasm::dispatch::LightGcOffsets {
-        mbuf_sz: (heap + arinsal_term::ProcessHeap::MBUF_SZ_OFFSET) as u32,
-        off_heap_overhead: (heap + arinsal_term::ProcessHeap::OFF_HEAP_OVERHEAD_OFFSET) as u32,
-        bin_vheap_size: (heap + arinsal_term::ProcessHeap::BIN_VHEAP_SIZE_OFFSET) as u32,
-        flags: (heap + arinsal_term::ProcessHeap::FLAGS_OFFSET) as u32,
     }
 }

@@ -1152,9 +1152,9 @@ fn cmp_impl(a: Term, b: Term, exact: bool) -> Ordering {
                         }
                     }
                     (FunRef::Export { entry: ae }, FunRef::Export { entry: be }) => {
-                        node_order(ae.module, be.module)
-                            .then(node_order(ae.function, be.function))
-                            .then(ae.arity.cmp(&be.arity))
+                        node_order(ae.module(), be.module())
+                            .then(node_order(ae.function(), be.function()))
+                            .then(ae.arity().cmp(&be.arity()))
                     }
                     (FunRef::Local { .. }, FunRef::Export { .. }) => Ordering::Less,
                     (FunRef::Export { .. }, FunRef::Local { .. }) => Ordering::Greater,
@@ -2630,9 +2630,9 @@ fn eq(a: Term, b: Term) -> bool {
                                 }
                             }
                             (FunRef::Export { entry: ae }, FunRef::Export { entry: be }) => {
-                                if node_order(ae.module, be.module) != Ordering::Equal
-                                    || node_order(ae.function, be.function) != Ordering::Equal
-                                    || ae.arity != be.arity
+                                if node_order(ae.module(), be.module()) != Ordering::Equal
+                                    || node_order(ae.function(), be.function()) != Ordering::Equal
+                                    || ae.arity() != be.arity()
                                 {
                                     return false;
                                 }

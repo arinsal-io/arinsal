@@ -30,6 +30,6 @@ pub(crate) fn fun_arity(term: Term) -> Option<u8> {
     // SAFETY: the term and any local fun entry remain live for the whole BIF call.
     match unsafe { term.fun_ref() }? {
         FunRef::Local { entry, .. } => Some(entry.arity),
-        FunRef::Export { entry } => Some(entry.arity),
+        FunRef::Export { entry } => Some(entry.arity()),
     }
 }

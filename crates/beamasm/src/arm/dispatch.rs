@@ -6,6 +6,7 @@ use arinsal_a64::{
     exec::{CodeMemory, ExecError},
 };
 
+use crate::common::process;
 use crate::{Update, emit_enter_runtime, emit_leave_runtime, rt::arinsal_enter_native_return};
 
 const RUNTIME_UPDATE: Update = Update::HEAP_ALLOC
@@ -63,20 +64,6 @@ pub struct LineBreakpointHelpers {
     pub cleanup: usize,
 }
 
-/// Byte offsets, from the process pointer, of the fields the light-BIF fragment's inline
-/// collection test reads (`ERTS_IS_GC_DESIRED_INTERNAL`, instr_bif.cpp:488-523).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LightGcOffsets {
-    /// `c_p->mbuf_sz`, a native-word count of words.
-    pub mbuf_sz: u32,
-    /// `Process.off_heap.overhead`, stored directly in the process.
-    pub off_heap_overhead: u32,
-    /// `Process.heap.bin_vheap_size` (`bin_vheap_sz`).
-    pub bin_vheap_size: u32,
-    /// `c_p->flags`, tested for `F_FORCE_GC | F_DISABLE_GC`.
-    pub flags: u32,
-}
-
 /// Runtime callbacks used by the shared export and instrumentation fragments.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DispatchRuntimeHelpers {
@@ -89,8 +76,6 @@ pub struct DispatchRuntimeHelpers {
     /// Collection helper run when a light BIF's result leaves a collection desired
     /// (`erts_gc_after_bif_call_lhf`). Zero disables the inline GC-desired test.
     pub light_bif_gc: usize,
-    /// Byte offsets of the live process fields the inline test reads, from `c_p`.
-    pub light_gc: LightGcOffsets,
     /// Shared exception resolver.
     pub exception_resolver: usize,
     /// Process-saving-calls export helper.
@@ -203,7 +188,6 @@ impl DispatchFragments {
             // Without a collection helper the GC-desired test never fires: a test header
             // publishes zero fragment and binary sizes.
             light_bif_gc: 0,
-            light_gc: LightGcOffsets::default(),
             exception_resolver,
             save_calls_export: save_calls_helper,
             unloaded_fun: unloaded_fun_helper,
@@ -224,7 +208,6 @@ impl DispatchFragments {
             light_bif: light_bif_helper,
             bif_table,
             light_bif_gc: light_bif_gc_helper,
-            light_gc: light_gc_offsets,
             exception_resolver,
             save_calls_export: save_calls_helper,
             unloaded_fun: unloaded_fun_helper,
@@ -260,7 +243,6 @@ impl DispatchFragments {
             bif_table,
             call_error_handler,
             light_bif_gc_helper,
-            light_gc_offsets,
             raise_exception,
         )
         .map_err(|_| ExecError::InvalidSize("export trampoline"))?;
@@ -270,7 +252,6 @@ impl DispatchFragments {
             &mut code,
             light_bif_helper,
             light_bif_gc_helper,
-            light_gc_offsets,
             exception_resolver,
             false,
         )
@@ -281,7 +262,6 @@ impl DispatchFragments {
             &mut code,
             light_bif_helper,
             light_bif_gc_helper,
-            light_gc_offsets,
             exception_resolver,
             true,
         )
@@ -845,7 +825,6 @@ fn emit_apply_fun_fragment(code: &mut CodeBuffer) -> Result<(), BufferError> {
 // the cached HTOP (x23) and E (x20).
 fn emit_gc_desired_test(
     code: &mut CodeBuffer,
-    gc: LightGcOffsets,
     collect: arinsal_a64::buf::Label,
 ) -> Result<(), BufferError> {
     // Same shape as erts' ERTS_IS_GC_DESIRED_INTERNAL: Z is set when collection is
@@ -854,25 +833,41 @@ fn emit_gc_desired_test(
     const NZCV_CF: u8 = 0b0010;
     const NZCV_VF: u8 = 0b0001;
     code.emit(|encoder| {
-        encoder.ldr_uoff(Gpr::w(9), Gpr::x(21), gc.flags)?;
+        encoder.ldr_uoff(Gpr::w(9), Gpr::x(21), process::FLAGS as u32)?;
         encoder.tst_imm(
             Gpr::w(9),
             u64::from(arinsal_term::pflags::F_FORCE_GC | arinsal_term::pflags::F_DISABLE_GC),
         )?;
-        encoder.ldr_uoff(Gpr::x(12), Gpr::x(21), gc.off_heap_overhead)
+        encoder.ldr_uoff(Gpr::x(12), Gpr::x(21), process::OFF_HEAP_OVERHEAD as u32)
     })?;
     code.emit(|encoder| {
-        encoder.ldr_uoff(Gpr::x(13), Gpr::x(21), gc.bin_vheap_size)?;
+        encoder.ldr_uoff(Gpr::x(13), Gpr::x(21), process::BIN_VHEAP_SZ as u32)?;
         // Enabled: overhead against bin_vheap_sz. Disabled: C is set, so the next
         // condition fails and collection is taken.
         encoder.ccmp_reg(Gpr::x(12), Gpr::x(13), NZCV_CF, Cond::Eq)?;
         encoder.sub_reg(Gpr::x(9), Gpr::x(20), Gpr::x(23), Shift::Lsl, 0)?;
         encoder.asr_imm(Gpr::x(9), Gpr::x(9), 3)?;
-        encoder.ldr_uoff(Gpr::x(11), Gpr::x(21), gc.mbuf_sz)?;
+        encoder.ldr_uoff(Gpr::x(11), Gpr::x(21), process::MBUF_SZ as u32)?;
         // Unless the binary test said "no collection" (LS), the flags force `lt`.
         encoder.ccmp_reg(Gpr::x(9), Gpr::x(11), NZCV_VF, Cond::Ls)
     })?;
     code.b_cond(Cond::Lt, collect)
+}
+
+/// `erts_gc_after_bif_call_lhf(c_p, live_hf_end, result, reg, arity)` with the BIF's result
+/// in x0, inside an entered runtime; the frame holds the Export* at sp+16 and the
+/// `live_hf_end` spilled before the BIF at sp+24. The result returns in x0.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:549-570 (gc_after_bif_call), OTP-29.1.1.
+fn emit_gc_after_bif_call(code: &mut CodeBuffer, gc_helper: usize) -> Result<(), BufferError> {
+    code.emit(|encoder| {
+        encoder.mov_reg(Gpr::x(2), Gpr::x(0))?;
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.ldp(Gpr::x(4), Gpr::x(1), Gpr::sp(), 16)?;
+        crate::arm::beam_asm::load_x_reg_array(encoder, Gpr::x(3))?;
+        encoder.ldrb_uoff(Gpr::w(4), Gpr::x(4), crate::bif::EXPORT_ARITY_OFFSET as u16)?;
+        encoder.mov_const(Gpr::x(17), gc_helper as u64)?;
+        encoder.blr(Gpr::x(17))
+    })
 }
 
 fn emit_export_fragment(
@@ -881,7 +876,6 @@ fn emit_export_fragment(
     bif_table: usize,
     error_handler_helper: usize,
     gc_helper: usize,
-    gc: LightGcOffsets,
     raise_exception: arinsal_a64::buf::Label,
 ) -> Result<(), BufferError> {
     let interpreted = code.new_label();
@@ -909,7 +903,7 @@ fn emit_export_fragment(
         })?;
         emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
         code.emit(|encoder| {
-            encoder.ldr_uoff(Gpr::x(1), Gpr::x(0), crate::bif::EXPORT_INFO_OFFSET)?;
+            encoder.mov_reg(Gpr::x(1), Gpr::x(0))?;
             encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
             crate::arm::beam_asm::load_x_reg_array(encoder, Gpr::x(2))?;
             encoder.mov_const(Gpr::x(17), error_handler_helper as u64)?;
@@ -942,7 +936,11 @@ fn emit_export_fragment(
         encoder.str_pre(Gpr::x(30), Gpr::x(20), -8)?;
         encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -32)?;
         encoder.mov_reg(Gpr::x(29), Gpr::sp())?;
-        encoder.str_uoff(Gpr::x(0), Gpr::sp(), 16)?;
+        // The Export* and `c_p->mbuf` before the BIF (`live_hf_end`).
+        // Port of erts/emulator/beam/beam_jit_common.cpp (beam_jit_call_bif: `live_hf_end =
+        // c_p->mbuf` before the call), OTP-29.1.1.
+        encoder.ldr_uoff(Gpr::x(9), Gpr::x(21), process::MBUF as u32)?;
+        encoder.stp(Gpr::x(0), Gpr::x(9), Gpr::sp(), 16)?;
         Ok(())
     })?;
     let helper_call = code.new_label();
@@ -1034,8 +1032,8 @@ fn emit_export_fragment(
     emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
         // Port of erts/emulator/beam/beam_jit_common.cpp (beam_jit_bif trampolines read the
-        // BIF from their own Export), OTP-29.1.1: x2 = the export's descriptor word.
-        encoder.ldr_uoff(Gpr::x(2), Gpr::x(0), crate::bif::EXPORT_INFO_OFFSET)?;
+        // BIF from their own Export), OTP-29.1.1: x2 = the Export*.
+        encoder.mov_reg(Gpr::x(2), Gpr::x(0))?;
         encoder.add_imm(
             Gpr::x(9),
             Gpr::x(0),
@@ -1071,20 +1069,11 @@ fn emit_export_fragment(
         // collects too. The result (or the non-value) is spilled and passed to the collector,
         // which roots it, or the arguments when there is none.
         let gc_after_bif = code.new_label();
-        emit_gc_desired_test(code, gc, gc_after_bif)?;
+        emit_gc_desired_test(code, gc_after_bif)?;
         code.b(check_return)?;
         code.bind(gc_after_bif)?;
-        code.emit(|encoder| encoder.str_uoff(Gpr::x(0), Gpr::sp(), 24))?;
         emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
-        code.emit(|encoder| {
-            encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
-            crate::arm::beam_asm::load_x_reg_array(encoder, Gpr::x(1))?;
-            encoder.ldr_uoff(Gpr::x(2), Gpr::sp(), 24)?;
-            encoder.ldr_uoff(Gpr::x(9), Gpr::sp(), 16)?;
-            encoder.ldr_uoff(Gpr::x(3), Gpr::x(9), crate::bif::EXPORT_INFO_OFFSET)?;
-            encoder.mov_const(Gpr::x(17), gc_helper as u64)?;
-            encoder.blr(Gpr::x(17))
-        })?;
+        emit_gc_after_bif_call(code, gc_helper)?;
         emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
     }
     code.bind(check_return)?;
@@ -1149,7 +1138,7 @@ fn emit_save_calls_export_fragment(
     code.emit(|encoder| encoder.stp_pre(Gpr::x(30), Gpr::x(0), Gpr::sp(), -32))?;
     emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
-        encoder.ldr_uoff(Gpr::x(2), Gpr::x(0), crate::bif::EXPORT_INFO_OFFSET)?;
+        encoder.mov_reg(Gpr::x(2), Gpr::x(0))?;
         encoder.mov_reg(Gpr::x(1), Gpr::x(0))?;
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
         encoder.mov_const(Gpr::x(17), helper as u64)?;
@@ -1327,7 +1316,6 @@ fn emit_call_light_bif_shared(
     code: &mut CodeBuffer,
     helper: usize,
     gc_helper: usize,
-    gc: LightGcOffsets,
     resolver: usize,
     helper_only: bool,
 ) -> Result<(), BufferError> {
@@ -1372,8 +1360,10 @@ fn emit_call_light_bif_shared(
     emit_enter_runtime(code, MAX_BIF_ARITY, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
         encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -32)?;
-        encoder.str_uoff(Gpr::x(3), Gpr::sp(), 16)?;
-        encoder.ldr_uoff(Gpr::x(9), Gpr::x(3), crate::bif::EXPORT_INFO_OFFSET)?;
+        // The Export* and `c_p->mbuf` before the BIF (`live_hf_end`, erts' TMP_MEM2q/3q).
+        // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:384-386, OTP-29.1.1.
+        encoder.ldr_uoff(Gpr::x(9), Gpr::x(21), process::MBUF as u32)?;
+        encoder.stp(Gpr::x(3), Gpr::x(9), Gpr::sp(), 16)?;
         encoder.add_imm(
             Gpr::x(10),
             Gpr::x(3),
@@ -1385,7 +1375,6 @@ fn emit_call_light_bif_shared(
             Gpr::x(21),
             std::mem::offset_of!(crate::ProcessHeader, current) as u32,
         )?;
-        encoder.str_uoff(Gpr::x(9), Gpr::sp(), 24)?;
         encoder.mov_reg(Gpr::x(29), Gpr::sp())?;
         Ok(())
     })?;
@@ -1413,7 +1402,7 @@ fn emit_call_light_bif_shared(
     // `off_heap.overhead`, `bin_vheap_sz`) and the header's `htop`/`stop`, as erts does.
     // Without a collection helper no test is emitted (test fragments use zero sizes).
     if gc_helper != 0 {
-        emit_gc_desired_test(code, gc, gc_after_bif)?;
+        emit_gc_desired_test(code, gc_after_bif)?;
     }
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:516-546 (check_bif_return), OTP-29.1.1.
     code.bind(check_return)?;
@@ -1478,29 +1467,19 @@ fn emit_call_light_bif_shared(
         // BIF, and the collection roots the result, or the arguments when there is none; then
         // check_bif_return looks at what it returned.
         code.bind(gc_after_bif)?;
-        code.emit(|encoder| encoder.str_uoff(Gpr::x(0), Gpr::sp(), 24))?;
         emit_enter_runtime(code, MAX_BIF_ARITY, RUNTIME_UPDATE)?;
-        code.emit(|encoder| {
-            encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
-            crate::arm::beam_asm::load_x_reg_array(encoder, Gpr::x(1))?;
-            encoder.ldr_uoff(Gpr::x(2), Gpr::sp(), 24)?;
-            encoder.ldr_uoff(Gpr::x(9), Gpr::sp(), 16)?;
-            encoder.ldr_uoff(Gpr::x(3), Gpr::x(9), crate::bif::EXPORT_INFO_OFFSET)?;
-            encoder.mov_const(Gpr::x(17), gc_helper as u64)?;
-            encoder.blr(Gpr::x(17))
-        })?;
+        emit_gc_after_bif_call(code, gc_helper)?;
         emit_leave_runtime(code, MAX_BIF_ARITY, RUNTIME_UPDATE)?;
         code.b(check_return)?;
     }
     code.bind(helper_call)?;
     code.emit(|encoder| {
         // x0 = c_p, x1 = export, x2 = export (site; breakpoints use a real one),
-        // x3 = the export's descriptor word, x4 = `reg`.
+        // x3 = the Export*, x4 = `reg`.
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
         encoder.mov_reg(Gpr::x(1), Gpr::x(3))?;
         encoder.mov_reg(Gpr::x(2), Gpr::x(3))?;
         crate::arm::beam_asm::load_x_reg_array(encoder, Gpr::x(4))?;
-        encoder.ldr_uoff(Gpr::x(3), Gpr::x(3), crate::bif::EXPORT_INFO_OFFSET)?;
         encoder.mov_const(Gpr::x(17), helper as u64)?;
         encoder.blr(Gpr::x(17))
     })?;

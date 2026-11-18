@@ -552,7 +552,7 @@ fn print_fun(out: &mut Vec<u8>, obj: Term, dcount: &mut i64) -> bool {
             out.extend_from_slice(b"fun ");
             // A temporary budget keeps the fun from being split between module and
             // function name; the real one is charged afterwards.
-            for (index, atom) in [entry.module, entry.function].into_iter().enumerate() {
+            for (index, atom) in [entry.module(), entry.function()].into_iter().enumerate() {
                 let mut tdcount = MAX_ATOM_SZ_LIMIT;
                 print_atom_name(out, atom, &mut tdcount);
                 *dcount -= MAX_ATOM_SZ_LIMIT - tdcount;
@@ -560,7 +560,7 @@ fn print_fun(out: &mut Vec<u8>, obj: Term, dcount: &mut i64) -> bool {
                     out.push(b':');
                 }
             }
-            out.extend_from_slice(format!("/{}", entry.arity).as_bytes());
+            out.extend_from_slice(format!("/{}", entry.arity()).as_bytes());
         }
         None => {}
     }

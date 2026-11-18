@@ -389,9 +389,9 @@ impl Hash2Run {
                     }
                     crate::FunRef::Export { entry } => {
                         if initial {
-                            let module = global_atoms().text(entry.module).unwrap();
-                            let function = global_atoms().text(entry.function).unwrap();
-                            combine(hash, entry.arity as u32, atom_hash(module), H);
+                            let module = global_atoms().text(entry.module()).unwrap();
+                            let function = global_atoms().text(entry.function()).unwrap();
+                            combine(hash, entry.arity() as u32, atom_hash(module), H);
                             combine(hash, atom_hash(function), 0, H.wrapping_mul(14));
                         }
                         FieldProgress::Common
@@ -1422,12 +1422,12 @@ pub fn make_hash(root: Term) -> u32 {
                             }
                         }
                         crate::FunRef::Export { entry } => {
-                            hash = hash.wrapping_mul(F11).wrapping_add(entry.arity as u32);
+                            hash = hash.wrapping_mul(F11).wrapping_add(entry.arity() as u32);
                             hash = hash.wrapping_mul(F1).wrapping_add(atom_hash(
-                                global_atoms().text(entry.module).unwrap(),
+                                global_atoms().text(entry.module()).unwrap(),
                             ));
                             hash = hash.wrapping_mul(F1).wrapping_add(atom_hash(
-                                global_atoms().text(entry.function).unwrap(),
+                                global_atoms().text(entry.function()).unwrap(),
                             ));
                         }
                     }

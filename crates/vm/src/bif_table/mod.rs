@@ -65,28 +65,16 @@ pub fn has_function(module: &str, function: &str, arity: u8) -> bool {
     special(module, function, arity).is_some()
 }
 
-/// `Export.info` of the BIF being called: the export that owns `c_p->current`
-/// (`&Export.info.mfa`, set by the call fragment).
-pub(crate) fn current_info(header: *mut ProcessHeader) -> u64 {
+/// The `Export*` of the BIF being called (0 when `c_p->current` is null): the call fragment
+/// points `c_p->current` at the export's `info.mfa` before it calls `bif_table[].f`.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:399-405 (call_light_bif_shared stores
+// `&exp->info.mfa` in `c_p->current`) and export.h (`ErtsContainerOf(mfa, Export, info.mfa)`),
+// OTP-29.1.1.
+pub(crate) fn current_export(header: *mut ProcessHeader) -> u64 {
     match raw::header_current(header) {
         0 => 0,
-        mfa => raw::export_info_of_mfa(mfa),
+        mfa => mfa - u64::from(arinsal_term::EXPORT_MFA_OFFSET),
     }
-}
-
-/// `(Export.info, Export*)` of the BIF being called: the call fragment points `c_p->current`
-/// at the export's info before it calls `bif_table[].f`.
-// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:399-405 (call_light_bif_shared stores
-// `&exp->info.mfa` in `c_p->current`), OTP-29.1.1.
-pub(crate) fn current_export(header: *mut ProcessHeader) -> (u64, u64) {
-    let info = current_info(header);
-    if info == 0 {
-        return (0, 0);
-    }
-    let identity = crate::beamasm_integration::export_from_info(info).map_or(0, |export| {
-        std::sync::Arc::as_ptr(export.export_object()) as u64
-    });
-    (info, identity)
 }
 
 /// Runs `bif_table[bif_number].f` for a BIF the executor calls by its MFA (a traced BIF, an

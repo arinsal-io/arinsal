@@ -729,9 +729,9 @@ fn size_rare(
             match &fun {
                 FunRef::Export { entry } => {
                     add!(
-                        1 + atom_size_in(table, entry.module, minor)?
-                            + atom_size_in(table, entry.function, minor)?
-                            + small_size(i64::from(entry.arity))
+                        1 + atom_size_in(table, entry.module(), minor)?
+                            + atom_size_in(table, entry.function(), minor)?
+                            + small_size(i64::from(entry.arity()))
                     );
                     // Port of external.c EXPORT_EXT: the arity is emitted by a nested enc_term.
                     if opts.local {
@@ -914,9 +914,9 @@ fn enc_rare<O: ByteOutput>(
         TermKind::Fun => match fun_of(term)? {
             FunRef::Export { entry } => {
                 out.push(113);
-                atom_bytes_in(table, out, entry.module, opts.minor)?;
-                atom_bytes_in(table, out, entry.function, opts.minor)?;
-                write_nested_small(out, i64::from(entry.arity), *opts);
+                atom_bytes_in(table, out, entry.module(), opts.minor)?;
+                atom_bytes_in(table, out, entry.function(), opts.minor)?;
+                write_nested_small(out, i64::from(entry.arity()), *opts);
             }
             FunRef::Local { entry, free_vars } => {
                 out.push(112);

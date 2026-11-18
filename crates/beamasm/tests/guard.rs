@@ -288,7 +288,7 @@ fn function_arity(value: Term, arity: Option<Term>) -> bool {
     };
     rt::fun_ref(value).is_some_and(|fun| match fun {
         arinsal_term::FunRef::Local { entry, .. } => i64::from(entry.arity) == arity,
-        arinsal_term::FunRef::Export { entry } => i64::from(entry.arity) == arity,
+        arinsal_term::FunRef::Export { entry } => i64::from(entry.arity()) == arity,
     })
 }
 

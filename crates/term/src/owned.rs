@@ -1,7 +1,7 @@
 //! Heap-independent ETF values, built without calling ETF encoding or decoding.
 use crate::{
-    ExportEntry, FLOAT, FunEntry, FunRef, HeapAlloc, Identity, MagicBin, NEG_BIG, Node, POS_BIG,
-    Term, TermBuilder, TermError, TermKind, global_atoms,
+    FLOAT, FunEntry, FunRef, HeapAlloc, Identity, MagicBin, NEG_BIG, Node, POS_BIG, Term,
+    TermBuilder, TermError, TermKind, global_atoms,
 };
 use arinsal_etf::OwnedTerm;
 use num_bigint::{BigInt, Sign};
@@ -142,9 +142,9 @@ pub fn from_owned<H: HeapAlloc>(input: &OwnedTerm, heap: &mut H) -> Result<Term,
                     let function = global_atoms()
                         .intern(function)
                         .map_err(|_| TermError::SystemLimit)?;
-                    values.push(
-                        builder.export_fun(Arc::new(ExportEntry::new(module, function, *arity)))?,
-                    );
+                    values.push(builder.export_fun(crate::fun::export_get_or_make_stub(
+                        module, function, *arity,
+                    ))?);
                 }
                 OwnedTerm::Fun { pid, free_vars, .. } => {
                     tasks.push(Task::Fun(value));
@@ -389,14 +389,14 @@ pub fn to_owned(root: Term) -> Result<OwnedTerm, TermError> {
                     match unsafe { term.fun_ref().unwrap() } {
                         FunRef::Export { entry } => values.push(OwnedTerm::Export {
                             module: global_atoms()
-                                .text(entry.module)
+                                .text(entry.module())
                                 .ok_or(TermError::BadArg)?
                                 .to_string(),
                             function: global_atoms()
-                                .text(entry.function)
+                                .text(entry.function())
                                 .ok_or(TermError::BadArg)?
                                 .to_string(),
-                            arity: entry.arity,
+                            arity: entry.arity(),
                         }),
                         FunRef::Local { entry, free_vars } => {
                             tasks.push(Task::Fun(entry.clone(), free_vars.len()));

@@ -18,6 +18,7 @@ mod difftest;
 mod dirty;
 mod dist;
 mod erl_bits;
+mod erl_gc;
 mod erl_osenv;
 mod erl_poll;
 mod erl_trace;
@@ -32,6 +33,7 @@ mod funs;
 mod lists;
 mod monitor_link;
 mod process;
+mod raw;
 mod register;
 /// Run the persistent child-setup helper mode selected by the CLI.
 #[doc(hidden)]
@@ -233,12 +235,12 @@ impl std::fmt::Display for VmError {
                 f,
                 "trap to {}:{}/{}",
                 arinsal_term::global_atoms()
-                    .text(trap.entry.module)
+                    .text(trap.entry.module())
                     .unwrap_or("?"),
                 arinsal_term::global_atoms()
-                    .text(trap.entry.function)
+                    .text(trap.entry.function())
                     .unwrap_or("?"),
-                trap.entry.arity
+                trap.entry.arity()
             ),
         }
     }

@@ -3115,6 +3115,23 @@ impl ProcessHeap {
         self.live_frag_mark.set(self.abi.mbuf.as_ptr() as usize);
     }
 
+    /// `c_p->mbuf` as the running BIF found it at its entry: the `live_hf_end` its call
+    /// fragment spilled.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:385 (`mbuf` spilled in
+    // `emit_call_light_bif_shared`), OTP-29.1.1.
+    pub fn bif_live_hf_end(&self) -> usize {
+        self.live_frag_mark.get()
+    }
+
+    /// The `live_hf_end` argument of `erts_gc_after_bif_call_lhf`: the collection it starts
+    /// treats the fragments in front of it as completely live.
+    // Port of erts/emulator/beam/erl_gc.c:418-478 (erts_gc_after_bif_call_lhf passes
+    // `live_hf_end` to garbage_collect), OTP-29.1.1.
+    pub fn set_live_hf_end(&self, live_hf_end: usize) {
+        self.live_frag_mark.set(live_hf_end);
+        self.live_frags_armed.set(true);
+    }
+
     /// A BIF disables collection to trap: keep the mark taken at its entry as `c_p->live_hf_end`.
     // Port of erts/emulator/beam/erl_gc.c:428-436 (erts_gc_after_bif_call_lhf: the first trap
     // with F_DISABLE_GC saves live_hf_end), OTP-29.1.1.
@@ -5428,22 +5445,16 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     }
     /// Construct an export fun with no environment.
     pub fn export_fun(&mut self, entry: Arc<ExportEntry>) -> Result<Term, TermError> {
-        // An export fun points at its node's export entry, never at a detached copy: entries
-        // built without a node (literals, `binary_to_term`) are looked up in the export table.
-        // Port of erts/emulator/beam/external.c (dec_term FUN_EXT/EXPORT_EXT:
-        // erts_export_get_or_make_stub), OTP-29.1.1.
-        let entry = if entry.info() == 0 {
-            crate::fun::export_get_or_make_stub(entry.module, entry.function, entry.arity)
-        } else {
-            entry
-        };
+        // The fun is `entry`'s shared lambda; decoders pass the entry
+        // `erts_export_get_or_make_stub` found.
+        // Port of erts/emulator/beam/export.c:44-56 (create_shared_lambda), OTP-29.1.1.
         crate::fun::export_lambda(entry)
     }
 
     /// Build the heap object referenced by a global `Export.lambda` literal.
     pub(crate) fn export_fun_in_heap(&mut self, entry: &ExportEntry) -> Result<Term, TermError> {
         let p = self.words(2)?;
-        store(p, crate::fun::export_header(entry.arity));
+        store(p, crate::fun::export_header(entry.arity()));
         store(p.wrapping_add(1), std::ptr::from_ref(entry) as u64);
         Ok(Term::from_ptr(p, 2))
     }

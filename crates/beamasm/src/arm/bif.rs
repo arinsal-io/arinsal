@@ -194,9 +194,10 @@ pub use arinsal_term::{
     ERTS_ADDRESSV_SIZE, ERTS_NUM_CODE_IX, ERTS_SAVE_CALLS_CODE_IX, EXPORT_INFO_OFFSET,
     EXPORT_MFA_OFFSET, ExportEntry,
 };
-/// Byte offset of [`ExportEntry::arity`] for the light-BIF yield path.
+/// Byte offset of `Export.info.mfa.arity` (a word; its low byte on little-endian targets).
 // Port of erts/emulator/beam/export.h:69-86 (Export.info.mfa.arity), OTP-29.1.1.
-pub const EXPORT_ARITY_OFFSET: u32 = core::mem::offset_of!(ExportEntry, arity) as u32;
+pub const EXPORT_ARITY_OFFSET: u32 =
+    EXPORT_MFA_OFFSET + core::mem::offset_of!(arinsal_term::ErtsCodeMfa, arity) as u32;
 /// Byte offset of [`ExportEntry::is_bif_traced`].
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:391, OTP-29.1.1.
 pub const EXPORT_IS_BIF_TRACED_OFFSET: u32 =

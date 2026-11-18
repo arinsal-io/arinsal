@@ -8,8 +8,8 @@
 //! (`erts_decode_ext_size`) or the hash check rejects it.
 
 use crate::{
-    Atom, AtomEncoding, ExportEntry, FunEntry, HeapAlloc, MagicBin, Node, Term, TermBuilder,
-    TermKind, atoms, global_atoms,
+    Atom, AtomEncoding, FunEntry, HeapAlloc, MagicBin, Node, Term, TermBuilder, TermKind, atoms,
+    global_atoms,
 };
 use num_bigint::{BigInt, Sign};
 use std::sync::Arc;
@@ -481,11 +481,13 @@ impl<H: HeapAlloc> LiteralDecoder<'_, '_, H> {
                 };
                 self.values.truncate(start);
                 let arity = u8::try_from(arity.as_small()?).ok()?;
-                let entry = Arc::new(ExportEntry::new(
+                // Port of erts/emulator/beam/external.c (dec_term EXPORT_EXT:
+                // erts_export_get_or_make_stub), OTP-29.1.1.
+                let entry = crate::fun::export_get_or_make_stub(
                     module.as_atom()?,
                     function.as_atom()?,
                     arity,
-                ));
+                );
                 self.builder.export_fun(entry).ok()
             }
             Frame::Fun {

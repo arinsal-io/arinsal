@@ -353,7 +353,6 @@ fn native_i_call_fun2_exported_fun_m_f_1() {
         target,
         target,
     ));
-    entry.set_info(1);
     let export_term = builder.export_fun(entry).unwrap();
     let export_bits = arinsal_beamasm::rt::term_bits(export_term);
 

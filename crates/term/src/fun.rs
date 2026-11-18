@@ -261,54 +261,55 @@ pub struct ErtsCodeMfa {
     pub arity: u64,
 }
 
+/// `ErtsCodeInfo` of the JIT: the metadata word (`raise_function_clause` bytes and the
+/// `breakpoint_flag` byte), the generic breakpoint and the MFA. `c_p->current` points at `mfa`.
+// Port of erts/emulator/beam/code_ix.h:104-125 (ErtsCodeInfo, BEAMASM), OTP-29.1.1.
+#[derive(Debug)]
+#[repr(C)]
+pub struct ErtsCodeInfo {
+    /// `u.metadata`: `raise_function_clause[7]` then `breakpoint_flag` (top byte).
+    pub u: AtomicUsize,
+    /// `gen_bp`: the `GenericBp` of a breakpoint on this function, null when none.
+    pub gen_bp: AtomicUsize,
+    /// `mfa`.
+    pub mfa: ErtsCodeMfa,
+}
+
 /// Export entry (`Export`): one per MFA and code scope, shared by external calls and by every
 /// `fun M:F/A` of that MFA, whose fun thing points at it.
-// Port of erts/emulator/beam/export.h:39-75 (Export: dispatch first, then the info word and
-// the MFA), OTP-29.1.1.
+// Port of erts/emulator/beam/export.h:39-102 (Export), OTP-29.1.1.
 #[derive(Debug)]
 #[repr(C)]
 pub struct ExportEntry {
     /// Native entry addresses indexed by code index (`Export.dispatch`); must stay first.
     pub dispatch: ErtsDispatchable,
-    /// The runtime's descriptor of this export (its BIF and call class), set once when the
-    /// node creates the export. Generated code reads it next to the addresses.
-    pub info: AtomicUsize,
-    /// Non-zero when this BIF export is traced. The light-BIF fragment loads it before the call.
-    // Port of erts/emulator/beam/export.h:58 (Export.is_bif_traced), OTP-29.1.1.
-    pub is_bif_traced: AtomicI32,
-    /// Module.
-    pub module: Atom,
-    /// Function.
-    pub function: Atom,
-    /// Arity.
-    pub arity: u8,
-    /// Globally shared zero-environment fun literal for this export.
-    // Port of erts/emulator/beam/export.h:62 and export.c:44-56 (Export.lambda), OTP-29.1.1.
-    pub(crate) lambda: OnceLock<Term>,
     /// Index into the BIF table, or -1 when this is not a BIF (`Export.bif_number`).
-    // Port of erts/emulator/beam/export.h:55 (Export.bif_number), OTP-29.1.1.
     pub bif_number: AtomicI32,
-    /// `Export.trampoline`: what the shared export trampoline stands for while an address of
-    /// this export enters it.
-    // Port of erts/emulator/beam/export.h:64-102 (Export.trampoline), OTP-29.1.1.
+    /// Non-zero when this BIF export is traced (`Export.is_bif_traced`).
+    pub is_bif_traced: AtomicI32,
+    /// `Export.lambda`: the globally shared external fun literal, [`crate::THE_NON_VALUE`]
+    /// until it is created.
+    pub lambda: AtomicU64,
+    /// `Export.info`.
+    pub info: ErtsCodeInfo,
+    /// `Export.trampoline`.
     pub trampoline: ExportTrampoline,
-    /// `Export.info.mfa`: `current` points here while the export's trampoline runs a BIF.
-    // Port of erts/emulator/beam/export.h:66 (Export.info), OTP-29.1.1.
-    pub mfa: ErtsCodeMfa,
 }
 
-/// `Export.trampoline` of the JIT: the opcode it stands for and its one argument word. BeamAsm
-/// enters one shared `beam_export_trampoline` for every export, which reads these.
+/// `Export.trampoline` of the JIT: `OP_PAD`, the opcode it stands for and its one argument
+/// word. BeamAsm enters one shared `export_trampoline` for every export, which reads these.
 // Port of erts/emulator/beam/export.h:64-102, OTP-29.1.1.
 #[derive(Debug)]
 #[repr(C)]
 pub struct ExportTrampoline {
-    /// [`TRAMPOLINE_NONE`], [`OP_CALL_ERROR_HANDLER`] or [`OP_I_GENERIC_BREAKPOINT`]
-    /// (`trampoline.common.op`).
+    /// `OP_PAD` (`BeamInstr __pad[1]` under BEAMASM).
+    pub pad: usize,
+    /// [`TRAMPOLINE_NONE`], [`OP_CALL_BIF_W`], [`OP_CALL_ERROR_HANDLER`] or
+    /// [`OP_I_GENERIC_BREAKPOINT`] (`trampoline.common.op`).
     pub op: AtomicUsize,
-    /// `trampoline.breakpoint.address` (the code a global call breakpoint continues to) or
-    /// `trampoline.not_loaded.deferred` (an exported function of code whose on_load function
-    /// has not finished).
+    /// `trampoline.bif.address` (the C function), `trampoline.breakpoint.address` (the code a
+    /// global call breakpoint continues to) or `trampoline.not_loaded.deferred` (an exported
+    /// function of code whose on_load function has not finished).
     pub address: AtomicUsize,
 }
 
@@ -343,11 +344,20 @@ pub const EXPORT_TRAMPOLINE_OP_OFFSET: u32 = (core::mem::offset_of!(ExportEntry,
     + core::mem::offset_of!(ExportTrampoline, op))
     as u32;
 
-/// Byte offset of [`ExportEntry::info`] for generated loads.
+/// Byte offset of `Export.info` (`ErtsCodeInfo`).
 pub const EXPORT_INFO_OFFSET: u32 = core::mem::offset_of!(ExportEntry, info) as u32;
-/// Byte offset of [`ExportEntry::mfa`] (`Export.info.mfa`): the address `c_p->current` holds.
-pub const EXPORT_MFA_OFFSET: u32 = core::mem::offset_of!(ExportEntry, mfa) as u32;
+/// Byte offset of `Export.info.mfa`: the address `c_p->current` holds.
+pub const EXPORT_MFA_OFFSET: u32 =
+    (core::mem::offset_of!(ExportEntry, info) + core::mem::offset_of!(ErtsCodeInfo, mfa)) as u32;
 const _: () = assert!(core::mem::offset_of!(ExportEntry, dispatch) == 0);
+// erts' x86-64/AArch64 `Export` offsets (+JDdump: `[rcx+36]`, `add rcx, 64`, `cmp [..+96]`).
+const _: () = assert!(core::mem::offset_of!(ExportEntry, bif_number) == 32);
+const _: () = assert!(core::mem::offset_of!(ExportEntry, is_bif_traced) == 36);
+const _: () = assert!(core::mem::offset_of!(ExportEntry, lambda) == 40);
+const _: () = assert!(EXPORT_INFO_OFFSET == 48);
+const _: () = assert!(EXPORT_MFA_OFFSET == 64);
+const _: () = assert!(EXPORT_TRAMPOLINE_OP_OFFSET == 96);
+const _: () = assert!(core::mem::size_of::<ExportEntry>() == 112);
 const _: () = assert!(core::mem::offset_of!(FunEntry, dispatch_target) == 0);
 
 impl ExportEntry {
@@ -372,25 +382,46 @@ impl ExportEntry {
     ) -> Self {
         Self {
             dispatch: ErtsDispatchable::new(address, save_calls),
-            info: AtomicUsize::new(0),
-            is_bif_traced: AtomicI32::new(0),
-            module,
-            function,
-            arity,
-            lambda: OnceLock::new(),
             bif_number: AtomicI32::new(-1),
+            is_bif_traced: AtomicI32::new(0),
+            lambda: AtomicU64::new(crate::THE_NON_VALUE),
+            info: ErtsCodeInfo {
+                u: AtomicUsize::new(0),
+                gen_bp: AtomicUsize::new(0),
+                mfa: ErtsCodeMfa {
+                    module: Term::atom(module).0,
+                    function: Term::atom(function).0,
+                    arity: arity as u64,
+                },
+            },
             // Port of erts/emulator/beam/export.c:85-87 (export_init: op_call_error_handler
             // once the opcodes are initialized), OTP-29.1.1.
             trampoline: ExportTrampoline {
+                pad: 0,
                 op: AtomicUsize::new(OP_CALL_ERROR_HANDLER),
                 address: AtomicUsize::new(0),
             },
-            mfa: ErtsCodeMfa {
-                module: Term::atom(module).0,
-                function: Term::atom(function).0,
-                arity: arity as u64,
-            },
         }
+    }
+
+    /// `info.mfa.module`.
+    pub const fn module(&self) -> Atom {
+        Atom((self.info.mfa.module >> 6) as u32)
+    }
+
+    /// `info.mfa.function`.
+    pub const fn function(&self) -> Atom {
+        Atom((self.info.mfa.function >> 6) as u32)
+    }
+
+    /// `info.mfa.arity`.
+    pub const fn arity(&self) -> u8 {
+        self.info.mfa.arity as u8
+    }
+
+    /// `Export.info.mfa`.
+    pub const fn mfa(&self) -> &ErtsCodeMfa {
+        &self.info.mfa
     }
 
     /// `Export.bif_number`, -1 when this is not a BIF.
@@ -423,16 +454,6 @@ impl ExportEntry {
         self.trampoline.address.store(address, Ordering::Release);
     }
 
-    /// The runtime descriptor word published by [`ExportEntry::set_info`], zero before it.
-    pub fn info(&self) -> usize {
-        self.info.load(Ordering::Acquire)
-    }
-
-    /// Publishes the runtime descriptor word.
-    pub fn set_info(&self, info: usize) {
-        self.info.store(info, Ordering::Release);
-    }
-
     /// Publishes `Export.is_bif_traced` for the light-BIF fragment's load.
     // Port of erts/emulator/beam/beam_bp.c:374 (ep->is_bif_traced = ...), OTP-29.1.1.
     pub fn set_bif_traced(&self, traced: bool) {
@@ -452,7 +473,10 @@ impl ExportEntry {
 
     /// Cached `Export.lambda` literal, if one has been requested.
     pub(crate) fn lambda(&self) -> Option<Term> {
-        self.lambda.get().copied()
+        match self.lambda.load(Ordering::Acquire) {
+            crate::THE_NON_VALUE => None,
+            word => Some(Term(word)),
+        }
     }
 
     /// Copies the address of code index `src` into `dst`.
@@ -480,8 +504,8 @@ pub(crate) fn export_lambda(entry: Arc<ExportEntry>) -> Result<Term, TermError> 
         return Ok(lambda);
     }
     let lambda = literals.builder().export_fun_in_heap(entry.as_ref())?;
-    let _ = entry.lambda.set(lambda);
-    Ok(entry.lambda().unwrap_or(lambda))
+    entry.lambda.store(lambda.0, Ordering::Release);
+    Ok(lambda)
 }
 
 // This table covers entries whose callers are outside a node's export table.

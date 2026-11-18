@@ -950,18 +950,6 @@ mod tests {
         line
     }
 
-    /// Rewrites erts' `Export` field offsets in one line of `call_light_bif_shared`.
-    fn export_offsets(line: &str) -> String {
-        let mfa = arinsal_term::EXPORT_MFA_OFFSET;
-        let traced = core::mem::offset_of!(arinsal_term::ExportEntry, is_bif_traced);
-        let arity = mfa as usize + core::mem::offset_of!(ErtsCodeMfa, arity);
-        line.replace("[rcx+36]", &format!("[rcx+{traced}]"))
-            .replace("[rcx+80]", &format!("[rcx+{arity}]"))
-            .replace("[r8+80]", &format!("[r8+{arity}]"))
-            .replace("[rcx+64]", &format!("[rcx+{mfa}]"))
-            .replace("add rcx, 64", &format!("add rcx, {mfa}"))
-    }
-
     // Differential check against erts: the fragment table is emitted in the order of the
     // `global::` labels of `erl +JDdump true`, and every fragment the constructor emits encodes
     // the same instructions as erts' (with Arinsal's process and scheduler register layouts and
@@ -1048,16 +1036,6 @@ mod tests {
             let lines: Vec<String> = fragment_lines(&dump, label.name())
                 .into_iter()
                 .map(|l| rewrite(l, &mut static_addresses))
-                // `offsetof(Export, info.mfa)`: 64 in erts, Arinsal's `ExportEntry.mfa`.
-                .map(|l| match (label, l.as_str()) {
-                    (GlobalLabels::BifExportTrap, "sub rax, 64") => {
-                        format!("sub rax, {}", arinsal_term::EXPORT_MFA_OFFSET)
-                    }
-                    // `Export.is_bif_traced` and `Export.info.mfa(.arity)`: 36, 64 and 80
-                    // in erts, `ExportEntry`'s fields here.
-                    (GlobalLabels::CallLightBifShared, _) => export_offsets(&l),
-                    _ => l,
-                })
                 .collect();
             // erts' range runs to the next fragment; its last bytes are `align 8` padding.
             let ours = &code[range.clone()];

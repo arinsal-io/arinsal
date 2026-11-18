@@ -212,7 +212,7 @@ impl Vm {
         let view = unsafe { fun.fun_ref() };
         let actual = match &view {
             Some(FunRef::Local { entry, .. }) => Some(entry.arity as usize),
-            Some(FunRef::Export { entry }) => Some(entry.arity as usize),
+            Some(FunRef::Export { entry }) => Some(entry.arity() as usize),
             None => None,
         };
         if actual != Some(arity) {
@@ -261,9 +261,9 @@ impl Vm {
                 Ok(ImportOutcome::Dispatch)
             }
             FunRef::Export { entry } => {
-                let module = atom_name(Term::atom(entry.module))
+                let module = atom_name(Term::atom(entry.module()))
                     .ok_or_else(|| VmError::Unsupported("export module atom".into()))?;
-                let function = atom_name(Term::atom(entry.function))
+                let function = atom_name(Term::atom(entry.function()))
                     .ok_or_else(|| VmError::Unsupported("export function atom".into()))?;
                 if module == "erlang" && function == "apply" && matches!(arity, 2 | 3) {
                     return self.apply_bif(p, arity, ctx);
@@ -273,8 +273,8 @@ impl Vm {
                 let began = p.begin_tail_apply(crate::proc_create::TAIL_FUN_CALL);
                 let result = self.call_named_atoms(
                     p,
-                    entry.module,
-                    entry.function,
+                    entry.module(),
+                    entry.function(),
                     &module,
                     &function,
                     arity,
@@ -415,8 +415,8 @@ impl Vm {
                 trap.args.len()
             )));
         }
-        let module_atom = trap.entry.module;
-        let function_atom = trap.entry.function;
+        let module_atom = trap.entry.module();
+        let function_atom = trap.entry.function();
         if !crate::trace_bp::any_pattern()
             && !crate::trace::saves_calls(p)
             && !self.unloaded_on_load(p, module)
@@ -1351,9 +1351,9 @@ impl Vm {
                 (entry.module, self.fun_function_name(entry), entry.arity)
             }
             FunRef::Export { entry } => (
-                entry.module,
-                atom_name(Term::atom(entry.function)),
-                entry.arity,
+                entry.module(),
+                atom_name(Term::atom(entry.function())),
+                entry.arity(),
             ),
         };
         let name = match name {
@@ -1442,7 +1442,7 @@ impl Vm {
                         .map_err(|_| VmError::Unsupported("atom undefined".into()))?,
                 ),
                 (FunRef::Local { entry, .. }, "module") => Term::atom(entry.module),
-                (FunRef::Export { entry }, "module") => Term::atom(entry.module),
+                (FunRef::Export { entry }, "module") => Term::atom(entry.module()),
                 (FunRef::Local { entry, .. }, "index") => {
                     Term::small(i64::from(entry.old_index))
                         .ok_or_else(|| VmError::Unsupported("fun index".into()))?
@@ -1467,11 +1467,13 @@ impl Vm {
                         Term::NIL
                     }
                 }
-                (FunRef::Export { entry }, "name") => Term::atom(entry.function),
+                (FunRef::Export { entry }, "name") => Term::atom(entry.function()),
                 (FunRef::Local { entry, .. }, "arity") => {
                     Term::small(i64::from(entry.arity)).unwrap()
                 }
-                (FunRef::Export { entry }, "arity") => Term::small(i64::from(entry.arity)).unwrap(),
+                (FunRef::Export { entry }, "arity") => {
+                    Term::small(i64::from(entry.arity())).unwrap()
+                }
                 (FunRef::Local { free_vars, .. }, "env") => {
                     let mut list = Term::NIL;
                     for &word in free_vars.iter().rev() {

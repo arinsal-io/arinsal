@@ -1487,7 +1487,7 @@ fn builtin(name: &str, args: &[Term], scratch: &mut VecHeap) -> Result<Term, Ets
             // SAFETY: the match source or scratch heap owns the fun.
             truth(unsafe { a.fun_ref() }.is_some_and(|fun| match fun {
                 arinsal_term::FunRef::Local { entry, .. } => BigInt::from(entry.arity) == arity,
-                arinsal_term::FunRef::Export { entry } => BigInt::from(entry.arity) == arity,
+                arinsal_term::FunRef::Export { entry } => BigInt::from(entry.arity()) == arity,
             }))
         }
         "is_record" => {

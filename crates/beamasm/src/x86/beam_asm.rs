@@ -282,52 +282,7 @@ pub const fn emit_boxed_val(src: Gp, bytes: i32, size: u8) -> Mem {
     Mem::base_disp(src, bytes - TAG_PRIMARY_BOXED as i32, size)
 }
 
-/// `offsetof(Process, field)` of the fields x86 native code addresses through `c_p`.
-// Port of erts/emulator/beam/erl_process.h (struct process), OTP-29.1.1: Arinsal's
-// `ProcessHeader` is the native prefix of the process.
-pub mod process {
-    use crate::ProcessHeader;
-    use core::mem::offset_of;
-
-    /// `offsetof(Process, htop)`.
-    pub const HTOP: i32 = offset_of!(ProcessHeader, htop) as i32;
-    /// `offsetof(Process, stop)`.
-    pub const STOP: i32 = offset_of!(ProcessHeader, stop) as i32;
-    /// `offsetof(Process, heap)`.
-    pub const HEAP: i32 = offset_of!(ProcessHeader, heap) as i32;
-    /// `offsetof(Process, hend)`.
-    pub const HEND: i32 = offset_of!(ProcessHeader, hend) as i32;
-    /// `offsetof(Process, fcalls)`.
-    pub const FCALLS: i32 = offset_of!(ProcessHeader, fcalls) as i32;
-    /// `offsetof(Process, freason)`.
-    pub const FREASON: i32 = offset_of!(ProcessHeader, exc.freason) as i32;
-    /// `offsetof(Process, fvalue)`.
-    pub const FVALUE: i32 = offset_of!(ProcessHeader, exc.fvalue) as i32;
-    /// `offsetof(Process, ftrace)`.
-    pub const FTRACE: i32 = offset_of!(ProcessHeader, exc.ftrace) as i32;
-    /// `offsetof(Process, i)`.
-    pub const I: i32 = offset_of!(ProcessHeader, i) as i32;
-    /// `offsetof(Process, arity)`.
-    pub const ARITY: i32 = offset_of!(ProcessHeader, arity) as i32;
-    /// `offsetof(Process, current)`.
-    pub const CURRENT: i32 = offset_of!(ProcessHeader, current) as i32;
-    /// `offsetof(Process, common.id)`.
-    pub const SELF_PID: i32 = offset_of!(ProcessHeader, self_pid) as i32;
-    /// `offsetof(Process, flags)`.
-    pub const FLAGS: i32 = offset_of!(ProcessHeader, flags) as i32;
-    /// `offsetof(Process, catches)`.
-    // Port of erts/emulator/beam/erl_process.h (struct process), OTP-29.1.1.
-    pub const CATCHES: i32 = offset_of!(ProcessHeader, catches) as i32;
-    /// `offsetof(Process, mbuf)`.
-    pub const MBUF: i32 = offset_of!(ProcessHeader, mbuf) as i32;
-    /// `offsetof(Process, mbuf_sz)`.
-    pub const MBUF_SZ: i32 = offset_of!(ProcessHeader, mbuf_sz) as i32;
-    /// `offsetof(Process, bin_vheap_sz)`. The process starts with its `ProcessHeap` (the VM
-    /// asserts `offset_of!(Process, heap) == 0`), so the heap's offsets are `c_p`'s.
-    pub const BIN_VHEAP_SZ: i32 = arinsal_term::ProcessHeap::BIN_VHEAP_SIZE_OFFSET as i32;
-    /// `offsetof(Process, off_heap.overhead)`, see [`BIN_VHEAP_SZ`].
-    pub const OFF_HEAP_OVERHEAD: i32 = arinsal_term::ProcessHeap::OFF_HEAP_OVERHEAD_OFFSET as i32;
-}
+pub use crate::common::process;
 
 /// `x86::ptr(c_p, offsetof(Process, field), size)`.
 pub const fn process_ref(offset: i32, size: u8) -> Mem {
