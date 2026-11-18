@@ -36,7 +36,7 @@ impl Process {
             );
         }
         // Port of erts/emulator/beam/erl_gc.c:782-785 (garbage_collect: F_DELAY_GC), OTP-29.1.1.
-        if !hibernate && self.delay_gc {
+        if !hibernate && self.delay_gc() {
             self.heap.delay_collection(min_free);
             return Ok(arinsal_term::GcStats::default());
         }

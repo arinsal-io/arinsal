@@ -35,11 +35,13 @@ impl Process {
             return;
         };
         if let Ok(scheduler) = runtime.scheduler() {
-            scheduler.with_proc_flags(pid, |flags| {
+            // erts_change_message_queue_management sets/clears ERTS_PSFLG_OFF_HEAP_MSGQ in
+            // `c_p->state` with an atomic bor/band.
+            scheduler.with_proc_state(pid, |state| {
                 if off_heap {
-                    proc_flags::set_state(flags, proc_flags::OFF_HEAP_MSGQ);
+                    state.fetch_or(arinsal_sched::psflg::OFF_HEAP_MSGQ, Ordering::AcqRel);
                 } else {
-                    proc_flags::clear_state(flags, proc_flags::OFF_HEAP_MSGQ);
+                    state.fetch_and(!arinsal_sched::psflg::OFF_HEAP_MSGQ, Ordering::AcqRel);
                 }
             });
         }

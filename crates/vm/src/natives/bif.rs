@@ -1122,7 +1122,7 @@ fn link_opt(
         }
         let runtime = process.runtime.ok_or_else(badarg)?;
         let scheduler = runtime.scheduler()?;
-        if !process.trap_exit && !scheduler.lookup_from(pid, process.on_managed) {
+        if !process.trap_exit() && !scheduler.lookup_from(pid, process.on_managed) {
             return link_no_proc(process);
         }
         // erts_link_internal_tree_lookup_create; a link that exists and is not unlinking sends
@@ -1164,7 +1164,7 @@ fn link_opt(
     if let Some(id) = other.as_port() {
         // `!prt && !(c_p->flags & F_TRAP_EXIT)`: res_no_proc.
         let live = crate::port::is_live(process, id);
-        if !live && !process.trap_exit {
+        if !live && !process.trap_exit() {
             return link_no_proc(process);
         }
         // erts_link_internal_tree_lookup_create + link_modify_flags: the link (with its
@@ -1200,7 +1200,7 @@ fn link_opt(
             crate::dist::link_remote(process, ctx, &node, other, priority)
         })?,
         // An old incarnation of this node: `noproc`, or its link exit when trapping exits.
-        External::ThisNode if !process.trap_exit => link_no_proc(process),
+        External::ThisNode if !process.trap_exit() => link_no_proc(process),
         External::ThisNode => {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             let exit = arinsal_term::TermBuilder::new(&mut heap)
@@ -1479,7 +1479,7 @@ fn send_exit_signal_bif(
         let exit2_suicide = exit2
             && alias == 0
             && pid == me
-            && (reason == Term::atom(atoms::KILL) || !process.trap_exit);
+            && (reason == Term::atom(atoms::KILL) || !process.trap_exit());
         if exit2_suicide {
             // The self-signal is handled at once (await_exit_trap); `kill` becomes `killed`.
             if reason == Term::atom(atoms::KILL) {

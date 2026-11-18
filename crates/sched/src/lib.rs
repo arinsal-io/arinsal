@@ -84,6 +84,7 @@ pub use timer::{TimerId, TimerRef};
 
 use arinsal_term::ptab::{PTAB_ID_DATA_MASK, PtabIdRing};
 pub use proc_ref::SignalProbe;
+use proc_ref::raw::{ProcLock, ProcLockGuard};
 use proc_ref::{ErasedProcRef, ProcRef, TaskCell};
 use std::any::Any;
 use std::cell::RefCell;
@@ -1532,8 +1533,14 @@ impl<M: SignalMessage> SignalProbe<M> {
     /// `ERTS_PSFLG_EXITING | SIG_Q | MSG_SIG_IN_Q | NMSG_SIG_IN_Q`, read without a table lookup
     /// (`ERTS_PROC_HAS_INCOMING_SIGNALS(c_p)`).
     pub fn is_quiet(&self) -> bool {
-        self.flags().load(Ordering::Acquire) & proc_flags::EXITING == 0
-            && self.input().state().load(Ordering::Acquire) & (psflg::SIG_Q | psflg::SIG_IN_Q) == 0
+        self.input().state().load(Ordering::Acquire)
+            & (psflg::EXITING | psflg::SIG_Q | psflg::SIG_IN_Q)
+            == 0
+    }
+
+    /// The process state word (`c_p->state`, [`psflg`]), read without a table lookup.
+    pub fn proc_state(&self) -> &AtomicU32 {
+        self.input().state()
     }
 
     /// The process's state flags ([`proc_flags`]), read without a table lookup.
@@ -1624,31 +1631,6 @@ pub mod proc_flags {
     pub const DIST_SPAWN: u32 = 1 << 10;
     pub const OWNED_TIMERS: u32 = 1 << 11;
     pub const ALL: u32 = (1 << 12) - 1;
-    /// `ERTS_PSFLG_EXITING`, outside `ALL` so cleanup does not retire the bit.
-    /// Port of erl_nif.c:2323 (`enif_is_process_alive` sees the state flag), OTP-29.1.1.
-    pub const EXITING: u32 = 1 << 15;
-    /// The process is parked in `erts_hibernate` (erl_process.c:9304 reads it for `status`).
-    /// It is a state bit the process sets on itself, outside `ALL` like `EXITING`.
-    pub const HIBERNATED: u32 = 1 << 14;
-    /// `ERTS_PSFLG_SUSPENDED`: the process has an active suspend (erl_process.c:7235 suspend_process).
-    /// Set by the suspend path, cleared when the last suspend is released. Outside `ALL`.
-    pub const SUSPENDED: u32 = 1 << 13;
-    /// `F_DISTRIBUTION`: the process is `net_kernel` (set by `setnode/2` under the thread
-    /// progress block), so its exit runs `erts_do_net_exits` for this node. Outside `ALL`.
-    pub const DISTRIBUTION: u32 = 1 << 12;
-    /// `ERTS_PSFLG_OFF_HEAP_MSGQ`: the message queue is off heap, so a sender builds each
-    /// message in a combined node instead of trying the receiver's heap. Outside `ALL` and its
-    /// done bits. Port of erts/emulator/beam/erl_process.h (ERTS_PSFLG_OFF_HEAP_MSGQ) and
-    /// erl_message.c (erts_alloc_message_heap_state), OTP-29.1.1.
-    pub const OFF_HEAP_MSGQ: u32 = 1 << 28;
-    /// Sets a state bit of the owning process (no cleanup bookkeeping).
-    pub fn set_state(flags: &AtomicU32, bit: u32) {
-        flags.fetch_or(bit, Ordering::AcqRel);
-    }
-    /// Clears a state bit of the owning process.
-    pub fn clear_state(flags: &AtomicU32, bit: u32) {
-        flags.fetch_and(!bit, Ordering::AcqRel);
-    }
     const DONE_SHIFT: u32 = 16;
 
     /// Bits whose global tables exit must still visit.
@@ -1691,19 +1673,17 @@ struct ProcShared<M: SignalMessage> {
     /// Creation order of this incarnation, so a reused pid is distinguishable.
     /// Port of erts/emulator/beam/erl_ptab.c:530 (`u.alive.started_interval`), OTP-29.1.1.
     started_interval: u64,
-    /// User priority (`process_flag(priority, _)`).
-    /// Port of erl_process.h (`ERTS_PSFLGS_USR_PRIO_MASK`), OTP-29.1.1.
-    user_priority: AtomicU8,
-    /// erts `ERTS_PSFLG_ACTIVE` as seen by other processes: cleared when a slice ends
-    /// waiting in a receive, set when it ends runnable.
+    /// How the last slice ended, as `process_info(_, status)` asked by another process reads it:
+    /// cleared when a slice ends waiting in a receive, set when it ends runnable. erts reads
+    /// `ERTS_PSFLG_ACTIVE` of the state word instead; here a signal wakes a waiting process
+    /// with `ACTIVE` (not `ACTIVE_SYS` + `RUNNING_SYS`), so the state word's bit says
+    /// "runnable" while it only handles signals.
     active: AtomicBool,
-    /// Priority of the highest pending system task, [`NO_SYS_PRIORITY`] when none.
-    /// The actual priority is the higher of the two.
-    /// Port of erl_process.h (`ERTS_PSFLGS_ACT_PRIO_MASK`, `ERTS_PSFLG_SYS_TASKS`), OTP-29.1.1.
+    /// Priority of the highest pending system task, [`NO_SYS_PRIORITY`] when none: the
+    /// lowest set bit of erts `p->sys_task_qs->qmask`, which `fetch_sys_task` and
+    /// `erts_set_process_priority` recompute the actual priority from. The actual and user
+    /// priorities and `ERTS_PSFLG_SYS_TASKS` are in the state word.
     sys_priority: AtomicU8,
-    /// erts `ERTS_PSFLG_ACTIVE_SYS`: system tasks are queued on the process and not yet run, so
-    /// the process stays active when its slice ends. Consumed by `schedule_out`.
-    active_sys: AtomicBool,
     /// `Process.next/prev`, `schedule_count` and `ERTS_PSFLG_IN_RUNQ`: the run queue links.
     rq_link: run_queue::RqLink,
     bound_worker: AtomicUsize,
@@ -1747,10 +1727,35 @@ struct ProcShared<M: SignalMessage> {
     xstate: AtomicU32,
 }
 
+#[repr(C)]
 struct Process<T: Task> {
-    shared: ProcShared<T::Message>,
     /// The process main lock: embedded in the process, as erts' `p->lock`, with no allocation.
-    cell: parking_lot::Mutex<TaskCell<T>>,
+    /// The task it guards is the first member of the process struct, so the task's native
+    /// prefix (`c_p`) and the process struct have the same address, and every field below is
+    /// at a fixed offset from `c_p` (erts reads `c_p->state` at `offsetof(Process, state)`).
+    cell: ProcLock<TaskCell<T>>,
+    shared: ProcShared<T::Message>,
+}
+
+impl<T: Task> Process<T> {
+    /// Offset of the state word (`p->state`) from the start of the process struct, which is
+    /// the start of the task.
+    // Port of erts/emulator/beam/erl_process.h (`erts_atomic32_t state` in `struct process`),
+    // OTP-29.1.1.
+    const STATE_OFFSET: usize = std::mem::offset_of!(Process<T>, shared)
+        + std::mem::offset_of!(ProcShared<T::Message>, input)
+        + Incoming::<Event<T::Message>>::STATE_OFFSET;
+    /// Offset of the task from the start of the process struct: zero.
+    const TASK_OFFSET: usize = std::mem::offset_of!(Process<T>, cell)
+        + ProcLock::<TaskCell<T>>::DATA_OFFSET
+        + TaskCell::<T>::TASK_OFFSET;
+}
+
+/// Offset of the process state word (`p->state`, [`psflg`]) from the task of process type `T`,
+/// which is where generated code's `c_p` points (`offsetof(Process, state)` in erts).
+pub const fn process_state_offset<T: Task>() -> usize {
+    assert!(Process::<T>::TASK_OFFSET == 0);
+    Process::<T>::STATE_OFFSET
 }
 
 impl<T: Task> std::ops::Deref for Process<T> {
@@ -1803,12 +1808,99 @@ impl<M: SignalMessage> ProcShared<M> {
     fn run_state(&self) -> RunStateWord<'_> {
         RunStateWord(self.input.state())
     }
-    /// Actual priority: the user priority, elevated by pending system tasks.
-    /// Port of erts/emulator/beam/erl_process.c:10737 (fetch_sys_task act prio), OTP-29.1.1.
+    /// Actual priority (`ERTS_PSFLGS_GET_ACT_PRIO(state)`): the user priority, elevated by
+    /// pending system tasks.
     fn priority(&self) -> Priority {
-        let user = self.user_priority.load(Ordering::Acquire);
-        let sys = self.sys_priority.load(Ordering::Acquire);
-        Priority::from_index(user.min(sys))
+        Priority::from_index(psflg::act_prio(self.input.state().load(Ordering::Acquire)) as u8)
+    }
+
+    /// User priority (`ERTS_PSFLGS_GET_USR_PRIO(state)`).
+    fn user_priority(&self) -> Priority {
+        Priority::from_index(psflg::usr_prio(self.input.state().load(Ordering::Acquire)) as u8)
+    }
+
+    /// A system task at `prio` is queued: record it in the task queue mask, set
+    /// `ERTS_PSFLG_SYS_TASKS` and elevate the actual priority to it. Returns the state before.
+    // Port of erts/emulator/beam/erl_process.c:7028-7100 (active_sys_enqueue: the
+    // `ERTS_PSFLGS_ACT_PRIO_MASK` elevation in the cmpxchg loop and the `sys_task_qs->qmask`
+    // update), OTP-29.1.1.
+    fn elevate_sys_task_prio(&self, prio: Priority, enable_flags: u32) -> u32 {
+        let task_prio = prio.index() as u32;
+        self.sys_priority
+            .fetch_min(task_prio as u8, Ordering::SeqCst);
+        let mut a = self.input.state().load(Ordering::SeqCst);
+        loop {
+            let mut n = a | psflg::SYS_TASKS | enable_flags;
+            if psflg::act_prio(a) > task_prio {
+                n = (n & !psflg::ACT_PRIO_MASK) | (task_prio << psflg::ACT_PRIO_OFFSET);
+            }
+            match self
+                .input
+                .state()
+                .compare_exchange_weak(a, n, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return a,
+                Err(current) => a = current,
+            }
+        }
+    }
+
+    /// Every system task ran: clear `ERTS_PSFLG_SYS_TASKS` and drop the actual priority back
+    /// to the user priority, unless a task queued meanwhile.
+    // Port of erts/emulator/beam/erl_process.c:10712-10776 (fetch_sys_task: `update_state`
+    // recomputes ACT_PRIO from the user priority and the remaining qmask), OTP-29.1.1.
+    fn reset_sys_task_prio(&self) {
+        self.sys_priority.store(NO_SYS_PRIORITY, Ordering::SeqCst);
+        let mut a = self.input.state().load(Ordering::SeqCst);
+        loop {
+            let st_prio = u32::from(self.sys_priority.load(Ordering::SeqCst));
+            let prio = psflg::usr_prio(a).min(st_prio);
+            let mut n = (a & !psflg::ACT_PRIO_MASK) | (prio << psflg::ACT_PRIO_OFFSET);
+            if st_prio == u32::from(NO_SYS_PRIORITY) {
+                n &= !psflg::SYS_TASKS;
+            }
+            if n == a {
+                return;
+            }
+            match self
+                .input
+                .state()
+                .compare_exchange_weak(a, n, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return,
+                Err(current) => a = current,
+            }
+        }
+    }
+
+    /// Set the user priority; the actual priority follows it unless system tasks keep it
+    /// elevated. It takes effect when the process is next queued.
+    // Port of erts/emulator/beam/erl_process.c:9456-9545 (erts_set_process_priority),
+    // OTP-29.1.1.
+    fn set_user_priority(&self, nprio: Priority) {
+        let nprio = nprio.index() as u32;
+        let mut a = self.input.state().load(Ordering::Relaxed);
+        if psflg::usr_prio(a) == nprio {
+            return;
+        }
+        loop {
+            let aprio = if a & psflg::SYS_TASKS == 0 {
+                nprio
+            } else {
+                nprio.min(u32::from(self.sys_priority.load(Ordering::SeqCst)))
+            };
+            let n = (a & !(psflg::USR_PRIO_MASK | psflg::ACT_PRIO_MASK))
+                | (nprio << psflg::USR_PRIO_OFFSET)
+                | (aprio << psflg::ACT_PRIO_OFFSET);
+            match self
+                .input
+                .state()
+                .compare_exchange_weak(a, n, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return,
+                Err(current) => a = current,
+            }
+        }
     }
 
     fn bound_worker(&self) -> Option<usize> {
@@ -2221,10 +2313,8 @@ impl<T: Task> ProcessTable<T> {
                     // Port of erts/emulator/beam/erl_ptab.c (erts_ptab_new_element:
                     // erts_current_interval_nob), OTP-29.1.1.
                     started_interval: context.started_interval,
-                    user_priority: AtomicU8::new(priority.index() as u8),
                     active: AtomicBool::new(true),
                     sys_priority: AtomicU8::new(NO_SYS_PRIORITY),
-                    active_sys: AtomicBool::new(false),
                     rq_link: run_queue::RqLink::default(),
                     bound_worker: AtomicUsize::new(bound_worker.unwrap_or(UNBOUND_WORKER)),
                     scheduler_id: AtomicUsize::new(0),
@@ -2240,10 +2330,10 @@ impl<T: Task> ProcessTable<T> {
                     exit_resume: AtomicBool::new(false),
                     reg_atom: AtomicU32::new(u32::MAX),
                     rtimer: ReceiveTimer::default(),
-                    input: Incoming::default(),
+                    input: Incoming::with_state(psflg::initial(priority.index() as u32)),
                     xstate: AtomicU32::new(0),
                 },
-                cell: parking_lot::Mutex::new(TaskCell::uninit()),
+                cell: ProcLock::new(TaskCell::uninit()),
             },
             |process, context| {
                 // alloc_process: the task is written straight into the allocated struct.
@@ -2755,7 +2845,7 @@ fn progress_wait<R>(wait: impl FnOnce() -> R) -> R {
 /// The receiver's `ERTS_PSFLG_OFF_HEAP_MSGQ`, read from the process the send already found
 /// (`erts_atomic32_read_nob(&receiver->state)` in erts_send_message).
 fn receiver_off_heap_msgq<T: Task>(process: &Process<T>) -> bool {
-    process.exit_flags.load(Ordering::Relaxed) & proc_flags::OFF_HEAP_MSGQ != 0
+    process.input.state().load(Ordering::Relaxed) & psflg::OFF_HEAP_MSGQ != 0
 }
 
 fn receiver_heap_stable<T: Task>(process: &Process<T>) -> bool {
@@ -2765,7 +2855,7 @@ fn receiver_heap_stable<T: Task>(process: &Process<T>) -> bool {
         && process.input.state().load(Ordering::Acquire) & psflg::DIRTY_RUNNING == 0
 }
 
-fn lock_cell<T: Task>(process: &Process<T>) -> parking_lot::MutexGuard<'_, TaskCell<T>> {
+fn lock_cell<T: Task>(process: &Process<T>) -> ProcLockGuard<'_, TaskCell<T>> {
     match process.cell.try_lock() {
         Some(cell) => cell,
         None => progress_wait(|| process.cell.lock()),
@@ -3229,8 +3319,7 @@ impl<T: Task> Inner<T> {
         let Some(handlers) = self.dirty_signal_handlers.get() else {
             return;
         };
-        let priority = priority
-            .unwrap_or_else(|| Priority::from_index(process.user_priority.load(Ordering::Acquire)));
+        let priority = priority.unwrap_or_else(|| process.user_priority());
         let handler = match priority {
             Priority::Max => handlers.max,
             Priority::High => handlers.high,
@@ -4316,10 +4405,8 @@ impl<T: Task> Inner<T> {
         priority: Priority,
     ) -> Result<(), Error> {
         let process = self.table.lookup(to).ok_or(Error::NoProcess)?;
-        let before = process.priority();
-        process
-            .sys_priority
-            .fetch_min(priority.index() as u8, Ordering::AcqRel);
+        let before =
+            Priority::from_index(psflg::act_prio(process.elevate_sys_task_prio(priority, 0)) as u8);
         self.deliver(from, to, payload, None)?;
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:1275
         // (maybe_elevate_sig_handling_prio), OTP-29.1.1: a dirty target cannot run at the
@@ -5615,6 +5702,10 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     pub fn exit_flags(&self) -> &AtomicU32 {
         &self.proc.exit_flags
     }
+    /// The process state word (`c_p->state`, [`psflg`]).
+    pub fn proc_state(&self) -> &AtomicU32 {
+        self.proc.input.state()
+    }
     /// Return the scheduler worker currently running this process.
     pub fn worker_id(&self) -> Option<usize> {
         self.consts.worker
@@ -6004,9 +6095,7 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     ///
     /// Port of erts/emulator/beam/erl_process.c:10737 (`fetch_sys_task`), OTP-29.1.1.
     pub fn clear_sys_task_priority(&self) {
-        self.proc
-            .sys_priority
-            .store(NO_SYS_PRIORITY, Ordering::Release);
+        self.proc.reset_sys_task_prio();
     }
     /// Mark the process active for system tasks it holds but did not run in this slice: its
     /// actual priority is raised to `priority` and it is not parked when the slice ends.
@@ -6015,10 +6104,7 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     /// `ERTS_PSFLG_ACTIVE_SYS | ERTS_PSFLG_SYS_TASKS` and the process stays in a run queue),
     /// OTP-29.1.1.
     pub fn set_active_sys(&self, priority: Priority) {
-        self.proc
-            .sys_priority
-            .fetch_min(priority.index() as u8, Ordering::AcqRel);
-        self.proc.active_sys.store(true, Ordering::Release);
+        self.proc.elevate_sys_task_prio(priority, psflg::ACTIVE_SYS);
     }
     /// Whether this run was scheduled for system tasks (erts `ERTS_PSFLG_RUNNING_SYS`).
     /// The task should handle its queued signals before executing code.
@@ -6346,9 +6432,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
     }
     fn process_priority(&self, pid: Pid) -> Option<Priority> {
         let process = self.inner.table.lookup(pid)?;
-        Some(Priority::from_index(
-            process.user_priority.load(Ordering::Acquire),
-        ))
+        Some(process.user_priority())
     }
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:8893
     // (erts_internal_dirty_process_handle_signals_1), OTP-29.1.1: the task cell is the
@@ -7078,6 +7162,14 @@ impl<T: Task> Scheduler<T> {
             .table
             .with_live(pid, |process| f(&process.exit_flags))
     }
+    /// Run `f` on the state word (`p->state`, [`psflg`]) of `pid`.
+    // Port of erts/emulator/beam/erl_process_lock.h:1135 (erts_proc_lookup_raw) followed by a
+    // read or cmpxchg of `rp->state`, OTP-29.1.1.
+    pub fn with_proc_state<R>(&self, pid: Pid, f: impl FnOnce(&AtomicU32) -> R) -> Option<R> {
+        self.inner
+            .table
+            .with_live(pid, |process| f(process.input.state()))
+    }
     /// Whether signals wait in the outer signal queue of `pid`. `None` when the process is not
     /// alive. A light caller reads its own state only while this is false.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:1547 (pending signal probe), OTP-29.1.1.
@@ -7097,9 +7189,9 @@ impl<T: Task> Scheduler<T> {
     /// this scheduler: `managed` skips the thread-progress delay.
     pub fn is_quiet_from(&self, pid: Pid, managed: bool) -> Option<bool> {
         let check = |process: &ProcRef<T>| {
-            process.exit_flags.load(Ordering::Acquire) & proc_flags::EXITING == 0
-                && process.input.state().load(Ordering::Acquire) & (psflg::SIG_Q | psflg::SIG_IN_Q)
-                    == 0
+            process.input.state().load(Ordering::Acquire)
+                & (psflg::EXITING | psflg::SIG_Q | psflg::SIG_IN_Q)
+                == 0
         };
         if managed {
             self.inner.table.with_live_managed(pid, check)
@@ -7111,9 +7203,9 @@ impl<T: Task> Scheduler<T> {
     /// (`erts_proc_lookup_raw(pid)` followed by the state test of `is_process_alive_1`).
     pub fn is_quiet_word(&self, word: u64) -> Option<bool> {
         self.inner.table.with_live_managed_word(word, |process| {
-            process.exit_flags.load(Ordering::Acquire) & proc_flags::EXITING == 0
-                && process.input.state().load(Ordering::Acquire) & (psflg::SIG_Q | psflg::SIG_IN_Q)
-                    == 0
+            process.input.state().load(Ordering::Acquire)
+                & (psflg::EXITING | psflg::SIG_Q | psflg::SIG_IN_Q)
+                == 0
         })
     }
     /// Run `op` between `erts_thr_progress_block` and `erts_thr_progress_unblock`, from a
@@ -7418,9 +7510,9 @@ impl<T: Task> Scheduler<T> {
     }
     /// User priority of a live process.
     pub fn process_priority(&self, pid: Pid) -> Option<Priority> {
-        self.inner.table.with_live(pid, |process| {
-            Priority::from_index(process.user_priority.load(Ordering::Acquire))
-        })
+        self.inner
+            .table
+            .with_live(pid, |process| process.user_priority())
     }
     /// Send an ordered signal from a process running on this thread, without a turn context.
     /// The erts BIF path (`erts_proc_sig_send_*` from `c_p`) holds a process monitor on the
@@ -8547,7 +8639,10 @@ mod dirty_state_tests {
             .state()
             .fetch_and(!psflg::DIRTY_RUNNING, Ordering::Release);
         // erts_alloc_message_heap_state: an off-heap queue is reported before any lock attempt.
-        proc_flags::set_state(&target.exit_flags, proc_flags::OFF_HEAP_MSGQ);
+        target
+            .input
+            .state()
+            .fetch_or(psflg::OFF_HEAP_MSGQ, Ordering::AcqRel);
         assert_eq!(
             scheduler
                 .try_send_on_heap(from, to, |_| Ok::<_, ()>(Some(())))
@@ -8558,7 +8653,10 @@ mod dirty_state_tests {
             scheduler.try_with_receiver_task(to, |_| ()),
             OnHeapTask::OffHeapMsgq
         );
-        proc_flags::clear_state(&target.exit_flags, proc_flags::OFF_HEAP_MSGQ);
+        target
+            .input
+            .state()
+            .fetch_and(!psflg::OFF_HEAP_MSGQ, Ordering::AcqRel);
         assert_eq!(
             scheduler.try_with_receiver_task(to, |_| ()),
             OnHeapTask::Done(())
@@ -8654,6 +8752,136 @@ mod proxy_requeue_tests {
         }
     }
 
+    /// The priority fields of the state word follow erts: `erl_create_process` sets user and
+    /// actual priority, `active_sys_enqueue` elevates ACT_PRIO with `ERTS_PSFLG_SYS_TASKS`,
+    /// `erts_set_process_priority` keeps the elevation, and `fetch_sys_task` drops it again.
+    /// No priority change touches the run state bits.
+    #[test]
+    fn state_word_priority_transitions_follow_erts() {
+        let scheduler = Scheduler::new(Config {
+            workers: 1,
+            max_processes: 8,
+            ..Config::default()
+        });
+        let release = Arc::new(AtomicBool::new(false));
+        let _blocker = scheduler
+            .spawn(Probe::Blocker(Arc::clone(&release)))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let pid = scheduler
+            .spawn(Probe::Yielder(Arc::new(AtomicU32::new(0))))
+            .unwrap();
+        let process = scheduler.inner.table.lookup(pid).unwrap();
+        let word = || process.input.state().load(Ordering::SeqCst);
+        let run_bits = |w: u32| {
+            w & (RUN_STATE_MASK | psflg::IN_RUNQ | psflg::IN_PRQ_MASK | psflg::PRQ_PRIO_MASK)
+        };
+        let normal = Priority::Normal.index() as u32;
+        assert_eq!(psflg::usr_prio(word()), normal);
+        assert_eq!(psflg::act_prio(word()), normal);
+        assert_eq!(word() & psflg::SYS_TASKS, 0);
+        let queued = run_bits(word());
+
+        let before = process.elevate_sys_task_prio(Priority::High, 0);
+        assert_eq!(psflg::act_prio(before), normal);
+        assert_eq!(psflg::act_prio(word()), 1);
+        assert_eq!(psflg::usr_prio(word()), normal);
+        assert_ne!(word() & psflg::SYS_TASKS, 0);
+        assert_eq!(word() & psflg::ACTIVE_SYS, 0);
+        assert_eq!(process.priority(), Priority::High);
+        assert_eq!(process.user_priority(), Priority::Normal);
+
+        // A lower task priority does not lower an elevated actual priority.
+        process.elevate_sys_task_prio(Priority::Low, psflg::ACTIVE_SYS);
+        assert_eq!(psflg::act_prio(word()), 1);
+        assert_ne!(word() & psflg::ACTIVE_SYS, 0);
+
+        // erts_set_process_priority: the user priority changes, the elevation stays.
+        process.set_user_priority(Priority::Low);
+        assert_eq!(psflg::usr_prio(word()), 3);
+        assert_eq!(psflg::act_prio(word()), 1);
+        process.set_user_priority(Priority::Max);
+        assert_eq!(psflg::act_prio(word()), 0);
+        process.set_user_priority(Priority::Low);
+        assert_eq!(psflg::act_prio(word()), 1);
+
+        // fetch_sys_task with an empty qmask: SYS_TASKS clears, ACT_PRIO = USR_PRIO.
+        process.reset_sys_task_prio();
+        assert_eq!(word() & psflg::SYS_TASKS, 0);
+        assert_eq!(psflg::act_prio(word()), 3);
+        assert_eq!(process.priority(), Priority::Low);
+        process.set_user_priority(Priority::Normal);
+        assert_eq!(psflg::act_prio(word()), normal);
+        assert_eq!(run_bits(word()), queued);
+
+        release.store(true, Ordering::Release);
+    }
+
+    /// The task is at the start of the process struct and the state word at
+    /// `process_state_offset` from it, so `c_p` reaches both by fixed offsets, as erts code
+    /// reaches `c_p->state`.
+    #[test]
+    fn state_word_is_at_a_fixed_offset_from_the_task() {
+        let scheduler = Scheduler::new(Config {
+            workers: 1,
+            max_processes: 8,
+            ..Config::default()
+        });
+        let release = Arc::new(AtomicBool::new(false));
+        let _blocker = scheduler
+            .spawn(Probe::Blocker(Arc::clone(&release)))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let pid = scheduler
+            .spawn(Probe::Yielder(Arc::new(AtomicU32::new(0))))
+            .unwrap();
+        let process = scheduler.inner.table.lookup(pid).unwrap();
+        let base = std::ptr::from_ref::<Process<Probe>>(&process).addr();
+        let task = std::ptr::from_ref::<Probe>(process.cell.lock().task()).addr();
+        assert_eq!(task, base);
+        let state = std::ptr::from_ref::<AtomicU32>(process.input.state()).addr();
+        assert_eq!(state - base, process_state_offset::<Probe>());
+        release.store(true, Ordering::Release);
+    }
+
+    /// `ERTS_PSFLG_EXITING`, `SUSPENDED` and `OFF_HEAP_MSGQ` are bits of the one state word at
+    /// their erts positions, readable through every accessor.
+    #[test]
+    fn exiting_suspended_off_heap_are_state_word_bits() {
+        assert_eq!(psflg::EXITING, 1 << 11);
+        assert_eq!(psflg::SUSPENDED, 1 << 16);
+        assert_eq!(psflg::GC, 1 << 17);
+        assert_eq!(psflg::SYS_TASKS, 1 << 18);
+        assert_eq!(psflg::ACTIVE_SYS, 1 << 20);
+        assert_eq!(psflg::OFF_HEAP_MSGQ, 1 << 24);
+        assert_eq!(psflg::USR_PRIO_MASK, 0b1100);
+        assert_eq!(psflg::ACT_PRIO_MASK, 0b0011);
+        let scheduler = Scheduler::new(Config {
+            workers: 1,
+            max_processes: 8,
+            ..Config::default()
+        });
+        let release = Arc::new(AtomicBool::new(false));
+        let pid = scheduler
+            .spawn(Probe::Blocker(Arc::clone(&release)))
+            .unwrap();
+        assert_eq!(scheduler.is_quiet(pid), Some(true));
+        scheduler
+            .with_proc_state(pid, |state| {
+                state.fetch_or(psflg::EXITING, Ordering::AcqRel)
+            })
+            .unwrap();
+        assert_eq!(scheduler.is_quiet(pid), Some(false));
+        let process = scheduler.inner.table.lookup(pid).unwrap();
+        assert!(!receiver_off_heap_msgq(&process));
+        process
+            .input
+            .state()
+            .fetch_or(psflg::OFF_HEAP_MSGQ, Ordering::AcqRel);
+        assert!(receiver_off_heap_msgq(&process));
+        release.store(true, Ordering::Release);
+    }
+
     /// A proxy entry runs the process before its real entry is dequeued; the process is woken
     /// again while the real entry is still linked. The new entry must not link the real node a
     /// second time (`ERTS_PSFLG_IN_RUNQ`, `check_enqueue_in_prio_queue`).
@@ -8676,9 +8904,7 @@ mod proxy_requeue_tests {
             .unwrap();
         let process = scheduler.inner.table.lookup(pid).unwrap();
         // The elevated priority a system task gives: a proxy entry in the high queue.
-        process
-            .sys_priority
-            .store(Priority::High.index() as u8, Ordering::Release);
+        process.elevate_sys_task_prio(Priority::High, 0);
         scheduler.inner.run_queues[0].push(Scheduled::at_prio(
             process.clone(),
             Enqueue::Proxy,
@@ -8925,12 +9151,15 @@ fn schedule_out<T: Task>(
     } = end;
     let worker_id = worker.unwrap_or(0);
     let mut own_enqueue = None;
-    // Only the thread running the process sets and clears the flag (erts keeps it in the state
-    // word it already read-modify-writes), so a plain load keeps an atomic RMW off every slice end.
-    let active_sys = process.active_sys.load(Ordering::Relaxed) && {
-        process.active_sys.store(false, Ordering::Relaxed);
-        true
-    };
+    // Only the thread running the process sets `ERTS_PSFLG_ACTIVE_SYS` (set_active_sys), so a
+    // plain load keeps an atomic RMW off every slice end that has none.
+    let active_sys = process.input.state().load(Ordering::Relaxed) & psflg::ACTIVE_SYS != 0
+        && process
+            .input
+            .state()
+            .fetch_and(!psflg::ACTIVE_SYS, Ordering::AcqRel)
+            & psflg::ACTIVE_SYS
+            != 0;
     // Port of erts/emulator/beam/erl_process.c:9678-9687 and erl_process.h:529
     // (ERTS_PROC_REDUCTIONS_EXECUTED), OTP-29.1.1: `actual` leaves out what the slice gave up
     // without working; `reds` is that with the minimum context switch cost.
@@ -8940,10 +9169,8 @@ fn schedule_out<T: Task>(
         // Port of erts/emulator/beam/erl_process.c:10200 (ERTS_PROC_REDUCTIONS_EXECUTED
         // with the user priority), OTP-29.1.1.
         let worker = local.as_deref().map_or(worker_id, |local| local.worker_id);
-        inner.balance.rqs[worker.min(inner.balance.rqs.len() - 1)].reductions_executed(
-            usize::from(process.user_priority.load(Ordering::Relaxed)),
-            consumed as i64,
-        );
+        inner.balance.rqs[worker.min(inner.balance.rqs.len() - 1)]
+            .reductions_executed(process.user_priority().index(), consumed as i64);
     }
     if dirty.is_some() {
         // Dirty schedulers keep no reduction or normal run queue counters.
@@ -8999,7 +9226,7 @@ fn schedule_out<T: Task>(
             let entry = process.run_state().yield_running_dirty(
                 kind,
                 prio,
-                usize::from(process.user_priority.load(Ordering::Acquire)),
+                process.user_priority().index(),
                 Ordering::Release,
             );
             inner.enqueue_dirty(Scheduled::at_prio(process.clone(), entry, prio), kind);
@@ -9213,7 +9440,7 @@ fn run_slice<T: Task>(
     // keep the elevated priority while ordered system-task signals are still pending.
     // Dirty schedulers never execute system tasks (erl_process.c:10255).
     let sys_task_run =
-        dirty.is_none() && process.sys_priority.load(Ordering::Acquire) != NO_SYS_PRIORITY;
+        dirty.is_none() && process.input.state().load(Ordering::Acquire) & psflg::SYS_TASKS != 0;
     let worker_id = worker.unwrap_or(0);
     // A process on a dirty run queue left the normal run queue accounting when it migrated.
     if dirty.is_none() {
@@ -9334,7 +9561,7 @@ fn run_process<T: Task>(
     {
         return None;
     }
-    let sys_task_run = process.sys_priority.load(Ordering::Acquire) != NO_SYS_PRIORITY;
+    let sys_task_run = process.input.state().load(Ordering::Acquire) & psflg::SYS_TASKS != 0;
     record_sched_stat(&process, id);
     {
         let mut local = local_cell.borrow_mut();
@@ -9411,7 +9638,7 @@ fn record_sched_stat<T: Task>(process: &Process<T>, scheduler_id: usize) {
             .sched_stat_scheduler_id
             .swap(scheduler_id, Ordering::Relaxed);
         sched_stat::record_execution(
-            usize::from(process.user_priority.load(Ordering::Relaxed)),
+            process.user_priority().index(),
             previous_scheduler != 0 && previous_scheduler != scheduler_id,
         );
     }

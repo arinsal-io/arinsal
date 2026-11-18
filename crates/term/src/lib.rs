@@ -91,7 +91,7 @@ pub use heap::{
     ConsListBuilder, FrameLayout, HAllocReservation, HeapAlloc, HeapBinaryWriter, HeapBlockBuilder,
     HeapFactory, HeapFactoryMark, HeapReservation, HeapReservationState, HeapTermSlot, LiteralArea,
     MfaLocation, NativeAbi, ProcessHeap, S_REDZONE, S_RESERVED, StackWord, TemporaryHeap,
-    TermBuilder, Tuple3Chain, TupleBuilder, VecHeap, flat_key_cmp,
+    TermBuilder, Tuple3Chain, TupleBuilder, VecHeap, flat_key_cmp, pflags,
 };
 pub use identity::Identity;
 pub use internal_hash::{immediate_internal_hash, internal_hash, internal_salted_hash};

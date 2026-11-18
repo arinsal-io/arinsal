@@ -21,9 +21,17 @@ use std::sync::Arc;
 /// The allocator handle sits in a prefix of the same allocation (`ERTS_HEAP_ALLOC`
 /// stores `Eterm *heap` in the process, not a side object). Null is an absent block,
 /// the way erts leaves `old_heap` NULL.
+///
+/// The young heap of a delayed collection is the `mem` of a heap fragment
+/// (`delay_garbage_collection`: `p->heap = &hfrag->mem[0]`); erts knows that from
+/// `p->abandoned_heap != NULL`, and the block carries the same fact in the low bit of its
+/// pointer ([`IN_HEAP_FRAG`]) because it frees itself.
 pub(crate) struct WordBlock {
     ptr: *mut u64,
 }
+
+/// [`WordBlock`] pointer bit: the words are the `mem` of a heap fragment.
+const IN_HEAP_FRAG: usize = 1;
 
 /// `ProcessHeap::alloc_ix` of a heap whose allocations read the thread's allocator index.
 pub(crate) const NO_ALLOC_IX: u16 = u16::MAX;
@@ -34,46 +42,30 @@ const MAPPED_WORDS: usize = 1 << (usize::BITS - 1);
 // SAFETY: A process owns its word block exclusively; moving it changes no pointers within it.
 unsafe impl Send for WordBlock {}
 
-/// A heap fragment: a BIF-allocated side buffer or an adopted message heap.
-pub(crate) enum Fragment {
-    /// erts `ErlHeapFragment` on the `p->mbuf` list: one `ERTS_ALC_T_HEAP_FRAG` block whose
-    /// first `used` words (`used_size`) hold objects; `memory.len()` is `alloc_size`.
-    // Port of erts/emulator/beam/erl_message.h:72-78 (ErlHeapFragment), OTP-29.1.1.
+/// A received message whose data stays where it was built until the next collection: erts
+/// keeps the whole `ErtsMessage` on `p->msg_frag` (`erts_save_message_in_proc`) and adds the
+/// used words of its heap fragments to `mbuf_sz`.
+// Port of erts/emulator/beam/erl_message.c:965-1000 (erts_save_message_in_proc), OTP-29.1.1.
+pub(crate) enum MsgFrag {
+    /// A message whose data is in a heap fragment of its own (`data.heap_frag`): the first
+    /// `used` words of `memory`.
     Block { memory: AllocBlock, used: usize },
-    /// erts `p->abandoned_heap`: the young heap left behind by a delayed collection. Its
-    /// first `used` words hold objects, and those below `high_water` are mature. It is not
-    /// part of `mbuf_sz`.
-    Abandoned {
-        block: WordBlock,
-        used: usize,
-        high_water: usize,
-    },
-    /// A received message whose data is in the heap fragment inline in its node: erts keeps
-    /// the whole `ErtsMessage` on `p->msg_frag` until the next collection.
-    // Port of erts/emulator/beam/erl_message.c (erts_save_message_in_proc), OTP-29.1.1.
+    /// A message whose data is in the heap fragment inline in its node
+    /// (`ERTS_MSG_COMBINED_HFRAG`).
     Node(crate::message::NodeFragment),
 }
 
-#[derive(Clone, Copy, Default)]
-pub(crate) struct MbufFast {
-    pub(crate) base: usize,
-    alloc_size: usize,
-    pub(crate) used_size: usize,
-    pub(crate) fragment_index: usize,
-}
-
-impl Fragment {
+impl MsgFrag {
     pub(crate) fn as_ptr(&self) -> *const u64 {
         match self {
             Self::Block { memory, .. } => memory.as_ptr(),
-            Self::Abandoned { block, .. } => block.as_ptr().cast(),
             Self::Node(fragment) => fragment.as_ptr(),
         }
     }
-    /// Words that hold objects.
+    /// Words that hold objects (`used_size`).
     pub(crate) fn len(&self) -> usize {
         match self {
-            Self::Block { used, .. } | Self::Abandoned { used, .. } => *used,
+            Self::Block { used, .. } => *used,
             Self::Node(fragment) => fragment.len(),
         }
     }
@@ -108,8 +100,44 @@ impl WordBlock {
         }
     }
 
+    /// A young heap of `words` words in a heap fragment of `words + 1` (erl_gc.c
+    /// delay_garbage_collection: `new_message_buffer(hsz + 1)`, the extra word for the saved
+    /// high-water mark).
+    // Port of erts/emulator/beam/erl_gc.c:532 (delay_garbage_collection), OTP-29.1.1.
+    pub(crate) fn in_heap_frag(words: usize) -> Self {
+        let frag = crate::raw::heap_frag::HeapFrag::new_message_buffer(words + 1, 0);
+        Self {
+            ptr: (frag.mem() as usize | IN_HEAP_FRAG) as *mut u64,
+        }
+    }
+
+    /// The heap fragment whose `mem` this block is, if it is one.
+    #[inline]
+    pub(crate) fn heap_frag(&self) -> Option<crate::raw::heap_frag::HeapFrag> {
+        (self.ptr as usize & IN_HEAP_FRAG != 0)
+            .then(|| crate::raw::heap_frag::HeapFrag::from_mem(self.user()))
+    }
+
+    /// The heap fragment of a block made by [`WordBlock::in_heap_frag`], which now belongs to
+    /// the caller.
+    pub(crate) fn into_heap_frag(self) -> crate::raw::heap_frag::HeapFrag {
+        let frag = self.heap_frag().expect("young heap is in a heap fragment");
+        std::mem::forget(self);
+        frag
+    }
+
+    #[inline(always)]
+    fn user(&self) -> *mut u64 {
+        (self.ptr as usize & !IN_HEAP_FRAG) as *mut u64
+    }
+
     /// Frees the block on the allocator index `ix` of the calling scheduler thread.
     pub(crate) fn release_at(self, ix: usize) {
+        if let Some(frag) = self.heap_frag() {
+            std::mem::forget(self);
+            crate::raw::heap_frag::free_message_buffer(frag);
+            return;
+        }
         let ptr = self.ptr;
         // The allocator frees the block here; the destructor must not free it again.
         std::mem::forget(self);
@@ -119,12 +147,20 @@ impl WordBlock {
     /// Grow or shrink this block in place when the carrier allows it.
     /// Port of erts/emulator/beam/erl_gc.c:2794 (`resize_new_heap` / `ERTS_HEAP_REALLOC`), OTP-29.1.1.
     pub(crate) fn realloc(&mut self, words: usize) {
+        assert!(
+            self.heap_frag().is_none(),
+            "a collection never resizes a delayed heap"
+        );
         self.ptr = AllocBlock::realloc_detached_heap(self.ptr, words)
             .expect("ERTS heap block reallocation failed");
     }
 
-    /// The typed block itself, for a heap block that joins the `mbuf` list.
+    /// The typed block itself, for a heap block that stays on `p->msg_frag`.
     pub(crate) fn into_alloc_block(self) -> AllocBlock {
+        assert!(
+            self.heap_frag().is_none(),
+            "a delayed heap joins the mbuf list"
+        );
         let ptr = self.ptr;
         // The reconstructed block frees the allocation; this value must not.
         std::mem::forget(self);
@@ -133,19 +169,32 @@ impl WordBlock {
 
     /// The block's words, for a copy that holds the heap exclusively.
     pub(crate) fn words(&self) -> &[u64] {
-        AllocBlock::heap_user_slice(self.ptr)
+        match self.heap_frag() {
+            Some(frag) => &frag.words()[..self.len()],
+            None => AllocBlock::heap_user_slice(self.ptr),
+        }
     }
 
     pub(crate) fn words_mut(&mut self) -> &mut [u64] {
-        AllocBlock::heap_user_slice_mut(self.ptr)
+        match self.heap_frag() {
+            Some(frag) => {
+                let len = self.len();
+                &mut frag.words_mut()[..len]
+            }
+            None => AllocBlock::heap_user_slice_mut(self.ptr),
+        }
     }
 
+    #[inline(always)]
     pub(crate) fn as_ptr(&self) -> *const UnsafeCell<u64> {
-        self.ptr.cast()
+        self.user().cast()
     }
 
     pub(crate) fn len(&self) -> usize {
-        AllocBlock::heap_user_len(self.ptr)
+        match self.heap_frag() {
+            Some(frag) => frag.alloc_size() - 1,
+            None => AllocBlock::heap_user_len(self.ptr),
+        }
     }
 
     pub(crate) fn contains_initialized(&self, address: usize, words: usize) -> bool {
@@ -169,6 +218,10 @@ impl WordBlock {
 
 impl Drop for WordBlock {
     fn drop(&mut self) {
+        if let Some(frag) = self.heap_frag() {
+            crate::raw::heap_frag::free_message_buffer(frag);
+            return;
+        }
         AllocBlock::free_detached_heap(self.ptr);
     }
 }
@@ -863,8 +916,10 @@ pub struct HeapReservation<'a, H: HeapAlloc + ?Sized> {
 #[derive(Clone, Copy, Debug)]
 pub struct HeapFactoryMark {
     htop: usize,
-    fragments: usize,
-    last_used: usize,
+    /// `heap_frags_saved`: `p->mbuf` as an address.
+    heap_frags_saved: usize,
+    /// `heap_frags_saved_used`.
+    heap_frags_saved_used: usize,
     off_heap_first: usize,
     overhead: u64,
     bin_vheap: u64,
@@ -939,7 +994,7 @@ impl HeapBinaryWriter {
             return Err(TermError::BadArg);
         }
         let words = 2 + bytes.div_ceil(8);
-        let restore_gc = heap.gc_enabled;
+        let restore_gc = heap.gc_enabled();
         let start = heap
             .alloc_halloc(words)
             .unwrap_or_else(|| heap.heap_fragment(words));
@@ -957,7 +1012,7 @@ impl HeapBinaryWriter {
         }
         let term = Term::from_ptr(start, 2);
         let state = reservation.suspend();
-        heap.gc_enabled = false;
+        heap.set_gc_enabled(false);
         Ok(Self {
             reservation: state,
             term,
@@ -1010,7 +1065,10 @@ impl HeapBinaryWriter {
     // Port of erts/emulator/beam/erl_iolist.c:425-620 (`generic_iolist_copy`), OTP-29.1.1.
     pub fn write(&mut self, heap: &mut ProcessHeap, chunk: &[u8]) -> Result<(), TermError> {
         assert!(!self.finished, "heap binary writer is finalized");
-        assert!(!heap.gc_enabled, "heap binary writer requires GC disabled");
+        assert!(
+            !heap.gc_enabled(),
+            "heap binary writer requires GC disabled"
+        );
         let end = self
             .written
             .checked_add(chunk.len())
@@ -1046,7 +1104,10 @@ impl HeapBinaryWriter {
     // Port of erts/emulator/beam/erl_iolist.c:765-834 (`list_to_bitstring_dispatch`), OTP-29.1.1.
     pub fn finish(&mut self, heap: &mut ProcessHeap) -> Result<Term, TermError> {
         assert!(!self.finished, "heap binary writer is finalized");
-        assert!(!heap.gc_enabled, "heap binary writer requires GC disabled");
+        assert!(
+            !heap.gc_enabled(),
+            "heap binary writer requires GC disabled"
+        );
         if self.written != self.bytes {
             return Err(TermError::BadArg);
         }
@@ -1062,7 +1123,7 @@ impl HeapBinaryWriter {
         let mut reservation = HeapReservation::resume(heap, state);
         reservation.set_cursor(reservation.limit());
         drop(reservation);
-        heap.gc_enabled = self.restore_gc;
+        heap.set_gc_enabled(self.restore_gc);
         self.finished = true;
         Ok(self.term)
     }
@@ -1073,7 +1134,10 @@ impl HeapBinaryWriter {
         if self.finished {
             return;
         }
-        assert!(!heap.gc_enabled, "heap binary writer requires GC disabled");
+        assert!(
+            !heap.gc_enabled(),
+            "heap binary writer requires GC disabled"
+        );
         let state = std::mem::replace(
             &mut self.reservation,
             HeapReservationState {
@@ -1084,7 +1148,7 @@ impl HeapBinaryWriter {
             },
         );
         drop(HeapReservation::resume(heap, state));
-        heap.gc_enabled = self.restore_gc;
+        heap.set_gc_enabled(self.restore_gc);
         self.finished = true;
     }
 }
@@ -1344,6 +1408,66 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapReservation<'_, H> {
     }
 }
 
+/// The `c_p->flags` bits (`F_*`).
+// Port of erts/emulator/beam/erl_process.h:1630-1656 (F_*), OTP-29.1.1.
+pub mod pflags {
+    /// Schedule out after a hibernate operation.
+    pub const F_HIBERNATE_SCHED: u32 = 1 << 0;
+    /// In the timer queue.
+    pub const F_INSLPQUEUE: u32 = 1 << 1;
+    /// Timed out.
+    pub const F_TIMO: u32 = 1 << 2;
+    /// The heap grows at the next collection.
+    pub const F_HEAP_GROW: u32 = 1 << 3;
+    /// The next collection is a fullsweep.
+    pub const F_NEED_FULLSWEEP: u32 = 1 << 4;
+    /// The process has created ETS tables.
+    pub const F_USING_DB: u32 = 1 << 5;
+    /// The process is used in distribution (`net_kernel`): its exit runs
+    /// `erts_do_net_exits`.
+    pub const F_DISTRIBUTION: u32 = 1 << 6;
+    /// The process has used the DDLL interface.
+    pub const F_USING_DDLL: u32 = 1 << 7;
+    /// The process has blocked multi-scheduling.
+    pub const F_HAVE_BLCKD_MSCHED: u32 = 1 << 8;
+    /// ETS super user.
+    pub const F_ETS_SUPER_USER: u32 = 1 << 9;
+    /// Force a collection at the next opportunity.
+    pub const F_FORCE_GC: u32 = 1 << 10;
+    /// Collection is disabled.
+    pub const F_DISABLE_GC: u32 = 1 << 11;
+    /// The abandoned heap is in use.
+    pub const F_ABANDONED_HEAP_USE: u32 = 1 << 12;
+    /// Collection is delayed (a receive looks at a message).
+    pub const F_DELAY_GC: u32 = 1 << 13;
+    /// Waiting to change schedulers online.
+    pub const F_SCHDLR_ONLN_WAITQ: u32 = 1 << 14;
+    /// The process has blocked normal multi-scheduling.
+    pub const F_HAVE_BLCKD_NMSCHED: u32 = 1 << 15;
+    /// Delayed delete of the process (dirty exit).
+    pub const F_DELAYED_DEL_PROC: u32 = 1 << 16;
+    /// Dirty copy literal area scheduled.
+    pub const F_DIRTY_CLA: u32 = 1 << 17;
+    /// Dirty hibernate collection scheduled.
+    pub const F_DIRTY_GC_HIBERNATE: u32 = 1 << 18;
+    /// Dirty major collection scheduled.
+    pub const F_DIRTY_MAJOR_GC: u32 = 1 << 19;
+    /// Dirty minor collection scheduled.
+    pub const F_DIRTY_MINOR_GC: u32 = 1 << 20;
+    /// The heap holds exactly the live data of a hibernated process.
+    pub const F_HIBERNATED: u32 = 1 << 21;
+    /// Trapping exits.
+    pub const F_TRAP_EXIT: u32 = 1 << 22;
+    /// A distributed fragmented send is in progress.
+    pub const F_FRAGMENTED_SEND: u32 = 1 << 23;
+    /// Debug: the last BIF call was a forced trap.
+    pub const F_DBG_FORCED_TRAP: u32 = 1 << 24;
+    /// Check whether a copy literal area collection is scheduled.
+    pub const F_DIRTY_CHECK_CLA: u32 = 1 << 25;
+    /// Truly asynchronous distribution.
+    pub const F_ASYNC_DIST: u32 = 1 << 26;
+}
+
 /// The fixed process prefix read and written by generated BeamAsm code.
 ///
 /// Port of erts/emulator/beam/jit/arm/beam_asm.hpp (`emit_enter_runtime` and
@@ -1372,12 +1496,20 @@ pub struct NativeAbi {
     pub _arity_pad: [u8; 7],
     /// Current function metadata pointer.
     pub current: *const core::ffi::c_void,
-    /// Process flags.
-    pub flags: u64,
+    /// `c_p->flags`: the [`pflags`] `F_*` bits. Written only by the thread that holds the
+    /// process (erts changes `p->flags` with the main lock held).
+    pub flags: u32,
+    pub _flags_pad: u32,
     /// Current process identifier consumed by the inline `self/0` emitter.
     pub self_pid: u64,
     /// First heap address safe for destructive tuple updates.
     pub high_water: *mut u64,
+    /// `c_p->mbuf`: the process's heap fragments, newest first. Generated code tests it
+    /// against null after a light BIF.
+    // Port of erts/emulator/beam/erl_process.h (`ErlHeapFragment* mbuf`), OTP-29.1.1.
+    pub mbuf: crate::raw::heap_frag::MbufList,
+    /// `c_p->mbuf_sz`: the used words of `mbuf` and of the heap fragments of `msg_frag`.
+    pub mbuf_sz: usize,
 }
 
 // SAFETY: the pointers address the owning `ProcessHeap`'s own blocks and immutable code; the
@@ -1403,8 +1535,11 @@ impl Default for NativeAbi {
             _arity_pad: [0; 7],
             current: std::ptr::null(),
             flags: 0,
+            _flags_pad: 0,
             self_pid: 0,
             high_water: std::ptr::null_mut(),
+            mbuf: crate::raw::heap_frag::MbufList::EMPTY,
+            mbuf_sz: 0,
         }
     }
 }
@@ -1420,12 +1555,12 @@ const _: () = assert!(std::mem::offset_of!(NativeAbi, i) == 0x48);
 const _: () = assert!(std::mem::offset_of!(NativeAbi, arity) == 0x50);
 const _: () = assert!(std::mem::offset_of!(NativeAbi, current) == 0x58);
 const _: () = assert!(std::mem::offset_of!(NativeAbi, flags) == 0x60);
+const _: () = assert!(pflags::F_DISABLE_GC == 0x800 && pflags::F_FORCE_GC == 0x400);
+const _: () = assert!(pflags::F_DELAY_GC == 0x2000 && pflags::F_TRAP_EXIT == 0x40_0000);
 const _: () = assert!(std::mem::offset_of!(NativeAbi, self_pid) == 0x68);
 const _: () = assert!(std::mem::offset_of!(NativeAbi, high_water) == 0x70);
-const _: () = assert!(
-    std::mem::offset_of!(ProcessHeap, force_gc)
-        == std::mem::offset_of!(ProcessHeap, gc_enabled) + 1
-);
+const _: () = assert!(std::mem::offset_of!(NativeAbi, mbuf) == 0x78);
+const _: () = assert!(std::mem::offset_of!(NativeAbi, mbuf_sz) == 0x80);
 
 /// A process heap with an upward bump pointer and a downward stack pointer.
 #[repr(C)]
@@ -1445,7 +1580,6 @@ pub struct ProcessHeap {
     pub(crate) alloc_ix: u16,
     pub(crate) bin_vheap: u64,
     pub(crate) bin_vheap_size: u64,
-    pub(crate) heap_grow: bool,
     pub(crate) native_allocation: bool,
     /// Set once generated code has run on this heap: runtime allocations stay below `HEAP_LIMIT`.
     pub(crate) native_redzone: bool,
@@ -1455,35 +1589,33 @@ pub struct ProcessHeap {
     pub(crate) bif_hidden_words: usize,
     /// Allocations go to `owners.detached` (see [`ProcessHeap::begin_detached`]).
     pub(crate) detached: bool,
-    /// Whether `fragments` holds the abandoned heap (erts `p->abandoned_heap != NULL`),
-    /// so the frequent "is there one" question does not walk the fragment list.
-    pub(crate) abandoned: bool,
-    pub(crate) fragments: Vec<Fragment>,
-    /// Cached current `p->mbuf` cursor, kept out of the fragment vector for its allocation path.
-    pub(crate) mbuf_fast: MbufFast,
-    /// Sum of used words in process heap fragments (`mbuf_sz` in erts).
-    pub(crate) fragment_words: usize,
-    /// `F_DISABLE_GC` inverted: collection may run after a BIF (`Process.gc_enabled`).
-    pub gc_enabled: bool,
-    /// `F_FORCE_GC`: the BIF epilogue collects whatever the heap state. Adjacent to
-    /// `gc_enabled` so the light-BIF fragment tests both with one halfword load, as erts tests
-    /// `F_FORCE_GC | F_DISABLE_GC` with one `tst` of `c_p->flags`.
-    pub force_gc: bool,
+    /// `p->abandoned_heap`: the young heap a delayed collection left behind, null when there
+    /// is none. Not part of `mbuf` or `mbuf_sz`.
+    pub(crate) abandoned_heap: WordBlock,
+    /// Used words of `abandoned_heap` (erts `aheap[heap_sz - 1]` with
+    /// `F_ABANDONED_HEAP_USE`).
+    pub(crate) abandoned_used: usize,
+    /// High-water mark of `abandoned_heap` as a word index (erts saves it in the extra word
+    /// at `hend` of the delayed heap).
+    pub(crate) abandoned_high_water: usize,
+    /// `p->msg_frag`: received messages whose data stays in their heap fragments until the
+    /// next collection.
+    pub(crate) msg_frag: Vec<MsgFrag>,
     /// Whether the next collection is the epilogue of a BIF call that decided to collect
     /// (`erts_gc_after_bif_call_lhf` with a valid `live_hf_end`).
     live_frags_armed: std::cell::Cell<bool>,
-    /// Length of `fragments` at the entry of the BIF whose epilogue collects: every fragment
-    /// from this index on was allocated by that BIF (the JIT's spilled `live_hf_end`), or
-    /// `INVALID_HFRAG` (`ERTS_INVALID_HFRAG_PTR`).
-    live_frag_mark: std::cell::Cell<u32>,
+    /// `c_p->mbuf` at the entry of the BIF whose epilogue collects: every fragment in front
+    /// of it was allocated by that BIF (the JIT's spilled `live_hf_end`), or
+    /// `ERTS_INVALID_HFRAG_PTR`.
+    live_frag_mark: std::cell::Cell<usize>,
     /// `c_p->live_hf_end`: the mark saved when a BIF trapped with collection disabled, or
-    /// `INVALID_HFRAG`; the collection that follows the continuation uses it instead of that
-    /// call's own mark.
-    live_frag_saved: std::cell::Cell<u32>,
+    /// `ERTS_INVALID_HFRAG_PTR`; the collection that follows the continuation uses it instead
+    /// of that call's own mark.
+    live_frag_saved: std::cell::Cell<usize>,
 }
 
-/// `ERTS_INVALID_HFRAG_PTR` (erl_gc.h) for the fragment-index form of `live_hf_end`.
-const INVALID_HFRAG: u32 = u32::MAX;
+/// `ERTS_INVALID_HFRAG_PTR` (erl_gc.h) as the address the marks hold.
+const INVALID_HFRAG: usize = crate::raw::heap_frag::INVALID_HFRAG_PTR;
 
 /// HAlloc space validated for a fixed heap object plus words reserved for following stores.
 pub struct HAllocReservation<'a> {
@@ -1657,9 +1789,15 @@ impl ProcessHeap {
     /// Release process-owned heap storage after the exit phases have finished.
     // Port of erts/emulator/beam/erl_process.c (delete_process), OTP-29.1.1.
     pub fn clear_for_exit(&mut self) {
-        self.abi = NativeAbi::default();
+        // The off-heap lists link objects in the heap and its fragments: release them first.
         self.owners = LazyOwners::default();
-        self.fragments = Vec::new();
+        // erl_gc.c erts_deallocate_young_generation: `free_message_buffer(c_p->mbuf)`,
+        // `erts_cleanup_messages(c_p->msg_frag)`, then the heaps.
+        self.abi = NativeAbi::default();
+        self.msg_frag = Vec::new();
+        self.abandoned_heap = WordBlock::default();
+        self.abandoned_used = 0;
+        self.abandoned_high_water = 0;
         self.words = WordBlock::default();
         self.old_words = WordBlock::default();
         self.old_htop = 0;
@@ -1669,24 +1807,23 @@ impl ProcessHeap {
         self.alloc_ix = NO_ALLOC_IX;
         self.bin_vheap = 0;
         self.bin_vheap_size = 46_422;
-        self.heap_grow = false;
         self.native_allocation = false;
         self.native_redzone = false;
         self.bif_hidden_words = 0;
         self.detached = false;
-        self.abandoned = false;
-        self.mbuf_fast = MbufFast::default();
-        self.fragment_words = 0;
-        self.gc_enabled = true;
-        self.force_gc = false;
         self.live_frags_armed.set(false);
         self.live_frag_mark.set(INVALID_HFRAG);
         self.live_frag_saved.set(INVALID_HFRAG);
     }
 
-    /// Byte offset of `fragment_words` (`mbuf_sz`) in the heap, for the native GC-desired test.
+    /// Byte offset of `c_p->mbuf` in the heap, which starts `c_p`.
+    // Port of erts/emulator/beam/erl_process.h (`mbuf`), OTP-29.1.1.
+    pub const MBUF_OFFSET: usize =
+        std::mem::offset_of!(ProcessHeap, abi) + std::mem::offset_of!(NativeAbi, mbuf);
+    /// Byte offset of `c_p->mbuf_sz` in the heap, for the native GC-desired test.
     // Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED), OTP-29.1.1.
-    pub const FRAGMENT_WORDS_OFFSET: usize = std::mem::offset_of!(ProcessHeap, fragment_words);
+    pub const MBUF_SZ_OFFSET: usize =
+        std::mem::offset_of!(ProcessHeap, abi) + std::mem::offset_of!(NativeAbi, mbuf_sz);
     /// Byte offset of the process off-heap overhead field.
     /// Size of the owner state kept inline, as `Process.off_heap` is in erts.
     pub const OWNERS_SIZE: usize = std::mem::size_of::<HeapOwners>();
@@ -1695,8 +1832,49 @@ impl ProcessHeap {
         + std::mem::offset_of!(HeapOwners, overhead);
     /// Byte offset of `bin_vheap_size` (`bin_vheap_sz`) in the heap.
     pub const BIN_VHEAP_SIZE_OFFSET: usize = std::mem::offset_of!(ProcessHeap, bin_vheap_size);
-    /// Byte offset of `gc_enabled` in the heap.
-    pub const GC_ENABLED_OFFSET: usize = std::mem::offset_of!(ProcessHeap, gc_enabled);
+    /// Byte offset of `c_p->flags` ([`pflags`]) in the heap, which starts `c_p`.
+    pub const FLAGS_OFFSET: usize =
+        std::mem::offset_of!(ProcessHeap, abi) + std::mem::offset_of!(NativeAbi, flags);
+
+    /// `!(c_p->flags & F_DISABLE_GC)`: collection may run.
+    #[inline(always)]
+    pub fn gc_enabled(&self) -> bool {
+        self.abi.flags & pflags::F_DISABLE_GC == 0
+    }
+
+    /// Clear (`true`) or set (`false`) `F_DISABLE_GC`.
+    #[inline(always)]
+    pub fn set_gc_enabled(&mut self, enabled: bool) {
+        self.set_flag(pflags::F_DISABLE_GC, !enabled);
+    }
+
+    /// `c_p->flags & F_FORCE_GC`: the next collection opportunity collects.
+    #[inline(always)]
+    pub fn force_gc(&self) -> bool {
+        self.abi.flags & pflags::F_FORCE_GC != 0
+    }
+
+    /// Set or clear `F_FORCE_GC`.
+    #[inline(always)]
+    pub fn set_force_gc(&mut self, on: bool) {
+        self.set_flag(pflags::F_FORCE_GC, on);
+    }
+
+    /// Set or clear one `F_*` bit of `c_p->flags`.
+    #[inline(always)]
+    pub fn set_flag(&mut self, flag: u32, on: bool) {
+        if on {
+            self.abi.flags |= flag;
+        } else {
+            self.abi.flags &= !flag;
+        }
+    }
+
+    /// Whether `flag` (an `F_*` bit) is set in `c_p->flags`.
+    #[inline(always)]
+    pub fn has_flag(&self, flag: u32) -> bool {
+        self.abi.flags & flag != 0
+    }
 
     /// Create a heap with 64 words, including stack space.
     pub fn new() -> Self {
@@ -1729,22 +1907,18 @@ impl ProcessHeap {
         });
         let block = WordBlock::new_for(words, ErtsAlcType::HEAP, words_ix);
         let base = block.as_ptr().cast::<u64>().cast_mut();
-        Self {
-            abi: NativeAbi {
-                htop: base,
-                stop: base.wrapping_add(words),
-                heap: base,
-                hend: base.wrapping_add(words),
-                high_water: base,
-                fcalls,
-                arity,
-                ..NativeAbi::default()
-            },
-            words: block,
-            min_heap_size: u32::try_from(min_heap_size).unwrap_or(u32::MAX),
-            alloc_ix: NO_ALLOC_IX,
-            ..Self::empty_fields()
-        }
+        let mut heap = Self::empty_fields();
+        heap.abi.htop = base;
+        heap.abi.stop = base.wrapping_add(words);
+        heap.abi.heap = base;
+        heap.abi.hend = base.wrapping_add(words);
+        heap.abi.high_water = base;
+        heap.abi.fcalls = fcalls;
+        heap.abi.arity = arity;
+        heap.words = block;
+        heap.min_heap_size = u32::try_from(min_heap_size).unwrap_or(u32::MAX);
+        heap.alloc_ix = NO_ALLOC_IX;
+        heap
     }
 
     /// The fields of a heap that owns no block, for the constructors.
@@ -1761,17 +1935,14 @@ impl ProcessHeap {
             alloc_ix: NO_ALLOC_IX,
             bin_vheap: 0,
             bin_vheap_size: 46_422,
-            heap_grow: false,
             native_allocation: false,
             native_redzone: false,
             bif_hidden_words: 0,
             detached: false,
-            abandoned: false,
-            fragments: Vec::new(),
-            mbuf_fast: MbufFast::default(),
-            fragment_words: 0,
-            gc_enabled: true,
-            force_gc: false,
+            abandoned_heap: WordBlock::default(),
+            abandoned_used: 0,
+            abandoned_high_water: 0,
+            msg_frag: Vec::new(),
             live_frags_armed: std::cell::Cell::new(false),
             live_frag_mark: std::cell::Cell::new(INVALID_HFRAG),
             live_frag_saved: std::cell::Cell::new(INVALID_HFRAG),
@@ -1796,19 +1967,15 @@ impl ProcessHeap {
     fn with_words_for_type_at(words: usize, allocation_type: ErtsAlcType, alloc_ix: u16) -> Self {
         let block = WordBlock::new_for(words, allocation_type, alloc_ix);
         let base = block.as_ptr().cast::<u64>().cast_mut();
-        Self {
-            abi: NativeAbi {
-                htop: base,
-                stop: base.wrapping_add(words),
-                heap: base,
-                hend: base.wrapping_add(words),
-                high_water: base,
-                ..NativeAbi::default()
-            },
-            words: block,
-            alloc_ix,
-            ..Self::empty_fields()
-        }
+        let mut heap = Self::empty_fields();
+        heap.abi.htop = base;
+        heap.abi.stop = base.wrapping_add(words);
+        heap.abi.heap = base;
+        heap.abi.hend = base.wrapping_add(words);
+        heap.abi.high_water = base;
+        heap.words = block;
+        heap.alloc_ix = alloc_ix;
+        heap
     }
 
     /// Names the allocator index of the scheduler thread that runs this process, or `None` once
@@ -1835,33 +2002,15 @@ impl ProcessHeap {
         WordBlock::new_for(words, allocation_type, self.alloc_ix)
     }
 
-    /// Frees every block of `fragments`, as [`Vec::clear`] would, on the allocator index of this
-    /// heap's scheduler thread.
-    #[inline]
-    pub(crate) fn release_fragments(&self, fragments: &mut Vec<Fragment>) {
-        if self.alloc_ix != NO_ALLOC_IX {
-            for fragment in fragments.iter_mut() {
-                if let Fragment::Block { memory, .. } = fragment {
-                    memory.release_in_place_at(usize::from(self.alloc_ix));
-                }
-            }
-        }
-        fragments.clear();
-    }
-
     /// Record the allocation state a failing builder can roll back to.
     // Port of erts/emulator/beam/erl_message.c (erts_factory_proc_init / erts_factory_proc_prealloc_init:
     // `original_htop`, `off_heap_saved`, `heap_frags_saved`, `heap_frags_saved_used`), OTP-29.1.1.
     pub fn factory_mark(&mut self) -> HeapFactoryMark {
-        self.sync_mbuf_fast();
-        let last_used = match self.fragments.last() {
-            Some(Fragment::Block { used, .. }) => *used,
-            _ => 0,
-        };
+        let saved = self.abi.mbuf.head();
         HeapFactoryMark {
             htop: self.htop_index(),
-            fragments: self.fragments.len(),
-            last_used,
+            heap_frags_saved: self.abi.mbuf.as_ptr() as usize,
+            heap_frags_saved_used: saved.map_or(0, |bp| bp.used_size()),
             off_heap_first: self.owners.off_heap_first,
             overhead: self.owners.overhead,
             bin_vheap: self.bin_vheap,
@@ -1871,7 +2020,6 @@ impl ProcessHeap {
     /// Discard everything allocated since `mark`: off-heap entries, heap fragments and the heap top.
     // Port of erts/emulator/beam/erl_message.c:1543 (erts_factory_undo, FACTORY_HALLOC), OTP-29.1.1.
     pub fn factory_undo(&mut self, mark: HeapFactoryMark) {
-        self.sync_mbuf_fast();
         // Cleanup off-heap: cut the chain at the saved head and release the new entries.
         let first = self.owners.off_heap_first;
         if first != mark.off_heap_first {
@@ -1889,21 +2037,16 @@ impl ProcessHeap {
             self.owners.overhead = mark.overhead;
         }
         self.bin_vheap = mark.bin_vheap;
-        // Free the heap fragments added since the mark.
-        if self.fragments.len() > mark.fragments {
-            let mut added = self.fragments.split_off(mark.fragments);
-            self.fragment_words -= added.iter().map(Fragment::len).sum::<usize>();
-            self.release_fragments(&mut added);
-        }
-        // Roll back the heap top and fix the last fragment.
+        // Free heap frags. erts leaves `mbuf_sz` as it is: the next collection resets it.
+        self.abi
+            .mbuf
+            .free_until(mark.heap_frags_saved as *mut crate::raw::heap_frag::ErlHeapFragment);
+        // Rollback heap top.
         self.set_htop_index(mark.htop);
-        if mark.fragments > 0
-            && let Some(Fragment::Block { used, .. }) = self.fragments.get_mut(mark.fragments - 1)
-        {
-            self.fragment_words -= *used - mark.last_used;
-            *used = mark.last_used;
+        // Fix last heap frag.
+        if let Some(saved) = self.abi.mbuf.head() {
+            saved.set_used_size(mark.heap_frags_saved_used);
         }
-        self.rebuild_mbuf_fast();
     }
 
     /// Reserve contiguous words for a process object.
@@ -2459,7 +2602,7 @@ impl ProcessHeap {
     /// compares it.
     #[inline]
     pub fn mbuf_size(&self) -> usize {
-        self.fragment_words
+        self.abi.mbuf_sz
     }
     /// Address of the word at `index` in the young heap block.
     #[inline]
@@ -2489,68 +2632,10 @@ impl ProcessHeap {
         self.heap_fragment_with_extra(words, 0)
     }
 
-    /// Publish the cached `mbuf` used size to the corresponding fragment before a slow walk.
-    pub(crate) fn sync_mbuf_fast(&mut self) {
-        let mbuf = self.mbuf_fast;
-        if mbuf.base == 0 {
-            return;
-        }
-        if let Some(Fragment::Block { memory, used }) = self.fragments.get_mut(mbuf.fragment_index)
-        {
-            debug_assert_eq!(memory.as_ptr() as usize, mbuf.base);
-            *used = mbuf.used_size;
-        }
-    }
-
-    pub(crate) fn set_mbuf_fast(&mut self, index: usize) {
-        self.sync_mbuf_fast();
-        self.mbuf_fast = match self.fragments.get(index) {
-            Some(Fragment::Block { memory, used }) => MbufFast {
-                base: memory.as_ptr() as usize,
-                alloc_size: memory.len(),
-                used_size: *used,
-                fragment_index: index,
-            },
-            _ => MbufFast::default(),
-        };
-    }
-
-    /// Rebuild the fast cursor after an operation replaces or adopts the fragment list.
-    pub(crate) fn rebuild_mbuf_fast(&mut self) {
-        let index = self
-            .fragments
-            .iter()
-            .rposition(|fragment| matches!(fragment, Fragment::Block { .. }));
-        if let Some(index) = index {
-            self.set_mbuf_fast(index);
-        } else {
-            self.mbuf_fast = MbufFast::default();
-        }
-    }
-
-    #[inline]
-    pub(crate) fn fragment_used_words(&self, index: usize, fragment: &Fragment) -> usize {
-        if self.mbuf_fast.base != 0
-            && self.mbuf_fast.fragment_index == index
-            && let Fragment::Block { .. } = fragment
-        {
-            return self.mbuf_fast.used_size;
-        }
-        fragment.len()
-    }
-
-    /// Allocate a side fragment with spare capacity for subsequent BIF allocations.
-    ///
-    /// Port of erts/emulator/beam/utils.c:135-189 (`erts_heap_alloc`), OTP-29.1.1.
+    /// `erts_heap_alloc`: extend the newest heap fragment when `words` fit in it, else link a
+    /// new one of `words + extra` words in front of `c_p->mbuf`.
+    // Port of erts/emulator/beam/utils.c:135-192 (erts_heap_alloc), OTP-29.1.1.
     pub fn heap_fragment_with_extra(&mut self, words: usize, extra: usize) -> *mut u64 {
-        // Port of the MBUF fast path in erts/emulator/beam/utils.c:148-154, OTP-29.1.1.
-        let mbuf = &mut self.mbuf_fast;
-        if mbuf.base != 0 && words <= mbuf.alloc_size - mbuf.used_size {
-            let ret = (mbuf.base as *mut u64).wrapping_add(mbuf.used_size);
-            mbuf.used_size += words;
-            self.fragment_words += words;
-            return ret;
-        }
         if self.detached
             && let Some(ptr) = self
                 .owners
@@ -2560,40 +2645,58 @@ impl ProcessHeap {
         {
             return ptr;
         }
-        let block_words = words.checked_add(extra).unwrap_or(words);
-        // Port of erts/emulator/beam/utils.c:173-186 (`erts_heap_alloc`), OTP-29.1.1.
-        // ERTS initializes only the requested term span; the spare fragment capacity is untouched.
-        let mut memory = if self.alloc_ix == NO_ALLOC_IX {
-            AllocBlock::new(ErtsAlcType::HEAP_FRAG, block_words)
-        } else {
-            AllocBlock::new_at(
-                usize::from(self.alloc_ix),
-                ErtsAlcType::HEAP_FRAG,
-                block_words,
-            )
+        if let Some(bp) = self.abi.mbuf.head() {
+            let used = bp.used_size();
+            if words <= bp.alloc_size() - used {
+                bp.set_used_size(used + words);
+                self.abi.mbuf_sz += words;
+                return bp.mem().wrapping_add(used);
+            }
         }
-        .expect("heap fragment allocation size is valid");
-        let ptr = memory.as_mut_ptr();
-        let alloc_size = memory.len();
-        self.sync_mbuf_fast();
-        let fragment_index = self.fragments.len();
-        self.fragments.push(Fragment::Block {
-            memory,
-            used: words,
-        });
-        self.mbuf_fast = MbufFast {
-            base: ptr as usize,
-            alloc_size,
-            used_size: words,
-            fragment_index,
-        };
-        self.fragment_words += words;
-        ptr
+        let n = words.checked_add(extra).unwrap_or(words);
+        let bp = crate::raw::heap_frag::HeapFrag::new_message_buffer(n, words);
+        self.abi.mbuf.push(bp);
+        self.abi.mbuf_sz += words;
+        bp.mem()
     }
+
+    /// The heap fragments of `c_p->mbuf`, newest first, as `(mem, used_size)`.
+    #[inline]
+    pub(crate) fn mbufs(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.abi
+            .mbuf
+            .iter()
+            .map(|bp| (bp.mem() as usize, bp.used_size()))
+    }
+
+    /// Every area of young objects outside the young heap block, as `(start address, used
+    /// words)`: the `mbuf` fragments, the heap fragments of `msg_frag` and the abandoned heap.
+    pub(crate) fn heap_frag_areas(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.mbufs()
+            .chain(
+                self.msg_frag
+                    .iter()
+                    .map(|frag| (frag.as_ptr() as usize, frag.len())),
+            )
+            .chain(
+                (!self.abandoned_heap.is_empty())
+                    .then(|| (self.abandoned_heap.as_ptr() as usize, self.abandoned_used)),
+            )
+    }
+
+    /// Whether `address` lies in the used words of a heap fragment area
+    /// ([`ProcessHeap::heap_frag_areas`]).
+    pub(crate) fn in_heap_frag_area(&self, address: usize) -> bool {
+        self.heap_frag_areas()
+            .any(|(start, used)| address >= start && address < start.saturating_add(used * 8))
+    }
+
     /// Move a standalone message heap into this process without copying its terms.
     ///
     /// The source must have no live stack or old generation. Terms allocated in
-    /// it remain valid until this process next collects its fragments.
+    /// it remain valid until this process next collects its fragments: its heap fragments
+    /// join `c_p->mbuf` in front (erts_flush_dirty_shadow_proc), its heap block is kept with
+    /// the received message data on `msg_frag`.
     pub fn adopt_message_fragment(&mut self, mut source: ProcessHeap) -> Result<(), AdoptError> {
         if source.stop_index() != source.words.len()
             || source.old_htop != 0
@@ -2601,42 +2704,47 @@ impl ProcessHeap {
         {
             return Err(AdoptError::NotStandalone);
         }
-        // Dirty-shadow process heaps retain their separate ABI object until ownership moves.
-        // Port of erts_flush_dirty_shadow_proc and erts_heap_alloc, OTP-29.1.1.
-        source.sync_mbuf_fast();
-        self.sync_mbuf_fast();
-        let adopted_words = source.htop_index() + source.fragment_words;
-        self.fragment_words += adopted_words;
+        // Port of erts/emulator/beam/erl_nfunc_sched.h (erts_flush_dirty_shadow_proc),
+        // OTP-29.1.1: the shadow's mbuf list goes in front of the process's, and its
+        // `mbuf_sz` is added.
         let used = source.htop_index();
-        let block = std::mem::take(&mut source.words).into_alloc_block();
+        self.abi.mbuf_sz += used + source.abi.mbuf_sz;
+        let block = std::mem::take(&mut source.words);
         source.abi.htop = std::ptr::null_mut();
         source.abi.stop = std::ptr::null_mut();
-        let used = used.min(block.len());
-        self.fragments.push(Fragment::Block {
-            memory: block,
-            used,
-        });
-        self.fragments.append(&mut source.fragments);
-        self.rebuild_mbuf_fast();
-        self.abandoned |= source.abandoned;
+        let source_mbuf = source.abi.mbuf.take();
+        source.abi.mbuf_sz = 0;
+        self.abi.mbuf.prepend(source_mbuf);
+        if !block.is_empty() {
+            let memory = block.into_alloc_block();
+            let used = used.min(memory.len());
+            self.msg_frag.push(MsgFrag::Block { memory, used });
+        }
+        self.msg_frag.append(&mut source.msg_frag);
+        if !source.abandoned_heap.is_empty() {
+            let memory = std::mem::take(&mut source.abandoned_heap).into_alloc_block();
+            self.abi.mbuf_sz += source.abandoned_used;
+            self.msg_frag.push(MsgFrag::Block {
+                memory,
+                used: source.abandoned_used,
+            });
+        }
         self.absorb_fragment_owners(&mut source);
         Ok(())
     }
 
-    /// Adopt a standalone `ErlHeapFragment` without copying its term words.
-    // Port of erts_save_message_in_proc, OTP-29.1.1.
+    /// Adopt a standalone `ErlHeapFragment` without copying its term words: the message
+    /// joins `msg_frag` and its used words count in `mbuf_sz`.
+    // Port of erts/emulator/beam/erl_message.c:965-1000 (erts_save_message_in_proc), OTP-29.1.1.
     pub fn adopt_message_heap_block(&mut self, source: crate::message::MessageHeapBlock) {
         let (block, used, off_heap, bin_vheap) = source.into_parts();
-        self.sync_mbuf_fast();
-        self.fragment_words += used;
+        self.absorb_off_heap(off_heap, bin_vheap);
+        self.abi.mbuf_sz += used;
         let used = used.min(block.len());
-        let fragment_index = self.fragments.len();
-        self.fragments.push(Fragment::Block {
+        self.msg_frag.push(MsgFrag::Block {
             memory: block,
             used,
         });
-        self.set_mbuf_fast(fragment_index);
-        self.absorb_off_heap(off_heap, bin_vheap);
     }
 
     /// Keep the inline heap fragment of a received message as a fragment of this process,
@@ -2646,8 +2754,8 @@ impl ProcessHeap {
     pub fn adopt_message_node(&mut self, mut fragment: crate::message::NodeFragment) {
         let (off_heap, bin_vheap) = fragment.take_owners();
         self.absorb_off_heap(off_heap, bin_vheap);
-        self.fragment_words += fragment.len();
-        self.fragments.push(Fragment::Node(fragment));
+        self.abi.mbuf_sz += fragment.len();
+        self.msg_frag.push(MsgFrag::Node(fragment));
     }
 
     /// Adopt the data of a received message, wherever it was allocated.
@@ -2690,8 +2798,10 @@ impl ProcessHeap {
         }
         let used = source.htop_index();
         let fits = !self.detached
-            && source.fragments.is_empty()
-            && source.fragment_words == 0
+            && source.abi.mbuf.is_empty()
+            && source.msg_frag.is_empty()
+            && source.abandoned_heap.is_empty()
+            && source.abi.mbuf_sz == 0
             && !self.words.is_empty()
             && !source.detached
             && self.halloc_words_left().is_some_and(|left| used <= left)
@@ -2794,14 +2904,9 @@ impl ProcessHeap {
     /// and of each heap fragment.
     // Port of erts/emulator/beam/erl_message.h (erts_msg_attached_data_size), OTP-29.1.1.
     pub fn message_data_size(&self) -> usize {
-        self.fragments
-            .iter()
-            .enumerate()
-            .filter_map(|(index, fragment)| match fragment {
-                Fragment::Block { .. } => Some(self.fragment_used_words(index, fragment)),
-                Fragment::Node(fragment) => Some(fragment.len()),
-                Fragment::Abandoned { .. } => None,
-            })
+        self.mbufs()
+            .map(|(_, used)| used)
+            .chain(self.msg_frag.iter().map(MsgFrag::len))
             .fold(self.htop_index(), usize::saturating_add)
     }
 
@@ -2992,7 +3097,7 @@ impl ProcessHeap {
     #[inline(always)]
     pub fn gc_after_bif_desired(&self) -> bool {
         let desired =
-            self.gc_enabled & (self.gc_desired() | self.bin_vheap_gc_due() | self.force_gc);
+            self.gc_enabled() & (self.gc_desired() | self.bin_vheap_gc_due() | self.force_gc());
         if desired {
             self.live_frags_armed.set(true);
         } else {
@@ -3007,7 +3112,7 @@ impl ProcessHeap {
     // `emit_call_light_bif_shared`), OTP-29.1.1.
     #[inline(always)]
     pub fn note_bif_entry(&self) {
-        self.live_frag_mark.set(self.fragments.len() as u32);
+        self.live_frag_mark.set(self.abi.mbuf.as_ptr() as usize);
     }
 
     /// A BIF disables collection to trap: keep the mark taken at its entry as `c_p->live_hf_end`.
@@ -3019,10 +3124,11 @@ impl ProcessHeap {
         }
     }
 
-    /// The fragment index from which a collection started by a BIF epilogue may treat the
-    /// fragments as completely live (erts `live_hf_end`), consumed by the collection.
-    // Port of erts/emulator/beam/erl_gc.c (`erts_gc_after_bif_call_lhf`), OTP-29.1.1.
-    pub(crate) fn take_live_frags_from(&self) -> Option<usize> {
+    /// `live_hf_end` of a collection started by a BIF epilogue: the fragments in front of it
+    /// on `c_p->mbuf` are completely live. Consumed by the collection.
+    // Port of erts/emulator/beam/erl_gc.c (`erts_gc_after_bif_call_lhf`, garbage_collect),
+    // OTP-29.1.1.
+    pub(crate) fn take_live_hf_end(&self) -> Option<*mut crate::raw::heap_frag::ErlHeapFragment> {
         let armed = self.live_frags_armed.replace(false);
         let mut mark = self.live_frag_mark.replace(INVALID_HFRAG);
         // erl_gc.c garbage_collect: `else if (p->live_hf_end != ERTS_INVALID_HFRAG_PTR)`, and
@@ -3031,13 +3137,26 @@ impl ProcessHeap {
         if saved != INVALID_HFRAG {
             mark = saved;
         }
-        (armed && mark != INVALID_HFRAG && mark as usize <= self.fragments.len())
-            .then_some(mark as usize)
+        // erts_gc_after_bif_call_lhf: `if (!p->mbuf) live_hf_end = ERTS_INVALID_HFRAG_PTR`.
+        if !armed || mark == INVALID_HFRAG || self.abi.mbuf.is_empty() {
+            return None;
+        }
+        let mark = mark as *mut crate::raw::heap_frag::ErlHeapFragment;
+        // The mark is on the list unless a collection ran inside the BIF and freed it.
+        (mark.is_null() || self.abi.mbuf.iter().any(|bp| bp.as_ptr() == mark)).then_some(mark)
     }
 }
 impl Default for ProcessHeap {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for ProcessHeap {
+    fn drop(&mut self) {
+        // The off-heap lists link objects in the heap blocks and the `mbuf` fragments, which
+        // drop after them with `abi`: release the lists first.
+        drop(std::mem::take(&mut self.owners));
     }
 }
 impl HeapAlloc for ProcessHeap {
@@ -3065,19 +3184,8 @@ impl HeapAlloc for ProcessHeap {
             }
             return;
         }
-        let mbuf = &mut self.mbuf_fast;
-        let mbuf_end = mbuf.base + mbuf.used_size * std::mem::size_of::<u64>();
-        if mbuf.base != 0
-            && end as usize == mbuf_end
-            && (start as usize) >= mbuf.base
-            && (start as usize) <= mbuf_end
-        {
-            let new_used = (start as usize - mbuf.base) / std::mem::size_of::<u64>();
-            let released = mbuf.used_size - new_used;
-            mbuf.used_size = new_used;
-            self.fragment_words -= released;
-            return;
-        }
+        // Port of erts/emulator/beam/erl_vm.h:164-173 (HRelease): on the heap the top moves
+        // back, else the newest fragment shrinks (erts_heap_frag_shrink).
         let base = self.words.as_ptr() as usize;
         let top = base + self.htop_index() * 8;
         let address = start as usize;
@@ -3085,19 +3193,20 @@ impl HeapAlloc for ProcessHeap {
             self.set_htop_index((address - base) / 8);
             return;
         }
-        let Some(Fragment::Block { memory, used }) = self.fragments.last_mut() else {
+        let Some(bp) = self.abi.mbuf.head() else {
             return;
         };
-        let fragment_start = memory.as_ptr() as usize;
-        let fragment_end = fragment_start.saturating_add(used.saturating_mul(8));
-        if address >= fragment_start
-            && address <= fragment_end
-            && end as usize == fragment_end
-            && (address - fragment_start).is_multiple_of(8)
+        let used = bp.used_size();
+        let mem = bp.mem() as usize;
+        let mem_end = mem + used * 8;
+        if address >= mem
+            && address <= mem_end
+            && end as usize == mem_end
+            && (address - mem).is_multiple_of(8)
         {
-            let new_used = (address - fragment_start) / 8;
-            self.fragment_words -= *used - new_used;
-            *used = new_used;
+            let new_used = (address - mem) / 8;
+            self.abi.mbuf_sz -= used - new_used;
+            bp.set_used_size(new_used);
         }
     }
     #[inline]
@@ -3159,9 +3268,15 @@ impl HeapAlloc for ProcessHeap {
             }
             return;
         }
+        // erts_heap_frag_shrink on the newest fragment.
         let released = allocated - used;
-        self.mbuf_fast.used_size -= released;
-        self.fragment_words -= released;
+        let bp = self
+            .abi
+            .mbuf
+            .head()
+            .expect("a fragment allocation is on the mbuf list");
+        bp.set_used_size(bp.used_size() - released);
+        self.abi.mbuf_sz -= released;
     }
     fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
         if self.detached
@@ -6283,7 +6398,7 @@ impl Term {
 }
 #[cfg(test)]
 mod heap_block_tests {
-    use super::{HeapAlloc, MbufFast, ProcessHeap, TermBuilder, VecHeap};
+    use super::{HeapAlloc, ProcessHeap, TermBuilder, VecHeap};
 
     #[test]
     fn positive_bignum_block_leaves_digits_for_incremental_fill() {
@@ -6330,11 +6445,9 @@ mod heap_block_tests {
                     for _ in 0..26 {
                         std::hint::black_box(heap.heap_fragment(1 + (next() % 12) as usize));
                     }
-                    let mut fragments = std::mem::take(&mut heap.fragments);
-                    heap.mbuf_fast = MbufFast::default();
-                    heap.release_fragments(&mut fragments);
-                    heap.fragments = fragments;
-                    heap.fragment_words = 0;
+                    // free_message_buffer(c_p->mbuf), as a collection does.
+                    drop(heap.abi.mbuf.take());
+                    heap.abi.mbuf_sz = 0;
                 }
                 best = best.min(started.elapsed().as_nanos() as f64 / (cycles as f64 * 26.0));
             }

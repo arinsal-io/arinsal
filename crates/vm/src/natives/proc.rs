@@ -518,8 +518,8 @@ pub(crate) fn flag(process: &mut Process, name: &str, value: Term) -> Result<Ter
             } else {
                 return Err(badarg());
             };
-            let old = process.trap_exit;
-            process.trap_exit = enabled;
+            let old = process.trap_exit();
+            process.set_trap_exit(enabled);
             Term::atom(if old {
                 arinsal_term::atoms::TRUE
             } else {
@@ -576,13 +576,24 @@ pub(crate) fn flag(process: &mut Process, name: &str, value: Term) -> Result<Ter
                 arinsal_term::atoms::FALSE
             })
         }
+        // Port of erts/emulator/beam/bif.c:2031-2041 (process_flag_2, am_async_dist), OTP-29.1.1.
         "async_dist" => {
-            if value != Term::atom(arinsal_term::atoms::TRUE)
-                && value != Term::atom(arinsal_term::atoms::FALSE)
-            {
+            let on = if value == Term::atom(arinsal_term::atoms::TRUE) {
+                true
+            } else if value == Term::atom(arinsal_term::atoms::FALSE) {
+                false
+            } else {
                 return Err(badarg());
-            }
-            set_flag(process, name, value).unwrap_or_else(|| Term::atom(arinsal_term::atoms::FALSE))
+            };
+            let old = process.heap.has_flag(arinsal_term::pflags::F_ASYNC_DIST);
+            process
+                .heap
+                .set_flag(arinsal_term::pflags::F_ASYNC_DIST, on);
+            Term::atom(if old {
+                arinsal_term::atoms::TRUE
+            } else {
+                arinsal_term::atoms::FALSE
+            })
         }
         "save_calls" => return save_calls_flag(process, value).map_err(VmError::Trap),
         "fullsweep_after" | "min_heap_size" | "min_bin_vheap_size" => {
@@ -873,7 +884,7 @@ fn process_info_aux(
         arinsal_term::atoms::MESSAGES => process_info_item_messages(process)?,
         // Port of erts/emulator/beam/erl_bif_info.c:1964 (ERTS_PI_IX_DICTIONARY), OTP-29.1.1.
         arinsal_term::atoms::DICTIONARY => process_info_item_dictionary(process)?,
-        arinsal_term::atoms::TRAP_EXIT => Term::atom(if src.read(process).trap_exit {
+        arinsal_term::atoms::TRAP_EXIT => Term::atom(if src.read(process).trap_exit() {
             arinsal_term::atoms::TRUE
         } else {
             arinsal_term::atoms::FALSE
@@ -965,30 +976,37 @@ fn process_info_aux(
                 arinsal_term::atoms::ON_HEAP
             },
         ),
+        // Port of erts/emulator/beam/erl_bif_info.c:2271 (`rp->flags & F_ASYNC_DIST`),
+        // OTP-29.1.1.
+        arinsal_term::atoms::ASYNC_DIST => Term::atom(
+            if src
+                .read(process)
+                .heap
+                .has_flag(arinsal_term::pflags::F_ASYNC_DIST)
+            {
+                arinsal_term::atoms::TRUE
+            } else {
+                arinsal_term::atoms::FALSE
+            },
+        ),
         arinsal_term::atoms::PRIORITY
         | arinsal_term::atoms::ERROR_HANDLER
         | arinsal_term::atoms::SAVE_CALLS
-        | arinsal_term::atoms::SENSITIVE
-        | arinsal_term::atoms::ASYNC_DIST => {
+        | arinsal_term::atoms::SENSITIVE => {
             // The flag name is needed as text for the process flag table, and the defaults
             // are per name; only these arms read it.
             let text = PROCESS_INFO_ARG_NAMES[item_ix];
             flag_value(src.read(process), text).unwrap_or_else(|| match text {
                 "priority" => Term::atom(arinsal_term::atoms::NORMAL),
                 "error_handler" => Term::atom(arinsal_term::atoms::ERROR_HANDLER),
-                "sensitive" | "async_dist" | "save_calls" => Term::atom(arinsal_term::atoms::FALSE),
+                "sensitive" | "save_calls" => Term::atom(arinsal_term::atoms::FALSE),
                 _ => Term::small(0).unwrap(),
             })
         }
         arinsal_term::atoms::BACKTRACE => process_info_item_backtrace(process)?,
         arinsal_term::atoms::BINARY => process_info_item_binary(process)?,
         arinsal_term::atoms::CATCHLEVEL => Term::small(0).unwrap(),
-        arinsal_term::atoms::CURRENT_FUNCTION
-            if process
-                .runtime
-                .as_ref()
-                .is_some_and(|runtime| runtime.is_hibernating(pid)) =>
-        {
+        arinsal_term::atoms::CURRENT_FUNCTION if process.hibernate_sched() => {
             // Port of erts/emulator/beam/erl_bif_info.c (`current_function`) and
             // beam_common.c (`erts_hibernate`), OTP-29.1.1: hibernate/3 parks at its export
             // entry; i_hibernate/0 keeps the process's current function.
@@ -2255,9 +2273,9 @@ pub(crate) fn process_info_light(
         Some(probe) => {
             probe.has_pending()
                 || probe
-                    .proc_flags()
+                    .proc_state()
                     .load(std::sync::atomic::Ordering::Acquire)
-                    & arinsal_sched::proc_flags::SUSPENDED
+                    & arinsal_sched::psflg::SUSPENDED
                     != 0
         }
         None => runtime.scheduler().ok()?.input_has_pending(own)? || runtime.suspend_active(own),
@@ -2334,9 +2352,9 @@ pub(crate) fn process_info_1_light(
         Some(probe) => {
             probe.has_pending()
                 || probe
-                    .proc_flags()
+                    .proc_state()
                     .load(std::sync::atomic::Ordering::Acquire)
-                    & arinsal_sched::proc_flags::SUSPENDED
+                    & arinsal_sched::psflg::SUSPENDED
                     != 0
         }
         None => runtime.scheduler().ok()?.input_has_pending(own)? || runtime.suspend_active(own),
@@ -2377,9 +2395,9 @@ fn process_info_light_single(
         Some(probe) => {
             probe.has_pending()
                 || probe
-                    .proc_flags()
+                    .proc_state()
                     .load(std::sync::atomic::Ordering::Acquire)
-                    & arinsal_sched::proc_flags::SUSPENDED
+                    & arinsal_sched::psflg::SUSPENDED
                     != 0
         }
         None => runtime.scheduler().ok()?.input_has_pending(own)? || runtime.suspend_active(own),
@@ -2587,7 +2605,7 @@ pub(crate) fn collect_heap(
     major: bool,
     keep: &mut [Term],
 ) -> Result<(), VmError> {
-    if !process.heap.gc_enabled {
+    if !process.heap.gc_enabled() {
         process.gc_deferred = true;
         return Ok(());
     }
@@ -3069,9 +3087,9 @@ fn call_values(
             ("process_info", [pid]) => process_info_call(vm, process, ctx, *pid, None),
             ("process_info", [pid, item]) => process_info_call(vm, process, ctx, *pid, Some(*item)),
             ("hibernate", [module, function, args]) => {
-                hibernate(process, vm.x_regs()?, ctx, *module, *function, *args)
+                hibernate(process, vm.x_regs()?, *module, *function, *args)
             }
-            ("hibernate", []) if module == "erlang" => hibernate_zero(vm, process, ctx),
+            ("hibernate", []) if module == "erlang" => hibernate_zero(vm, process),
             ("suspend_process", [pid, options]) if module == "erts_internal" => {
                 suspend_process(process, ctx, *pid, *options)
             }
@@ -3195,7 +3213,6 @@ pub(crate) fn save_calls_flag(
 fn hibernate(
     process: &mut Process,
     reg: &mut [Term],
-    ctx: &RunCtx<'_, Message>,
     module: Term,
     function: Term,
     args: Term,
@@ -3221,9 +3238,11 @@ fn hibernate(
         }
         return Err(badarg());
     }
-    let runtime = process
-        .runtime
-        .ok_or_else(|| VmError::Unsupported("hibernate requires a scheduler".into()))?;
+    if process.runtime.is_none() {
+        return Err(VmError::Unsupported(
+            "hibernate requires a scheduler".into(),
+        ));
+    }
     // Port of erts/emulator/beam/beam_common.c:1568 (erts_hibernate), OTP-29.1.1: the
     // arguments stay in the argument registers (arity 3) as the only roots and the stack
     // is discarded; the executor shrinks the heap once the BIF has unwound.
@@ -3241,22 +3260,18 @@ fn hibernate(
         resume_in_place: false, // elixir_loop1
         current_mfa: None,
     });
-    runtime.mark_hibernating(ctx.pid(), true);
     // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
-    process.slice_mut().hibernate_sched = true;
+    process.set_hibernate_sched(true);
     Err(VmError::Unsupported("hibernate".into()))
 }
 
 // OTP-29.1.1 `erts/emulator/beam/ops.tab` lowers `hibernate/0` to `i_hibernate`.
-fn hibernate_zero(
-    vm: &Vm,
-    process: &mut Process,
-    ctx: &RunCtx<'_, Message>,
-) -> Result<Term, VmError> {
-    let runtime = process
-        .runtime
-        .ok_or_else(|| VmError::Unsupported("hibernate requires a scheduler".into()))?;
-    let pid = ctx.pid();
+fn hibernate_zero(vm: &Vm, process: &mut Process) -> Result<Term, VmError> {
+    if process.runtime.is_none() {
+        return Err(VmError::Unsupported(
+            "hibernate requires a scheduler".into(),
+        ));
+    }
     if process
         .cold
         .as_ref()
@@ -3274,9 +3289,8 @@ fn hibernate_zero(
         resume_in_place: true,
         current_mfa: Some(current_mfa),
     });
-    runtime.mark_hibernating(pid, true);
     // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
-    process.slice_mut().hibernate_sched = true;
+    process.set_hibernate_sched(true);
     Err(VmError::Unsupported("hibernate".into()))
 }
 

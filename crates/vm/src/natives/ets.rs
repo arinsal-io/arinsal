@@ -12,10 +12,9 @@ use arinsal_ets::{
 use arinsal_sched::{Pid, RunCtx};
 use arinsal_term::{HeapAlloc, MagicBin, Term, TermBuilder, TermKind, global_atoms};
 use num_bigint::BigInt;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // Only atoms of the static erts table: interning others here would give them
@@ -67,10 +66,13 @@ static ETS_ATOMS: LazyLock<HashMap<&'static str, arinsal_term::Atom>> = LazyLock
     .collect()
 });
 
-// Port of erts/emulator/beam/erl_db.c (`erts_internal_ets_super_user_1`),
-// OTP-29.1.1. Process currently has no ETS-specific flag word.
-static ETS_SUPER_USERS: LazyLock<Mutex<HashSet<Term>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+/// `p->flags & F_ETS_SUPER_USER` of the calling process (db_get_table_aux).
+#[inline(always)]
+fn ets_super_user(process: &Process) -> bool {
+    process
+        .heap
+        .has_flag(arinsal_term::pflags::F_ETS_SUPER_USER)
+}
 
 #[inline]
 fn boolean_term(value: bool) -> Term {
@@ -344,18 +346,16 @@ fn live_table_terms<H: HeapAlloc>(
         .collect()
 }
 #[inline(always)]
-fn allowed(table: &arinsal_ets::Table, caller: Term, write: bool) -> bool {
-    // Port of erts/emulator/beam/erl_db.c (db_get_table_aux), OTP-29.1.1.
-    // Access depends on stored flags, not the table-wide statistics in info().
-    // The cheap owner and protection tests come first; the global super-user set is the
-    // last resort so ordinary calls never take its lock.
+fn allowed(table: &arinsal_ets::Table, caller: Term, super_user: bool, write: bool) -> bool {
+    // Port of erts/emulator/beam/erl_db.c:780-792 (db_get_table_aux: owner, protection, then
+    // `p->flags & F_ETS_SUPER_USER`), OTP-29.1.1.
     caller == table.options.owner
         || match table.options.protection {
             Protection::Private => false,
             Protection::Protected => !write,
             Protection::Public => true,
         }
-        || ETS_SUPER_USERS.lock().unwrap().contains(&caller)
+        || super_user
 }
 /// A one-based element position as erts reads `signed_val(Pos)`; positions below 1
 /// become 0 so the table reports `position`.
@@ -517,12 +517,12 @@ fn bif_register_frame(
 /// protection does not already grant access. Port of erts/emulator/beam/erl_db.c
 /// (db_get_table_aux, DB_READ access test), OTP-29.1.1.
 #[inline(always)]
-fn read_allowed(table: &arinsal_ets::Table, pid: arinsal_sched::Pid) -> bool {
+fn read_allowed(table: &arinsal_ets::Table, pid: arinsal_sched::Pid, super_user: bool) -> bool {
     match table.options.protection {
         Protection::Public | Protection::Protected => true,
         Protection::Private => pid
             .to_term()
-            .is_some_and(|caller| allowed(table, caller, false)),
+            .is_some_and(|caller| allowed(table, caller, super_user, false)),
     }
 }
 
@@ -579,6 +579,7 @@ pub(crate) fn ets_lookup_2(process: &mut Process, args: &[Term]) -> Result<Term,
 /// the BIF path. Errors decline to the scheduler path so it can build the proper exception.
 // Port of erts/emulator/beam/erl_db.c (ets_lookup_2, db_get_table_aux), OTP-29.1.1.
 fn direct_lookup_named(process: &mut Process, args: &[Term]) -> Option<Term> {
+    let super_user = ets_super_user(process);
     let name = args[0].as_atom()?;
     let pid = process.self_pid?;
     let group = reader_group(process);
@@ -590,7 +591,7 @@ fn direct_lookup_named(process: &mut Process, args: &[Term]) -> Option<Term> {
                 || !table.options.named_table
                 || table.options.name != name
                 || table.is_busy()
-                || !read_allowed(&table, pid)
+                || !read_allowed(&table, pid, super_user)
             {
                 return None;
             }
@@ -601,12 +602,13 @@ fn direct_lookup_named(process: &mut Process, args: &[Term]) -> Option<Term> {
 }
 
 fn direct_lookup_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
+    let super_user = ets_super_user(process);
     let pid = process.self_pid?;
     let key = args[1];
     let group = reader_group(process);
     with_cached_table(process, args[0], |shared, _options, process| {
         let table = shared.read_at(group);
-        if table.is_detached() || table.is_busy() || !read_allowed(&table, pid) {
+        if table.is_detached() || table.is_busy() || !read_allowed(&table, pid, super_user) {
             return None;
         }
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
@@ -629,12 +631,13 @@ pub(crate) fn ets_member_2(process: &mut Process, args: &[Term]) -> Result<Term,
 }
 
 fn direct_member_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
+    let super_user = ets_super_user(process);
     let pid = process.self_pid?;
     let key = args[1];
     let group = reader_group(process);
     with_cached_table(process, args[0], |shared, _options, _| {
         let table = shared.read_at(group);
-        if table.is_detached() || table.is_busy() || !read_allowed(&table, pid) {
+        if table.is_detached() || table.is_busy() || !read_allowed(&table, pid, super_user) {
             return None;
         }
         Some(boolean_term(table.member_at(key, group)))
@@ -657,6 +660,7 @@ pub(crate) fn ets_lookup_element(process: &mut Process, args: &[Term]) -> Result
 /// frame. Any failure declines, and the general path repeats the lookup and raises.
 // Port of erts/emulator/beam/erl_db.c (ets_lookup_element_3), OTP-29.1.1.
 fn direct_lookup_element_hit(process: &mut Process, args: &[Term]) -> Option<Term> {
+    let super_user = ets_super_user(process);
     if args.len() != 3 {
         return None;
     }
@@ -667,7 +671,7 @@ fn direct_lookup_element_hit(process: &mut Process, args: &[Term]) -> Option<Ter
         let table = shared.read_at(group);
         if table.is_detached()
             || table.is_busy()
-            || !read_allowed(&table, pid)
+            || !read_allowed(&table, pid, super_user)
             || matches!(
                 table.options.table_type,
                 TableType::Bag | TableType::DuplicateBag
@@ -733,19 +737,28 @@ pub(crate) fn ets_delete_2(process: &mut Process, args: &[Term]) -> Result<Term,
 }
 
 fn direct_delete_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
+    let super_user = ets_super_user(process);
     let caller = direct_caller(process)?;
     let group = reader_group(process);
     let target = args[0];
     let key = args[1];
     if target.is_magic_ref() {
         with_cached_table(process, target, |shared, options, _| {
-            direct_delete_from_shared(shared, group, options, caller, key, None)
+            direct_delete_from_shared(shared, group, options, caller, super_user, key, None)
         })
     } else if let Some(name) = target.as_atom() {
         let rt = process.runtime.as_ref()?;
         rt.named_ets
             .with_table(name, |shared| {
-                direct_delete_from_shared(shared, group, shared.options(), caller, key, Some(name))
+                direct_delete_from_shared(
+                    shared,
+                    group,
+                    shared.options(),
+                    caller,
+                    super_user,
+                    key,
+                    Some(name),
+                )
             })
             .flatten()
     } else {
@@ -758,6 +771,7 @@ fn direct_delete_from_shared(
     group: usize,
     options: &TableOptions,
     caller: Term,
+    super_user: bool,
     key: Term,
     name: Option<arinsal_term::Atom>,
 ) -> Option<Term> {
@@ -766,7 +780,7 @@ fn direct_delete_from_shared(
         if table.is_detached()
             || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
             || table.is_busy()
-            || !allowed(&table, caller, true)
+            || !allowed(&table, caller, super_user, true)
         {
             return None;
         }
@@ -780,7 +794,7 @@ fn direct_delete_from_shared(
     if table.is_detached()
         || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
         || table.is_busy()
-        || !allowed(&table, caller, true)
+        || !allowed(&table, caller, super_user, true)
     {
         return None;
     }
@@ -839,6 +853,7 @@ pub(crate) fn bif_failure(
 // erl_db_hash.c (db_put_hash), OTP-29.1.1.
 #[inline]
 fn insert_one<const NEW: bool>(process: &mut Process, args: &[Term]) -> Option<Term> {
+    let super_user = ets_super_user(process);
     if args[1].classify() != TermKind::Tuple {
         return None;
     }
@@ -853,7 +868,7 @@ fn insert_one<const NEW: bool>(process: &mut Process, args: &[Term]) -> Option<T
             if table.is_detached()
                 || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
                 || table.is_busy()
-                || !allowed(&table, caller, true)
+                || !allowed(&table, caller, super_user, true)
             {
                 return None;
             }
@@ -863,7 +878,7 @@ fn insert_one<const NEW: bool>(process: &mut Process, args: &[Term]) -> Option<T
         if table.is_detached()
             || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
             || table.is_busy()
-            || !allowed(&table, caller, true)
+            || !allowed(&table, caller, super_user, true)
         {
             return None;
         }
@@ -943,6 +958,7 @@ fn direct_update_counter_from_shared(
     args: &[Term],
     heap: &mut arinsal_term::ProcessHeap,
 ) -> Option<Result<Term, VmError>> {
+    let super_user = heap.has_flag(arinsal_term::pflags::F_ETS_SUPER_USER);
     if options.write_concurrency != WriteConcurrency::Disabled {
         let table = shared.read_at(group);
         if table.is_detached()
@@ -952,14 +968,14 @@ fn direct_update_counter_from_shared(
             return None;
         }
         if let Some(increment) = args.get(2).and_then(|operation| operation.as_small()) {
-            if let Err(error) = validate_counter_request(&table, caller, args) {
+            if let Err(error) = validate_counter_request(&table, caller, super_user, args) {
                 return Some(Err(error));
             }
             if let Some(value) = table.update_counter_one_in_place_shared(args[1], increment) {
                 return Some(Ok(value));
             }
         }
-        let request = match counter_request(&table, caller, args) {
+        let request = match counter_request(&table, caller, super_user, args) {
             Ok(Some(request)) => request,
             Ok(None) => return None,
             Err(error) => return Some(Err(error)),
@@ -977,14 +993,14 @@ fn direct_update_counter_from_shared(
         return None;
     }
     if let Some(increment) = args.get(2).and_then(|operation| operation.as_small()) {
-        if let Err(error) = validate_counter_request(&table, caller, args) {
+        if let Err(error) = validate_counter_request(&table, caller, super_user, args) {
             return Some(Err(error));
         }
         if let Some(value) = table.update_counter_one_in_place(args[1], increment) {
             return Some(Ok(value));
         }
     }
-    let request = match counter_request(&table, caller, args) {
+    let request = match counter_request(&table, caller, super_user, args) {
         Ok(Some(request)) => request,
         Ok(None) => return None,
         Err(error) => return Some(Err(error)),
@@ -1000,9 +1016,10 @@ type CounterRequest = (Term, smallvec::SmallVec<[CounterOp; 4]>, bool);
 fn counter_request(
     table: &arinsal_ets::Table,
     caller: Term,
+    super_user: bool,
     args: &[Term],
 ) -> Result<Option<CounterRequest>, VmError> {
-    validate_counter_request(table, caller, args)?;
+    validate_counter_request(table, caller, super_user, args)?;
     let Some((operations, single)) = small_counter_ops(table.options.keypos, args[2]) else {
         return Ok(None);
     };
@@ -1012,9 +1029,10 @@ fn counter_request(
 fn validate_counter_request(
     table: &arinsal_ets::Table,
     caller: Term,
+    super_user: bool,
     args: &[Term],
 ) -> Result<(), VmError> {
-    if !allowed(table, caller, true) {
+    if !allowed(table, caller, super_user, true) {
         return Err(badarg_cause("access"));
     }
     // ets_update_counter_4 validates Default before do_update_counter checks table type.
@@ -1039,6 +1057,7 @@ pub(crate) fn insert_args(
     target: Term,
     objects: Term,
 ) -> Result<Term, VmError> {
+    let super_user = ets_super_user(process);
     // SAFETY: object terms remain in the caller's live process heap for this BIF.
     let is_tuple = unsafe { objects.tuple_ref() }.is_some();
 
@@ -1066,7 +1085,7 @@ pub(crate) fn insert_args(
             if table.is_busy() {
                 return Err(VmError::Yield);
             }
-            if !allowed(&table, caller, true) {
+            if !allowed(&table, caller, super_user, true) {
                 return Err(badarg_cause("access"));
             }
             return Ok(boolean_term(true));
@@ -1081,7 +1100,7 @@ pub(crate) fn insert_args(
             if table.is_busy() {
                 return Err(VmError::Yield);
             }
-            if !allowed(&table, caller, true) {
+            if !allowed(&table, caller, super_user, true) {
                 return Err(badarg_cause("access"));
             }
             let yes = table.insert_term_shared(object, insert_new).map_err(err)?;
@@ -1101,7 +1120,7 @@ pub(crate) fn insert_args(
         if table.is_busy() {
             return Err(VmError::Yield);
         }
-        if !allowed(&table, caller, true) {
+        if !allowed(&table, caller, super_user, true) {
             return Err(badarg_cause("access"));
         }
         let yes = if single {
@@ -1148,6 +1167,7 @@ pub(crate) fn insert_list(
     objects: Term,
     mut state: Option<EtsInsert>,
 ) -> Result<ListInsert, VmError> {
+    let super_user = ets_super_user(process);
     const ITERATIONS_PER_RED: isize = 8;
     let rt = process.runtime.ok_or_else(badarg)?;
     let initial = process.heap.abi.fcalls.max(0) as isize;
@@ -1183,7 +1203,7 @@ pub(crate) fn insert_list(
                 .is_some_and(|name| table.options.named_table && table.options.name != name)
         {
             err(EtsError::NoTable)
-        } else if !allowed(&table, caller, true) {
+        } else if !allowed(&table, caller, super_user, true) {
             badarg_cause("access")
         } else {
             badarg()
@@ -1240,7 +1260,7 @@ pub(crate) fn insert_list(
         if table.is_busy() {
             return Err(err(EtsError::Busy));
         }
-        if !allowed(&table, caller, true) {
+        if !allowed(&table, caller, super_user, true) {
             return Err(badarg_cause("access"));
         }
         let mut check_cursor = objects;
@@ -1311,7 +1331,7 @@ pub(crate) fn insert_list(
         drop(table);
         return Ok(ListInsert::Trap(EtsInsert::Copy { cursor, prepared }));
     }
-    if !allowed(&table, caller, true) {
+    if !allowed(&table, caller, super_user, true) {
         return Err(badarg_cause("access"));
     }
     let mut member_cursor = None;
@@ -1366,6 +1386,7 @@ fn lookup_args(
     target: Term,
     key: Term,
 ) -> Result<Term, VmError> {
+    let super_user = ets_super_user(process);
     let group = reader_group(process);
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
     let mut lookup = |shared: &arinsal_ets::TableLock,
@@ -1380,7 +1401,7 @@ fn lookup_args(
         if table.is_busy() {
             return Err(err(arinsal_ets::EtsError::Busy));
         }
-        if !allowed(&table, caller, false) {
+        if !allowed(&table, caller, super_user, false) {
             return Err(badarg_cause("access"));
         }
         if member {
@@ -1411,7 +1432,8 @@ fn lookup_element_locked(
     default: Option<Term>,
     heap: &mut arinsal_bifs::ProcessHeapHandle<'_>,
 ) -> Result<Term, VmError> {
-    if !allowed(table, caller, false) {
+    let super_user = heap.0.has_flag(arinsal_term::pflags::F_ETS_SUPER_USER);
+    if !allowed(table, caller, super_user, false) {
         return Err(badarg_cause("access"));
     }
     // Port of erts/emulator/beam/erl_db.c ets_lookup_element_3: the table is looked up and its
@@ -1583,13 +1605,14 @@ fn delete_or_clear(
     args: &[Term],
     caller: Term,
 ) -> Result<Term, VmError> {
+    let super_user = ets_super_user(process);
     let rt = process.runtime.ok_or_else(badarg)?;
     let initial = process.heap.abi.fcalls.max(0) as isize;
     let mut reds = initial;
     if function == EtsBif::Delete {
         let mut registry = rt.ets.write().unwrap();
         let tid = handle(&registry, args[0])?;
-        if !allowed(&*registry.get(tid).map_err(err)?, caller, true) {
+        if !allowed(&*registry.get(tid).map_err(err)?, caller, super_user, true) {
             return Err(badarg_cause("access"));
         }
         let (mut garbage, fixations) = registry.detach(tid).map_err(err)?;
@@ -1610,7 +1633,7 @@ fn delete_or_clear(
     let registry = rt.ets.read().unwrap();
     let tid = handle(&registry, args[0])?;
     let mut table = registry.get_mut(tid).map_err(err)?;
-    if !allowed(&table, caller, true) {
+    if !allowed(&table, caller, super_user, true) {
         return Err(badarg_cause("access"));
     }
     // `BIF_ARG_2 != undefined`: this is the continuation, and the table is no longer busy.
@@ -1860,6 +1883,7 @@ fn hash_select(
     function: EtsBif,
     args: &[Term],
 ) -> Result<Option<Term>, VmError> {
+    let super_user = ets_super_user(process);
     use arinsal_ets::{IterSafety, ScanPosition};
     let caller = caller_pid.to_term().ok_or_else(badarg)?;
     let rt = process.runtime.ok_or_else(badarg)?;
@@ -1896,7 +1920,7 @@ fn hash_select(
             Err(EtsError::Busy) => return Err(VmError::Yield),
             Err(error) => return Err(err(error)),
         };
-        if !allowed(&table, caller, false) {
+        if !allowed(&table, caller, super_user, false) {
             return Err(badarg_cause("access"));
         }
         let hash = table.is_hash();
@@ -2486,6 +2510,7 @@ fn call_inner(
     function: EtsBif,
     args: &[Term],
 ) -> Result<Term, VmError> {
+    let super_user = ets_super_user(process);
     let caller = caller_pid.to_term().ok_or_else(badarg)?;
     if function == EtsBif::MatchSpecTest {
         // Port of erts/emulator/beam/erl_db_util.c
@@ -2516,16 +2541,19 @@ fn call_inner(
         let [flag] = args else {
             return Err(badarg());
         };
-        let mut users = ETS_SUPER_USERS.lock().unwrap();
-        if *flag == Term::atom(arinsal_term::atoms::TRUE) {
-            users.insert(caller);
-            return Ok(Term::atom(arinsal_term::atoms::OK));
-        }
-        if *flag == Term::atom(arinsal_term::atoms::FALSE) {
-            users.remove(&caller);
-            return Ok(Term::atom(arinsal_term::atoms::OK));
-        }
-        return Err(badarg());
+        // Port of erts/emulator/beam/erl_db.c:4712-4721 (erts_internal_ets_super_user_1),
+        // OTP-29.1.1.
+        let on = if *flag == Term::atom(arinsal_term::atoms::TRUE) {
+            true
+        } else if *flag == Term::atom(arinsal_term::atoms::FALSE) {
+            false
+        } else {
+            return Err(badarg());
+        };
+        process
+            .heap
+            .set_flag(arinsal_term::pflags::F_ETS_SUPER_USER, on);
+        return Ok(Term::atom(arinsal_term::atoms::OK));
     }
     if ctx.is_some()
         && gated_by_busy(function)
@@ -2746,7 +2774,7 @@ fn call_inner(
                 if table.is_busy() {
                     return Err(VmError::Yield);
                 }
-                if !allowed(&table, caller, true) {
+                if !allowed(&table, caller, super_user, true) {
                     return Err(badarg_cause("access"));
                 }
                 table.options.named_table
@@ -2796,7 +2824,7 @@ fn call_inner(
                 != WriteConcurrency::Disabled
             {
                 let table = registry.get_shared(tid).map_err(err)?;
-                if !allowed(&table, caller, true) {
+                if !allowed(&table, caller, super_user, true) {
                     return Err(badarg_cause("access"));
                 }
                 if table.delete_key_shared(*key) {
@@ -2804,7 +2832,7 @@ fn call_inner(
                 }
             }
             let mut table = registry.get_mut(tid).map_err(err)?;
-            if !allowed(&table, caller, true) {
+            if !allowed(&table, caller, super_user, true) {
                 return Err(badarg_cause("access"));
             }
             table.delete_key(*key);
@@ -2815,7 +2843,7 @@ fn call_inner(
         (EtsBif::LookupBinaryInfo, [target, key]) => {
             let tid = handle(&registry, *target)?;
             let table = registry.get_shared(tid).map_err(err)?;
-            if !allowed(&table, caller, false) {
+            if !allowed(&table, caller, super_user, false) {
                 return Err(badarg_cause("access"));
             }
             let binaries = table
@@ -2830,7 +2858,7 @@ fn call_inner(
         (EtsBif::SetOpts, [target, options]) => {
             let tid = handle(&registry, *target)?;
             let mut table = registry.get_mut(tid).map_err(err)?;
-            if !allowed(&table, caller, true) {
+            if !allowed(&table, caller, super_user, true) {
                 return Err(badarg_cause("access"));
             }
             if table.options.owner != caller {
@@ -2916,7 +2944,7 @@ fn call_inner(
         (EtsBif::RawFirst, [target]) => {
             let tid = handle(&registry, *target)?;
             let table = registry.get_shared(tid).map_err(err)?;
-            if !allowed(&table, caller, false) {
+            if !allowed(&table, caller, super_user, false) {
                 return Err(badarg_cause("access"));
             }
             Ok(table
@@ -2929,7 +2957,7 @@ fn call_inner(
         (EtsBif::RawNext, [target, key]) => {
             let tid = handle(&registry, *target)?;
             let table = registry.get_shared(tid).map_err(err)?;
-            if !allowed(&table, caller, false) {
+            if !allowed(&table, caller, super_user, false) {
                 return Err(badarg_cause("access"));
             }
             Ok(table
@@ -2947,7 +2975,7 @@ fn call_inner(
                 != WriteConcurrency::Disabled
             {
                 let table = registry.get_shared(tid).map_err(err)?;
-                if !allowed(&table, caller, true) {
+                if !allowed(&table, caller, super_user, true) {
                     return Err(badarg_cause("access"));
                 }
                 if table.options.table_type != TableType::OrderedSet {
@@ -2956,7 +2984,7 @@ fn call_inner(
                 }
             }
             let mut table = registry.get_mut(tid).map_err(err)?;
-            if !allowed(&table, caller, true) {
+            if !allowed(&table, caller, super_user, true) {
                 return Err(badarg_cause("access"));
             }
             let values = table.take(*key, &mut heap).map_err(err)?;
@@ -2965,7 +2993,7 @@ fn call_inner(
         (EtsBif::Slot, [target, index]) => {
             let tid = handle(&registry, *target)?;
             let table = registry.get_shared(tid).map_err(err)?;
-            if !allowed(&table, caller, false) {
+            if !allowed(&table, caller, super_user, false) {
                 return Err(badarg_cause("access"));
             }
             let slot =
@@ -2978,7 +3006,7 @@ fn call_inner(
         (EtsBif::First | EtsBif::Last, [target]) => {
             let tid = handle(&registry, *target)?;
             let table = table_guard(&registry, tid, true)?;
-            if !allowed(&table, caller, false) {
+            if !allowed(&table, caller, super_user, false) {
                 return Err(badarg_cause("access"));
             }
             Ok(table
@@ -2994,7 +3022,7 @@ fn call_inner(
             }
             let tid = handle(&registry, *target)?;
             let table = table_guard(&registry, tid, true)?;
-            if !allowed(&table, caller, false) {
+            if !allowed(&table, caller, super_user, false) {
                 return Err(badarg_cause("access"));
             }
             Ok((if function == EtsBif::Next {
@@ -3012,7 +3040,7 @@ fn call_inner(
         (EtsBif::FirstLookup | EtsBif::LastLookup, [target]) => {
             let tid = handle(&registry, *target)?;
             let table = table_guard(&registry, tid, true)?;
-            if !allowed(&table, caller, false) {
+            if !allowed(&table, caller, super_user, false) {
                 return Err(badarg_cause("access"));
             }
             match table
@@ -3029,7 +3057,7 @@ fn call_inner(
             }
             let tid = handle(&registry, *target)?;
             let table = table_guard(&registry, tid, true)?;
-            if !allowed(&table, caller, false) {
+            if !allowed(&table, caller, super_user, false) {
                 return Err(badarg_cause("access"));
             }
             match table
@@ -3043,7 +3071,7 @@ fn call_inner(
         (EtsBif::SafeFixtable, [target, fixed]) => {
             let tid = handle(&registry, *target)?;
             let mut table = registry.get_mut(tid).map_err(err)?;
-            if !allowed(&table, caller, false) {
+            if !allowed(&table, caller, super_user, false) {
                 return Err(badarg_cause("access"));
             }
             let fixed = boolean(*fixed)?;
@@ -3068,7 +3096,7 @@ fn call_inner(
                 != WriteConcurrency::Disabled
             {
                 let table = registry.get_shared(tid).map_err(err)?;
-                if !allowed(&table, caller, true) {
+                if !allowed(&table, caller, super_user, true) {
                     return Err(badarg_cause("access"));
                 }
                 if table.delete_object_shared(*object).map_err(err)? {
@@ -3076,7 +3104,7 @@ fn call_inner(
                 }
             }
             let mut table = registry.get_mut(tid).map_err(err)?;
-            if !allowed(&table, caller, true) {
+            if !allowed(&table, caller, super_user, true) {
                 return Err(badarg_cause("access"));
             }
             table.delete_object(*object).map_err(err)?;
@@ -3088,7 +3116,7 @@ fn call_inner(
             let tid = handle(&registry, *target)?;
             {
                 let table = registry.get(tid).map_err(err)?;
-                if !allowed(&table, caller, true) {
+                if !allowed(&table, caller, super_user, true) {
                     return Err(badarg_cause("access"));
                 }
             }
@@ -3129,7 +3157,7 @@ fn call_inner(
         | (EtsBif::MatchObject, [target, spec]) => {
             let tid = handle(&registry, *target)?;
             let table = table_guard(&registry, tid, true)?;
-            if !allowed(&table, caller, false) {
+            if !allowed(&table, caller, super_user, false) {
                 return Err(badarg_cause("access"));
             }
             if matches!(function, EtsBif::Select | EtsBif::SelectReverse)
@@ -3245,7 +3273,7 @@ fn call_inner(
                     != WriteConcurrency::Disabled
             {
                 let table = registry.get_shared(tid).map_err(err)?;
-                if !allowed(&table, caller, true) {
+                if !allowed(&table, caller, super_user, true) {
                     return Err(badarg_cause("access"));
                 }
                 if table.options.table_type == TableType::Bag {
@@ -3266,7 +3294,7 @@ fn call_inner(
             }
             if function == EtsBif::SelectCount {
                 let table = registry.get_shared(tid).map_err(err)?;
-                if !allowed(&table, caller, false) {
+                if !allowed(&table, caller, super_user, false) {
                     return Err(badarg_cause("access"));
                 }
                 if *spec == Term::NIL {
@@ -3279,7 +3307,7 @@ fn call_inner(
                     .map_err(|_| badarg());
             }
             let mut table = registry.get_mut(tid).map_err(err)?;
-            if !allowed(&table, caller, function != EtsBif::SelectCount) {
+            if !allowed(&table, caller, super_user, function != EtsBif::SelectCount) {
                 return Err(badarg_cause("access"));
             }
             // Port of erts/emulator/beam/erl_db.c (ets_select_replace_2), OTP-29.1.1.
@@ -3327,7 +3355,7 @@ fn call_inner(
             {
                 let table = registry.get_shared(tid).map_err(err)?;
                 if table.options.table_type == TableType::Set {
-                    if !allowed(&table, caller, true) {
+                    if !allowed(&table, caller, super_user, true) {
                         return Err(badarg_cause("access"));
                     }
                     let default = default_object(&table, args.get(3).copied())?;
@@ -3345,7 +3373,7 @@ fn call_inner(
                 }
             }
             let mut table = registry.get_mut(tid).map_err(err)?;
-            if !allowed(&table, caller, true) {
+            if !allowed(&table, caller, super_user, true) {
                 return Err(badarg_cause("access"));
             }
             let default = default_object(&table, args.get(3).copied())?;
@@ -3375,7 +3403,7 @@ fn call_inner(
                     table.options.table_type,
                     TableType::Set | TableType::OrderedSet
                 ) {
-                    if !allowed(&table, caller, true) {
+                    if !allowed(&table, caller, super_user, true) {
                         return Err(badarg_cause("access"));
                     }
                     let default = default_object(&table, args.get(3).copied())?;
@@ -3426,7 +3454,7 @@ fn call_inner(
                 }
             }
             let mut table = registry.get_mut(tid).map_err(err)?;
-            if !allowed(&table, caller, true) {
+            if !allowed(&table, caller, super_user, true) {
                 return Err(badarg_cause("access"));
             }
             let default = default_object(&table, args.get(3).copied())?;

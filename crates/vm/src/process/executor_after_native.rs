@@ -12,40 +12,20 @@ impl Executor {
         ctx: &mut RunCtx<'_, Message>,
         outcome: arinsal_beamasm::ExitReason,
         code_ptr: usize,
-        reenter: &mut bool,
     ) -> Result<Flow, VmError> {
         match outcome {
             arinsal_beamasm::ExitReason::Yield => {
                 crate::beamasm_integration::count_native_yield();
                 let exit_kind = std::mem::take(&mut process.native_exit_kind);
                 if exit_kind != crate::proc_create::NativeExit::None {
-                    if exit_kind == crate::proc_create::NativeExit::ReserveFetch {
-                        // Native `recv_marker_reserve` needs the outer queue
-                        // fetched first. Port of erts/emulator/beam/
-                        // erl_proc_sig_queue.h:2226 (erts_msgq_recv_marker_insert),
-                        // OTP-29.1.1: fetch (no handling), then rerun the
-                        // instruction in place: erts does not schedule out there.
-                        if process.signal_probe().is_none() {
-                            process.set_signal_probe(ctx.signal_probe());
-                        }
-                        process.fetch_signals(ctx)?;
-                        *reenter = true;
-                        return Ok(Flow::Continue);
-                    }
-                    if exit_kind == crate::proc_create::NativeExit::SignalFetch {
-                        // Native `loop_rec` reached the end of the message queue
-                        // with signals to fetch or handle. Port of
-                        // erts/emulator/beam/jit/arm/instr_msg.cpp:84-104
-                        // (i_loop_rec_shared calls erts_proc_sig_receive_helper),
-                        // OTP-29.1.1: the helper runs here, then the `loop_rec`
-                        // reruns; a yield schedules out there.
-                        if process.signal_probe().is_none() {
-                            process.set_signal_probe(ctx.signal_probe());
-                        }
-                        let fcalls = process.heap.abi.fcalls;
-                        let (used, _) = process.receive_helper(ctx, fcalls)?;
-                        super::executor::bump_fcalls(process, used);
-                        return Ok(Flow::Continue);
+                    if exit_kind == crate::proc_create::NativeExit::Exiting
+                        && let Some(error) = process
+                            .cold
+                            .as_mut()
+                            .and_then(|cold| cold.native_exiting.take())
+                    {
+                        // The native receive helper handled a signal that ends the process.
+                        return Ok(Flow::Break(Err(*error)));
                     }
                     if exit_kind == crate::proc_create::NativeExit::Wait
                         && let Some(timeout_pos) = process.native_wait.take()
@@ -749,16 +729,15 @@ impl Executor {
                                 process.set_native_pc(None);
                                 process.native_continuation_resume = false;
                                 if hibernate_fetch_collect(process, ctx)? {
-                                    if let Some(runtime) = process.runtime {
-                                        runtime.mark_hibernating(ctx.pid(), true);
+                                    if process.runtime.is_some() {
                                         // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
-                                        process.slice_mut().hibernate_sched = true;
+                                        process.set_hibernate_sched(true);
                                     }
                                     return Ok(Flow::Break(Ok(RunState::Wait {
                                         timeout_pos: None,
                                     })));
                                 }
-                                self.install_apply(process, ctx)?;
+                                self.install_apply(process)?;
                                 return Ok(Flow::Continue);
                             }
                             Err(error) => return Err(error),

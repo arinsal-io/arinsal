@@ -39,7 +39,11 @@ pub use child_setup::run_child_setup;
 /// Run one staged child exec request selected by the CLI.
 #[doc(hidden)]
 pub use child_setup::run_child_setup_exec;
-pub use process::ScheduledResult;
+pub use process::{
+    ERTS_MESSAGE_TERM_OFFSET, PROCESS_FLAGS_OFFSET, PROCESS_MBUF_OFFSET, PROCESS_MBUF_SZ_OFFSET,
+    PROCESS_SIGQ_CONT_OFFSET, PROCESS_SIGQ_FIRST_OFFSET, PROCESS_SIGQ_LAST_OFFSET,
+    PROCESS_SIGQ_MQ_LEN_OFFSET, PROCESS_SIGQ_SAVE_OFFSET, PROCESS_STATE_OFFSET, ScheduledResult,
+};
 mod inet_drv;
 // g_inet_udp
 mod inet_udp;

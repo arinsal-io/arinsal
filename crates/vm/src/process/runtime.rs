@@ -427,40 +427,22 @@ impl Runtime {
             .unwrap_or(false)
     }
 
-    /// Sets or clears the HIBERNATED state bit: the process reports it on itself, as erts'
-    /// state word does (erl_process.c:9304 erts_process_state2status).
-    pub(crate) fn mark_hibernating(&self, pid: Pid, on: bool) {
-        let Ok(scheduler) = self.scheduler() else {
-            return;
-        };
-        scheduler.with_proc_flags(pid, |flags| {
-            if on {
-                proc_flags::set_state(flags, proc_flags::HIBERNATED);
-            } else {
-                proc_flags::clear_state(flags, proc_flags::HIBERNATED);
-            }
-        });
-    }
-
     /// Status of another process, derived from its scheduling state when asked.
     // Port of erts/emulator/beam/erl_process.c:9304 (erts_process_state2status), OTP-29.1.1:
     // erts reads the state word instead of having each process publish its status.
     pub(crate) fn remote_status(&self, pid: Pid) -> &'static str {
-        if self.suspend_active(pid) {
-            return "suspended";
-        }
         let state = self
             .scheduler()
             .ok()
             .and_then(|scheduler| {
-                scheduler.with_proc_flags(pid, |flags| flags.load(Ordering::Acquire))
+                scheduler.with_proc_state(pid, |state| state.load(Ordering::Acquire))
             })
             .unwrap_or(0);
-        if state & proc_flags::EXITING != 0 {
+        if state & arinsal_sched::psflg::EXITING != 0 {
             return "exiting";
         }
-        if state & proc_flags::HIBERNATED != 0 {
-            return "waiting";
+        if self.suspend_active(pid) {
+            return "suspended";
         }
         match self
             .scheduler()
@@ -470,14 +452,5 @@ impl Runtime {
             Some(false) => "waiting",
             Some(true) | None => "runnable",
         }
-    }
-
-    pub(crate) fn is_hibernating(&self, pid: Pid) -> bool {
-        self.scheduler()
-            .ok()
-            .and_then(|scheduler| {
-                scheduler.with_proc_flags(pid, |flags| flags.load(Ordering::Acquire))
-            })
-            .is_some_and(|state| state & proc_flags::HIBERNATED != 0)
     }
 }

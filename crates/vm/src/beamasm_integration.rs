@@ -505,21 +505,15 @@ fn receive_fragments() -> Option<&'static arinsal_beamasm::receive_frag::Receive
     FRAGMENTS
         .get_or_init(|| {
             arinsal_beamasm::receive_frag::ReceiveFragments::new(
-                crate::native_helpers::arinsal_beamasm_loop_rec,
+                crate::native_helpers::arinsal_beamasm_receive_helper,
                 crate::native_helpers::arinsal_beamasm_wait,
                 crate::native_helpers::arinsal_beamasm_wait,
                 yield_fragments()?.context_switch(),
-                Some(arinsal_beamasm::receive_frag::InlinePeek {
-                    save_offset: u32::try_from(
-                        std::mem::offset_of!(crate::Process, inbox)
-                            + crate::process::MessageQueue::SAVE_OFFSET,
-                    )
-                    .ok()?,
-                    term_offset: u32::try_from(crate::process::MessageQueue::node_term_offset())
-                        .ok()?,
-                    delay_gc_offset: u16::try_from(std::mem::offset_of!(crate::Process, delay_gc))
-                        .ok()?,
-                }),
+                arinsal_beamasm::receive_frag::MsgOffsets {
+                    sig_qs_save: crate::PROCESS_SIGQ_SAVE_OFFSET as u32,
+                    message_term: crate::ERTS_MESSAGE_TERM_OFFSET as u32,
+                    flags: crate::PROCESS_FLAGS_OFFSET as u32,
+                },
             )
             .ok()
         })
@@ -2298,9 +2292,9 @@ pub(crate) fn print_stats() {
 fn light_gc_offsets() -> arinsal_beamasm::dispatch::LightGcOffsets {
     let heap = std::mem::offset_of!(crate::Process, heap);
     arinsal_beamasm::dispatch::LightGcOffsets {
-        fragment_words: (heap + arinsal_term::ProcessHeap::FRAGMENT_WORDS_OFFSET) as u32,
+        mbuf_sz: (heap + arinsal_term::ProcessHeap::MBUF_SZ_OFFSET) as u32,
         off_heap_overhead: (heap + arinsal_term::ProcessHeap::OFF_HEAP_OVERHEAD_OFFSET) as u32,
         bin_vheap_size: (heap + arinsal_term::ProcessHeap::BIN_VHEAP_SIZE_OFFSET) as u32,
-        gc_enabled: (heap + arinsal_term::ProcessHeap::GC_ENABLED_OFFSET) as u32,
+        flags: (heap + arinsal_term::ProcessHeap::FLAGS_OFFSET) as u32,
     }
 }

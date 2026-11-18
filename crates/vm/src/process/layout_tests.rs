@@ -308,3 +308,54 @@ fn queued_event_stays_compact() {
         56
     );
 }
+
+/// The state word is past the native prefix and in reach of a 32-bit load with an unsigned
+/// scaled immediate from `c_p` (arm64 `ldr w, [c_p, #imm]`: up to 4095 * 4), as erts keeps
+/// `c_p->state` addressable by a single displacement.
+#[test]
+fn process_state_word_offset_is_a_single_load_from_c_p() {
+    let offset = super::PROCESS_STATE_OFFSET;
+    eprintln!("PROCESS_STATE_OFFSET = {offset:#x}");
+    assert!(offset >= size_of::<arinsal_term::NativeAbi>());
+    assert_eq!(offset % 4, 0);
+    assert!(offset <= 4095 * 4, "state word at {offset:#x}");
+}
+
+/// `sig_qs.save` and `ErtsMessage.m[0]` as generated code reads them: the word at
+/// `PROCESS_SIGQ_SAVE_OFFSET` names the `next` field holding the node at the save pointer, and
+/// the term of that node is at `ERTS_MESSAGE_TERM_OFFSET`. The fields are in reach of one
+/// `ldr x, [c_p, #imm]` (unsigned scaled immediate: up to 4095 * 8).
+#[test]
+fn sig_qs_fields_are_at_their_exported_offsets() {
+    let mut queue = super::MessageQueue::default();
+    queue.init_in_place();
+    let term = Term::small(42).expect("small");
+    queue.push_back(term);
+    let node = queue
+        .entries
+        .peek_node()
+        .expect("a message at the save pointer");
+    let save = queue.entries.save_field();
+    assert_eq!(queue.entries.first_field(), save);
+    let term_at = node.as_ptr() as usize + super::ERTS_MESSAGE_TERM_OFFSET;
+    assert_eq!(
+        std::ptr::from_ref(queue.peek().expect("peek")) as usize,
+        term_at
+    );
+    assert_eq!(
+        super::PROCESS_SIGQ_FIRST_OFFSET,
+        std::mem::offset_of!(Process, inbox) + std::mem::offset_of!(super::MessageQueue, entries)
+    );
+    for offset in [
+        super::PROCESS_SIGQ_FIRST_OFFSET,
+        super::PROCESS_SIGQ_LAST_OFFSET,
+        super::PROCESS_SIGQ_SAVE_OFFSET,
+        super::PROCESS_SIGQ_MQ_LEN_OFFSET,
+        super::PROCESS_SIGQ_CONT_OFFSET,
+    ] {
+        eprintln!("sig_qs field at {offset:#x}");
+        assert_eq!(offset % 8, 0);
+        assert!(offset <= 4095 * 8, "sig_qs field at {offset:#x}");
+    }
+    assert_eq!(queue.len(), 1);
+}

@@ -160,6 +160,7 @@ impl Executor {
         ctx: &RunCtx<'_, Message>,
     ) -> bool {
         process.slice_is_plain()
+            && !process.hibernate_sched()
             && !process.dirty_bif_completed()
             && ctx.fast_slice_ok_before_signals()
             && !crate::suspend::ctx_suspended(ctx)
@@ -185,12 +186,9 @@ impl Executor {
         ran: &mut bool,
     ) -> Option<Result<RunState, VmError>> {
         let mut first = true;
-        let mut reenter = false;
         loop {
             let code_ptr = process.native_pc()?;
-            // A fetch that reenters native code runs the instruction in place, with no scheduling
-            // point in between.
-            if !first && !std::mem::take(&mut reenter) && !Self::fast_entry_ok(process, ctx) {
+            if !first && !Self::fast_entry_ok(process, ctx) {
                 return None;
             }
             if first {
@@ -254,7 +252,7 @@ impl Executor {
                 continue;
             }
             if !matches!(outcome, arinsal_beamasm::ExitReason::Yield) {
-                match self.after_native(process, ctx, outcome, code_ptr, &mut reenter) {
+                match self.after_native(process, ctx, outcome, code_ptr) {
                     Ok(Flow::Continue) => continue,
                     Ok(Flow::Break(result)) => return Some(result),
                     Err(error) => return Some(Err(error)),
@@ -279,17 +277,20 @@ impl Executor {
                     }
                     return Some(Ok(RunState::Wait { timeout_pos }));
                 }
-                crate::proc_create::NativeExit::SignalFetch => {
+                crate::proc_create::NativeExit::Exiting => {
                     crate::beamasm_integration::count_native_yield();
                     process.native_exit_kind = crate::proc_create::NativeExit::None;
-                    let fcalls = process.heap.abi.fcalls;
-                    match process.receive_helper(ctx, fcalls) {
-                        Ok((used, _)) => bump_fcalls(process, used),
-                        Err(error) => return Some(Err(error)),
+                    // The native receive helper handled a signal that ends the process.
+                    if let Some(error) = process
+                        .cold
+                        .as_mut()
+                        .and_then(|cold| cold.native_exiting.take())
+                    {
+                        return Some(Err(*error));
                     }
-                    continue;
+                    return Some(Ok(RunState::Yield));
                 }
-                _ => match self.after_native(process, ctx, outcome, code_ptr, &mut reenter) {
+                _ => match self.after_native(process, ctx, outcome, code_ptr) {
                     Ok(Flow::Continue) => continue,
                     Ok(Flow::Break(result)) => return Some(result),
                     Err(error) => return Some(Err(error)),
@@ -311,7 +312,7 @@ impl Executor {
         // before the runtime handle is cloned.
         if process.runtime.is_some()
             && !crate::suspend::ctx_suspended(ctx)
-            && !process.slice().is_some_and(|work| work.hibernate_sched)
+            && !process.hibernate_sched()
         {
             return Ok(None);
         }
@@ -325,7 +326,7 @@ impl Executor {
                 parked => Ok(Some(parked)),
             };
         }
-        if process.slice().is_some_and(|work| work.hibernate_sched) {
+        if process.hibernate_sched() {
             process.drain(ctx)?;
             if process.inbox.is_empty() {
                 return Ok(Some(RunState::Wait { timeout_pos: None }));
@@ -337,34 +338,27 @@ impl Executor {
                 .and_then(|cold| cold.hibernate.as_ref())
                 .is_some_and(|cont| cont.resume_in_place);
             if resume_in_place {
-                runtime.mark_hibernating(pid, false);
                 // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
-                process.slice_mut().hibernate_sched = false;
+                process.set_hibernate_sched(false);
             } else {
-                self.install_apply(process, ctx)?;
+                self.install_apply(process)?;
             }
         }
         Ok(None)
     }
 
     // g_proc_sched. Port of bif.c:1402 (`hibernate_3` resumes via apply/3), OTP-29.1.1.
-    pub(super) fn install_apply(
-        &mut self,
-        process: &mut Process,
-        ctx: &mut RunCtx<'_, Message>,
-    ) -> Result<(), VmError> {
-        let pid = ctx.pid();
-        let runtime = process
-            .runtime
-            .ok_or_else(|| VmError::Unsupported("hibernate without a scheduler".into()))?;
+    pub(super) fn install_apply(&mut self, process: &mut Process) -> Result<(), VmError> {
+        if process.runtime.is_none() {
+            return Err(VmError::Unsupported("hibernate without a scheduler".into()));
+        }
         process
             .cold_mut()
             .hibernate
             .take()
             .ok_or_else(|| VmError::Unsupported("hibernate continuation missing".into()))?;
-        runtime.mark_hibernating(pid, false);
         // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
-        process.slice_mut().hibernate_sched = false;
+        process.set_hibernate_sched(false);
         // hibernate/3 left `apply(M, F, A)` in X0..X2.
         if self.native_registers.x_reg_array.len() < 3 {
             return Err(VmError::Unsupported("hibernate registers".into()));

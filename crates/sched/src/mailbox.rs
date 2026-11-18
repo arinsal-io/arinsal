@@ -33,6 +33,29 @@ pub mod psflg {
     pub const IN_PRQ_LOW: u32 = bit(3);
     /// The `IN_PRQ_*` bit of queue 0 (max priority); queue `q` is this shifted left by `q`.
     pub const IN_PRQ_OFFSET_BIT: u32 = IN_PRQ_MAX;
+    /// `ERTS_PSFLGS_PRIO_MASK`: one two-bit priority field.
+    pub const PRIO_MASK: u32 = 3;
+    /// `ERTS_PSFLGS_ACT_PRIO_OFFSET`: the actual priority, the user priority possibly elevated
+    /// by pending system tasks.
+    pub const ACT_PRIO_OFFSET: u32 = 0;
+    /// `ERTS_PSFLGS_ACT_PRIO_MASK`.
+    pub const ACT_PRIO_MASK: u32 = PRIO_MASK << ACT_PRIO_OFFSET;
+    /// `ERTS_PSFLGS_USR_PRIO_OFFSET`: the priority `process_flag(priority, _)` set.
+    pub const USR_PRIO_OFFSET: u32 = 2;
+    /// `ERTS_PSFLGS_USR_PRIO_MASK`.
+    pub const USR_PRIO_MASK: u32 = PRIO_MASK << USR_PRIO_OFFSET;
+    /// `ERTS_PSFLGS_GET_ACT_PRIO`.
+    pub const fn act_prio(state: u32) -> u32 {
+        (state >> ACT_PRIO_OFFSET) & PRIO_MASK
+    }
+    /// `ERTS_PSFLGS_GET_USR_PRIO`.
+    pub const fn usr_prio(state: u32) -> u32 {
+        (state >> USR_PRIO_OFFSET) & PRIO_MASK
+    }
+    /// `ERTS_PSFLGS_GET_PRQ_PRIO`.
+    pub const fn prq_prio(state: u32) -> u32 {
+        (state >> PRQ_PRIO_OFFSET) & PRIO_MASK
+    }
     /// `ERTS_PSFLGS_IN_PRQ_MASK`.
     pub const IN_PRQ_MASK: u32 = IN_PRQ_MAX | IN_PRQ_HIGH | IN_PRQ_NORMAL | IN_PRQ_LOW;
     /// `ERTS_PSFLGS_IN_PRQ_MASK_OFFSET`: the first `IN_PRQ_*` bit.
@@ -55,12 +78,25 @@ pub mod psflg {
     pub const RUNNING: u32 = bit(9);
     /// `ERTS_PSFLG_SUSPENDED`.
     pub const SUSPENDED: u32 = bit(10);
+    /// `ERTS_PSFLG_GC`: the process is being garbage collected (read by
+    /// `erts_process_state2status`).
+    pub const GC: u32 = bit(11);
+    /// `ERTS_PSFLG_SYS_TASKS`: system tasks are queued on the process.
+    pub const SYS_TASKS: u32 = bit(12);
     /// `ERTS_PSFLG_NMSG_SIG_IN_Q`: non-message signals in the outer signal queue.
     pub const NMSG_SIG_IN_Q: u32 = bit(13);
     /// `ERTS_PSFLG_ACTIVE_SYS`.
     pub const ACTIVE_SYS: u32 = bit(14);
     /// `ERTS_PSFLG_RUNNING_SYS`.
     pub const RUNNING_SYS: u32 = bit(15);
+    /// `ERTS_PSFLG_PROXY`: the struct is a proxy entry, never set on a process struct.
+    pub const PROXY: u32 = bit(16);
+    /// `ERTS_PSFLG_DELAYED_SYS`: delayed (GC) system tasks while GC is disabled.
+    pub const DELAYED_SYS: u32 = bit(17);
+    /// `ERTS_PSFLG_OFF_HEAP_MSGQ`: the message queue is off heap, so a sender builds each
+    /// message in a combined node instead of trying the receiver's heap
+    /// (erl_message.c erts_alloc_message_heap_state).
+    pub const OFF_HEAP_MSGQ: u32 = bit(18);
     /// `ERTS_PSFLG_SIG_Q`: unhandled signals in the middle signal queue.
     pub const SIG_Q: u32 = bit(19);
     /// `ERTS_PSFLG_SIG_IN_Q`: either kind of signal in the outer signal queue.
@@ -78,6 +114,14 @@ pub mod psflg {
     pub const DIRTY_WORK: u32 = DIRTY_CPU_PROC | DIRTY_IO_PROC | DIRTY_ACTIVE_SYS;
     /// `ERTS_PSFLG_DIRTY_RUNNING`: the process executes on a dirty scheduler.
     pub const DIRTY_RUNNING: u32 = bit(23);
+    /// `ERTS_PSFLGS_VOLATILE_HEAP`.
+    pub const VOLATILE_HEAP: u32 = EXITING | DIRTY_RUNNING | DIRTY_RUNNING_SYS;
+
+    /// The initial state of a new process at priority `prio`: user and actual priority.
+    // Port of erts/emulator/beam/erl_process.c:12511 (erl_create_process), OTP-29.1.1.
+    pub const fn initial(prio: u32) -> u32 {
+        (prio << USR_PRIO_OFFSET) | (prio << ACT_PRIO_OFFSET)
+    }
 }
 
 /// How a queued signal sets the in-queue state bits.
@@ -192,10 +236,17 @@ pub struct Incoming<T: Send + 'static> {
 
 impl<T: Send + 'static> Default for Incoming<T> {
     fn default() -> Self {
+        Self::with_state(0)
+    }
+}
+
+impl<T: Send + 'static> Incoming<T> {
+    /// An empty in-queue of a process whose state word starts as `state`.
+    pub fn with_state(state: u32) -> Self {
         Self {
             msgq: Mutex::new(SignalQueue::default()),
             buffered: AtomicUsize::new(0),
-            state: AtomicU32::new(0),
+            state: AtomicU32::new(state),
             buffered_nmsgs: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             buffering_allowed: AtomicBool::new(false),
@@ -209,6 +260,9 @@ impl<T: Send + 'static> Default for Incoming<T> {
 }
 
 impl<T: Send + 'static> Incoming<T> {
+    /// Offset of the state word within the in-queue.
+    pub(crate) const STATE_OFFSET: usize = std::mem::offset_of!(Incoming<T>, state);
+
     /// The erts process state word (`p->state`).
     pub fn state(&self) -> &AtomicU32 {
         &self.state

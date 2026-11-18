@@ -329,7 +329,7 @@ impl Process {
         // Port of erts/emulator/beam/erl_process.c:14470-14504
         // (ERTS_CONTINUE_EXIT_CLEAN_SYS_TASKS_AFTER), OTP-29.1.1: after the name is gone,
         // the exit of the F_DISTRIBUTION process (net_kernel) runs erts_do_net_exits.
-        if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::DISTRIBUTION != 0
+        if self.heap.has_flag(arinsal_term::pflags::F_DISTRIBUTION)
             && let Some(runtime) = self.runtime
         {
             let reason = if reason == Term::atom(arinsal_term::atoms::KILL) {

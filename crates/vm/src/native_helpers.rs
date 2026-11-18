@@ -176,22 +176,21 @@ pub extern "C" fn arinsal_beamasm_bs_init_writable(header: *mut ProcessHeader, s
 // scheduler through `ColdState::native_wait`.
 
 /// Reserves a receive marker (`recv_marker_reserve`).
+// Port of erts/emulator/beam/erl_proc_sig_queue.h:2226 (erts_msgq_recv_marker_insert),
+// OTP-29.1.1: the outer queue is fetched (`erts_proc_sig_fetch`) before the marker is
+// inserted, with the scheduler data the process reaches through `c_p`.
 pub extern "C" fn arinsal_beamasm_recv_marker_reserve(header: *mut ProcessHeader) -> u64 {
     let Some(process) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
-    // Port of erts/emulator/beam/erl_proc_sig_queue.h:2226 (erts_msgq_recv_marker_insert),
-    // OTP-29.1.1: the outer queue is fetched before the marker is inserted. Signals waiting
-    // there (or a process without a probe yet) send the instruction to the scheduler, which
-    // fetches and reruns it.
-    let pending = process
-        .signal_probe()
-        .is_none_or(arinsal_sched::SignalProbe::has_pending);
-    if pending {
-        process.native_exit_kind = crate::proc_create::NativeExit::ReserveFetch;
-        return u64::from(arinsal_beamasm::receive::RECV_MARKER_FETCH);
-    }
-    match process.reserve_receive_marker() {
+    let fetched = crate::process::sched_data::with_sched_data(process, |_vm, process, ctx| {
+        if process.signal_probe().is_none() {
+            process.set_signal_probe(ctx.signal_probe());
+        }
+        process.fetch_signals(ctx)
+    })
+    .expect("native code runs inside an executor slice, which publishes its scheduler data");
+    match fetched.and_then(|()| process.reserve_receive_marker()) {
         Ok(marker) => crate::native_hooks::raw(marker),
         Err(_) => {
             crate::native_hooks::set_error(process, "system_limit");
@@ -228,62 +227,51 @@ pub extern "C" fn arinsal_beamasm_recv_marker_use(header: *mut ProcessHeader, re
     }
 }
 
-/// Peeks the message at the save pointer (`i_loop_rec`). Zero means the process waits;
-/// [`arinsal_beamasm::receive::LOOP_REC_FETCH`] that the outer signal queue must be fetched
-/// first.
-// Port of erts/emulator/beam/jit/arm/instr_msg.cpp:131-176 (emit_i_loop_rec_shared peek)
-// and erts/emulator/beam/erl_proc_sig_queue.c:7730-7790 (erts_proc_sig_receive_helper),
-// OTP-29.1.1.
-pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
-    let Some(process) = crate::native_hooks::enter_runtime(header) else {
+/// `erts_proc_sig_receive_helper`, called by `i_loop_rec_shared` when the message queue is
+/// exhausted at the save pointer: fetch the outer queue and handle signals until a message is
+/// available, the queues are empty, or the reductions run out. The message node goes to
+/// TMP_MEM2q (`*msgpp`), `get_out` to TMP_MEM3q; returns the reductions consumed.
+// Port of erts/emulator/beam/erl_proc_sig_queue.c:7730-7880 (erts_proc_sig_receive_helper)
+// and erts/emulator/beam/jit/arm/instr_msg.cpp (emit_i_loop_rec_shared), OTP-29.1.1.
+pub extern "C" fn arinsal_beamasm_receive_helper(
+    header: *mut ProcessHeader,
+    fcalls: i32,
+    neg_o_reds: i32,
+    reg: *mut u64,
+) -> i32 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
         return 0;
     };
-    // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:116-118, 179, 191 (F_DELAY_GC set on
-    // entry, cleared on the wait and schedule-out exits), OTP-29.1.1.
-    process.delay_gc = true;
-    if let Some(message) = process.inbox.peek() {
-        return crate::native_hooks::raw(*message);
-    }
-    // The message queue is exhausted. Signals left unhandled in the middle queue, or sent
-    // since the last fetch (by this process or any other) to the outer queue, go to the
-    // receive helper on the scheduler side. A process without a probe yet fetches once, which
-    // installs it.
-    if !process.sig_cont_empty() {
-        process.delay_gc = false;
-        process.native_exit_kind = crate::proc_create::NativeExit::SignalFetch;
-        return u64::from(arinsal_beamasm::receive::LOOP_REC_FETCH);
-    }
-    let pending = process
-        .signal_probe()
-        .is_none_or(arinsal_sched::SignalProbe::has_pending);
-    if !pending {
-        process.delay_gc = false;
-        return 0;
-    }
-    // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:131-176 (erts_proc_sig_receive_helper
-    // call under eHeapAlloc), OTP-29.1.1: fetch messages in place and peek again.
-    let fetched = process.fetch_messages_in_place();
-    if fetched.is_ok()
-        && let Some(message) = process.inbox.peek()
-    {
-        // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_receive_helper,
-        // `consumed_reds += 4` per fetch), OTP-29.1.1: the call site published FCALLS
-        // (Update::REDUCTIONS) and reloads it afterwards.
-        process.heap.abi.fcalls = process.heap.abi.fcalls.saturating_sub(4);
-        return crate::native_hooks::raw(*message);
-    }
-    process.delay_gc = false;
-    // Everything fetched was scanned: wait. A non-message signal left at the head of the
-    // outer queue is handled by the scheduler.
-    if fetched.is_ok()
-        && process
-            .signal_probe()
-            .is_some_and(|probe| !probe.has_pending())
-    {
-        return 0;
-    }
-    process.native_exit_kind = crate::proc_create::NativeExit::SignalFetch;
-    u64::from(arinsal_beamasm::receive::LOOP_REC_FETCH)
+    let result = crate::process::sched_data::with_sched_data(process, |_vm, process, ctx| {
+        if process.signal_probe().is_none() {
+            process.set_signal_probe(ctx.signal_probe());
+        }
+        process.receive_helper(ctx, fcalls - neg_o_reds)
+    })
+    .expect("native code runs inside an executor slice, which publishes its scheduler data");
+    let (consumed, message, get_out) = match result {
+        Ok((consumed, crate::process::ReceiveHelper::Message)) => (
+            consumed,
+            process
+                .inbox
+                .entries
+                .peek_node()
+                .map_or(0, |node| node.as_ptr() as u64),
+            0,
+        ),
+        Ok((consumed, crate::process::ReceiveHelper::Wait)) => (consumed, 0, 0),
+        Ok((consumed, crate::process::ReceiveHelper::Yield)) => (consumed, 0, 1),
+        // A handled signal ends the process (erts: ERTS_PSFLG_EXITING, `*get_outp = 1`): it
+        // schedules out and the scheduler completes the exit.
+        Err(error) => {
+            process.native_exit_kind = crate::proc_create::NativeExit::Exiting;
+            process.cold_mut().native_exiting = Some(Box::new(error));
+            (0, 0, 1)
+        }
+    };
+    registers.tmp_mem[1] = message;
+    registers.tmp_mem[2] = get_out;
+    consumed
 }
 
 /// Removes the current message from the mailbox (`remove_message`).
@@ -349,7 +337,7 @@ pub extern "C" fn arinsal_beamasm_set_save_next(header: *mut ProcessHeader) {
 pub extern "C" fn arinsal_beamasm_wait(header: *mut ProcessHeader, resume: usize) {
     if let Some(process) = crate::native_hooks::enter_runtime(header) {
         // Port of erts/emulator/beam/emu/msg_instrs.tab:110 (wait clears F_DELAY_GC), OTP-29.1.1.
-        process.delay_gc = false;
+        process.set_delay_gc(false);
         let timeout = process.native_wait_timeout.take();
         process.native_wait = Some(timeout);
         process.native_wait_self = resume & 1 != 0;
@@ -1637,7 +1625,7 @@ fn bif_trap_export(
 ) -> u64 {
     // erl_gc.c:430-436 (erts_gc_after_bif_call_lhf): the first trap with F_DISABLE_GC saves
     // live_hf_end. The fragment tests GC only after a value, so the trap epilogue does it.
-    if !process.heap.gc_enabled {
+    if !process.heap.gc_enabled() {
         process.heap.save_live_frags_mark();
     }
     // BIF_TRAP's arguments replace the BIF arguments in X0 onwards and set `c_p->arity`: they
@@ -1920,7 +1908,7 @@ fn gc_after_bif_call(
 ) -> u64 {
     // erl_gc.c:428-445 (erts_gc_after_bif_call_lhf): with F_DISABLE_GC the result is returned
     // without a collection.
-    if !process.heap.gc_enabled {
+    if !process.heap.gc_enabled() {
         if value != arinsal_term::THE_NON_VALUE {
             registers.x_reg_array[0] = crate::native_hooks::from_raw(value);
         }

@@ -67,15 +67,14 @@ pub struct LineBreakpointHelpers {
 /// collection test reads (`ERTS_IS_GC_DESIRED_INTERNAL`, instr_bif.cpp:488-523).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LightGcOffsets {
-    /// `Process.heap.fragment_words` (`mbuf_sz`), a native-word count of words.
-    pub fragment_words: u32,
+    /// `c_p->mbuf_sz`, a native-word count of words.
+    pub mbuf_sz: u32,
     /// `Process.off_heap.overhead`, stored directly in the process.
     pub off_heap_overhead: u32,
     /// `Process.heap.bin_vheap_size` (`bin_vheap_sz`).
     pub bin_vheap_size: u32,
-    /// `Process.gc_enabled` and the adjacent `force_gc` byte, read as one halfword; anything
-    /// but 1 means `F_DISABLE_GC` or `F_FORCE_GC`.
-    pub gc_enabled: u32,
+    /// `c_p->flags`, tested for `F_FORCE_GC | F_DISABLE_GC`.
+    pub flags: u32,
 }
 
 /// Runtime callbacks used by the shared export and instrumentation fragments.
@@ -855,10 +854,11 @@ fn emit_gc_desired_test(
     const NZCV_CF: u8 = 0b0010;
     const NZCV_VF: u8 = 0b0001;
     code.emit(|encoder| {
-        // `gc_enabled` and `force_gc` are adjacent bytes: the halfword is 1 only for an
-        // enabled process with no forced collection (`F_FORCE_GC | F_DISABLE_GC` clear).
-        encoder.ldrh_uoff(Gpr::w(9), Gpr::x(21), gc.gc_enabled as u16)?;
-        encoder.cmp_imm(Gpr::w(9), 1, false)?;
+        encoder.ldr_uoff(Gpr::w(9), Gpr::x(21), gc.flags)?;
+        encoder.tst_imm(
+            Gpr::w(9),
+            u64::from(arinsal_term::pflags::F_FORCE_GC | arinsal_term::pflags::F_DISABLE_GC),
+        )?;
         encoder.ldr_uoff(Gpr::x(12), Gpr::x(21), gc.off_heap_overhead)
     })?;
     code.emit(|encoder| {
@@ -868,7 +868,7 @@ fn emit_gc_desired_test(
         encoder.ccmp_reg(Gpr::x(12), Gpr::x(13), NZCV_CF, Cond::Eq)?;
         encoder.sub_reg(Gpr::x(9), Gpr::x(20), Gpr::x(23), Shift::Lsl, 0)?;
         encoder.asr_imm(Gpr::x(9), Gpr::x(9), 3)?;
-        encoder.ldr_uoff(Gpr::x(11), Gpr::x(21), gc.fragment_words)?;
+        encoder.ldr_uoff(Gpr::x(11), Gpr::x(21), gc.mbuf_sz)?;
         // Unless the binary test said "no collection" (LS), the flags force `lt`.
         encoder.ccmp_reg(Gpr::x(9), Gpr::x(11), NZCV_VF, Cond::Ls)
     })?;

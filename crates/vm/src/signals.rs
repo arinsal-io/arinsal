@@ -1237,9 +1237,8 @@ fn proc_is_exiting_runtime(runtime: &crate::process::Runtime, pid: Pid) -> bool 
         .scheduler()
         .ok()
         .and_then(|scheduler| {
-            scheduler.with_proc_flags(pid, |flags| {
-                flags.load(std::sync::atomic::Ordering::Acquire)
-                    & arinsal_sched::proc_flags::EXITING
+            scheduler.with_proc_state(pid, |state| {
+                state.load(std::sync::atomic::Ordering::Acquire) & arinsal_sched::psflg::EXITING
                     != 0
             })
         })
@@ -1393,7 +1392,7 @@ fn run_request(
     // Port of erts/emulator/beam/erl_process.c:10829-10833 and 10878-10895 (execute_sys_tasks,
     // F_DISABLE_GC with ERTS_PSTT_GC_MAJOR/MINOR/CLA), OTP-29.1.1: the task waits (reply
     // included) in the delayed queue until `erts_set_gc_state(1)` moves it back.
-    if !process.heap.gc_enabled
+    if !process.heap.gc_enabled()
         && matches!(
             pending.op,
             RemoteOp::Collect { .. } | RemoteOp::CopyLiteralArea { .. }
@@ -1643,9 +1642,13 @@ pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Messag
     if let Some(cold) = process.cold.as_mut() {
         cold.persistent_get_all = None;
     }
-    // Port of erl_nif.c:2323 (`ERTS_PSFLG_EXITING` on the process).
-    let _ =
-        arinsal_sched::proc_flags::publish(ctx.exit_flags(), arinsal_sched::proc_flags::EXITING);
+    // Port of erts/emulator/beam/erl_process.c:13485 (set_self_exiting: ERTS_PSFLG_EXITING
+    // set in `c_p->state` by change_proc_schedule_state), OTP-29.1.1. The process is running,
+    // so ERTS_PSFLG_ACTIVE is already set.
+    ctx.proc_state().fetch_or(
+        arinsal_sched::psflg::EXITING,
+        std::sync::atomic::Ordering::AcqRel,
+    );
     // Port of erts/emulator/beam/erl_process.c:11039 (cleanup_sys_tasks), OTP-29.1.1: the
     // queued tasks of the exiting process get their failure reply.
     let mut pending = VecDeque::new();

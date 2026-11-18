@@ -488,7 +488,7 @@ mod tests {
     #[test]
     fn bif_epilogue_does_not_collect_with_gc_disabled() {
         let mut process = process_over_the_bin_vheap_limit();
-        process.heap.gc_enabled = false;
+        process.heap.set_gc_enabled(false);
         let mut arguments = [Term::NIL];
         let mut result = Ok(Term::atom(arinsal_term::atoms::TRUE));
 

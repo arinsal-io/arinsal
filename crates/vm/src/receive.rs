@@ -974,7 +974,7 @@ impl Process {
         {
             return Ok(false);
         }
-        self.delay_gc = false;
+        self.set_delay_gc(false);
         crate::natives::erts_debug::after_message_queue_change(self);
         self.cancel_receive_timer();
         Ok(true)
@@ -1011,7 +1011,7 @@ impl Process {
         let removed_message = self.inbox.remove_to_heap_with_token(&mut self.heap)?;
         // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1168-1171 (beam_jit_remove_message:
         // erts_save_message_in_proc, then F_DELAY_GC cleared), OTP-29.1.1.
-        self.delay_gc = false;
+        self.set_delay_gc(false);
         if on_heap_words != 0 {
             crate::trace_bp::adjust_memory_break(self, on_heap_words as i64);
         }
@@ -1078,7 +1078,7 @@ impl Process {
             return;
         };
         if next == 0
-            || probe.proc_flags().load(Ordering::Acquire) & arinsal_sched::proc_flags::EXITING != 0
+            || probe.proc_state().load(Ordering::Acquire) & arinsal_sched::psflg::EXITING != 0
             || !probe.receive_timer().timed_out()
         {
             return;
@@ -1094,7 +1094,7 @@ impl Process {
     /// [`arinsal_sched::RunOutcome::WaitTimer`]), `None` waits without a timer.
     pub(crate) fn wait_timeout(&mut self, value: Term) -> Result<Option<u64>, VmError> {
         // Port of erts/emulator/beam/emu/msg_instrs.tab:231 (F_DELAY_GC cleared), OTP-29.1.1.
-        self.delay_gc = false;
+        self.set_delay_gc(false);
         // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1208-1240
         // (beam_jit_wait_timeout), OTP-29.1.1: with F_INSLPQUEUE or F_TIMO set the timer is
         // already set and the operand is not read again (no X register is live across the

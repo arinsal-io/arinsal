@@ -156,13 +156,8 @@ fn heap_contains(heap: &ProcessHeap, addr: usize) -> bool {
     if in_span(heap.old_words.as_ptr() as usize, old, addr) {
         return true;
     }
-    heap.fragments.iter().enumerate().any(|(index, fragment)| {
-        in_span(
-            fragment.as_ptr() as usize,
-            heap.fragment_used_words(index, fragment) * 8,
-            addr,
-        )
-    })
+    heap.heap_frag_areas()
+        .any(|(start, used)| in_span(start, used * 8, addr))
 }
 
 fn accepted(heap: &ProcessHeap, term: Term) -> bool {
@@ -188,19 +183,14 @@ fn describe(heap: &ProcessHeap) -> String {
         let used = start + heap.old_htop * 8;
         format!("{start:#x}..{end:#x} used={start:#x}..{used:#x}")
     };
-    let fragments = if heap.fragments.is_empty() {
+    let fragments = heap
+        .heap_frag_areas()
+        .map(|(start, used)| format!("{start:#x}..{:#x}", start + used * 8))
+        .collect::<Vec<_>>();
+    let fragments = if fragments.is_empty() {
         "<none>".to_owned()
     } else {
-        heap.fragments
-            .iter()
-            .enumerate()
-            .map(|(index, fragment)| {
-                let start = fragment.as_ptr() as usize;
-                let end = start + heap.fragment_used_words(index, fragment) * 8;
-                format!("{start:#x}..{end:#x}")
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
+        fragments.join(", ")
     };
     format!(
         "young: {young}\n  old: {old}\n  fragments: {fragments}\n  stable_heaps: {}",
@@ -360,13 +350,8 @@ fn used_areas(heap: &ProcessHeap) -> Vec<(usize, usize, &'static str)> {
     if !heap.old_words.is_empty() {
         areas.push((old, old + heap.old_htop * 8, "old"));
     }
-    for (index, fragment) in heap.fragments.iter().enumerate() {
-        let start = fragment.as_ptr() as usize;
-        areas.push((
-            start,
-            start + heap.fragment_used_words(index, fragment) * 8,
-            "fragment",
-        ));
+    for (start, used) in heap.heap_frag_areas() {
+        areas.push((start, start + used * 8, "fragment"));
     }
     areas
 }

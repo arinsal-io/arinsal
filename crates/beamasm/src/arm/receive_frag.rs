@@ -7,10 +7,13 @@ use arinsal_a64::{
 };
 
 use crate::{
-    Update, emit_enter_runtime, emit_leave_runtime,
-    receive::{LOOP_REC_FETCH, LoopRecHook, WaitHook},
+    Update,
+    arm::beam_asm::{load_x_reg_array, tmp_mem_ref},
+    emit_enter_runtime, emit_leave_runtime,
+    receive::{ReceiveHelperHook, WaitHook},
 };
 
+const SCHEDULER_REGS: Gpr = Gpr::x(19);
 const C_P: Gpr = Gpr::x(21);
 const FCALLS: Gpr = Gpr::w(22);
 const XREG0: Gpr = Gpr::x(25);
@@ -18,22 +21,30 @@ const XREG1: Gpr = Gpr::x(26);
 const XREG2: Gpr = Gpr::x(27);
 const ARG1: Gpr = Gpr::x(0);
 const ARG2: Gpr = Gpr::x(1);
+const ARG3: Gpr = Gpr::x(2);
+const ARG4: Gpr = Gpr::x(3);
 const TMP1: Gpr = Gpr::x(8);
 const TMP2: Gpr = Gpr::x(9);
 const SUPER_TMP: Gpr = Gpr::x(17);
 const PROCESS_I: u32 = 72;
 const PROCESS_ARITY: u16 = 80;
+/// `message_ptr` (TMP_MEM2q): where the receive helper leaves the message it made available.
+const MESSAGE_PTR: u32 = tmp_mem_ref(1);
+/// `get_out` (TMP_MEM3q): nonzero when the process must schedule out.
+const GET_OUT: u32 = tmp_mem_ref(2);
 
-/// Where `i_loop_rec_shared` finds the message at the save position without a call, as erts'
-/// `emit_i_loop_rec_shared` loads `*c_p->sig_qs.save`: byte offsets from the process.
+/// The process fields `i_loop_rec_shared` reads, as byte offsets from `c_p`: the VM's
+/// `PROCESS_SIGQ_SAVE_OFFSET`, `ERTS_MESSAGE_TERM_OFFSET` and `PROCESS_FLAGS_OFFSET`, which
+/// erts compiles in as `offsetof(Process, sig_qs.save)`, `offsetof(ErtsMessage, m[0])` and
+/// `offsetof(Process, flags)`.
 #[derive(Clone, Copy)]
-pub struct InlinePeek {
-    /// `sig_qs.save`: the `next` field that points at the message a receive looks at.
-    pub save_offset: u32,
-    /// The term of a message in its node (`offsetof(ErtsMessage, m[0])`).
-    pub term_offset: u32,
-    /// The `F_DELAY_GC` byte set while a receive looks at a message.
-    pub delay_gc_offset: u16,
+pub struct MsgOffsets {
+    /// `c_p->sig_qs.save`: the `next` field that points at the message a receive looks at.
+    pub sig_qs_save: u32,
+    /// `offsetof(ErtsMessage, m[0])`: the term of a message in its node.
+    pub message_term: u32,
+    /// `c_p->flags`, where a receive sets `F_DELAY_GC` while it looks at messages.
+    pub flags: u32,
 }
 
 /// Receive fragments: `i_loop_rec_shared`, `wait_unlocked_shared` and `wait_locked_shared`.
@@ -44,17 +55,31 @@ pub struct ReceiveFragments {
     wait_locked_offset: usize,
 }
 
+/// `c_p->flags &= ~F_DELAY_GC` (instr_msg.cpp: ldr w / and / str w).
+fn clear_delay_gc(code: &mut CodeBuffer, flags: u32) -> Result<(), BufferError> {
+    code.emit(|e| {
+        e.ldr_uoff(Gpr::w(8), C_P, flags)?;
+        e.and_imm(
+            Gpr::w(8),
+            Gpr::w(8),
+            u64::from(!arinsal_term::pflags::F_DELAY_GC),
+        )?;
+        e.str_uoff(Gpr::w(8), C_P, flags)
+    })
+}
+
 impl ReceiveFragments {
-    /// Emits the shared receive fragments once for the VM. `context_switch` is the entry of
-    /// the shared `context_switch_simplified` fragment the schedule-out paths branch to.
+    /// Emits the shared receive fragments once for the VM. `receive_helper` is
+    /// `erts_proc_sig_receive_helper`; `context_switch` is the entry of the shared
+    /// `context_switch_simplified` fragment the schedule-out paths branch to.
     // Port of erts/emulator/beam/jit/arm/instr_msg.cpp (emit_i_loop_rec_shared,
     // emit_wait_unlocked, emit_wait_locked), OTP-29.1.1.
     pub fn new(
-        loop_rec: LoopRecHook,
+        receive_helper: ReceiveHelperHook,
         wait_unlocked: WaitHook,
         wait_locked: WaitHook,
         context_switch: usize,
-        inline_peek: Option<InlinePeek>,
+        offsets: MsgOffsets,
     ) -> Result<Self, ExecError> {
         let mut code = CodeBuffer::new();
         let fail = |_: BufferError| ExecError::InvalidSize("receive fragment");
@@ -63,58 +88,67 @@ impl ReceiveFragments {
         let wait_locked_label = code.new_label();
         let schedule_out = code.new_label();
         let done = code.new_label();
-        let wait = code.new_label();
 
+        // Port of erts/emulator/beam/jit/arm/instr_msg.cpp (emit_i_loop_rec_shared),
+        // OTP-29.1.1. The wait address erts keeps in TMP_MEM1q stays in XREG2, which no
+        // runtime call clobbers; the loop_rec has no live X registers.
         code.bind(loop_rec_label).map_err(fail)?;
         code.emit(|e| {
             e.mov_reg(XREG1, Gpr::x(30))?;
-            e.mov_reg(XREG2, ARG2)?;
+            e.ldr_uoff(Gpr::w(8), C_P, offsets.flags)?;
+            e.orr_imm(
+                Gpr::w(8),
+                Gpr::w(8),
+                u64::from(arinsal_term::pflags::F_DELAY_GC),
+            )?;
+            e.str_uoff(Gpr::w(8), C_P, offsets.flags)?;
             e.str_uoff(ARG1, C_P, PROCESS_I)?;
+            e.mov_reg(XREG2, ARG2)?;
             e.cmp_imm(FCALLS, 0, false)
         })
         .map_err(fail)?;
         code.b_cond(Cond::Le, schedule_out).map_err(fail)?;
-        if let Some(peek) = inline_peek {
-            // Port of erts/emulator/beam/jit/arm/instr_msg.cpp (emit_i_loop_rec_shared, "Peek
-            // next message"), OTP-29.1.1: load the message at the save position; only an empty
-            // message queue calls the receive helper.
-            let fetch = code.new_label();
-            code.emit(|e| {
-                e.ldr_uoff(TMP1, C_P, peek.save_offset)?;
-                e.ldr_uoff(TMP1, TMP1, 0)
-            })
-            .map_err(fail)?;
-            code.cbz(TMP1, fetch).map_err(fail)?;
-            code.emit(|e| {
-                e.ldr_uoff(XREG0, TMP1, peek.term_offset)?;
-                e.mov_const(TMP2, 1)?;
-                e.strb_uoff(TMP2, C_P, peek.delay_gc_offset)?;
-                e.ret(XREG1)
-            })
-            .map_err(fail)?;
-            code.bind(fetch).map_err(fail)?;
-        }
-        emit_enter_runtime(&mut code, 0, Update::HEAP_ALLOC.union(Update::REDUCTIONS))
+
+        // "Peek next message".
+        code.emit(|e| {
+            e.ldr_uoff(TMP1, C_P, offsets.sig_qs_save)?;
+            e.ldr_uoff(ARG1, TMP1, 0)
+        })
+        .map_err(fail)?;
+        code.cbnz(ARG1, done).map_err(fail)?;
+        // Inner queue empty, fetch more from the outer and middle queues.
+        emit_enter_runtime(&mut code, 0, Update::REDUCTIONS.union(Update::HEAP_ALLOC))
             .map_err(fail)?;
         code.emit(|e| {
+            e.str_uoff(Gpr::xzr(), SCHEDULER_REGS, MESSAGE_PTR)?;
             e.mov_reg(ARG1, C_P)?;
-            e.mov_const(SUPER_TMP, loop_rec as *const () as u64)?;
+            e.mov_reg(Gpr::w(1), FCALLS)?;
+            e.mov_const(ARG3, 0)?;
+            load_x_reg_array(e, ARG4)?;
+            e.mov_const(SUPER_TMP, receive_helper as *const () as u64)?;
             e.blr(SUPER_TMP)
         })
         .map_err(fail)?;
-        emit_leave_runtime(&mut code, 0, Update::HEAP_ALLOC.union(Update::REDUCTIONS))
+        // The helper only inspects FCALLS; the consumed reductions come back in ARG1.
+        emit_leave_runtime(&mut code, 0, Update::HEAP_ALLOC).map_err(fail)?;
+        code.emit(|e| {
+            e.sub_reg(FCALLS, FCALLS, Gpr::w(0), arinsal_a64::enc::Shift::Lsl, 0)?;
+            e.ldr_uoff(ARG1, SCHEDULER_REGS, MESSAGE_PTR)
+        })
+        .map_err(fail)?;
+        code.cbnz(ARG1, done).map_err(fail)?;
+        // Did we receive a signal or run out of reductions?
+        code.emit(|e| e.ldr_uoff(Gpr::w(8), SCHEDULER_REGS, GET_OUT))
             .map_err(fail)?;
-        code.emit(|e| e.cmp_imm(ARG1, LOOP_REC_FETCH, false))
-            .map_err(fail)?;
-        code.b_cond(Cond::Hi, done).map_err(fail)?;
-        // A fetch the hook did not finish in place runs the helper on the scheduler side,
-        // which charges its own four reductions; an empty inner queue is charged here.
-        code.cbnz(ARG1, schedule_out).map_err(fail)?;
-        code.emit(|e| e.subs_imm(FCALLS, FCALLS, 4, false))
-            .map_err(fail)?;
-        code.b(wait).map_err(fail)?;
+        code.cbnz(Gpr::w(8), schedule_out).map_err(fail)?;
+        // The queue is empty and the process neither yields nor exits: on to the wait.
+        clear_delay_gc(&mut code, offsets.flags).map_err(fail)?;
+        code.emit(|e| e.br(XREG2)).map_err(fail)?;
 
+        // Out of reductions or a signal to act on: schedule out at the `loop_rec`, whose
+        // address (`c_p->i`) was set on entry.
         code.bind(schedule_out).map_err(fail)?;
+        clear_delay_gc(&mut code, offsets.flags).map_err(fail)?;
         code.emit(|e| {
             e.mov_const(TMP2, 0)?;
             e.strb_uoff(TMP2, C_P, PROCESS_ARITY)?;
@@ -123,12 +157,10 @@ impl ReceiveFragments {
         })
         .map_err(fail)?;
 
-        code.bind(wait).map_err(fail)?;
-        code.emit(|e| e.br(XREG2)).map_err(fail)?;
-
+        // ARG1 holds the message node.
         code.bind(done).map_err(fail)?;
         code.emit(|e| {
-            e.mov_reg(XREG0, ARG1)?;
+            e.ldr_uoff(XREG0, ARG1, offsets.message_term)?;
             e.ret(XREG1)
         })
         .map_err(fail)?;

@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arinsal_sched::{Pid, RunCtx, SharedPayload, Signal, proc_flags};
+use arinsal_sched::{Pid, RunCtx, SharedPayload, Signal, psflg};
 
 use arinsal_term::Term;
 
@@ -66,11 +66,11 @@ impl SuspendMonitor {
 /// the suspendee itself.
 fn mirror_bit(runtime: &Runtime, pid: Pid, on: bool) {
     if let Ok(scheduler) = runtime.scheduler() {
-        scheduler.with_proc_flags(pid, |flags| {
+        scheduler.with_proc_state(pid, |state| {
             if on {
-                proc_flags::set_state(flags, proc_flags::SUSPENDED);
+                state.fetch_or(psflg::SUSPENDED, Ordering::AcqRel);
             } else {
-                proc_flags::clear_state(flags, proc_flags::SUSPENDED);
+                state.fetch_and(!psflg::SUSPENDED, Ordering::AcqRel);
             }
         });
     }
@@ -79,7 +79,7 @@ fn mirror_bit(runtime: &Runtime, pid: Pid, on: bool) {
 /// Whether the process running on `ctx` is suspended: one load of its own state word, as erts
 /// tests `ERTS_PSFLG_SUSPENDED` in `p->state` without a process table lookup.
 pub(crate) fn ctx_suspended(ctx: &arinsal_sched::RunCtx<'_, Message>) -> bool {
-    ctx.exit_flags().load(Ordering::Acquire) & proc_flags::SUSPENDED != 0
+    ctx.proc_state().load(Ordering::Acquire) & psflg::SUSPENDED != 0
 }
 
 /// Whether `pid` is suspended, read from its state bit (cross-thread safe).
@@ -88,8 +88,8 @@ pub(crate) fn suspended_bit(runtime: &Runtime, pid: Pid) -> bool {
         .scheduler()
         .ok()
         .and_then(|scheduler| {
-            scheduler.with_proc_flags(pid, |flags| {
-                flags.load(Ordering::Acquire) & proc_flags::SUSPENDED != 0
+            scheduler.with_proc_state(pid, |state| {
+                state.load(Ordering::Acquire) & psflg::SUSPENDED != 0
             })
         })
         .unwrap_or(false)
@@ -241,10 +241,10 @@ pub(crate) fn sync_reply(
     asynchronous: bool,
     exiting: bool,
 ) -> Result<(), VmError> {
-    let state = ctx.exit_flags().load(Ordering::Acquire);
-    let atom = if exiting || state & proc_flags::EXITING != 0 {
+    let state = ctx.proc_state().load(Ordering::Acquire);
+    let atom = if exiting || state & psflg::EXITING != 0 {
         Some(if asynchronous { "exited" } else { "badarg" })
-    } else if state & proc_flags::SUSPENDED == 0 {
+    } else if state & psflg::SUSPENDED == 0 {
         Some(if asynchronous {
             "not_suspended"
         } else {

@@ -52,6 +52,13 @@ impl Task for Process {
         data: &mut SchedulerData,
         budget: u32,
     ) -> RunOutcome {
+        // `c_p` (the native prefix at the start of this task) and the process state word are in
+        // one process struct, the state word at `offsetof(Process, state)` from `c_p`.
+        debug_assert_eq!(
+            std::ptr::from_ref(ctx.proc_state()).addr()
+                - std::ptr::from_mut(self.native_header()).addr(),
+            crate::process::PROCESS_STATE_OFFSET
+        );
         // Port of erts/emulator/beam/erl_trace.c:704-716 (trace_sched), OTP-29.1.1.
         let trace_scheduling = crate::trace::running_procs_enabled();
         if trace_scheduling {
@@ -455,7 +462,7 @@ impl Process {
         // Port of erts/emulator/beam/erl_process.c:6747-6763 (schedule_out_process), OTP-29.1.1:
         // with GC disabled the dirty collection is dropped; the next collection does it.
         if !ctx.scheduler_type().is_dirty()
-            && !self.heap.gc_enabled
+            && !self.heap.gc_enabled()
             && self.cold.as_mut().is_some_and(|cold| {
                 cold.dirty_gc.take().is_some() && cold.dirty_sys_tasks.is_empty()
             })

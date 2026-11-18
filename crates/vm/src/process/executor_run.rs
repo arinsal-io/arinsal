@@ -140,8 +140,6 @@ impl Executor {
                     // iterations have already executed and their live X count is gc_live,
                     // not the switch-out arity.
                     let mut schedule_in_gc = !fast_ran;
-                    // Native code that exited only for a fetch reenters without a scheduling point.
-                    let mut reenter = false;
                     loop {
                         // Port of erts/emulator/beam/erl_process.c (schedule: the scheduler-type
                         // switch; check_dirty_enqueue_in_prio_queue), OTP-29.1.1: a process whose dirty NIF has not run yet carries its
@@ -165,8 +163,7 @@ impl Executor {
                             }
                             _ => {}
                         }
-                        let reentered = std::mem::take(&mut reenter);
-                        if !dirty_here && !reentered {
+                        if !dirty_here {
                             // A caught exception re-enters this loop without replenishing its process slice.
                             if process.heap.abi.fcalls <= 0 {
                                 break Ok(RunState::Yield);
@@ -468,7 +465,7 @@ impl Executor {
                                     self.native_registers.x_reg_array.first()
                                 );
                             }
-                            match self.after_native(process, ctx, outcome, code_ptr, &mut reenter) {
+                            match self.after_native(process, ctx, outcome, code_ptr) {
                                 Ok(Flow::Continue) => continue,
                                 Ok(Flow::Break(result)) => break result,
                                 Err(error) => return Err(error),
@@ -500,14 +497,13 @@ impl Executor {
                         }
                         if hibernate_stopped(process) {
                             if hibernate_fetch_collect(process, ctx)? {
-                                if let Some(runtime) = process.runtime {
-                                    runtime.mark_hibernating(ctx.pid(), true);
+                                if process.runtime.is_some() {
                                     // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
-                                    process.slice_mut().hibernate_sched = true;
+                                    process.set_hibernate_sched(true);
                                 }
                                 break Ok(RunState::Wait { timeout_pos: None });
                             }
-                            self.install_apply(process, ctx)?;
+                            self.install_apply(process)?;
                             continue;
                         }
                         if matches!(&result, Ok(RunState::Yield))

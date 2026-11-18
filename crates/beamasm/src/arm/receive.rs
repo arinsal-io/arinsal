@@ -9,24 +9,20 @@ use crate::{
 
 const FCALLS: Gpr = Gpr::w(22);
 
-/// Runtime callback which reserves a receive marker and returns its term.
+/// Runtime callback which reserves a receive marker and returns its term
+/// (`erts_msgq_recv_marker_insert`).
 pub type RecvMarkerReserveHook = extern "C" fn(*mut ProcessHeader) -> u64;
-/// Value the `recv_marker_reserve` hook returns when the outer signal queue must be fetched
-/// before the marker is inserted: native code exits at the instruction so the scheduler
-/// fetches with its context, then reruns it (no term word equals it).
-pub const RECV_MARKER_FETCH: u16 = 1;
 /// Runtime callback which binds a marker to a reference.
 pub type RecvMarkerBindHook = extern "C" fn(*mut ProcessHeader, u64, u64);
 /// Runtime callback which clears a marker reference.
 pub type RecvMarkerClearHook = extern "C" fn(*mut ProcessHeader, u64);
 /// Runtime callback which restores a saved mailbox position for a reference.
 pub type RecvMarkerUseHook = extern "C" fn(*mut ProcessHeader, u64);
-/// Runtime callback which peeks the next message, returning zero for an empty queue.
-pub type LoopRecHook = extern "C" fn(*mut ProcessHeader) -> u64;
-/// Value the `i_loop_rec` hook returns when the private queue is exhausted but signals wait in
-/// the outer queue: native code schedules out at the `loop_rec` so the scheduler fetches and
-/// handles them with its context, then reruns the instruction (no term word equals it).
-pub const LOOP_REC_FETCH: u16 = 1;
+/// `erts_proc_sig_receive_helper(c_p, fcalls, neg_o_reds, msgpp, get_outp)`, called by
+/// `i_loop_rec_shared` at the end of the message queue. The last argument is the register file
+/// (`reg`): the helper leaves the message node in TMP_MEM2q (`*msgpp`) and `get_out` in
+/// TMP_MEM3q, the slots erts passes the addresses of. Returns the reductions consumed.
+pub type ReceiveHelperHook = extern "C" fn(*mut ProcessHeader, i32, i32, *mut u64) -> i32;
 /// Runtime callback which removes the current message and returns reductions left.
 pub type RemoveMessageHook = extern "C" fn(*mut ProcessHeader, i32, usize) -> i32;
 /// Runtime callback which advances the saved mailbox pointer.
@@ -79,30 +75,12 @@ impl BeamModuleAssembler {
         dst: ArgVal,
         hooks: ReceiveHooks,
     ) -> Result<(), ModuleError> {
-        let entry = self.code.new_label();
-        let fetch = self.code.new_label();
-        let done = self.code.new_label();
-        self.code.bind(entry)?;
         self.emit_runtime_hook_with(
             hooks.recv_marker_reserve as usize,
             &[],
             6,
             crate::Update::HEAP_ALLOC,
         )?;
-        self.code
-            .emit(|e| e.cmp_imm(Gpr::x(0), RECV_MARKER_FETCH, false))?;
-        self.code.b_cond(Cond::Eq, fetch)?;
-        self.code.b(done)?;
-        // erts_msgq_recv_marker_insert fetches the outer queue first (erl_proc_sig_queue.h:2226).
-        // The fetch needs the scheduler context, so native code exits here and reruns the
-        // instruction; the live X registers are unknown at this instruction, so the whole
-        // register window is kept.
-        self.code.bind(fetch)?;
-        self.code.adr(Gpr::x(8), entry)?;
-        self.code.emit(|e| e.str_uoff(Gpr::x(8), Gpr::x(21), 72))?;
-        self.emit_yield_live(u8::MAX)?;
-        self.code.b(self.yield_label)?;
-        self.code.bind(done)?;
         self.store_operand(dst, Gpr::x(0))
     }
 

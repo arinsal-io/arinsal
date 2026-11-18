@@ -439,7 +439,7 @@ impl Process {
                         // (handle_exit_signal), OTP-29.1.1: `kill` exits without exception dispatch.
                         break 'exit Err(VmError::Trap(crate::exceptions::Trap::killed()));
                     }
-                    if self.trap_exit {
+                    if self.trap_exit() {
                         // Port of erts/emulator/beam/external.c:3127-3141, OTP-29.1.1.
                         // A scheduler proxy stands in for a remote PID internally, but
                         // EXIT messages expose the peer's original PID to Erlang code.
@@ -517,7 +517,7 @@ impl Process {
                 // A link exit is never untrappable: `kill` only kills as an `exit/2` signal
                 // (handle_exit_signal: `!linked && reason == am_kill`).
                 let result: Result<i32, VmError> = 'exit: {
-                    if self.trap_exit {
+                    if self.trap_exit() {
                         let tuple =
                             self.tuple(&[Term::atom(arinsal_term::atoms::EXIT_2), port, reason])?;
                         if prio {
@@ -952,7 +952,7 @@ impl Process {
         let mut message = reason;
         let seq_token = message.take_seq_token();
         let reason = message.into_receiver(self)?;
-        if self.trap_exit && (linked || reason != Term::atom(arinsal_term::atoms::KILL)) {
+        if self.trap_exit() && (linked || reason != Term::atom(arinsal_term::atoms::KILL)) {
             let from_term = crate::dist::external_pid_term(&mut self.heap, from)?;
             let tuple =
                 self.tuple(&[Term::atom(arinsal_term::atoms::EXIT_2), from_term, reason])?;

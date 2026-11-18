@@ -98,7 +98,7 @@ pub(crate) fn copy_literal_area(
         // Port of beam_bif_load.c:1012 (erts_check_copy_literals_gc_need), OTP-29.1.1:
         // the heap may be inconsistent while GC is disabled, so do not scan it;
         // the collection is requested and delayed until GC is enabled.
-        if !process.heap.gc_enabled {
+        if !process.heap.gc_enabled() {
             reply_literal_area_copy(
                 ctx,
                 request,
@@ -136,7 +136,7 @@ pub(crate) fn copy_literal_area(
             // erts_garbage_collect_literals roots `c_p->arg_reg` up to `c_p->arity`, the live
             // X registers of the point where the process switched out (erl_gc.c:1243).
             let live_x = crate::process::switched_out_live(process);
-            let hibernated = process.hibernated;
+            let hibernated = process.hibernated();
             let copied = rewrite_roots(process, live_x, std::slice::from_ref(&area))?;
             process.heap.request_full_sweep();
             process.force_gc_live(live_x)?;

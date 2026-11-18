@@ -14,10 +14,9 @@ pub(crate) enum NativeExit {
     None,
     /// A traced `timeout` left its event for the scheduler (`ColdState::native_timeout_trace`).
     TimeoutTrace,
-    /// `recv_marker_reserve` needs the outer signal queue fetched first.
-    ReserveFetch,
-    /// `loop_rec` reached the end of the message queue with signals to fetch or handle.
-    SignalFetch,
+    /// The receive helper handled a signal that ends the process
+    /// (`ProcessCold::native_exiting`).
+    Exiting,
     /// `wait` or `wait_timeout` (`ColdState::native_wait`).
     Wait,
 }
@@ -397,10 +396,6 @@ pub struct Process {
     pub(crate) virtual_reds: u32,
     pub(crate) reductions_used: u64,
     pub(crate) gc_deferred: bool,
-    /// erts `F_DELAY_GC`: set from `loop_rec` until `remove_message` or the wait, while x0
-    /// may refer to a queued message whose data is still in its heap fragment.
-    // Port of erts/emulator/beam/erl_process.h:1643, 1728-1736 (F_DELAY_GC), OTP-29.1.1.
-    pub(crate) delay_gc: bool,
     pub(crate) uniq_counter: i64,
     pub(crate) stats: ProcessStats,
     /// Final reason remains on the task until the scheduler reaps late monitors.
@@ -421,8 +416,6 @@ pub struct Process {
     pub(crate) run_key: u64,
     /// The same for `Executor::run`'s scheduler-derived PID words.
     pub(crate) exec_key: u64,
-    /// `F_HIBERNATED`: the heap holds exactly the live data of a hibernated process.
-    pub(crate) hibernated: bool,
     /// The process's outer signal queue: native `loop_rec` probes it and fetches messages.
     signal_probe: Option<arinsal_sched::SignalProbe<crate::process::Message>>,
     /// A native `wait`/`wait_timeout` asked the scheduler to sleep (receive timer position, `None` for
@@ -483,7 +476,6 @@ pub struct Process {
     // `natives::sys::after_collection` on every collection.
     /// The persistent-term store of the node this process runs in.
     pub(crate) persistent_terms: &'static arinsal_pterm::Store,
-    pub(crate) trap_exit: bool,
     /// Class of the exception currently being handled. `raise/2` re-raises
     /// this after an `after` block, because that block may clobber X registers.
     /// mix_loop1. Port of the freason kept across `i_raise` (beam_emu), OTP-29.1.1.
@@ -1292,8 +1284,6 @@ pub(crate) struct SliceWork {
     pub(crate) suspend_parked: bool,
     /// Receive-timeout pause of the active suspends (erts `common.timer` as `ErtsPausedProcTimer`).
     pub(crate) timer_pause: Option<crate::process::TimerPause>,
-    /// Parked by hibernation until a message arrives (erts `F_HIBERNATE_SCHED`).
-    pub(crate) hibernate_sched: bool,
     /// Static NIF identity, native return point and target scheduler class of a NIF call
     /// (or `enif_schedule_nif` continuation) waiting for a scheduler of that class.
     pub(crate) native_dirty_nif: Option<(usize, usize, arinsal_bifs::SchedulerClass)>,
@@ -1333,7 +1323,6 @@ impl SliceWork {
     pub(crate) fn any(&self) -> bool {
         self.native_dirty_nif.is_some()
             || self.dirty_sys_gc
-            || self.hibernate_sched
             || self.timer_pause.is_some()
             || self.bif_trap.is_some()
             || self.debug_wait_completion.is_some()
@@ -1354,6 +1343,10 @@ pub(crate) struct ProcessCold {
     /// THE_NON_VALUE with TRAP to its call, and the scheduler finishes the call with this
     /// result instead of calling the BIF again.
     pub(crate) bif_outcome: Option<Box<crate::VmError>>,
+    /// The exit a signal handled by the native receive helper started: erts sets
+    /// `ERTS_PSFLG_EXITING` and the reason in `c_p->fvalue`, then `i_loop_rec_shared` schedules
+    /// out (`*get_outp = 1`); the scheduler completes the exit with it.
+    pub(crate) native_exiting: Option<Box<crate::VmError>>,
     /// The parked `erlang:hibernate` continuation (erts keeps it on the process; `F_HIBERNATE_SCHED`).
     pub(crate) hibernate: Option<crate::process::HibernateCont>,
     /// `p->max_heap_size` (erts erl_process.h:1034): the limit and its flags.
@@ -1548,6 +1541,46 @@ impl Process {
     /// Words of the Erlang stack as erts counts them, with the frames of a trapped call.
     pub(crate) fn observed_stack_words(&self) -> usize {
         self.heap.stack_words()
+    }
+    /// `c_p->flags & F_TRAP_EXIT`.
+    #[inline(always)]
+    pub(crate) fn trap_exit(&self) -> bool {
+        self.heap.has_flag(arinsal_term::pflags::F_TRAP_EXIT)
+    }
+    /// Set or clear `F_TRAP_EXIT` (`process_flag(trap_exit, _)`).
+    pub(crate) fn set_trap_exit(&mut self, on: bool) {
+        self.heap.set_flag(arinsal_term::pflags::F_TRAP_EXIT, on);
+    }
+    /// `c_p->flags & F_DELAY_GC`: set from `loop_rec` until `remove_message` or the wait,
+    /// while x0 may refer to a queued message whose data is still in its heap fragment.
+    // Port of erts/emulator/beam/erl_process.h:1643, 1728-1736 (F_DELAY_GC), OTP-29.1.1.
+    #[inline(always)]
+    pub(crate) fn delay_gc(&self) -> bool {
+        self.heap.has_flag(arinsal_term::pflags::F_DELAY_GC)
+    }
+    /// Set or clear `F_DELAY_GC`.
+    #[inline(always)]
+    pub(crate) fn set_delay_gc(&mut self, on: bool) {
+        self.heap.set_flag(arinsal_term::pflags::F_DELAY_GC, on);
+    }
+    /// `c_p->flags & F_HIBERNATED`: the heap holds exactly the live data of a hibernated
+    /// process.
+    pub(crate) fn hibernated(&self) -> bool {
+        self.heap.has_flag(arinsal_term::pflags::F_HIBERNATED)
+    }
+    /// Set or clear `F_HIBERNATED`.
+    pub(crate) fn set_hibernated(&mut self, on: bool) {
+        self.heap.set_flag(arinsal_term::pflags::F_HIBERNATED, on);
+    }
+    /// `c_p->flags & F_HIBERNATE_SCHED`: schedule out after the hibernate operation; set
+    /// until the process resumes.
+    pub(crate) fn hibernate_sched(&self) -> bool {
+        self.heap.has_flag(arinsal_term::pflags::F_HIBERNATE_SCHED)
+    }
+    /// Set or clear `F_HIBERNATE_SCHED`.
+    pub(crate) fn set_hibernate_sched(&mut self, on: bool) {
+        self.heap
+            .set_flag(arinsal_term::pflags::F_HIBERNATE_SCHED, on);
     }
     /// Returns the BeamAsm ABI prefix for direct native entry and runtime hooks.
     pub fn native_header(&mut self) -> &mut ProcessHeader {
@@ -2041,7 +2074,6 @@ impl Process {
             reds_in: 4000,
             virtual_reds: 0,
             reductions_used: 0,
-            delay_gc: false,
             gc_deferred: false,
             uniq_counter: 0,
             stats: ProcessStats::default(),
@@ -2053,7 +2085,6 @@ impl Process {
             scheduler_id: 0,
             run_key: 0,
             exec_key: 0,
-            hibernated: false,
             signal_probe: None,
             native_wait: None,
             native_wait_timeout: None,
@@ -2080,7 +2111,6 @@ impl Process {
             apply_inline: [Term::NIL, Term::NIL, Term::NIL],
             apply_inline_len: 0,
             persistent_terms: arinsal_pterm::global_store(),
-            trap_exit: false,
             exc_class: None,
             entry: false,
             native_continuation_resume: false,
@@ -2190,7 +2220,7 @@ impl Process {
         {
             return Ok(0);
         }
-        if !self.heap.gc_enabled {
+        if !self.heap.gc_enabled() {
             // Port of erts/emulator/beam/erl_gc.c:780-783 (garbage_collect with F_DISABLE_GC):
             // the need is satisfied in a fresh heap fragment and the collection is delayed.
             self.delay_heap_collection(words);
@@ -2380,7 +2410,7 @@ mod procdict_tests {
     }
 }
 
-/// `process_flag/2` values kept on the process: erts stores these as struct fields (`p->flags`, `async_dist`, `p->sig_qs.flags`, `ERTS_PSD_*`), not behind string keys. A field is
+/// `process_flag/2` values kept on the process: erts stores these as struct fields (`p->sig_qs.flags`, `ERTS_PSD_*`), not behind string keys. A field is
 /// `None` until the flag is first set; readers then report the erts default.
 #[derive(Default)]
 pub(crate) struct ProcFlags {
@@ -2388,7 +2418,6 @@ pub(crate) struct ProcFlags {
     pub(crate) priority: Option<Term>,
     pub(crate) message_queue_data: Option<Term>,
     pub(crate) sensitive: Option<Term>,
-    pub(crate) async_dist: Option<Term>,
     pub(crate) priority_messages: Option<Term>,
     pub(crate) save_calls: Option<Term>,
     pub(crate) group_leader: Option<Term>,
@@ -2404,7 +2433,6 @@ impl ProcFlags {
             "priority" => &mut self.priority,
             "message_queue_data" => &mut self.message_queue_data,
             "sensitive" => &mut self.sensitive,
-            "async_dist" => &mut self.async_dist,
             "priority_messages" => &mut self.priority_messages,
             "save_calls" => &mut self.save_calls,
             "group_leader" => &mut self.group_leader,
@@ -2422,7 +2450,6 @@ impl ProcFlags {
             "priority" => self.priority,
             "message_queue_data" => self.message_queue_data,
             "sensitive" => self.sensitive,
-            "async_dist" => self.async_dist,
             "priority_messages" => self.priority_messages,
             "save_calls" => self.save_calls,
             "group_leader" => self.group_leader,
@@ -2717,7 +2744,6 @@ mod layout_report {
             "  Process.gc_deferred {}",
             size_of_val(&process.gc_deferred)
         );
-        eprintln!("  Process.delay_gc {}", size_of_val(&process.delay_gc));
         eprintln!(
             "  Process.uniq_counter {}",
             size_of_val(&process.uniq_counter)
@@ -2733,7 +2759,6 @@ mod layout_report {
             "  Process.scheduler_id {}",
             size_of_val(&process.scheduler_id)
         );
-        eprintln!("  Process.hibernated {}", size_of_val(&process.hibernated));
         eprintln!(
             "  Process.signal_probe {}",
             size_of_val(&process.signal_probe)
@@ -2803,7 +2828,6 @@ mod layout_report {
             "  Process.apply_inline_len {}",
             size_of_val(&process.apply_inline_len)
         );
-        eprintln!("  Process.trap_exit {}", size_of_val(&process.trap_exit));
         eprintln!("  Process.exc_class {}", size_of_val(&process.exc_class));
         eprintln!("  Process.entry {}", size_of_val(&process.entry));
         eprintln!(

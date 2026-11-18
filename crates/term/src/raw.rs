@@ -12,6 +12,7 @@ use std::mem::MaybeUninit;
 use std::num::NonZeroUsize;
 
 pub mod estack;
+pub(crate) mod heap_frag;
 pub mod magic_bin;
 
 /// Copy one self-contained table block word by word, offsetting its pointers and linking its

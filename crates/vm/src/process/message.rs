@@ -341,7 +341,7 @@ impl Message {
         Some((to, node))
     }
 
-    pub(super) fn immediate(term: Term) -> Self {
+    pub(super) const fn immediate(term: Term) -> Self {
         Self {
             term,
             data: None,

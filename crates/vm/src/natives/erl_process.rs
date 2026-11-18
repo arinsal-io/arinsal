@@ -563,10 +563,11 @@ fn create_child(
             );
         }
         child.heap.set_fullsweep_after(fullsweep_after);
-        // SPO_ASYNC_DIST sets F_ASYNC_DIST; an unset field already reads as false.
-        if so.async_dist {
-            child.cold_mut().flags.async_dist = Some(Term::atom(atoms::TRUE));
-        }
+        // Port of erts/emulator/beam/erl_process.c:12552-12553 (erl_create_process:
+        // SPO_ASYNC_DIST sets F_ASYNC_DIST), OTP-29.1.1.
+        child
+            .heap
+            .set_flag(arinsal_term::pflags::F_ASYNC_DIST, so.async_dist);
         if !crate::natives::proc::is_default_max_heap(max_heap) {
             child.cold_mut().max_heap = max_heap;
         }
@@ -662,8 +663,11 @@ fn create_child(
     // Port of erts/emulator/beam/erl_process.c (erl_create_process), OTP-29.1.1: the state
     // word carries ERTS_PSFLG_OFF_HEAP_MSGQ before the pid is handed out.
     if so.off_heap_msgq == Some(true) {
-        scheduler.with_proc_flags(spawned.pid(), |flags| {
-            arinsal_sched::proc_flags::set_state(flags, arinsal_sched::proc_flags::OFF_HEAP_MSGQ);
+        scheduler.with_proc_state(spawned.pid(), |state| {
+            state.fetch_or(
+                arinsal_sched::psflg::OFF_HEAP_MSGQ,
+                std::sync::atomic::Ordering::AcqRel,
+            );
         });
     }
     let seq_spawn = if crate::seq_trace::has_token(parent) {

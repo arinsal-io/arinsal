@@ -30,7 +30,7 @@ fn message_on_receiver_heap(
     let total_words = words + token_words;
     if total_words == 0
         || receiver.message_queue_data() != MessageQueueData::OnHeap
-        || !receiver.heap.gc_enabled
+        || !receiver.heap.gc_enabled()
         || receiver.heap.is_detached()
     {
         return Ok(None);
@@ -322,8 +322,8 @@ impl Process {
                 Some(crate::register::RegId::Proc(pid))
                     if runtime
                         .scheduler()?
-                        .with_proc_flags(pid, |flags| {
-                            flags.load(Ordering::Acquire) & proc_flags::EXITING == 0
+                        .with_proc_state(pid, |state| {
+                            state.load(Ordering::Acquire) & arinsal_sched::psflg::EXITING == 0
                         })
                         .unwrap_or(false) =>
                 {

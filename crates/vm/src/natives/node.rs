@@ -4,7 +4,7 @@ use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::RunCtx;
-use arinsal_term::{Term, TermBuilder, global_atoms};
+use arinsal_term::{ProcessHeap, Term, TermBuilder, global_atoms, pflags};
 use num_bigint::BigInt;
 use std::io::Write;
 
@@ -131,25 +131,37 @@ fn call_setnode2(
     // thread reads the node identity while it changes.
     let mut success = false;
     let mut events = Vec::new();
+    let me = ctx.pid();
     ctx.with_thread_progress_blocked(|| {
-        use arinsal_sched::proc_flags;
-        success = scheduler
-            .with_proc_flags(net_kernel, |flags| {
-                let state = flags.load(std::sync::atomic::Ordering::Acquire);
-                if state & (proc_flags::EXITING | proc_flags::DISTRIBUTION) != 0 {
-                    return false;
-                }
-                // Port of dist.c:5030-5037: a creation below 4 is raised to 4.
-                node_tables::inc_no_nodes();
-                node_tables::set_this_node(name.clone(), creation.max(4));
-                node_tables::set_alive(true);
-                events =
-                    node_tables::lock().nodes_monitor_events("nodeup", name, u32::MAX, true, None);
-                // F_DISTRIBUTION: the exit of net_kernel runs erts_do_net_exits (dist.c:5045).
-                proc_flags::set_state(flags, proc_flags::DISTRIBUTION);
-                true
+        let exiting = scheduler
+            .with_proc_state(net_kernel, |state| {
+                state.load(std::sync::atomic::Ordering::Acquire) & arinsal_sched::psflg::EXITING
+                    != 0
             })
-            .unwrap_or(false);
+            .unwrap_or(true);
+        // `net_kernel->flags` with net_kernel's locks held (dist.c:5043-5046): the caller's own
+        // flags when net_kernel calls, else net_kernel's under its main lock (free while thread
+        // progress is blocked).
+        let mut set_distribution = |flags: &mut ProcessHeap| {
+            if exiting || flags.has_flag(pflags::F_DISTRIBUTION) {
+                return false;
+            }
+            // Port of dist.c:5030-5037: a creation below 4 is raised to 4.
+            node_tables::inc_no_nodes();
+            node_tables::set_this_node(name.clone(), creation.max(4));
+            node_tables::set_alive(true);
+            events = node_tables::lock().nodes_monitor_events("nodeup", name, u32::MAX, true, None);
+            // F_DISTRIBUTION: the exit of net_kernel runs erts_do_net_exits (dist.c:5045).
+            flags.set_flag(pflags::F_DISTRIBUTION, true);
+            true
+        };
+        success = if net_kernel == me {
+            set_distribution(&mut process.heap)
+        } else {
+            scheduler
+                .try_with_task(net_kernel, |task| set_distribution(&mut task.heap))
+                .unwrap_or(false)
+        };
         if success {
             let _ = crate::dist::send_nodes_monitor_events(scheduler, std::mem::take(&mut events));
         }

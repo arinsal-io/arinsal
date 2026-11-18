@@ -236,7 +236,7 @@ pub(crate) fn install_export_trap(
     process.x.ensure_x(arity);
     process.x[..arity].copy_from_slice(&trap.args);
     process.gc_live = arity;
-    let gc_was_enabled = process.heap.gc_enabled;
+    let gc_was_enabled = process.heap.gc_enabled();
     if trap.gc_disabled {
         process.set_gc_enabled(false);
     }
@@ -357,7 +357,7 @@ mod export_trap_tests {
             global_atoms().intern("demonitor").unwrap(),
         );
         install_export_trap(&mut process, 0, callee, &trap, true);
-        assert!(process.heap.gc_enabled, "export traps keep GC enabled");
+        assert!(process.heap.gc_enabled(), "export traps keep GC enabled");
 
         // A collection while the process is scheduled out: the live X registers are the roots.
         process

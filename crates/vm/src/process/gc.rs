@@ -72,7 +72,7 @@ fn hibernate_collect(process: &mut Process) -> Result<(), VmError> {
     };
     process.gc_live = live;
     process.heap.abi.arity = live as u8;
-    if !process.heap.gc_enabled {
+    if !process.heap.gc_enabled() {
         return Ok(());
     }
     process.garbage_collect_hibernate(live).map(|_| ())
@@ -99,11 +99,11 @@ impl Process {
     /// Set this process's `F_DISABLE_GC` equivalent and return its previous state.
     /// Port of erts/emulator/beam/erl_process.c:11823 (`erts_set_gc_state`), OTP-29.1.1.
     pub(crate) fn set_gc_enabled(&mut self, enabled: bool) -> bool {
-        let previous = self.heap.gc_enabled;
+        let previous = self.heap.gc_enabled();
         if enabled {
             self.erts_set_gc_state_enable();
         } else {
-            self.heap.gc_enabled = false;
+            self.heap.set_gc_enabled(false);
         }
         previous
     }
@@ -113,7 +113,7 @@ impl Process {
     /// scheduling point (`sys_tasks_deferred`). Returns whether tasks were moved.
     // Port of erts/emulator/beam/erl_process.c:11823-11935 (erts_set_gc_state), OTP-29.1.1.
     pub(crate) fn erts_set_gc_state_enable(&mut self) -> bool {
-        self.heap.gc_enabled = true;
+        self.heap.set_gc_enabled(true);
         let Some(cold) = self.cold.as_mut() else {
             return false;
         };
@@ -146,7 +146,7 @@ impl Process {
     /// Force collection with the current BEAM live-register count.
     // Port of erts/emulator/beam/erl_gc.c:1136 (`erts_garbage_collect_literals`), OTP-29.1.1.
     pub(crate) fn force_gc_live(&mut self, live: usize) -> Result<(), VmError> {
-        if !self.heap.gc_enabled {
+        if !self.heap.gc_enabled() {
             self.gc_deferred = true;
             return Ok(());
         }
@@ -230,7 +230,7 @@ impl Process {
         extra: &mut [Term],
         min_free: usize,
     ) -> Result<arinsal_term::GcStats, VmError> {
-        self.hibernated = false;
+        self.set_hibernated(false);
         self.collect_roots(objv, extra, min_free, false)
     }
 
@@ -249,7 +249,7 @@ impl Process {
         let collected = self.collect_roots(&mut x[..live_x], &mut [], 0, true);
         self.x = x;
         let stats = collected?;
-        self.hibernated = true;
+        self.set_hibernated(true);
         Ok(stats)
     }
 

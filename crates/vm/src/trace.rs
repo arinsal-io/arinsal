@@ -3030,7 +3030,7 @@ pub(crate) fn push_native_trace_frame(
         } else {
             0
         };
-    if !process.heap.gc_enabled && process.heap.free_words() < needed {
+    if !process.heap.gc_enabled() && process.heap.free_words() < needed {
         // Port of erts/emulator/beam/erl_gc.c:780-783 (garbage_collect with F_DISABLE_GC):
         // the need is satisfied in a fresh heap fragment and the collection is left for later.
         process.delay_heap_collection(frame_words);

@@ -60,7 +60,6 @@ pub(crate) fn initialize_spawned(
         std::ptr::addr_of_mut!((*process).virtual_reds).write(0);
         std::ptr::addr_of_mut!((*process).reductions_used).write(0);
         std::ptr::addr_of_mut!((*process).gc_deferred).write(false);
-        std::ptr::addr_of_mut!((*process).delay_gc).write(false);
         std::ptr::addr_of_mut!((*process).uniq_counter).write(0);
         std::ptr::addr_of_mut!((*process).stats).write(stats);
         std::ptr::addr_of_mut!((*process).final_exit_reason).write(None);
@@ -71,7 +70,6 @@ pub(crate) fn initialize_spawned(
         std::ptr::addr_of_mut!((*process).scheduler_id).write(0);
         std::ptr::addr_of_mut!((*process).run_key).write(0);
         std::ptr::addr_of_mut!((*process).exec_key).write(0);
-        std::ptr::addr_of_mut!((*process).hibernated).write(false);
         std::ptr::addr_of_mut!((*process).signal_probe).write(None);
         std::ptr::addr_of_mut!((*process).native_wait).write(None);
         std::ptr::addr_of_mut!((*process).native_retry).write(None);
@@ -98,7 +96,6 @@ pub(crate) fn initialize_spawned(
         std::ptr::addr_of_mut!((*process).apply_inline).write(apply_inline);
         std::ptr::addr_of_mut!((*process).apply_inline_len).write(0);
         std::ptr::addr_of_mut!((*process).persistent_terms).write(persistent_terms);
-        std::ptr::addr_of_mut!((*process).trap_exit).write(false);
         std::ptr::addr_of_mut!((*process).exc_class).write(None);
         std::ptr::addr_of_mut!((*process).entry).write(false);
         std::ptr::addr_of_mut!((*process).native_continuation_resume).write(false);
@@ -141,7 +138,6 @@ fn process_fields_are_initialized(process: Process) {
         virtual_reds,
         reductions_used,
         gc_deferred,
-        delay_gc,
         uniq_counter,
         stats,
         final_exit_reason,
@@ -152,7 +148,6 @@ fn process_fields_are_initialized(process: Process) {
         scheduler_id,
         run_key,
         exec_key,
-        hibernated,
         signal_probe,
         native_wait,
         native_retry,
@@ -179,7 +174,6 @@ fn process_fields_are_initialized(process: Process) {
         apply_inline,
         apply_inline_len,
         persistent_terms,
-        trap_exit,
         exc_class,
         entry,
         native_continuation_resume,
@@ -207,7 +201,6 @@ fn process_fields_are_initialized(process: Process) {
         virtual_reds,
         reductions_used,
         gc_deferred,
-        delay_gc,
         uniq_counter,
         stats,
         final_exit_reason,
@@ -218,7 +211,6 @@ fn process_fields_are_initialized(process: Process) {
         scheduler_id,
         run_key,
         exec_key,
-        hibernated,
         signal_probe,
         native_wait,
         native_retry,
@@ -245,7 +237,6 @@ fn process_fields_are_initialized(process: Process) {
         apply_inline,
         apply_inline_len,
         persistent_terms,
-        trap_exit,
         exc_class,
         entry,
         native_continuation_resume,

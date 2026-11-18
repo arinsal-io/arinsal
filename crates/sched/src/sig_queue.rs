@@ -29,6 +29,7 @@ pub(crate) use raw::HeldNode;
 /// A queue of signal nodes (`first`/`last` of `ErtsSignalInQueue` and of the private queues),
 /// with the count of its signals and of its non-message signals (erts tracks the latter with
 /// `nmsigs`).
+#[repr(C)]
 pub struct SignalQueue<T> {
     first: Option<NonNull<SignalNode<T>>>,
     last: Option<NonNull<SignalNode<T>>>,
@@ -39,6 +40,12 @@ pub struct SignalQueue<T> {
 
 // SAFETY: the queue owns its nodes like a `Vec` owns its values.
 unsafe impl<T: Send> Send for SignalQueue<T> {}
+
+impl<T> SignalQueue<T> {
+    /// Byte offset of `first` (`sig_qs.cont` for the middle queue). The layout does not depend
+    /// on `T`.
+    pub const FIRST_OFFSET: usize = std::mem::offset_of!(SignalQueue<T>, first);
+}
 
 impl<T> Default for SignalQueue<T> {
     fn default() -> Self {

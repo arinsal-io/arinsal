@@ -193,8 +193,16 @@ impl<T> Drop for MessageQueueList<T> {
 }
 
 impl<T> MessageQueueList<T> {
-    /// Byte offset of `save`, for generated code (`offsetof(Process, sig_qs.save)`).
+    /// Byte offset of `first` (`sig_qs.first`) in the queue. The layout does not depend on
+    /// `T`: every field is a pointer or a word.
+    pub const FIRST_OFFSET: usize = std::mem::offset_of!(MessageQueueList<T>, first);
+    /// Byte offset of `last` (`sig_qs.last`).
+    pub const LAST_OFFSET: usize = std::mem::offset_of!(MessageQueueList<T>, last);
+    /// Byte offset of `save` (`sig_qs.save`), which generated code loads to peek the message
+    /// a receive looks at next.
     pub const SAVE_OFFSET: usize = std::mem::offset_of!(MessageQueueList<T>, save);
+    /// Byte offset of `len` (`sig_qs.mq_len`).
+    pub const LEN_OFFSET: usize = std::mem::offset_of!(MessageQueueList<T>, len);
 
     /// Anchor the queue where it stays: `last = save = &first`.
     // Port of erts/emulator/beam/erl_process.c:12723-12727 (erl_create_process), OTP-29.1.1.

@@ -2,14 +2,15 @@
 
 use core::ffi::c_void;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arinsal_a64::enc::Gpr;
 use arinsal_beamasm::{
     ExitReason, ProcessHeader, SchedulerRegisters, enter_native,
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
     receive::ReceiveHooks,
-    receive_frag::ReceiveFragments,
-    rt::process_header_mut,
+    receive_frag::{MsgOffsets, ReceiveFragments},
+    rt::{process_header_mut, scheduler_registers_mut},
     yield_frag::YieldFragments,
 };
 
@@ -18,11 +19,73 @@ fn fragments() -> &'static ReceiveFragments {
     &FRAGMENTS
         .get_or_init(|| {
             let yields = YieldFragments::new().unwrap();
-            let receive =
-                ReceiveFragments::new(peek, wait, wait, yields.context_switch(), None).unwrap();
+            let receive = ReceiveFragments::new(
+                receive_helper,
+                wait,
+                wait,
+                yields.context_switch(),
+                MsgOffsets {
+                    sig_qs_save: std::mem::offset_of!(TestProcess, save) as u32,
+                    message_term: 8,
+                    flags: std::mem::offset_of!(ProcessHeader, flags) as u32,
+                },
+            )
+            .unwrap();
             (yields, receive)
         })
         .1
+}
+
+/// A process block with `sig_qs.save` after the native prefix.
+#[repr(C)]
+struct TestProcess {
+    header: ProcessHeader,
+    /// `sig_qs.save`: this thread's [`SAVE_FIELD`].
+    save: *const AtomicU64,
+}
+
+thread_local! {
+    /// The `next` field `sig_qs.save` names: the address of a message node `[next, term]`, or 0
+    /// at the end of the queue.
+    static SAVE_FIELD: AtomicU64 = const { AtomicU64::new(0) };
+}
+
+/// A queue of message nodes `[next, term]` with the save pointer at the first.
+fn queue(terms: &[u64]) -> TestProcess {
+    let mut next = 0;
+    for &term in terms.iter().rev() {
+        let node: &'static [AtomicU64; 2] =
+            Box::leak(Box::new([AtomicU64::new(next), AtomicU64::new(term)]));
+        NODES.with(|nodes| nodes.borrow_mut().push(node));
+        next = std::ptr::from_ref(node).expose_provenance() as u64;
+    }
+    SAVE_FIELD.with(|field| field.store(next, Ordering::Relaxed));
+    TestProcess {
+        header: ProcessHeader {
+            fcalls: 10,
+            ..ProcessHeader::default()
+        },
+        save: SAVE_FIELD.with(std::ptr::from_ref),
+    }
+}
+
+/// The node at the save pointer.
+fn save_node() -> Option<&'static [AtomicU64; 2]> {
+    let address = SAVE_FIELD.with(|field| field.load(Ordering::Relaxed));
+    (address != 0).then(|| node_ref(std::ptr::with_exposed_provenance(address as usize)))
+}
+
+fn node_ref(node: *const [AtomicU64; 2]) -> &'static [AtomicU64; 2] {
+    let nodes = NODES.with(|nodes| nodes.borrow().clone());
+    nodes
+        .into_iter()
+        .find(|known| std::ptr::eq(*known, node))
+        .expect("a node of the queue")
+}
+
+thread_local! {
+    static NODES: std::cell::RefCell<Vec<&'static [AtomicU64; 2]>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn hooks() -> ReceiveHooks {
@@ -66,23 +129,28 @@ extern "C" fn use_marker(process: *mut ProcessHeader, reference: u64) {
     });
 }
 
-extern "C" fn peek(process: *mut ProcessHeader) -> u64 {
-    process_header_mut(process, |header| match header.arity {
-        0 => 0x101,
-        1 => 0x202,
-        _ => 0,
-    })
+/// The receive helper of an empty queue: no message, no reductions, on to the wait.
+extern "C" fn receive_helper(_: *mut ProcessHeader, _: i32, _: i32, reg: *mut u64) -> i32 {
+    scheduler_registers_mut(reg, |registers| {
+        registers.tmp_mem[1] = 0;
+        registers.tmp_mem[2] = 0;
+    });
+    0
 }
 
+/// Records the term of the message it removes in `fvalue`.
 extern "C" fn remove(process: *mut ProcessHeader, reductions: i32, _code_ix: usize) -> i32 {
+    let term = save_node().expect("a message at the save pointer")[1].load(Ordering::Relaxed);
     process_header_mut(process, |header| {
-        header.exc.fvalue = u64::from(header.arity);
+        header.exc.fvalue = term;
         reductions - 1
     })
 }
 
-extern "C" fn save_next(process: *mut ProcessHeader) {
-    process_header_mut(process, |header| header.arity += 1);
+/// `erts_msgq_set_save_next`.
+extern "C" fn save_next(_: *mut ProcessHeader) {
+    let next = save_node().expect("a message at the save pointer")[0].load(Ordering::Relaxed);
+    SAVE_FIELD.with(|field| field.store(next, Ordering::Relaxed));
 }
 
 extern "C" fn wait(process: *mut ProcessHeader, destination: usize) {
@@ -103,7 +171,8 @@ extern "C" fn timeout(process: *mut ProcessHeader) {
     });
 }
 
-fn run(module: &FinalizedModule, label: u32, header: &mut ProcessHeader) -> ExitReason {
+fn run(module: &FinalizedModule, label: u32, process: &mut TestProcess) -> ExitReason {
+    let header = &mut process.header;
     let mut regs = SchedulerRegisters::default();
     if header.stop.is_null() {
         let stack = Box::leak(vec![0u64; 64].into_boxed_slice());
@@ -132,13 +201,9 @@ fn native_first_message() {
     .unwrap();
     asm.emit_i_func_label(2).unwrap();
     let module = asm.finalize().unwrap();
-    let mut header = ProcessHeader {
-        arity: 0,
-        fcalls: 10,
-        ..ProcessHeader::default()
-    };
-    assert_eq!(run(&module, 1, &mut header), ExitReason::Returned);
-    assert_eq!(header.exc.fvalue, 0);
+    let mut process = queue(&[0x101]);
+    assert_eq!(run(&module, 1, &mut process), ExitReason::Returned);
+    assert_eq!(process.header.exc.fvalue, 0x101);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -162,14 +227,9 @@ fn native_skip_then_match() {
     asm.emit_wait_locked(10, hooks()).unwrap();
     asm.emit_i_func_label(13).unwrap();
     let module = asm.finalize().unwrap();
-    let mut header = ProcessHeader {
-        arity: 0,
-        fcalls: 10,
-        ..ProcessHeader::default()
-    };
-    assert_eq!(run(&module, 10, &mut header), ExitReason::Returned);
-    assert_eq!(header.arity, 1);
-    assert_eq!(header.exc.fvalue, 1);
+    let mut process = queue(&[0x101, 0x202]);
+    assert_eq!(run(&module, 10, &mut process), ExitReason::Returned);
+    assert_eq!(process.header.exc.fvalue, 0x202);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -189,16 +249,14 @@ fn native_wait_suspends_and_resumes() {
     asm.emit_i_func_label(21).unwrap();
     asm.emit_wait_locked(20, hooks()).unwrap();
     let module = asm.finalize().unwrap();
-    let mut header = ProcessHeader {
-        arity: 2,
-        fcalls: 10,
-        ..ProcessHeader::default()
-    };
-    assert_eq!(run(&module, 20, &mut header), ExitReason::Yield);
-    assert_eq!(header.i, module.entries[&20].cast());
-    header.arity = 1;
-    assert_eq!(run(&module, 20, &mut header), ExitReason::Returned);
-    assert_eq!(header.exc.fvalue, 1);
+    let mut process = queue(&[]);
+    assert_eq!(run(&module, 20, &mut process), ExitReason::Yield);
+    assert_eq!(process.header.i, module.entries[&20].cast());
+    // A message arrives at the save pointer.
+    let arrived = queue(&[0x303]);
+    assert_eq!(arrived.save, process.save);
+    assert_eq!(run(&module, 20, &mut process), ExitReason::Returned);
+    assert_eq!(process.header.exc.fvalue, 0x303);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -218,12 +276,9 @@ fn native_after_zero_timeout() {
     .unwrap();
     asm.emit_i_func_label(31).unwrap();
     let module = asm.finalize().unwrap();
-    let mut header = ProcessHeader {
-        fcalls: 10,
-        ..ProcessHeader::default()
-    };
-    assert_eq!(run(&module, 30, &mut header), ExitReason::Returned);
-    assert_eq!(header.arity, 1, "timeout branch executed");
+    let mut process = queue(&[]);
+    assert_eq!(run(&module, 30, &mut process), ExitReason::Returned);
+    assert_eq!(process.header.arity, 1, "timeout branch executed");
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -246,15 +301,12 @@ fn native_recv_marker() {
     })
     .unwrap();
     let module = asm.finalize().unwrap();
-    let mut header = ProcessHeader {
-        arity: 4,
-        fcalls: 10,
-        ..ProcessHeader::default()
-    };
-    assert_eq!(run(&module, 40, &mut header), ExitReason::Returned);
-    assert_eq!(header.exc.fvalue, 0x551);
-    assert_eq!(header.arity, 4);
-    assert_eq!(header.current, 7usize as *const c_void);
+    let mut process = queue(&[]);
+    process.header.arity = 4;
+    assert_eq!(run(&module, 40, &mut process), ExitReason::Returned);
+    assert_eq!(process.header.exc.fvalue, 0x551);
+    assert_eq!(process.header.arity, 4);
+    assert_eq!(process.header.current, 7usize as *const c_void);
 }
 
 #[cfg(not(target_arch = "aarch64"))]

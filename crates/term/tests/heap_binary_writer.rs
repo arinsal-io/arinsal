@@ -15,7 +15,7 @@ fn every_small_binary_split_preserves_bytes_and_gc_state() {
                 writer.write(&mut heap, &[*byte]).unwrap();
             }
             let result = writer.finish(&mut heap).unwrap();
-            assert!(heap.gc_enabled);
+            assert!(heap.gc_enabled());
             assert_eq!(to_owned(result).unwrap(), OwnedTerm::Binary(bytes.clone()));
         }
     }
@@ -29,6 +29,26 @@ fn cancel_partial_binary_releases_the_reservation() {
     let mut writer = HeapBinaryWriter::new(&mut heap, 64).unwrap();
     writer.write(&mut heap, &[255; 13]).unwrap();
     writer.cancel(&mut heap);
-    assert!(heap.gc_enabled);
+    assert!(heap.gc_enabled());
     assert_eq!(heap.words_left(), available);
+}
+
+/// `F_DISABLE_GC` and `F_FORCE_GC` are bits of the one `c_p->flags` word at `NativeAbi`
+/// offset 0x60; changing one keeps the other flags.
+#[test]
+fn gc_flags_live_in_the_process_flags_word() {
+    use arinsal_term::{ProcessHeap, pflags};
+    let mut heap = ProcessHeap::with_words(16);
+    assert!(heap.gc_enabled() && !heap.force_gc());
+    heap.set_flag(pflags::F_TRAP_EXIT, true);
+    heap.set_gc_enabled(false);
+    heap.set_force_gc(true);
+    assert_eq!(
+        heap.abi.flags,
+        pflags::F_TRAP_EXIT | pflags::F_DISABLE_GC | pflags::F_FORCE_GC
+    );
+    heap.set_gc_enabled(true);
+    heap.set_force_gc(false);
+    assert_eq!(heap.abi.flags, pflags::F_TRAP_EXIT);
+    assert_eq!(ProcessHeap::FLAGS_OFFSET, 0x60);
 }

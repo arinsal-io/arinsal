@@ -1,5 +1,9 @@
 use super::*;
 
+mod raw;
+
+pub(crate) use self::raw::MESSAGE_TERM_OFFSET;
+
 /// Which part of a queued message a collection root stands for.
 #[derive(Clone, Copy)]
 pub(crate) struct RootSlot {
@@ -14,6 +18,7 @@ pub(crate) struct RootSlot {
 /// Priority messages lead, up to the prio queue's end marker (`ErtsPrioQInfo` in
 /// `ProcessCold`).
 #[derive(Default)]
+#[repr(C)]
 pub(crate) struct MessageQueue {
     /// `sig_qs.first`/`last`/`save`/`mq_len`.
     pub(crate) entries: arinsal_sched::MessageQueueList<Event<Message>>,
@@ -91,23 +96,6 @@ impl QueuedMessage {
 }
 
 impl MessageQueue {
-    /// Byte offset of `sig_qs.save` in the queue, for generated code.
-    pub(crate) const SAVE_OFFSET: usize = std::mem::offset_of!(MessageQueue, entries)
-        + arinsal_sched::MessageQueueList::<Event<Message>>::SAVE_OFFSET;
-
-    /// Byte offset of the term of a message in its node (`offsetof(ErtsMessage, m[0])`), for
-    /// generated code. The variant's place in `Payload` is a property of the type; it is
-    /// read off a value, which has the layout every node has.
-    pub(crate) fn node_term_offset() -> usize {
-        let event = Event {
-            from: Pid::from_data(0),
-            payload: Payload::Message(Message::immediate(Term::NIL)),
-        };
-        let term = std::ptr::addr_of!(queued(&event).term) as usize;
-        std::mem::offset_of!(arinsal_term::message::SignalNode<Event<Message>>, value) + term
-            - std::ptr::addr_of!(event) as usize
-    }
-
     /// Bytes the queued messages occupy: each node and its on-heap data.
     // Port of erts/emulator/beam/erl_process_dump.c:117 (erts_process_memory, the message
     // queue loop: `sizeof(ErtsMessage)` plus `erts_msg_attached_data_size`), OTP-29.1.1.

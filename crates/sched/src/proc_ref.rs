@@ -318,9 +318,7 @@ impl<M: SignalMessage> SignalProbe<M> {
     // Port of erts/emulator/beam/erl_process.c (erts_set_process_priority on `c_p`),
     // OTP-29.1.1.
     pub fn set_user_priority(&self, priority: crate::Priority) {
-        self.field(self.shared)
-            .user_priority
-            .store(priority.index() as u8, Ordering::Release);
+        self.field(self.shared).set_user_priority(priority);
     }
 
     /// Binds the process to the one-based scheduler `scheduler_id` (zero unbinds) and returns
@@ -382,12 +380,17 @@ impl<M: SignalMessage> SignalProbe<M> {
 
 /// The task of a process, written in place into the process struct after the struct is
 /// allocated (erts alloc_process takes the struct, then the fields are set in place).
+#[repr(C)]
 pub(crate) struct TaskCell<T: Task> {
+    /// First, so the task is at the start of the process struct (`c_p`).
     task: MaybeUninit<T>,
     initialized: bool,
 }
 
 impl<T: Task> TaskCell<T> {
+    /// Offset of the task within the cell (zero: the task is first).
+    pub(crate) const TASK_OFFSET: usize = std::mem::offset_of!(TaskCell<T>, task);
+
     /// A cell whose task [`TaskCell::init_with`] writes next.
     pub(crate) fn uninit() -> Self {
         Self {
