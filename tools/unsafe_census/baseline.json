@@ -6,7 +6,7 @@
     "args": 0,
     "arith": 0,
     "beam": 0,
-    "beamasm": 19,
+    "beamasm": 31,
     "beamjit": 2,
     "beamops": 0,
     "bifs": 6,
@@ -30,8 +30,8 @@
     "re": 18,
     "sched": 122,
     "spec": 0,
-    "term": 401,
+    "term": 402,
     "vm": 353,
-    "drv": 92
+    "drv": 93
   }
 }
