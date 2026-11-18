@@ -1,6 +1,6 @@
 //! Audited native runtime transition core.
 
-use super::{ExitReason, NativeEntry, ProcessHeader, SchedulerRegisters};
+use crate::{ExitReason, NativeEntry, ProcessHeader, SchedulerRegisters};
 use core::ffi::c_void;
 
 /// Returns the tagged word for a test-owned term whose heap remains live.

@@ -1,19 +1,18 @@
 //! `i_bs_match` / `i_bs_match_test_heap`: segment optimiser and emitter.
 //!
-//! Port of erts/emulator/beam/jit/beam_jit_bs.cpp:287-528 (`beam_jit_bsm_init`,
-//! `beam_jit_opt_bsm_segments`) and erts/emulator/beam/jit/arm/instr_bs.cpp:2496-3210
+//! Port of erts/emulator/beam/jit/arm/instr_bs.cpp:2496-3210
 //! (`emit_read_bits`, `emit_extract_integer`, `emit_extract_bitstring`,
 //! `emit_i_bs_match_test_heap`), OTP-29.1.1.
 
 use crate::bs_match::{BsMatchCmdHelper, BsMatchHelper};
+pub use crate::common::bs::BsmCommand;
+use crate::common::bs::{Action, SMALL_BITS, bsm_init, heap_bits_size, opt_bsm_segments};
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
 use arinsal_a64::enc::{Cond, Gpr, Shift, Shifted};
 
 /// `BSF_LITTLE`, `BSF_SIGNED` (erts/emulator/beam/erl_bits.h).
 const BSF_LITTLE: u64 = 2;
 const BSF_SIGNED: u64 = 4;
-/// `SMALL_BITS`: bits of a small integer on a 64-bit target.
-const SMALL_BITS: u64 = 60;
 /// Offset of `ErlSubBits` fields from the (untagged) pointer.
 const BASE_FLAGS_OFFSET: u32 = 8;
 const START_OFFSET: i16 = 16;
@@ -22,11 +21,6 @@ const END_OFFSET: i16 = 24;
 const BOXED_TAG: i16 = 2;
 /// `ERL_SUB_BITS_FLAG_MASK`.
 const SUB_BITS_FLAG_MASK: u64 = 3;
-const ERL_ONHEAP_BITS_LIMIT: u64 = 64 * 8;
-/// Words of a sub-bitstring (erl_bits.h, ERL_SUB_BITS_SIZE).
-const ERL_SUB_BITS_SIZE: u64 = 5;
-/// `BUILD_SUB_BITSTRING_HEAP_NEED`: `MAX(ERL_SUB_BITS_SIZE, heap_bits_size(ERL_ONHEAP_BITS_LIMIT))`.
-const BUILD_SUB_BITSTRING_HEAP_NEED: u64 = 2 + 64 / 8;
 const TAG_PRIMARY_BOXED: u16 = 2;
 const TAG_IMMED1_SMALL: u64 = 0xf;
 const TAG_IMMED1_SIZE: u8 = 4;
@@ -49,274 +43,6 @@ const TMP4: Gpr = Gpr::x(11);
 const TMP5: Gpr = Gpr::x(12);
 const SUPER_TMP: Gpr = Gpr::x(14);
 const HTOP: Gpr = Gpr::x(23);
-
-/// One command of a `bs_match` list, decoded from the loader operands.
-#[derive(Clone, Copy, Debug)]
-pub enum BsmCommand {
-    /// `{ensure_at_least, Size, Unit}`.
-    EnsureAtLeast { size: u64, unit: u64 },
-    /// `{ensure_exactly, Size}`.
-    EnsureExactly { size: u64 },
-    /// `{integer, Live, Flags, Size, Unit, Dst}`; `live` is `None` for `nil`.
-    Integer {
-        live: Option<u32>,
-        flags: u64,
-        size: u64,
-        unit: u64,
-        dst: ArgVal,
-    },
-    /// `{binary, Live, Flags, Size, Unit, Dst}`.
-    Binary {
-        live: Option<u32>,
-        flags: u64,
-        size: u64,
-        unit: u64,
-        dst: ArgVal,
-    },
-    /// `{get_tail, Live, Unit, Dst}`.
-    GetTail { live: Option<u32>, dst: ArgVal },
-    /// `{skip, Size}`.
-    Skip { size: u64 },
-    /// `{'=:=', Live, Size, Value}`.
-    Eq {
-        live: Option<u32>,
-        size: u64,
-        value: u64,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Action {
-    EnsureAtLeast,
-    EnsureExactly,
-    Eq,
-    TestHeap,
-    Read,
-    ExtractBitstring,
-    ExtractInteger,
-    ReadInteger,
-    GetInteger,
-    GetBitstring,
-    GetTail,
-    Skip,
-    Drop,
-}
-
-/// `BsmSegment` (beam_jit_bs.hpp:73-98).
-#[derive(Clone, Copy, Debug)]
-struct Segment {
-    action: Action,
-    live: Option<u32>,
-    size: u64,
-    unit: u64,
-    flags: u64,
-    dst: Option<ArgVal>,
-}
-
-impl Segment {
-    fn new(action: Action) -> Self {
-        Segment {
-            action,
-            live: None,
-            size: 0,
-            unit: 0,
-            flags: 0,
-            dst: None,
-        }
-    }
-}
-
-/// Port of beam_jit_bs.cpp:287-364 (beam_jit_bsm_init).
-fn bsm_init(commands: &[BsmCommand]) -> Vec<Segment> {
-    commands
-        .iter()
-        .map(|command| match *command {
-            BsmCommand::EnsureAtLeast { size, unit } => Segment {
-                size,
-                unit,
-                ..Segment::new(Action::EnsureAtLeast)
-            },
-            BsmCommand::EnsureExactly { size } => Segment {
-                size,
-                ..Segment::new(Action::EnsureExactly)
-            },
-            BsmCommand::Integer {
-                live,
-                flags,
-                size,
-                unit,
-                dst,
-            } => Segment {
-                live,
-                size: size * unit,
-                unit,
-                flags,
-                dst: Some(dst),
-                ..Segment::new(Action::GetInteger)
-            },
-            BsmCommand::Binary {
-                live,
-                flags,
-                size,
-                unit,
-                dst,
-            } => Segment {
-                live,
-                size: size * unit,
-                unit,
-                flags,
-                dst: Some(dst),
-                ..Segment::new(Action::GetBitstring)
-            },
-            BsmCommand::GetTail { live, dst } => Segment {
-                live,
-                dst: Some(dst),
-                ..Segment::new(Action::GetTail)
-            },
-            BsmCommand::Skip { size } => Segment {
-                size,
-                ..Segment::new(Action::Skip)
-            },
-            BsmCommand::Eq { live, size, value } => Segment {
-                live,
-                size,
-                unit: value,
-                ..Segment::new(Action::Eq)
-            },
-        })
-        .collect()
-}
-
-/// `erts_extracted_bitstring_size` (erl_bits.h:585-593) for fields the segments extract
-/// inline (at most 64 bits, always a heap bitstring).
-///
-/// Wider fields go through `TermBuilder::sub_binary`, which allocates a BinRef plus a
-/// SubBits (8 words) over a refc owner instead of erts' single SubBits, so the reservation
-/// uses that builder's bound until the binary owner layout is the erts one.
-fn extracted_bitstring_size(bits: u64) -> u64 {
-    if bits <= 64 {
-        heap_bits_size(bits)
-    } else if bits <= ERL_ONHEAP_BITS_LIMIT {
-        heap_bits_size(bits).max(8)
-    } else {
-        8.max(ERL_SUB_BITS_SIZE)
-    }
-}
-
-/// `heap_bits_size` (erl_bits.h:155-161).
-fn heap_bits_size(bits: u64) -> u64 {
-    2 + bits.div_ceil(8).div_ceil(8)
-}
-
-/// Port of beam_jit_bs.cpp:366-528 (beam_jit_opt_bsm_segments).
-fn opt_bsm_segments(segments: &[Segment], need: u64, live: u32) -> Vec<Segment> {
-    let mut segs: Vec<Segment> = Vec::with_capacity(segments.len() * 2);
-    let mut heap_need = need;
-
-    for seg in segments {
-        match seg.action {
-            Action::GetInteger if seg.size >= SMALL_BITS => {
-                // BIG_NEED_FOR_BITS
-                heap_need += (seg.size - 1) / 64 + 1 + 1;
-            }
-            Action::GetBitstring => heap_need += extracted_bitstring_size(seg.size),
-            Action::GetTail => heap_need += BUILD_SUB_BITSTRING_HEAP_NEED,
-            _ => {}
-        }
-    }
-
-    let mut read_action_pos: Option<usize> = None;
-    let count = segments.len();
-
-    for (i, original) in segments.iter().enumerate() {
-        let mut seg = *original;
-        if heap_need != 0 && seg.live.is_some() {
-            let mut s = seg;
-            read_action_pos = None;
-            s.action = Action::TestHeap;
-            s.size = heap_need;
-            segs.push(s);
-            heap_need = 0;
-        }
-
-        match seg.action {
-            Action::GetInteger | Action::GetBitstring => {
-                let is_common_size = matches!(seg.size, 8 | 16 | 32);
-                if seg.size > 64 {
-                    read_action_pos = None;
-                } else if read_action_pos.is_none()
-                    && seg.action == Action::GetInteger
-                    && is_common_size
-                    && i + 1 == count
-                {
-                    seg.action = Action::ReadInteger;
-                    read_action_pos = None;
-                } else {
-                    match read_action_pos {
-                        Some(pos) if seg.size + segs[pos].size <= 64 => {
-                            segs[pos].size += seg.size;
-                        }
-                        _ => {
-                            read_action_pos = Some(segs.len());
-                            let mut s = Segment::new(Action::Read);
-                            s.size = seg.size;
-                            segs.push(s);
-                        }
-                    }
-                    seg.action = match seg.action {
-                        Action::GetInteger => Action::ExtractInteger,
-                        _ => Action::ExtractBitstring,
-                    };
-                }
-                segs.push(seg);
-            }
-            Action::Eq => {
-                match read_action_pos {
-                    Some(pos) if seg.size + segs[pos].size <= 64 => {
-                        segs[pos].size += seg.size;
-                    }
-                    _ => {
-                        read_action_pos = Some(segs.len());
-                        let mut s = Segment::new(Action::Read);
-                        s.size = seg.size;
-                        segs.push(s);
-                    }
-                }
-                let last = segs.last_mut().expect("a segment was just pushed");
-                if last.action == Action::Eq && last.size + seg.size <= 64 {
-                    // Coalesce with the previous EQ instruction.
-                    last.size += seg.size;
-                    last.unit = last.unit.checked_shl(seg.size as u32).unwrap_or(0) | seg.unit;
-                } else {
-                    segs.push(seg);
-                }
-            }
-            Action::Skip => {
-                match read_action_pos {
-                    Some(pos) if seg.size + segs[pos].size <= 64 => {
-                        segs[pos].size += seg.size;
-                        seg.action = Action::Drop;
-                    }
-                    _ => read_action_pos = None,
-                }
-                segs.push(seg);
-            }
-            _ => {
-                read_action_pos = None;
-                segs.push(seg);
-            }
-        }
-    }
-
-    // A trailing test_heap (for i_bs_match_test_heap).
-    if heap_need != 0 {
-        let mut seg = Segment::new(Action::TestHeap);
-        seg.size = heap_need;
-        seg.live = Some(live);
-        segs.push(seg);
-    }
-    segs
-}
 
 impl BeamModuleAssembler {
     /// `ctx_reg = load_source(Ctx, scratch)`.

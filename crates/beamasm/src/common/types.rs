@@ -3,7 +3,7 @@
 //! Port of the helpers in erts/emulator/beam/jit/beam_jit_common.hpp:253-415 and
 //! erts/emulator/beam/jit/beam_jit_types.hpp (BeamTypeId, BeamArgType), OTP-29.1.1.
 
-use crate::module::ArgVal;
+use crate::common::args::ArgVal;
 
 /// Type-union bits, the `BEAM_TYPE_*` values of erts/emulator/beam/beam_types.h.
 pub mod type_id {
@@ -275,7 +275,7 @@ pub fn is_bsl_small(lhs: &TypedArg, rhs: &TypedArg) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{ArgType, MAX_SMALL, TypedArg, type_id};
-    use crate::module::ArgVal;
+    use crate::common::args::ArgVal;
 
     fn typed(union_bits: u16) -> TypedArg {
         TypedArg::new(

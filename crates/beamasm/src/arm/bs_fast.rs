@@ -1,9 +1,9 @@
 //! Inline `bs_create_bin` shapes that BeamAsm builds without the generic helper.
 //!
-//! Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1076-2494 and
-//! erts/emulator/beam/jit/beam_jit_bs.cpp:162-250, OTP-29.1.1.
+//! Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1076-2494, OTP-29.1.1.
 
 use crate::bs_construct::{BsCreateBinHelpers, BsSegment, BsSegmentKind};
+use crate::common::bs::{AccSeg, Group, combine};
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
 use arinsal_a64::enc::{Cond, Gpr, Shift, Shifted};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -63,17 +63,6 @@ fn tmp_at(index: u32) -> u32 {
 
 fn bits_state() -> u32 {
     std::mem::offset_of!(crate::SchedulerRegisters, erl_bits_state) as u32
-}
-
-struct AccSeg {
-    src: ArgVal,
-    bits: u64,
-    offset: u64,
-}
-
-struct Group {
-    bits: u64,
-    segs: Vec<AccSeg>,
 }
 
 struct FixedPlan {
@@ -265,49 +254,6 @@ fn x_index(src: ArgVal) -> Option<u32> {
         ArgVal::X(index) => Some(u32::from(index)),
         ArgVal::XMemory(index) => Some(index),
         _ => None,
-    }
-}
-
-/// Groups big-endian integer fields into 64-bit accumulator stores.
-// Port of erts/emulator/beam/jit/beam_jit_bs.cpp:162-250 (beam_jit_bsc_combine_segments).
-fn combine(segs: &[AccSeg]) -> Vec<Group> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    let mut combined = 0u64;
-    for (index, seg) in segs.iter().enumerate() {
-        if index == start {
-            combined = seg.bits;
-            continue;
-        }
-        if combined + seg.bits <= 64 {
-            combined += seg.bits;
-            continue;
-        }
-        out.push(finish_group(segs, start, index, combined));
-        start = index;
-        combined = seg.bits;
-    }
-    if start < segs.len() {
-        out.push(finish_group(segs, start, segs.len(), combined));
-    }
-    out
-}
-
-fn finish_group(segs: &[AccSeg], start: usize, end: usize, bits: u64) -> Group {
-    let mut offset = 64 - bits;
-    let mut grouped = Vec::with_capacity(end - start);
-    for seg in segs[start..end].iter().rev() {
-        grouped.push(AccSeg {
-            src: seg.src,
-            bits: seg.bits,
-            offset,
-        });
-        offset += seg.bits;
-    }
-    grouped.reverse();
-    Group {
-        bits,
-        segs: grouped,
     }
 }
 

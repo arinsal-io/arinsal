@@ -245,6 +245,14 @@ impl Drop for TempDirectory {
     }
 }
 
+/// `ARINSAL_BEAMASM_DUMP`, read once. Module emission consults it per load.
+pub(crate) fn dump_directory() -> Option<&'static std::ffi::OsStr> {
+    static DIRECTORY: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+    DIRECTORY
+        .get_or_init(|| std::env::var_os("ARINSAL_BEAMASM_DUMP"))
+        .as_deref()
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_disassembly;

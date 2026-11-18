@@ -3,6 +3,8 @@
 use arinsal_a64::buf::IdMap;
 use std::path::Path;
 
+pub use crate::common::args::ArgVal;
+use crate::common::args::trimmed_arg;
 use crate::rt::arinsal_enter_native_return;
 use arinsal_a64::{
     buf::{BufferError, CodeBuffer, Label},
@@ -46,25 +48,6 @@ fn memory_slot(arg: ArgVal) -> Option<(Gpr, u32)> {
         ArgVal::XMemory(i) => i.checked_mul(8).map(|offset| (SCHEDULER_REGS, offset)),
         _ => None,
     }
-}
-
-/// Typed operand accepted by the first BeamAsm emitter slice.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ArgVal {
-    /// Register backed X value, numbered X0 through X5.
-    X(u8),
-    /// X value stored in the scheduler register array beyond the hardware cache.
-    XMemory(u32),
-    /// Erlang stack Y value, numbered from the current stack pointer.
-    Y(u32),
-    /// An immediate machine word.
-    Immediate(u64),
-    /// A literal machine word.
-    Literal(u64),
-    /// A module label number.
-    Label(u32),
-    /// An export table index (external call emission is currently unported).
-    Export(u32),
 }
 
 /// Errors while emitting or finalizing a native module.
@@ -365,7 +348,7 @@ impl BeamModuleAssembler {
             rodata_label_patches: Vec::new(),
             rodata_pointer_patches: Vec::new(),
             code_label_patches: Vec::new(),
-            reg_cache: crate::regcache::RegCache::default(),
+            reg_cache: crate::regcache::RegCache::new(SCHEDULER_REGS, E),
             map_lookups: Vec::new(),
             labels: LabelIds::default(),
             defined: DefinedLabels::default(),
@@ -428,7 +411,7 @@ impl BeamModuleAssembler {
 
     /// Enables optional instruction-range capture for one module.
     pub fn enable_dump(&mut self, module: &str) {
-        if crate::dump_directory().is_some() {
+        if crate::dump::dump_directory().is_some() {
             self.dump_module = Some(module.to_owned());
         }
     }
@@ -2641,14 +2624,14 @@ impl BeamModuleAssembler {
             bytes[site..site + 8].copy_from_slice(&(address as u64).to_le_bytes());
         }
         if let Some(module) = &self.dump_module {
-            let directory =
-                crate::dump_directory().expect("dump output directory was checked when enabled");
+            let directory = crate::dump::dump_directory()
+                .expect("dump output directory was checked when enabled");
             crate::dump::write_module(Path::new(directory), module, &self.dump_functions, &bytes)
                 .map_err(ModuleError::Dump)?;
         }
         memory.write_bytes(offset, &bytes)?;
         if let Some(module) = &self.dump_module
-            && let Some(directory) = crate::dump_directory()
+            && let Some(directory) = crate::dump::dump_directory()
         {
             let _ = std::fs::write(
                 Path::new(directory).join(format!("{module}.base")),
@@ -2793,16 +2776,6 @@ fn first_y_offset(index: u32) -> Result<u32, ModuleError> {
     index
         .checked_mul(8)
         .ok_or(ModuleError::InvalidOperand("Y register offset overflow"))
-}
-
-/// The operand a destination becomes once `words` have been trimmed from the frame.
-// Port of erts/emulator/beam/jit/arm/beam_jit_args.hpp (ArgVal::trimmed), OTP-29.1.1.
-fn trimmed_arg(dst: ArgVal, words: u32) -> Option<ArgVal> {
-    match dst {
-        ArgVal::Y(index) => index.checked_sub(words).map(ArgVal::Y),
-        ArgVal::X(_) | ArgVal::XMemory(_) => Some(dst),
-        _ => None,
-    }
 }
 
 /// Whether a source operand is a beam literal that lives in the literal area (a list or boxed

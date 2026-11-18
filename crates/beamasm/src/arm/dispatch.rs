@@ -364,7 +364,7 @@ impl DispatchFragments {
         memory.write_bytes(offset, &bytes)?;
         // `ARINSAL_BEAMASM_DUMP`: the shared fragments' code image and entry offsets, so the
         // fragments a profile samples can be listed like a module's code.
-        if let Some(directory) = crate::dump_directory() {
+        if let Some(directory) = crate::dump::dump_directory() {
             let directory = std::path::Path::new(directory);
             let entries = [
                 ("export", export),
