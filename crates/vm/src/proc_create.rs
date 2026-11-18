@@ -1416,8 +1416,6 @@ pub(crate) struct ProcessCold {
     /// Storage of a table being released by a trapped `ets:delete/1` or
     /// `ets:internal_delete_all/2`.
     pub(crate) ets_free: Option<Box<EtsFree>>,
-    /// Progress of a trapped list `ets:insert/2` or `ets:insert_new/2`.
-    pub(crate) ets_insert: Option<Box<EtsInsert>>,
     /// Progress of a trapped `ets:select/2`, `match/2`, `match_object/2` or `select_count/2`.
     pub(crate) ets_select: Option<Box<EtsSelect>>,
     /// Operand registers of `apply` calls in progress. A callee may collect before it
@@ -2306,22 +2304,6 @@ pub(crate) enum EtsInsert {
     },
     /// The remaining objects were handed to the busy table; the result lands in the slot.
     Global(arinsal_ets::InsertOutcome),
-}
-
-impl EtsInsert {
-    pub(crate) fn cursor(&self) -> Option<Term> {
-        match self {
-            Self::Check { cursor, .. } | Self::Copy { cursor, .. } => Some(*cursor),
-            Self::Global(_) => None,
-        }
-    }
-
-    pub(crate) fn cursor_mut(&mut self) -> Option<&mut Term> {
-        match self {
-            Self::Check { cursor, .. } | Self::Copy { cursor, .. } => Some(cursor),
-            Self::Global(_) => None,
-        }
-    }
 }
 
 /// Mutable access to `Process::sig_cont`; keeps `SLOW_SIG_CONT` right on drop.

@@ -69,10 +69,6 @@ impl Process {
                     && cold.apply_roots.is_empty()
                     && cold.nif_pending.is_none()
                     && cold
-                        .ets_insert
-                        .as_ref()
-                        .is_none_or(|state| state.cursor().is_none())
-                    && cold
                         .ets_select
                         .as_ref()
                         .is_none_or(|state| state.saved.is_empty())
@@ -204,13 +200,6 @@ impl Process {
             roots.push(&mut cold.apply_roots);
             if let Some(pending) = cold.nif_pending.as_mut() {
                 roots.push(pending.roots_mut());
-            }
-            if let Some(cursor) = cold
-                .ets_insert
-                .as_deref_mut()
-                .and_then(crate::proc_create::EtsInsert::cursor_mut)
-            {
-                roots.push_term(cursor);
             }
             if let Some(state) = cold.ets_select.as_mut() {
                 roots.push(state.saved.roots_mut());

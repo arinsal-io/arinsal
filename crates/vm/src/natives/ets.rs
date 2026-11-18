@@ -169,6 +169,10 @@ fn binary_info_err(error: EtsError) -> VmError {
         error => err(error),
     }
 }
+/// `is_list(arg2) && CDR(arg2) != NIL`: a list for `ets_insert_2_list_driver`.
+pub(crate) fn is_list_insert(objects: Term) -> bool {
+    list_next(objects).is_some_and(|(_, tail)| tail != Term::NIL)
+}
 fn list_next(term: Term) -> Option<(Term, Term)> {
     // SAFETY: every caller keeps the source list on the active process heap while traversing it.
     unsafe { term.cons_ref() }
@@ -737,6 +741,7 @@ pub(crate) fn ets_lookup_2(process: &mut Process, args: &[Term]) -> Result<Term,
     {
         return Ok(value);
     }
+    help_busy_table(process, args[0], false)?;
     let caller = direct_caller(process).ok_or_else(badarg)?;
     lookup_args(process, caller, false, args[0], args[1])
 }
@@ -997,8 +1002,9 @@ pub(crate) fn ets_insert_2<const NEW: bool>(
     if let Some(value) = insert_one::<NEW>(process, args) {
         return Ok(value);
     }
+    help_busy_table(process, args[0], false)?;
     let caller = direct_caller(process).ok_or_else(badarg)?;
-    insert_args(process, None, caller, NEW, args[0], args[1])
+    insert_args(process, caller, NEW, args[0], args[1])
 }
 
 /// Attach the BIF's stack frame to a failure, as `handle_error` builds it from the X registers.
@@ -1220,9 +1226,8 @@ fn validate_counter_request(
     Ok(())
 }
 
-fn insert_args(
+pub(crate) fn insert_args(
     process: &mut Process,
-    ctx: Option<&mut RunCtx<'_, Message>>,
     caller: Term,
     insert_new: bool,
     target: Term,
@@ -1230,21 +1235,6 @@ fn insert_args(
 ) -> Result<Term, VmError> {
     // SAFETY: object terms remain in the caller's live process heap for this BIF.
     let is_tuple = unsafe { objects.tuple_ref() }.is_some();
-    // Port of erts/emulator/beam/erl_db.c (ets_insert_2: a list of two or more
-    // objects, or a trapped continuation, goes to ets_insert_2_list_driver).
-    if !is_tuple
-        && (process
-            .cold
-            .as_ref()
-            .is_some_and(|cold| cold.ets_insert.is_some())
-            || list_next(objects)
-                .and_then(|(_, tail)| list_next(tail))
-                .is_some())
-    {
-        // A list insert traps, which only the scheduler path can do.
-        let ctx = ctx.ok_or(VmError::Yield)?;
-        return insert_list(process, ctx, caller, insert_new, target, objects);
-    }
 
     // Port of erts/emulator/beam/erl_db.c (ets_insert_2), OTP-29.1.1: a singleton list
     // supplies its object directly, while an empty list only resolves and checks the table.
@@ -1344,33 +1334,29 @@ fn insert_args(
 /// other list is first copied into table form without the table lock, then locked in and
 /// inserted a slice at a time; when it does not finish, the rest is installed in the table, which
 /// turns busy so that every other user helps and this process collects the result.
-fn insert_list(
+pub(crate) fn insert_list(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
     caller: Term,
     insert_new: bool,
     target: Term,
     objects: Term,
-) -> Result<Term, VmError> {
+    mut state: Option<EtsInsert>,
+) -> Result<ListInsert, VmError> {
     const ITERATIONS_PER_RED: isize = 8;
     let rt = process.runtime.ok_or_else(badarg)?;
-    let mut state = process
-        .cold
-        .as_mut()
-        .and_then(|cold| cold.ets_insert.take());
     let initial = process.heap.abi.fcalls.max(0) as isize;
     let mut loops = initial * ITERATIONS_PER_RED;
-    let done = |process: &mut Process, ctx: &mut RunCtx<'_, Message>, loops: isize, yes: bool| {
+    let done = |process: &mut Process, loops: isize, yes: bool| {
         let used = (initial * ITERATIONS_PER_RED - loops) / ITERATIONS_PER_RED;
-        bump_reds(process, ctx, used);
-        Ok(boolean_term(yes))
+        bump_direct(process, used);
+        Ok(ListInsert::Value(boolean_term(yes)))
     };
-    if let Some(EtsInsert::Global(outcome)) = state.as_deref() {
+    if let Some(EtsInsert::Global(outcome)) = state.as_ref() {
         // The table is no longer busy (or gone): the operation completed or was aborted by
         // someone else.
         return match outcome.load(std::sync::atomic::Ordering::Acquire) {
-            1 => Ok(boolean_term(true)),
-            2 => Ok(boolean_term(false)),
+            1 => Ok(ListInsert::Value(boolean_term(true))),
+            2 => Ok(ListInsert::Value(boolean_term(false))),
             _ => Err(badarg_cause("id")),
         };
     }
@@ -1397,7 +1383,7 @@ fn insert_list(
             badarg()
         }
     };
-    let (mut cursor, mut checked, prepared) = match state.take().map(|boxed| *boxed) {
+    let (mut cursor, mut checked, prepared) = match state.take() {
         None => (objects, 0, None),
         Some(EtsInsert::Check { cursor, count }) => (cursor, count, None),
         Some(EtsInsert::Copy { cursor, prepared }) => (cursor, 0, Some(prepared)),
@@ -1411,12 +1397,10 @@ fn insert_list(
             // at that point when the counter reaches zero.
             loops -= 1;
             if loops <= 0 {
-                process.cold_mut().ets_insert = Some(Box::new(EtsInsert::Check {
+                return Ok(ListInsert::Trap(EtsInsert::Check {
                     cursor,
                     count: checked,
                 }));
-                bump_reds(process, ctx, isize::MAX);
-                return Err(VmError::Yield);
             }
             let object = match advance_list(&mut cursor) {
                 Ok(Some(object)) => object,
@@ -1459,7 +1443,7 @@ fn insert_list(
                 loops -= 1;
                 let object = advance_list(&mut check_cursor)?.expect("list cursor checked");
                 if table.member_object(object).map_err(err)? {
-                    return done(process, ctx, loops, false);
+                    return done(process, loops, false);
                 }
             }
         }
@@ -1474,7 +1458,7 @@ fn insert_list(
             loops -= 1 + extra_reds as isize;
         }
         let yes = true;
-        return done(process, ctx, loops, yes);
+        return done(process, loops, yes);
     }
     // erts keeps the table identity alive while copying but releases the global table registry
     // lock. A concurrent delete must be able to detach the table during this yielding phase.
@@ -1488,9 +1472,7 @@ fn insert_list(
         // generated loop yields before copying the current object when this consumes the slice.
         loops -= 1;
         if loops <= 0 {
-            process.cold_mut().ets_insert = Some(Box::new(EtsInsert::Copy { cursor, prepared }));
-            bump_reds(process, ctx, isize::MAX);
-            return Err(VmError::Yield);
+            return Ok(ListInsert::Trap(EtsInsert::Copy { cursor, prepared }));
         }
         let object = match advance_list(&mut cursor) {
             Ok(Some(object)) => object,
@@ -1521,8 +1503,7 @@ fn insert_list(
     }
     if table.is_busy() {
         drop(table);
-        process.cold_mut().ets_insert = Some(Box::new(EtsInsert::Copy { cursor, prepared }));
-        return Err(err(EtsError::Busy));
+        return Ok(ListInsert::Trap(EtsInsert::Copy { cursor, prepared }));
     }
     if !allowed(&table, caller, true) {
         return Err(badarg_cause("access"));
@@ -1554,7 +1535,7 @@ fn insert_list(
         table.insert_prepared_batch(&mut pending, &mut loops);
     }
     if pending.is_empty() && loops > 0 {
-        return done(process, ctx, loops, !destroy_copied);
+        return done(process, loops, !destroy_copied);
     }
     let outcome: arinsal_ets::InsertOutcome = Default::default();
     table.begin_busy_insert_list(
@@ -1563,9 +1544,13 @@ fn insert_list(
         destroy_copied,
         std::sync::Arc::clone(&outcome),
     );
-    process.cold_mut().ets_insert = Some(Box::new(EtsInsert::Global(outcome)));
-    bump_reds(process, ctx, isize::MAX);
-    Err(VmError::Yield)
+    Ok(ListInsert::Trap(EtsInsert::Global(outcome)))
+}
+
+/// The end of one `ets_insert_2_list_driver` slice: the result, or the state to trap with.
+pub(crate) enum ListInsert {
+    Value(Term),
+    Trap(EtsInsert),
 }
 
 fn lookup_args(
@@ -1710,7 +1695,7 @@ fn bump_reds(process: &mut Process, _ctx: &mut RunCtx<'_, Message>, used: isize)
 /// the one in the process header.
 ///
 /// Port of erts/emulator/beam/bif.h, BUMP_REDS, OTP-29.1.1.
-fn bump_direct(process: &mut Process, used: isize) {
+pub(crate) fn bump_direct(process: &mut Process, used: isize) {
     let used = used.clamp(0, i32::MAX as isize) as i32;
     let live = process.heap.abi.fcalls.saturating_sub(used).max(0);
     process.heap.abi.fcalls = live;
@@ -1743,9 +1728,8 @@ fn compiled_match_program(reference: Term) -> Option<Arc<MatchProgram>> {
 /// Port of erts/emulator/beam/erl_db.c (handle_lacking_permission with DB_BUSY):
 /// a process that finds the table busy runs the delete_all or list-insert continuation with its
 /// own reductions and then retries.
-fn help_busy_table(
+pub(crate) fn help_busy_table(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
     target: Term,
     own_list_insert: bool,
 ) -> Result<(), VmError> {
@@ -1772,9 +1756,8 @@ fn help_busy_table(
             reds = initial + 1;
         }
     }
-    bump_reds(
+    bump_direct(
         process,
-        ctx,
         if reds > initial {
             isize::MAX
         } else {
@@ -2813,11 +2796,11 @@ fn call_inner(
         }
         return Err(badarg());
     }
-    if let Some(ctx) = ctx.as_deref_mut()
+    if ctx.is_some()
         && gated_by_busy(function)
         && let Some(&target) = args.first()
     {
-        help_busy_table(process, ctx, target, false)?;
+        help_busy_table(process, target, false)?;
     }
     if matches!(
         (function, args.len()),
@@ -3789,9 +3772,6 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("ets", "delete", 2),
     ("ets", "internal_delete_all", 2),
     ("ets", "setopts", 2),
-    ("ets", "insert", 2),
-    ("ets", "insert_new", 2),
-    ("ets", "lookup", 2),
     ("ets", "member", 2),
     ("ets", "take", 2),
     ("ets", "slot", 2),
@@ -3947,83 +3927,6 @@ macro_rules! ets_entry {
     };
 }
 
-fn entry_insert(
-    _vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    args: super::NativeArgs<'_>,
-) -> Option<Result<Term, VmError>> {
-    if args.len() != 2 {
-        return Some(Err(badarg()));
-    }
-    let (Some(target), Some(objects)) = (args.get(process, 0), args.get(process, 1)) else {
-        return Some(Err(badarg()));
-    };
-    let own_list_insert = matches!(
-        process
-            .cold
-            .as_ref()
-            .and_then(|cold| cold.ets_insert.as_deref()),
-        Some(EtsInsert::Global(_))
-    );
-    if let Err(error) = help_busy_table(process, ctx, target, own_list_insert) {
-        return Some(Err(error));
-    }
-    let result = {
-        let caller = caller_of(ctx);
-        insert_args(process, Some(ctx), caller, false, target, objects)
-    };
-    Some(bif_frame("ets", "insert", &[target, objects], result))
-}
-
-fn entry_insert_new(
-    _vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    args: super::NativeArgs<'_>,
-) -> Option<Result<Term, VmError>> {
-    if args.len() != 2 {
-        return Some(Err(badarg()));
-    }
-    let (Some(target), Some(objects)) = (args.get(process, 0), args.get(process, 1)) else {
-        return Some(Err(badarg()));
-    };
-    let own_list_insert = matches!(
-        process
-            .cold
-            .as_ref()
-            .and_then(|cold| cold.ets_insert.as_deref()),
-        Some(EtsInsert::Global(_))
-    );
-    if let Err(error) = help_busy_table(process, ctx, target, own_list_insert) {
-        return Some(Err(error));
-    }
-    let result = {
-        let caller = caller_of(ctx);
-        insert_args(process, Some(ctx), caller, true, target, objects)
-    };
-    Some(bif_frame("ets", "insert_new", &[target, objects], result))
-}
-
-fn entry_lookup(
-    _vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    args: super::NativeArgs<'_>,
-) -> Option<Result<Term, VmError>> {
-    if args.len() != 2 {
-        return Some(Err(badarg()));
-    }
-    let (Some(target), Some(key)) = (args.get(process, 0), args.get(process, 1)) else {
-        return Some(Err(badarg()));
-    };
-    if let Err(error) = help_busy_table(process, ctx, target, false) {
-        return Some(Err(error));
-    }
-    let result = lookup_args(process, caller_of(ctx), false, target, key);
-    Some(bif_frame("ets", "lookup", &[target, key], result))
-}
-
 fn entry_member(
     _vm: &mut Vm,
     process: &mut Process,
@@ -4036,7 +3939,7 @@ fn entry_member(
     let (Some(target), Some(key)) = (args.get(process, 0), args.get(process, 1)) else {
         return Some(Err(badarg()));
     };
-    if let Err(error) = help_busy_table(process, ctx, target, false) {
+    if let Err(error) = help_busy_table(process, target, false) {
         return Some(Err(error));
     }
     let result = lookup_args(process, caller_of(ctx), true, target, key);
@@ -4264,9 +4167,6 @@ pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<super::
         ("info", 2) => Some(entry_info_2),
         ("delete", 1) => Some(entry_delete_1),
         ("delete", 2) => Some(entry_delete_2),
-        ("insert", 2) => Some(entry_insert),
-        ("insert_new", 2) => Some(entry_insert_new),
-        ("lookup", 2) => Some(entry_lookup),
         ("member", 2) => Some(entry_member),
         ("take", 2) => Some(entry_take),
         ("slot", 2) => Some(entry_slot),
