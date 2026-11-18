@@ -110,7 +110,8 @@ impl BeamModuleAssembler {
         let wait = self.msg_label(wait)?;
         self.lea_label(ARG2, wait)?;
         let fragment = self.ga_get(GlobalLabels::ILoopRecShared)?;
-        self.asm.fragment_call_abs(fragment)
+        let target = self.resolve_fragment(fragment);
+        self.asm.fragment_call(target)
     }
 
     // Port of erts/emulator/beam/jit/x86/instr_msg.cpp:247-263 (emit_remove_message),
@@ -341,7 +342,7 @@ mod tests {
 
     /// One erts dump line with every displacement to code outside the block (labels, the
     /// module's fragment thunks, absolute runtime calls) written as `fill` bytes.
-    fn masked(line: &str, fill: u8) -> String {
+    fn masked(line: &str, fill: u8, relative_fragment_call: bool) -> String {
         let bytes = |opcode: &[u8], width: usize| {
             let all: Vec<String> = opcode
                 .iter()
@@ -355,7 +356,11 @@ mod tests {
         if let Some(target) = line.strip_prefix("call ")
             && target.parse::<u64>().is_ok()
         {
-            return bytes(&[0x40, 0xe8], 4);
+            return if relative_fragment_call {
+                bytes(&[0xe8], 4)
+            } else {
+                bytes(&[0x40, 0xe8], 4)
+            };
         }
         if let Some((dst, target)) = line
             .strip_prefix("lea ")
@@ -382,13 +387,40 @@ mod tests {
     fn matches(
         block: &[String],
         emit: &dyn Fn(&mut BeamModuleAssembler) -> Result<(), AsmError>,
+        relative_fragment_call: bool,
     ) -> bool {
         let lines = |fill: u8| -> Vec<String> {
-            block
-                .iter()
-                .filter(|l| !l.starts_with("align "))
-                .map(|l| masked(l, fill))
-                .collect()
+            const NOPS: [&str; 3] = ["0x90", "0x66, 0x90", "0x0f, 0x1f, 0x00"];
+            let is_call_alignment_nop = |line: &str| {
+                matches!(
+                    line.to_ascii_lowercase().replace(' ', "").as_str(),
+                    ".byte0x90" | ".byte0x66,0x90" | ".byte0x0f,0x1f,0x00"
+                )
+            };
+            let mut output: Vec<String> = Vec::new();
+            for line in block.iter().filter(|line| !line.starts_with("align ")) {
+                if relative_fragment_call
+                    && line
+                        .strip_prefix("call ")
+                        .is_some_and(|target| target.parse::<u64>().is_ok())
+                {
+                    while output
+                        .last()
+                        .is_some_and(|line| is_call_alignment_nop(line))
+                    {
+                        output.pop();
+                    }
+                    let prefix_len = gnu_as(&output).expect("GNU as for call prefix").len();
+                    let padding = (4 - (prefix_len + 5) % 4) % 4;
+                    if padding > 0 {
+                        output.push(format!(".byte {}", NOPS[padding - 1]));
+                    }
+                    output.push(masked(line, fill, true));
+                } else {
+                    output.push(masked(line, fill, false));
+                }
+            }
+            output
         };
         let (Some(zeros), Some(ones)) = (gnu_as(&lines(0)), gnu_as(&lines(0xff))) else {
             return false;
@@ -449,7 +481,10 @@ mod tests {
             };
             for block in blocks {
                 let Some(f) = emit(&block) else { continue };
-                assert!(matches(&block, &*f), "{op}: {block:?}");
+                assert!(
+                    matches(&block, &*f, op == "i_loop_rec_f"),
+                    "{op}: {block:?}"
+                );
                 compared += 1;
             }
         }

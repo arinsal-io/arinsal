@@ -27,8 +27,43 @@ const VINSERTI128: Opcode = Opcode::m0f3a(0x38).with_pp(Pp::P66);
 const VPTEST: Opcode = Opcode::m0f38(0x17).with_pp(Pp::P66);
 const VUCOMISD: Opcode = Opcode::m0f(0x2E).with_pp(Pp::P66);
 const VZEROUPPER: Opcode = Opcode::m0f(0x77);
+const VADDPD: Opcode = Opcode::m0f(0x58).with_pp(Pp::P66);
+const VSUBPD: Opcode = Opcode::m0f(0x5C).with_pp(Pp::P66);
+const VMULPD: Opcode = Opcode::m0f(0x59).with_pp(Pp::P66);
+const VDIVPD: Opcode = Opcode::m0f(0x5E).with_pp(Pp::P66);
 
 impl Emitter {
+    fn vex_packed_binary_xmm(
+        &mut self,
+        opcode: Opcode,
+        dst: Xmm,
+        a: Xmm,
+        b: Xmm,
+    ) -> Result<(), EncodeError> {
+        let (d, v, r) = (Self::vec_id(dst.0)?, Self::vec_id(a.0)?, Self::vec_id(b.0)?);
+        self.vex_rm(opcode, false, d, v, Rm::Reg(r), Imm::NONE)
+    }
+
+    /// `vaddpd xmm, xmm, xmm` (asmjit `a.vaddpd(Xmm, Xmm, Xmm)`, AVX).
+    pub fn vaddpd_xxx(&mut self, dst: Xmm, a: Xmm, b: Xmm) -> Result<(), EncodeError> {
+        self.vex_packed_binary_xmm(VADDPD, dst, a, b)
+    }
+
+    /// `vsubpd xmm, xmm, xmm` (asmjit `a.vsubpd(Xmm, Xmm, Xmm)`, AVX).
+    pub fn vsubpd_xxx(&mut self, dst: Xmm, a: Xmm, b: Xmm) -> Result<(), EncodeError> {
+        self.vex_packed_binary_xmm(VSUBPD, dst, a, b)
+    }
+
+    /// `vmulpd xmm, xmm, xmm` (asmjit `a.vmulpd(Xmm, Xmm, Xmm)`, AVX).
+    pub fn vmulpd_xxx(&mut self, dst: Xmm, a: Xmm, b: Xmm) -> Result<(), EncodeError> {
+        self.vex_packed_binary_xmm(VMULPD, dst, a, b)
+    }
+
+    /// `vdivpd xmm, xmm, xmm` (asmjit `a.vdivpd(Xmm, Xmm, Xmm)`, AVX).
+    pub fn vdivpd_xxx(&mut self, dst: Xmm, a: Xmm, b: Xmm) -> Result<(), EncodeError> {
+        self.vex_packed_binary_xmm(VDIVPD, dst, a, b)
+    }
+
     fn avx_gp_id(reg: Gp) -> Result<(u8, u8), EncodeError> {
         if reg.id > 15 {
             return Err(EncodeError::InvalidRegister(reg));

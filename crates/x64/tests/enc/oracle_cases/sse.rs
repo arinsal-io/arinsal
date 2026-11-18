@@ -106,4 +106,24 @@ pub fn cases(out: &mut Vec<OCase>) {
     out.push(case("movdqu xmm0, xmmword ptr [rax+rsp*2]", |e| {
         e.movdqu_xm(Xmm(0), Mem::base_index(RAX, RSP, 1, 0, 16))
     }));
+    out.push(case("btc rax, 63", |e| e.btc_ri(RAX, 63)));
+    out.push(case("btc qword ptr [r13-8], 63", |e| {
+        e.btc_mi(qword_ptr(R13, -8), 63)
+    }));
+    out.push(case("addpd xmm9, xmm15", |e| e.addpd_xx(Xmm(9), Xmm(15))));
+    out.push(case("subpd xmm10, xmm8", |e| e.subpd_xx(Xmm(10), Xmm(8))));
+    out.push(case("mulpd xmm4, xmm0", |e| e.mulpd_xx(Xmm(4), Xmm(0))));
+    out.push(case("divpd xmm2, xmm3", |e| e.divpd_xx(Xmm(2), Xmm(3))));
+    out.push(case("vaddpd xmm9, xmm1, xmm15", |e| {
+        e.vaddpd_xxx(Xmm(9), Xmm(1), Xmm(15))
+    }));
+    out.push(case("vsubpd xmm10, xmm8, xmm0", |e| {
+        e.vsubpd_xxx(Xmm(10), Xmm(8), Xmm(0))
+    }));
+    out.push(case("vmulpd xmm4, xmm7, xmm0", |e| {
+        e.vmulpd_xxx(Xmm(4), Xmm(7), Xmm(0))
+    }));
+    out.push(case("vdivpd xmm2, xmm3, xmm15", |e| {
+        e.vdivpd_xxx(Xmm(2), Xmm(3), Xmm(15))
+    }));
 }

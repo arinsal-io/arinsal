@@ -12,12 +12,12 @@ use arinsal_x64::enc::{Gp, Mem, MemBase};
 use super::beam_asm::register::{
     ARG1, ARG2, ARG3, ARG4, ARG5, ARG6, E, REGISTERS, RET, TMP1, TMP2,
 };
-use super::beam_asm::{AsmError, BeamAssembler, Distance, Update, get_arg_ref};
+use super::beam_asm::{AsmError, BeamAssembler, Distance, Update, get_arg_ref, tmp_mem_q};
 use super::beam_asm_global::{
     BEAM_ASM_FUNC_PROLOGUE_SIZE, BeamGlobalAssembler, GLOBAL_LABELS, GlobalLabels,
 };
 pub use super::rt::{beam_catches_cons, i_emit_nyi};
-use crate::common::args::{ArgVal, REG_MASK};
+use crate::common::args::{ArgVal, REG_MASK, Relation, memory_relation};
 use crate::common::register_cache::{CacheMem, RegisterCache};
 use crate::common::types::{ArgType, BeamModuleAssemblerCommon};
 
@@ -32,6 +32,18 @@ pub struct Patch {
     pub ptr_offs: usize,
     /// `val_offs`.
     pub val_offs: usize,
+}
+
+/// `BeamModuleAssemblerCommon::patch_lambda`: uses of an `ArgLambda` and the entry label used
+/// by `call_fun2` for that lambda.
+// Port of erts/emulator/beam/jit/beam_jit_common.hpp:158-165 (struct patch_lambda), OTP-29.1.1.
+#[derive(Debug)]
+pub struct LambdaPatch {
+    /// The immediate pointer patch sites for the lambda's `ErlFunEntry`.
+    pub patches: Vec<Patch>,
+    /// The direct body label for a zero-environment lambda or its environment-unpacking
+    /// trampoline for a local closure.
+    pub trampoline: Label,
 }
 
 /// `ErtsCodeInfo` with `BEAMASM`: the `i_func_info` block in front of every function.
@@ -133,8 +145,8 @@ pub struct BeamModuleAssembler {
     raw_labels: HashMap<u32, Label>,
     /// `imports[index].patches`.
     pub imports: HashMap<u32, Vec<Patch>>,
-    /// `lambdas[index].patches`.
-    pub lambdas: HashMap<u32, Vec<Patch>>,
+    /// `lambdas[index].patches` and `lambdas[index].trampoline`.
+    pub lambdas: HashMap<u32, LambdaPatch>,
     /// `literals[index].patches`. Arinsal's [`ArgVal::Literal`] carries the literal's term,
     /// so the patches are keyed by that term, the value they are filled with.
     pub literals: HashMap<u64, Vec<Patch>>,
@@ -380,9 +392,26 @@ impl BeamModuleAssembler {
         num_labels: u32,
         num_functions: usize,
         beam_types: Vec<ArgType>,
+        lambdas: impl IntoIterator<Item = (u32, u32, u32)>,
     ) -> Result<Self, AsmError> {
         let mut m = Self::with_fragment_addresses(num_labels, ga.ptrs().to_vec());
         m.beam_types = beam_types;
+        for (index, label, num_free) in lambdas {
+            let trampoline = if num_free > 0 {
+                m.asm.new_label()
+            } else {
+                *m.raw_labels
+                    .get(&label)
+                    .ok_or(AsmError::Operand("lambda body label"))?
+            };
+            m.lambdas.insert(
+                index,
+                LambdaPatch {
+                    patches: Vec::new(),
+                    trampoline,
+                },
+            );
+        }
         let code_header = m.asm.new_label();
         m.asm.align_code(8)?;
         m.asm.bind(code_header)?;
@@ -390,6 +419,15 @@ impl BeamModuleAssembler {
         m.asm
             .embed_zeros(core::mem::size_of::<BeamCodeHeader>() + 8 * num_functions)?;
         Ok(m)
+    }
+
+    /// `lambdas[index].trampoline` used by `emit_i_lambda_trampoline` and `emit_i_call_fun2`.
+    // Port of erts/emulator/beam/jit/beam_asm_module.cpp:79-82 (getLambda), OTP-29.1.1.
+    pub fn lambda_trampoline(&self, index: u32) -> Result<Label, AsmError> {
+        self.lambdas
+            .get(&index)
+            .map(|lambda| lambda.trampoline)
+            .ok_or(AsmError::Operand("lambda index"))
     }
 
     /// A module assembler calling the fragments of `ga`, whose code is placed at `ga_base`.
@@ -702,10 +740,11 @@ impl BeamModuleAssembler {
                 self.preserve_cache(&[to], &[], |m| m.asm.mov_imm(to, value))
             }
             ArgVal::FunEntry(index) => self.preserve_cache(&[to], &[], |m| {
-                let mut patches = m.lambdas.remove(&index).unwrap_or_default();
-                let result = Self::make_move_patch(&mut m.asm, to, &mut patches, 0);
-                m.lambdas.insert(index, patches);
-                result
+                let lambda = m
+                    .lambdas
+                    .get_mut(&index)
+                    .ok_or(AsmError::Operand("lambda index"))?;
+                Self::make_move_patch(&mut m.asm, to, &mut lambda.patches, 0)
             }),
             ArgVal::Literal(term) => self.preserve_cache(&[to], &[], |m| {
                 let mut patches = m.literals.remove(&term).unwrap_or_default();
@@ -1291,7 +1330,12 @@ impl BeamModuleAssembler {
         index: u32,
         fe: usize,
     ) -> Result<(), AsmError> {
-        for patch in self.lambdas.get(&index).into_iter().flatten() {
+        for patch in self
+            .lambdas
+            .get(&index)
+            .into_iter()
+            .flat_map(|lambda| &lambda.patches)
+        {
             self.write_patch(rw, patch, fe as u64 + patch.val_offs as u64)?;
         }
         Ok(())
@@ -1325,6 +1369,91 @@ impl BeamModuleAssembler {
             self.write_patch(rw, patch, string_table as u64 + patch.val_offs as u64)?;
         }
         Ok(())
+    }
+
+    /// Builds the argument vector and stores a guard BIF entry in the erts call registers.
+    // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:125-162
+    // (emit_setup_guard_bif), OTP-29.1.1.
+    fn emit_setup_guard_bif(&mut self, args: &[ArgVal], bif: ArgVal) -> Result<(), AsmError> {
+        use super::beam_asm::register::{ARG1, ARG2, ARG4};
+        assert!(!args.is_empty() && args.len() <= 3);
+
+        let contiguous = matches!(args[0], ArgVal::X(_) | ArgVal::Y(_))
+            && args
+                .windows(2)
+                .all(|pair| memory_relation(pair[0], pair[1]) == Relation::Consecutive);
+        if contiguous {
+            let first =
+                get_arg_ref(args[0], 8).ok_or(AsmError::Operand("BIF argument register"))?;
+            self.asm.emit(|e| e.lea(ARG2, first))?;
+        } else {
+            self.asm.emit(|e| e.lea(ARG2, tmp_mem_q(2)))?;
+            for (index, arg) in args.iter().copied().enumerate() {
+                self.mov_arg_to_mem(
+                    arinsal_x64::enc::qword_ptr(ARG2, (index * 8) as i32),
+                    arg,
+                    ARG1,
+                )?;
+            }
+        }
+        self.mov_arg_to_reg(ARG4, bif)
+    }
+
+    /// Emits the shared guard or body call for a unary BIF.
+    // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:164-177 (emit_i_bif1), OTP-29.1.1.
+    pub fn emit_i_bif1(
+        &mut self,
+        src: ArgVal,
+        fail: ArgVal,
+        bif: ArgVal,
+        dst: ArgVal,
+    ) -> Result<(), AsmError> {
+        use super::beam_asm::register::RET;
+        self.emit_setup_guard_bif(&[src], bif)?;
+        let ArgVal::Label(fail) = fail else {
+            return Err(AsmError::Operand("BIF failure label"));
+        };
+        if fail != 0 {
+            let fragment = self.ga_get(GlobalLabels::IBifGuardShared)?;
+            self.safe_fragment_call(fragment)?;
+            let label = self
+                .resolve_beam_label(fail)
+                .ok_or(AsmError::Operand("unknown failure label"))?;
+            self.asm.jcc(arinsal_x64::enc::CondCode::E, label)?;
+        } else {
+            let fragment = self.ga_get(GlobalLabels::IBifBodyShared)?;
+            self.safe_fragment_call(fragment)?;
+        }
+        self.mov_arg_from_reg(dst, RET)
+    }
+
+    /// Emits the shared guard or body call for a binary BIF.
+    // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:179-192 (emit_i_bif2), OTP-29.1.1.
+    pub fn emit_i_bif2(
+        &mut self,
+        lhs: ArgVal,
+        rhs: ArgVal,
+        fail: ArgVal,
+        bif: ArgVal,
+        dst: ArgVal,
+    ) -> Result<(), AsmError> {
+        use super::beam_asm::register::RET;
+        self.emit_setup_guard_bif(&[lhs, rhs], bif)?;
+        let ArgVal::Label(fail) = fail else {
+            return Err(AsmError::Operand("BIF failure label"));
+        };
+        if fail != 0 {
+            let fragment = self.ga_get(GlobalLabels::IBifGuardShared)?;
+            self.safe_fragment_call(fragment)?;
+            let label = self
+                .resolve_beam_label(fail)
+                .ok_or(AsmError::Operand("unknown failure label"))?;
+            self.asm.jcc(arinsal_x64::enc::CondCode::E, label)?;
+        } else {
+            let fragment = self.ga_get(GlobalLabels::IBifBodyShared)?;
+            self.safe_fragment_call(fragment)?;
+        }
+        self.mov_arg_from_reg(dst, RET)
     }
 }
 

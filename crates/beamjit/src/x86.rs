@@ -63,6 +63,9 @@ pub fn beamasm_new_assembler(
         beam.code.label_count,
         beam.code.function_count as usize,
         beam_types(beam),
+        beam.lambdas
+            .iter()
+            .map(|lambda| (lambda.index, lambda.label, lambda.num_free)),
     )
 }
 

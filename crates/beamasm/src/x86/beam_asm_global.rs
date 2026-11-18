@@ -519,6 +519,10 @@ impl BeamGlobalAssembler {
             G::CallLightBifShared => Self::emit_call_light_bif_shared,
             G::ProcessMain => Self::emit_process_main,
             G::ILoopRecShared => Self::emit_i_loop_rec_shared,
+            G::ApplyFunShared => Self::emit_apply_fun_shared,
+            G::BifElementShared => Self::emit_bif_element_shared,
+            G::CheckFloatError => Self::emit_check_float_error,
+            G::FconvShared => Self::emit_fconv_shared,
             G::HandleElementError => Self::emit_handle_element_error,
             G::HandleHdError => Self::emit_handle_hd_error,
             G::HandleMapGetBadkey => Self::emit_handle_map_get_badkey,
@@ -982,6 +986,7 @@ mod tests {
         let addresses = |label: GlobalLabels| -> Vec<u64> {
             use GlobalLabels as G;
             match label {
+                G::ApplyFunShared => vec![mfa_address(&crate::x86::instr_fun::APPLY2_MFA)],
                 G::HandleElementError => vec![mfa_address(&ELEMENT_MFA)],
                 G::HandleHdError => vec![mfa_address(&HD_MFA)],
                 G::HandleMapGetBadkey => vec![mfa_address(&MAP_GET_BADKEY_MFA)],
@@ -1036,15 +1041,75 @@ mod tests {
             let lines: Vec<String> = fragment_lines(&dump, label.name())
                 .into_iter()
                 .map(|l| rewrite(l, &mut static_addresses))
+                .map(|line| {
+                    if let Some(data) = line.strip_prefix(".dq ") {
+                        format!(".quad {data}")
+                    } else {
+                        line.replace("[L", "[rip + L")
+                    }
+                })
                 .collect();
+            let mut lines_with_alignment: Vec<String> = Vec::with_capacity(lines.len());
+            for line in lines {
+                if line == "align 16" {
+                    // erts aligns this fragment's embedded constants by their absolute
+                    // code address. The fragment may start at offset 8 mod 16 in this table.
+                    const NOPS: [&str; 9] = [
+                        "0x90",
+                        "0x66, 0x90",
+                        "0x0f, 0x1f, 0x00",
+                        "0x0f, 0x1f, 0x40, 0x00",
+                        "0x0f, 0x1f, 0x44, 0x00, 0x00",
+                        "0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00",
+                        "0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00",
+                        "0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00",
+                        "0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00",
+                    ];
+                    let prefix_for_size: Vec<String> = lines_with_alignment
+                        .iter()
+                        .map(|prefix_line| {
+                            let Some((op, _)) = prefix_line.split_once(" global::") else {
+                                return prefix_line.clone();
+                            };
+                            match op {
+                                "jmp" => ".byte 0xe9, 0, 0, 0, 0".to_string(),
+                                "short jmp" => ".byte 0xeb, 0".to_string(),
+                                "jz" => ".byte 0x0f, 0x84, 0, 0, 0, 0".to_string(),
+                                "jnz" => ".byte 0x0f, 0x85, 0, 0, 0, 0".to_string(),
+                                "short jz" => ".byte 0x74, 0".to_string(),
+                                "short jnz" => ".byte 0x75, 0".to_string(),
+                                other => panic!("unknown global jump `{other}`"),
+                            }
+                        })
+                        .collect();
+                    let prefix_len = crate::x86::jdump::gnu_as(&prefix_for_size)
+                        .expect("GNU as for alignment prefix")
+                        .len();
+                    let mut padding = (16 - (range.start + prefix_len) % 16) % 16;
+                    while padding > 0 {
+                        let length = padding.min(NOPS.len());
+                        lines_with_alignment.push(format!(".byte {}", NOPS[length - 1]));
+                        padding -= length;
+                    }
+                } else {
+                    lines_with_alignment.push(line);
+                }
+            }
             // erts' range runs to the next fragment; its last bytes are `align 8` padding.
             let ours = &code[range.clone()];
             let matched = (1..=ours.len()).rev().any(|n| {
-                crate::x86::jdump::matches_with_global_jumps(&lines, &ours[..n], &unbound)
-                    == Some(true)
+                crate::x86::jdump::matches_with_global_jumps(
+                    &lines_with_alignment,
+                    &ours[..n],
+                    &unbound,
+                ) == Some(true)
                     && ours[n..].len() < 8
             });
-            assert!(matched, "{label:?}: {lines:?} vs {:02x?}", ours);
+            assert!(
+                matched,
+                "{label:?}: {lines_with_alignment:?} vs {:02x?}",
+                ours
+            );
         }
     }
 

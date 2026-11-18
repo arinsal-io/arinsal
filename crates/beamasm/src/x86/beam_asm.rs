@@ -588,13 +588,13 @@ impl BeamAssembler {
         match feature {
             CpuFeature::Avx => cpu::has_avx(),
             CpuFeature::Avx2 => cpu::has_avx2(),
+            CpuFeature::Avx512F => cpu::has_avx512f(),
+            CpuFeature::Avx512Vl => cpu::has_avx512vl(),
             CpuFeature::Bmi1 => cpu::has_bmi1(),
             CpuFeature::Bmi2 => cpu::has_bmi2(),
             CpuFeature::Lzcnt => cpu::has_lzcnt(),
             CpuFeature::Popcnt => cpu::has_popcnt(),
             CpuFeature::Movbe => cpu::has_movbe(),
-            CpuFeature::Avx512Vl => cpu::has_avx512vl(),
-            CpuFeature::Avx512F => cpu::has_avx512f(),
             CpuFeature::Sse => true,
         }
     }
@@ -746,6 +746,13 @@ impl BeamAssembler {
         self.aligned_call_with(|e| e.call_m(target))
     }
 
+    /// `erlang_call(Gp, spill)`: calls a checked fun target through its entry register.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:327-348 (erlang_call), OTP-29.1.1.
+    pub fn erlang_call_r(&mut self, target: Gp) -> Result<(), AsmError> {
+        self.emit_assert_redzone_unused();
+        self.aligned_call_with(|e| e.call_r(target))
+    }
+
     /// `runtime_call<Sig, Func>()` on the SysV ABI: `call imm(Func)`, which asmjit encodes
     /// as a 6-byte `REX call rel32`, relocated to a rel32 or to an address-table call. `func`
     /// is the address of an erts-named runtime function (`x86::rt`), taken with `f as usize`.
@@ -880,6 +887,10 @@ pub enum CpuFeature {
     Avx,
     /// `kAVX2`.
     Avx2,
+    /// `kAVX512_F`.
+    Avx512F,
+    /// `kAVX512_VL`.
+    Avx512Vl,
     /// `kBMI`.
     Bmi1,
     /// `kBMI2`.
@@ -890,10 +901,6 @@ pub enum CpuFeature {
     Popcnt,
     /// `kMOVBE`.
     Movbe,
-    /// `kAVX512_VL`, used by `emit_copy_words`.
-    Avx512Vl,
-    /// `kAVX512_F`, used by `emit_copy_words`.
-    Avx512F,
     /// `kSSE`, the x86-64 baseline feature.
     Sse,
 }

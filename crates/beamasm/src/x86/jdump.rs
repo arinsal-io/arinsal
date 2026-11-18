@@ -264,15 +264,38 @@ pub(crate) fn matches_with_global_jumps(
                     Some(near) if all_near || unbound.contains(&target) => near,
                     _ => op,
                 };
-                let opcode: &[u8] = match op {
-                    "short jmp" => &[0xeb],
-                    "call" => &[0xe8],
-                    "jmp" => &[0xe9],
-                    "jz" => &[0x0f, 0x84],
-                    "jnz" => &[0x0f, 0x85],
-                    "short jz" => &[0x74],
-                    "short jnz" => &[0x75],
-                    other => panic!("unknown jump `{other}`"),
+                let condition = match op.strip_prefix("short ").unwrap_or(op) {
+                    "jo" => 0x80,
+                    "jno" => 0x81,
+                    "jb" | "jc" | "jnae" => 0x82,
+                    "jae" | "jnb" | "jnc" => 0x83,
+                    "je" | "jz" => 0x84,
+                    "jne" | "jnz" => 0x85,
+                    "jbe" | "jna" => 0x86,
+                    "ja" | "jnbe" => 0x87,
+                    "js" => 0x88,
+                    "jns" => 0x89,
+                    "jp" | "jpe" => 0x8a,
+                    "jnp" | "jpo" => 0x8b,
+                    "jl" | "jnge" => 0x8c,
+                    "jge" | "jnl" => 0x8d,
+                    "jle" | "jng" => 0x8e,
+                    "jg" | "jnle" => 0x8f,
+                    _ => 0,
+                };
+                let opcode: Vec<u8> = if op == "short jmp" {
+                    vec![0xeb]
+                } else if op == "call" {
+                    vec![0xe8]
+                } else if op == "jmp" {
+                    vec![0xe9]
+                } else if op.starts_with("short ") {
+                    // The short-branch opcode is 0x70 + the low four condition bits.
+                    vec![0x70 + (condition - 0x80)]
+                } else if condition != 0 {
+                    vec![0x0f, condition]
+                } else {
+                    panic!("unknown jump `{op}`")
                 };
                 let width = if op.starts_with("short") { 1 } else { 4 };
                 let bytes: Vec<String> = opcode

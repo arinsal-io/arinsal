@@ -375,7 +375,8 @@ impl BeamModuleAssembler {
         self.asm.mov_imm(ARG4, args.len() as u64)?;
         self.embed_vararg_rodata(args, ARG5, super::beam_asm::CP_SIZE as u32)?;
         let fragment = self.ga_get(GlobalLabels::NewMapShared)?;
-        self.asm.fragment_call_abs(fragment)?;
+        let target = self.resolve_fragment(fragment);
+        self.asm.fragment_call(target)?;
         self.mov_arg_from_reg(dst, RET)
     }
 
@@ -637,7 +638,8 @@ impl BeamModuleAssembler {
             self.asm.mov_imm(ARG4, args.len() as u64)?;
             self.embed_vararg_rodata(args, ARG5, super::beam_asm::CP_SIZE as u32)?;
             let fragment = self.ga_get(GlobalLabels::UpdateMapAssocShared)?;
-            self.asm.fragment_call_abs(fragment)?;
+            let target = self.resolve_fragment(fragment);
+            self.asm.fragment_call(target)?;
         }
         self.mov_arg_from_reg(dst, RET)
     }
@@ -662,7 +664,8 @@ impl BeamModuleAssembler {
             self.mov_arg_to_reg(ARG3, args[1])?;
             self.mov_arg_to_reg(ARG4, src)?;
             let fragment = self.ga_get(GlobalLabels::UpdateMapSingleExactBodyShared)?;
-            self.asm.fragment_call_abs(fragment)?;
+            let target = self.resolve_fragment(fragment);
+            self.asm.fragment_call(target)?;
         } else {
             self.mov_arg_to_mem(get_x_ref(live as u32, 8), src, ARG1)?;
             self.asm.mov_imm(ARG3, live)?;
@@ -670,14 +673,16 @@ impl BeamModuleAssembler {
             self.embed_vararg_rodata(args, ARG5, super::beam_asm::CP_SIZE as u32)?;
             if fail != 0 {
                 let fragment = self.ga_get(GlobalLabels::UpdateMapExactGuardShared)?;
-                self.asm.fragment_call_abs(fragment)?;
+                let target = self.resolve_fragment(fragment);
+                self.asm.fragment_call(target)?;
                 let fail = self
                     .resolve_beam_label(fail)
                     .ok_or(AsmError::Operand("map-update fail label"))?;
                 self.asm.jcc(CondCode::E, fail)?;
             } else {
                 let fragment = self.ga_get(GlobalLabels::UpdateMapExactBodyShared)?;
-                self.asm.fragment_call_abs(fragment)?;
+                let target = self.resolve_fragment(fragment);
+                self.asm.fragment_call(target)?;
             }
         }
         self.mov_arg_from_reg(dst, RET)
@@ -692,6 +697,7 @@ mod tests {
     use crate::x86::beam_asm_global::{BeamGlobalAssembler, GLOBAL_LABELS};
     use crate::x86::jdump::{erts_dump, erts_to_arinsal, gnu_as, matches_with_global_jumps};
     use arinsal_x64::buf::Section;
+    use similar_asserts::assert_eq;
 
     #[test]
     fn map_global_fragment_table_contains_erts_map_fragments() {
@@ -829,7 +835,12 @@ mod tests {
         true
     }
 
-    fn compare_code(block: &[String], bytes: &[u8], call_rewrites: &[(&str, &str)]) {
+    fn compare_code(
+        block: &[String],
+        bytes: &[u8],
+        call_rewrites: &[(&str, &str)],
+        fragment_call_start: Option<usize>,
+    ) {
         let mut lines = module_code_lines(block);
         for line in &mut lines {
             for (from, to) in call_rewrites {
@@ -838,11 +849,58 @@ mod tests {
                 }
             }
         }
+        if let Some(start_offset) = fragment_call_start {
+            const NOPS: [&str; 3] = ["0x90", "0x66, 0x90", "0x0f, 0x1f, 0x00"];
+            let is_call_alignment_nop = |line: &str| {
+                matches!(
+                    line.to_ascii_lowercase().replace(' ', "").as_str(),
+                    ".byte0x90" | ".byte0x66,0x90" | ".byte0x0f,0x1f,0x00"
+                )
+            };
+            let mut normalized: Vec<String> = Vec::with_capacity(lines.len());
+            for line in lines {
+                if let Some(("call", target)) = line.split_once(' ')
+                    && target.parse::<u64>().is_ok()
+                {
+                    while normalized
+                        .last()
+                        .is_some_and(|line| is_call_alignment_nop(line))
+                    {
+                        normalized.pop();
+                    }
+                    let prefix_len = gnu_as(&normalized).expect("GNU as for call prefix").len();
+                    let padding = (4 - (start_offset + prefix_len + 5) % 4) % 4;
+                    if padding > 0 {
+                        normalized.push(format!(".byte {}", NOPS[padding - 1]));
+                    }
+                    normalized.push(".byte 0xe8, 0, 0, 0, 0".to_owned());
+                } else {
+                    normalized.push(line);
+                }
+            }
+            lines = normalized;
+        }
+        let expected_bytes = gnu_as(&lines).expect("GNU as for map code block");
+        let mut actual_bytes = bytes.to_vec();
+        let mut search_from = 0;
+        for line in &lines {
+            if line == ".byte 0xe8, 0, 0, 0, 0" {
+                let call_offset = search_from
+                    + expected_bytes[search_from..]
+                        .windows(5)
+                        .position(|window| window == [0xe8, 0, 0, 0, 0])
+                        .expect("expected relative fragment call");
+                if let Some(displacement) = actual_bytes.get_mut(call_offset + 1..call_offset + 5) {
+                    displacement.fill(0);
+                }
+                search_from = call_offset + 5;
+            }
+        }
         let unbound = [];
         assert_eq!(
-            matches_with_global_jumps(&lines, bytes, &unbound),
+            matches_with_global_jumps(&lines, &actual_bytes, &unbound),
             Some(true),
-            "{lines:?}; actual={bytes:02x?}"
+            "{lines:?}; expected={expected_bytes:02x?}; actual={bytes:02x?}; masked={actual_bytes:02x?}"
         );
     }
 
@@ -928,7 +986,7 @@ mod tests {
             .unwrap();
         let mut code = new_map.asm.a.bytes(Section::Code)[1..].to_vec();
         assert!(zero_r8_rip_lea(&mut code), "new_map rodata lea not found");
-        compare_code(&new_map_block, &code, &[]);
+        compare_code(&new_map_block, &code, &[], Some(1));
         let data_expected = gnu_as(&module_data_lines(&new_map_block))
             .expect("GNU binutils required for JIT dump tests");
         assert_eq!(new_map.asm.a.bytes(Section::Data), data_expected);
@@ -963,7 +1021,7 @@ mod tests {
         let op_end = small_map.asm.a.offset();
         small_map.emit_dispatch_table().unwrap();
         let code = small_map.asm.a.bytes(Section::Code)[2..op_end].to_vec();
-        compare_code(&small_map_block, &code, &[]);
+        compare_code(&small_map_block, &code, &[], Some(2));
 
         let Some(maps_dump) = erts_dump("maps") else {
             eprintln!("skipping: `erl +JDdump true` unavailable");
@@ -992,6 +1050,7 @@ mod tests {
             &assoc_block,
             &assoc_code,
             &[("call L335", ".byte 0xe8, 0, 0, 0, 0")],
+            None,
         );
 
         let exact_block = full_op_blocks(&maps_dump, "update_map_exact_sjdtI")
@@ -1016,7 +1075,7 @@ mod tests {
             )
             .unwrap();
         let exact_code = exact.asm.a.bytes(Section::Code).to_vec();
-        compare_code(&exact_block, &exact_code, &[]);
+        compare_code(&exact_block, &exact_code, &[], Some(0));
     }
 
     #[test]

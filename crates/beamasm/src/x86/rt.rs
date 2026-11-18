@@ -179,6 +179,21 @@ unsafe extern "C" {
     pub safe fn erts_unary_minus(c_p: *mut crate::ProcessHeader, arg1: u64) -> u64;
 }
 
+// Port of erts/emulator/beam/jit/x86/instr_float.cpp (`extern "C" { #include "big.h" }`),
+// OTP-29.1.1: `big_to_double` writes the converted float to TMP_MEM1.
+unsafe extern "C" {
+    /// `int big_to_double(Eterm x, double *resp)` (big.h).
+    pub safe fn big_to_double(x: u64, resp: *mut f64) -> i32;
+}
+
+// Port of erts/emulator/beam/jit/x86/instr_guard_bifs.cpp (`erl_utils.h`), OTP-29.1.1:
+// exact comparison runtime function called by address. The map lookup declaration is shared
+// with instr_map below.
+unsafe extern "C" {
+    /// `int eq(Eterm a, Eterm b)` (erl_utils.h / utils.c).
+    pub safe fn eq(a: u64, b: u64) -> i32;
+}
+
 // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:397-399 (i_emit_nyi) and
 // erts/emulator/beam/beam_catches.h:38 (beam_catches_cons), OTP-29.1.1. erts defines
 // `i_emit_nyi` static in beam_asm_module.cpp around `erts_exit(ERTS_ERROR_EXIT, "NYI: %s\n",
@@ -203,6 +218,20 @@ unsafe extern "C" {
     /// `void save_calls(Process *p, const Export *)` (beam_common.h). `Export` crosses as an
     /// address, as for `call_error_handler`.
     pub safe fn save_calls(c_p: *mut crate::ProcessHeader, export: usize);
+    /// `const Export *fixed_apply(Process *p, Eterm *reg, Uint arity, ErtsCodePtr I,
+    /// Uint flags)` (beam_common.h); the export address, or null after setting the process
+    /// exception.
+    pub safe fn fixed_apply(
+        c_p: *mut crate::ProcessHeader,
+        reg: *mut u64,
+        arity: u64,
+        i: usize,
+        flags: u64,
+    ) -> usize;
+    /// `const Export *apply(Process *p, Eterm *reg, ErtsCodePtr I, Uint flags)`
+    /// (beam_common.h); the export address, or null after setting the process exception.
+    pub safe fn apply(c_p: *mut crate::ProcessHeader, reg: *mut u64, i: usize, flags: u64)
+    -> usize;
 }
 
 // Port of erts/emulator/beam/jit/x86/instr_common.cpp runtime declarations, OTP-29.1.1.
@@ -936,6 +965,35 @@ mod tests {
     }
     #[unsafe(no_mangle)]
     extern "C" fn save_calls(_c_p: *mut crate::ProcessHeader, _export: usize) {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn fixed_apply(
+        _c_p: *mut crate::ProcessHeader,
+        _reg: *mut u64,
+        _arity: u64,
+        _i: usize,
+        _flags: u64,
+    ) -> usize {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn apply(
+        _c_p: *mut crate::ProcessHeader,
+        _reg: *mut u64,
+        _i: usize,
+        _flags: u64,
+    ) -> usize {
+        unreachable!("byte-test fixture")
+    }
+
+    // Fixtures for guard and float runtime symbols; byte tests only take their addresses.
+    #[unsafe(no_mangle)]
+    extern "C" fn big_to_double(_x: u64, _resp: *mut f64) -> i32 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn eq(_a: u64, _b: u64) -> i32 {
         unreachable!("byte-test fixture")
     }
 

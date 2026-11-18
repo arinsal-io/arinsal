@@ -1216,16 +1216,17 @@ impl BeamModuleAssembler {
         self.asm.emit(|e| e.cmp_rr(ARG3, E))?;
         self.asm.short_jcc(CondCode::BE, after_gc_check)?;
         let garbage_collect = self.ga_get(GlobalLabels::GarbageCollect)?;
+        let garbage_collect = self.resolve_fragment(garbage_collect);
         // The preserved term need not be stashed when it is currently live.
         if !(preserve.is_x_register() && preserve.reg().is_some_and(|x| u64::from(x) >= live)) {
             self.asm.mov_imm(ARG4, live)?;
-            self.asm.fragment_call_abs(garbage_collect)?;
+            self.asm.fragment_call(garbage_collect)?;
             self.mov_arg_to_reg(preserve_reg, preserve)?;
         } else {
             let slot = get_x_ref(live as u32, 8);
             self.asm.emit(|e| e.mov_mr(slot, preserve_reg))?;
             self.asm.mov_imm(ARG4, live + 1)?;
-            self.asm.fragment_call_abs(garbage_collect)?;
+            self.asm.fragment_call(garbage_collect)?;
             self.asm.emit(|e| e.mov_rm(preserve_reg, slot))?;
         }
         self.asm.bind(after_gc_check)
@@ -1243,7 +1244,8 @@ impl BeamModuleAssembler {
         self.asm.short_jcc(CondCode::BE, after_gc_check)?;
         self.asm.mov_imm(ARG4, live)?;
         let garbage_collect = self.ga_get(GlobalLabels::GarbageCollect)?;
-        self.asm.fragment_call_abs(garbage_collect)?;
+        let garbage_collect = self.resolve_fragment(garbage_collect);
+        self.asm.fragment_call(garbage_collect)?;
         self.asm.bind(after_gc_check)
     }
 }
@@ -1377,72 +1379,102 @@ mod tests {
         m.asm.a.bytes(Section::Code)[start..].to_vec()
     }
 
-    fn expected_erts_block(block: &[String]) -> Option<Vec<u8>> {
+    fn expected_erts_block(
+        block: &[String],
+        start_offset: usize,
+        resolve_fragment_calls: bool,
+    ) -> Option<Vec<u8>> {
         use std::collections::HashSet;
 
         let labels: HashSet<&str> = block
             .iter()
             .filter_map(|line| line.strip_suffix(':'))
             .collect();
-        let lines = block
-            .iter()
-            .map(|line| {
-                let line = crate::x86::jdump::erts_to_arinsal(line);
-                let (prefix, instruction) = if let Some(rest) = line.strip_prefix("short ") {
-                    (Some(true), rest)
-                } else if let Some(rest) = line.strip_prefix("long ") {
-                    (Some(false), rest)
-                } else {
-                    (None, line.as_str())
-                };
-                let Some((op, target)) = instruction.split_once(' ') else {
-                    return line;
-                };
-                // `call imm(address)` (through the address table) vs. `call L<n>`, the
-                // module's dispatch-table thunk of a fragment (`safe_fragment_call`).
-                if op == "call" && target.parse::<u64>().is_ok() {
-                    return ".byte 0x40, 0xe8, 0, 0, 0, 0".to_owned();
-                }
-                if op == "call" && !labels.contains(target) {
-                    return ".byte 0xe8, 0, 0, 0, 0".to_owned();
-                }
-                let target_is_local = labels.contains(target);
-                if !target_is_local && op.starts_with('j') {
-                    let condition = match op {
-                        "jo" => 0x0,
-                        "jno" => 0x1,
-                        "jb" | "jc" | "jnae" => 0x2,
-                        "jae" | "jnb" | "jnc" => 0x3,
-                        "je" | "jz" => 0x4,
-                        "jne" | "jnz" => 0x5,
-                        "jbe" | "jna" => 0x6,
-                        "ja" | "jnbe" => 0x7,
-                        "js" => 0x8,
-                        "jns" => 0x9,
-                        "jp" | "jpe" => 0xa,
-                        "jnp" | "jpo" => 0xb,
-                        "jl" | "jnge" => 0xc,
-                        "jge" | "jnl" => 0xd,
-                        "jle" | "jng" => 0xe,
-                        "jg" | "jnle" => 0xf,
-                        "jmp" => {
-                            return if prefix == Some(true) {
-                                ".byte 0xeb, 0".to_owned()
-                            } else {
-                                ".byte 0xe9, 0, 0, 0, 0".to_owned()
-                            };
-                        }
-                        _ => return line,
-                    };
-                    let short = prefix == Some(true);
-                    if short {
-                        return format!(".byte {:#04x}, 0", 0x70 + condition);
+        const CALL_NOPS: [&str; 3] = ["0x90", "0x66, 0x90", "0x0f, 0x1f, 0x00"];
+        let is_call_alignment_nop = |line: &str| {
+            matches!(
+                line.to_ascii_lowercase().replace(' ', "").as_str(),
+                ".byte0x90" | ".byte0x66,0x90" | ".byte0x0f,0x1f,0x00"
+            )
+        };
+        let mut lines = Vec::with_capacity(block.len());
+        for source in block {
+            let line = crate::x86::jdump::erts_to_arinsal(source);
+            let (prefix, instruction) = if let Some(rest) = line.strip_prefix("short ") {
+                (Some(true), rest)
+            } else if let Some(rest) = line.strip_prefix("long ") {
+                (Some(false), rest)
+            } else {
+                (None, line.as_str())
+            };
+            let Some((op, target)) = instruction.split_once(' ') else {
+                lines.push(line);
+                continue;
+            };
+            // `call imm(address)` (through the address table) vs. `call L<n>`, the
+            // module's dispatch-table thunk of a fragment (`safe_fragment_call`).
+            if op == "call" && target.parse::<u64>().is_ok() {
+                if resolve_fragment_calls {
+                    while lines.last().is_some_and(|line| is_call_alignment_nop(line)) {
+                        lines.pop();
                     }
-                    return format!(".byte 0x0f, {:#04x}, 0, 0, 0, 0", 0x80 + condition);
+                    let prefix_len = gnu_as(&lines)?.len();
+                    let padding = (4 - (start_offset + prefix_len + 5) % 4) % 4;
+                    if padding > 0 {
+                        lines.push(format!(".byte {}", CALL_NOPS[padding - 1]));
+                    }
+                    lines.push(".byte 0xe8, 0, 0, 0, 0".to_owned());
+                } else {
+                    lines.push(".byte 0x40, 0xe8, 0, 0, 0, 0".to_owned());
                 }
-                line
-            })
-            .collect::<Vec<_>>();
+                continue;
+            }
+            if op == "call" && !labels.contains(target) {
+                lines.push(".byte 0xe8, 0, 0, 0, 0".to_owned());
+                continue;
+            }
+            let target_is_local = labels.contains(target);
+            if !target_is_local && op.starts_with('j') {
+                let condition = match op {
+                    "jo" => 0x0,
+                    "jno" => 0x1,
+                    "jb" | "jc" | "jnae" => 0x2,
+                    "jae" | "jnb" | "jnc" => 0x3,
+                    "je" | "jz" => 0x4,
+                    "jne" | "jnz" => 0x5,
+                    "jbe" | "jna" => 0x6,
+                    "ja" | "jnbe" => 0x7,
+                    "js" => 0x8,
+                    "jns" => 0x9,
+                    "jp" | "jpe" => 0xa,
+                    "jnp" | "jpo" => 0xb,
+                    "jl" | "jnge" => 0xc,
+                    "jge" | "jnl" => 0xd,
+                    "jle" | "jng" => 0xe,
+                    "jg" | "jnle" => 0xf,
+                    "jmp" => {
+                        lines.push(if prefix == Some(true) {
+                            ".byte 0xeb, 0".to_owned()
+                        } else {
+                            ".byte 0xe9, 0, 0, 0, 0".to_owned()
+                        });
+                        continue;
+                    }
+                    _ => {
+                        lines.push(line);
+                        continue;
+                    }
+                };
+                let short = prefix == Some(true);
+                lines.push(if short {
+                    format!(".byte {:#04x}, 0", 0x70 + condition)
+                } else {
+                    format!(".byte 0x0f, {:#04x}, 0, 0, 0, 0", 0x80 + condition)
+                });
+                continue;
+            }
+            lines.push(line);
+        }
         gnu_as(&lines)
     }
 
@@ -1450,9 +1482,27 @@ mod tests {
         block: &[String],
         emit: impl Fn(&mut BeamModuleAssembler) -> Result<(), AsmError>,
     ) {
-        let expected = expected_erts_block(block).expect("GNU binutils must assemble erts dump");
+        let expected =
+            expected_erts_block(block, 0, false).expect("GNU binutils must assemble erts dump");
         let mut last = Vec::new();
         for start_offset in 0..4 {
+            last = emitted_with_fragments_at(start_offset, |m| emit(m));
+            if last == expected {
+                return;
+            }
+        }
+        assert_eq!(last, expected, "{block:#?}");
+    }
+
+    fn assert_erts_block_matches_thunk_call(
+        block: &[String],
+        emit: impl Fn(&mut BeamModuleAssembler) -> Result<(), AsmError>,
+    ) {
+        let mut last = Vec::new();
+        let mut expected = Vec::new();
+        for start_offset in 0..4 {
+            expected = expected_erts_block(block, start_offset, true)
+                .expect("GNU binutils must assemble erts dump");
             last = emitted_with_fragments_at(start_offset, |m| emit(m));
             if last == expected {
                 return;
@@ -2440,7 +2490,7 @@ mod tests {
     fn frames_and_heap_emitters_match_erts_dump() {
         let allocate = dump_block("allocate_tt", |_| true);
         let (_, live) = heap_test_args(&allocate).expect("allocate_tt operands");
-        assert_erts_block_matches(&allocate, |m| {
+        assert_erts_block_matches_thunk_call(&allocate, |m| {
             m.emit_allocate(
                 ArgVal::Word(stack_words(&allocate).unwrap()),
                 ArgVal::Word(live),
@@ -2450,7 +2500,7 @@ mod tests {
         let allocate_heap = dump_block("allocate_heap_tIt", |_| true);
         let (need_heap, live) = heap_test_args(&allocate_heap).expect("allocate_heap operands");
         let need_stack = stack_words(&allocate_heap).unwrap();
-        assert_erts_block_matches(&allocate_heap, |m| {
+        assert_erts_block_matches_thunk_call(&allocate_heap, |m| {
             m.emit_allocate_heap(
                 ArgVal::Word(need_stack),
                 ArgVal::Word(need_heap),
@@ -2460,7 +2510,7 @@ mod tests {
 
         let test_heap = dump_block("test_heap_It", |_| true);
         let (need_heap, live) = heap_test_args(&test_heap).expect("test_heap operands");
-        assert_erts_block_matches(&test_heap, |m| {
+        assert_erts_block_matches_thunk_call(&test_heap, |m| {
             m.emit_test_heap(ArgVal::Word(need_heap), ArgVal::Word(live))
         });
 
@@ -2549,7 +2599,7 @@ mod tests {
 
         let catch_end = dump_block("catch_end_y", |block| stack_slot(block).is_some());
         let catch_tag = stack_slot(&catch_end).unwrap();
-        assert_erts_block_matches(&catch_end, |m| m.emit_catch_end(catch_tag));
+        assert_erts_block_matches_thunk_call(&catch_end, |m| m.emit_catch_end(catch_tag));
 
         let try_end = dump_block("try_end_y", |block| stack_slot(block).is_some());
         let catch_tag = stack_slot(&try_end).unwrap();
@@ -2613,7 +2663,8 @@ mod tests {
             .filter(|line| line.as_str() != "align 4")
             .map(|line| line.replace("[start/0+24]", "[rip+9]"))
             .collect::<Vec<_>>();
-        let expected = expected_erts_block(&expected_context).expect("assemble erts block");
+        let expected =
+            expected_erts_block(&expected_context, 0, false).expect("assemble erts block");
 
         let addresses = vec![Some(0x1000); super::super::beam_asm_global::GLOBAL_LABELS.len()];
         let mut m = BeamModuleAssembler::with_fragment_addresses(2, addresses);
@@ -2919,7 +2970,8 @@ impl BeamModuleAssembler {
             .emit(|e| e.cmp_mi(get_x_ref(0, 8), arinsal_term::THE_NON_VALUE as i64))?;
         self.asm.short_jcc(CondCode::NE, next)?;
         let fragment = self.ga_get(GlobalLabels::CatchEndShared)?;
-        self.asm.fragment_call_abs(fragment)?;
+        let target = self.resolve_fragment(fragment);
+        self.asm.fragment_call(target)?;
         self.asm.bind(next)
     }
 

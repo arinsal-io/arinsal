@@ -112,3 +112,30 @@ fn sse_follows_asmjit_width_and_register_field_handling() {
     assert!(wrapped.movdqu_xx(Xmm(16), Xmm(0)).is_ok());
     assert_eq!(wrapped.bytes, [0xF3, 0x0F, 0x6F, 0xC0]);
 }
+
+#[test]
+fn btc_and_packed_double_forms() {
+    let cases: &[Case] = &[
+        ("btc rax, 63", |e| e.btc_ri(RAX, 63)),
+        ("btc qword ptr [r13-8], 63", |e| {
+            e.btc_mi(qword_ptr(R13, -8), 63)
+        }),
+        ("addpd xmm9, xmm15", |e| e.addpd_xx(Xmm(9), Xmm(15))),
+        ("subpd xmm10, xmm8", |e| e.subpd_xx(Xmm(10), Xmm(8))),
+        ("mulpd xmm4, xmm0", |e| e.mulpd_xx(Xmm(4), Xmm(0))),
+        ("divpd xmm2, xmm3", |e| e.divpd_xx(Xmm(2), Xmm(3))),
+        ("vaddpd xmm9, xmm1, xmm15", |e| {
+            e.vaddpd_xxx(Xmm(9), Xmm(1), Xmm(15))
+        }),
+        ("vsubpd xmm10, xmm8, xmm0", |e| {
+            e.vsubpd_xxx(Xmm(10), Xmm(8), Xmm(0))
+        }),
+        ("vmulpd xmm4, xmm7, xmm0", |e| {
+            e.vmulpd_xxx(Xmm(4), Xmm(7), Xmm(0))
+        }),
+        ("vdivpd xmm2, xmm3, xmm15", |e| {
+            e.vdivpd_xxx(Xmm(2), Xmm(3), Xmm(15))
+        }),
+    ];
+    check(cases);
+}

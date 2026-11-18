@@ -218,7 +218,8 @@ impl BeamModuleAssembler {
             .emit_rip_label(entry, |e| e.lea(ARG3, Mem::rip(0, 8)))?;
 
         let fragment = self.ga_get(GlobalLabels::CallLightBifShared)?;
-        self.asm.fragment_call_abs(fragment)
+        let target = self.resolve_fragment(fragment);
+        self.asm.fragment_call(target)
     }
 }
 
@@ -228,10 +229,17 @@ mod tests {
     use crate::x86::beam_asm_global::GLOBAL_LABELS;
     use crate::x86::jdump::{erts_dump, gnu_as};
     use arinsal_x64::buf::Section;
+    use similar_asserts::assert_eq;
 
-    /// The lines of each `call_light_bif_be` block from the entry label to the fragment call,
-    /// with the absolute call written as `fill` bytes (`call imm` through the address table).
+    /// The lines of each `call_light_bif_be` block from the entry label to its thunk call.
     fn blocks(dump: &str, fill: u8) -> Vec<(u64, Vec<String>)> {
+        const NOPS: [&str; 3] = ["0x90", "0x66, 0x90", "0x0f, 0x1f, 0x00"];
+        let is_call_alignment_nop = |line: &str| {
+            matches!(
+                line.to_ascii_lowercase().replace(' ', "").as_str(),
+                ".byte0x90" | ".byte0x66,0x90" | ".byte0x0f,0x1f,0x00"
+            )
+        };
         let lines: Vec<&str> = dump.lines().map(str::trim).collect();
         let mut out = Vec::new();
         for (i, _) in lines
@@ -248,7 +256,17 @@ mod tests {
                 }
                 if let Some(target) = line.strip_prefix("call ") {
                     assert!(target.parse::<u64>().is_ok(), "{line}");
-                    text.push(format!(".byte 0x40, 0xe8, {fill}, {fill}, {fill}, {fill}"));
+                    // +JDdump prints the fragment target address. Reconstruct the five-byte
+                    // module thunk call and its CP padding, as BeamModuleAssembler does.
+                    while text.last().is_some_and(|line| is_call_alignment_nop(line)) {
+                        text.pop();
+                    }
+                    let prefix_len = gnu_as(&text).expect("GNU as for call prefix").len();
+                    let padding = (4 - (prefix_len + 5) % 4) % 4;
+                    if padding > 0 {
+                        text.push(format!(".byte {}", NOPS[padding - 1]));
+                    }
+                    text.push(format!(".byte 0xe8, {fill}, {fill}, {fill}, {fill}"));
                     break;
                 }
                 if let Some(value) = line.strip_prefix("mov rax, ") {

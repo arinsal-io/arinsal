@@ -1960,6 +1960,7 @@ mod tests {
     use crate::x86::beam_asm_global::GLOBAL_LABELS;
     use crate::x86::jdump::{beam_register, erts_to_arinsal, gnu_as};
     use arinsal_x64::buf::Section;
+    use similar_asserts::assert_eq;
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::OnceLock;
@@ -2056,8 +2057,22 @@ mod tests {
     fn expected(block: &[String]) -> Option<Vec<u8>> {
         let lines = instrs(block);
         let local: Vec<&str> = lines.iter().filter_map(|l| l.strip_suffix(':')).collect();
-        let mut out = Vec::new();
-        for line in lines {
+        let mut out: Vec<String> = Vec::new();
+        let is_call_alignment_nop = |line: &str| {
+            matches!(
+                line.to_ascii_lowercase().replace(' ', "").as_str(),
+                ".byte0x90" | ".byte0x66,0x90" | ".byte0x0f,0x1f,0x00"
+            )
+        };
+        let mut test_heap_fragment_call = false;
+        for line in block {
+            if line.starts_with("# test_heap ") {
+                test_heap_fragment_call = true;
+                continue;
+            }
+            if line.starts_with('#') {
+                continue;
+            }
             let target = line.rsplit(' ').next().unwrap_or("");
             let external = (target.starts_with('L') || target.starts_with("label_"))
                 && !local.contains(&target);
@@ -2067,8 +2082,28 @@ mod tests {
             if let Some(address) = line.strip_prefix("call ")
                 && address.parse::<u64>().is_ok()
             {
-                // runtime_call / fragment_call(ga->get_x()): `REX call rel32`, relocated.
-                out.push(".byte 0x40, 0xe8, 0, 0, 0, 0".to_string());
+                let mut last_instruction = out.len();
+                while last_instruction > 0 && is_call_alignment_nop(&out[last_instruction - 1]) {
+                    last_instruction -= 1;
+                }
+                let garbage_collect_call = test_heap_fragment_call
+                    || out
+                        .get(last_instruction.wrapping_sub(1))
+                        .is_some_and(|line| {
+                            line.starts_with("mov ecx, ") || line == "xor ecx, ecx"
+                        });
+                if garbage_collect_call {
+                    // `emit_gc_test` passes Live in ECX, then calls the module thunk with a
+                    // five-byte CP call. Its reference dump padding is for a six-byte call.
+                    while out.last().is_some_and(|line| is_call_alignment_nop(line)) {
+                        out.pop();
+                    }
+                    out.push(".byte 0xe8, 0, 0, 0, 0".to_string());
+                    test_heap_fragment_call = false;
+                } else {
+                    // runtime_call / fragment_call(ga->get_x()): `REX call rel32`, relocated.
+                    out.push(".byte 0x40, 0xe8, 0, 0, 0, 0".to_string());
+                }
                 continue;
             }
             let mut line = erts_to_arinsal(line);

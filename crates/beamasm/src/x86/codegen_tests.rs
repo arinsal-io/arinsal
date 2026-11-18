@@ -257,6 +257,9 @@ fn erlc_module_runs_as_x86_native_code() {
         beam.code.label_count,
         beam.code.function_count as usize,
         vec![ArgType::ANY],
+        beam.lambdas
+            .iter()
+            .map(|lambda| (lambda.index, lambda.label, lambda.num_free)),
     )
     .unwrap();
     let mut loader = Loader {
@@ -377,7 +380,8 @@ fn erlc_module_runs_as_x86_native_code() {
 #[test]
 fn patches_reach_the_running_code() {
     let (ga, _global) = global_assembler();
-    let mut m = BeamModuleAssembler::new_module(&ga, 3, 1, vec![ArgType::ANY]).unwrap();
+    let mut m =
+        BeamModuleAssembler::new_module(&ga, 3, 1, vec![ArgType::ANY], [(0, 2, 0)]).unwrap();
     let (module, function) = (atom_word("x86_first"), atom_word("loaded"));
     m.emit_i_func_label(ArgVal::Label(1)).unwrap();
     m.emit_i_func_info(
@@ -561,7 +565,7 @@ fn function_prologues_match_erts_dump() {
             return;
         };
 
-        let mut m = BeamModuleAssembler::new_module(&ga, 3, 1, vec![ArgType::ANY]).unwrap();
+        let mut m = BeamModuleAssembler::new_module(&ga, 3, 1, vec![ArgType::ANY], []).unwrap();
         let at = m.asm.a.offset();
         emit_prologue(&mut m, mfa);
         let mut ours = m.asm.a.bytes(arinsal_x64::buf::Section::Code)[at..].to_vec();
@@ -670,7 +674,7 @@ init() -> erlang:load_nif(\"nonexistent\", 0).
     let header_zeros = lines[2].matches("0x00").count();
     let functions = lines.iter().filter(|l| **l == "# i_func_info_IaaI").count();
     let (ga, _global) = global_assembler();
-    let m = BeamModuleAssembler::new_module(&ga, 3, functions, vec![ArgType::ANY]).unwrap();
+    let m = BeamModuleAssembler::new_module(&ga, 3, functions, vec![ArgType::ANY], []).unwrap();
     assert_eq!(m.asm.a.offset(), header_zeros);
     assert_eq!(
         header_zeros,
@@ -692,7 +696,7 @@ init() -> erlang:load_nif(\"nonexistent\", 0).
         return;
     };
 
-    let mut m = BeamModuleAssembler::new_module(&ga, 3, functions, vec![ArgType::ANY]).unwrap();
+    let mut m = BeamModuleAssembler::new_module(&ga, 3, functions, vec![ArgType::ANY], []).unwrap();
     let at = m.asm.a.offset();
     emit_prologue(&mut m, block_mfa(block));
     m.emit_return().unwrap();
@@ -750,7 +754,7 @@ f(X) ->
             return;
         };
 
-        let mut m = BeamModuleAssembler::new_module(&ga, 1, 0, vec![ArgType::ANY]).unwrap();
+        let mut m = BeamModuleAssembler::new_module(&ga, 1, 0, vec![ArgType::ANY], []).unwrap();
         // `i_debug_line` ends 8-byte aligned.
         m.asm.align_code(8).unwrap();
         let at = m.asm.a.offset();

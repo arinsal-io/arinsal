@@ -30,10 +30,47 @@ const DIVSD: Opcode = Opcode::m0f(0x5E).with_pp(Pp::PF2);
 const SQRTSD: Opcode = Opcode::m0f(0x51).with_pp(Pp::PF2);
 const CVTSI2SD: Opcode = Opcode::m0f(0x2A).with_pp(Pp::PF2);
 const CVTTSD2SI: Opcode = Opcode::m0f(0x2C).with_pp(Pp::PF2);
+const BTC: Opcode = Opcode::m0f(0xBA);
+const ADDPD: Opcode = Opcode::m0f(0x58).with_pp(Pp::P66);
+const SUBPD: Opcode = Opcode::m0f(0x5C).with_pp(Pp::P66);
+const MULPD: Opcode = Opcode::m0f(0x59).with_pp(Pp::P66);
+const DIVPD: Opcode = Opcode::m0f(0x5E).with_pp(Pp::P66);
 
 impl Emitter {
     fn xmm_id(reg: Xmm) -> Result<u8, EncodeError> {
         Self::vec_id(reg.0)
+    }
+
+    /// `btc dst, imm8` (asmjit `a.btc(Gp, Imm)`).
+    pub fn btc_ri(&mut self, dst: Gp, bit: i64) -> Result<(), EncodeError> {
+        let size = dst.size();
+        if !matches!(size, 2 | 4 | 8) {
+            return Err(EncodeError::InvalidInstruction);
+        }
+        let mut rex = ByteRex::default();
+        let dst = Self::gp_id(dst, &mut rex)?;
+        self.x86_rm(
+            BTC.prefix_by_size(size),
+            7,
+            Rm::Reg(dst),
+            rex,
+            Imm::new(bit as u64, 1),
+        )
+    }
+
+    /// `btc size ptr [dst], imm8` (asmjit `a.btc(Mem, Imm)`).
+    pub fn btc_mi(&mut self, dst: Mem, bit: i64) -> Result<(), EncodeError> {
+        let size = Self::mem_size(&dst)?;
+        if !matches!(size, 2 | 4 | 8) {
+            return Err(EncodeError::InvalidInstruction);
+        }
+        self.x86_rm(
+            BTC.prefix_by_size(size),
+            7,
+            Rm::Mem(&dst),
+            ByteRex::default(),
+            Imm::new(bit as u64, 1),
+        )
     }
 
     fn gp_id_width(reg: Gp) -> Result<(u8, u8), EncodeError> {
@@ -72,6 +109,26 @@ impl Emitter {
 
     fn scalar_binary(&mut self, opcode: Opcode, dst: Xmm, src: Xmm) -> Result<(), EncodeError> {
         self.xmm_rm(opcode, dst, src)
+    }
+
+    /// `addpd dst, src` (asmjit `a.addpd(Xmm, Xmm)`).
+    pub fn addpd_xx(&mut self, dst: Xmm, src: Xmm) -> Result<(), EncodeError> {
+        self.xmm_rm(ADDPD, dst, src)
+    }
+
+    /// `subpd dst, src` (asmjit `a.subpd(Xmm, Xmm)`).
+    pub fn subpd_xx(&mut self, dst: Xmm, src: Xmm) -> Result<(), EncodeError> {
+        self.xmm_rm(SUBPD, dst, src)
+    }
+
+    /// `mulpd dst, src` (asmjit `a.mulpd(Xmm, Xmm)`).
+    pub fn mulpd_xx(&mut self, dst: Xmm, src: Xmm) -> Result<(), EncodeError> {
+        self.xmm_rm(MULPD, dst, src)
+    }
+
+    /// `divpd dst, src` (asmjit `a.divpd(Xmm, Xmm)`).
+    pub fn divpd_xx(&mut self, dst: Xmm, src: Xmm) -> Result<(), EncodeError> {
+        self.xmm_rm(DIVPD, dst, src)
     }
 
     fn scalar_binary_mem(&mut self, opcode: Opcode, dst: Xmm, src: Mem) -> Result<(), EncodeError> {
