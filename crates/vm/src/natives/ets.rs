@@ -723,7 +723,7 @@ fn with_cached_table<R>(
     target
         .with_magic_payload::<arinsal_ets::TableLock, _>(|lock| {
             let options = lock.options();
-            body(lock, &options, process)
+            body(lock, options, process)
         })
         .flatten()
 }
@@ -932,17 +932,8 @@ fn direct_insert(
     module: arinsal_term::Atom,
     function: arinsal_term::Atom,
 ) -> Option<Term> {
-    direct_insert_cached(process, args).or_else(|| {
-        direct_plain(
-            process,
-            args,
-            module,
-            function,
-            |process, caller, target, objects| {
-                insert_args(process, None, caller, false, target, objects)
-            },
-        )
-    })
+    ets_insert_2::<false>(process, args)
+        .or_else(|| direct_plain(process, args, module, function, insert_plain::<false>))
 }
 
 fn direct_insert_new(
@@ -951,17 +942,17 @@ fn direct_insert_new(
     module: arinsal_term::Atom,
     function: arinsal_term::Atom,
 ) -> Option<Term> {
-    direct_insert_new_cached(process, args).or_else(|| {
-        direct_plain(
-            process,
-            args,
-            module,
-            function,
-            |process, caller, target, objects| {
-                insert_args(process, None, caller, true, target, objects)
-            },
-        )
-    })
+    ets_insert_2::<true>(process, args)
+        .or_else(|| direct_plain(process, args, module, function, insert_plain::<true>))
+}
+
+fn insert_plain<const NEW: bool>(
+    process: &mut Process,
+    caller: Term,
+    target: Term,
+    objects: Term,
+) -> Result<Term, VmError> {
+    insert_args(process, None, caller, NEW, target, objects)
 }
 
 /// `ets:delete/2` through the table lock and the storage's key-level write lock.
@@ -994,7 +985,7 @@ fn direct_delete_cached(
         let rt = process.runtime.as_ref()?;
         rt.named_ets
             .with_table(name, |shared| {
-                direct_delete_from_shared(shared, group, &shared.options(), caller, key, Some(name))
+                direct_delete_from_shared(shared, group, shared.options(), caller, key, Some(name))
             })
             .flatten()
     } else {
@@ -1038,20 +1029,12 @@ fn direct_delete_from_shared(
     Some(Term::atom(arinsal_term::atoms::TRUE))
 }
 
-fn direct_insert_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
-    direct_insert_one_cached(process, args, false)
-}
-
-fn direct_insert_new_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
-    direct_insert_one_cached(process, args, true)
-}
-
-// Port of erts/emulator/beam/erl_db.c (ets_insert_2/insert_new_2), OTP-29.1.1.
-fn direct_insert_one_cached(
-    process: &mut Process,
-    args: &[Term],
-    insert_new: bool,
-) -> Option<Term> {
+/// One tuple inserted into a set, bag or CA-tree table: table lookup, access check, bucket
+/// store. `None` declines to the general path (lists, errors, a busy table).
+// Port of erts/emulator/beam/erl_db.c (ets_insert_2/insert_new_2, db_get_table_aux) and
+// erl_db_hash.c (db_put_hash), OTP-29.1.1.
+#[inline]
+fn ets_insert_2<const NEW: bool>(process: &mut Process, args: &[Term]) -> Option<Term> {
     if args[1].classify() != TermKind::Tuple {
         return None;
     }
@@ -1059,42 +1042,20 @@ fn direct_insert_one_cached(
     let group = reader_group(process);
     let object = args[1];
     let target = args[0];
-    if target.is_magic_ref() {
-        with_cached_table(process, target, |shared, options, _| {
-            direct_insert_one_from_shared(shared, group, options, caller, None, object, insert_new)
-        })
-    } else if let Some(name) = target.as_atom() {
-        let rt = process.runtime.as_ref()?;
-        rt.named_ets
-            .with_table(name, |shared| {
-                direct_insert_one_from_shared(
-                    shared,
-                    group,
-                    &shared.options(),
-                    caller,
-                    Some(name),
-                    object,
-                    insert_new,
-                )
-            })
-            .flatten()
-    } else {
-        None
-    }
-}
-
-// Port of erts/emulator/beam/erl_db.c and erl_db_hash.c, OTP-29.1.1.
-fn direct_insert_one_from_shared(
-    shared: &arinsal_ets::TableLock,
-    group: usize,
-    options: &TableOptions,
-    caller: Term,
-    name: Option<arinsal_term::Atom>,
-    object: Term,
-    insert_new: bool,
-) -> Option<Term> {
-    if options.write_concurrency != WriteConcurrency::Disabled {
-        let table = shared.read_at(group);
+    let insert = |shared: &arinsal_ets::TableLock, name: Option<arinsal_term::Atom>| {
+        let options = shared.options();
+        if options.write_concurrency != WriteConcurrency::Disabled {
+            let table = shared.read_at(group);
+            if table.is_detached()
+                || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
+                || table.is_busy()
+                || !allowed(&table, caller, true)
+            {
+                return None;
+            }
+            return table.insert_term_shared(object, NEW).ok().map(boolean_term);
+        }
+        let mut table = shared.write();
         if table.is_detached()
             || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
             || table.is_busy()
@@ -1102,22 +1063,21 @@ fn direct_insert_one_from_shared(
         {
             return None;
         }
-        return table
-            .insert_term_shared(object, insert_new)
-            .ok()
-            .map(boolean_term);
+        let inserted = table.insert_term(object, NEW).ok()?;
+        Some(boolean_term(inserted))
+    };
+    if target.is_magic_ref() {
+        target
+            .with_magic_payload::<arinsal_ets::TableLock, _>(|shared| insert(shared, None))
+            .flatten()
+    } else if let Some(name) = target.as_atom() {
+        let rt = process.runtime.as_ref()?;
+        rt.named_ets
+            .with_table(name, |shared| insert(shared, Some(name)))
+            .flatten()
+    } else {
+        None
     }
-
-    let mut table = shared.write();
-    if table.is_detached()
-        || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
-        || table.is_busy()
-        || !allowed(&table, caller, true)
-    {
-        return None;
-    }
-    let inserted = table.insert_term(object, insert_new).ok()?;
-    Some(boolean_term(inserted))
 }
 
 /// `ets:update_counter/3,4` on small counters, updated in place under the table lock.
@@ -1160,7 +1120,7 @@ fn direct_update_counter_cached(
             direct_update_counter_from_shared(
                 shared,
                 group,
-                &shared.options(),
+                shared.options(),
                 caller,
                 Some(name),
                 args,
@@ -1477,7 +1437,7 @@ fn insert_list(
                 Ok(None) => unreachable!(),
                 Err(_) => return Err(check_failure()),
             };
-            if Table::check_object(&options, object).is_err() {
+            if Table::check_object(options, object).is_err() {
                 return Err(check_failure());
             }
             checked += 1;
@@ -1523,7 +1483,7 @@ fn insert_list(
             // generated loop consumes one reduction before db_put, which consumes at least one.
             loops -= 1;
             let object = advance_list(&mut insert_cursor)?.expect("list cursor checked");
-            let prepared = Table::prepare_object(&options, object).map_err(err)?;
+            let prepared = Table::prepare_object(options, object).map_err(err)?;
             let extra_reds = table.insert_prepared_counted(prepared);
             loops -= 1 + extra_reds as isize;
         }
@@ -1551,7 +1511,7 @@ fn insert_list(
             Ok(None) => unreachable!(),
             Err(_) => return Err(check_failure()),
         };
-        match Table::prepare_object(&options, object) {
+        match Table::prepare_object(options, object) {
             Ok(object) => prepared.push(object),
             Err(error) => {
                 if error == EtsError::BadArg {

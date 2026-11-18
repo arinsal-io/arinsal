@@ -6052,8 +6052,8 @@ pub type TableWriteGuard<'a, T> = rwmtx::RwMtxWriteGuard<'a, T>;
 
 impl TableLock {
     /// The creation options (see the field note for which of them may be stale).
-    pub fn options(&self) -> TableOptions {
-        self.creation
+    pub fn options(&self) -> &TableOptions {
+        &self.creation
     }
 
     /// Whether the table is waiting for its users to finish a trapped operation; readable
