@@ -387,6 +387,24 @@ impl DriverPort {
             -3 => InitAck::Failed(StartError::Badarg),
             _ => InitAck::Opened,
         };
+        self.init_ack_with(ack, start_result);
+    }
+
+    /// `erl_drv_init_ack` of a failed start whose errno the driver already holds
+    /// (`ERL_DRV_ERROR_ERRNO` with errno set from the forker's reply).
+    pub(crate) fn init_ack_failed(&self, error: StartError) {
+        if !self.async_open.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let result = match error {
+            StartError::General => -1,
+            StartError::Errno(_) => -2,
+            StartError::Badarg => -3,
+        };
+        self.init_ack_with(InitAck::Failed(error), result);
+    }
+
+    fn init_ack_with(&self, ack: InitAck, start_result: isize) {
         self.host.init_ack(self, ack);
         // erts ends the port before it records the start result as driver data,
         // so `stop` of a failed start still sees what `start` returned.

@@ -473,15 +473,7 @@ fn halt(
     };
 
     if let Some(text) = message {
-        let dump_path = write_halt_crash_dump(&text)
-            .unwrap_or_else(|_| std::path::PathBuf::from("erl_crash.dump"));
-        let _ = write!(
-            std::io::stderr().lock(),
-            "{text}\r\n\r\nCrash dump is being written to: {}...done\r\n",
-            dump_path.display()
-        );
-        let _ = std::io::stderr().flush();
-        crate::erts_exit(1);
+        erts_exit_dump(&text);
     }
     if !flush {
         crate::erts_exit(status);
@@ -579,6 +571,20 @@ fn combined_flush_timeout(option: Option<u32>) -> Option<u64> {
 fn halt_flush_timeout_callback(_ctx: &mut dyn arinsal_sched::TimerCallbackCtx<Message>) {
     // Port of erts/emulator/beam/erl_init.c:2771 (flush-timeout exit), OTP-29.1.1.
     crate::erts_exit(255);
+}
+
+/// `erts_exit(ERTS_DUMP_EXIT, ...)`: write the slogan and a crash dump, then end the node.
+// Port of erts/emulator/beam/erl_init.c (erts_exit_vv with ERTS_DUMP_EXIT), OTP-29.1.1.
+pub(crate) fn erts_exit_dump(text: &str) -> ! {
+    let dump_path =
+        write_halt_crash_dump(text).unwrap_or_else(|_| std::path::PathBuf::from("erl_crash.dump"));
+    let _ = write!(
+        std::io::stderr().lock(),
+        "{text}\r\n\r\nCrash dump is being written to: {}...done\r\n",
+        dump_path.display()
+    );
+    let _ = std::io::stderr().flush();
+    crate::erts_exit(1)
 }
 
 fn write_halt_crash_dump(message: &str) -> std::io::Result<std::path::PathBuf> {

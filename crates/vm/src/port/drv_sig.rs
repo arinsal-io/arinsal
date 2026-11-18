@@ -633,7 +633,7 @@ fn deliver_exit(
     if remove_and_notify(runtime, id, scheduler, from, reason).is_none() {
         return false;
     }
-    release_io(handle);
+    release_io_flushing(handle, reason != Term::atom(arinsal_term::atoms::KILL));
     if let Some(to) = closed_to {
         event_message(
             scheduler,

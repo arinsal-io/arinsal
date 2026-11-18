@@ -49,6 +49,7 @@ mod ram_file_drv;
 mod receive;
 mod seq_trace;
 mod signals;
+mod spawn_drv;
 mod suspend;
 mod sys_signals;
 mod trace;
@@ -267,8 +268,6 @@ pub struct EvalResult {
 /// Lazy module loader and single-process execution engine.
 pub struct Vm {
     paths: Vec<PathBuf>,
-    /// The node's `erl_child_setup` process, started when scheduled execution begins.
-    pub(crate) child_setup: Option<Arc<crate::child_setup::ChildSetup>>,
     /// The node runtime has VM lifetime, like erts' process, port, and scheduler tables.
     pub(crate) runtime: Option<&'static crate::process::Runtime>,
     pub(crate) statistics_origins: crate::natives::sys::StatisticsOrigins,
@@ -289,52 +288,6 @@ pub struct Vm {
     /// executor runs a process, zero otherwise. An address so `Vm` stays `Send`.
     // Port of erts/emulator/beam/erl_process.h (ErtsSchedulerData.registers), OTP-29.1.1.
     pub(crate) esdp_registers: usize,
-}
-
-#[test]
-fn cli_help_dev_null_is_ready_once() {
-    use std::os::fd::AsRawFd;
-
-    let input = std::fs::File::open("/dev/null").unwrap();
-    let interest = check_io::InterestSet {
-        readable: true,
-        writable: false,
-    };
-    for _ in 0..2 {
-        let (fd, ready) = check_io::wait_any(&[(input.as_raw_fd(), interest)])
-            .unwrap()
-            .unwrap();
-        assert_eq!(fd, input.as_raw_fd());
-        assert!(ready.readable);
-    }
-}
-
-#[test]
-fn cli_help_regular_file_is_ready_through_eof() {
-    use std::io::Read;
-    use std::os::fd::AsRawFd;
-
-    let path = std::env::temp_dir().join(format!("arinsal-cli-help-{}", std::process::id()));
-    std::fs::write(&path, b"data").unwrap();
-    let mut input = std::fs::File::open(&path).unwrap();
-    // Model the file-port open path, which identifies always-ready inputs once at open time.
-    check_io::mark_fallback(input.as_raw_fd(), true);
-    let interest = check_io::InterestSet {
-        readable: true,
-        writable: false,
-    };
-    let mut bytes = [0; 8];
-    for expected in [b"data".as_slice(), b"".as_slice()] {
-        let (fd, ready) = check_io::wait_any(&[(input.as_raw_fd(), interest)])
-            .unwrap()
-            .unwrap();
-        assert_eq!(fd, input.as_raw_fd());
-        assert!(ready.readable);
-        let n = input.read(&mut bytes).unwrap();
-        assert_eq!(&bytes[..n], expected);
-    }
-    check_io::mark_fallback(input.as_raw_fd(), false);
-    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -377,12 +330,12 @@ impl Drop for Vm {
         {
             scheduler.release();
         }
-        // erts_exit closes the forker port: erl_child_setup reads EOF and exits, and the
-        // port's reader ends with it. The runtime's own handle must not keep them alive.
+        // erts_exit ends the OS process and with it the forker socket: erl_child_setup reads
+        // end of file and exits.
         if !self.replica
-            && let Some(child_setup) = self.child_setup.take()
+            && let Some(runtime) = self.runtime
         {
-            child_setup.shutdown();
+            crate::spawn_drv::shutdown_forker(runtime);
         }
     }
 }

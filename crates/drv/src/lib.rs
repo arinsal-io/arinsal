@@ -68,7 +68,7 @@ pub use ext::{BUSY_MSGQ_DISABLED, ErlDrvMonitor, InitAck};
 pub use hooks::{SystemHooks, set_system_hooks};
 use linebuf::LineBuf;
 use lock::{ReentrantGuard, ReentrantLock};
-pub use native::{NativeDriver, SELECT_READ, SELECT_USE, SELECT_WRITE};
+pub use native::{NativeDriver, SELECT_READ, SELECT_USE, SELECT_USE_NO_CALLBACK, SELECT_WRITE};
 pub use select::{
     Action, FdSel, FdTable, NifSelectMessage, NifSelectResource, SelSlot, is_driver_selection,
     nif_select, poll_event, rejected, selection_counts, set_fd_table, wanted,
@@ -220,6 +220,7 @@ pub(crate) struct Callbacks {
     pub(crate) ready_output: Option<DrvFn2>,
     pub(crate) timeout: Option<DrvFn1>,
     pub(crate) ready_async: Option<DrvFn2>,
+    pub(crate) flush: Option<DrvFn1>,
     pub(crate) stop_select: Option<DrvFn2>,
     process_exit: Option<extern "C" fn(DrvData, *mut ErlDrvMonitor)>,
 }
@@ -392,6 +393,7 @@ impl Driver {
                 ready_output: entry.ready_output,
                 timeout: entry.timeout,
                 ready_async: entry.ready_async,
+                flush: entry.flush,
                 stop_select: entry.stop_select,
                 process_exit: entry.process_exit,
             },
@@ -434,6 +436,7 @@ impl Driver {
                 ready_output: entry.ready_output,
                 timeout: entry.timeout,
                 ready_async: entry.ready_async,
+                flush: entry.flush,
                 stop_select: entry.stop_select,
                 process_exit: entry.process_exit,
             },
@@ -681,6 +684,9 @@ const SFLG_STOPPING: u32 = 32;
 /// `ERTS_PORT_SFLG_INVALID`: the port is terminated; driver lookups of its handle fail while
 /// the record lives on (async jobs and the port data lock keep it, as `erts_port_inc_refc`).
 const SFLG_INVALID: u32 = 64;
+/// `ERTS_PORT_SFLG_CLOSING`: the exit was delivered but the driver queue still holds data;
+/// the port stays in limbo until the queue is flushed (io.c:3955).
+const SFLG_CLOSING: u32 = 128;
 
 /// The driver side of one port (`Port` fields used by drivers in erts).
 pub struct DriverPort {
@@ -1392,6 +1398,28 @@ impl DriverPort {
         true
     }
 
+    /// Port of io.c:3940-3950 (erts_deliver_port_exit: a port whose driver queue still holds
+    /// data turns CLOSING and is flushed, flush_port, instead of terminating) for a reason
+    /// other than `kill`. `true` when the port was terminated now; `false` when it stays in
+    /// limbo until the driver empties its queue and fails.
+    pub fn close_or_flush(&self) -> bool {
+        let _guard = self.guard();
+        let state = self.state.load(Ordering::Acquire);
+        if state & (SFLG_TERMINATING | SFLG_CLOSING) == 0 && self.queue_len() > 0 {
+            self.state.fetch_or(SFLG_CLOSING, Ordering::AcqRel);
+            // Port of io.c:3653 (flush_port).
+            if let Some(native) = &self.driver.native {
+                native.flush(self);
+            } else if let Some(flush) = self.driver.callbacks.flush {
+                crate::task::call1(flush, self.data());
+            }
+            if self.state.load(Ordering::Acquire) & SFLG_TERMINATING != 0 || self.queue_len() > 0 {
+                return false;
+            }
+        }
+        self.terminate()
+    }
+
     /// `driver_failure_atom` from outside a callback (erl_bif_ddll.c:123
     /// kill_ports_driver_unloaded), under the port lock.
     pub fn fail_atom(&self, reason: &str) {
@@ -1404,6 +1432,10 @@ impl DriverPort {
     /// Port of io.c:6381 (driver_output2).
     fn output2(&self, header: &[u8], data: Option<&[u8]>) -> c_int {
         let state = self.state.load(Ordering::Acquire);
+        if state & SFLG_CLOSING != 0 {
+            // io.c:6394: a closing port delivers nothing.
+            return 0;
+        }
         if state & (SFLG_TERMINATING | SFLG_STOPPING) == SFLG_TERMINATING {
             return 0;
         }
@@ -1450,6 +1482,11 @@ impl DriverPort {
             }
         }
         if state & SFLG_TERMINATING != 0 {
+            return 0;
+        }
+        if state & SFLG_CLOSING != 0 {
+            // Port of io.c:7206: a closing port's failure ends its limbo.
+            self.terminate();
             return 0;
         }
         if eof && state & SFLG_SOFT_EOF != 0 {

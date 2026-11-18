@@ -182,6 +182,52 @@ impl IoQueue {
         (base.cast::<SysIOVec>(), live as i32)
     }
 
+    /// Port of io.c:6852 (driver_enq): queue a copy of `data` at the end. `-1` on
+    /// allocation failure.
+    pub(crate) fn enq_bytes(&mut self, data: &[u8]) -> i32 {
+        if data.is_empty() {
+            return 0;
+        }
+        let bin = binary::from_bytes(data);
+        if bin.is_null() {
+            return -1;
+        }
+        self.iov.push([binary::bytes_ptr(bin) as usize, data.len()]);
+        self.binv.push(bin as usize);
+        self.size += data.len();
+        0
+    }
+
+    /// `driver_peekq(port)[0]`: copy the start of the head element into `out`; the bytes
+    /// copied (sys_drivers.c forker_ready_output reads the queued request this way).
+    pub(crate) fn copy_head(&self, out: &mut [u8]) -> usize {
+        let Some(slot) = self.iov.get(self.head) else {
+            return 0;
+        };
+        let bytes = mem::slice(slot[0] as *const u8, slot[1]);
+        let n = bytes.len().min(out.len());
+        out[..n].copy_from_slice(&bytes[..n]);
+        n
+    }
+
+    /// `writev(fd, driver_peekq(port))` of sys_drivers.c (ready_output): write the head
+    /// of the queue, at most `max_vsize` elements, without dequeuing it.
+    pub(crate) fn writev_head(&mut self, fd: i32, max_vsize: usize) -> std::io::Result<usize> {
+        let (iov, count) = self.peekq();
+        if count == 0 {
+            return Ok(0);
+        }
+        let count = (count as usize).min(max_vsize);
+        // SAFETY: `iov` points at `count` live `[base, len]` slots laid out as `struct iovec`;
+        // every slot references a binary the queue holds a reference to.
+        let n = unsafe { libc::writev(fd, iov.cast::<libc::iovec>(), count as libc::c_int) };
+        if n < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+
     /// Port of erl_io_queue.c:58 (erts_ioq_clear): drop every queued binary.
     pub(crate) fn clear(&mut self) {
         for bin in self.binv.drain(self.head.min(self.binv.len())..) {

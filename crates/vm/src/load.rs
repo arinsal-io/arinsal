@@ -838,7 +838,6 @@ impl Vm {
         let code_ix = Arc::clone(crate::code_ix::global());
         Self {
             paths,
-            child_setup: None,
             runtime: None,
             statistics_origins: if replica {
                 crate::natives::sys::StatisticsOrigins::now()

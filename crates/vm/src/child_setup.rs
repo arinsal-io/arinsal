@@ -1,27 +1,27 @@
-//! Unix child-setup service for operating-system ports.
+// Port of erts/emulator/sys/unix/erl_child_setup.c and the forker protocol of
+// erts/emulator/sys/unix/sys_drivers.c (forker_start, spawn_start), OTP-29.1.1.
+//
+//! `erl_child_setup`: the process that forks every OS port child, and the frames the forker
+//! port and the spawn ports exchange with it.
 
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
-use rustix::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use rustix::fd::{AsFd, AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use rustix::fs::{OFlags, fcntl_setfl};
 use rustix::io::{FdFlags, fcntl_dupfd_cloexec, fcntl_setfd, write};
 use rustix::net::{
-    AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
-    SendAncillaryMessage, SendFlags, SocketFlags, SocketType, recvmsg, sendmsg, socketpair,
+    AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SocketFlags, SocketType,
+    recvmsg, socketpair,
 };
 use rustix::pipe::pipe;
 use signal_hook_mio::v1_0::Signals;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, IoSlice, IoSliceMut, Read, Write as _};
+use std::io::{self, IoSliceMut};
 use std::mem::MaybeUninit;
-use std::net::Shutdown;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
 
 const START: u32 = 0;
 const GO: u32 = 2;
@@ -35,27 +35,81 @@ const NO_PORT_ID: u64 = u64::MAX;
 const SIGNAL_TOKEN: Token = Token(0);
 const CONTROL_TOKEN: Token = Token(1);
 
-/// The parent-side handle for the runtime's persistent `erl_child_setup` process.
-pub(crate) struct ChildSetup {
-    control: Mutex<UnixStream>,
-    pending: Arc<Mutex<Pending>>,
-    helper: Mutex<Option<Child>>,
-    response_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
-}
-
-#[derive(Default)]
-struct Pending {
-    status: HashMap<u64, Sender<i64>>,
-}
-
-/// Parent endpoints and status stream for a spawned port process. The forker's `Go` frame
-/// (OS pid or errno) arrives later on `output`; the port reads it as input.
+/// The pipes of a spawn port (spawn_start). The forker's `Go` frame (OS pid or errno)
+/// arrives later on `output`; the port reads it as input.
 pub(crate) struct SpawnedChild {
     pub(crate) input: OwnedFd,
     pub(crate) output: OwnedFd,
     /// Setup payload bytes the pipe did not take yet.
     pub(crate) setup_rest: Vec<u8>,
-    pub(crate) status: Option<Receiver<i64>>,
+    /// The child's ends for the forker's Start request: `ofd[0]`, `ifd[1]`, `stderrfd`.
+    pub(crate) child_fds: ChildFds,
+}
+
+/// The descriptors a Start request hands to `erl_child_setup`; the forker port closes them
+/// once the request is sent (forker_deq).
+pub(crate) struct ChildFds {
+    input: OwnedFd,
+    output: OwnedFd,
+    /// A dup of the node's stderr; `None` when stderr goes to `output`.
+    stderr: Option<OwnedFd>,
+}
+
+impl ChildFds {
+    /// `proto->u.start` of spawn_start: the Start request carrying these descriptors and,
+    /// when the exit status is wanted, the port id the forker's SigChld names. The
+    /// descriptors now belong to the request.
+    pub(crate) fn into_start(self, port_id: Option<u64>) -> [u8; FRAME_LEN] {
+        let input = self.input.into_raw_fd();
+        let output = self.output.into_raw_fd();
+        let stderr = self.stderr.map_or(output, IntoRawFd::into_raw_fd);
+        let mut frame = [0u8; FRAME_LEN];
+        frame[0..4].copy_from_slice(&START.to_ne_bytes());
+        frame[8..16].copy_from_slice(&port_id.unwrap_or(NO_PORT_ID).to_ne_bytes());
+        for (index, fd) in [input, output, stderr].into_iter().enumerate() {
+            let offset = 16 + index * std::mem::size_of::<i32>();
+            frame[offset..offset + 4].copy_from_slice(&fd.to_ne_bytes());
+        }
+        frame
+    }
+}
+
+/// `proto->u.start.fds` of a Start request.
+pub(crate) fn start_fds(frame: &[u8; FRAME_LEN]) -> [RawFd; 3] {
+    std::array::from_fn(|index| {
+        let offset = 16 + index * std::mem::size_of::<i32>();
+        i32::from_ne_bytes(frame[offset..offset + 4].try_into().unwrap())
+    })
+}
+
+/// `proto->u.start.port_id` of a Start request.
+pub(crate) fn start_port_id(frame: &[u8; FRAME_LEN]) -> u64 {
+    u64::from_ne_bytes(frame[8..16].try_into().unwrap())
+}
+
+/// `proto->u.sigchld`: the port that wants the exit status and the raw wait status (or the
+/// errno of a Start request the forker could not take).
+pub(crate) struct SigChld {
+    pub(crate) port_id: u64,
+    pub(crate) status: i32,
+}
+
+/// A SigChld frame (forker_sigchld).
+pub(crate) fn sigchld_frame(port_id: u64, error: i32) -> [u8; FRAME_LEN] {
+    let mut frame = [0u8; FRAME_LEN];
+    frame[0..4].copy_from_slice(&SIGCHLD.to_ne_bytes());
+    frame[8..16].copy_from_slice(&port_id.to_ne_bytes());
+    frame[16..20].copy_from_slice(&error.to_ne_bytes());
+    frame
+}
+
+/// Decode a SigChld frame; `None` for any other frame.
+pub(crate) fn parse_sigchld(frame: &[u8]) -> Option<SigChld> {
+    let frame: &[u8; FRAME_LEN] = frame.try_into().ok()?;
+    (u32::from_ne_bytes(frame[0..4].try_into().unwrap()) == SIGCHLD).then(|| SigChld {
+        port_id: u64::from_ne_bytes(frame[8..16].try_into().unwrap()),
+        status: i32::from_ne_bytes(frame[16..20].try_into().unwrap()),
+    })
 }
 
 /// Length of a forker protocol frame (`ErtsSysForkerProto`).
@@ -92,9 +146,10 @@ pub(crate) fn ack_frame() -> [u8; FRAME_LEN] {
     ack
 }
 
-/// Start the persistent forker before the runtime begins running BEAM code.
+/// Start `erl_child_setup` with a unix domain socket to it (forker_start): the parent's end
+/// of the socket and the process.
 // Port of erts/emulator/sys/unix/sys_drivers.c (`forker_start`), OTP-29.1.1.
-pub(crate) fn start() -> io::Result<Arc<ChildSetup>> {
+pub(crate) fn start() -> io::Result<(OwnedFd, Child)> {
     let executable = arinsal_executable().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -114,8 +169,6 @@ pub(crate) fn start() -> io::Result<Arc<ChildSetup>> {
     let vm_stdout = fcntl_dupfd_cloexec(std::io::stdout(), 3).map_err(to_io_error)?;
     fcntl_setfd(&vm_stdin, FdFlags::empty()).map_err(to_io_error)?;
     fcntl_setfd(&vm_stdout, FdFlags::empty()).map_err(to_io_error)?;
-    let parent = UnixStream::from(parent_fd);
-    let read_stream = parent.try_clone()?;
     let mut command = Command::new(executable);
     command
         .arg("--child-setup")
@@ -124,151 +177,55 @@ pub(crate) fn start() -> io::Result<Arc<ChildSetup>> {
         .stderr(Stdio::from(std::fs::File::from(vm_stdout)))
         .env_clear();
     let helper = command.spawn()?;
-    let pending = Arc::new(Mutex::new(Pending::default()));
-    let response_pending = Arc::clone(&pending);
-    let response_thread = std::thread::Builder::new()
-        .name("arinsal-child-setup-io".to_owned())
-        .spawn(move || response_loop(read_stream, response_pending))?;
-    Ok(Arc::new(ChildSetup {
-        control: Mutex::new(parent),
-        pending,
-        helper: Mutex::new(Some(helper)),
-        response_thread: Mutex::new(Some(response_thread)),
-    }))
+    Ok((parent_fd, helper))
 }
 
-impl ChildSetup {
-    pub(crate) fn shutdown(&self) {
-        let _ = self.control.lock().unwrap().shutdown(Shutdown::Write);
-        if let Some(mut helper) = self.helper.lock().unwrap().take() {
-            let _ = helper.wait();
-        }
-        if let Some(response_thread) = self.response_thread.lock().unwrap().take() {
-            let _ = response_thread.join();
+/// The pipes of a new spawn port and the command payload written into the child's input
+/// (spawn_start up to the forker request).
+// Port of erts/emulator/sys/unix/sys_drivers.c (`spawn_start`), OTP-29.1.1.
+pub(crate) fn spawn_pipes(setup: &[u8], stderr_to_stdout: bool) -> io::Result<SpawnedChild> {
+    let (parent_output, child_output) = pipe().map_err(to_io_error)?;
+    let max_files = crate::erl_poll::erts_poll_max_fds();
+    if parent_output.as_raw_fd() as usize >= max_files {
+        return Err(io::Error::from_raw_os_error(libc::EMFILE));
+    }
+    let (child_input, parent_input) = pipe().map_err(to_io_error)?;
+    if parent_input.as_raw_fd() as usize >= max_files {
+        return Err(io::Error::from_raw_os_error(libc::EMFILE));
+    }
+    // Port of erts/emulator/sys/unix/sys_drivers.c:502, OTP-29.1.1.
+    // `dup(2)` is part of spawn_start's capacity check when stderr is not redirected.
+    let stderr = if stderr_to_stdout {
+        None
+    } else {
+        Some(fcntl_dupfd_cloexec(std::io::stderr(), 0).map_err(to_io_error)?)
+    };
+    if stderr.as_ref().unwrap_or(&child_output).as_raw_fd() as usize >= max_files {
+        return Err(io::Error::from_raw_os_error(libc::EMFILE));
+    }
+    // The setup payload goes into the pipe before the request reaches the forker, and what
+    // the pipe does not take is queued for the port.
+    fcntl_setfl(&parent_input, OFlags::NONBLOCK).map_err(to_io_error)?;
+    fcntl_setfl(&parent_output, OFlags::NONBLOCK).map_err(to_io_error)?;
+    let mut written = 0;
+    while written < setup.len() {
+        match write(&parent_input, &setup[written..]) {
+            Ok(n) => written += n,
+            Err(error) if error == rustix::io::Errno::INTR => continue,
+            Err(error) if error == rustix::io::Errno::AGAIN => break,
+            Err(error) => return Err(to_io_error(error)),
         }
     }
-
-    /// Queue a start request for the persistent helper; the `Go`/`Ack` handshake is the port's.
-    // Port of erts/emulator/sys/unix/sys_drivers.c (`spawn_start`), OTP-29.1.1.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn spawn(
-        &self,
-        port_id: u64,
-        setup: &[u8],
-        status_wanted: bool,
-        _use_stdio: bool,
-        _read_write: u8,
-        stderr_to_stdout: bool,
-    ) -> io::Result<SpawnedChild> {
-        let (parent_output, child_output) = pipe().map_err(to_io_error)?;
-        let max_files = crate::erl_poll::erts_poll_max_fds();
-        if parent_output.as_raw_fd() as usize >= max_files {
-            return Err(io::Error::from_raw_os_error(libc::EMFILE));
-        }
-        let (child_input, parent_input) = pipe().map_err(to_io_error)?;
-        if parent_input.as_raw_fd() as usize >= max_files {
-            return Err(io::Error::from_raw_os_error(libc::EMFILE));
-        }
-        // Port of erts/emulator/sys/unix/sys_drivers.c:502, OTP-29.1.1.
-        // `dup(2)` is part of spawn_start's capacity check when stderr is not redirected.
-        let stderr_dup = if stderr_to_stdout {
-            None
-        } else {
-            Some(fcntl_dupfd_cloexec(std::io::stderr(), 0).map_err(to_io_error)?)
-        };
-        let stderr = stderr_dup
-            .as_ref()
-            .map(AsFd::as_fd)
-            .unwrap_or_else(|| child_output.as_fd());
-        if stderr.as_raw_fd() as usize >= max_files {
-            return Err(io::Error::from_raw_os_error(libc::EMFILE));
-        }
-        let fds: Vec<BorrowedFd<'_>> = vec![child_input.as_fd(), child_output.as_fd(), stderr];
-        let (status_tx, status_rx) = mpsc::channel();
-        {
-            let mut pending = self.pending.lock().unwrap();
-            if status_wanted {
-                pending.status.insert(port_id, status_tx);
-            }
-        }
-        // Port of sys_drivers.c (`spawn_start`): the setup payload goes into the pipe before the
-        // request reaches the forker, and what the pipe does not take is queued for the port.
-        fcntl_setfl(&parent_input, OFlags::NONBLOCK).map_err(to_io_error)?;
-        fcntl_setfl(&parent_output, OFlags::NONBLOCK).map_err(to_io_error)?;
-        let mut written = 0;
-        while written < setup.len() {
-            match write(&parent_input, &setup[written..]) {
-                Ok(n) => written += n,
-                Err(error) if error == rustix::io::Errno::INTR => continue,
-                Err(error) if error == rustix::io::Errno::AGAIN => break,
-                Err(error) => return Err(to_io_error(error)),
-            }
-        }
-        let setup_rest = setup[written..].to_vec();
-        let mut frame = [0u8; FRAME_LEN];
-        frame[0..4].copy_from_slice(&START.to_ne_bytes());
-        frame[8..16]
-            .copy_from_slice(&(if status_wanted { port_id } else { NO_PORT_ID }).to_ne_bytes());
-        for (index, fd) in fds.iter().enumerate() {
-            let offset = 16 + index * std::mem::size_of::<i32>();
-            frame[offset..offset + 4].copy_from_slice(&fd.as_raw_fd().to_ne_bytes());
-        }
-        if let Err(error) = self.send_start(&frame, &fds) {
-            self.pending.lock().unwrap().status.remove(&port_id);
-            return Err(error);
-        }
-        drop(child_input);
-        drop(child_output);
-        Ok(SpawnedChild {
-            input: parent_input,
-            output: parent_output,
-            setup_rest,
-            status: status_wanted.then_some(status_rx),
-        })
-    }
-
-    fn send_start(&self, frame: &[u8; FRAME_LEN], fds: &[BorrowedFd<'_>]) -> io::Result<()> {
-        let mut stream = self.control.lock().unwrap();
-        let mut ancillary_space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(3))];
-        let mut ancillary = SendAncillaryBuffer::new(&mut ancillary_space);
-        if !ancillary.push(SendAncillaryMessage::ScmRights(fds)) {
-            return Err(io::Error::other("forker descriptor message is too large"));
-        }
-        let sent = sendmsg(
-            &*stream,
-            &[IoSlice::new(frame)],
-            &mut ancillary,
-            SendFlags::empty(),
-        )
-        .map_err(to_io_error)?;
-        if sent < frame.len() {
-            stream.write_all(&frame[sent..])?;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for ChildSetup {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
-fn response_loop(mut stream: UnixStream, pending: Arc<Mutex<Pending>>) {
-    let mut frame = [0u8; FRAME_LEN];
-    loop {
-        if stream.read_exact(&mut frame).is_err() {
-            break;
-        }
-        let action = u32::from_ne_bytes(frame[0..4].try_into().unwrap());
-        if action == SIGCHLD {
-            let port_id = u64::from_ne_bytes(frame[8..16].try_into().unwrap());
-            let status = i32::from_ne_bytes(frame[16..20].try_into().unwrap());
-            if let Some(sender) = pending.lock().unwrap().status.remove(&port_id) {
-                let _ = sender.send(child_wait_status(status));
-            }
-        }
-    }
+    Ok(SpawnedChild {
+        input: parent_input,
+        output: parent_output,
+        setup_rest: setup[written..].to_vec(),
+        child_fds: ChildFds {
+            input: child_input,
+            output: child_output,
+            stderr,
+        },
+    })
 }
 
 /// Run in the persistent child-setup process selected by the CLI's hidden mode.
@@ -539,15 +496,6 @@ fn write_all_fd(fd: &impl AsFd, bytes: &[u8]) -> io::Result<()> {
 fn wait_status(status: ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     status.into_raw()
-}
-
-fn child_wait_status(raw: i32) -> i64 {
-    use std::os::unix::process::ExitStatusExt;
-    let status = ExitStatus::from_raw(raw);
-    match status.signal() {
-        Some(signal) => 128 + i64::from(signal),
-        None => i64::from(status.code().unwrap_or(0)),
-    }
 }
 
 /// Execute a single staged spawn request, in the helper's child process.

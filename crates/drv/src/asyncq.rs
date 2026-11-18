@@ -30,12 +30,34 @@ pub fn set_async_threads(threads: usize) {
     CONFIGURED.store(threads, Ordering::Relaxed);
 }
 
+/// What a job runs on the async thread: `async_invoke(async_data)` of a C driver, or the
+/// invoke function a native driver passed with its data captured.
+enum Invoke {
+    C {
+        invoke: DrvFn1,
+        data: usize,
+        free: Option<DrvFn1>,
+    },
+    Native(Option<Box<dyn FnOnce() + Send>>),
+}
+
+impl Invoke {
+    fn run(&mut self) {
+        match self {
+            Invoke::C { invoke, data, .. } => call1(*invoke, *data as *mut c_void),
+            Invoke::Native(invoke) => {
+                if let Some(invoke) = invoke.take() {
+                    invoke();
+                }
+            }
+        }
+    }
+}
+
 /// A queued `driver_async` request (`ErtsAsync`).
 pub(crate) struct Job {
     port: PortRef,
-    invoke: DrvFn1,
-    data: usize,
-    free: Option<DrvFn1>,
+    invoke: Invoke,
     /// The port data lock the job holds a reference on (`ErtsAsync.pdl`), zero when none.
     pdl: usize,
     /// Zero-based scheduler that issued the job (`a->sched_id - 1`).
@@ -63,10 +85,10 @@ fn pool() -> &'static Pool {
                 .name(format!("arinsal-drv-async-{}", index + 1))
                 .spawn(move || {
                     while let Ok(message) = rx.recv() {
-                        let AsyncMessage::Job(job) = message else {
+                        let AsyncMessage::Job(mut job) = message else {
                             break;
                         };
-                        call1(job.invoke, job.data as *mut c_void);
+                        job.invoke.run();
                         // Port of erl_async.c:227 (async_reply): the issuing
                         // scheduler runs ready_async as aux work.
                         let port = job.port.clone();
@@ -139,19 +161,33 @@ impl Job {
             return true;
         }
         port.start_task();
-        match port.driver.callbacks.ready_async {
-            Some(callback) => {
-                call2(callback, port.data(), self.data as *mut c_void);
-                port.add_reds(REDS_INPUT);
+        match &self.invoke {
+            Invoke::C { data, .. } => match port.driver.callbacks.ready_async {
+                Some(callback) => {
+                    call2(callback, port.data(), *data as *mut c_void);
+                    port.add_reds(REDS_INPUT);
+                    false
+                }
+                None => true,
+            },
+            Invoke::Native(_) => {
+                if let Some(native) = &port.driver.native {
+                    native.ready_async(port);
+                    port.add_reds(REDS_INPUT);
+                }
                 false
             }
-            None => true,
         }
     }
 
     fn free(&self) {
-        if let Some(free) = self.free {
-            call1(free, self.data as *mut c_void);
+        if let Invoke::C {
+            data,
+            free: Some(free),
+            ..
+        } = &self.invoke
+        {
+            call1(*free, *data as *mut c_void);
         }
     }
 
@@ -176,18 +212,35 @@ pub(crate) fn driver_async(
     data: *mut c_void,
     free: Option<DrvFn1>,
 ) -> c_long {
+    let invoke = Invoke::C {
+        invoke,
+        data: data as usize,
+        free,
+    };
+    submit(port, key, invoke)
+}
+
+/// `driver_async` of a native driver: `invoke` runs on the async thread, then the driver's
+/// `ready_async` runs under the port lock on the issuing scheduler.
+pub(crate) fn driver_async_native(
+    port: PortRef,
+    key: Option<&mut c_uint>,
+    invoke: Box<dyn FnOnce() + Send>,
+) -> c_long {
+    submit(port, key, Invoke::Native(Some(invoke)))
+}
+
+fn submit(port: PortRef, key: Option<&mut c_uint>, invoke: Invoke) -> c_long {
     let threads = CONFIGURED.load(Ordering::Relaxed);
     let mut job = Job {
         port: port.clone(),
         invoke,
-        data: data as usize,
-        free,
         pdl: 0,
         // Port of erl_async.c:552-554, OTP-29.1.1: scheduler 1 when not on a scheduler.
         sched_id: arinsal_sched::current_normal_scheduler().unwrap_or(0),
     };
     if threads == 0 {
-        call1(invoke, data);
+        job.invoke.run();
         if job.deliver() {
             job.free();
         }
@@ -217,8 +270,8 @@ pub(crate) fn driver_async(
         job.pdl = pdl;
     }
     port.host.ddll_reference(&port);
-    if let Err(job) = pool.enqueue(queue, job) {
-        call1(job.invoke, job.data as *mut c_void);
+    if let Err(mut job) = pool.enqueue(queue, job) {
+        job.invoke.run();
         job.ready();
         return 0;
     }

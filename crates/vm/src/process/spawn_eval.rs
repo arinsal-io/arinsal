@@ -276,11 +276,6 @@ impl Vm {
         if module != "erl_init" {
             initialize_feature_defaults(arinsal_pterm::global_store())?;
         }
-        if self.child_setup.is_none() {
-            self.child_setup = Some(crate::child_setup::start().map_err(|error| {
-                VmError::Load(format!("cannot start erl_child_setup: {error}"))
-            })?);
-        }
         self.refresh_code();
         if !self.code.loaded.contains_key(module)
             && !self.code.pending_on_load.contains_key(module)
@@ -318,8 +313,6 @@ impl Vm {
             let code = Arc::clone(&self.code_ix);
             let port_layout = arinsal_term::ptab::port_table_layout();
             let port_ids = PtabIdRing::new(port_layout.max());
-            // erts creates its forker port first and keeps port id zero occupied.
-            assert_eq!(port_ids.reserve(), Some(0));
             let named_ets = Arc::new(arinsal_ets::NamedTableIndex::new());
             let runtime: &'static Runtime = Box::leak(Box::new(Runtime {
                 statistics: crate::natives::sys::StatisticsState::new(self.statistics_origins),
@@ -335,7 +328,7 @@ impl Vm {
                 reg: crate::register::RegisterTable::new(),
                 next_trace_weak_id: AtomicU64::new(0),
                 ports: crate::port::PortTable::new(port_layout),
-                child_setup: Arc::clone(self.child_setup.as_ref().expect("child setup started")),
+                forker_port: OnceLock::new(),
                 system_monitor: Mutex::new(None),
                 session_monitors: Mutex::new(Vec::new()),
                 system_monitor_flags: AtomicU8::new(0),
@@ -404,6 +397,9 @@ impl Vm {
                     .scheduler
                     .set(scheduler)
                     .map_err(|_| VmError::Unsupported("runtime scheduler already set".into()))?;
+                // Port of erts/emulator/sys/unix/sys_drivers.c:170 (erl_sys_late_init): the
+                // forker is the node's first port.
+                crate::spawn_drv::open_forker(runtime)?;
                 crate::erl_trace::set_node(runtime);
                 // Port of code_ix.c:142-171 and beam_common.c (erts_schedule_code_barrier),
                 // OTP-29.1.1: code-table owners retire through this scheduler's progress queue.

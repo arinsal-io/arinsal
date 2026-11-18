@@ -25,8 +25,9 @@ pub(crate) struct Runtime {
     pub(crate) reg: crate::register::RegisterTable,
     pub(crate) next_trace_weak_id: AtomicU64,
     pub(crate) ports: crate::port::PortTable,
-    /// Persistent `erl_child_setup` process; all OS port children are forked there.
-    pub(crate) child_setup: Arc<crate::child_setup::ChildSetup>,
+    /// `forker_port` of sys_drivers.c: the port of the `spawn_forker` driver, through which
+    /// every OS port child is forked by `erl_child_setup`.
+    pub(crate) forker_port: OnceLock<u64>,
     pub(crate) system_monitor: Mutex<Option<crate::natives::erts_debug::SystemMonitorState>>,
     /// `system_monitor` state of dynamic trace sessions, keyed by session id.
     pub(crate) session_monitors: Mutex<Vec<(u64, crate::natives::erts_debug::SystemMonitorState)>>,
