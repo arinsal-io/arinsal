@@ -5,23 +5,28 @@
 
 use core::fmt;
 #[cfg(target_os = "linux")]
-use std::ffi::{CStr, CString};
+use rustix::fd::OwnedFd;
 #[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use rustix::fs::{MemfdFlags, Mode, OFlags, ftruncate, memfd_create, open};
+#[cfg(target_os = "linux")]
+use rustix::io::Errno;
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "x86_64")))]
+use rustix::mm::{MapFlags, ProtFlags};
+#[cfg(target_os = "linux")]
+use rustix::param::page_size;
+#[cfg(target_os = "linux")]
+use rustix::{shm, system};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 const GRANULARITY: usize = 64;
 const CONFIGURED_BLOCK_SIZE: usize = 32 * 1024 * 1024;
 const MAX_BLOCK_SIZE: usize = 64 * 1024 * 1024;
 const MAX_REQUEST_SIZE: usize = u32::MAX as usize / 2;
-#[cfg(target_os = "linux")]
-const MFD_CLOEXEC: u32 = 0x0001;
-#[cfg(target_os = "linux")]
-const MFD_EXEC: u32 = 0x0010;
-
 static ALLOCATOR: OnceLock<Mutex<JitAllocator>> = OnceLock::new();
 #[cfg(target_os = "linux")]
-static MEMFD_UNSUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static MEMFD_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "linux")]
 static SHM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "linux")]
@@ -113,13 +118,7 @@ impl DualMapping {
 
     // Port of asmjit `VirtMem::release_dual_mapping`, virtmem.cpp:935-950.
     fn unmap(&mut self) {
-        // SAFETY: both pointers describe the live aliases returned by the target mapping routine.
-        unsafe {
-            libc::munmap(self.rx.cast(), self.size);
-            if self.rw != self.rx {
-                libc::munmap(self.rw.cast(), self.size);
-            }
-        }
+        unmap_aliases(self.rx, self.rw, self.size);
         self.rx = core::ptr::null_mut();
         self.rw = core::ptr::null_mut();
         self.size = 0;
@@ -519,124 +518,84 @@ impl Drop for CodeMemory {
 // Port of asmjit `alloc_dual_mapping_using_file`, virtmem.cpp:1087-1113.
 fn linux_dual_mapping(size: usize) -> Result<DualMapping, ExecError> {
     let fd = anonymous_fd(size)?;
-    let rx = match map_fd(fd, size, libc::PROT_READ | libc::PROT_EXEC) {
-        Ok(rx) => rx,
-        Err(error) => {
-            // SAFETY: `fd` is owned by this function and no mapping succeeded.
-            unsafe { libc::close(fd) };
-            return Err(error);
-        }
-    };
-    let rw = match map_fd(fd, size, libc::PROT_READ | libc::PROT_WRITE) {
+    let rx = map_fd(&fd, size, ProtFlags::READ | ProtFlags::EXEC)?;
+    let rw = match map_fd(&fd, size, ProtFlags::READ | ProtFlags::WRITE) {
         Ok(rw) => rw,
         Err(error) => {
-            // SAFETY: `rx` is the live first alias created above.
-            unsafe { libc::munmap(rx.cast(), size) };
-            // SAFETY: `fd` is owned by this function and both mappings have been attempted.
-            unsafe { libc::close(fd) };
+            unmap_aliases(rx, core::ptr::null_mut(), size);
             return Err(error);
         }
     };
-    // SAFETY: the file descriptor is no longer needed after both MAP_SHARED aliases are live.
-    unsafe { libc::close(fd) };
     Ok(DualMapping { rx, rw, size })
 }
 
 #[cfg(target_os = "linux")]
 // Port of asmjit `AnonymousMemory::open` and `AnonymousMemory::allocate`, virtmem.cpp:588-696.
-fn anonymous_fd(size: usize) -> Result<libc::c_int, ExecError> {
+fn anonymous_fd(size: usize) -> Result<OwnedFd, ExecError> {
     if !MEMFD_UNSUPPORTED.load(Ordering::Relaxed) {
-        let name = b"vmem\0";
         // AsmJit passes MFD_EXEC on kernels that support it and falls back to shm_open only when
         // the memfd_create syscall itself is unavailable.
-        // SAFETY: the syscall receives a static NUL-terminated name and integer flags.
-        let fd = unsafe {
-            libc::syscall(
-                libc::SYS_memfd_create,
-                name.as_ptr().cast::<libc::c_char>(),
-                MFD_CLOEXEC | memfd_exec_flag(),
-            )
-        } as libc::c_int;
-        if fd >= 0 {
-            resize_fd(fd, size)?;
-            return Ok(fd);
+        match memfd_create("vmem", MemfdFlags::CLOEXEC | memfd_exec_flag()) {
+            Ok(fd) => {
+                resize_fd(&fd, size)?;
+                return Ok(fd);
+            }
+            Err(Errno::NOSYS) => MEMFD_UNSUPPORTED.store(true, Ordering::Relaxed),
+            Err(error) => return Err(ExecError::MappingFailed(error.into())),
         }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ENOSYS) {
-            return Err(ExecError::MappingFailed(error));
-        }
-        MEMFD_UNSUPPORTED.store(true, Ordering::Relaxed);
     }
     shm_fd(size)
 }
 
 #[cfg(target_os = "linux")]
-fn resize_fd(fd: libc::c_int, size: usize) -> Result<(), ExecError> {
-    let size = libc::off_t::try_from(size).map_err(|_| ExecError::InvalidSize)?;
-    // SAFETY: `fd` is open and `size` is a positive, representable file length.
-    if unsafe { libc::ftruncate(fd, size) } != 0 {
-        let error = std::io::Error::last_os_error();
-        // SAFETY: `fd` was opened in this call chain and must be closed on allocation failure.
-        unsafe { libc::close(fd) };
-        return Err(ExecError::MappingFailed(error));
-    }
-    Ok(())
+fn resize_fd(fd: &OwnedFd, size: usize) -> Result<(), ExecError> {
+    let size = u64::try_from(size).map_err(|_| ExecError::InvalidSize)?;
+    ftruncate(fd, size).map_err(|error| ExecError::MappingFailed(error.into()))
 }
 
 #[cfg(target_os = "linux")]
-fn shm_fd(size: usize) -> Result<libc::c_int, ExecError> {
+fn shm_fd(size: usize) -> Result<OwnedFd, ExecError> {
     let prefer_tmp = shm_prefers_tmp()?;
     for _ in 0..100 {
-        let (fd, name, is_tmp) = open_anonymous_file(prefer_tmp)?;
-        if fd < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EEXIST) {
+        let (fd, name, is_tmp) = match open_anonymous_file(prefer_tmp) {
+            Ok(opened) => opened,
+            Err(ExecError::MappingFailed(error))
+                if error.raw_os_error() == Some(Errno::EXIST.raw_os_error()) =>
+            {
                 continue;
             }
-            return Err(ExecError::MappingFailed(error));
+            Err(error) => return Err(error),
+        };
+        if is_tmp {
+            let _ = rustix::fs::unlink(name.as_str());
+        } else {
+            let _ = shm::unlink(name.as_str());
         }
-        // SAFETY: unlinking the created object preserves its already-open descriptor.
-        unsafe {
-            if is_tmp {
-                libc::unlink(name.as_ptr());
-            } else {
-                libc::shm_unlink(name.as_ptr());
-            }
-        }
-        resize_fd(fd, size)?;
+        resize_fd(&fd, size)?;
         return Ok(fd);
     }
-    Err(ExecError::MappingFailed(std::io::Error::from_raw_os_error(
-        libc::EEXIST,
-    )))
+    Err(ExecError::MappingFailed(Errno::EXIST.into()))
 }
 
 #[cfg(target_os = "linux")]
 // Port of asmjit `get_mfd_exec_flag`, virtmem.cpp:525-543.
-fn memfd_exec_flag() -> u32 {
+fn memfd_exec_flag() -> MemfdFlags {
     match MEMFD_EXEC_SUPPORTED.load(Ordering::Relaxed) {
-        1 => return 0,
-        2 => return MFD_EXEC,
+        1 => return MemfdFlags::empty(),
+        2 => return MemfdFlags::EXEC,
         _ => {}
     }
-    let mut info: libc::utsname =
-        // SAFETY: `utsname` is a plain C output struct fully initialized by `uname` below.
-        unsafe { core::mem::zeroed() };
-    // SAFETY: uname writes the kernel's fixed-size name fields into the valid struct pointer.
-    if unsafe { libc::uname(&mut info) } != 0 {
-        return 0;
-    }
-    // SAFETY: uname guarantees that `release` is NUL-terminated.
-    let release = unsafe { CStr::from_ptr(info.release.as_ptr()) }.to_bytes();
+    let info = system::uname();
+    let release = info.release().to_bytes();
     let mut parts = release.split(|byte| *byte == b'.');
     let major = parts.next().and_then(parse_decimal).unwrap_or_default();
     let minor = parts.next().and_then(parse_decimal).unwrap_or_default();
     let flag = if major > 6 || (major == 6 && minor >= 3) {
-        MFD_EXEC
+        MemfdFlags::EXEC
     } else {
-        0
+        MemfdFlags::empty()
     };
-    MEMFD_EXEC_SUPPORTED.store(if flag == 0 { 1 } else { 2 }, Ordering::Relaxed);
+    MEMFD_EXEC_SUPPORTED.store(if flag.is_empty() { 1 } else { 2 }, Ordering::Relaxed);
     flag
 }
 
@@ -657,92 +616,91 @@ fn shm_prefers_tmp() -> Result<bool, ExecError> {
         2 => return Ok(true),
         _ => {}
     }
-    // SAFETY: sysconf has no pointer arguments and returns the system page size.
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    let page_size = if page_size > 0 {
-        page_size as usize
-    } else {
-        4096
-    };
+    let page_size = page_size();
     let (fd, name, is_tmp) = open_anonymous_file(false)?;
-    if fd < 0 {
-        return Err(ExecError::MappingFailed(std::io::Error::last_os_error()));
+    if is_tmp {
+        let _ = rustix::fs::unlink(name.as_str());
+    } else {
+        let _ = shm::unlink(name.as_str());
     }
-    // SAFETY: name denotes the temporary shared-memory probe object created above.
-    unsafe { libc::shm_unlink(name.as_ptr()) };
-    resize_fd(fd, page_size)?;
-    let map_result = map_fd(fd, page_size, libc::PROT_READ | libc::PROT_EXEC);
-    // SAFETY: the probe descriptor remains open until the RX probe has completed.
-    unsafe { libc::close(fd) };
+    resize_fd(&fd, page_size)?;
+    let map_result = map_fd(&fd, page_size, ProtFlags::READ | ProtFlags::EXEC);
+    drop(fd);
     let prefer_tmp = match map_result {
         Ok(pointer) => {
-            // SAFETY: pointer is the live probe mapping returned by mmap.
-            unsafe { libc::munmap(pointer.cast(), page_size) };
+            unmap_aliases(pointer, core::ptr::null_mut(), page_size);
             false
         }
-        Err(ExecError::MappingFailed(error)) if error.raw_os_error() == Some(libc::EINVAL) => true,
+        Err(ExecError::MappingFailed(error))
+            if error.raw_os_error() == Some(Errno::INVAL.raw_os_error()) =>
+        {
+            true
+        }
         Err(error) => return Err(error),
     };
-    let _ = is_tmp;
     SHM_PREFERS_TMP.store(if prefer_tmp { 2 } else { 1 }, Ordering::Relaxed);
     Ok(prefer_tmp)
 }
 
 #[cfg(target_os = "linux")]
 // Port of asmjit `AnonymousMemory::open`, virtmem.cpp:588-675.
-fn open_anonymous_file(prefer_tmp: bool) -> Result<(libc::c_int, CString, bool), ExecError> {
+fn open_anonymous_file(prefer_tmp: bool) -> Result<(OwnedFd, String, bool), ExecError> {
     let sequence = SHM_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     if prefer_tmp {
         let directory = std::env::var_os("TMPDIR").unwrap_or_else(|| "/tmp".into());
-        let name = CString::new(format!(
+        let name = format!(
             "{}/arinsal-jit-{}-{sequence}",
             directory.to_string_lossy().trim_end_matches('/'),
             std::process::id()
-        ))
-        .expect("generated temporary path has no NUL");
-        // SAFETY: name is a valid unique path and mode is supplied for O_CREAT.
-        let fd = unsafe {
-            libc::open(
-                name.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
+        );
+        let fd = open(
+            name.as_str(),
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|error| ExecError::MappingFailed(error.into()))?;
         Ok((fd, name, true))
     } else {
-        let name = CString::new(format!("/arinsal-jit-{}-{sequence}", std::process::id()))
-            .expect("generated shared-memory name has no NUL");
-        // SAFETY: name is a valid NUL-terminated POSIX shared-memory name.
-        let fd = unsafe {
-            libc::shm_open(
-                name.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
+        let name = format!("/arinsal-jit-{}-{sequence}", std::process::id());
+        let fd = shm::open(
+            name.as_str(),
+            shm::OFlags::RDWR | shm::OFlags::CREATE | shm::OFlags::EXCL,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|error| ExecError::MappingFailed(error.into()))?;
         Ok((fd, name, false))
     }
 }
 
 #[cfg(target_os = "linux")]
 // Port of asmjit `map_memory`, used by `alloc_dual_mapping_using_file`, virtmem.cpp:1087-1113.
-fn map_fd(fd: libc::c_int, size: usize, protection: libc::c_int) -> Result<*mut u8, ExecError> {
-    // SAFETY: fd is open, offset zero and size describe its shared backing object, and MAP_FAILED
-    // is checked before the pointer is returned.
-    let ptr = unsafe {
-        libc::mmap(
+fn map_fd(fd: &OwnedFd, size: usize, protection: ProtFlags) -> Result<*mut u8, ExecError> {
+    // SAFETY: the descriptor is open, offset zero and size describe its shared backing object,
+    // and the returned mapping is retained until its corresponding unmap.
+    unsafe {
+        rustix::mm::mmap(
             core::ptr::null_mut(),
             size,
             protection,
-            libc::MAP_SHARED,
+            MapFlags::SHARED,
             fd,
             0,
         )
-    };
-    if ptr == libc::MAP_FAILED {
-        Err(ExecError::MappingFailed(std::io::Error::last_os_error()))
-    } else {
-        Ok(ptr.cast())
+    }
+    .map(|pointer| pointer.cast())
+    .map_err(|error| ExecError::MappingFailed(error.into()))
+}
+
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "x86_64")))]
+// Port of asmjit `VirtMem::release_dual_mapping`, virtmem.cpp:935-950.
+fn unmap_aliases(rx: *mut u8, rw: *mut u8, size: usize) {
+    // SAFETY: the pointers are live mappings owned by this allocator, and `size` is their mapped
+    // page-rounded block length. The second alias can be null when only the RX mapping succeeded.
+    unsafe {
+        let _ = rustix::mm::munmap(rx.cast(), size);
+        if !rw.is_null() && rw != rx {
+            let _ = rustix::mm::munmap(rw.cast(), size);
+        }
     }
 }
 
@@ -778,20 +736,7 @@ fn macos_x86_dual_mapping(size: usize) -> Result<DualMapping, ExecError> {
 
     // AsmJit uses a writable mapping as the remap source on x86 macOS; unlike Apple Silicon,
     // x86 selects this dual-mapping path rather than MAP_JIT and per-thread write protection.
-    // SAFETY: anonymous private pages are requested read/write and MAP_FAILED is checked.
-    let rx = unsafe {
-        libc::mmap(
-            core::ptr::null_mut(),
-            size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
-            -1,
-            0,
-        )
-    };
-    if rx == libc::MAP_FAILED {
-        return Err(ExecError::MappingFailed(std::io::Error::last_os_error()));
-    }
+    let rx = anonymous_mapping(size, ProtFlags::READ | ProtFlags::WRITE)?;
     // SAFETY: `mach_task_self_` is the process's current Mach task port exported by libSystem.
     let task = unsafe { mach_task_self_ };
     let mut rw_address = 0_u64;
@@ -815,7 +760,7 @@ fn macos_x86_dual_mapping(size: usize) -> Result<DualMapping, ExecError> {
     };
     if remap_result != 0 {
         // SAFETY: rx is the sole live mapping because remap failed.
-        unsafe { libc::munmap(rx, size) };
+        unmap_aliases(rx, core::ptr::null_mut(), size);
         return Err(ExecError::ProtectionFailed(remap_result));
     }
     let rw = rw_address as *mut u8;
@@ -824,23 +769,14 @@ fn macos_x86_dual_mapping(size: usize) -> Result<DualMapping, ExecError> {
         (rw_address, VM_PROT_READ | VM_PROT_WRITE),
     ] {
         // SAFETY: address and size identify one of the two aliases made by mach_vm_remap.
-        let maximum_result = unsafe { vm_protect(task, address, size as u64, 1, protection) };
+        let maximum_result = mach_vm_protect(task, address, size as u64, 1, protection);
         if maximum_result != 0 {
-            // SAFETY: both aliases are live and owned by this function.
-            unsafe {
-                libc::munmap(rx, size);
-                libc::munmap(rw.cast(), size);
-            }
+            unmap_aliases(rx, rw, size);
             return Err(ExecError::ProtectionFailed(maximum_result));
         }
-        // SAFETY: the alias is live and its maximum permission has just been restricted.
-        let current_result = unsafe { vm_protect(task, address, size as u64, 0, protection) };
+        let current_result = mach_vm_protect(task, address, size as u64, 0, protection);
         if current_result != 0 {
-            // SAFETY: both aliases are live and owned by this function.
-            unsafe {
-                libc::munmap(rx, size);
-                libc::munmap(rw.cast(), size);
-            }
+            unmap_aliases(rx, rw, size);
             return Err(ExecError::ProtectionFailed(current_result));
         }
     }
@@ -849,6 +785,24 @@ fn macos_x86_dual_mapping(size: usize) -> Result<DualMapping, ExecError> {
         rw,
         size,
     })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+// Port of asmjit `alloc_dual_mapping_using_mach_vm_remap`, virtmem.cpp:999-1083.
+fn anonymous_mapping(size: usize, protection: ProtFlags) -> Result<*mut u8, ExecError> {
+    // SAFETY: a fresh private mapping is requested at any address and retained until unmapping.
+    unsafe {
+        rustix::mm::mmap_anonymous(core::ptr::null_mut(), size, protection, MapFlags::PRIVATE)
+    }
+    .map(|pointer| pointer.cast())
+    .map_err(|error| ExecError::MappingFailed(error.into()))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+// Port of asmjit `alloc_dual_mapping_using_mach_vm_remap`, virtmem.cpp:999-1083.
+fn mach_vm_protect(task: u32, address: u64, size: u64, set_maximum: i32, protection: i32) -> i32 {
+    // SAFETY: `address` and `size` identify a live alias returned by mach_vm_remap.
+    unsafe { vm_protect(task, address, size, set_maximum, protection) }
 }
 
 // x86 instruction and data caches are coherent, so publishing RX after an RW-alias write needs
