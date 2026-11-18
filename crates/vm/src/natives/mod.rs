@@ -126,17 +126,6 @@ impl NativeArgs<'_> {
         .map_or(&[], |registers| &registers.x_reg_array[..arity])
     }
 
-    #[inline]
-    pub(crate) fn get(self, _process: &Process, index: usize) -> Option<Term> {
-        match self {
-            Self::Registers(reg, arity) if index < arity => {
-                Self::register_window(reg, arity).get(index).copied()
-            }
-            Self::Registers(..) => None,
-            Self::Slice(args) => args.get(index).copied(),
-        }
-    }
-
     pub(crate) fn with_values<R>(
         self,
         process: &mut Process,
@@ -197,7 +186,6 @@ pub fn implemented_natives() -> &'static [(&'static str, &'static str, u8)] {
             erl_debugger::IMPLEMENTED,
             erts_debug::IMPLEMENTED,
             dist::IMPLEMENTED,
-            ets::IMPLEMENTED,
             nif::IMPLEMENTED,
             re::IMPLEMENTED,
             node::IMPLEMENTED,
@@ -232,7 +220,6 @@ fn family_dispatches(module: &str, function: &str, arity: u8) -> bool {
         || code::recognizes(module, function, arity)
         || dist::recognizes(module, function, arity)
         || listed(misc::IMPLEMENTED, module, function, arity)
-        || ets::recognizes(module, function, arity)
         || nif::recognizes(module, function, arity)
         || re::recognizes(module, function, arity)
         || node::recognizes(module, function, arity)
@@ -278,7 +265,6 @@ fn handler_agrees(module: &str, function: &str, arity: u8) -> bool {
     if code::recognizes(module, function, arity)
         || listed(erts_debug::IMPLEMENTED, module, function, arity)
         || dist::recognizes(module, function, arity)
-        || ets::recognizes(module, function, arity)
         || proc::recognizes(module, function, arity)
         || listed(records::IMPLEMENTED, module, function, arity)
         || crate::signals::recognizes(module, function, arity)
@@ -678,9 +664,6 @@ fn resolve(module: &str, function: &str, arity: u8) -> Option<NativeEntry> {
     if code::recognizes(module, function, arity) {
         return Some(NativeEntry::DirectFamily(code::call));
     }
-    if let Some(handle) = ets::handler(module, function, arity) {
-        return Some(NativeEntry::Resolved(handle));
-    }
     if crate::seq_trace::recognizes(module, function, arity) {
         return Some(NativeEntry::DirectFamily(crate::seq_trace::call));
     }
@@ -774,17 +757,6 @@ mod tests {
                 "{module}:{function}/{arity} is listed but its family does not dispatch it"
             );
         }
-    }
-
-    #[test]
-    fn ets_imports_resolve_to_distinct_entries() {
-        let entries = ets::IMPLEMENTED
-            .iter()
-            .map(|&(module, function, arity)| {
-                ets::handler(module, function, arity).expect("listed ETS BIF has an entry") as usize
-            })
-            .collect::<std::collections::HashSet<_>>();
-        assert_eq!(entries.len(), ets::IMPLEMENTED.len());
     }
 
     #[test]

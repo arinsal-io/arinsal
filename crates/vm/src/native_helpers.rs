@@ -1112,9 +1112,6 @@ pub(crate) fn light_entry(export: ExportDispatch) -> Option<usize> {
                 .unwrap_or(crate::bif_table::bif!(process_bif_light)),
         );
     }
-    if export.direct_ets.is_some() {
-        return Some(crate::bif_table::bif!(direct_bif_light));
-    }
     if export.runs_in_executor() {
         return Some(crate::bif_table::bif!(yield_executor_bif));
     }
@@ -1260,30 +1257,6 @@ fn thin_bif_failed(
     process_bif_result(process, export, Err(trap))
 }
 
-/// An ETS or process-dictionary BIF whose body is `direct_ets`.
-pub(crate) extern "C" fn direct_bif_light(
-    header: *mut ProcessHeader,
-    regs: *mut u64,
-    _i: u64,
-) -> u64 {
-    // Port of erts/emulator/beam/bif.h (BIF_ALIST: `c_p, reg, I`), OTP-29.1.1: the BIF
-    // finds its export through `c_p->current`, which the call fragment set.
-    let (descriptor, identity) = crate::bif_table::current_export(header);
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, regs) else {
-        return 0;
-    };
-    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
-        return 0;
-    };
-    if let Some(raw) = call_direct_bif(process, registers, export, false) {
-        return raw;
-    }
-    process.heap.abi.arity = export.arity;
-    process.heap.abi.i = identity as *const u8 as *const _;
-    process.heap.abi.exc.freason = 1 << 10;
-    0
-}
-
 // `export_call`: reached through an export entry, whose BIF trampoline charges the call one
 // reduction (erts/emulator/beam/jit/arm/instr_bif.cpp:399, OTP-29.1.1); a light BIF call
 // site has already charged it.
@@ -1312,13 +1285,6 @@ fn invoke_dispatch_bif(
         }
         // The light-BIF fragment already loaded `Export.is_bif_traced` and compared
         // `active_code_ix` (instr_bif.cpp:391-397). An export-entry call has not.
-        // ETS and the process dictionary run here so a `call_ext` does not trap back
-        // into the executor once per key.
-        if export.direct_ets.is_some()
-            && let Some(raw) = call_direct_bif(process, registers, export, export_call)
-        {
-            return Some(raw);
-        }
     }
     if let Some(export) = export
         && let Some(bif) = export.light_process_bif
@@ -1457,98 +1423,6 @@ fn invoke_dispatch_bif_slow(
     }
     park_executor(process, export, identity as u64, !export_call);
     None
-}
-
-/// Runs an ETS or process-dictionary BIF from native code.
-///
-/// `None` means the direct body declined (or a trace pattern is active) and the
-/// scheduler path must run the call.
-fn call_direct_bif(
-    process: &mut crate::Process,
-    registers: &mut arinsal_beamasm::SchedulerRegisters,
-    export: ExportDispatch,
-    export_call: bool,
-) -> Option<u64> {
-    let direct = export.direct_ets?;
-    if export.is_bif_traced() {
-        return None;
-    }
-    let arity = usize::from(export.arity).min(4);
-    let args = [
-        registers.x_reg_array[0],
-        registers.x_reg_array[1],
-        registers.x_reg_array[2],
-        registers.x_reg_array[3],
-    ];
-    let value = direct(
-        process,
-        &args[..arity],
-        export.module_atom,
-        export.function_atom,
-    )?;
-    if export_call {
-        charge_bif_reductions(process, 1);
-    }
-    // Port of erts/emulator/beam/bif.h (BIF_ERROR) and jit/arm/instr_bif.cpp
-    // (call_light_bif_shared), OTP-29.1.1: a failed BIF returns THE_NON_VALUE with only
-    // `freason`/`fvalue` set; the call is not redone. `handle_error` builds the top frame from
-    // `bif_mfa` (`c_p->current`) and the arguments still in the X registers.
-    if value.is_non_value() {
-        process.heap.abi.current = std::ptr::from_ref(export.mfa()).cast();
-        // Port of erl_gc.c (erts_gc_after_bif_call_lhf), OTP-29.1.1: the GC-desired test runs
-        // before the result is looked at, so a failed BIF collects too, with its arguments live.
-        if process.heap.gc_after_bif_desired() {
-            direct_bif_error_gc(process, registers, usize::from(export.arity));
-        }
-        return Some(0);
-    }
-    registers.x_reg_array[0] = value;
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_light_bif_shared) and
-    // beam_jit_common.cpp (beam_jit_call_bif), OTP-29.1.1: the BIF only returns its result.
-    // The one collection after it is the caller's `erts_gc_after_bif_call_lhf`, with the
-    // result as its root: the light fragment's test, or the export trampoline's
-    // `gc_after_bif_call`.
-    Some(crate::native_hooks::raw(value))
-}
-
-/// Collects after a direct BIF that failed: the argument registers and the failure words are
-/// the roots. A failed collection replaces the failure with `system_limit`.
-// Port of erts/emulator/beam/erl_gc.c (erts_gc_after_bif_call_lhf, with `c_p->fvalue` and
-// `c_p->ftrace` as process roots), OTP-29.1.1.
-#[cold]
-#[inline(never)]
-fn direct_bif_error_gc(
-    process: &mut crate::Process,
-    registers: &mut arinsal_beamasm::SchedulerRegisters,
-    arity: usize,
-) {
-    let ftrace = process.heap.abi.exc.ftrace;
-    let mut roots = [
-        crate::native_hooks::from_raw(process.heap.abi.exc.fvalue),
-        if ftrace == 0 {
-            Term::NIL
-        } else {
-            crate::native_hooks::from_raw(ftrace)
-        },
-    ];
-    match process.collect_heap_roots_objv(&mut registers.x_reg_array[..arity], &mut roots, 0) {
-        Ok(stats) => {
-            process.heap.abi.exc.fvalue = crate::native_hooks::raw(roots[0]);
-            if ftrace != 0 {
-                process.heap.abi.exc.ftrace = crate::native_hooks::raw(roots[1]);
-            }
-            crate::natives::sys::after_collection(
-                process,
-                stats.collections,
-                stats.words_reclaimed,
-            );
-            process.charge_gc_stats(&stats);
-        }
-        Err(_) => {
-            process.heap.abi.exc.ftrace = 0;
-            crate::native_hooks::set_error(process, "system_limit");
-        }
-    }
 }
 
 /// Everything after a light BIF that did not just return a value: a continuation the body

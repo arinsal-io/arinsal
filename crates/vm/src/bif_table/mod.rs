@@ -145,9 +145,18 @@ pub(crate) fn call_from_executor(
             // BIF_TRAP*: the executor makes the trap export's call next.
             None => match crate::bif_traps::take_export_trap(process) {
                 Some(trap) => crate::VmError::TrapExport(trap),
-                None => crate::VmError::Unsupported(format!(
-                    "{module}:{function}/{arity}: BIF_TRAP from the executor"
-                )),
+                // An outcome only the scheduler completes (ERTS_BIF_YIELD): the call finishes
+                // with it, as `executor_after_native` finishes a native call.
+                None => match process
+                    .cold
+                    .as_mut()
+                    .and_then(|cold| cold.bif_outcome.take())
+                {
+                    Some(outcome) => *outcome,
+                    None => crate::VmError::Unsupported(format!(
+                        "{module}:{function}/{arity}: BIF_TRAP from the executor"
+                    )),
+                },
             },
         },
     ))
@@ -157,7 +166,6 @@ pub(crate) fn call_from_executor(
 pub(crate) fn is_body(f: usize) -> bool {
     f != 0
         && f != bif!(crate::native_helpers::yield_executor_bif)
-        && f != bif!(crate::native_helpers::direct_bif_light)
         && f != bif!(crate::native_helpers::process_bif_light)
         && f != bif!(crate::native_helpers::process_info_2_light)
 }
@@ -299,6 +307,59 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("ets", "insert", 2) => bif!(erl_db::ets_insert_2),
         ("ets", "insert_new", 2) => bif!(erl_db::ets_insert_new_2),
         ("ets", "lookup", 2) => bif!(erl_db::ets_lookup_2),
+        ("erlang", "match_spec_test", 3) => bif!(erl_db::match_spec_test_3),
+        ("erts_internal", "ets_lookup_binary_info", 2) => bif!(erl_db::ets_lookup_binary_info_2),
+        ("erts_internal", "ets_raw_first", 1) => bif!(erl_db::ets_raw_first_1),
+        ("erts_internal", "ets_raw_next", 2) => bif!(erl_db::ets_raw_next_2),
+        ("erts_internal", "ets_super_user", 1) => bif!(erl_db::ets_super_user_1),
+        ("ets", "new", 2) => bif!(erl_db::ets_new_2),
+        ("ets", "whereis", 1) => bif!(erl_db::ets_whereis_1),
+        ("ets", "rename", 2) => bif!(erl_db::ets_rename_2),
+        ("ets", "info", 1) => bif!(erl_db::ets_info_1),
+        ("ets", "info", 2) => bif!(erl_db::ets_info_2),
+        ("ets", "delete", 1) => bif!(erl_db::ets_delete_1),
+        ("ets", "delete", 2) => bif!(erl_db::ets_delete_2),
+        ("ets", "internal_delete_all", 2) => bif!(erl_db::ets_internal_delete_all_2),
+        ("ets", "setopts", 2) => bif!(erl_db::ets_setopts_2),
+        ("ets", "member", 2) => bif!(erl_db::ets_member_2),
+        ("ets", "take", 2) => bif!(erl_db::ets_take_2),
+        ("ets", "slot", 2) => bif!(erl_db::ets_slot_2),
+        ("ets", "first", 1) => bif!(erl_db::ets_first_1),
+        ("ets", "first_lookup", 1) => bif!(erl_db::ets_first_lookup_1),
+        ("ets", "last", 1) => bif!(erl_db::ets_last_1),
+        ("ets", "last_lookup", 1) => bif!(erl_db::ets_last_lookup_1),
+        ("ets", "next", 2) => bif!(erl_db::ets_next_2),
+        ("ets", "next_lookup", 2) => bif!(erl_db::ets_next_lookup_2),
+        ("ets", "prev", 2) => bif!(erl_db::ets_prev_2),
+        ("ets", "prev_lookup", 2) => bif!(erl_db::ets_prev_lookup_2),
+        ("ets", "safe_fixtable", 2) => bif!(erl_db::ets_safe_fixtable_2),
+        ("ets", "delete_object", 2) => bif!(erl_db::ets_delete_object_2),
+        ("ets", "give_away", 3) => bif!(erl_db::ets_give_away_3),
+        ("ets", "select", 1) => bif!(erl_db::ets_select_1),
+        ("ets", "select", 2) => bif!(erl_db::ets_select_2),
+        ("ets", "select", 3) => bif!(erl_db::ets_select_3),
+        ("ets", "select_reverse", 1) => bif!(erl_db::ets_select_reverse_1),
+        ("ets", "select_reverse", 2) => bif!(erl_db::ets_select_reverse_2),
+        ("ets", "select_reverse", 3) => bif!(erl_db::ets_select_reverse_3),
+        ("ets", "match", 1) => bif!(erl_db::ets_match_1),
+        ("ets", "match", 2) => bif!(erl_db::ets_match_2),
+        ("ets", "match", 3) => bif!(erl_db::ets_match_3),
+        ("ets", "match_object", 1) => bif!(erl_db::ets_match_object_1),
+        ("ets", "match_object", 2) => bif!(erl_db::ets_match_object_2),
+        ("ets", "match_object", 3) => bif!(erl_db::ets_match_object_3),
+        ("ets", "match_spec_compile", 1) => bif!(erl_db::ets_match_spec_compile_1),
+        ("ets", "is_compiled_ms", 1) => bif!(erl_db::ets_is_compiled_ms_1),
+        ("ets", "internal_request_all", 0) => bif!(erl_db::ets_internal_request_all_0),
+        ("ets", "match_spec_run_r", 3) => bif!(erl_db::ets_match_spec_run_r_3),
+        ("ets", "select_count", 2) => bif!(erl_db::ets_select_count_2),
+        ("ets", "internal_select_delete", 2) => bif!(erl_db::ets_internal_select_delete_2),
+        ("ets", "select_replace", 2) => bif!(erl_db::ets_select_replace_2),
+        ("ets", "lookup_element", 3) => bif!(erl_db::ets_lookup_element_3),
+        ("ets", "lookup_element", 4) => bif!(erl_db::ets_lookup_element_4),
+        ("ets", "update_element", 3) => bif!(erl_db::ets_update_element_3),
+        ("ets", "update_element", 4) => bif!(erl_db::ets_update_element_4),
+        ("ets", "update_counter", 3) => bif!(erl_db::ets_update_counter_3),
+        ("ets", "update_counter", 4) => bif!(erl_db::ets_update_counter_4),
         // erl_bif_atomics.c
         ("erts_internal", "atomics_new", 2) => bif!(erl_bif_atomics::atomics_new_2),
         ("atomics", "put", 3) => bif!(erl_bif_atomics::atomics_put_3),

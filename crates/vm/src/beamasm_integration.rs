@@ -127,11 +127,6 @@ pub(crate) struct DispatchTarget {
     /// The MFA is a light (not heap) BIF in the BIF table (erts `Export.bif_number` with the
     /// light-BIF kind), looked up once at intern.
     pub light_kind: bool,
-    /// Runs the BIF inside native code, without a trap back into the executor.
-    /// ETS uses this, and so do `erlang:put/2` and `erlang:erase/1`: those are
-    /// heap BIFs in erts (`call_ext`), and trapping once per key dominated the
-    /// dictionary benchmark.
-    pub direct_ets: Option<crate::natives::ets::DirectEts>,
     /// The process BIF a light BIF call runs straight away, for a native that needs only its
     /// process (see `natives::ProcessBif`); the executor still runs it for interpreted code.
     pub light_process_bif: Option<crate::natives::ProcessBif>,
@@ -569,7 +564,6 @@ pub(crate) fn make_export(mfa: Mfa) -> Option<&'static Arc<arinsal_beamasm::bif:
             // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
             slot: new_export_slot(mfa, trampoline, save_calls),
             light_kind: light_kind(&module, &function, mfa.2),
-            direct_ets: crate::natives::ets::direct_entry(&module, &function, mfa.2),
             module: module.clone(),
             function: function.clone(),
             module_atom: mfa.0,
@@ -629,11 +623,6 @@ fn import_entries(module: &arinsal_loader::Module) -> Option<ImportEntries> {
                 // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
                 slot: new_export_slot(mfa, trampoline, save_calls),
                 light_kind: light_kind(import.module, import.function, import.arity),
-                direct_ets: crate::natives::ets::direct_entry(
-                    import.module,
-                    import.function,
-                    import.arity,
-                ),
                 module: import.module.to_owned(),
                 function: import.function.to_owned(),
                 module_atom: import.module_atom,
@@ -672,7 +661,6 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
         Arc::new(DispatchTarget {
             slot: new_export_slot(key, trampoline, save_calls),
             light_kind: light_kind(module, function, arity),
-            direct_ets: crate::natives::ets::direct_entry(module, function, arity),
             module: module.to_owned(),
             function: function.to_owned(),
             module_atom,
@@ -710,11 +698,6 @@ fn publish_module(
                 // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
                 slot: new_export_slot(mfa, trampoline, save_calls),
                 light_kind: light_kind(&module.name, export.function, export.arity),
-                direct_ets: crate::natives::ets::direct_entry(
-                    &module.name,
-                    export.function,
-                    export.arity,
-                ),
                 module: module.name.clone(),
                 function: export.function.to_owned(),
                 module_atom: module.name_atom,
