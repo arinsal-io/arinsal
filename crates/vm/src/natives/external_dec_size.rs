@@ -55,7 +55,6 @@ pub(crate) fn decoded_size(
     const SMALL_MAP_LIMIT: usize = 32;
     const ERL_ONHEAP_BIN_LIMIT: usize = 64;
     const EXTERNAL_THING_HEAD_SIZE: usize = 3;
-    let endp = bytes.len();
     if !sc.started {
         *sc = B2tSizeState {
             started: true,
@@ -64,7 +63,9 @@ pub(crate) fn decoded_size(
             ..B2tSizeState::default()
         };
     }
-    let mut ep = sc.ep;
+    // `ep`..`endp` as one slice: a length check and the read behind it are one test, as the
+    // `CHKSIZE` + read of erts compile to.
+    let mut rest: &[u8] = bytes.get(sc.ep..).ok_or(BifError::BADARG)?;
     let mut atom_extra_skip = sc.atom_extra_skip;
     let mut lext_state = sc.lext_state.take();
     let mut heap_size = sc.heap_size;
@@ -72,26 +73,42 @@ pub(crate) fn decoded_size(
     let mut lext_term_end = sc.lext_term_end;
     let mut terms = sc.terms;
     let error = || BifError::BADARG;
-    macro_rules! chksize {
-        ($sz:expr) => {
-            if $sz > endp - ep {
-                return Err(error());
-            }
+    macro_rules! ep {
+        () => {
+            bytes.len() - rest.len()
         };
     }
     macro_rules! skip {
         ($sz:expr) => {{
             let sz: usize = $sz;
-            if sz > endp - ep {
-                return Err(error());
-            }
-            ep += sz;
+            rest = rest.get(sz..).ok_or_else(error)?;
         }};
     }
     macro_rules! skip2 {
         ($sz1:expr, $sz2:expr) => {{
             let sz = usize::checked_add($sz1, $sz2).ok_or_else(error)?;
             skip!(sz);
+        }};
+    }
+    macro_rules! rd8 {
+        () => {{
+            let (&b, r) = rest.split_first().ok_or_else(error)?;
+            rest = r;
+            b
+        }};
+    }
+    macro_rules! rd16 {
+        () => {{
+            let (b, r) = rest.split_first_chunk::<2>().ok_or_else(error)?;
+            rest = r;
+            u16::from_be_bytes(*b)
+        }};
+    }
+    macro_rules! rd32 {
+        () => {{
+            let (b, r) = rest.split_first_chunk::<4>().ok_or_else(error)?;
+            rest = r;
+            u32::from_be_bytes(*b)
         }};
     }
     macro_rules! addterms {
@@ -105,9 +122,6 @@ pub(crate) fn decoded_size(
             heap_size = heap_size.checked_add($n).ok_or_else(error)?;
         }};
     }
-    let u8_at = |ep: usize| bytes[ep];
-    let u16_at = |ep: usize| u16::from_be_bytes([bytes[ep], bytes[ep + 1]]);
-    let u32_at = |ep: usize| u32::from_be_bytes(bytes[ep..ep + 4].try_into().unwrap());
     // `goto continue_check_lext`: a hash that yielded resumes at the check, not at a tag.
     let mut resume_lext = terms == lext_term_end && lext_hash.is_some();
     loop {
@@ -115,23 +129,17 @@ pub(crate) fn decoded_size(
             if std::mem::take(&mut resume_lext) {
                 break 'tag;
             }
-            chksize!(1);
-            let tag = u8_at(ep);
-            ep += 1;
+            let tag = rd8!();
             match tag {
                 97 => skip!(1),
                 98 => skip!(4),
                 110 => {
-                    chksize!(1);
-                    let n = u8_at(ep) as usize;
-                    ep += 1;
+                    let n = rd8!() as usize;
                     skip2!(n, 1);
                     words!(1 + n.div_ceil(8));
                 }
                 111 => {
-                    chksize!(4);
-                    let n = u32_at(ep) as usize;
-                    ep += 4;
+                    let n = rd32!() as usize;
                     if n > 65_535 * 4 {
                         return Err(error());
                     }
@@ -139,9 +147,7 @@ pub(crate) fn decoded_size(
                     words!(2 + n.div_ceil(8));
                 }
                 100 | 118 => {
-                    chksize!(2);
-                    let n = u16_at(ep) as usize;
-                    ep += 2;
+                    let n = rd16!() as usize;
                     if (tag == 118 && n > 1020) || (tag == 100 && n > 255) {
                         return Err(error());
                     }
@@ -149,9 +155,7 @@ pub(crate) fn decoded_size(
                     atom_extra_skip = 0;
                 }
                 115 | 119 => {
-                    chksize!(1);
-                    let n = u8_at(ep) as usize;
-                    ep += 1;
+                    let n = rd8!() as usize;
                     skip2!(n, atom_extra_skip);
                     atom_extra_skip = 0;
                 }
@@ -182,9 +186,7 @@ pub(crate) fn decoded_size(
                     let (id_words, extra) = if tag == 101 {
                         (1usize, 5usize)
                     } else {
-                        chksize!(2);
-                        let n = u16_at(ep) as usize;
-                        ep += 2;
+                        let n = rd16!() as usize;
                         if n > 5 {
                             return Err(error());
                         }
@@ -204,10 +206,8 @@ pub(crate) fn decoded_size(
                     }
                 }
                 108 => {
-                    chksize!(4);
-                    let n = u32_at(ep) as usize;
-                    ep += 4;
-                    if n.checked_add(1).is_none_or(|count| count > endp - ep) {
+                    let n = rd32!() as usize;
+                    if n.checked_add(1).is_none_or(|count| count > rest.len()) {
                         return Err(error());
                     }
                     addterms!(n);
@@ -216,15 +216,11 @@ pub(crate) fn decoded_size(
                 }
                 104 | 105 => {
                     let n = if tag == 104 {
-                        chksize!(1);
-                        ep += 1;
-                        u8_at(ep - 1) as usize
+                        rd8!() as usize
                     } else {
-                        chksize!(4);
-                        ep += 4;
-                        u32_at(ep - 4) as usize
+                        rd32!() as usize
                     };
-                    if n > (1 << 24) - 1 || n > endp - ep {
+                    if n > (1 << 24) - 1 || n > rest.len() {
                         return Err(error());
                     }
                     addterms!(n);
@@ -233,14 +229,12 @@ pub(crate) fn decoded_size(
                     }
                 }
                 116 => {
-                    chksize!(4);
-                    let n = u32_at(ep) as usize;
-                    ep += 4;
+                    let n = rd32!() as usize;
                     if n > (1 << 31) - 1 {
                         return Err(error());
                     }
                     let children = n.checked_mul(2).ok_or_else(error)?;
-                    if children > endp - ep {
+                    if children > rest.len() {
                         return Err(error());
                     }
                     if n <= SMALL_MAP_LIMIT {
@@ -255,9 +249,7 @@ pub(crate) fn decoded_size(
                     addterms!(children);
                 }
                 107 => {
-                    chksize!(2);
-                    let n = u16_at(ep) as usize;
-                    ep += 2;
+                    let n = rd16!() as usize;
                     skip!(n);
                     words!(n.checked_mul(2).ok_or_else(error)?);
                 }
@@ -270,9 +262,7 @@ pub(crate) fn decoded_size(
                     words!(3);
                 }
                 109 => {
-                    chksize!(4);
-                    let n = u32_at(ep) as usize;
-                    ep += 4;
+                    let n = rd32!() as usize;
                     skip!(n);
                     words!(if n <= ERL_ONHEAP_BIN_LIMIT {
                         2 + n.div_ceil(8)
@@ -281,10 +271,8 @@ pub(crate) fn decoded_size(
                     });
                 }
                 77 => {
-                    chksize!(5);
-                    let n = u32_at(ep) as usize;
-                    let bits = u8_at(ep + 4);
-                    ep += 5;
+                    let n = rd32!() as usize;
+                    let bits = rd8!();
                     if !(1..=8).contains(&bits) || n == 0 {
                         return Err(error());
                     }
@@ -298,9 +286,11 @@ pub(crate) fn decoded_size(
                 113 => addterms!(3usize),
                 112 => {
                     // The Size field is ignored by dec_term; it has historical OTP bugs.
-                    chksize!(4 + 1 + 16 + 4 + 4);
-                    let free = u32_at(ep + 25) as usize;
-                    ep += 29;
+                    let (hdr, r) = rest
+                        .split_first_chunk::<{ 4 + 1 + 16 + 4 + 4 }>()
+                        .ok_or_else(error)?;
+                    let free = u32::from_be_bytes([hdr[25], hdr[26], hdr[27], hdr[28]]) as usize;
+                    rest = r;
                     if free > 255 {
                         return Err(error());
                     }
@@ -308,20 +298,16 @@ pub(crate) fn decoded_size(
                     words!(2 + free);
                 }
                 121 => {
-                    chksize!(4);
-                    let hash = u32_at(ep);
-                    ep += 4;
+                    let hash = rd32!();
                     if lext_hash.is_some() {
                         return Err(error());
                     }
-                    lext_hash = Some((hash, ep));
+                    lext_hash = Some((hash, ep!()));
                     lext_term_end = terms.checked_sub(1).ok_or_else(error)?;
                     addterms!(1usize);
                 }
                 67 => {
-                    chksize!(4);
-                    let n = u32_at(ep) as usize;
-                    ep += 4;
+                    let n = rd32!() as usize;
                     let record_words = n
                         .checked_mul(2)
                         .and_then(|fields| fields.checked_add(8))
@@ -341,6 +327,7 @@ pub(crate) fn decoded_size(
         }
         if terms == lext_term_end {
             let (expected, start) = lext_hash.ok_or_else(error)?;
+            let ep = ep!();
             if ep <= start {
                 return Err(error());
             }
@@ -370,7 +357,7 @@ pub(crate) fn decoded_size(
                 complete: false,
                 input_ptr: 0,
                 input_len: 0,
-                ep,
+                ep: ep!(),
                 atom_extra_skip,
                 heap_size,
                 lext_hash,
@@ -380,7 +367,7 @@ pub(crate) fn decoded_size(
             return Ok(None);
         }
         if terms == 0 {
-            sc.ep = ep;
+            sc.ep = ep!();
             sc.complete = true;
             sc.input_ptr = bytes.as_ptr() as usize;
             sc.input_len = bytes.len();

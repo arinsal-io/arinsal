@@ -19,35 +19,41 @@ use num_bigint::{BigInt, Sign};
 use smallvec::SmallVec;
 use std::sync::Arc;
 
+#[derive(Clone, Copy)]
 pub(super) struct Reader<'a> {
     pub(super) validated: ValidatedBytes<'a>,
-    pub(super) at: usize,
+    cur: raw::Cursor<'a>,
 }
 impl Reader<'_> {
+    pub(super) fn at(&self) -> usize {
+        self.cur.offset(self.validated)
+    }
+    pub(super) fn set_at(&mut self, at: usize) {
+        self.cur = raw::Cursor::at(self.validated, at);
+    }
+    pub(super) fn cur_peek(&self) -> u8 {
+        self.cur.peek()
+    }
+    pub(super) fn cur_skip(&mut self, n: usize) {
+        self.cur.skip(n);
+    }
+    pub(super) fn cur_back(&mut self, n: usize) {
+        self.cur.back(n);
+    }
     pub(super) fn take(&mut self, n: usize) -> Result<&[u8], BifError> {
-        let part = raw::take_validated(self.validated, self.at, n);
-        self.at += n;
-        Ok(part)
+        Ok(self.cur.take(n))
     }
     pub(super) fn u8(&mut self) -> Result<u8, BifError> {
-        let value = raw::u8_validated(self.validated, self.at);
-        self.at += 1;
-        Ok(value)
+        Ok(self.cur.u8())
     }
     pub(super) fn u16(&mut self) -> Result<u16, BifError> {
-        let value = raw::u16_validated(self.validated, self.at);
-        self.at += 2;
-        Ok(value)
+        Ok(self.cur.u16())
     }
     pub(super) fn u32(&mut self) -> Result<u32, BifError> {
-        let value = raw::u32_validated(self.validated, self.at);
-        self.at += 4;
-        Ok(value)
+        Ok(self.cur.u32())
     }
     pub(super) fn u64(&mut self) -> Result<u64, BifError> {
-        let value = raw::u64_validated(self.validated, self.at);
-        self.at += 8;
-        Ok(value)
+        Ok(self.cur.u64())
     }
     pub(super) fn atom(
         &mut self,
@@ -105,7 +111,10 @@ impl Reader<'_> {
 
 impl<'a> Reader<'a> {
     pub(super) fn new(validated: ValidatedBytes<'a>, at: usize) -> Self {
-        Self { validated, at }
+        Self {
+            validated,
+            cur: raw::Cursor::at(validated, at),
+        }
     }
 }
 
@@ -186,8 +195,8 @@ fn produce(
 /// `dec_sysname`: a node name atom, or `NIL_EXT` for this node under `LOCAL_EXT`.
 // Port of erts/emulator/beam/external.c (dec_sysname), OTP-29.1.1.
 fn dec_sysname(r: &mut Reader<'_>, flags: &DecFlags) -> Result<(Atom, bool), BifError> {
-    if flags.internal_nc && r.validated.as_slice().get(r.at) == Some(&106) {
-        r.at += 1;
+    if flags.internal_nc && r.at() < r.validated.as_slice().len() && r.cur_peek() == 106 {
+        r.cur_skip(1);
         return Ok((flags.this_node.0, true));
     }
     let node = r
@@ -260,6 +269,212 @@ pub(crate) fn dec_term(
     }
 }
 
+/// The rare tags of `dec_term`, outlined so the hot loop keeps its cursor, `next` and `reds`
+/// in registers: the cursor and `next` go in by value and come back.
+// Port of erts/emulator/beam/external.c (dec_term, the cases off the hot path), OTP-29.1.1.
+#[inline(never)]
+fn dec_rare(
+    tag: u8,
+    mut r: Reader<'_>,
+    fac: &mut HeapReservation<'_, ProcessHeap>,
+    flags: &mut DecFlags,
+    objp: HeapSlotPtr,
+    mut next: Option<HeapSlotPtr>,
+) -> Result<(usize, Option<HeapSlotPtr>), BifError> {
+    match tag {
+        110 | 111 => {
+            let n = if tag == 110 {
+                r.u8()? as usize
+            } else {
+                r.u32()? as usize
+            };
+            let neg = r.u8()?;
+            let digits = r.take(n)?;
+            // Strip away leading zeroes to avoid creating illegal bignums.
+            let len = digits
+                .iter()
+                .rposition(|byte| *byte != 0)
+                .map_or(0, |i| i + 1);
+            let big = if len == 0 {
+                Term::small(0).unwrap()
+            } else {
+                let value = BigInt::from_bytes_le(
+                    if neg == 0 { Sign::Plus } else { Sign::Minus },
+                    &digits[..len],
+                );
+                TermBuilder::new(&mut *fac)
+                    .int_from_bigint(&value)
+                    .map_err(map_term_build_error)?
+            };
+            objp.store(big.word());
+        }
+        99 | 70 => {
+            let value = if tag == 70 {
+                let value = f64::from_bits(r.u64()?);
+                if !value.is_finite() {
+                    return Err(BifError::BADARG);
+                }
+                value
+            } else {
+                // sys_chars_to_double
+                let raw = r.take(31)?;
+                let end = raw.iter().position(|byte| *byte == 0).unwrap_or(31);
+                let value = std::str::from_utf8(&raw[..end])
+                    .map_err(|_| BifError::BADARG)?
+                    .trim()
+                    .parse::<f64>()
+                    .map_err(|_| BifError::BADARG)?;
+                if !value.is_finite() {
+                    return Err(BifError::BADARG);
+                }
+                value
+            };
+            objp.store(
+                TermBuilder::new(&mut *fac)
+                    .float(value)
+                    .map_err(map_term_build_error)?
+                    .word(),
+            );
+        }
+        103 | 88 => {
+            objp.store(Term::NIL.word());
+            objp.store(dec_pid(&mut r, fac, tag, flags)?.word());
+        }
+        102 | 89 | 120 | 101 | 114 | 90 => {
+            objp.store(dec_port_or_ref(&mut r, fac, tag, flags)?.word());
+        }
+        113 => {
+            let module = r
+                .atom(flags.safe, true)?
+                .0
+                .as_atom()
+                .ok_or(BifError::BADARG)?;
+            let name = r
+                .atom(flags.safe, true)?
+                .0
+                .as_atom()
+                .ok_or(BifError::BADARG)?;
+            let temp = dec_sub_term(fac, &mut r, flags)?;
+            let arity = temp.as_small().ok_or(BifError::BADARG)?;
+            if arity < 0 {
+                return Err(BifError::BADARG);
+            }
+            let arity = u8::try_from(arity).map_err(|_| BifError::BADARG)?;
+            let mfa = (module, name, arity);
+            if flags.safe && crate::export::active_export_entry(mfa).is_none() {
+                return Err(BifError::BADARG);
+            }
+            let export =
+                crate::export::export_get_or_make_stub(mfa).ok_or(BifError::SystemLimit)?;
+            objp.store(
+                TermBuilder::new(&mut *fac)
+                    .export_fun(export)
+                    .map_err(map_term_build_error)?
+                    .word(),
+            );
+        }
+        112 => {
+            r.take(4)?; // Skip total size in bytes
+            let arity = r.u8()?;
+            let uniq: [u8; 16] = r.take(16)?.try_into().map_err(|_| BifError::BADARG)?;
+            let index = r.u32()?;
+            let num_free = r.u32()? as usize;
+            let funp = produce(fac, ERL_FUN_SIZE + num_free)?;
+            let module = r
+                .atom(flags.safe, true)?
+                .0
+                .as_atom()
+                .ok_or(BifError::BADARG)?;
+            let old_index = dec_sub_term(fac, &mut r, flags)?
+                .as_small()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or(BifError::BADARG)?;
+            let old_uniq = dec_sub_term(fac, &mut r, flags)?
+                .as_small()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or(BifError::BADARG)?;
+            let pid = dec_sub_term(fac, &mut r, flags)?;
+            if pid.classify() != TermKind::Pid {
+                return Err(BifError::BADARG);
+            }
+            let entry = Arc::new(FunEntry {
+                dispatch_target: Default::default(),
+                pend_purge_address: Default::default(),
+                module,
+                arity,
+                index,
+                uniq,
+                old_index,
+                old_uniq,
+                pid,
+                dispatch: Default::default(),
+                dispatch_epoch: Default::default(),
+            });
+            let fun = TermBuilder::<HeapReservation<'_, ProcessHeap>>::init_decoded_fun(
+                funp, entry, num_free,
+            )
+            .map_err(map_term_build_error)?;
+            objp.store(fun.word());
+            for i in (0..num_free).rev() {
+                let env = funp.offset(ERL_FUN_SIZE + i);
+                env.store(link(next));
+                next = Some(env);
+            }
+        }
+        73 | 75 => {
+            let n = if tag == 73 {
+                r.u16()? as u32
+            } else {
+                let b = r.take(3)?;
+                u32::from_be_bytes([0, b[0], b[1], b[2]])
+            };
+            let atom = Atom(n);
+            if global_atoms().text(atom).is_none() {
+                return Err(BifError::BADARG);
+            }
+            objp.store(Term::atom(atom).word());
+        }
+        67 => {
+            let num_fields = r.u32()? as usize;
+            let exported = match r.u8()? {
+                0 => false,
+                1 => true,
+                // The other bits in this byte are reserved and must be zero.
+                _ => return Err(BifError::BADARG),
+            };
+            let module = r
+                .atom(flags.safe, true)?
+                .0
+                .as_atom()
+                .ok_or(BifError::BADARG)?;
+            let name = r
+                .atom(flags.safe, true)?
+                .0
+                .as_atom()
+                .ok_or(BifError::BADARG)?;
+            let mut keys = SmallVec::<[Atom; 8]>::new();
+            for _ in 0..num_fields {
+                keys.push(
+                    r.atom(flags.safe, true)?
+                        .0
+                        .as_atom()
+                        .ok_or(BifError::BADARG)?,
+                );
+            }
+            let (instance, values) = TermBuilder::new(&mut *fac)
+                .decoded_native_record(module, name, exported, &keys)
+                .map_err(map_term_build_error)?;
+            for value in values.iter().rev() {
+                value.store(link(next));
+                next = Some(*value);
+            }
+            objp.store(instance.word());
+        }
+        _ => return Err(BifError::BADARG),
+    }
+    Ok((r.at(), next))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dec_term_body(
     fac: &mut HeapReservation<'_, ProcessHeap>,
@@ -270,25 +485,28 @@ fn dec_term_body(
     flags: &mut DecFlags,
     reds: &mut i64,
 ) -> Result<Option<usize>, BifError> {
+    // `reds` lives in a local so it stays in a register; it is stored back where `dec_term`
+    // returns to its caller, as erts keeps `reds` in a local and writes `ctx->reds` on exit.
+    let mut reds_l = *reds;
     let mut r = Reader::new(validated, ep);
     let mut next: Option<HeapSlotPtr>;
     let mut map_array: SmallVec<[DecTermMap; 10]>;
     if let Some(c) = ctx.as_deref_mut() {
         next = c.dc.next;
-        r.at = c.dc.ep;
+        r.set_at(c.dc.ep);
         if *c.state != B2tState::Decode {
-            let mut n_limit = *reds;
+            let mut n_limit = reds_l;
             let mut n = c.dc.remaining_n as i64;
             if *c.state == B2tState::DecodeBinary {
                 n_limit *= B2T_MEMCPY_FACTOR as i64;
-                *reds -= n / B2T_MEMCPY_FACTOR as i64;
+                reds_l -= n / B2T_MEMCPY_FACTOR as i64;
             } else {
-                *reds -= n;
+                reds_l -= n;
             }
             if n > n_limit {
                 c.dc.remaining_n -= n_limit as usize;
                 n = n_limit;
-                *reds = 0;
+                reds_l = 0;
             } else {
                 c.dc.remaining_n = 0;
             }
@@ -336,10 +554,11 @@ fn dec_term_body(
             if c.dc.remaining_n == 0 {
                 *c.state = B2tState::Decode;
             }
-            if *reds <= 0 {
+            if reds_l <= 0 {
                 c.dc.next = next;
-                c.dc.ep = r.at;
-                *reds = 0;
+                c.dc.ep = r.at();
+                reds_l = 0;
+                *reds = reds_l;
                 return Ok(None);
             }
         }
@@ -361,34 +580,8 @@ fn dec_term_body(
             match tag {
                 98 => objp.store(Term::small(i64::from(r.u32()? as i32)).unwrap().word()),
                 97 => objp.store(Term::small(i64::from(r.u8()?)).unwrap().word()),
-                110 | 111 => {
-                    let n = if tag == 110 {
-                        r.u8()? as usize
-                    } else {
-                        r.u32()? as usize
-                    };
-                    let neg = r.u8()?;
-                    let digits = r.take(n)?;
-                    // Strip away leading zeroes to avoid creating illegal bignums.
-                    let len = digits
-                        .iter()
-                        .rposition(|byte| *byte != 0)
-                        .map_or(0, |i| i + 1);
-                    let big = if len == 0 {
-                        Term::small(0).unwrap()
-                    } else {
-                        let value = BigInt::from_bytes_le(
-                            if neg == 0 { Sign::Plus } else { Sign::Minus },
-                            &digits[..len],
-                        );
-                        TermBuilder::new(&mut *fac)
-                            .int_from_bigint(&value)
-                            .map_err(map_term_build_error)?
-                    };
-                    objp.store(big.word());
-                }
                 100 | 115 | 118 | 119 => {
-                    r.at -= 1;
+                    r.cur_back(1);
                     objp.store(r.atom(flags.safe, true)?.0.word());
                 }
                 104 | 105 => {
@@ -405,12 +598,12 @@ fn dec_term_body(
                         hp.store((n as u64) << 6);
                         let mut o = hp.offset(n as usize);
                         if let Some(c) = ctx.as_deref_mut() {
-                            if *reds < n {
+                            if reds_l < n {
                                 *c.state = B2tState::DecodeTuple;
-                                c.dc.remaining_n = (n - *reds) as usize;
-                                n = *reds;
+                                c.dc.remaining_n = (n - reds_l) as usize;
+                                n = reds_l;
                             }
-                            *reds -= n;
+                            reds_l -= n;
                         }
                         while n > 0 {
                             o.store(link(next));
@@ -435,12 +628,12 @@ fn dec_term_body(
                         o = o.back(2);
                         nu -= 1;
                         if let Some(c) = ctx.as_deref_mut() {
-                            if *reds < nu {
+                            if reds_l < nu {
                                 *c.state = B2tState::DecodeList;
-                                c.dc.remaining_n = (nu - *reds) as usize;
-                                nu = *reds;
+                                c.dc.remaining_n = (nu - reds_l) as usize;
+                                nu = reds_l;
                             }
-                            *reds -= nu;
+                            reds_l -= nu;
                         }
                         while nu > 0 {
                             let n = next.ok_or(BifError::BADARG)?;
@@ -458,12 +651,12 @@ fn dec_term_body(
                         objp.store(Term::NIL.word());
                     } else {
                         if let Some(c) = ctx.as_deref_mut() {
-                            if *reds < n {
+                            if reds_l < n {
                                 *c.state = B2tState::DecodeString;
-                                c.dc.remaining_n = (n - *reds) as usize;
-                                n = *reds;
+                                c.dc.remaining_n = (n - reds_l) as usize;
+                                n = reds_l;
                             }
-                            *reds -= n;
+                            reds_l -= n;
                         }
                         let src = r.take(n as usize)?;
                         let hp = produce(fac, 2 * n as usize)?;
@@ -475,41 +668,6 @@ fn dec_term_body(
                         }
                         hp.offset(2 * n as usize - 1).store(Term::NIL.word());
                     }
-                }
-                99 | 70 => {
-                    let value = if tag == 70 {
-                        let value = f64::from_bits(r.u64()?);
-                        if !value.is_finite() {
-                            return Err(BifError::BADARG);
-                        }
-                        value
-                    } else {
-                        // sys_chars_to_double
-                        let raw = r.take(31)?;
-                        let end = raw.iter().position(|byte| *byte == 0).unwrap_or(31);
-                        let value = std::str::from_utf8(&raw[..end])
-                            .map_err(|_| BifError::BADARG)?
-                            .trim()
-                            .parse::<f64>()
-                            .map_err(|_| BifError::BADARG)?;
-                        if !value.is_finite() {
-                            return Err(BifError::BADARG);
-                        }
-                        value
-                    };
-                    objp.store(
-                        TermBuilder::new(&mut *fac)
-                            .float(value)
-                            .map_err(map_term_build_error)?
-                            .word(),
-                    );
-                }
-                103 | 88 => {
-                    objp.store(Term::NIL.word());
-                    objp.store(dec_pid(&mut r, fac, tag, flags)?.word());
-                }
-                102 | 89 | 120 | 101 | 114 | 90 => {
-                    objp.store(dec_port_or_ref(&mut r, fac, tag, flags)?.word());
                 }
                 109 | 77 => {
                     let mut nu = r.u32()? as usize;
@@ -525,7 +683,7 @@ fn dec_term_body(
                         if ctx.is_some() {
                             // Count reductions but don't bother trying to trap in the
                             // middle, it's short enough not to matter.
-                            *reds -= (*reds).min((nu / B2T_MEMCPY_FACTOR) as i64);
+                            reds_l -= reds_l.min((nu / B2T_MEMCPY_FACTOR) as i64);
                         }
                         let src = r.take(nu)?;
                         let words = 2 + nu.div_ceil(8);
@@ -540,15 +698,15 @@ fn dec_term_body(
                         let data = binary.bytes_mut_unique().ok_or(BifError::BADARG)?;
                         let data_addr = data.as_mut_ptr() as usize;
                         if let Some(c) = ctx.as_deref_mut() {
-                            let n_limit = (*reds).max(0) as usize * B2T_MEMCPY_FACTOR;
+                            let n_limit = reds_l.max(0) as usize * B2T_MEMCPY_FACTOR;
                             if nu > n_limit {
                                 *c.state = B2tState::DecodeBinary;
                                 c.dc.remaining_n = nu - n_limit;
                                 c.dc.remaining_bytes = data_addr + n_limit;
                                 nu = n_limit;
-                                *reds = 0;
+                                reds_l = 0;
                             } else {
-                                *reds -= (nu / B2T_MEMCPY_FACTOR) as i64;
+                                reds_l -= (nu / B2T_MEMCPY_FACTOR) as i64;
                             }
                         }
                         data[..nu].copy_from_slice(r.take(nu)?);
@@ -557,36 +715,6 @@ fn dec_term_body(
                             .map_err(map_term_build_error)?;
                         objp.store(term.word());
                     }
-                }
-                113 => {
-                    let module = r
-                        .atom(flags.safe, true)?
-                        .0
-                        .as_atom()
-                        .ok_or(BifError::BADARG)?;
-                    let name = r
-                        .atom(flags.safe, true)?
-                        .0
-                        .as_atom()
-                        .ok_or(BifError::BADARG)?;
-                    let temp = dec_sub_term(fac, &mut r, flags)?;
-                    let arity = temp.as_small().ok_or(BifError::BADARG)?;
-                    if arity < 0 {
-                        return Err(BifError::BADARG);
-                    }
-                    let arity = u8::try_from(arity).map_err(|_| BifError::BADARG)?;
-                    let mfa = (module, name, arity);
-                    if flags.safe && crate::export::active_export_entry(mfa).is_none() {
-                        return Err(BifError::BADARG);
-                    }
-                    let export =
-                        crate::export::export_get_or_make_stub(mfa).ok_or(BifError::SystemLimit)?;
-                    objp.store(
-                        TermBuilder::new(&mut *fac)
-                            .export_fun(export)
-                            .map_err(map_term_build_error)?
-                            .word(),
-                    );
                 }
                 116 => {
                     let size = r.u32()? as usize;
@@ -637,125 +765,33 @@ fn dec_term_body(
                         }
                     }
                 }
-                112 => {
-                    r.take(4)?; // Skip total size in bytes
-                    let arity = r.u8()?;
-                    let uniq: [u8; 16] = r.take(16)?.try_into().map_err(|_| BifError::BADARG)?;
-                    let index = r.u32()?;
-                    let num_free = r.u32()? as usize;
-                    let funp = produce(fac, ERL_FUN_SIZE + num_free)?;
-                    let module = r
-                        .atom(flags.safe, true)?
-                        .0
-                        .as_atom()
-                        .ok_or(BifError::BADARG)?;
-                    let old_index = dec_sub_term(fac, &mut r, flags)?
-                        .as_small()
-                        .and_then(|n| u32::try_from(n).ok())
-                        .ok_or(BifError::BADARG)?;
-                    let old_uniq = dec_sub_term(fac, &mut r, flags)?
-                        .as_small()
-                        .and_then(|n| u32::try_from(n).ok())
-                        .ok_or(BifError::BADARG)?;
-                    let pid = dec_sub_term(fac, &mut r, flags)?;
-                    if pid.classify() != TermKind::Pid {
-                        return Err(BifError::BADARG);
-                    }
-                    let entry = Arc::new(FunEntry {
-                        dispatch_target: Default::default(),
-                        pend_purge_address: Default::default(),
-                        module,
-                        arity,
-                        index,
-                        uniq,
-                        old_index,
-                        old_uniq,
-                        pid,
-                        dispatch: Default::default(),
-                        dispatch_epoch: Default::default(),
-                    });
-                    let fun = TermBuilder::<HeapReservation<'_, ProcessHeap>>::init_decoded_fun(
-                        funp, entry, num_free,
-                    )
-                    .map_err(map_term_build_error)?;
-                    objp.store(fun.word());
-                    for i in (0..num_free).rev() {
-                        let env = funp.offset(ERL_FUN_SIZE + i);
-                        env.store(link(next));
-                        next = Some(env);
-                    }
-                }
-                73 | 75 => {
-                    let n = if tag == 73 {
-                        r.u16()? as u32
-                    } else {
-                        let b = r.take(3)?;
-                        u32::from_be_bytes([0, b[0], b[1], b[2]])
-                    };
-                    let atom = Atom(n);
-                    if global_atoms().text(atom).is_none() {
-                        return Err(BifError::BADARG);
-                    }
-                    objp.store(Term::atom(atom).word());
-                }
                 121 => {
                     flags.internal_nc = true;
                     r.take(4)?; // 32-bit hash (verified in decoded_size())
                     continue;
                 }
-                67 => {
-                    let num_fields = r.u32()? as usize;
-                    let exported = match r.u8()? {
-                        0 => false,
-                        1 => true,
-                        // The other bits in this byte are reserved and must be zero.
-                        _ => return Err(BifError::BADARG),
-                    };
-                    let module = r
-                        .atom(flags.safe, true)?
-                        .0
-                        .as_atom()
-                        .ok_or(BifError::BADARG)?;
-                    let name = r
-                        .atom(flags.safe, true)?
-                        .0
-                        .as_atom()
-                        .ok_or(BifError::BADARG)?;
-                    let mut keys = SmallVec::<[Atom; 8]>::new();
-                    for _ in 0..num_fields {
-                        keys.push(
-                            r.atom(flags.safe, true)?
-                                .0
-                                .as_atom()
-                                .ok_or(BifError::BADARG)?,
-                        );
-                    }
-                    let (instance, values) = TermBuilder::new(&mut *fac)
-                        .decoded_native_record(module, name, exported, &keys)
-                        .map_err(map_term_build_error)?;
-                    for value in values.iter().rev() {
-                        value.store(link(next));
-                        next = Some(*value);
-                    }
-                    objp.store(instance.word());
+                _ => {
+                    let (at, rest) = dec_rare(tag, r, fac, flags, objp, next)?;
+                    r.set_at(at);
+                    next = rest;
                 }
-                _ => return Err(BifError::BADARG),
             }
             break;
         }
 
-        *reds -= 1;
-        if *reds <= 0 {
+        reds_l -= 1;
+        if reds_l <= 0 {
             if let Some(c) = ctx.as_deref_mut() {
                 if next.is_some() || *c.state != B2tState::Decode {
-                    c.dc.ep = r.at;
+                    c.dc.ep = r.at();
                     c.dc.next = next;
                     c.dc.map_array = map_array;
-                    *reds = 0;
+                    reds_l = 0;
+                    *reds = reds_l;
                     return Ok(None);
                 }
             } else {
-                *reds = i64::MAX;
+                reds_l = i64::MAX;
             }
         }
     }
@@ -795,9 +831,10 @@ fn dec_term_body(
 
     if let Some(c) = ctx {
         *c.state = B2tState::Done;
-        c.dc.ep = r.at;
+        c.dc.ep = r.at();
     }
-    Ok(Some(r.at))
+    *reds = reds_l;
+    Ok(Some(r.at()))
 }
 
 /// `dec_term(edep, factory, ep, &temp, NULL, flags)`: a nested decode into a local word.
@@ -808,7 +845,9 @@ fn dec_sub_term(
 ) -> Result<Term, BifError> {
     let mut temp: u64 = 0;
     let slot = HeapSlotPtr::from_ptr(&mut temp).ok_or(BifError::BADARG)?;
-    r.at = dec_term(fac, r.validated, r.at, Some(slot), None, flags)?.ok_or(BifError::BADARG)?;
+    let at =
+        dec_term(fac, r.validated, r.at(), Some(slot), None, flags)?.ok_or(BifError::BADARG)?;
+    r.set_at(at);
     Ok(term_from_bits(temp))
 }
 
