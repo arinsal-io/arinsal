@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use arinsal_beamasm::bif::ExportEntry;
-use arinsal_term::{Atom, TRAMPOLINE_BREAKPOINT, TRAMPOLINE_CALL_ERROR_HANDLER, TRAMPOLINE_NONE};
+use arinsal_term::{Atom, OP_CALL_ERROR_HANDLER, OP_I_GENERIC_BREAKPOINT, TRAMPOLINE_NONE};
 
 type Mfa = (Atom, Atom, u8);
 
@@ -107,7 +107,7 @@ pub(crate) fn is_export_trampoline_active(ep: &ExportEntry, ix: usize) -> bool {
 /// Whether calls through `ep` hit a global call breakpoint (`op_i_generic_breakpoint` in its
 /// trampoline).
 pub(crate) fn has_export_breakpoint(ep: &ExportEntry) -> bool {
-    ep.trampoline_op() == TRAMPOLINE_BREAKPOINT
+    ep.trampoline_op() == OP_I_GENERIC_BREAKPOINT
 }
 
 /// `export_start_staging`: the staging code index starts with the active address of every
@@ -144,7 +144,7 @@ pub(crate) fn delete_code(tables: &crate::load::CodeTables, module: Atom, ix: us
             ep.set_trampoline_op(TRAMPOLINE_NONE);
         }
         ep.set_bif_traced(false);
-        ep.set_trampoline_op(TRAMPOLINE_CALL_ERROR_HANDLER);
+        ep.set_trampoline_op(OP_CALL_ERROR_HANDLER);
         ep.set_trampoline_address(0);
         activate_export_trampoline(ep, ix);
     }
@@ -211,7 +211,7 @@ pub(crate) fn finish_after_on_load(
             ep.set_trampoline_address(0);
         } else if ep.bif_number() == -1 {
             if keep {
-                ep.set_trampoline_op(TRAMPOLINE_CALL_ERROR_HANDLER);
+                ep.set_trampoline_op(OP_CALL_ERROR_HANDLER);
                 activate_export_trampoline(ep, ix);
             } else {
                 ep.set_trampoline_address(0);
@@ -237,7 +237,7 @@ pub(crate) fn set_export_breakpoint(mfa: Mfa, enabled: bool, bif_traced: bool) {
     let ix = staging.ix();
     if enabled {
         if !is_export_trampoline_active(ep, ix) {
-            ep.set_trampoline_op(TRAMPOLINE_BREAKPOINT);
+            ep.set_trampoline_op(OP_I_GENERIC_BREAKPOINT);
             ep.set_trampoline_address(ep.address(ix));
         }
         ep.set_bif_traced(bif_traced);

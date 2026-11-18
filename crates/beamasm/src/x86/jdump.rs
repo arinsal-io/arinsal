@@ -123,7 +123,7 @@ pub(crate) fn beam_register(operand: &str) -> Option<crate::common::args::ArgVal
 
 /// erts 29.1.1 x86-64 `Process` field offsets in the dumps (`[r13+N]`), with Arinsal's
 /// `ProcessHeader` offset of the same field.
-pub(crate) const ERTS_PROCESS_OFFSETS: [(i32, i32); 14] = {
+pub(crate) const ERTS_PROCESS_OFFSETS: [(i32, i32); 18] = {
     use crate::x86::beam_asm::process;
     [
         (0, process::SELF_PID),
@@ -139,6 +139,10 @@ pub(crate) const ERTS_PROCESS_OFFSETS: [(i32, i32); 14] = {
         (96, process::HEAP),
         (256, process::CATCHES),
         (124, process::FLAGS),
+        (528, process::OFF_HEAP_OVERHEAD),
+        (544, process::MBUF),
+        (568, process::MBUF_SZ),
+        (584, process::BIN_VHEAP_SZ),
         (
             488,
             core::mem::offset_of!(crate::ProcessHeader, high_water) as i32,

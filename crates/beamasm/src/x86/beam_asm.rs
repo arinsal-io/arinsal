@@ -318,6 +318,15 @@ pub mod process {
     /// `offsetof(Process, catches)`.
     // Port of erts/emulator/beam/erl_process.h (struct process), OTP-29.1.1.
     pub const CATCHES: i32 = offset_of!(ProcessHeader, catches) as i32;
+    /// `offsetof(Process, mbuf)`.
+    pub const MBUF: i32 = offset_of!(ProcessHeader, mbuf) as i32;
+    /// `offsetof(Process, mbuf_sz)`.
+    pub const MBUF_SZ: i32 = offset_of!(ProcessHeader, mbuf_sz) as i32;
+    /// `offsetof(Process, bin_vheap_sz)`. The process starts with its `ProcessHeap` (the VM
+    /// asserts `offset_of!(Process, heap) == 0`), so the heap's offsets are `c_p`'s.
+    pub const BIN_VHEAP_SZ: i32 = arinsal_term::ProcessHeap::BIN_VHEAP_SIZE_OFFSET as i32;
+    /// `offsetof(Process, off_heap.overhead)`, see [`BIN_VHEAP_SZ`].
+    pub const OFF_HEAP_OVERHEAD: i32 = arinsal_term::ProcessHeap::OFF_HEAP_OVERHEAD_OFFSET as i32;
 }
 
 /// `x86::ptr(c_p, offsetof(Process, field), size)`.

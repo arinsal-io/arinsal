@@ -898,11 +898,7 @@ fn emit_export_fragment(
                 Gpr::x(0),
                 arinsal_term::EXPORT_TRAMPOLINE_OP_OFFSET,
             )?;
-            encoder.cmp_imm(
-                Gpr::x(9),
-                arinsal_term::TRAMPOLINE_CALL_ERROR_HANDLER as u16,
-                false,
-            )
+            encoder.cmp_imm(Gpr::x(9), arinsal_term::OP_CALL_ERROR_HANDLER as u16, false)
         })?;
         code.b_cond(Cond::Ne, not_error_handler)?;
         code.emit(|encoder| {
@@ -979,7 +975,7 @@ fn emit_export_fragment(
             Gpr::x(0),
             arinsal_term::EXPORT_TRAMPOLINE_OP_OFFSET,
         )?;
-        encoder.cmp_imm(Gpr::x(9), arinsal_term::TRAMPOLINE_CALL_BIF as u16, false)
+        encoder.cmp_imm(Gpr::x(9), arinsal_term::OP_CALL_BIF_W as u16, false)
     })?;
     code.b_cond(Cond::Ne, helper_call)?;
     code.emit(|encoder| {

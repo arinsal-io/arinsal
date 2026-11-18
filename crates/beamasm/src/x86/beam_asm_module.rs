@@ -1329,6 +1329,18 @@ impl BeamModuleAssembler {
 }
 
 impl BeamModuleAssembler {
+    /// Raises with the error address taken implicitly from the call to
+    /// `raise_exception_null_exp` (its return address, not a CP), through the module's
+    /// fragment thunk as every module `safe_fragment_call`.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:256-262
+    // (BeamModuleAssembler::emit_raise_exception()), OTP-29.1.1.
+    pub(crate) fn emit_raise_exception(&mut self) -> Result<(), AsmError> {
+        let fragment = self.ga_get(GlobalLabels::RaiseExceptionNullExp)?;
+        self.safe_fragment_call(fragment)?;
+        self.last_error_offset = self.asm.a.offset();
+        Ok(())
+    }
+
     /// Loads the exception MFA and calls the shared raise fragment, recording the throwing PC.
     // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:264-271
     // (BeamModuleAssembler::emit_raise_exception(const ErtsCodeMFA *)), OTP-29.1.1.

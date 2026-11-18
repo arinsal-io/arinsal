@@ -312,9 +312,7 @@ impl DispatchRegistry {
             // export's trampoline calls the error handler (export_init).
             if target.slot.bif_number() != -1 || target.class != arinsal_loader::ImportClass::Remote
             {
-                target
-                    .slot
-                    .set_trampoline_op(arinsal_term::TRAMPOLINE_CALL_BIF);
+                target.slot.set_trampoline_op(arinsal_term::OP_CALL_BIF_W);
             }
             // Port of erts/emulator/beam/export.h:38-58 (Export), OTP-29.1.1: the slot holds
             // its descriptor's address, which generated code passes to the runtime helpers

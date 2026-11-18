@@ -1398,8 +1398,13 @@ mod tests {
                 let Some((op, target)) = instruction.split_once(' ') else {
                     return line;
                 };
-                if op == "call" && (target.parse::<u64>().is_ok() || !labels.contains(target)) {
+                // `call imm(address)` (through the address table) vs. `call L<n>`, the
+                // module's dispatch-table thunk of a fragment (`safe_fragment_call`).
+                if op == "call" && target.parse::<u64>().is_ok() {
                     return ".byte 0x40, 0xe8, 0, 0, 0, 0".to_owned();
+                }
+                if op == "call" && !labels.contains(target) {
+                    return ".byte 0xe8, 0, 0, 0, 0".to_owned();
                 }
                 let target_is_local = labels.contains(target);
                 if !target_is_local && op.starts_with('j') {
@@ -2836,16 +2841,6 @@ impl BeamModuleAssembler {
         self.emit_raise_exception()
     }
 
-    /// Calls `raise_exception_null_exp` with a non-CP return address.
-    // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:256-262
-    // (BeamModuleAssembler::emit_raise_exception), OTP-29.1.1.
-    fn emit_raise_exception(&mut self) -> Result<(), AsmError> {
-        let fragment = self.ga_get(GlobalLabels::RaiseExceptionNullExp)?;
-        self.asm.safe_fragment_call_abs(fragment)?;
-        self.last_error_offset = self.asm.a.offset();
-        Ok(())
-    }
-
     /// `badmatch(Src)`.
     // Port of erts/emulator/beam/jit/x86/instr_common.cpp:2966-2969 (emit_badmatch), OTP-29.1.1.
     pub fn emit_badmatch(&mut self, src: ArgVal) -> Result<(), AsmError> {
@@ -2961,7 +2956,10 @@ impl BeamModuleAssembler {
         let fragment = self.ga_get(GlobalLabels::RaiseShared)?;
         self.mov_arg_to_reg(ARG3, value)?;
         self.mov_arg_to_reg(ARG2, trace)?;
-        self.asm.fragment_call_abs(fragment)?;
+        // `fragment_call(resolve_fragment(ga->get_raise_shared()))`: a call to the module's
+        // thunk of the fragment.
+        let thunk = self.resolve_fragment(fragment);
+        self.asm.fragment_call(thunk)?;
         self.last_error_offset = self.asm.a.offset();
         Ok(())
     }
@@ -3012,7 +3010,9 @@ impl BeamModuleAssembler {
             ArgVal::Immediate(Term::atom(atoms::TRUE).word()),
             ARG1,
         )?;
-        self.asm.fragment_call_abs(fragment)
+        // `fragment_call(resolve_fragment(ga->get_dispatch_return()))` (NATIVE_ERLANG_STACK).
+        let thunk = self.resolve_fragment(fragment);
+        self.asm.fragment_call(thunk)
     }
 }
 

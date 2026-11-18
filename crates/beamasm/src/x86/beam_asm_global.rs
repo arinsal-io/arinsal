@@ -516,6 +516,7 @@ impl BeamGlobalAssembler {
         use GlobalLabels as G;
         Some(match label {
             G::GarbageCollect => Self::emit_garbage_collect,
+            G::CallLightBifShared => Self::emit_call_light_bif_shared,
             G::ProcessMain => Self::emit_process_main,
             G::ILoopRecShared => Self::emit_i_loop_rec_shared,
             G::HandleElementError => Self::emit_handle_element_error,
@@ -949,6 +950,18 @@ mod tests {
         line
     }
 
+    /// Rewrites erts' `Export` field offsets in one line of `call_light_bif_shared`.
+    fn export_offsets(line: &str) -> String {
+        let mfa = arinsal_term::EXPORT_MFA_OFFSET;
+        let traced = core::mem::offset_of!(arinsal_term::ExportEntry, is_bif_traced);
+        let arity = mfa as usize + core::mem::offset_of!(ErtsCodeMfa, arity);
+        line.replace("[rcx+36]", &format!("[rcx+{traced}]"))
+            .replace("[rcx+80]", &format!("[rcx+{arity}]"))
+            .replace("[r8+80]", &format!("[r8+{arity}]"))
+            .replace("[rcx+64]", &format!("[rcx+{mfa}]"))
+            .replace("add rcx, 64", &format!("add rcx, {mfa}"))
+    }
+
     // Differential check against erts: the fragment table is emitted in the order of the
     // `global::` labels of `erl +JDdump true`, and every fragment the constructor emits encodes
     // the same instructions as erts' (with Arinsal's process and scheduler register layouts and
@@ -990,7 +1003,8 @@ mod tests {
                 G::DispatchSaveCallsFun
                 | G::DispatchSaveCallsExport
                 | G::UnloadedFun
-                | G::ILoopRecShared => {
+                | G::ILoopRecShared
+                | G::CallLightBifShared => {
                     vec![active]
                 }
                 G::PlusBodyShared => vec![mfa_address(&crate::x86::instr_arith::PLUS_MFA)],
@@ -1039,6 +1053,9 @@ mod tests {
                     (GlobalLabels::BifExportTrap, "sub rax, 64") => {
                         format!("sub rax, {}", arinsal_term::EXPORT_MFA_OFFSET)
                     }
+                    // `Export.is_bif_traced` and `Export.info.mfa(.arity)`: 36, 64 and 80
+                    // in erts, `ExportEntry`'s fields here.
+                    (GlobalLabels::CallLightBifShared, _) => export_offsets(&l),
                     _ => l,
                 })
                 .collect();

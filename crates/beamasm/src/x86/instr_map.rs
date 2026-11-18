@@ -474,7 +474,7 @@ impl BeamModuleAssembler {
             && BeamAssembler::has_cpu_feature(CpuFeature::Bmi2)
         {
             let fragment = self.ga_get(GlobalLabels::IGetMapElementShared)?;
-            self.asm.safe_fragment_call_abs(fragment)?;
+            self.safe_fragment_call(fragment)?;
             self.asm.jcc(CondCode::NE, fail)?;
         } else {
             self.asm.emit_enter_runtime(Update::NONE)?;
@@ -595,7 +595,7 @@ impl BeamModuleAssembler {
 
         if key.is_immed() && BeamAssembler::has_cpu_feature(CpuFeature::Bmi2) {
             let fragment = self.ga_get(GlobalLabels::IGetMapElementHashShared)?;
-            self.asm.safe_fragment_call_abs(fragment)?;
+            self.safe_fragment_call(fragment)?;
             self.asm.jcc(CondCode::NE, fail)?;
         } else {
             self.asm.emit_enter_runtime(Update::NONE)?;
@@ -630,7 +630,7 @@ impl BeamModuleAssembler {
             self.mov_arg_to_reg(ARG3, args[1])?;
             self.mov_arg_to_reg(ARG4, src)?;
             let fragment = self.ga_get(GlobalLabels::UpdateMapSingleAssocShared)?;
-            self.asm.safe_fragment_call_abs(fragment)?;
+            self.safe_fragment_call(fragment)?;
         } else {
             self.mov_arg_to_mem(get_x_ref(live as u32, 8), src, ARG1)?;
             self.asm.mov_imm(ARG3, live)?;
@@ -986,7 +986,13 @@ mod tests {
             )
             .unwrap();
         let assoc_code = assoc.asm.a.bytes(Section::Code).to_vec();
-        compare_code(&assoc_block, &assoc_code, &[("call L335", "call 0")]);
+        // `call L335`: the module's dispatch-table thunk (5-byte `call rel32`), unbound until
+        // the table is emitted at the end of the module.
+        compare_code(
+            &assoc_block,
+            &assoc_code,
+            &[("call L335", ".byte 0xe8, 0, 0, 0, 0")],
+        );
 
         let exact_block = full_op_blocks(&maps_dump, "update_map_exact_sjdtI")
             .into_iter()
@@ -1143,7 +1149,8 @@ mod tests {
         let mut expected = module_code_lines(&hash_block);
         for line in &mut expected {
             if line == "call L1351" {
-                *line = "call 0".to_owned();
+                // The module's thunk of the fragment (`safe_fragment_call`), unbound here.
+                *line = ".byte 0xe8, 0, 0, 0, 0".to_owned();
             } else if line.starts_with("jnz label_") {
                 *line = "{disp32} jnz label_1".to_owned();
             }

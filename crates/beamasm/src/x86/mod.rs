@@ -9,6 +9,7 @@ pub mod beam_asm_module;
 #[allow(unsafe_code)]
 mod codegen_tests;
 pub mod instr_arith;
+pub mod instr_bif;
 pub mod instr_bs;
 pub mod instr_call;
 pub mod instr_common;

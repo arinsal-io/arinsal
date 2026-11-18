@@ -122,6 +122,21 @@ unsafe extern "C" {
     ) -> i32;
 }
 
+// Port of erts/emulator/beam/jit/x86/instr_bif.cpp runtime-call declarations (erl_gc.h),
+// OTP-29.1.1.
+unsafe extern "C" {
+    /// `Eterm erts_gc_after_bif_call_lhf(Process *p, ErlHeapFragment *live_hf_end,
+    /// Eterm result, Eterm *regs, Uint arity)` (erl_gc.h): collects after a BIF whose result
+    /// left a collection desired; `live_hf_end` is `c_p->mbuf` before the call.
+    pub safe fn erts_gc_after_bif_call_lhf(
+        c_p: *mut crate::ProcessHeader,
+        live_hf_end: usize,
+        result: u64,
+        regs: *mut u64,
+        arity: u64,
+    ) -> u64;
+}
+
 // Port of erts/emulator/beam/jit/x86/instr_arith.cpp runtime-call declarations, OTP-29.1.1.
 unsafe extern "C" {
     /// `Eterm erts_band(Process *p, Eterm arg1, Eterm arg2)`.
@@ -842,6 +857,17 @@ mod tests {
     }
     #[unsafe(no_mangle)]
     extern "C" fn copy_out_registers(_: *mut crate::ProcessHeader, _: *mut u64) {
+        unreachable!("byte-test fixture")
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_gc_after_bif_call_lhf(
+        _c_p: *mut crate::ProcessHeader,
+        _live_hf_end: usize,
+        _result: u64,
+        _regs: *mut u64,
+        _arity: u64,
+    ) -> u64 {
         unreachable!("byte-test fixture")
     }
 

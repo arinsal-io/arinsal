@@ -303,7 +303,7 @@ pub struct ExportEntry {
 #[derive(Debug)]
 #[repr(C)]
 pub struct ExportTrampoline {
-    /// [`TRAMPOLINE_NONE`], [`TRAMPOLINE_CALL_ERROR_HANDLER`] or [`TRAMPOLINE_BREAKPOINT`]
+    /// [`TRAMPOLINE_NONE`], [`OP_CALL_ERROR_HANDLER`] or [`OP_I_GENERIC_BREAKPOINT`]
     /// (`trampoline.common.op`).
     pub op: AtomicUsize,
     /// `trampoline.breakpoint.address` (the code a global call breakpoint continues to) or
@@ -312,14 +312,32 @@ pub struct ExportTrampoline {
     pub address: AtomicUsize,
 }
 
-/// `trampoline.common.op == 0`.
+/// `trampoline.common.op == 0`: during the last phase of loading a module with `on_load`,
+/// `trampoline.not_loaded.deferred` may be set while the op is zero.
 pub const TRAMPOLINE_NONE: usize = 0;
+// `trampoline.common.op` holds a `BeamOpCode` of the JIT flavour, numbered by beam_makeops
+// from the architecture's jit/<arch>/ops.tab (generated beam_opcodes.h), so the numbers
+// differ between x86-64 and AArch64. `export_trampoline` compares the word with them.
+// Port of erts/emulator/beam/export.h:64-102 (trampoline.{common,bif,breakpoint,not_loaded}.op)
+// and the generated jit/beam_opcodes.h, OTP-29.1.1.
 /// `op_call_error_handler`.
-pub const TRAMPOLINE_CALL_ERROR_HANDLER: usize = 1;
+#[cfg(target_arch = "x86_64")]
+pub const OP_CALL_ERROR_HANDLER: usize = 31;
 /// `op_i_generic_breakpoint`.
-pub const TRAMPOLINE_BREAKPOINT: usize = 2;
+#[cfg(target_arch = "x86_64")]
+pub const OP_I_GENERIC_BREAKPOINT: usize = 111;
 /// `op_call_bif_W`: a BIF (or a native the runtime implements) the trampoline calls.
-pub const TRAMPOLINE_CALL_BIF: usize = 3;
+#[cfg(target_arch = "x86_64")]
+pub const OP_CALL_BIF_W: usize = 29;
+/// `op_call_error_handler`.
+#[cfg(not(target_arch = "x86_64"))]
+pub const OP_CALL_ERROR_HANDLER: usize = 34;
+/// `op_i_generic_breakpoint`.
+#[cfg(not(target_arch = "x86_64"))]
+pub const OP_I_GENERIC_BREAKPOINT: usize = 115;
+/// `op_call_bif_W`: a BIF (or a native the runtime implements) the trampoline calls.
+#[cfg(not(target_arch = "x86_64"))]
+pub const OP_CALL_BIF_W: usize = 32;
 /// Byte offset of `trampoline.common.op` for generated loads.
 pub const EXPORT_TRAMPOLINE_OP_OFFSET: u32 = (core::mem::offset_of!(ExportEntry, trampoline)
     + core::mem::offset_of!(ExportTrampoline, op))
@@ -364,7 +382,7 @@ impl ExportEntry {
             // Port of erts/emulator/beam/export.c:85-87 (export_init: op_call_error_handler
             // once the opcodes are initialized), OTP-29.1.1.
             trampoline: ExportTrampoline {
-                op: AtomicUsize::new(TRAMPOLINE_CALL_ERROR_HANDLER),
+                op: AtomicUsize::new(OP_CALL_ERROR_HANDLER),
                 address: AtomicUsize::new(0),
             },
             mfa: ErtsCodeMfa {
