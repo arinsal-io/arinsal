@@ -19,6 +19,7 @@ use arinsal_x64::enc::CondCode;
 use super::beam_asm::register::{ARG1, ARG2, ARG2D, ARG3, ARG4, C_P, RET};
 use super::beam_asm::{AsmError, BeamAssembler, Update, get_x_ref, process, process_ref};
 pub use super::rt::{call_error_handler, erts_garbage_collect_nobump, handle_error};
+pub use crate::common::process_offsets::ProcessOffsets;
 use crate::exc::{EXC_BADARG, EXC_BADKEY, EXC_BADMAP};
 
 /// erts `BeamGlobalAssembler::GlobalLabels`: one label per global fragment, in the order of
@@ -452,6 +453,8 @@ pub struct BeamGlobalAssembler {
     labels: Vec<Label>,
     /// `ptrs`: the executable address of every label, filled by [`Self::codegen`].
     ptrs: Vec<Option<usize>>,
+    /// The `offsetof` values of the VM's `Process` the fragments compile in.
+    pub(crate) offsets: ProcessOffsets,
 }
 
 /// `ErtsCodeMFA` a global fragment raises with (`static ErtsCodeMFA mfa` in its emitter).
@@ -491,13 +494,14 @@ impl BeamGlobalAssembler {
     /// other freely without any order dependencies; no fragment is emitted yet.
     // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:39-46
     // (BeamGlobalAssembler::BeamGlobalAssembler, the `labelNames` loop), OTP-29.1.1.
-    pub fn declare_labels() -> Self {
+    pub fn declare_labels(offsets: ProcessOffsets) -> Self {
         let mut asm = BeamAssembler::new();
         let labels = GLOBAL_LABELS.iter().map(|_| asm.new_label()).collect();
         Self {
             asm,
             labels,
             ptrs: Vec::new(),
+            offsets,
         }
     }
 
@@ -511,6 +515,9 @@ impl BeamGlobalAssembler {
     pub fn emit_ptr(label: GlobalLabels) -> Option<EmitFn> {
         use GlobalLabels as G;
         Some(match label {
+            G::GarbageCollect => Self::emit_garbage_collect,
+            G::ProcessMain => Self::emit_process_main,
+            G::ILoopRecShared => Self::emit_i_loop_rec_shared,
             G::HandleElementError => Self::emit_handle_element_error,
             G::HandleHdError => Self::emit_handle_hd_error,
             G::HandleMapGetBadkey => Self::emit_handle_map_get_badkey,
@@ -536,6 +543,7 @@ impl BeamGlobalAssembler {
             G::BsGetTailShared => Self::emit_bs_get_tail_shared,
             G::BsGetUtf8Shared => Self::emit_bs_get_utf8_shared,
             G::BsCreateBinErrorShared => Self::emit_bs_create_bin_error_shared,
+            G::BsInitBitsShared => Self::emit_bs_init_bits_shared,
             G::GetSint64Shared => Self::emit_get_sint64_shared,
             G::ConstructUtf8Shared => Self::emit_construct_utf8_shared,
             G::StoreUnaligned => Self::emit_store_unaligned,
@@ -582,8 +590,8 @@ impl BeamGlobalAssembler {
     /// bytes and bound to its predeclared label. Fragments not ported yet are absent.
     // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:35-55
     // (BeamGlobalAssembler::BeamGlobalAssembler, up to codegen), OTP-29.1.1.
-    pub fn new() -> Result<Self, AsmError> {
-        let mut ga = Self::declare_labels();
+    pub fn new(offsets: ProcessOffsets) -> Result<Self, AsmError> {
+        let mut ga = Self::declare_labels(offsets);
         for label in &GLOBAL_LABELS[..GLOBAL_FRAGMENT_COUNT] {
             if let Some(emit) = Self::emit_ptr(*label) {
                 ga.asm.align_code(8)?;
@@ -666,6 +674,48 @@ impl BeamGlobalAssembler {
         a.emit_leave_frame()?;
         let target = a.emit_setup_dispatchable_call_active(RET)?;
         a.emit(|e| e.jmp_m(target))
+    }
+
+    /// `ARG3` = HTOP + S_RESERVED + bytes needed, `ARG4` = live registers: collects garbage,
+    /// returning to the caller, or schedules out when the process is exiting.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:100-155 (emit_garbage_collect),
+    // OTP-29.1.1.
+    fn emit_garbage_collect(&mut self) -> Result<(), AsmError> {
+        use super::beam_asm::register::{ARG1D, ARG5D, FCALLS, HTOP, RETD};
+        use super::process_main::ERTS_PSFLG_EXITING;
+        let state = arinsal_x64::enc::dword_ptr(C_P, self.offsets.state as i32);
+        let a = &mut self.asm;
+        let exiting = a.new_label();
+        a.emit_enter_frame()?;
+        // ARG3 to words needed, cancelling the S_RESERVED of the GC check (the GC adds it).
+        a.emit(|e| e.sub_rr(ARG3, HTOP))?;
+        a.emit(|e| e.shr_ri(ARG3, 3))?;
+        a.emit(|e| e.lea(ARG2, qword_ptr(ARG3, -(arinsal_term::S_RESERVED as i32))))?;
+        // Our return address in c_p->i, to tell where we crashed during GC.
+        const {
+            assert!(matches!(
+                super::beam_asm::FRAME_LAYOUT,
+                super::beam_asm::FrameLayout::Ra
+            ))
+        };
+        a.emit(|e| e.mov_rm(RET, qword_ptr(arinsal_x64::enc::RSP, 0)))?;
+        a.emit(|e| e.mov_mr(process_ref(process::I, 8), RET))?;
+        a.emit_enter_runtime(Update::STACK.union(Update::HEAP))?;
+        a.emit(|e| e.mov_rr(ARG1, C_P))?;
+        a.load_x_reg_array(ARG3)?;
+        a.emit(|e| e.mov_rr(ARG5D, FCALLS))?;
+        a.runtime_call(erts_garbage_collect_nobump as *const () as usize)?;
+        a.emit(|e| e.sub_rr(FCALLS, RETD))?;
+        a.emit_leave_runtime(Update::STACK.union(Update::HEAP))?;
+        a.emit(|e| e.mov_rm(ARG1D, state))?;
+        a.emit(|e| e.test_ri(ARG1D, i64::from(ERTS_PSFLG_EXITING)))?;
+        a.short_jcc(CondCode::NE, exiting)?;
+        a.emit_leave_frame()?;
+        a.emit(|e| e.ret())?;
+        a.bind(exiting)?;
+        a.emit_unwind_frame()?;
+        let do_schedule = self.label(GlobalLabels::DoSchedule);
+        self.asm.jmp(do_schedule)
     }
 
     /// `raise_exception_null_exp`: `raise_exception` without an MFA.
@@ -937,7 +987,10 @@ mod tests {
                 G::HandleMapGetBadmap => vec![mfa_address(&MAP_GET_BADMAP_MFA)],
                 G::HandleMapSizeError => vec![mfa_address(&MAP_SIZE_MFA)],
                 G::HandleNodeError => vec![mfa_address(&NODE_MFA)],
-                G::DispatchSaveCallsFun | G::DispatchSaveCallsExport | G::UnloadedFun => {
+                G::DispatchSaveCallsFun
+                | G::DispatchSaveCallsExport
+                | G::UnloadedFun
+                | G::ILoopRecShared => {
                     vec![active]
                 }
                 G::PlusBodyShared => vec![mfa_address(&crate::x86::instr_arith::PLUS_MFA)],
@@ -962,7 +1015,7 @@ mod tests {
             eprintln!("skipping byte comparison: GNU binutils unavailable");
             return;
         }
-        let ga = BeamGlobalAssembler::new().unwrap();
+        let ga = BeamGlobalAssembler::new(ProcessOffsets::ERTS_X86_64).unwrap();
         let code = ga.asm.a.bytes(Section::Code);
         let ranges = ga.ranges();
         let unbound: Vec<&str> = GLOBAL_LABELS
@@ -973,6 +1026,10 @@ mod tests {
         assert!(ranges.len() >= 21);
         for (label, range) in ranges {
             assert_eq!(range.start % 8, 0);
+            if label == GlobalLabels::ProcessMain {
+                // Compared piecewise by `process_main_matches_erts_dump`.
+                continue;
+            }
             let mut static_addresses = addresses(label).into_iter();
             let lines: Vec<String> = fragment_lines(&dump, label.name())
                 .into_iter()
@@ -996,6 +1053,109 @@ mod tests {
         }
     }
 
+    /// The text of erts' `process_main` with Arinsal's schedule-out half: erts' loop entry and
+    /// `schedule_next` (the Rust scheduler's) are left out, `reds_used` is not computed, and
+    /// `schedule_next` publishes FCALLS and jumps to the bridge. `fill` is the byte the
+    /// displacements to code elsewhere are written with.
+    fn arinsal_process_main(dump: &str, fill: u8) -> Vec<String> {
+        let main = fragment_lines(dump, "process_main");
+        let from = |text: &str| main.iter().position(|l| *l == text).unwrap();
+        let at = |i: usize| crate::x86::jdump::erts_to_arinsal(main[i]);
+        // L215 (context_switch_local) up to `short jmp L217` after `Process exiting`.
+        let local = from("movzx edi, byte ptr [rdx-8]") - 1;
+        let exiting = from("mov qword ptr [r13+464], 0");
+        // The `copy_out_registers` call of `not_exiting` (L219).
+        let copy_out = from("mov r14d, edx") + 1;
+        let do_schedule_local = main[exiting + 1].strip_prefix("short jmp ").unwrap();
+        let fill_disp = if fill == 0 { "rip+0" } else { "rip-1" };
+        let mut text = vec![
+            format!("{do_schedule_local}:"),
+            "{disp32} jmp Lsched".into(),
+        ];
+        for i in local..=exiting + 1 {
+            let line = at(i);
+            text.push(match line.as_str() {
+                "lea rdi, qword ptr [global::process_exit]" => format!("lea rdi, [{fill_disp}]"),
+                // asmjit binds the forward `short jz` target L219 here; GNU `as` takes it as
+                // written.
+                _ => line,
+            });
+        }
+        let not_exiting = main[local..]
+            .iter()
+            .find_map(|l| l.strip_prefix("short jz "))
+            .unwrap();
+        text.push(format!("{not_exiting}:"));
+        text.extend((copy_out..copy_out + 2).map(at));
+        text.push(format!(
+            ".byte 0x40, 0xe8, {fill:#04x}, {fill:#04x}, {fill:#04x}, {fill:#04x}"
+        ));
+        text.push("Lsched:".into());
+        text.push(crate::x86::jdump::erts_to_arinsal(
+            "mov dword ptr [r13+120], r14d",
+        ));
+        text.push(format!(
+            ".byte 0x40, 0xe9, {fill:#04x}, {fill:#04x}, {fill:#04x}, {fill:#04x}"
+        ));
+        for entry in ["context_switch", "context_switch_simplified", "do_schedule"] {
+            text.push(".p2align 0".into());
+            // Without the loop between them, the jumps back to the local labels are in rel8
+            // reach, where asmjit (and GNU `as`) take the short form.
+            text.extend(
+                fragment_lines(dump, entry)
+                    .into_iter()
+                    .map(|l| crate::x86::jdump::erts_to_arinsal(l).replace("{disp32} ", "")),
+            );
+        }
+        text
+    }
+
+    // The schedule-out half of process_main against erts' text (see `arinsal_process_main`),
+    // the three entry points bound where erts binds them.
+    #[test]
+    fn process_main_matches_erts_dump() {
+        let Some(dump) = crate::x86::jdump::erts_dump("beam_asm_global") else {
+            eprintln!("skipping: `erl +JDdump true` unavailable");
+            return;
+        };
+        let (Some(zeros), Some(ones)) = (
+            crate::x86::jdump::gnu_as(&arinsal_process_main(&dump, 0)),
+            crate::x86::jdump::gnu_as(&arinsal_process_main(&dump, 0xff)),
+        ) else {
+            eprintln!("skipping byte comparison: GNU binutils unavailable");
+            return;
+        };
+        let ga = BeamGlobalAssembler::new(ProcessOffsets::ERTS_X86_64).unwrap();
+        let code = ga.asm.a.bytes(Section::Code);
+        let (_, range) = ga
+            .ranges()
+            .into_iter()
+            .find(|(label, _)| *label == GlobalLabels::ProcessMain)
+            .unwrap();
+        let ours = &code[range.start..range.start + zeros.len()];
+        assert!(
+            ours.iter()
+                .zip(zeros.iter().zip(&ones))
+                .all(|(o, (z, f))| z != f || o == z),
+            "{:02x?}\nvs\n{:02x?}",
+            ours,
+            zeros
+        );
+        assert!(code[range.start + zeros.len()..range.end].len() < 8);
+        let main = ga.asm.a.label_location(ga.label(GlobalLabels::ProcessMain));
+        for (entry, name) in [
+            (GlobalLabels::ContextSwitch, "context_switch"),
+            (
+                GlobalLabels::ContextSwitchSimplified,
+                "context_switch_simplified",
+            ),
+            (GlobalLabels::DoSchedule, "do_schedule"),
+        ] {
+            let at = ga.asm.a.label_location(ga.label(entry)).unwrap().offset;
+            assert!(at > main.unwrap().offset && at < range.end, "{name}");
+        }
+    }
+
     #[test]
     fn exception_reasons_match_erts() {
         // freason immediates of erts' handle_*_error fragments in the 29.1.1 dump.
@@ -1006,7 +1166,8 @@ mod tests {
 
     #[test]
     fn unported_fragments_are_absent() {
-        assert!(BeamGlobalAssembler::emit_ptr(GlobalLabels::ProcessMain).is_none());
+        assert!(BeamGlobalAssembler::emit_ptr(GlobalLabels::ExportTrampoline).is_none());
+        // Bound inside process_main, not fragments of their own.
         assert!(BeamGlobalAssembler::emit_ptr(GlobalLabels::ContextSwitch).is_none());
     }
 }

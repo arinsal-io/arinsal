@@ -512,7 +512,7 @@ fn receive_fragments() -> Option<&'static arinsal_beamasm::receive_frag::Receive
                 arinsal_beamasm::receive_frag::MsgOffsets {
                     sig_qs_save: crate::PROCESS_SIGQ_SAVE_OFFSET as u32,
                     message_term: crate::ERTS_MESSAGE_TERM_OFFSET as u32,
-                    flags: crate::PROCESS_FLAGS_OFFSET as u32,
+                    state: crate::PROCESS_STATE_OFFSET as u32,
                 },
             )
             .ok()

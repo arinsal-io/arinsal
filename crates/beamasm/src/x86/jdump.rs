@@ -123,7 +123,7 @@ pub(crate) fn beam_register(operand: &str) -> Option<crate::common::args::ArgVal
 
 /// erts 29.1.1 x86-64 `Process` field offsets in the dumps (`[r13+N]`), with Arinsal's
 /// `ProcessHeader` offset of the same field.
-pub(crate) const ERTS_PROCESS_OFFSETS: [(i32, i32); 13] = {
+pub(crate) const ERTS_PROCESS_OFFSETS: [(i32, i32); 14] = {
     use crate::x86::beam_asm::process;
     [
         (0, process::SELF_PID),
@@ -138,6 +138,7 @@ pub(crate) const ERTS_PROCESS_OFFSETS: [(i32, i32); 13] = {
         (464, process::CURRENT),
         (96, process::HEAP),
         (256, process::CATCHES),
+        (124, process::FLAGS),
         (
             488,
             core::mem::offset_of!(crate::ProcessHeader, high_water) as i32,
@@ -217,6 +218,10 @@ pub(crate) fn erts_to_arinsal(line: &str) -> String {
             line = line.replace(&aux(erts), &aux(tmp_mem_q_disp(index)));
             break;
         }
+    }
+    // `aux_regs.d.erl_bits_state` follows TMP_MEM5.
+    if line.contains(&aux(-16)) {
+        line = line.replace(&aux(-16), &aux(crate::ERL_BITS_STATE_DISP));
     }
     line
 }

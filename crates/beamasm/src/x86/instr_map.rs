@@ -873,7 +873,9 @@ mod tests {
             .map(|line| erts_to_arinsal(line))
             .collect();
 
-        let mut ga = BeamGlobalAssembler::declare_labels();
+        let mut ga = BeamGlobalAssembler::declare_labels(
+            crate::common::process_offsets::ProcessOffsets::ERTS_X86_64,
+        );
         ga.emit_internal_hash_helper().unwrap();
         let hash_expected = gnu_as(&hash_lines).expect("GNU binutils required for JIT dump tests");
         assert_eq!(ga.asm.a.bytes(Section::Code), hash_expected);
@@ -893,7 +895,9 @@ mod tests {
             .filter(|line| !line.is_empty())
             .map(|line| erts_to_arinsal(line))
             .collect();
-        let mut ga = BeamGlobalAssembler::declare_labels();
+        let mut ga = BeamGlobalAssembler::declare_labels(
+            crate::common::process_offsets::ProcessOffsets::ERTS_X86_64,
+        );
         ga.emit_flatmap_get_element().unwrap();
         let flatmap_expected =
             gnu_as(&flatmap_lines).expect("GNU binutils required for JIT dump tests");

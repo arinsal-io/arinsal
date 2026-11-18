@@ -4,5 +4,6 @@
 
 pub mod args;
 pub mod bs;
+pub mod process_offsets;
 pub mod register_cache;
 pub mod types;

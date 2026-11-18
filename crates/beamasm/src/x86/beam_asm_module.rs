@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use arinsal_x64::buf::{Label, Section};
 use arinsal_x64::enc::{Gp, Mem, MemBase};
 
-use super::beam_asm::register::{ARG1, ARG3, ARG4, ARG5, ARG6, E, REGISTERS, RET, TMP1, TMP2};
+use super::beam_asm::register::{
+    ARG1, ARG2, ARG3, ARG4, ARG5, ARG6, E, REGISTERS, RET, TMP1, TMP2,
+};
 use super::beam_asm::{AsmError, BeamAssembler, Distance, Update, get_arg_ref};
 use super::beam_asm_global::{
     BEAM_ASM_FUNC_PROLOGUE_SIZE, BeamGlobalAssembler, GLOBAL_LABELS, GlobalLabels,
@@ -1341,6 +1343,50 @@ impl BeamModuleAssembler {
         self.safe_fragment_call(fragment)?;
         self.last_error_offset = self.asm.a.offset();
         Ok(())
+    }
+
+    /// The `(Label I, const ErtsCodeMFA *)` overload of `emit_raise_exception`: raises with
+    /// the address of `i` as the error address.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:273-277
+    // (BeamModuleAssembler::emit_raise_exception(Label, const ErtsCodeMFA *)), OTP-29.1.1.
+    pub(crate) fn emit_raise_exception_label(
+        &mut self,
+        i: Label,
+        exp: Option<&'static arinsal_term::ErtsCodeMfa>,
+    ) -> Result<(), AsmError> {
+        self.asm
+            .a
+            .emit_rip_label(i, |e| e.lea(ARG2, Mem::rip(0, 8)))?;
+        self.emit_raise_exception_gp(ARG2, exp)
+    }
+
+    /// The `(x86::Gp I, const ErtsCodeMFA *)` overload of `emit_raise_exception`: a faked
+    /// call frame whose return address is the error address `i`, then `raise_exception_shared`.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:279-301
+    // (BeamModuleAssembler::emit_raise_exception(x86::Gp, const ErtsCodeMFA *)), OTP-29.1.1.
+    pub(crate) fn emit_raise_exception_gp(
+        &mut self,
+        i: Gp,
+        exp: Option<&'static arinsal_term::ErtsCodeMfa>,
+    ) -> Result<(), AsmError> {
+        if i != ARG2 {
+            self.asm.emit(|e| e.mov_rr(ARG2, i))?;
+        }
+        let exp = exp.map_or(0, |mfa| std::ptr::from_ref(mfa) as usize as u64);
+        self.asm.mov_imm(ARG4, exp)?;
+        // NATIVE_ERLANG_STACK: the CP must be reserved for try/catch to work, so fake a call
+        // with the return address set to the error address (the RA frame layout pushes no
+        // frame pointer).
+        self.asm.emit(|e| e.push_r(ARG2))?;
+        const {
+            assert!(matches!(
+                super::beam_asm::FRAME_LAYOUT,
+                super::beam_asm::FrameLayout::Ra
+            ))
+        };
+        let fragment = self.ga_get(GlobalLabels::RaiseExceptionShared)?;
+        let label = self.resolve_fragment(fragment);
+        self.asm.jmp(label)
     }
 }
 

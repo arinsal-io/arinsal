@@ -22,9 +22,9 @@ use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
 use super::beam_asm_module::{BeamModuleAssembler, arg_label, arg_word};
 pub use super::rt::{
     beam_jit_bs_construct_fail_info, beam_jit_bs_field_size_argument_error,
-    beam_jit_bs_get_integer, erts_bs_get_binary_2, erts_bs_get_float_2, erts_bs_get_integer_2,
-    erts_bs_get_utf8, erts_bs_get_utf16, erts_bs_init_writable, erts_bs_start_match_3,
-    erts_build_sub_bitstring, erts_cmp_bits,
+    beam_jit_bs_get_integer, beam_jit_bs_init_bits, erts_bs_get_binary_2, erts_bs_get_float_2,
+    erts_bs_get_integer_2, erts_bs_get_utf8, erts_bs_get_utf16, erts_bs_init_writable,
+    erts_bs_start_match_3, erts_build_sub_bitstring, erts_cmp_bits,
 };
 use crate::common::args::ArgVal;
 use crate::common::bs::{
@@ -1772,6 +1772,38 @@ impl BeamGlobalAssembler {
         a.jmp(raise_exception_shared)
     }
 
+    /// `ARG4` = binary size in bits, `ARG5` = extra words, `ARG6` = live X registers: the new
+    /// binary in RET, or `do_schedule` when the process is exiting. Called from
+    /// `i_bs_create_bin` inside the runtime, so the stack is realigned around the call.
+    // Port of erts/emulator/beam/jit/x86/instr_bs.cpp:1593-1637 (emit_bs_init_bits_shared),
+    // OTP-29.1.1.
+    pub(crate) fn emit_bs_init_bits_shared(&mut self) -> Result<(), AsmError> {
+        use super::process_main::ERTS_PSFLG_EXITING;
+        let state = dword_ptr(C_P, self.offsets.state as i32);
+        let do_schedule = self.label(GlobalLabels::DoSchedule);
+        let a = &mut self.asm;
+        let exiting = a.new_label();
+        a.load_erl_bits_state(ARG3)?;
+        a.load_x_reg_array(ARG2)?;
+        a.emit(|e| e.mov_rr(ARG1, C_P))?;
+        a.emit(|e| e.push_r(enc::RBP))?;
+        a.emit(|e| e.mov_rr(enc::RBP, enc::RSP))?;
+        a.runtime_call(beam_jit_bs_init_bits as *const () as usize)?;
+        a.emit(|e| e.leave())?;
+        a.emit(|e| e.mov_rm(super::beam_asm::register::ARG1D, state))?;
+        a.emit(|e| {
+            e.test_ri(
+                super::beam_asm::register::ARG1D,
+                i64::from(ERTS_PSFLG_EXITING),
+            )
+        })?;
+        a.short_jcc(CondCode::NE, exiting)?;
+        a.emit(|e| e.ret())?;
+        a.bind(exiting)?;
+        a.emit_leave_runtime(Update::REDUCTIONS.union(Update::HEAP_ALLOC))?;
+        a.jmp(do_schedule)
+    }
+
     /// The 64 least significant bits of the bignum in ARG1 (ZF clear), or ZF set when ARG1
     /// is not a bignum.
     // Port of erts/emulator/beam/jit/x86/instr_bs.cpp:1114-1154 (emit_get_sint64_shared),
@@ -2921,7 +2953,9 @@ mod tests {
         ] {
             assert!(BeamGlobalAssembler::emit_ptr(label).is_some(), "{label:?}");
         }
-        let ga = BeamGlobalAssembler::new().unwrap();
+        let ga =
+            BeamGlobalAssembler::new(crate::common::process_offsets::ProcessOffsets::ERTS_X86_64)
+                .unwrap();
         let m = BeamModuleAssembler::with_global(4, &ga, 0x1000);
         assert!(m.ga_get(G::BsGetTailShared).is_ok());
         assert!(m.ga_get(G::BsGetUtf8ShortShared).is_err());

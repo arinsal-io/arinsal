@@ -14,9 +14,11 @@ pub mod instr_call;
 pub mod instr_common;
 pub mod instr_fun;
 pub mod instr_map;
+pub mod instr_msg;
 pub mod instr_select;
 #[cfg(test)]
 mod jdump;
+pub mod process_main;
 #[allow(unsafe_code)]
 pub mod rt;
 

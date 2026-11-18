@@ -65,6 +65,9 @@ pub unsafe fn enter_native_raw(
 #[allow(improper_ctypes)]
 unsafe extern "C" {
     pub fn arinsal_enter_native_return();
+    /// The Rust scheduler loop's `schedule_next`: where `context_switch`,
+    /// `context_switch_simplified` and `do_schedule` leave native code (see the bridge).
+    pub fn arinsal_schedule_next();
     /// erts `beam_return_trace`: the return address of a return_trace frame.
     pub fn arinsal_return_trace();
     /// erts `beam_exception_trace`: the return address of an exception_trace frame.
@@ -254,6 +257,16 @@ unsafe extern "C" {
         arg3: u64,
         arg1: u64,
     );
+    /// `Eterm beam_jit_bs_init_bits(Process *c_p, Eterm *reg, struct erl_bits_state *EBS,
+    /// Uint num_bits, Uint alloc, unsigned Live)` (beam_jit_common.hpp).
+    pub safe fn beam_jit_bs_init_bits(
+        c_p: *mut crate::ProcessHeader,
+        reg: *mut u64,
+        ebs: *mut u64,
+        num_bits: u64,
+        alloc: u64,
+        live: u32,
+    ) -> u64;
     /// `ErlSubBits *erts_bs_start_match_3(Process *p, Eterm Bin)` (erl_bits.h).
     pub safe fn erts_bs_start_match_3(c_p: *mut crate::ProcessHeader, bin: u64) -> usize;
     /// `Eterm erts_bs_get_integer_2(Process *p, Uint num_bits, unsigned flags,
@@ -303,6 +316,71 @@ unsafe extern "C" {
         offset: u64,
         size: u64,
     ) -> u64;
+}
+
+// Port of erts/emulator/beam/jit/x86/instr_msg.cpp (`extern "C" { #include "bif.h"
+// #include "code_ix.h" #include "erl_proc_sig_queue.h" }` and the beam_jit_* receive helpers
+// of jit/beam_jit_common.hpp) and jit/x86/process_main.cpp (`copy_out_registers` of
+// beam_common.h), OTP-29.1.1: the runtime functions the receive emitters, `i_loop_rec_shared`
+// and the schedule-out half of `process_main` call by address. `ErtsMessage *` crosses as an
+// address (native code only loads `m[0]` and passes it on); `instr_msg` re-exports them.
+unsafe extern "C" {
+    /// `int erts_proc_sig_receive_helper(Process *c_p, int fcalls, int neg_o_reds,
+    /// ErtsMessage **msgpp, int *get_outp)` (erl_proc_sig_queue.h): reductions used.
+    pub safe fn erts_proc_sig_receive_helper(
+        c_p: *mut crate::ProcessHeader,
+        fcalls: i32,
+        neg_o_reds: i32,
+        msgpp: *mut usize,
+        get_outp: *mut i32,
+    ) -> i32;
+    /// `ErtsMessage *beam_jit_decode_dist(Process *c_p, ErtsMessage *msgp)`
+    /// (beam_jit_common.hpp): the decoded message, or null when it was dropped.
+    pub safe fn beam_jit_decode_dist(c_p: *mut crate::ProcessHeader, msgp: usize) -> usize;
+    /// `Eterm erts_msgq_recv_marker_insert(Process *c_p)` (erl_proc_sig_queue.h).
+    pub safe fn erts_msgq_recv_marker_insert(c_p: *mut crate::ProcessHeader) -> u64;
+    /// `void erts_msgq_recv_marker_bind(Process *c_p, Eterm insert_id, Eterm bind_id)`
+    /// (erl_proc_sig_queue.h).
+    pub safe fn erts_msgq_recv_marker_bind(
+        c_p: *mut crate::ProcessHeader,
+        insert_id: u64,
+        bind_id: u64,
+    );
+    /// `void erts_msgq_recv_marker_clear(Process *c_p, Eterm id)` (erl_proc_sig_queue.h).
+    pub safe fn erts_msgq_recv_marker_clear(c_p: *mut crate::ProcessHeader, id: u64);
+    /// `void erts_msgq_recv_marker_set_save(Process *c_p, Eterm id)` (erl_proc_sig_queue.h).
+    pub safe fn erts_msgq_recv_marker_set_save(c_p: *mut crate::ProcessHeader, id: u64);
+    /// `void erts_msgq_set_save_next(Process *c_p)` (erl_proc_sig_queue.h).
+    pub safe fn erts_msgq_set_save_next(c_p: *mut crate::ProcessHeader);
+    /// `Sint32 beam_jit_remove_message(Process *c_p, Sint32 FCALLS, Eterm *HTOP, Eterm *E,
+    /// Uint32 active_code_ix)` (beam_jit_common.hpp): the remaining reductions.
+    pub safe fn beam_jit_remove_message(
+        c_p: *mut crate::ProcessHeader,
+        fcalls: i32,
+        htop: *mut u64,
+        e: *mut u64,
+        active_code_ix: u32,
+    ) -> i32;
+    /// `void beam_jit_wait_unlocked(Process *c_p, ErtsCodePtr cp)` (beam_jit_common.hpp).
+    pub safe fn beam_jit_wait_unlocked(c_p: *mut crate::ProcessHeader, cp: usize);
+    /// `void beam_jit_wait_locked(Process *c_p, ErtsCodePtr cp)` (beam_jit_common.hpp).
+    pub safe fn beam_jit_wait_locked(c_p: *mut crate::ProcessHeader, cp: usize);
+    /// `void beam_jit_take_receive_lock(Process *c_p)` (beam_jit_common.hpp).
+    pub safe fn beam_jit_take_receive_lock(c_p: *mut crate::ProcessHeader);
+    /// `enum beam_jit_tmo_ret beam_jit_wait_timeout(Process *c_p, Eterm timeout_value,
+    /// ErtsCodePtr next)` (beam_jit_common.hpp): `RET_next` 0, `RET_wait` 1, `RET_badarg` 2.
+    pub safe fn beam_jit_wait_timeout(
+        c_p: *mut crate::ProcessHeader,
+        timeout_value: u64,
+        next: usize,
+    ) -> u32;
+    /// `void beam_jit_timeout(Process *c_p)` (beam_jit_common.hpp).
+    pub safe fn beam_jit_timeout(c_p: *mut crate::ProcessHeader);
+    /// `void beam_jit_timeout_locked(Process *c_p)` (beam_jit_common.hpp).
+    pub safe fn beam_jit_timeout_locked(c_p: *mut crate::ProcessHeader);
+    /// `void copy_out_registers(Process *c_p, Eterm *reg)` (beam_common.h): saves the
+    /// `c_p->arity` live X registers into the process before it is scheduled out.
+    pub safe fn copy_out_registers(c_p: *mut crate::ProcessHeader, reg: *mut u64);
 }
 
 /// Displacements (from `registers`) the bridge shares with native fragments and the VM, as on
@@ -449,6 +527,7 @@ core::arch::global_asm!(
     "mov [r13 + {htop}], r15",
     "mov [r13 + {stop}], rsp",
     "mov [r13 + {fcalls}], r14d",
+    "3:",
     "mov rsp, [rbx + {runtime_stack}]",
     "pop rcx",
     "mov [rcx], rax",
@@ -461,6 +540,16 @@ core::arch::global_asm!(
     "pop rbx",
     "pop rbp",
     "ret",
+    // `schedule_next` of erts' process_main (process_main.cpp:195-293), reached by a jump from
+    // the schedule-out half of the `process_main` fragment (beam_asm_global
+    // `emit_process_main`) on the runtime stack, with HTOP, E and FCALLS published to `c_p`
+    // and the live X registers copied out: back to the Rust scheduler loop, which runs
+    // `erts_schedule` and re-enters through this bridge. Kind 1: the process was scheduled
+    // out.
+    concat!(".global ", asm_sym!("arinsal_schedule_next")),
+    concat!(asm_sym!("arinsal_schedule_next"), ":"),
+    "mov eax, 1",
+    "jmp 3b",
     htop = const HTOP,
     stop = const STOP,
     fcalls = const FCALLS,
@@ -659,6 +748,101 @@ mod tests {
     #[unsafe(no_mangle)]
     extern "C" fn erts_unary_minus(_: *mut crate::ProcessHeader, _: u64) -> u64 {
         unreachable!("arithmetic byte-test fixture")
+    }
+
+    // Fixtures for the receive and schedule-out runtime functions (instr_msg, process_main).
+    #[unsafe(no_mangle)]
+    extern "C" fn beam_jit_bs_init_bits(
+        _: *mut crate::ProcessHeader,
+        _: *mut u64,
+        _: *mut u64,
+        _: u64,
+        _: u64,
+        _: u32,
+    ) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_garbage_collect_nobump(
+        _: *mut crate::ProcessHeader,
+        _: i32,
+        _: *mut u64,
+        _: i32,
+        _: i32,
+    ) -> i32 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_proc_sig_receive_helper(
+        _: *mut crate::ProcessHeader,
+        _: i32,
+        _: i32,
+        _: *mut usize,
+        _: *mut i32,
+    ) -> i32 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn beam_jit_decode_dist(_: *mut crate::ProcessHeader, _: usize) -> usize {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_msgq_recv_marker_insert(_: *mut crate::ProcessHeader) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_msgq_recv_marker_bind(_: *mut crate::ProcessHeader, _: u64, _: u64) {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_msgq_recv_marker_clear(_: *mut crate::ProcessHeader, _: u64) {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_msgq_recv_marker_set_save(_: *mut crate::ProcessHeader, _: u64) {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_msgq_set_save_next(_: *mut crate::ProcessHeader) {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn beam_jit_remove_message(
+        _: *mut crate::ProcessHeader,
+        _: i32,
+        _: *mut u64,
+        _: *mut u64,
+        _: u32,
+    ) -> i32 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn beam_jit_wait_unlocked(_: *mut crate::ProcessHeader, _: usize) {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn beam_jit_wait_locked(_: *mut crate::ProcessHeader, _: usize) {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn beam_jit_take_receive_lock(_: *mut crate::ProcessHeader) {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn beam_jit_wait_timeout(_: *mut crate::ProcessHeader, _: u64, _: usize) -> u32 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn beam_jit_timeout(_: *mut crate::ProcessHeader) {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn beam_jit_timeout_locked(_: *mut crate::ProcessHeader) {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn copy_out_registers(_: *mut crate::ProcessHeader, _: *mut u64) {
+        unreachable!("byte-test fixture")
     }
 
     /// Fixture for the VM's `the_active_code_index`, so byte tests of

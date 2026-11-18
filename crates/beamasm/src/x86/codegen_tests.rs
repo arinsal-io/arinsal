@@ -194,7 +194,9 @@ impl OpSink for Loader<'_> {
 /// The global code as erts emits it, with every fragment not ported yet bound to `ud2`, so
 /// that the labels the ported fragments jump to resolve. None of them is reached here.
 fn global_assembler() -> (BeamGlobalAssembler, arinsal_x64::exec::CodeMemory) {
-    let mut ga = BeamGlobalAssembler::new().unwrap();
+    let mut ga =
+        BeamGlobalAssembler::new(crate::common::process_offsets::ProcessOffsets::ERTS_X86_64)
+            .unwrap();
     for label in GLOBAL_LABELS {
         let l = ga.label(label);
         if ga.asm.a.label_location(l).is_none() {

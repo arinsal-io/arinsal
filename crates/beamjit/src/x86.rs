@@ -15,7 +15,7 @@ use crate::beam_asm::{
 };
 use arinsal_beam::BeamFile;
 use arinsal_beamasm::beam_asm::AsmError;
-use arinsal_beamasm::beam_asm_global::BeamGlobalAssembler;
+use arinsal_beamasm::beam_asm_global::{BeamGlobalAssembler, ProcessOffsets};
 use arinsal_beamasm::beam_asm_module::{BeamCodeHeader, BeamModuleAssembler};
 use arinsal_beamasm::common::args::ArgVal;
 use arinsal_beamasm::common::types::ArgType;
@@ -42,8 +42,11 @@ pub struct BeamAsm {
 /// waits for their emitters.
 // Port of erts/emulator/beam/jit/beam_jit_main.cpp:243-325 (beamasm_init, up to `bga`),
 // OTP-29.1.1.
-pub fn beamasm_init() -> Result<BeamAsm, AsmError> {
-    let mut bga = BeamGlobalAssembler::new()?;
+///
+/// `offsets` are the VM's `offsetof(Process, ...)` values the fragments compile in
+/// (`arinsal_vm::PROCESS_STATE_OFFSET`, `PROCESS_SIGQ_SAVE_OFFSET`, `ERTS_MESSAGE_TERM_OFFSET`).
+pub fn beamasm_init(offsets: ProcessOffsets) -> Result<BeamAsm, AsmError> {
+    let mut bga = BeamGlobalAssembler::new(offsets)?;
     let global_code = bga.codegen()?;
     Ok(BeamAsm { bga, global_code })
 }

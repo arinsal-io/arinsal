@@ -33,19 +33,13 @@ const MESSAGE_PTR: u32 = tmp_mem_ref(1);
 /// `get_out` (TMP_MEM3q): nonzero when the process must schedule out.
 const GET_OUT: u32 = tmp_mem_ref(2);
 
-/// The process fields `i_loop_rec_shared` reads, as byte offsets from `c_p`: the VM's
-/// `PROCESS_SIGQ_SAVE_OFFSET`, `ERTS_MESSAGE_TERM_OFFSET` and `PROCESS_FLAGS_OFFSET`, which
-/// erts compiles in as `offsetof(Process, sig_qs.save)`, `offsetof(ErtsMessage, m[0])` and
-/// `offsetof(Process, flags)`.
-#[derive(Clone, Copy)]
-pub struct MsgOffsets {
-    /// `c_p->sig_qs.save`: the `next` field that points at the message a receive looks at.
-    pub sig_qs_save: u32,
-    /// `offsetof(ErtsMessage, m[0])`: the term of a message in its node.
-    pub message_term: u32,
-    /// `c_p->flags`, where a receive sets `F_DELAY_GC` while it looks at messages.
-    pub flags: u32,
-}
+/// The process fields `i_loop_rec_shared` reads whose offsets the VM provides
+/// (`sig_qs.save`, `ErtsMessage.m[0]`): the architecture-neutral
+/// [`crate::common::process_offsets::ProcessOffsets`].
+pub use crate::common::process_offsets::ProcessOffsets as MsgOffsets;
+
+/// `offsetof(Process, flags)`: part of the fixed native prefix.
+const PROCESS_FLAGS: u32 = core::mem::offset_of!(crate::ProcessHeader, flags) as u32;
 
 /// Receive fragments: `i_loop_rec_shared`, `wait_unlocked_shared` and `wait_locked_shared`.
 pub struct ReceiveFragments {
@@ -95,13 +89,13 @@ impl ReceiveFragments {
         code.bind(loop_rec_label).map_err(fail)?;
         code.emit(|e| {
             e.mov_reg(XREG1, Gpr::x(30))?;
-            e.ldr_uoff(Gpr::w(8), C_P, offsets.flags)?;
+            e.ldr_uoff(Gpr::w(8), C_P, PROCESS_FLAGS)?;
             e.orr_imm(
                 Gpr::w(8),
                 Gpr::w(8),
                 u64::from(arinsal_term::pflags::F_DELAY_GC),
             )?;
-            e.str_uoff(Gpr::w(8), C_P, offsets.flags)?;
+            e.str_uoff(Gpr::w(8), C_P, PROCESS_FLAGS)?;
             e.str_uoff(ARG1, C_P, PROCESS_I)?;
             e.mov_reg(XREG2, ARG2)?;
             e.cmp_imm(FCALLS, 0, false)
@@ -142,13 +136,13 @@ impl ReceiveFragments {
             .map_err(fail)?;
         code.cbnz(Gpr::w(8), schedule_out).map_err(fail)?;
         // The queue is empty and the process neither yields nor exits: on to the wait.
-        clear_delay_gc(&mut code, offsets.flags).map_err(fail)?;
+        clear_delay_gc(&mut code, PROCESS_FLAGS).map_err(fail)?;
         code.emit(|e| e.br(XREG2)).map_err(fail)?;
 
         // Out of reductions or a signal to act on: schedule out at the `loop_rec`, whose
         // address (`c_p->i`) was set on entry.
         code.bind(schedule_out).map_err(fail)?;
-        clear_delay_gc(&mut code, offsets.flags).map_err(fail)?;
+        clear_delay_gc(&mut code, PROCESS_FLAGS).map_err(fail)?;
         code.emit(|e| {
             e.mov_const(TMP2, 0)?;
             e.strb_uoff(TMP2, C_P, PROCESS_ARITY)?;
