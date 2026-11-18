@@ -44,10 +44,22 @@ struct Permission {
     ended: Option<u64>,
 }
 
-/// One node's code index state (`the_active_code_index`, `the_staging_code_index`).
+/// `erts_atomic32_t the_active_code_index` (code_ix.c): the code index every scheduler runs
+/// with. JIT code reads it by symbol (`emit_leave_runtime<eCodeIndex>`, the export and fun
+/// call sequences), so it has erts' name and C layout (`AtomicU32` is a `u32`).
+// Port of erts/emulator/beam/code_ix.c:38-39 (the_active_code_index), OTP-29.1.1.
+#[allow(non_upper_case_globals)]
+#[unsafe(no_mangle)]
+pub static the_active_code_index: AtomicU32 = AtomicU32::new(0);
+
+/// `erts_atomic32_t the_staging_code_index` (code_ix.c).
+// Port of erts/emulator/beam/code_ix.c:38-39 (the_staging_code_index), OTP-29.1.1.
+#[allow(non_upper_case_globals)]
+static the_staging_code_index: AtomicU32 = AtomicU32::new(0);
+
+/// The node's code index state; the active and staging indexes are the globals
+/// [`the_active_code_index`] and `the_staging_code_index`, as in code_ix.c.
 pub(crate) struct CodeIndexes {
-    active: AtomicU32,
-    staging: AtomicU32,
     /// `module_tables[ERTS_NUM_CODE_IX]`, the export tables and the ranges of each code index.
     tables: [RawSlot<CodeTables>; ERTS_NUM_CODE_IX],
     /// Generation of each slot's tables, published after the tables: a scheduled-in process
@@ -83,8 +95,6 @@ impl CodeIndexes {
         let initial = Arc::new(CodeTables::new());
         let (bccix, catch_vec) = crate::beam_catches::beam_catches_init();
         Self {
-            active: AtomicU32::new(0),
-            staging: AtomicU32::new(0),
             generations: std::array::from_fn(|_| AtomicU64::new(initial.generation)),
             tables: std::array::from_fn(|_| RawSlot::new(Arc::clone(&initial))),
             catches: std::array::from_fn(|_| RawSlot::new(Arc::clone(&catch_vec))),
@@ -671,12 +681,12 @@ impl CodeIndexes {
 
     /// `erts_active_code_ix`.
     pub(crate) fn active(&self) -> usize {
-        self.active.load(Ordering::Acquire) as usize
+        the_active_code_index.load(Ordering::Acquire) as usize
     }
 
     /// `erts_staging_code_ix`.
     pub(crate) fn staging(&self) -> usize {
-        self.staging.load(Ordering::Acquire) as usize
+        the_staging_code_index.load(Ordering::Acquire) as usize
     }
 
     /// Makes the staging index active and opens the next one for staging.
@@ -685,9 +695,8 @@ impl CodeIndexes {
     // erts_schedule_code_barrier / erts_blocking_code_barrier do in code_ix.c:558-631.
     fn commit_with_barrier(&self, code_barrier_pending: bool) {
         let ix = self.staging();
-        self.active.store(ix as u32, Ordering::Release);
-        self.staging
-            .store(((ix + 1) % ERTS_NUM_CODE_IX) as u32, Ordering::Release);
+        the_active_code_index.store(ix as u32, Ordering::Release);
+        the_staging_code_index.store(((ix + 1) % ERTS_NUM_CODE_IX) as u32, Ordering::Release);
         if code_barrier_pending && !CODE_BARRIER_PENDING.replace(true) && runs_native_slices() {
             CODE_BARRIER_THREADS.fetch_add(1, Ordering::SeqCst);
         }
