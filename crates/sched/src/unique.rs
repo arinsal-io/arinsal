@@ -6,7 +6,6 @@
 mod raw;
 
 use std::cell::Cell;
-use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,19 +22,21 @@ const VALUE_BITS: u32 = 48;
 const VALUE_MASK: u64 = (1 << VALUE_BITS) - 1;
 const MIN_SMALL: i128 = -(1_i128 << 59);
 
-/// The per-scheduler `ref` and `unique` fields from `ErtsSchedulerData`.
+/// The `thr_id`, `unique` and `ref` fields of a scheduler's `SchedRefUnique`.
 ///
-/// The scheduler worker owns this value for its lifetime. Its thread-local binding
-/// lets VM and NIF calls reach the same fields as `erts_proc_sched_data(c_p)`.
-// Port of erts/emulator/beam/erl_process.h (`ErtsSchedulerData.ref`, `.unique`) and
-// erl_process.c (`init_scheduler_data`), OTP-29.1.1.
-pub struct ErtsSchedulerData {
+/// They are part of the scheduler's one data block (`crate::SchedRefUnique`). The
+/// thread-local binding is erts' `erts_get_scheduler_data()` for code that has no `esdp`
+/// at hand (VM and NIF calls); it holds a counted handle so the scheduler loop keeps
+/// its `&mut esdp`.
+// Port of erts/emulator/beam/erl_process.h:718-720 (`SchedRefUnique.thr_id`, `.unique`,
+// `.ref`) and erl_process.c (`init_scheduler_data`), OTP-29.1.1.
+pub struct SchedRefUnique {
     thr_id: Cell<u32>,
     ref_n: Cell<u64>,
     unique_n: Cell<u64>,
 }
 
-impl Default for ErtsSchedulerData {
+impl Default for SchedRefUnique {
     fn default() -> Self {
         Self {
             thr_id: Cell::new(0),
@@ -45,7 +46,7 @@ impl Default for ErtsSchedulerData {
     }
 }
 
-impl ErtsSchedulerData {
+impl SchedRefUnique {
     /// Allocate the service fields for one normal scheduler.
     pub fn new_normal(thr_id: u32) -> Self {
         Self {
@@ -63,11 +64,10 @@ impl ErtsSchedulerData {
     }
 
     /// Bind these scheduler-owned counters for the lifetime of its worker thread.
-    pub fn bind(&self) -> SchedulerDataGuard<'_> {
+    pub fn bind(self: &Rc<Self>) -> SchedulerDataGuard {
         SchedulerDataGuard {
             previous: raw::replace(self),
-            _data: PhantomData,
-            _not_send: PhantomData,
+            _data: Rc::clone(self),
         }
     }
 
@@ -90,13 +90,13 @@ impl ErtsSchedulerData {
 }
 
 /// Restores the previous scheduler binding when a task turn returns.
-pub struct SchedulerDataGuard<'a> {
-    previous: *const ErtsSchedulerData,
-    _data: PhantomData<&'a ErtsSchedulerData>,
-    _not_send: PhantomData<Rc<()>>,
+pub struct SchedulerDataGuard {
+    previous: *const SchedRefUnique,
+    /// Keeps the bound counters alive; `Rc` also keeps the guard on its thread.
+    _data: Rc<SchedRefUnique>,
 }
 
-impl Drop for SchedulerDataGuard<'_> {
+impl Drop for SchedulerDataGuard {
     fn drop(&mut self) {
         raw::restore(self.previous);
     }
@@ -156,7 +156,7 @@ fn set_ref_numbers(thr_id: u32, value: u64) -> [u32; 3] {
 // (`erts_sched_make_ref_in_array`), OTP-29.1.1.
 #[inline]
 pub fn next_ref_words() -> [u32; 3] {
-    raw::with_current(ErtsSchedulerData::bump_ref_words).unwrap_or_else(global_ref_words)
+    raw::with_current(SchedRefUnique::bump_ref_words).unwrap_or_else(global_ref_words)
 }
 
 /// Next ordinary-reference identifier.
@@ -300,11 +300,11 @@ mod tests {
 
     #[test]
     fn scheduler_data_keeps_its_reference_counter() {
-        let data = ErtsSchedulerData {
+        let data = Rc::new(SchedRefUnique {
             thr_id: Cell::new(7),
             ref_n: Cell::new(9),
             unique_n: Cell::new(0),
-        };
+        });
         let _guard = data.bind();
         let first = next_ref_words();
         let second = next_ref_words();

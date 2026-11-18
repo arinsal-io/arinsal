@@ -2,29 +2,30 @@
 //!
 //! Port of `erts_get_scheduler_data` from erts/emulator/beam/erl_process.c, OTP-29.1.1.
 
-use super::ErtsSchedulerData;
+use super::SchedRefUnique;
 use std::cell::Cell;
 
 thread_local! {
-    static CURRENT: Cell<*const ErtsSchedulerData> = const { Cell::new(std::ptr::null()) };
+    static CURRENT: Cell<*const SchedRefUnique> = const { Cell::new(std::ptr::null()) };
 }
 
-pub(super) fn replace(data: &ErtsSchedulerData) -> *const ErtsSchedulerData {
+pub(super) fn replace(data: &SchedRefUnique) -> *const SchedRefUnique {
     CURRENT.with(|current| current.replace(std::ptr::from_ref(data)))
 }
 
-pub(super) fn restore(previous: *const ErtsSchedulerData) {
+pub(super) fn restore(previous: *const SchedRefUnique) {
     CURRENT.with(|current| current.set(previous));
 }
 
-pub(super) fn with_current<R>(f: impl for<'a> FnOnce(&'a ErtsSchedulerData) -> R) -> Option<R> {
+pub(super) fn with_current<R>(f: impl for<'a> FnOnce(&'a SchedRefUnique) -> R) -> Option<R> {
     CURRENT.with(|current| {
         let data = current.get();
         if data.is_null() {
             None
         } else {
-            // SAFETY: `ErtsSchedulerData::bind` borrows `data` for the binding guard's
-            // lifetime, and this thread-local slot is restored when that guard drops.
+            // SAFETY: `SchedRefUnique::bind` keeps `data` alive (an `Rc` clone) for the
+            // binding guard's lifetime, and the guard's drop restores this slot. The
+            // counters are only read through shared references (`Cell`).
             Some(f(unsafe { &*data }))
         }
     })
