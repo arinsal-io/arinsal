@@ -5583,18 +5583,15 @@ pub struct RunCtx<'a, M: SignalMessage> {
     inner: &'a mut dyn ContextOps<M>,
     /// The running process: the pointer erts passes around as `c_p`.
     proc: &'a ProcShared<M>,
-    /// The constants of the scheduler thread running the slice (`esdp`).
-    consts: &'a SliceConsts,
+    /// The data of the scheduler thread running the slice (`esdp`), kept for the thread's
+    /// lifetime.
+    esdp: &'a mut ErtsSchedData,
     /// `reds_used` as process_main hands it to `erts_schedule` at the context switch
     /// (`REDS_IN - FCALLS`): the task reports it once when its slice ends.
     reds_used: u32,
     /// `REDS_IN`: the reductions the slice was scheduled in with.
     budget: u32,
-    /// `esdp->virtual_reds`: part of the consumed budget that is not work.
-    virtual_reds: u32,
-    msacc_enabled: bool,
-    wall_enabled: bool,
-    gc_accounted_total: u64,
+    /// erts_schedule's `state & ERTS_PSFLG_SYS_TASKS` at schedule-in.
     sys_task_run: bool,
     /// A dirty signal handler acts for a process whose dirty job is executing.
     dirty_running: bool,
@@ -5603,13 +5600,59 @@ pub struct RunCtx<'a, M: SignalMessage> {
     dirty_queued: bool,
 }
 
-/// What a slice's context knows about the scheduler thread it runs on; fixed for the thread's
-/// lifetime, like the fields of erts' `ErtsSchedulerData` that `process_main` reads.
-#[derive(Clone, Copy)]
-struct SliceConsts {
+/// The part of erts' `ErtsSchedulerData` that `erts_schedule`, `process_main` and the BIFs of
+/// a slice read through `esdp`: one per scheduler thread, owned by its loop for the thread's
+/// lifetime. The scheduler's `ref`/`unique` counters are [`unique::ErtsSchedulerData`] and
+/// the VM's part is [`Task::SchedulerData`].
+// Port of erts/emulator/beam/erl_process.h:687 (struct ErtsSchedulerData_: `no`, `type`,
+// `virtual_reds`, `msacc`, `sched_wall_time`), OTP-29.1.1.
+struct ErtsSchedData {
+    /// `esdp->no - 1` of a normal scheduler; `None` on a dirty scheduler and for a context
+    /// acting as another process.
     worker: Option<usize>,
+    /// `erts_no_schedulers`.
     worker_count: usize,
+    /// `esdp->type`.
     sched_type: SchedulerType,
+    /// `esdp->virtual_reds`: part of the consumed budget that is not work. `erts_schedule`
+    /// reads it at schedule-out and resets it.
+    virtual_reds: u32,
+    /// `ERTS_MSACC_IS_ENABLED_CACHED()`: `esdp->msacc` cached at the context switch.
+    msacc_enabled: bool,
+    /// `esdp->sched_wall_time.enabled`.
+    wall_enabled: bool,
+    /// Collection time already moved into the GC microstate, for this slice's process.
+    gc_accounted_total: u64,
+}
+
+impl ErtsSchedData {
+    // Port of erts/emulator/beam/erl_process.c:5994 (init_scheduler_data), OTP-29.1.1.
+    fn new(worker: Option<usize>, worker_count: usize, sched_type: SchedulerType) -> Self {
+        Self {
+            worker,
+            worker_count,
+            sched_type,
+            virtual_reds: 0,
+            msacc_enabled: false,
+            wall_enabled: false,
+            gc_accounted_total: 0,
+        }
+    }
+
+    /// Schedule-in of one slice: the accounting caches `process_main` refreshes at every
+    /// context switch (`ERTS_MSACC_UPDATE_CACHE`).
+    // Port of erts/emulator/beam/jit/x86/process_main.cpp (schedule_next: msacc cache) and
+    // erl_process.c (erts_schedule: `esdp->virtual_reds = 0` once read), OTP-29.1.1.
+    fn schedule_in(&mut self, accounting_flags: u8, gc_nanoseconds: impl FnOnce() -> u64) {
+        self.virtual_reds = 0;
+        self.msacc_enabled = accounting_flags & ACCOUNTING_MSACC != 0;
+        self.wall_enabled = accounting_flags & ACCOUNTING_WALL != 0;
+        self.gc_accounted_total = if self.msacc_enabled {
+            gc_nanoseconds()
+        } else {
+            0
+        };
+    }
 }
 
 trait ContextOps<M: SignalMessage> {
@@ -5708,7 +5751,7 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     }
     /// Return the scheduler worker currently running this process.
     pub fn worker_id(&self) -> Option<usize> {
-        self.consts.worker
+        self.esdp.worker
     }
     /// Reject further mailbox publishes and delete this pid from the process table.
     /// In-flight publishers that already resolved the slot still land; a later
@@ -5750,11 +5793,11 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     }
     /// Number of scheduler workers available to this runtime.
     pub fn scheduler_count(&self) -> usize {
-        self.consts.worker_count
+        self.esdp.worker_count
     }
     /// One-based id of the worker executing this process turn.
     pub fn scheduler_id(&self) -> Option<usize> {
-        self.consts.worker.map(|worker| worker + 1)
+        self.esdp.worker.map(|worker| worker + 1)
     }
     /// Identity of the normal scheduler thread running this slice, zero on a dirty
     /// scheduler. A task caches what it derived from the scheduler (its `esdp`) under this key
@@ -5763,10 +5806,10 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     // process_main reads once per scheduler, not once per process switch), OTP-29.1.1.
     #[inline(always)]
     pub fn scheduler_key(&self) -> u64 {
-        if self.consts.sched_type != SchedulerType::Normal {
+        if self.esdp.sched_type != SchedulerType::Normal {
             return 0;
         }
-        self.consts.worker.map_or(0, |worker| worker as u64 + 1)
+        self.esdp.worker.map_or(0, |worker| worker as u64 + 1)
     }
     /// Whether the slice may skip the scheduling-in work a signal, a system task or a dirty
     /// scheduler would add: a plain slice on a normal scheduler with reductions left. Queued
@@ -5784,7 +5827,7 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     }
     /// Type of the scheduler executing this process turn.
     pub fn scheduler_type(&self) -> SchedulerType {
-        self.consts.sched_type
+        self.esdp.sched_type
     }
     /// Publish messages and signals this turn has buffered so far. A long dirty job
     /// calls this so its sends do not wait for the job to return.
@@ -5937,7 +5980,7 @@ impl<M: SignalMessage> RunCtx<'_, M> {
             previous + 1
         };
         let should_yield =
-            target != UNBOUND_WORKER && self.consts.worker.is_some_and(|worker| worker != target);
+            target != UNBOUND_WORKER && self.esdp.worker.is_some_and(|worker| worker != target);
         (previous_id, should_yield)
     }
     /// Record that `reds` of the consumed budget are virtual: they end the slice but are not
@@ -5946,7 +5989,7 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     // esdp->virtual_reds`), OTP-29.1.1.
     #[inline]
     pub fn add_virtual_reds(&mut self, reds: u32) {
-        self.virtual_reds = self.virtual_reds.saturating_add(reds);
+        self.esdp.virtual_reds = self.esdp.virtual_reds.saturating_add(reds);
     }
     /// Reductions of the quantum not yet reported through [`RunCtx::consume`]. A context
     /// acting as another process (a dirty signal handler) has the caller's reductions left.
@@ -5974,15 +6017,15 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     }
     /// Change the current scheduler worker's microstate category.
     pub fn set_msacc_state(&mut self, state: MsaccState) {
-        if !self.msacc_enabled {
+        if !self.esdp.msacc_enabled {
             return;
         }
         self.inner.set_msacc_state(state);
     }
     /// Change microstate accounting while this task is running.
     pub fn set_msacc_accounting_enabled(&mut self, enabled: bool) {
-        if self.msacc_enabled != enabled {
-            self.msacc_enabled = enabled;
+        if self.esdp.msacc_enabled != enabled {
+            self.esdp.msacc_enabled = enabled;
             self.inner.set_msacc_enabled(enabled);
         }
     }
@@ -5993,24 +6036,24 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     /// Account newly completed collection time before a live microstate snapshot.
     // Port of erts/emulator/beam/erl_gc.c:800 (collector state interval), OTP-29.1.1.
     pub fn account_gc_total(&mut self, total_nanoseconds: u64) {
-        if self.msacc_enabled {
-            let delta = total_nanoseconds.saturating_sub(self.gc_accounted_total);
+        if self.esdp.msacc_enabled {
+            let delta = total_nanoseconds.saturating_sub(self.esdp.gc_accounted_total);
             if delta != 0 {
                 self.inner.reclassify_gc_ns(delta);
             }
-            self.gc_accounted_total = self.gc_accounted_total.max(total_nanoseconds);
+            self.esdp.gc_accounted_total = self.esdp.gc_accounted_total.max(total_nanoseconds);
         }
     }
     /// Set the GC counter origin when accounting is enabled or reset mid-turn.
     pub fn set_gc_accounting_baseline(&mut self, total_nanoseconds: u64) {
-        self.gc_accounted_total = total_nanoseconds;
+        self.esdp.gc_accounted_total = total_nanoseconds;
     }
     /// Update this worker's active interval when scheduler wall time changes.
     pub fn set_wall_accounting_enabled(&mut self, enabled: bool) {
-        if self.wall_enabled == enabled {
+        if self.esdp.wall_enabled == enabled {
             return;
         }
-        self.wall_enabled = enabled;
+        self.esdp.wall_enabled = enabled;
         self.inner.set_wall_accounting_enabled(enabled);
     }
     /// Take the oldest signal from the outer signal queue, for a task without an inner
@@ -6384,22 +6427,14 @@ impl<T: Task> Runner<'_, T> {
         handle: &mut TargetHandler<'_, T::Message>,
     ) -> bool {
         debug_assert_eq!(pid, process.pid);
-        let consts = SliceConsts {
-            worker: None,
-            worker_count: self.inner.config.workers,
-            sched_type: SchedulerType::Normal,
-        };
+        let mut esdp = ErtsSchedData::new(None, self.inner.config.workers, SchedulerType::Normal);
         let task = cell.task_mut();
         let mut ctx = RunCtx {
             inner: self,
             proc: &process.shared,
-            consts: &consts,
+            esdp: &mut esdp,
             reds_used: 0,
             budget: reds,
-            virtual_reds: 0,
-            msacc_enabled: false,
-            wall_enabled: false,
-            gc_accounted_total: 0,
             sys_task_run: false,
             dirty_running: process.input.state().load(Ordering::SeqCst) & psflg::DIRTY_RUNNING != 0,
             dirty_queued: process.input.state().load(Ordering::SeqCst) & psflg::DIRTY_WORK != 0
@@ -9416,9 +9451,10 @@ fn run_slice<T: Task>(
     inner: &Inner<T>,
     item: Scheduled<T>,
     data: &mut T::SchedulerData,
-    worker: Option<usize>,
+    esdp: &mut ErtsSchedData,
     dirty: Option<DirtyKind>,
 ) {
+    let worker = esdp.worker;
     let process = item.process;
     // A stale duplicate entry finds the process not queued below and runs nothing
     // (execute_process in erts works from the state word the same way).
@@ -9453,7 +9489,6 @@ fn run_slice<T: Task>(
     // every process scheduled in), OTP-29.1.1.
     let budget = inner.config.reductions;
     let accounting_flags = inner.accounting_flags.load(Ordering::Relaxed);
-    let msacc_enabled = accounting_flags & ACCOUNTING_MSACC != 0;
     let accounting_started = (accounting_flags & ACCOUNTING_WALL != 0).then(Instant::now);
     let mut cell = lock_cell(&process);
     if let Some(kind) = dirty
@@ -9468,11 +9503,6 @@ fn run_slice<T: Task>(
         cell = lock_cell(&process);
         cell.task_mut().finish_dirty_job(result);
     }
-    let consts = SliceConsts {
-        worker,
-        worker_count: inner.config.workers,
-        sched_type: dirty.map_or(SchedulerType::Normal, SchedulerType::from),
-    };
     let (outcome, reds_used, virtual_reds, active_ns) = {
         let mut runner = Runner {
             inner,
@@ -9481,43 +9511,36 @@ fn run_slice<T: Task>(
         };
         let result = {
             let task = cell.task_mut();
+            esdp.schedule_in(accounting_flags, || task.gc_nanoseconds());
             let mut ctx = RunCtx {
                 inner: &mut runner,
                 proc: &process.shared,
-                consts: &consts,
+                esdp,
                 reds_used: 0,
-                virtual_reds: 0,
                 budget,
-                msacc_enabled,
-                wall_enabled: accounting_flags & ACCOUNTING_WALL != 0,
-                gc_accounted_total: if msacc_enabled {
-                    task.gc_nanoseconds()
-                } else {
-                    0
-                },
                 sys_task_run,
                 dirty_running: false,
                 dirty_queued: false,
             };
-            if msacc_enabled {
+            if ctx.esdp.msacc_enabled {
                 ctx.set_msacc_state(MsaccState::Emulator);
             }
             // A normal scheduler thread already has its type, like `esdp->type`.
             let thread_type = worker
                 .is_none()
-                .then(|| SCHEDULER_TYPE.with(|current| current.replace(ctx.consts.sched_type)));
+                .then(|| SCHEDULER_TYPE.with(|current| current.replace(ctx.esdp.sched_type)));
             let outcome = task.run(&mut ctx, data, budget);
             if let Some(thread_type) = thread_type {
                 SCHEDULER_TYPE.with(|current| current.set(thread_type));
             }
-            if ctx.msacc_enabled {
+            if ctx.esdp.msacc_enabled {
                 ctx.set_msacc_state(MsaccState::Other);
                 ctx.account_gc_total(task.gc_nanoseconds());
             }
             let active_ns = accounting_started.map_or(0, |started| {
                 started.elapsed().as_nanos().min(u64::MAX as u128) as u64
             });
-            (outcome, ctx.reds_used, ctx.virtual_reds, active_ns)
+            (outcome, ctx.reds_used, ctx.esdp.virtual_reds, active_ns)
         };
         runner.flush();
         result
@@ -9552,7 +9575,7 @@ fn run_process<T: Task>(
     item: Scheduled<T>,
     data: &mut T::SchedulerData,
     id: usize,
-    consts: &SliceConsts,
+    esdp: &mut ErtsSchedData,
 ) -> Option<SliceEnd<T>> {
     let process = item.process;
     if !process
@@ -9574,7 +9597,6 @@ fn run_process<T: Task>(
     let budget = inner.config.reductions;
     // `schedule_next` has synchronized the scheduler's accounting state with these flags.
     let accounting_flags = inner.accounting_flags.load(Ordering::Relaxed);
-    let msacc_enabled = accounting_flags & ACCOUNTING_MSACC != 0;
     let accounting_started = (accounting_flags & ACCOUNTING_WALL != 0).then(Instant::now);
     let mut cell = lock_cell(&process);
     let mut runner = Runner {
@@ -9584,36 +9606,29 @@ fn run_process<T: Task>(
     };
     let (outcome, reds_used, virtual_reds, active_ns) = {
         let task = cell.task_mut();
+        esdp.schedule_in(accounting_flags, || task.gc_nanoseconds());
         let mut ctx = RunCtx {
             inner: &mut runner,
             proc: &process.shared,
-            consts,
+            esdp,
             reds_used: 0,
-            virtual_reds: 0,
             budget,
-            msacc_enabled,
-            wall_enabled: accounting_flags & ACCOUNTING_WALL != 0,
-            gc_accounted_total: if msacc_enabled {
-                task.gc_nanoseconds()
-            } else {
-                0
-            },
             sys_task_run,
             dirty_running: false,
             dirty_queued: false,
         };
-        if msacc_enabled {
+        if ctx.esdp.msacc_enabled {
             ctx.set_msacc_state(MsaccState::Emulator);
         }
         let outcome = task.run(&mut ctx, data, budget);
-        if ctx.msacc_enabled {
+        if ctx.esdp.msacc_enabled {
             ctx.set_msacc_state(MsaccState::Other);
             ctx.account_gc_total(task.gc_nanoseconds());
         }
         let active_ns = accounting_started.map_or(0, |started| {
             started.elapsed().as_nanos().min(u64::MAX as u128) as u64
         });
-        (outcome, ctx.reds_used, ctx.virtual_reds, active_ns)
+        (outcome, ctx.reds_used, ctx.esdp.virtual_reds, active_ns)
     };
     runner.flush();
     if matches!(outcome, RunOutcome::Exit(_)) {
@@ -10716,11 +10731,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
     let inherited_affinity = rustix::thread::sched_getaffinity(None).ok();
     #[cfg(target_os = "linux")]
     let mut applied_binding = None;
-    let consts = SliceConsts {
-        worker: Some(id),
-        worker_count: inner.config.workers,
-        sched_type: SchedulerType::Normal,
-    };
+    let mut esdp = ErtsSchedData::new(Some(id), inner.config.workers, SchedulerType::Normal);
     let mut previous: Option<SliceEnd<T>> = None;
     while !inner.stopped.load(Ordering::Acquire) {
         #[cfg(target_os = "linux")]
@@ -10742,7 +10753,14 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         };
         // A managed thread runs its later operations at its progress point
         // (`scheduler_progress`), so the unmanaged-runtime pass of `run_one` is not needed.
-        previous = run_process(&inner, &local_cell, item, &mut scheduler_data, id, &consts);
+        previous = run_process(
+            &inner,
+            &local_cell,
+            item,
+            &mut scheduler_data,
+            id,
+            &mut esdp,
+        );
     }
     // A stop never drops a finished slice.
     if let Some(end) = previous.take() {
@@ -10955,6 +10973,7 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
     // scheduler), OTP-29.1.1.
     let mut scheduler_data = T::SchedulerData::default();
     arinsal_term::initialize_scheduler_random(std::ptr::from_ref(&scheduler_data).cast());
+    let mut esdp = ErtsSchedData::new(None, inner.config.workers, kind.into());
     let pool = &inner.dirty[kind.index()];
     let thread = &pool.threads[index];
     let spin_count = scheduler_spin_count(
@@ -11028,7 +11047,7 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
             .input
             .state()
             .fetch_or(psflg::DIRTY_RUNNING, Ordering::SeqCst);
-        run_slice(&inner, item, &mut scheduler_data, None, Some(kind));
+        run_slice(&inner, item, &mut scheduler_data, &mut esdp, Some(kind));
         process
             .input
             .state()

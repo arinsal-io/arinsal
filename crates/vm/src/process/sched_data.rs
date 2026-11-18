@@ -1,43 +1,41 @@
 //! The scheduler data a process reaches while its native code runs.
 //!
 //! erts gives every BIF the scheduler it runs on through the process
-//! (`erts_proc_sched_data(c_p)`, erl_process.h), so a BIF called straight from module code
-//! reaches the scheduler's state without leaving native code. Here that state is the
-//! executor's VM view (code tables, loader) and the slice's `RunCtx` (run queue, timers,
-//! thread progress). The executor publishes both for its thread for exactly the time the
-//! process's native code runs; a BIF entered from that code reaches them through the process.
+//! (`erts_proc_sched_data(c_p)` reads `c_p->scheduler_data`, erl_process.h), so a BIF called
+//! straight from module code reaches the scheduler's state without leaving native code. Here
+//! that state is the executor's VM view (code tables, loader) and the slice's `RunCtx` (run
+//! queue, timers, thread progress). The executor stores both into the process for exactly the
+//! time the process's native code runs; a BIF entered from that code reaches them through the
+//! process.
 // Port of erts/emulator/beam/erl_process.h (erts_proc_sched_data, `c_p->scheduler_data`),
 // OTP-29.1.1.
 
 mod raw;
 
+pub(crate) use raw::Published as SchedulerDataPtr;
+
 use super::Message;
 use crate::{Process, Vm};
 use arinsal_sched::RunCtx;
 
-/// The published scheduler data of the running native slice. Dropping it restores the
-/// previous publication; it holds the borrows of the VM view and slice context it published,
-/// so the executor cannot touch either while native code runs.
-pub(crate) struct NativeSlice<'s> {
-    previous: raw::Published,
-    _borrow: std::marker::PhantomData<&'s mut ()>,
-}
+/// Running a process's native code with its scheduler data set.
+pub(crate) struct NativeSlice;
 
-impl<'s> NativeSlice<'s> {
-    /// Publishes `vm` and `ctx` for this thread while the process runs native code.
+impl NativeSlice {
+    /// Runs `body` with `process.scheduler_data` pointing at `vm` and `ctx`; the previous
+    /// value is restored when it returns. The borrows of `vm` and `ctx` are held for the call,
+    /// so the executor cannot touch either while native code runs.
     #[inline(always)]
-    pub(crate) fn enter(vm: &'s mut Vm, ctx: &'s mut RunCtx<'_, Message>) -> Self {
-        Self {
-            previous: raw::publish(vm, ctx),
-            _borrow: std::marker::PhantomData,
-        }
-    }
-}
-
-impl Drop for NativeSlice<'_> {
-    #[inline(always)]
-    fn drop(&mut self) {
-        raw::restore(self.previous);
+    pub(crate) fn run<R>(
+        vm: &mut Vm,
+        ctx: &mut RunCtx<'_, Message>,
+        process: &mut Process,
+        body: impl FnOnce(&mut Process) -> R,
+    ) -> R {
+        let previous = std::mem::replace(&mut process.scheduler_data, raw::publish(vm, ctx));
+        let result = body(process);
+        process.scheduler_data = previous;
+        result
     }
 }
 
@@ -50,13 +48,16 @@ pub(crate) fn with_sched_data<R>(
     process: &mut Process,
     f: impl FnOnce(&mut Vm, &mut Process, &mut RunCtx<'_, Message>) -> R,
 ) -> Option<R> {
-    raw::with_published(|vm, ctx| {
+    let published = std::mem::take(&mut process.scheduler_data);
+    let result = raw::with_published(published, |vm, ctx| {
         debug_assert!(
             process.self_pid == Some(ctx.pid()),
             "scheduler data reached from a process that is not the slice's"
         );
         f(vm, process, ctx)
-    })
+    });
+    process.scheduler_data = published;
+    result
 }
 
 /// `erts_proc_sched_data(c_p)->registers->x_reg_array` of the native slice `process` runs

@@ -103,8 +103,9 @@ impl Vm {
                 if let natives::NativeArgs::Slice(values) = args {
                     reg[..values.len()].copy_from_slice(values);
                 }
-                let _slice = crate::process::sched_data::NativeSlice::enter(self, ctx);
-                crate::bif_table::call_from_executor(p, reg, module, function, arity)
+                crate::process::sched_data::NativeSlice::run(self, ctx, p, |p| {
+                    crate::bif_table::call_from_executor(p, reg, module, function, arity)
+                })
             };
             if table_result.is_some() {
                 return table_result;
@@ -142,8 +143,10 @@ impl Vm {
                 }
                 // `erts_proc_sched_data(c_p)`: the body reaches this scheduler's data as it
                 // does from native code.
-                let _slice = crate::process::sched_data::NativeSlice::enter(self, ctx);
-                crate::bif_table::call_from_executor(p, reg, module, function, args.len())
+                let arity = args.len();
+                crate::process::sched_data::NativeSlice::run(self, ctx, p, |p| {
+                    crate::bif_table::call_from_executor(p, reg, module, function, arity)
+                })
             }
             None => None,
         }

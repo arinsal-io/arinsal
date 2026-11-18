@@ -214,12 +214,10 @@ impl Executor {
             let native = {
                 // Port of erts `c_p->scheduler_data`: a BIF native code calls reaches this
                 // scheduler's data through the process while the slice runs.
-                let _slice = super::sched_data::NativeSlice::enter(&mut self.vm, ctx);
-                crate::native_bridge::run_native_resume(
-                    process,
-                    &mut self.native_registers,
-                    code_ptr,
-                )
+                let registers = &mut self.native_registers;
+                super::sched_data::NativeSlice::run(&mut self.vm, ctx, process, |process| {
+                    crate::native_bridge::run_native_resume(process, registers, code_ptr)
+                })
             };
             // Native `timeout` has no scheduler context to send its trace event.
             if process.native_exit_kind != crate::proc_create::NativeExit::None
