@@ -90,21 +90,58 @@ fn alive_trap(process: &mut crate::Process, pid: Term) -> VmError {
     ))
 }
 
-/// `system_info/1` called with only the process and its argument registers.
+/// `system_info/1`.
 // Port of erts/emulator/beam/erl_bif_info.c (system_info_1), OTP-29.1.1.
 pub(crate) extern "C" fn system_info_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     let [selector] = crate::bif_table::bif_args::<1>(reg);
-    if let Some(item) = system_info_body_item(process, selector) {
-        process.heap.note_bif_entry();
-        return bif_ret(c_p, i, item);
-    }
-    crate::native_helpers::process_bif_light(c_p, reg, i)
+    process.heap.note_bif_entry();
+    let item = system_info_body(process, selector);
+    bif_ret(c_p, i, item)
 }
 
-/// Selectors answered directly by `system_info_1`, before allocator aux-work or trap paths.
+/// The body of `system_info_1`: every selector is answered here, including the allocator
+/// requests that send aux work and the `{allocator, _}` / `{allocator_sizes, _}` traps.
+// Port of erts/emulator/beam/erl_bif_info.c (system_info_1, info_1_tuple), OTP-29.1.1.
+pub(crate) fn system_info_body(process: &mut Process, selector: Term) -> Result<Term, VmError> {
+    if let Some(item) = system_info_body_item(process, selector) {
+        return item;
+    }
+    // erl_bif_info.c info_1_tuple: memory_internal, allocator and allocator_sizes.
+    if let Some(item) = crate::natives::sys::alloc_info::system_info(process, selector) {
+        return item;
+    }
+    let owned_selector = arinsal_term::to_owned(selector).ok();
+    if let Some(arinsal_etf::OwnedTerm::Tuple(parts)) = owned_selector.as_ref()
+        && let [
+            arinsal_etf::OwnedTerm::Atom(operation),
+            arinsal_etf::OwnedTerm::Atom(name),
+        ] = parts.as_slice()
+        && operation == "allocator"
+    {
+        return crate::natives::sys::allocator_system_info(process, name);
+    }
+    let name = selector
+        .as_atom()
+        .and_then(|atom| global_atoms().text(atom));
+    match name {
+        // Port of erts/emulator/beam/erl_bif_info.c:2949-2954, OTP-29.1.1.
+        Some("info" | "procs" | "loaded" | "dist") => {
+            crate::natives::sys::system_info_dump(process, name.unwrap())
+        }
+        // Port of erts/emulator/beam/erl_bif_info.c:2784 (system_info scheduler_id), OTP-29.1.1.
+        Some("scheduler_id") => Term::small(i64::from(process.scheduler_id))
+            .filter(|_| process.scheduler_id != 0)
+            .ok_or_else(badarg),
+        // Port of erts/emulator/beam/erl_bif_info.c:2879 (allocated_areas), OTP-29.1.1.
+        Some("allocated_areas") => crate::natives::sys::memory_areas(process),
+        _ => Err(badarg()),
+    }
+}
+
+/// Selectors answered by `system_info_1` from the process and runtime state.
 // Port of erts/emulator/beam/erl_bif_info.c (system_info_1), OTP-29.1.1.
 pub(crate) fn system_info_body_item(
     process: &mut Process,
@@ -113,9 +150,6 @@ pub(crate) fn system_info_body_item(
     let name = selector
         .as_atom()
         .and_then(|atom| global_atoms().text(atom));
-    if matches!(name, Some("allocator" | "alloc_util_allocators")) {
-        return None;
-    }
     if let Some(item) =
         name.and_then(|name| crate::natives::sys::system_info_process_item(process, name))
     {
@@ -125,34 +159,6 @@ pub(crate) fn system_info_body_item(
         return Some(item);
     }
     system_info_light_item(process, selector)
-}
-
-/// `system_info/1` from the generated-code process entry.
-// Port of erts/emulator/beam/erl_bif_info.c (system_info_1), OTP-29.1.1.
-pub(crate) fn system_info_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [selector] = args else {
-        return None;
-    };
-    if let Some(name) = selector
-        .as_atom()
-        .and_then(|atom| global_atoms().text(atom))
-        && let Some(item) = crate::natives::sys::system_info_process_item(process, name)
-    {
-        return match item {
-            Ok(value) => Some(Ok(value)),
-            Err(VmError::Trap(trap)) => Some(Err(trap)),
-            Err(_) => None,
-        };
-    }
-    system_info_light_item(process, *selector).map(|item| {
-        item.map_err(|error| match error {
-            VmError::Trap(trap) => trap,
-            _ => crate::exceptions::Trap::error(Term::atom(atoms::SYSTEM_LIMIT)),
-        })
-    })
 }
 
 /// The selectors `system_info_1` answers from process-independent build and runtime state.

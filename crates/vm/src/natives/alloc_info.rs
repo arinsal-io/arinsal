@@ -5,8 +5,7 @@
 //! are exposed through `allocated_areas`; per-allocator carrier statistics
 //! are empty because Arinsal does not use erts_alloc.
 
-use super::{MemorySources, Process, RunCtx, Vm, VmError, badarg};
-use crate::process::Message;
+use super::{MemorySources, Process, VmError, badarg};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
 
@@ -27,12 +26,7 @@ const ALLOCATORS: &[&str] = &[
 ];
 
 /// Handle allocator and internal memory requests made by preloaded `erlang.erl`.
-pub(super) fn system_info(
-    vm: &Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    selector: Term,
-) -> Option<Result<Term, VmError>> {
+pub(crate) fn system_info(process: &mut Process, selector: Term) -> Option<Result<Term, VmError>> {
     let owned = arinsal_term::to_owned(selector).ok()?;
     let OwnedTerm::Tuple(parts) = &owned else {
         return None;
@@ -73,9 +67,7 @@ pub(super) fn system_info(
     };
     let supported = match operation.as_str() {
         "memory_internal" | "allocator" | "allocator_sizes" => request_allocators(
-            vm,
             process,
-            ctx,
             &parts[1],
             &parts[2],
             operation == "memory_internal",
@@ -86,9 +78,7 @@ pub(super) fn system_info(
 }
 
 fn request_allocators(
-    vm: &Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
     reference: &OwnedTerm,
     allocators: &OwnedTerm,
     memory_internal: bool,
@@ -103,15 +93,15 @@ fn request_allocators(
     if memory_internal {
         super::alloc_atoms::note_allocated_areas();
     }
-    let sources = MemorySources::gather(vm, process);
+    let sources = MemorySources::gather(process);
     let runtime = process.runtime.ok_or_else(badarg)?;
-    let target = ctx.pid();
+    let target = process.self_pid.ok_or_else(badarg)?;
     let names = names
         .iter()
         .map(|name| (*name).to_owned())
         .collect::<Vec<_>>();
     let reference = reference.clone();
-    ctx.request_aux_work_all(move |worker| {
+    runtime.scheduler()?.request_aux_work_all(move |worker| {
         // Port of erts/emulator/beam/erl_alloc.c (reply_alloc_info), OTP-29.1.1: the counts
         // are read when this scheduler executes the request, not when it was issued.
         let timer_count = runtime

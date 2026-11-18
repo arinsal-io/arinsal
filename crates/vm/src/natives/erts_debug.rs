@@ -2514,7 +2514,7 @@ fn internal_state_get(
         }
         Some("memory") => {
             ctx.block_thread_progress(std::time::Duration::ZERO);
-            let values = crate::natives::sys::memory_values(vm, process);
+            let values = crate::natives::sys::memory_values(process);
             let mut entries = Vec::with_capacity(values.len());
             for (name, value) in values {
                 let value = int(process, value as usize)?;

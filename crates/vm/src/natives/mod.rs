@@ -362,9 +362,6 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     if module == "erts_internal" && function == "garbage_collect" && arity == 1 {
         return Some(sys::garbage_collect_bif);
     }
-    if module == "erlang" && function == "system_info" && arity == 1 {
-        return Some(erl_bif_info::system_info_light);
-    }
     // Port of bif.tab `bif erlang:dt_spread_tag/1` and `dt_restore_tag/1`: plain BIFs.
     if module == "erlang" && function == "dt_spread_tag" && arity == 1 {
         return Some(sys::dt_spread_tag_light);

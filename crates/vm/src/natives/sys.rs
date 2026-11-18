@@ -20,7 +20,7 @@ use std::time::Instant;
 #[path = "alloc_atoms.rs"]
 mod alloc_atoms;
 #[path = "alloc_info.rs"]
-mod alloc_info;
+pub(crate) mod alloc_info;
 
 const QUANTUM: u32 = 4_000;
 // Header subtags from arinsal-term/src/lib.rs. They are crate-private there.
@@ -680,16 +680,11 @@ fn call_values(
             TermKind::Pid => Ok(Term::atom(arinsal_term::atoms::FALSE)),
             _ => Err(badarg()),
         }),
-        ("erlang", "system_info", 1)
-            if args[0] == Term::atom(arinsal_term::atoms::PROCESS_COUNT) =>
-        {
-            // Port of erts/emulator/beam/erl_bif_info.c:2942, OTP-29.1.1.
-            // This selector is an atomic process-table count; avoid the generic tuple/allocator
-            // selector conversion before reaching that branch.
-            Some(non_neg(process, process_count(process) as u64))
-        }
-        ("erlang", "system_info", 1) => alloc_info::system_info(vm, process, ctx, args[0])
-            .or_else(|| system_info(vm, process, Some(ctx), args[0])),
+        // The executor runs the same BIF body as the table entry (erts calls one C function for
+        // traced and untraced calls). Port of erts/emulator/beam/erl_bif_info.c (system_info_1).
+        ("erlang", "system_info", 1) => Some(crate::natives::erl_bif_info::system_info_body(
+            process, args[0],
+        )),
         _ => None,
     }
 }
@@ -1088,51 +1083,6 @@ fn display_string(args: &[Term]) -> Result<Term, arinsal_bifs::BifError> {
     }
     .map_err(|_| arinsal_bifs::BifError::BADARG)?;
     Ok(Term::atom(arinsal_term::atoms::TRUE))
-}
-
-// boot_loop1: init:has_small_memory/0 probes this before loading kernel modules.
-fn system_info(
-    vm: &Vm,
-    process: &mut Process,
-    ctx: Option<&RunCtx<'_, Message>>,
-    selector: Term,
-) -> Option<Result<Term, VmError>> {
-    // The executor path of a traced system_info/1 runs the same BIF body as the table entry
-    // (erts calls one C function for traced and untraced calls).
-    // Port of erts/emulator/beam/erl_bif_info.c (system_info_1), OTP-29.1.1.
-    if let Some(item) = crate::natives::erl_bif_info::system_info_body_item(process, selector) {
-        return Some(item);
-    }
-    let owned_selector = arinsal_term::to_owned(selector).ok();
-    if let Some(arinsal_etf::OwnedTerm::Tuple(parts)) = owned_selector.as_ref()
-        && let [
-            arinsal_etf::OwnedTerm::Atom(operation),
-            arinsal_etf::OwnedTerm::Atom(name),
-        ] = parts.as_slice()
-        && operation == "allocator"
-    {
-        return Some(allocator_system_info(process, name));
-    }
-    let name = selector
-        .as_atom()
-        .and_then(|atom| global_atoms().text(atom));
-    if matches!(name, Some("allocator" | "alloc_util_allocators")) {
-        return name.and_then(|name| system_info_process_item(process, name));
-    }
-    match name {
-        // Port of erts/emulator/beam/erl_bif_info.c:2949-2954, OTP-29.1.1.
-        Some("info" | "procs" | "loaded" | "dist") => {
-            Some(system_info_dump(vm, process, name.unwrap()))
-        }
-        // Port of erts/emulator/beam/erl_bif_info.c:2784 (system_info scheduler_id), OTP-29.1.1.
-        Some("scheduler_id") => Some(
-            ctx.and_then(RunCtx::scheduler_id)
-                .and_then(|id| Term::small(id as i64))
-                .ok_or_else(badarg),
-        ),
-        Some("allocated_areas") => Some(memory_areas(vm, process)),
-        _ => Some(Err(badarg())),
-    }
 }
 
 /// The `system_info/1` items that need only the calling process, as erts computes them from
@@ -1558,7 +1508,7 @@ fn process_count(process: &Process) -> usize {
         .map_or(1, |scheduler| scheduler.process_count())
 }
 
-fn system_info_dump(vm: &Vm, process: &mut Process, selector: &str) -> Result<Term, VmError> {
+pub(crate) fn system_info_dump(process: &mut Process, selector: &str) -> Result<Term, VmError> {
     use arinsal_etf::OwnedTerm as O;
 
     let dump = match selector {
@@ -1577,9 +1527,13 @@ fn system_info_dump(vm: &Vm, process: &mut Process, selector: &str) -> Result<Te
         }
         "loaded" => {
             let mut dump = String::new();
-            for module in vm.code.modules.iter() {
-                use std::fmt::Write as _;
-                let _ = writeln!(dump, "{}", module.name);
+            if let Some(runtime) = process.runtime {
+                runtime.with_active_code(|_, tables| {
+                    for module in tables.modules.iter() {
+                        use std::fmt::Write as _;
+                        let _ = writeln!(dump, "{}", module.name);
+                    }
+                });
             }
             dump
         }
@@ -1665,7 +1619,7 @@ fn allocator_global_settings(
     (amcbf, rmcbf, mcs, mmap_scs, lock_memory, ycs, mmc, sac)
 }
 
-fn allocator_system_info(process: &mut Process, name: &str) -> Result<Term, VmError> {
+pub(crate) fn allocator_system_info(process: &mut Process, name: &str) -> Result<Term, VmError> {
     use arinsal_etf::OwnedTerm as O;
     let configured = arinsal_args::active_allocator_options();
     if name == "sys_alloc" {
@@ -2772,10 +2726,10 @@ fn ethread_info(process: &mut Process) -> Result<Term, VmError> {
     .map_err(|error| VmError::Unsupported(format!("ethread_info result: {error:?}")))
 }
 
-fn memory_areas(vm: &Vm, process: &mut Process) -> Result<Term, VmError> {
+pub(crate) fn memory_areas(process: &mut Process) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_alloc.c:2580 (erts_allocated_areas), OTP-29.1.1.
     alloc_atoms::note_allocated_areas();
-    let sources = MemorySources::gather(vm, process);
+    let sources = MemorySources::gather(process);
     let atom = sources.atom;
     let code = sources.code;
     // `external_alloc` is the data no alloc_util allocator holds, which `erlang:memory/0` adds
@@ -2831,12 +2785,14 @@ pub(crate) struct MemorySources {
 }
 
 impl MemorySources {
-    pub(crate) fn gather(vm: &Vm, process: &Process) -> Self {
+    pub(crate) fn gather(process: &Process) -> Self {
         let (_, persistent) = process.persistent_terms.info();
         let runtime = process.runtime.as_ref();
         Self {
             atom: global_atoms().memory(),
-            code: vm.code.table_bytes(),
+            code: runtime.map_or_else(Default::default, |runtime| {
+                runtime.with_active_code(|_, tables| tables.table_bytes())
+            }),
             ets: ets_structure_bytes(process),
             persistent: persistent as u64,
             process_table: runtime
@@ -2875,8 +2831,8 @@ impl MemorySources {
 /// `erlang:memory/0` for the process: the formulas of erts_memory.
 // Port of erts/emulator/beam/erl_alloc.c:2190 (erts_memory) and erlang.erl (`memory/0`),
 // OTP-29.1.1: totals are sums of allocator block sizes, not of carriers.
-pub(crate) fn memory_values(vm: &Vm, process: &Process) -> [(&'static str, u64); 9] {
-    let sources = MemorySources::gather(vm, process);
+pub(crate) fn memory_values(process: &Process) -> [(&'static str, u64); 9] {
+    let sources = MemorySources::gather(process);
     let blocks = |allocator: &str| {
         arinsal_alloc::typed::allocator_blocks_bytes(allocator)
             .unwrap_or(0)
@@ -5610,12 +5566,13 @@ mod tests {
     static SCHEDULER_FLAGS: Mutex<()> = Mutex::new(());
 
     fn system_info_test_item(
-        vm: &Vm,
+        _vm: &Vm,
         process: &mut Process,
         selector: Term,
     ) -> Option<Result<Term, VmError>> {
-        crate::natives::erl_bif_info::system_info_body_item(process, selector)
-            .or_else(|| system_info(vm, process, None, selector))
+        Some(crate::natives::erl_bif_info::system_info_body(
+            process, selector,
+        ))
     }
 
     #[test]
