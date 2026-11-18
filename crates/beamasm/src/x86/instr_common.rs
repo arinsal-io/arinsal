@@ -3024,6 +3024,7 @@ impl BeamModuleAssembler {
         let do_schedule = self.ga_get(GlobalLabels::DoSchedule)?;
         let spec = Update::HEAP_ALLOC.union(Update::REDUCTIONS);
         self.asm.emit_enter_runtime(spec)?;
+        // `EXC_NORMAL` is `EXC_EXIT` with the normal-exit index from `error.h`.
         self.asm.emit(|e| {
             e.mov_mi(
                 process_ref(process::FREASON, 8),
