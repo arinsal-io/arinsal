@@ -81,6 +81,41 @@ unsafe extern "C" {
     );
 }
 
+// Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:28-32 (`extern "C" { #include
+// "bif.h" #include "beam_common.h" }`) and erl_gc.h, OTP-29.1.1: the runtime functions the
+// fragments of this file call by address (`runtime_call`). They are defined with these erts
+// names and C signatures by the VM (docs/design/jit_runtime_symbols.md); fragments take their
+// address with `f as usize`. The declarations live in this raw module (`unsafe extern`);
+// `beam_asm_global` re-exports them.
+unsafe extern "C" {
+    /// `ErtsCodePtr handle_error(Process *c_p, ErtsCodePtr pc, Eterm *reg,
+    /// const ErtsCodeMFA *bif_mfa)` (beam_common.h): the handler to continue at, or null.
+    pub safe fn handle_error(
+        c_p: *mut crate::ProcessHeader,
+        pc: usize,
+        reg: *mut u64,
+        bif_mfa: *const arinsal_term::ErtsCodeMfa,
+    ) -> usize;
+    /// `const Export *call_error_handler(Process *p, const ErtsCodeMFA *mfa, Eterm *reg,
+    /// Eterm func)` (beam_common.h): the `Export` address, or null. `Export` is read only by
+    /// native code, so it crosses as an address.
+    pub safe fn call_error_handler(
+        c_p: *mut crate::ProcessHeader,
+        mfa: *const arinsal_term::ErtsCodeMfa,
+        reg: *mut u64,
+        func: u64,
+    ) -> usize;
+    /// `int erts_garbage_collect_nobump(Process *p, int need, Eterm *objv, int nobj,
+    /// int fcalls)` (erl_gc.h): reductions spent.
+    pub safe fn erts_garbage_collect_nobump(
+        c_p: *mut crate::ProcessHeader,
+        need: i32,
+        objv: *mut u64,
+        nobj: i32,
+        fcalls: i32,
+    ) -> i32;
+}
+
 /// Displacements (from `registers`) the bridge shares with native fragments and the VM, as on
 /// arm64. `tmp_mem[0..2]`: the exit target and resume address a trace hook leaves.
 const TMP_MEM0: i32 = tmp_mem_disp(0);
@@ -359,14 +394,13 @@ mod tests {
         fcalls as u64 + text.len() as u64
     }
 
-    /// The Rust trace return hook: records its kind and continues at the exit fragment.
-    extern "C" fn trace_hook(
-        _c_p: *mut ProcessHeader,
-        kind: u64,
-        reg: *mut SchedulerRegisters,
-    ) -> usize {
-        // SAFETY: the trace fragment passes the live registers it runs with.
-        unsafe { (*reg).tmp_mem[7] = kind + 10 };
+    /// The Rust trace return hook: records its kind and continues at the exit fragment. Like
+    /// the VM's `arinsal_beamasm_native_trace_return`, it gets `reg` (`x_reg_array`), not the
+    /// start of the register file.
+    extern "C" fn trace_hook(_c_p: *mut ProcessHeader, kind: u64, reg: *mut u64) -> usize {
+        let registers = SchedulerRegisters::from_reg(reg);
+        // SAFETY: the trace fragment passes the `reg` of the live register file it runs with.
+        unsafe { (*registers).tmp_mem[7] = kind + 10 };
         arinsal_enter_native_return as *const () as usize
     }
 

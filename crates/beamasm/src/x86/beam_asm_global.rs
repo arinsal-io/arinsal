@@ -16,6 +16,7 @@ use arinsal_x64::enc::qword_ptr;
 
 use super::beam_asm::register::{ARG1, ARG2, ARG2D, ARG3, ARG4, RET};
 use super::beam_asm::{AsmError, BeamAssembler, get_x_ref, process, process_ref};
+pub use super::rt::{call_error_handler, erts_garbage_collect_nobump, handle_error};
 use crate::exc::{EXC_BADARG, EXC_BADKEY, EXC_BADMAP};
 
 /// erts `BeamGlobalAssembler::GlobalLabels`: one label per global fragment, in the order of
