@@ -419,8 +419,13 @@ impl BeamModuleAssembler {
         let here = self.code.new_label();
         self.code.bind(here)?;
         self.code.adr(Gpr::x(8), here)?;
-        self.code
-            .emit(|e| e.stur(Gpr::x(8), SCHEDULER_REGS, crate::tmp_mem_disp(6) as i16))?;
+        self.code.emit(|e| {
+            e.str_uoff(
+                Gpr::x(8),
+                SCHEDULER_REGS,
+                crate::arm::beam_asm::tmp_mem_ref(6),
+            )
+        })?;
         // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:311-326, OTP-29.1.1.
         let update = crate::Update::HEAP_ALLOC.union(crate::Update::X_REGS);
         crate::emit_enter_runtime(&mut self.code, 6, update)?;
@@ -429,7 +434,7 @@ impl BeamModuleAssembler {
             e.str_uoff(value, C_P, 48)?;
             e.str_uoff(trace, C_P, 56)?;
             e.mov_reg(Gpr::x(0), C_P)?;
-            e.mov_reg(Gpr::x(1), Gpr::x(19))?;
+            crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(1))?;
             e.mov_reg(Gpr::x(2), E)
         })?;
         self.fragment_call(resolver_address)?;
@@ -440,7 +445,11 @@ impl BeamModuleAssembler {
         // the caller's LR (nested native frames would re-enter and spin).
         self.code.emit(|e| {
             e.mov_reg(Gpr::x(0), Gpr::xzr())?;
-            e.ldur(Gpr::x(30), SCHEDULER_REGS, crate::tmp_mem_disp(4) as i16)?;
+            e.ldr_uoff(
+                Gpr::x(30),
+                SCHEDULER_REGS,
+                crate::arm::beam_asm::tmp_mem_ref(4),
+            )?;
             e.br(Gpr::x(30))
         })?;
         self.code.bind(caught)?;

@@ -244,7 +244,8 @@ impl BeamModuleAssembler {
         self.stage_args(keys, base)?;
         let source = self.source_reg(src)?;
         self.code.emit(|e| e.mov_reg(Gpr::x(2), source))?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(1), SCHEDULER_REGS))?;
+        self.code
+            .emit(|e| crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(1)))?;
         self.code
             .emit(|e| e.mov_const(Gpr::x(3), keys.len() as u64))?;
         self.code
@@ -263,7 +264,7 @@ impl BeamModuleAssembler {
             if matches!(dst, ArgVal::X(SCRATCH_X)) {
                 continue;
             }
-            let offset = (base + index as u32) * 8;
+            let offset = crate::arm::beam_asm::x_ref(base + index as u32);
             self.code
                 .emit(|e| e.ldr_uoff(Gpr::x(0), SCHEDULER_REGS, offset))?;
             self.store_record_result(dst)?;
@@ -284,7 +285,8 @@ impl BeamModuleAssembler {
         let base = live.max(6);
         self.stage_args(args, base)?;
         let source = self.source_reg(src)?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(1), SCHEDULER_REGS))?;
+        self.code
+            .emit(|e| crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(1)))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(2), source))?;
         self.code
             .emit(|e| e.mov_const(Gpr::x(3), u64::from(live)))?;
@@ -318,7 +320,8 @@ impl BeamModuleAssembler {
         let base = live.max(6);
         self.stage_args(args, base)?;
         let id = self.source_reg(id)?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(1), SCHEDULER_REGS))?;
+        self.code
+            .emit(|e| crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(1)))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(2), id))?;
         self.code
             .emit(|e| e.mov_const(Gpr::x(3), u64::from(live)))?;
@@ -359,9 +362,10 @@ impl BeamModuleAssembler {
         }
         for (index, arg) in args.iter().copied().enumerate() {
             let value = self.source_reg(arg)?;
-            let offset = (base as usize + index) * 8;
-            let offset = u32::try_from(offset)
-                .map_err(|_| ModuleError::InvalidOperand("record operand offset overflow"))?;
+            let offset = crate::arm::beam_asm::x_ref(
+                u32::try_from(base as usize + index)
+                    .map_err(|_| ModuleError::InvalidOperand("record operand offset overflow"))?,
+            );
             self.code
                 .emit(|e| e.str_uoff(value, SCHEDULER_REGS, offset))?;
         }
@@ -377,8 +381,13 @@ impl BeamModuleAssembler {
                 Ok(())
             }
             ArgVal::X(index) if index < 1024 => {
-                self.code
-                    .emit(|e| e.str_uoff(Gpr::x(0), SCHEDULER_REGS, index * 8))?;
+                self.code.emit(|e| {
+                    e.str_uoff(
+                        Gpr::x(0),
+                        SCHEDULER_REGS,
+                        crate::arm::beam_asm::x_ref(index),
+                    )
+                })?;
                 Ok(())
             }
             ArgVal::Y(index) => {

@@ -489,7 +489,7 @@ impl BeamModuleAssembler {
         for (i, arg) in args.iter().copied().enumerate() {
             let source = self.source_reg(arg)?;
             self.code
-                .emit(|e| e.str_uoff(source, Gpr::x(19), i as u32 * 8))?;
+                .emit(|e| e.str_uoff(source, Gpr::x(19), crate::arm::beam_asm::x_ref(i as u32)))?;
         }
         let update = Update::HEAP_ALLOC.union(Update::REDUCTIONS);
         emit_enter_runtime(&mut self.code, 6, update)?;
@@ -502,7 +502,7 @@ impl BeamModuleAssembler {
                 std::mem::offset_of!(crate::ProcessHeader, current) as u32,
             )?;
             e.mov_reg(Gpr::x(0), Gpr::x(21))?;
-            e.mov_reg(Gpr::x(1), Gpr::x(19))?;
+            crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(1))?;
             e.mov_reg(Gpr::x(2), Gpr::xzr())
         })?;
         self.fragment_call(bif)?;

@@ -48,7 +48,7 @@ fn freg(index: u32) -> Result<FloatLoc, ModuleError> {
     if index < REGISTER_BACKED_FREGS {
         Ok(FloatLoc::Reg(VecReg(index as u8 + 8)))
     } else if index < 1024 {
-        let base = crate::F_REG_ARRAY_DISP as u32;
+        let base = crate::arm::beam_asm::F_REG_ARRAY_REF;
         Ok(FloatLoc::Mem(base + 8 * index))
     } else {
         Err(ModuleError::InvalidOperand(

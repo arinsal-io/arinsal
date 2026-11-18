@@ -782,7 +782,8 @@ impl BeamModuleAssembler {
         }
         self.stage_map_args(args, live.max(6))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(1), Gpr::xzr()))?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(2), Gpr::x(19)))?;
+        self.code
+            .emit(|e| crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(2)))?;
         self.code.emit(|e| e.mov_const(Gpr::x(3), live as u64))?;
         self.code
             .emit(|e| e.mov_const(Gpr::x(4), (args.len() / 2) as u64))?;
@@ -1039,9 +1040,10 @@ impl BeamModuleAssembler {
         }
         for (index, arg) in args.iter().copied().enumerate() {
             let value = self.source_reg(arg)?;
-            let offset = u32::try_from(index + base as usize)
-                .map_err(|_| ModuleError::InvalidOperand("map argument offset overflow"))?
-                * 8;
+            let offset = crate::arm::beam_asm::x_ref(
+                u32::try_from(index + base as usize)
+                    .map_err(|_| ModuleError::InvalidOperand("map argument offset overflow"))?,
+            );
             self.code.emit(|e| e.str_uoff(value, Gpr::x(19), offset))?;
         }
         Ok(())
@@ -1072,7 +1074,9 @@ impl BeamModuleAssembler {
         match dst {
             ArgVal::X(i) if i < 6 => self.code.emit(|e| e.mov_reg(X[i as usize], src))?,
             ArgVal::Y(i) => self.code.emit(|e| e.str_uoff(src, E, i * 8))?,
-            ArgVal::X(i) => self.code.emit(|e| e.str_uoff(src, Gpr::x(19), i * 8))?,
+            ArgVal::X(i) => self
+                .code
+                .emit(|e| e.str_uoff(src, Gpr::x(19), crate::arm::beam_asm::x_ref(i)))?,
             _ => {
                 return Err(ModuleError::InvalidOperand(
                     "map destination must be X or Y register",
@@ -1136,13 +1140,13 @@ fn emit_update_map_single_exact_body_shared(
     helper: MapUpdateHelper,
 ) -> Result<(), BufferError> {
     let error = code.new_label();
-    let tmp_mem1 = crate::tmp_mem_disp(0) as i16;
-    let tmp_mem2 = crate::tmp_mem_disp(1) as i16;
-    let native_error_pc = crate::tmp_mem_disp(6) as i16;
-    let native_return = crate::tmp_mem_disp(4) as i16;
+    let tmp_mem1 = crate::arm::beam_asm::tmp_mem_ref(0);
+    let tmp_mem2 = crate::arm::beam_asm::tmp_mem_ref(1);
+    let native_error_pc = crate::arm::beam_asm::tmp_mem_ref(6);
+    let native_return = crate::arm::beam_asm::tmp_mem_ref(4);
     let freason = std::mem::offset_of!(crate::ProcessHeader, exc.freason) as u32;
 
-    code.emit(|e| e.stur(Gpr::x(1), Gpr::x(19), tmp_mem2))?;
+    code.emit(|e| e.str_uoff(Gpr::x(1), Gpr::x(19), tmp_mem2))?;
     code.emit(|e| {
         e.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16)?;
         e.mov_reg(Gpr::x(29), Gpr::sp())
@@ -1150,25 +1154,25 @@ fn emit_update_map_single_exact_body_shared(
     emit_enter_runtime(code, 6, Update::HEAP_ALLOC)?;
     code.emit(|e| {
         e.mov_reg(Gpr::x(0), Gpr::x(21))?;
-        e.sub_imm(Gpr::x(4), Gpr::x(19), tmp_mem1.unsigned_abs(), false)?;
-        e.mov_reg(Gpr::x(5), Gpr::x(19))?;
+        e.add_imm(Gpr::x(4), Gpr::x(19), tmp_mem1 as u16, false)?;
+        crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(5))?;
         e.mov_const(Gpr::x(17), helper as usize as u64)?;
         e.blr(Gpr::x(17))
     })?;
     emit_leave_runtime(code, 6, Update::HEAP_ALLOC)?;
     code.emit(|e| e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16))?;
     code.cbz(Gpr::w(0), error)?;
-    code.emit(|e| e.ldur(Gpr::x(0), Gpr::x(19), tmp_mem1))?;
+    code.emit(|e| e.ldr_uoff(Gpr::x(0), Gpr::x(19), tmp_mem1))?;
     code.emit(|e| e.ret(Gpr::x(30)))?;
 
     code.bind(error)?;
     code.emit(|e| {
-        e.ldur(Gpr::x(9), Gpr::x(19), tmp_mem2)?;
+        e.ldr_uoff(Gpr::x(9), Gpr::x(19), tmp_mem2)?;
         e.mov_const(Gpr::x(8), crate::guard::EXC_BADKEY)?;
         e.stp(Gpr::x(8), Gpr::x(9), Gpr::x(21), freason as i16)?;
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
-        e.stur(Gpr::x(30), Gpr::x(19), native_error_pc)?;
-        e.ldur(Gpr::x(30), Gpr::x(19), native_return)?;
+        e.str_uoff(Gpr::x(30), Gpr::x(19), native_error_pc)?;
+        e.ldr_uoff(Gpr::x(30), Gpr::x(19), native_return)?;
         e.br(Gpr::x(30))
     })
 }
@@ -1195,9 +1199,9 @@ fn emit_update_map_shared(
     code.emit(|e| {
         e.mov_reg(ARG1, Gpr::x(21))?;
         if !single {
-            e.mov_reg(ARG3, Gpr::x(19))?;
+            crate::arm::beam_asm::load_x_reg_array(e, ARG3)?;
         }
-        e.mov_reg(Gpr::x(5), Gpr::x(19))?;
+        crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(5))?;
         e.mov_const(Gpr::x(17), helper as usize as u64)?;
         e.blr(Gpr::x(17))
     })?;
@@ -1209,8 +1213,8 @@ fn emit_update_map_shared(
         });
     }
     let error = code.new_label();
-    let native_error_pc = crate::tmp_mem_disp(6) as i16;
-    let scheduler_return = crate::tmp_mem_disp(4) as i16;
+    let native_error_pc = crate::arm::beam_asm::tmp_mem_ref(6);
+    let scheduler_return = crate::arm::beam_asm::tmp_mem_ref(4);
     code.emit(|e| {
         e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)?;
         e.ldr_uoff(TMP2, Gpr::x(21), 40)
@@ -1220,9 +1224,9 @@ fn emit_update_map_shared(
     code.bind(error)?;
     code.emit(|e| {
         e.sub_imm(TMP1, Gpr::x(30), 4, false)?;
-        e.stur(TMP1, Gpr::x(19), native_error_pc)?;
+        e.str_uoff(TMP1, Gpr::x(19), native_error_pc)?;
         e.mov_reg(ARG1, Gpr::xzr())?;
-        e.ldur(Gpr::x(30), Gpr::x(19), scheduler_return)?;
+        e.ldr_uoff(Gpr::x(30), Gpr::x(19), scheduler_return)?;
         e.br(Gpr::x(30))
     })
 }
@@ -1246,9 +1250,7 @@ fn emit_map_runtime_inner(
             let target = Gpr::x(index as u8 + 1);
             // BeamAsm's mov_var omits moves when source and destination already match.
             // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1649-1664, OTP-29.1.1.
-            if target != arg {
-                e.mov_reg(target, arg)?;
-            }
+            crate::module::move_hook_arg(e, target, arg)?;
         }
         e.mov_const(Gpr::x(17), helper as u64)?;
         e.str_uoff(Gpr::x(30), Gpr::x(21), 72)?;

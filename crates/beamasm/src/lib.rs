@@ -32,10 +32,11 @@ const _: () = assert!(std::mem::offset_of!(ProcessHeader, exc) == 0x28);
 const _: () = assert!(std::mem::offset_of!(ProcessHeader, catches) == 0x40);
 const _: () = assert!(std::mem::offset_of!(ProcessHeader, high_water) == 0x70);
 /// Scheduler register file, erts `ErtsSchedulerRegisters`: the auxiliary registers first, in
-/// one cache line pair, then the X and float register arrays, then seldom-used data. The JIT's
-/// register base (x19 on arm64, rbx on x86-64) points at `x_reg_array`, so the auxiliary
-/// registers are reached with short negative displacements and X registers with
-/// `index * 8`; [`scheduler_reg_disp`] maps a field offset to that displacement.
+/// one cache line pair, then the X and float register arrays, then seldom-used data. As in
+/// erts, arm64's `scheduler_registers` (x19) points at the start of the struct (positive
+/// offsets), while x86-64's `registers` (rbx) points at `x_reg_array`, so its auxiliary
+/// registers take short negative displacements ([`scheduler_reg_disp`]). Runtime helpers
+/// get `reg` (`x_reg_array`) on both and reach the struct with [`SchedulerRegisters::from_reg`].
 // Port of erts/emulator/beam/erl_process.h:626-685 (ErtsSchedulerRegisters), OTP-29.1.1.
 #[repr(C, align(64))]
 pub struct SchedulerRegisters {
@@ -54,7 +55,7 @@ pub struct SchedulerRegisters {
     pub erl_bits_state: [u64; 2],
     /// `aux_regs.align__`: pads the auxiliary registers to whole cache lines.
     _aux_align: [u64; 5],
-    /// X register array; the JIT register base points to element zero. Typed like erts'
+    /// X register array (`reg`). Typed like erts'
     /// `Eterm *reg`, so the runtime hands BIFs `&reg[..arity]` as their arguments without a
     /// copy.
     // Port of erts/emulator/beam/bif.h:33-40 (BIF_ARG_n is reg[n]), OTP-29.1.1.
@@ -82,30 +83,30 @@ pub struct SchedulerRegisters {
     pub trap_return: u64,
 }
 
-/// Offset of `x_reg_array`, the field the JIT register base points at.
+/// Offset of `x_reg_array` (`getXRef(0)` on arm64, the x86-64 `registers` base).
 pub const X_REG_ARRAY_OFFSET: usize = std::mem::offset_of!(SchedulerRegisters, x_reg_array);
 
-/// Displacement from the JIT register base (`x_reg_array`) of the field at `offset`.
+/// Displacement from the x86-64 `registers` base (`x_reg_array`) of the field at `offset`.
 // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:232-242 (getSchedulerRegRef), OTP-29.1.1.
 pub const fn scheduler_reg_disp(offset: usize) -> i32 {
     offset as i32 - X_REG_ARRAY_OFFSET as i32
 }
 
-/// Displacement of `tmp_mem[index]` from the JIT register base.
+/// Displacement of `tmp_mem[index]` from the x86-64 `registers` base.
 pub const fn tmp_mem_disp(index: usize) -> i32 {
     scheduler_reg_disp(std::mem::offset_of!(SchedulerRegisters, tmp_mem) + index * 8)
 }
 
-/// Displacement of `erl_bits_state` from the JIT register base.
+/// Displacement of `erl_bits_state` from the x86-64 `registers` base.
 pub const ERL_BITS_STATE_DISP: i32 =
     scheduler_reg_disp(std::mem::offset_of!(SchedulerRegisters, erl_bits_state));
-/// Displacement of `runtime_stack` from the JIT register base.
+/// Displacement of `runtime_stack` from the x86-64 `registers` base.
 pub const RUNTIME_STACK_DISP: i32 =
     scheduler_reg_disp(std::mem::offset_of!(SchedulerRegisters, runtime_stack));
-/// Displacement of `f_reg_array` from the JIT register base.
+/// Displacement of `f_reg_array` from the x86-64 `registers` base.
 pub const F_REG_ARRAY_DISP: i32 =
     scheduler_reg_disp(std::mem::offset_of!(SchedulerRegisters, f_reg_array));
-/// Displacement of `match_staging` from the JIT register base.
+/// Displacement of `match_staging` from the x86-64 `registers` base.
 pub const MATCH_STAGING_DISP: i32 =
     scheduler_reg_disp(std::mem::offset_of!(SchedulerRegisters, match_staging));
 /// Displacement of `active_code_ix`, read by the native entry trampoline.

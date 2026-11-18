@@ -40,7 +40,7 @@ impl BeamModuleAssembler {
         dst: Option<ArgVal>,
         helper: BsMatchCmdHelper,
     ) -> Result<(), ModuleError> {
-        let staging = crate::MATCH_STAGING_DISP as u32;
+        let staging = crate::arm::beam_asm::MATCH_STAGING_REF;
         for (index, operand) in staged.iter().copied().enumerate() {
             let register = self.source_reg(operand)?;
             let offset = staging + index as u32 * 8;
@@ -55,7 +55,7 @@ impl BeamModuleAssembler {
             e.mov_reg(Gpr::x(0), Gpr::x(21))?;
             e.mov_const(Gpr::x(1), u64::from(kind))?;
             e.mov_const(Gpr::x(2), u64::from(live))?;
-            e.mov_reg(Gpr::x(3), Gpr::x(19))?;
+            crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(3))?;
             Ok(())
         })?;
         self.fragment_call(helper as usize)?;

@@ -183,7 +183,11 @@ impl BeamModuleAssembler {
                     // X registers above the register cache live in the X register array.
                     self.code.emit(|e| {
                         e.ldr_uoff(Gpr::x(10), Gpr::x(9), offset)?;
-                        e.str_uoff(Gpr::x(10), Gpr::x(19), (index as u32) * 8)
+                        e.str_uoff(
+                            Gpr::x(10),
+                            Gpr::x(19),
+                            crate::arm::beam_asm::x_ref(index as u32),
+                        )
                     })?;
                 }
             }
@@ -387,7 +391,7 @@ pub(crate) fn emit_call_fun_error(
         e.mov_reg(Gpr::x(1), Gpr::x(3))?;
         e.lsr_imm(Gpr::x(2), Gpr::x(2), 8)?;
         // `reg`, as erts passes the X register array to beam_jit_handle_call_fun_error.
-        e.mov_reg(Gpr::x(3), Gpr::x(19))
+        crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(3))
     })?;
     asm.fragment_call(helper)?;
     emit_leave_runtime(&mut asm.code, 6, update)?;

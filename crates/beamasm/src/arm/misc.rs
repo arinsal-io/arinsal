@@ -146,7 +146,7 @@ fn emit_apply_common(
             asm.code.emit(|e| e.mov_const(Gpr::x(11), 0))?;
             asm.emit_runtime_hook_unchecked(
                 runtime.resolver as usize,
-                // The last argument is `reg` (x19): the resolver moves the arguments there.
+                // The last argument is `reg` (`load_x_reg_array`): the resolver moves the arguments there.
                 &[Gpr::x(9), Gpr::x(10), Gpr::x(11), Gpr::x(19)],
                 live,
                 update,

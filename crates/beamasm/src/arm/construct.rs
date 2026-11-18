@@ -11,7 +11,6 @@ const E: Gpr = Gpr::x(20);
 const C_P: Gpr = Gpr::x(21);
 const FCALLS: Gpr = Gpr::w(22);
 const HTOP: Gpr = Gpr::x(23);
-const SCHEDULER_REGS: Gpr = Gpr::x(19);
 const XREGS: [Gpr; 6] = [
     Gpr::x(25),
     Gpr::x(26),
@@ -737,7 +736,7 @@ impl BeamModuleAssembler {
         crate::emit_enter_runtime(&mut self.code, MAX_REGISTER_X, update)?;
         self.code.emit(|e| {
             e.mov_reg(Gpr::x(0), C_P)?;
-            e.mov_reg(Gpr::x(1), SCHEDULER_REGS)?;
+            crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(1))?;
             e.mov_reg(Gpr::w(4), FCALLS)
         })?;
         self.fragment_call(hook)?;

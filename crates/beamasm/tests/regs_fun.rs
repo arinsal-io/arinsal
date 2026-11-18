@@ -185,9 +185,11 @@ fn run(
     }
     emit(&mut asm).unwrap();
     let capture_and_return = |e: &mut arinsal_a64::enc::Emitter| {
-        e.stp(Gpr::x(25), Gpr::x(26), Gpr::x(19), 0)?;
-        e.stp(Gpr::x(27), Gpr::x(28), Gpr::x(19), 16)?;
-        e.stp(Gpr::x(15), Gpr::x(16), Gpr::x(19), 32)?;
+        // x19 is the start of the register file; X0 is at `x_reg_array`.
+        let x0 = std::mem::offset_of!(SchedulerRegisters, x_reg_array) as i16;
+        e.stp(Gpr::x(25), Gpr::x(26), Gpr::x(19), x0)?;
+        e.stp(Gpr::x(27), Gpr::x(28), Gpr::x(19), x0 + 16)?;
+        e.stp(Gpr::x(15), Gpr::x(16), Gpr::x(19), x0 + 32)?;
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
         if own_cp {
             e.ldr_uoff(Gpr::x(30), Gpr::x(19), cp_slot)?;

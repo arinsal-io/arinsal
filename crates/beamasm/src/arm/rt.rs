@@ -73,7 +73,7 @@ pub fn scheduler_registers_mut<R>(
     reg: *mut u64,
     f: impl FnOnce(&mut SchedulerRegisters) -> R,
 ) -> R {
-    // SAFETY: x19 points into the unique live register area for this invocation.
+    // SAFETY: native code passes `reg` (load_x_reg_array) of the unique live register area.
     unsafe { f(&mut *SchedulerRegisters::from_reg(reg)) }
 }
 
@@ -179,6 +179,10 @@ unsafe extern "C" {
     );
 }
 
+/// `f_reg_array` lies past `add`'s 12-bit immediate: the bridge adds this 4 KiB-page part
+/// and addresses the float registers from it.
+const F_PAGE: u32 = super::beam_asm::F_REG_ARRAY_REF & !4095;
+
 // Mach-O prepends an underscore to C symbols and uses @PAGE/@PAGEOFF; ELF uses neither.
 #[cfg(target_vendor = "apple")]
 macro_rules! asm_sym {
@@ -237,39 +241,47 @@ core::arch::global_asm!(
     "str x20, [x21, #8]",
     "str x23, [x21, #0]",
     "str w22, [x21, #32]",
-    "stp x25, x26, [x19, #0]",
-    "stp x27, x28, [x19, #16]",
-    "stp x15, x16, [x19, #32]",
-    "add x15, x19, #8192",
-    "stp d8, d9, [x15, #0]",
-    "stp d10, d11, [x15, #16]",
-    "stp d12, d13, [x15, #32]",
-    "stp d14, d15, [x15, #48]",
+    "stp x25, x26, [x19, #{x0}]",
+    "stp x27, x28, [x19, #{x2}]",
+    "stp x15, x16, [x19, #{x4}]",
+    "add x15, x19, #{f_page}",
+    "stp d8, d9, [x15, #{f0}]",
+    "stp d10, d11, [x15, #{f1}]",
+    "stp d12, d13, [x15, #{f2}]",
+    "stp d14, d15, [x15, #{f3}]",
     "mov x0, x21",
     // `reg`: the hook roots and reloads the X registers through it.
-    "mov x2, x19",
+    "add x2, x19, #{x0}",
     "ldr x16, [x19, #{trace_hook}]",
     "blr x16",
     "mov x14, x0",
     "ldr x20, [x21, #8]",
     "ldr x23, [x21, #0]",
     "ldr w22, [x21, #32]",
-    "ldp x25, x26, [x19, #0]",
-    "ldp x27, x28, [x19, #16]",
-    "ldp x15, x16, [x19, #32]",
-    "add x17, x19, #8192",
-    "ldp d8, d9, [x17, #0]",
-    "ldp d10, d11, [x17, #16]",
-    "ldp d12, d13, [x17, #32]",
-    "ldp d14, d15, [x17, #48]",
+    "ldp x25, x26, [x19, #{x0}]",
+    "ldp x27, x28, [x19, #{x2}]",
+    "ldp x15, x16, [x19, #{x4}]",
+    "add x17, x19, #{f_page}",
+    "ldp d8, d9, [x17, #{f0}]",
+    "ldp d10, d11, [x17, #{f1}]",
+    "ldp d12, d13, [x17, #{f2}]",
+    "ldp d14, d15, [x17, #{f3}]",
     // A hook that hands the return to the scheduler leaves the exit target and resume
     // address in tmp_mem[0..2] and returns the exit fragment; x1/x2 are free at a return.
     "ldr x1, [x19, #{tmp_mem0}]",
     "ldr x2, [x19, #{tmp_mem1}]",
     "br x14",
-    trace_hook = const crate::tmp_mem_disp(5),
-    tmp_mem0 = const crate::tmp_mem_disp(0),
-    tmp_mem1 = const crate::tmp_mem_disp(1),
+    trace_hook = const super::beam_asm::tmp_mem_ref(5),
+    tmp_mem0 = const super::beam_asm::tmp_mem_ref(0),
+    tmp_mem1 = const super::beam_asm::tmp_mem_ref(1),
+    x0 = const super::beam_asm::x_ref(0),
+    x2 = const super::beam_asm::x_ref(2),
+    x4 = const super::beam_asm::x_ref(4),
+    f_page = const F_PAGE,
+    f0 = const super::beam_asm::F_REG_ARRAY_REF - F_PAGE,
+    f1 = const super::beam_asm::F_REG_ARRAY_REF - F_PAGE + 16,
+    f2 = const super::beam_asm::F_REG_ARRAY_REF - F_PAGE + 32,
+    f3 = const super::beam_asm::F_REG_ARRAY_REF - F_PAGE + 48,
 );
 
 #[cfg(target_arch = "aarch64")]
@@ -291,8 +303,9 @@ core::arch::global_asm!(
     "stp d14, d15, [sp, #-16]!",
     "sub sp, sp, #16",
     "str x3, [sp, #0]",
-    // x19 points at x_reg_array, past the auxiliary registers; x21 is c_p.
-    "add x19, x1, #{x_reg_array}",
+    // x19 is `scheduler_registers`, the start of the register file
+    // (process_main.cpp:61-73); x21 is c_p.
+    "mov x19, x1",
     "mov x21, x0",
     "ldr x20, [x21, #8]",
     "ldr w22, [x21, #32]",
@@ -300,14 +313,14 @@ core::arch::global_asm!(
     // Port of erts/emulator/beam/jit/arm/process_main.cpp:236-247, OTP-29.1.1: the runtime
     // already resolved the process's code index (save_calls or the active one).
     "ldr x24, [x19, #{active_code_ix}]",
-    "ldp x25, x26, [x19, #0]",
-    "ldp x27, x28, [x19, #16]",
-    "ldp x15, x16, [x19, #32]",
-    "add x14, x19, #8192",
-    "ldp d8, d9, [x14, #0]",
-    "ldp d10, d11, [x14, #16]",
-    "ldp d12, d13, [x14, #32]",
-    "ldp d14, d15, [x14, #48]",
+    "ldp x25, x26, [x19, #{x0}]",
+    "ldp x27, x28, [x19, #{x2}]",
+    "ldp x15, x16, [x19, #{x4}]",
+    "add x14, x19, #{f_page}",
+    "ldp d8, d9, [x14, #{f0}]",
+    "ldp d10, d11, [x14, #{f1}]",
+    "ldp d12, d13, [x14, #{f2}]",
+    "ldp d14, d15, [x14, #{f3}]",
     // The native function's RET lands at the ABI exit fragment.
     asm_load_enter_native_return!(),
     // Runtime error fragments use this slot after runtime hooks replace x30.
@@ -320,10 +333,10 @@ core::arch::global_asm!(
     "str xzr, [x19, #{entry_return}]",
     // Port of erts/emulator/beam/jit/arm/process_main.cpp:284-288, OTP-29.1.1.
     // A scheduler re-entry can target a BIF continuation, whose result is in XREG0.
-    "ldr x0, [x19]",
+    "ldr x0, [x19, #{x0}]",
     "br x2",
     "1:",
-    "ldr x0, [x19]",
+    "ldr x0, [x19, #{x0}]",
     // The call pushes the exit fragment's address on the return-address predictor, so the
     // native function's RET to it and the fragment's own RET back to the Rust caller are both
     // predicted. A `br` here leaves the predictor one entry short and every RET up the
@@ -346,14 +359,14 @@ core::arch::global_asm!(
     "str x23, [x21, #0]",
     "str x20, [x21, #8]",
     "str w22, [x21, #32]",
-    "stp x25, x26, [x19, #0]",
-    "stp x27, x28, [x19, #16]",
-    "stp x15, x16, [x19, #32]",
-    "add x14, x19, #8192",
-    "stp d8, d9, [x14, #0]",
-    "stp d10, d11, [x14, #16]",
-    "stp d12, d13, [x14, #32]",
-    "stp d14, d15, [x14, #48]",
+    "stp x25, x26, [x19, #{x0}]",
+    "stp x27, x28, [x19, #{x2}]",
+    "stp x15, x16, [x19, #{x4}]",
+    "add x14, x19, #{f_page}",
+    "stp d8, d9, [x14, #{f0}]",
+    "stp d10, d11, [x14, #{f1}]",
+    "stp d12, d13, [x14, #{f2}]",
+    "stp d14, d15, [x14, #{f3}]",
     // Keep the output pointer in this bridge's own stack frame across native code.
     "ldr x9, [sp, #0]",
     "stp x0, x1, [x9]",
@@ -370,9 +383,16 @@ core::arch::global_asm!(
     "ldp x19, x20, [sp], #16",
     "ldp x29, x30, [sp], #16",
     "ret",
-    x_reg_array = const crate::X_REG_ARRAY_OFFSET,
-    active_code_ix = const crate::ACTIVE_CODE_IX_DISP,
-    entry_return = const crate::ENTRY_RETURN_DISP,
-    exit_fragment = const crate::tmp_mem_disp(4),
-    exit_marker = const crate::tmp_mem_disp(3),
+    active_code_ix = const super::beam_asm::sched_ref(core::mem::offset_of!(SchedulerRegisters, active_code_ix)),
+    entry_return = const super::beam_asm::sched_ref(core::mem::offset_of!(SchedulerRegisters, entry_return)),
+    exit_fragment = const super::beam_asm::tmp_mem_ref(4),
+    exit_marker = const super::beam_asm::tmp_mem_ref(3),
+    x0 = const super::beam_asm::x_ref(0),
+    x2 = const super::beam_asm::x_ref(2),
+    x4 = const super::beam_asm::x_ref(4),
+    f_page = const F_PAGE,
+    f0 = const super::beam_asm::F_REG_ARRAY_REF - F_PAGE,
+    f1 = const super::beam_asm::F_REG_ARRAY_REF - F_PAGE + 16,
+    f2 = const super::beam_asm::F_REG_ARRAY_REF - F_PAGE + 32,
+    f3 = const super::beam_asm::F_REG_ARRAY_REF - F_PAGE + 48,
 );

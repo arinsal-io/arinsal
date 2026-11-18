@@ -30,6 +30,51 @@ pub mod register {
     pub const TMP: [&str; 6] = ["x8", "x9", "x10", "x11", "x12", "x13"];
 }
 
+/// `getSchedulerRegRef`: x19 points at the start of `SchedulerRegisters`, so a field is
+/// addressed by its own (positive) offset.
+// Port of erts/emulator/beam/jit/arm/beam_asm.hpp:240-243 (getSchedulerRegRef), OTP-29.1.1.
+pub(crate) const fn sched_ref(offset: usize) -> u32 {
+    offset as u32
+}
+
+/// `getXRef(index)`: X registers start at `x_reg_array`'s offset from x19.
+// Port of erts/emulator/beam/jit/arm/beam_asm.hpp:252-259 (getXRef), OTP-29.1.1.
+pub(crate) const fn x_ref(index: u32) -> u32 {
+    sched_ref(crate::X_REG_ARRAY_OFFSET) + index * 8
+}
+
+/// `TMP_MEM{index+1}q`.
+// Port of erts/emulator/beam/jit/arm/beam_asm.hpp:194-203 (TMP_MEM1q..TMP_MEM5q), OTP-29.1.1.
+pub(crate) const fn tmp_mem_ref(index: usize) -> u32 {
+    sched_ref(std::mem::offset_of!(crate::SchedulerRegisters, tmp_mem) + index * 8)
+}
+
+/// `aux_regs.d.erl_bits_state` from x19.
+pub(crate) const ERL_BITS_STATE_REF: u32 = sched_ref(std::mem::offset_of!(
+    crate::SchedulerRegisters,
+    erl_bits_state
+));
+/// `f_reg_array` from x19 (`getFRef(0)`).
+pub(crate) const F_REG_ARRAY_REF: u32 =
+    sched_ref(std::mem::offset_of!(crate::SchedulerRegisters, f_reg_array));
+/// `match_staging` from x19.
+pub(crate) const MATCH_STAGING_REF: u32 = sched_ref(std::mem::offset_of!(
+    crate::SchedulerRegisters,
+    match_staging
+));
+/// `trap_return` from x19.
+pub(crate) const TRAP_RETURN_REF: u32 =
+    sched_ref(std::mem::offset_of!(crate::SchedulerRegisters, trap_return));
+
+/// `load_x_reg_array(to)`: `reg` for a runtime helper, the address of `getXRef(0)`.
+// Port of erts/emulator/beam/jit/arm/beam_asm.hpp:276-282 (load_x_reg_array), OTP-29.1.1.
+pub(crate) fn load_x_reg_array(
+    e: &mut arinsal_a64::enc::Emitter,
+    to: Gpr,
+) -> Result<(), arinsal_a64::enc::EncodeError> {
+    e.add_imm(to, Gpr::x(19), x_ref(0) as u16, false)
+}
+
 /// X registers arm64 keeps in machine registers (`num_register_backed_xregs`).
 // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:136-139, OTP-29.1.1.
 pub(crate) const NUM_REGISTER_BACKED_XREGS: u32 = 6;
@@ -124,7 +169,7 @@ pub fn emit_enter_runtime(
             e.str_uoff(Gpr::w(22), Gpr::x(21), 32)?;
         }
         for (first, second) in cached_x_regs(live, update) {
-            let offset = (first as u32) * 8;
+            let offset = x_ref(first as u32);
             match second {
                 Some(second) => e.stp(
                     Gpr::x(X_REG_CACHE[first]),
@@ -161,7 +206,7 @@ pub fn emit_leave_runtime(
             e.ldr_uoff(Gpr::w(22), Gpr::x(21), 32)?;
         }
         for (first, second) in cached_x_regs(live, update) {
-            let offset = (first as u32) * 8;
+            let offset = x_ref(first as u32);
             match second {
                 Some(second) => e.ldp(
                     Gpr::x(X_REG_CACHE[first]),

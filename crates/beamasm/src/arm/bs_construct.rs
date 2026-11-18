@@ -124,8 +124,8 @@ const BITS: Gpr = Gpr::x(10);
 const SEG_BITS: Gpr = Gpr::x(11);
 const SCRATCH: Gpr = Gpr::x(12);
 const RELOADED_ARG: Gpr = Gpr::x(9);
-const SAVED_BITS: i16 = crate::tmp_mem_disp(0) as i16;
-const SAVED_RESULT: i16 = crate::tmp_mem_disp(1) as i16;
+const SAVED_BITS: u32 = crate::arm::beam_asm::tmp_mem_ref(0);
+const SAVED_RESULT: u32 = crate::arm::beam_asm::tmp_mem_ref(1);
 
 #[derive(Clone, Copy)]
 struct SegmentFailureLabels {
@@ -206,9 +206,7 @@ fn source_reg_after_allocation(
     match source {
         ArgVal::X(index) if index < NUM_REGISTER_BACKED_XREGS => asm.source_reg(source),
         ArgVal::X(index) if index < 1024 => {
-            let offset = index
-                .checked_mul(8)
-                .ok_or(ModuleError::InvalidOperand("X register offset overflow"))?;
+            let offset = crate::arm::beam_asm::x_ref(index);
             asm.code
                 .emit(|e| e.ldr_uoff(RELOADED_ARG, SCHEDULER_REGS, offset))?;
             Ok(RELOADED_ARG)
@@ -268,7 +266,7 @@ fn emit_bs_create_bin_generic(
     }
 
     asm.code
-        .emit(|e| e.stur(BITS, SCHEDULER_REGS, SAVED_BITS))?;
+        .emit(|e| e.str_uoff(BITS, SCHEDULER_REGS, SAVED_BITS))?;
     asm.code.emit(|e| {
         e.mov_const(Gpr::x(3), u64::from(alloc))?;
         e.mov_const(Gpr::x(4), u64::from(live))
@@ -314,12 +312,12 @@ fn emit_bs_create_bin_generic(
         }
         asm.code.b(route_failure)?;
         asm.code.bind(append_ok)?;
-        let bits_state = crate::ERL_BITS_STATE_DISP as i16;
+        let bits_state = crate::arm::beam_asm::ERL_BITS_STATE_REF;
         asm.code.emit(|e| {
-            e.ldur(Gpr::x(8), SCHEDULER_REGS, bits_state + 8)?;
-            e.ldur(BITS, SCHEDULER_REGS, SAVED_BITS)?;
+            e.ldr_uoff(Gpr::x(8), SCHEDULER_REGS, bits_state + 8)?;
+            e.ldr_uoff(BITS, SCHEDULER_REGS, SAVED_BITS)?;
             e.add_reg(BITS, BITS, Gpr::x(8), Shift::Lsl, 0)?;
-            e.stur(BITS, SCHEDULER_REGS, SAVED_BITS)
+            e.str_uoff(BITS, SCHEDULER_REGS, SAVED_BITS)
         })?;
     } else if let Some(segment) = segments
         .first()
@@ -337,13 +335,13 @@ fn emit_bs_create_bin_generic(
         )?;
         asm.code.cbz(Gpr::x(0), route_failure)?;
         asm.code
-            .emit(|e| e.stur(Gpr::x(0), SCHEDULER_REGS, SAVED_RESULT))?;
-        let bits_state = crate::ERL_BITS_STATE_DISP as i16;
+            .emit(|e| e.str_uoff(Gpr::x(0), SCHEDULER_REGS, SAVED_RESULT))?;
+        let bits_state = crate::arm::beam_asm::ERL_BITS_STATE_REF;
         asm.code.emit(|e| {
-            e.ldur(Gpr::x(8), SCHEDULER_REGS, bits_state + 8)?;
-            e.ldur(BITS, SCHEDULER_REGS, SAVED_BITS)?;
+            e.ldr_uoff(Gpr::x(8), SCHEDULER_REGS, bits_state + 8)?;
+            e.ldr_uoff(BITS, SCHEDULER_REGS, SAVED_BITS)?;
             e.add_reg(BITS, BITS, Gpr::x(8), Shift::Lsl, 0)?;
-            e.stur(BITS, SCHEDULER_REGS, SAVED_BITS)
+            e.str_uoff(BITS, SCHEDULER_REGS, SAVED_BITS)
         })?;
     } else {
         emit_bs_helper_call(
@@ -358,7 +356,7 @@ fn emit_bs_create_bin_generic(
     }
     asm.code.cbz(Gpr::x(0), route_failure)?;
     asm.code
-        .emit(|e| e.stur(Gpr::x(0), SCHEDULER_REGS, SAVED_RESULT))?;
+        .emit(|e| e.str_uoff(Gpr::x(0), SCHEDULER_REGS, SAVED_RESULT))?;
 
     for (segment, &segment_failures) in segments.iter().zip(&failures) {
         if matches!(
@@ -386,7 +384,7 @@ fn emit_bs_create_bin_generic(
             e.mov_reg(Gpr::x(3), SEG_BITS)?;
             e.mov_const(Gpr::x(4), metadata)?;
             e.mov_const(Gpr::x(5), u64::from(segment.index))?;
-            e.ldur(Gpr::x(6), SCHEDULER_REGS, SAVED_BITS)
+            e.ldr_uoff(Gpr::x(6), SCHEDULER_REGS, SAVED_BITS)
         })?;
         emit_bs_helper_call(
             asm,
@@ -398,8 +396,8 @@ fn emit_bs_create_bin_generic(
         asm.code.cbz(Gpr::x(0), route_failure)?;
     }
     asm.code.emit(|e| {
-        e.ldur(Gpr::x(0), SCHEDULER_REGS, SAVED_RESULT)?;
-        e.stur(Gpr::xzr(), SCHEDULER_REGS, SAVED_RESULT)
+        e.ldr_uoff(Gpr::x(0), SCHEDULER_REGS, SAVED_RESULT)?;
+        e.str_uoff(Gpr::xzr(), SCHEDULER_REGS, SAVED_RESULT)
     })?;
     asm.store_register(dst, Gpr::x(0))?;
     asm.code.b(success)?;
@@ -560,7 +558,7 @@ fn emit_segment_size(
         };
         if accumulate {
             asm.code
-                .emit(|e| e.stur(BITS, SCHEDULER_REGS, SAVED_BITS))?;
+                .emit(|e| e.str_uoff(BITS, SCHEDULER_REGS, SAVED_BITS))?;
         }
         asm.code
             .emit(|e| e.mov_const(Gpr::x(3), u64::from(segment.index)))?;
@@ -579,7 +577,7 @@ fn emit_segment_size(
         asm.code.emit(|e| e.mov_reg(SEG_BITS, Gpr::x(0)))?;
         if accumulate {
             asm.code
-                .emit(|e| e.ldur(BITS, SCHEDULER_REGS, SAVED_BITS))?;
+                .emit(|e| e.ldr_uoff(BITS, SCHEDULER_REGS, SAVED_BITS))?;
             asm.code
                 .emit(|e| e.adds_reg(BITS, BITS, SEG_BITS, Shift::Lsl, 0))?;
             branch_if_condition(asm, Cond::Cs, failures.system_limit)?;
@@ -595,7 +593,7 @@ fn emit_segment_size(
         };
         if accumulate {
             asm.code
-                .emit(|e| e.stur(BITS, SCHEDULER_REGS, SAVED_BITS))?;
+                .emit(|e| e.str_uoff(BITS, SCHEDULER_REGS, SAVED_BITS))?;
         }
         asm.code
             .emit(|e| e.mov_const(Gpr::x(3), u64::from(segment.index)))?;
@@ -614,7 +612,7 @@ fn emit_segment_size(
         asm.code.emit(|e| e.mov_reg(SEG_BITS, Gpr::x(0)))?;
         if accumulate {
             asm.code
-                .emit(|e| e.ldur(BITS, SCHEDULER_REGS, SAVED_BITS))?;
+                .emit(|e| e.ldr_uoff(BITS, SCHEDULER_REGS, SAVED_BITS))?;
             asm.code
                 .emit(|e| e.adds_reg(BITS, BITS, SEG_BITS, Shift::Lsl, 0))?;
             branch_if_condition(asm, Cond::Cs, failures.system_limit)?;
@@ -678,7 +676,7 @@ fn emit_bs_helper_call(
     crate::emit_enter_runtime(&mut asm.code, live, update)?;
     asm.code.emit(|e| {
         e.mov_reg(Gpr::x(0), C_P)?;
-        e.mov_reg(Gpr::x(1), SCHEDULER_REGS)?;
+        crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(1))?;
         for (index, arg) in args.iter().copied().enumerate() {
             let dst = Gpr::x(index as u8 + 2);
             if arg != dst {
