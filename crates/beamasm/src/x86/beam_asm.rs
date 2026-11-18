@@ -9,7 +9,7 @@
 //! [`CodeBuffer`], whose instructions are encoded by [`Emitter`] one asmjit call at a time.
 
 use arinsal_x64::buf::{BufferError, CodeBuffer, Label};
-use arinsal_x64::enc::{self, Emitter, EncodeError, Gp, Mem};
+use arinsal_x64::enc::{self, CondCode, Emitter, EncodeError, Gp, Mem};
 
 use crate::common::args::ArgVal;
 use crate::{
@@ -94,7 +94,7 @@ pub mod register {
     pub const RETB: Gp = enc::AL;
 }
 
-use register::{ACTIVE_CODE_IX, C_P, E, REGISTERS, RET};
+use register::{ACTIVE_CODE_IX, ARG1, ARG1D, ARG6, C_P, E, E_SAVED, FCALLS, HTOP, REGISTERS, RET};
 
 /// Bytes `runtime_call` reserves below the arguments for the callee: Win64's shadow space.
 // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:497-529 (runtime_call), OTP-29.1.1.
@@ -308,6 +308,8 @@ pub mod process {
     pub const ARITY: i32 = offset_of!(ProcessHeader, arity) as i32;
     /// `offsetof(Process, current)`.
     pub const CURRENT: i32 = offset_of!(ProcessHeader, current) as i32;
+    /// `offsetof(Process, common.id)`.
+    pub const SELF_PID: i32 = offset_of!(ProcessHeader, self_pid) as i32;
     /// `offsetof(Process, flags)`.
     pub const FLAGS: i32 = offset_of!(ProcessHeader, flags) as i32;
 }
@@ -325,6 +327,8 @@ pub enum AsmError {
     Encode(EncodeError),
     /// Label binding, fixup or layout failed.
     Buffer(BufferError),
+    /// An operand the instruction does not take (erts `ASSERT`s it at load time).
+    Operand(&'static str),
 }
 
 impl From<EncodeError> for AsmError {
@@ -504,7 +508,228 @@ impl BeamAssembler {
     pub fn emit_setup_dispatchable_call_active(&mut self, src: Gp) -> Result<Mem, AsmError> {
         self.emit_setup_dispatchable_call(src, ACTIVE_CODE_IX)
     }
+
+    /// `a.jmp(label)`: asmjit encodes a jump to a bound label within rel8 reach as
+    /// `jmp rel8` and every other label jump as `jmp rel32`.
+    // Port of erts/emulator/asmjit/x86/x86assembler.cpp (kEncodingX86Jmp, label target),
+    // OTP-29.1.1.
+    pub fn jmp(&mut self, label: Label) -> Result<(), AsmError> {
+        if self.bound_within_rel8(label, 2) {
+            Ok(self.a.jmp_short(label)?)
+        } else {
+            Ok(self.a.jmp_near(label)?)
+        }
+    }
+
+    /// `a.short_().jmp(label)`.
+    pub fn short_jmp(&mut self, label: Label) -> Result<(), AsmError> {
+        Ok(self.a.jmp_short(label)?)
+    }
+
+    /// `a.j<cc>(label)`: `jcc rel8` to a bound label within reach, `jcc rel32` otherwise.
+    // Port of erts/emulator/asmjit/x86/x86assembler.cpp (kEncodingX86Jcc, label target),
+    // OTP-29.1.1.
+    pub fn jcc(&mut self, cc: CondCode, label: Label) -> Result<(), AsmError> {
+        if self.bound_within_rel8(label, 2) {
+            Ok(self.a.jcc_short(cc as u8, label)?)
+        } else {
+            Ok(self.a.jcc_near(cc as u8, label)?)
+        }
+    }
+
+    /// `a.short_().j<cc>(label)`.
+    pub fn short_jcc(&mut self, cc: CondCode, label: Label) -> Result<(), AsmError> {
+        Ok(self.a.jcc_short(cc as u8, label)?)
+    }
+
+    /// `j<cc>` with the reach a tag test asks for (`dShort` / `dLong`).
+    pub fn jcc_dist(&mut self, cc: CondCode, label: Label, dist: Distance) -> Result<(), AsmError> {
+        match dist {
+            Distance::Short => self.short_jcc(cc, label),
+            Distance::Long => self.jcc(cc, label),
+        }
+    }
+
+    fn bound_within_rel8(&self, label: Label, short_size: usize) -> bool {
+        self.a.label_location(label).is_some_and(|location| {
+            location.section == self.a.active_section() && {
+                let disp = location.offset as i64 - (self.a.offset() + short_size) as i64;
+                i8::try_from(disp).is_ok()
+            }
+        })
+    }
+
+    /// `hasCpuFeature(feature)`: the host CPU features asmjit's `CpuInfo` reports.
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp (BeamAssemblerCommon::hasCpuFeature),
+    // OTP-29.1.1.
+    pub fn has_cpu_feature(feature: CpuFeature) -> bool {
+        match feature {
+            CpuFeature::Avx => std::arch::is_x86_feature_detected!("avx"),
+            CpuFeature::Avx2 => std::arch::is_x86_feature_detected!("avx2"),
+            CpuFeature::Bmi2 => std::arch::is_x86_feature_detected!("bmi2"),
+            CpuFeature::Lzcnt => std::arch::is_x86_feature_detected!("lzcnt"),
+            CpuFeature::Popcnt => std::arch::is_x86_feature_detected!("popcnt"),
+            CpuFeature::Movbe => std::arch::is_x86_feature_detected!("movbe"),
+        }
+    }
+
+    /// `aligned_call(target, size)`: pads with erts' canned NOPs so the return address of the
+    /// `size`-byte call that follows forms a valid CP (4-byte aligned).
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:417-439 (aligned_call(target, size)) and
+    // jit/x86/process_main.cpp:33-36 (nops), OTP-29.1.1.
+    fn pad_for_call(&mut self, size: usize) {
+        const NOPS: [&[u8]; 3] = [&[0x90], &[0x66, 0x90], &[0x0F, 0x1F, 0x00]];
+        let next_address = self.a.offset() + size;
+        if !next_address.is_multiple_of(4) {
+            let nop_count = 4 - next_address % 4;
+            self.a.append(NOPS[nop_count - 1]);
+        }
+    }
+
+    /// `aligned_call(Label)`: relative calls are always 5 bytes long.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:395-398, OTP-29.1.1.
+    pub fn aligned_call_label(&mut self, target: Label) -> Result<(), AsmError> {
+        self.pad_for_call(5);
+        self.a.call(target)?;
+        debug_assert!(self.a.offset().is_multiple_of(4));
+        Ok(())
+    }
+
+    /// `aligned_call(OperandType)` for a register or memory target: measures the call, then
+    /// pads and emits it.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:400-415, OTP-29.1.1.
+    pub fn aligned_call_with(
+        &mut self,
+        call: impl Fn(&mut Emitter) -> Result<(), EncodeError>,
+    ) -> Result<(), AsmError> {
+        let mut probe = Emitter::new();
+        call(&mut probe)?;
+        self.pad_for_call(probe.len());
+        self.emit(call)?;
+        debug_assert!(self.a.offset().is_multiple_of(4));
+        Ok(())
+    }
+
+    /// `fragment_call(Label)`: calls a shared fragment with a return address that is a CP.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:355-370 (fragment_call), OTP-29.1.1.
+    pub fn fragment_call(&mut self, target: Label) -> Result<(), AsmError> {
+        self.emit_assert_redzone_unused();
+        self.aligned_call_label(target)
+    }
+
+    /// `erlang_call(Label, spill)`: with `NATIVE_ERLANG_STACK` an Erlang call is a native
+    /// `call` whose return address is the CP.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:327-348 (erlang_call), OTP-29.1.1.
+    pub fn erlang_call(&mut self, target: Label) -> Result<(), AsmError> {
+        self.emit_assert_redzone_unused();
+        self.aligned_call_label(target)
+    }
+
+    /// `erlang_call(Mem, spill)`, e.g. through `emit_setup_dispatchable_call`.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:327-348 (erlang_call), OTP-29.1.1.
+    pub fn erlang_call_m(&mut self, target: Mem) -> Result<(), AsmError> {
+        self.emit_assert_redzone_unused();
+        self.aligned_call_with(|e| e.call_m(target))
+    }
+
+    /// `emit_assert_redzone_unused()`: emits nothing outside `JIT_HARD_DEBUG`.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:302-322, OTP-29.1.1.
+    pub fn emit_assert_redzone_unused(&mut self) {}
+
+    /// `pic_jmp(addr)`: a position-independent absolute jump through `ARG6`.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:553-559 (pic_jmp), OTP-29.1.1.
+    pub fn pic_jmp(&mut self, address: usize) -> Result<(), AsmError> {
+        self.emit(|e| e.mov_ri(ARG6, address as i64))?;
+        self.emit(|e| e.jmp_r(ARG6))
+    }
+
+    /// `emit_leave_runtime<Spec>()` for the `RA` frame layout with `NATIVE_ERLANG_STACK`:
+    /// back to the Erlang stack and reload what `Spec` names.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:818-868 (emit_leave_runtime),
+    // OTP-29.1.1.
+    pub fn emit_leave_runtime(&mut self, spec: Update) -> Result<(), AsmError> {
+        const { assert!(matches!(FRAME_LAYOUT, FrameLayout::Ra)) };
+        if spec.contains(Update::STACK) {
+            self.emit(|e| e.mov_rm(E, process_ref(process::STOP, 8)))?;
+        } else {
+            self.emit(|e| e.mov_rr(E, E_SAVED))?;
+        }
+        if spec.contains(Update::HEAP) {
+            self.emit(|e| e.mov_rm(HTOP, process_ref(process::HTOP, 8)))?;
+        }
+        if spec.contains(Update::REDUCTIONS) {
+            self.emit(|e| e.mov_rm(FCALLS, process_ref(process::FCALLS, 4)))?;
+        }
+        if spec.contains(Update::CODE_INDEX) {
+            // Updates the local copy of the active code index, retaining save_calls.
+            let active = &raw const super::rt::the_active_code_index as i64;
+            self.emit(|e| e.mov_ri(ARG1, active))?;
+            self.emit(|e| e.mov_rm(ARG1D, enc::dword_ptr(ARG1, 0)))?;
+            self.emit(|e| e.cmp_ri(ACTIVE_CODE_IX, ERTS_SAVE_CALLS_CODE_IX as i64))?;
+            self.emit(|e| e.cmovcc_rr(CondCode::NE, ACTIVE_CODE_IX, ARG1))?;
+        }
+        Ok(())
+    }
+
+    /// `emit_is_cons(Fail, Src, dist)`.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:885-892 (emit_is_cons), OTP-29.1.1.
+    pub fn emit_is_cons(&mut self, fail: Label, src: Gp, dist: Distance) -> Result<(), AsmError> {
+        self.emit_test_cons(src)?;
+        self.jcc_dist(CondCode::NE, fail, dist)
+    }
+
+    /// `emit_is_not_cons(Fail, Src, dist)`.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:894-901 (emit_is_not_cons), OTP-29.1.1.
+    pub fn emit_is_not_cons(
+        &mut self,
+        fail: Label,
+        src: Gp,
+        dist: Distance,
+    ) -> Result<(), AsmError> {
+        self.emit_test_cons(src)?;
+        self.jcc_dist(CondCode::E, fail, dist)
+    }
+
+    /// `emit_is_boxed(Fail, Src, dist)`.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:907-914 (emit_is_boxed), OTP-29.1.1.
+    pub fn emit_is_boxed(&mut self, fail: Label, src: Gp, dist: Distance) -> Result<(), AsmError> {
+        self.emit_test_boxed(src)?;
+        self.jcc_dist(CondCode::NE, fail, dist)
+    }
+
+    /// `emit_is_not_boxed(Fail, Src, dist)`.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:916-923 (emit_is_not_boxed), OTP-29.1.1.
+    pub fn emit_is_not_boxed(
+        &mut self,
+        fail: Label,
+        src: Gp,
+        dist: Distance,
+    ) -> Result<(), AsmError> {
+        self.emit_test_boxed(src)?;
+        self.jcc_dist(CondCode::E, fail, dist)
+    }
 }
+
+/// The CPU features erts' x86 emitters test (`CpuFeatures::X86::k*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuFeature {
+    /// `kAVX`.
+    Avx,
+    /// `kAVX2`.
+    Avx2,
+    /// `kBMI2`.
+    Bmi2,
+    /// `kLZCNT`.
+    Lzcnt,
+    /// `kPOPCNT`.
+    Popcnt,
+    /// `kMOVBE`.
+    Movbe,
+}
+
+/// `ERTS_SAVE_CALLS_CODE_IX`.
+// Port of erts/emulator/beam/code_ix.h:72-95, OTP-29.1.1.
+pub const ERTS_SAVE_CALLS_CODE_IX: u32 = arinsal_term::ERTS_SAVE_CALLS_CODE_IX as u32;
 
 // Port of erts/emulator/beam/jit/beam_jit_main.cpp:291-305 (beamasm_init), OTP-29.1.1: the
 // commonly used process fields must be reachable with an 8-bit displacement from `c_p`.
@@ -624,5 +849,81 @@ mod tests {
             }),
             [0x48, 0x89, 0xf0, 0x4a, 0x8b, 0x3c, 0xe0]
         );
+    }
+
+    fn as_bytes(lines: &[&str]) -> Option<Vec<u8>> {
+        let lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        crate::x86::jdump::gnu_as(&lines)
+    }
+
+    #[test]
+    fn leave_runtime_matches_erts_sequences() {
+        let ours = bytes(|a| a.emit_leave_runtime(Update::HEAP_ALLOC.union(Update::REDUCTIONS)));
+        let expected = as_bytes(&[
+            &format!("mov rsp, qword ptr [r13+{}]", process::STOP),
+            &format!("mov r15, qword ptr [r13+{}]", process::HTOP),
+            &format!("mov r14d, dword ptr [r13+{}]", process::FCALLS),
+        ]);
+        if let Some(expected) = expected {
+            assert_eq!(ours, expected);
+        }
+        // Without eStack, E comes back from E_saved.
+        assert_eq!(
+            bytes(|a| a.emit_leave_runtime(Update::NONE)),
+            [0x48, 0x89, 0xec]
+        );
+        let active = &raw const crate::x86::rt::the_active_code_index as u64;
+        let ours = bytes(|a| a.emit_leave_runtime(Update::CODE_INDEX));
+        let mov = if active <= u64::from(u32::MAX) {
+            format!("mov edi, {active}")
+        } else {
+            format!("movabs rdi, {active}")
+        };
+        let expected = as_bytes(&[
+            "mov rsp, rbp",
+            &mov,
+            "mov edi, dword ptr [rdi]",
+            &format!("cmp r12, {ERTS_SAVE_CALLS_CODE_IX}"),
+            "cmovne r12, rdi",
+        ]);
+        if let Some(expected) = expected {
+            assert_eq!(ours, expected);
+        }
+    }
+
+    #[test]
+    fn label_jumps_follow_asmjit_reach() {
+        let mut asm = BeamAssembler::new();
+        let back = asm.new_label();
+        let forward = asm.new_label();
+        asm.bind(back).unwrap();
+        asm.jcc(CondCode::NE, back).unwrap(); // bound, in reach: rel8
+        asm.jcc(CondCode::NE, forward).unwrap(); // unbound: rel32
+        asm.jmp(back).unwrap(); // rel8
+        asm.a.append(&[0x90; 200]);
+        asm.jmp(back).unwrap(); // out of rel8 reach: rel32
+        asm.bind(forward).unwrap();
+        let code = asm.a.bytes(arinsal_x64::buf::Section::Code).to_vec();
+        assert_eq!(&code[..2], &[0x75, 0xfe]);
+        assert_eq!(&code[2..4], &[0x0f, 0x85]);
+        assert_eq!(&code[8..10], &[0xeb, 0xf6]);
+        assert_eq!(code[210], 0xe9);
+        assert_eq!(code.len(), 215);
+    }
+
+    #[test]
+    fn aligned_calls_return_to_a_cp() {
+        let mut asm = BeamAssembler::new();
+        let target = asm.new_label();
+        asm.a.append(&[0x90]);
+        // 1 + 5 = 6: two NOP bytes (`66 90`) put the return address at 8.
+        asm.aligned_call_label(target).unwrap();
+        asm.bind(target).unwrap();
+        // `call [rax + r12*8]` is 4 bytes: at 8 its end is already 4-byte aligned, no padding.
+        asm.aligned_call_with(|e| e.call_m(Mem::base_index(enc::RAX, enc::R12, 3, 0, 8)))
+            .unwrap();
+        let code = asm.a.bytes(arinsal_x64::buf::Section::Code).to_vec();
+        assert_eq!(&code[1..4], &[0x66, 0x90, 0xe8]);
+        assert_eq!(code.len(), 12);
     }
 }

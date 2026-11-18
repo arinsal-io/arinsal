@@ -105,6 +105,9 @@ unsafe extern "C" {
         reg: *mut u64,
         func: u64,
     ) -> usize;
+    /// `ErtsCodeIndex the_active_code_index` (code_ix.h): the node's active code index,
+    /// read by `emit_leave_runtime<eCodeIndex>`.
+    pub safe static the_active_code_index: u32;
     /// `int erts_garbage_collect_nobump(Process *p, int need, Eterm *objv, int nobj,
     /// int fcalls)` (erl_gc.h): reductions spent.
     pub safe fn erts_garbage_collect_nobump(
@@ -286,6 +289,11 @@ core::arch::global_asm!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fixture for the VM's `the_active_code_index`, so byte tests of
+    /// `emit_leave_runtime(Update::CODE_INDEX)` link.
+    #[unsafe(no_mangle)]
+    static the_active_code_index: u32 = 0;
 
     // Native functions following the x86-64 BeamAsm register contract, entered through the
     // bridge. `preserve` is a host-side caller that checks the bridge keeps every System V

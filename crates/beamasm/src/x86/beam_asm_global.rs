@@ -514,11 +514,10 @@ impl BeamGlobalAssembler {
         })
     }
 
-    /// `a.jmp(labels[target])` to a fragment emitted after the current one. asmjit encodes a
-    /// jump to a label that is not bound yet as `jmp rel32`.
+    /// `a.jmp(labels[target])`.
     fn jmp_later_fragment(&mut self, target: GlobalLabels) -> Result<(), AsmError> {
         let label = self.label(target);
-        Ok(self.asm.a.jmp_near(label)?)
+        self.asm.jmp(label)
     }
 
     /// ARG3 = return address, `current_label + TEST_YIELD_RETURN_OFFSET`.
@@ -628,23 +627,6 @@ mod tests {
         );
     }
 
-    /// `beam_asm_global.asm` written by `erl +JDdump true`, or `None` without `erl`.
-    fn erts_global_dump() -> Option<String> {
-        let dir = std::env::temp_dir().join(format!("arinsal-x86-jdump-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok()?;
-        let status = Command::new("erl")
-            .args(["+JDdump", "true", "-noshell", "-eval", "halt()."])
-            .current_dir(&dir)
-            .status()
-            .ok()?;
-        let text = status
-            .success()
-            .then(|| std::fs::read_to_string(dir.join("beam_asm_global.asm")).ok())
-            .flatten();
-        let _ = std::fs::remove_dir_all(&dir);
-        text
-    }
-
     /// The instruction lines of fragment `name` in the erts dump.
     fn fragment_lines<'a>(dump: &'a str, name: &str) -> Vec<&'a str> {
         let head = format!("global::{name}:");
@@ -719,7 +701,7 @@ mod tests {
     // instructions as erts' (with Arinsal's process field offsets and static MFA addresses).
     #[test]
     fn fragments_match_erts_dump() {
-        let Some(dump) = erts_global_dump() else {
+        let Some(dump) = crate::x86::jdump::erts_dump("beam_asm_global") else {
             eprintln!("skipping: `erl +JDdump true` unavailable");
             return;
         };

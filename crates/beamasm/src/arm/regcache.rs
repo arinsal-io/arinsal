@@ -9,10 +9,39 @@ use crate::module::{BeamModuleAssembler, ModuleError};
 const SUPER_TMP: Gpr = Gpr::x(17);
 const CACHE_SIZE: usize = 16;
 
-/// `RegisterCache<16, a64::Mem, a64::Gp>` of erts/emulator/beam/jit/arm/beam_asm.hpp.
-pub(crate) type RegCache = crate::common::register_cache::RegCache<CACHE_SIZE, Gpr>;
-/// The `a64::Mem` operand the cache is keyed by.
-pub(crate) type Slot = crate::common::register_cache::Slot<Gpr>;
+/// `RegisterCache<16, a64::Mem, a64::Gp>` of erts/emulator/beam/jit/arm/beam_asm.hpp, keyed
+/// by [`Slot`] and pinned to the code offset and the number of labels bound.
+pub(crate) type RegCache =
+    crate::common::register_cache::RegisterCache<CACHE_SIZE, Slot, Gpr, (usize, u64)>;
+
+/// The `a64::Mem` operand the cache is keyed by: base register and byte offset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Slot {
+    pub(crate) base: Gpr,
+    pub(crate) offset: u32,
+}
+
+impl crate::common::register_cache::CacheMem<Gpr> for Slot {
+    fn base_reg(&self) -> Option<Gpr> {
+        Some(self.base)
+    }
+
+    fn trimmed(&self, bytes: u32) -> Option<Self> {
+        self.offset.checked_sub(bytes).map(|offset| Slot {
+            base: self.base,
+            offset,
+        })
+    }
+}
+
+impl RegCache {
+    /// An empty cache over X slots addressed from `xregs` and Y slots from `yregs`, with no
+    /// temporaries to allocate from.
+    // Port of beam_jit_register_cache.hpp:66-70 (RegisterCache::RegisterCache), OTP-29.1.1.
+    pub(crate) fn new(xregs: Gpr, yregs: Gpr) -> Self {
+        Self::with_temporaries(xregs, yregs, &[])
+    }
+}
 
 impl BeamModuleAssembler {
     fn cache_here(&self) -> (usize, u64) {
