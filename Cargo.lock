@@ -73,6 +73,7 @@ dependencies = [
  "arinsal-a64",
  "arinsal-bifs",
  "arinsal-term",
+ "arinsal-x64",
  "similar-asserts",
 ]
 

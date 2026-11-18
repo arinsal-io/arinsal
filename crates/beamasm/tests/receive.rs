@@ -1,3 +1,5 @@
+#![cfg(target_arch = "aarch64")]
+
 use core::ffi::c_void;
 use std::sync::OnceLock;
 

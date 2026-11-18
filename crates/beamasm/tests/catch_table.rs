@@ -1,3 +1,5 @@
+#![cfg(target_arch = "aarch64")]
+
 use arinsal_beamasm::{
     ProcessHeader,
     module::{ArgVal, BeamModuleAssembler},

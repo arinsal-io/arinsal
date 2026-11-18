@@ -1,3 +1,5 @@
+#![cfg(target_arch = "aarch64")]
+
 use arinsal_a64::enc::Gpr;
 use arinsal_beamasm::{
     ExitReason, ProcessHeader, SchedulerRegisters, enter_native, module::BeamModuleAssembler,

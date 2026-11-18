@@ -13,6 +13,7 @@ workspace = true
 arinsal-a64 = { path = "../a64" }
 arinsal-bifs = { path = "../bifs" }
 arinsal-term = { path = "../term" }
+arinsal-x64 = { path = "../x64" }
 
 [dev-dependencies]
 similar-asserts = "2"

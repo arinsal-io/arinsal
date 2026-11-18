@@ -1,3 +1,5 @@
+#![cfg(target_arch = "aarch64")]
+
 use std::{cell::RefCell, cmp::Ordering, collections::HashMap, process::Command, sync::Arc};
 
 use arinsal_a64::enc::Gpr;

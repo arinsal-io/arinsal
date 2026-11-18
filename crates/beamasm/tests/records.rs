@@ -1,3 +1,5 @@
+#![cfg(target_arch = "aarch64")]
+
 use std::sync::{Mutex, OnceLock};
 
 use arinsal_a64::enc::Gpr;

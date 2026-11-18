@@ -1,3 +1,5 @@
+#![cfg(target_arch = "aarch64")]
+
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use arinsal_a64::enc::Gpr;

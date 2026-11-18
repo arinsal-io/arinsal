@@ -1,3 +1,5 @@
+#![cfg(target_arch = "aarch64")]
+
 use similar_asserts::assert_eq;
 
 use arinsal_a64::enc::Gpr;

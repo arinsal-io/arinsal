@@ -1,3 +1,5 @@
+#![cfg(target_arch = "aarch64")]
+
 use std::{cell::Cell, process::Command, sync::atomic::AtomicPtr};
 
 use arinsal_a64::enc::Gpr;

@@ -1,3 +1,5 @@
+#![cfg(target_arch = "aarch64")]
+
 use std::sync::{
     Mutex, OnceLock,
     atomic::{AtomicUsize, Ordering},
