@@ -19,6 +19,7 @@ pub(crate) mod erl_bif_op;
 pub(crate) mod erl_bif_os;
 pub(crate) mod erl_bif_re;
 pub(crate) mod erl_bif_unique;
+pub(crate) mod erl_db;
 pub(crate) mod erl_debugger;
 pub(crate) mod erl_hl_timer;
 pub(crate) mod erl_iolist;

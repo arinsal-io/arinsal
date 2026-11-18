@@ -15,14 +15,15 @@ pub mod estack;
 pub mod magic_bin;
 
 /// Copy one self-contained table block word by word, offsetting its pointers and linking its
-/// off-heap things into `dst` (the caller checked the block with `shallow_copyable`).
+/// off-heap things into `dst` (the caller checked the block with `shallow_copyable` and
+/// reserved `block.len()` words at `base`).
 // Port of erts/emulator/beam/copy.c (`copy_shallow_x`), OTP-29.1.1.
 pub(crate) fn copy_shallow<H: HeapAlloc + ?Sized>(
     root: Term,
     block: &[u64],
+    base: *mut u64,
     dst: &mut H,
 ) -> Result<Term, TermError> {
-    let base = dst.alloc(block.len()).ok_or(TermError::HeapFull)?;
     let source = block.as_ptr();
     let offset = (base as u64).wrapping_sub(source as u64);
     let empty = crate::global_empty_tuple().0;

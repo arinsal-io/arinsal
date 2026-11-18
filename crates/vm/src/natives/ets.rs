@@ -532,11 +532,8 @@ pub(crate) fn direct_entry(module: &str, function: &str, arity: u8) -> Option<Di
     // send messages or trap (give_away, request_all, delete/1, internal_delete_all) need the
     // scheduler context and keep the scheduler path.
     match (function, arity) {
-        ("lookup", 2) => Some(direct_lookup),
         ("member", 2) => Some(direct_member),
         ("lookup_element", 3 | 4) => Some(direct_lookup_element),
-        ("insert", 2) => Some(direct_insert),
-        ("insert_new", 2) => Some(direct_insert_new),
         ("update_counter", 3 | 4) => Some(direct_update_counter),
         ("new", 2) => Some(direct_bif::<{ EtsBif::New as u8 }>),
         ("whereis", 1) => Some(direct_bif::<{ EtsBif::Whereis as u8 }>),
@@ -728,21 +725,20 @@ fn with_cached_table<R>(
         .flatten()
 }
 
-fn direct_lookup(
-    process: &mut Process,
-    args: &[Term],
-    module: arinsal_term::Atom,
-    function: arinsal_term::Atom,
-) -> Option<Term> {
+/// `ets:lookup/2`.
+// Port of erts/emulator/beam/erl_db.c (ets_lookup_2, db_get_table_aux), OTP-29.1.1.
+pub(crate) fn ets_lookup_2(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     if args[0].is_magic_ref() {
-        direct_lookup_cached(process, args)
-            .or_else(|| direct_plain(process, args, module, function, lookup_args_member))
-    } else if args[0].as_atom().is_some() {
-        direct_lookup_named(process, args)
-            .or_else(|| direct_plain(process, args, module, function, lookup_args_member))
-    } else {
-        direct_plain(process, args, module, function, lookup_args_member)
+        if let Some(value) = direct_lookup_cached(process, args) {
+            return Ok(value);
+        }
+    } else if args[0].as_atom().is_some()
+        && let Some(value) = direct_lookup_named(process, args)
+    {
+        return Ok(value);
     }
+    let caller = direct_caller(process).ok_or_else(badarg)?;
+    lookup_args(process, caller, false, args[0], args[1])
 }
 
 /// Successful `ets:lookup/2` for a named table, with the same lookup, lock, and copy steps as
@@ -782,15 +778,6 @@ fn direct_plain(
     let caller = direct_caller(process)?;
     let result = run(process, caller, args[0], args[1]);
     finish_direct(process, module, function, args, result)
-}
-
-fn lookup_args_member(
-    process: &mut Process,
-    caller: Term,
-    target: Term,
-    key: Term,
-) -> Result<Term, VmError> {
-    lookup_args(process, caller, false, target, key)
 }
 
 fn direct_lookup_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
@@ -926,35 +913,6 @@ fn direct_lookup_element_cached(
     result.and_then(|result| finish_direct(process, module, function, args, result))
 }
 
-fn direct_insert(
-    process: &mut Process,
-    args: &[Term],
-    module: arinsal_term::Atom,
-    function: arinsal_term::Atom,
-) -> Option<Term> {
-    ets_insert_2::<false>(process, args)
-        .or_else(|| direct_plain(process, args, module, function, insert_plain::<false>))
-}
-
-fn direct_insert_new(
-    process: &mut Process,
-    args: &[Term],
-    module: arinsal_term::Atom,
-    function: arinsal_term::Atom,
-) -> Option<Term> {
-    ets_insert_2::<true>(process, args)
-        .or_else(|| direct_plain(process, args, module, function, insert_plain::<true>))
-}
-
-fn insert_plain<const NEW: bool>(
-    process: &mut Process,
-    caller: Term,
-    target: Term,
-    objects: Term,
-) -> Result<Term, VmError> {
-    insert_args(process, None, caller, NEW, target, objects)
-}
-
 /// `ets:delete/2` through the table lock and the storage's key-level write lock.
 // Port of erts/emulator/beam/erl_db.c (ets_delete_2), OTP-29.1.1.
 fn direct_delete(
@@ -1029,12 +987,40 @@ fn direct_delete_from_shared(
     Some(Term::atom(arinsal_term::atoms::TRUE))
 }
 
+/// `ets:insert/2` and `ets:insert_new/2`: one tuple is stored in place, anything else (lists,
+/// the empty list, errors, a busy table) takes the general body.
+// Port of erts/emulator/beam/erl_db.c (ets_insert_2, ets_insert_new_2), OTP-29.1.1.
+pub(crate) fn ets_insert_2<const NEW: bool>(
+    process: &mut Process,
+    args: &[Term],
+) -> Result<Term, VmError> {
+    if let Some(value) = insert_one::<NEW>(process, args) {
+        return Ok(value);
+    }
+    let caller = direct_caller(process).ok_or_else(badarg)?;
+    insert_args(process, None, caller, NEW, args[0], args[1])
+}
+
+/// Attach the BIF's stack frame to a failure, as `handle_error` builds it from the X registers.
+// Port of erts/emulator/beam/beam_common.c (save_stacktrace), OTP-29.1.1.
+pub(crate) fn bif_failure(
+    function: &str,
+    args: &[Term],
+    result: Result<Term, VmError>,
+) -> Result<Term, VmError> {
+    let atoms = arinsal_term::global_atoms();
+    let (Ok(module), Ok(function)) = (atoms.intern("ets"), atoms.intern(function)) else {
+        return result;
+    };
+    bif_register_frame(module, function, args.len(), result)
+}
+
 /// One tuple inserted into a set, bag or CA-tree table: table lookup, access check, bucket
 /// store. `None` declines to the general path (lists, errors, a busy table).
 // Port of erts/emulator/beam/erl_db.c (ets_insert_2/insert_new_2, db_get_table_aux) and
 // erl_db_hash.c (db_put_hash), OTP-29.1.1.
 #[inline]
-fn ets_insert_2<const NEW: bool>(process: &mut Process, args: &[Term]) -> Option<Term> {
+fn insert_one<const NEW: bool>(process: &mut Process, args: &[Term]) -> Option<Term> {
     if args[1].classify() != TermKind::Tuple {
         return None;
     }

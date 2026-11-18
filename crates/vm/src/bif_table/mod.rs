@@ -174,8 +174,9 @@ fn function_at(index: usize) -> Option<Bif> {
 use crate::native_helpers::{persistent_term_get_1_light, persistent_term_get_2_light};
 use crate::natives::{
     bif_phash2, binary, erl_arith, erl_bif_atomics, erl_bif_binary, erl_bif_chksum, erl_bif_guard,
-    erl_bif_info, erl_bif_lists, erl_bif_op, erl_bif_re, erl_bif_unique, erl_hl_timer, erl_iolist,
-    erl_map, erl_math, erl_process_dict, erl_ptab, erl_time_sup, erl_unicode, external, register,
+    erl_bif_info, erl_bif_lists, erl_bif_op, erl_bif_re, erl_bif_unique, erl_db, erl_hl_timer,
+    erl_iolist, erl_map, erl_math, erl_process_dict, erl_ptab, erl_time_sup, erl_unicode, external,
+    register,
 };
 
 /// `bif_table[i].f` for a BIF whose body is not the shared plain/process/trap adapter.
@@ -294,6 +295,10 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erts_internal", "perf_counter_unit", 0) => {
             bif!(erl_time_sup::perf_counter_unit_0)
         }
+        // erl_db.c
+        ("ets", "insert", 2) => bif!(erl_db::ets_insert_2),
+        ("ets", "insert_new", 2) => bif!(erl_db::ets_insert_new_2),
+        ("ets", "lookup", 2) => bif!(erl_db::ets_lookup_2),
         // erl_bif_atomics.c
         ("erts_internal", "atomics_new", 2) => bif!(erl_bif_atomics::atomics_new_2),
         ("atomics", "put", 3) => bif!(erl_bif_atomics::atomics_put_3),

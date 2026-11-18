@@ -181,7 +181,8 @@ pub fn copy_shallow<H: HeapAlloc + ?Sized>(
     block: &[u64],
     dst: &mut H,
 ) -> Result<Term, TermError> {
-    crate::raw::copy_shallow(root, block, dst)
+    let base = dst.alloc(block.len()).ok_or(TermError::HeapFull)?;
+    crate::raw::copy_shallow(root, block, base, dst)
 }
 
 /// Copy a nonempty tuple whose elements are all immediates in one pass, without sizing it first.
