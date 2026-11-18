@@ -1,5 +1,6 @@
 //! x86_64 machine-code support for Arinsal's BeamAsm port.
 //!
-//! `buf` owns code and data sections. Instruction encodings are added in later port boxes.
+//! `buf` owns code and data sections, `enc` encodes instructions (`docs/design/x86_encoder_api.md`).
 
 pub mod buf;
+pub mod enc;
