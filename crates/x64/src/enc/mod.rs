@@ -12,10 +12,13 @@
 
 mod alu;
 mod avx;
+mod branch;
+mod cond;
 mod core;
 mod mov;
 mod operand;
 
+pub use cond::CondCode;
 pub use operand::*;
 
 use std::fmt;

@@ -5,6 +5,8 @@ mod golden;
 
 mod alu;
 mod avx;
+mod branch;
+mod cond;
 mod mem;
 mod mov;
 mod operand;
