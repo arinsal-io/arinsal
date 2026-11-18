@@ -526,6 +526,13 @@ impl BeamGlobalAssembler {
             G::DispatchSaveCallsExport => Self::emit_dispatch_save_calls_export,
             G::UnloadedFun => Self::emit_unloaded_fun,
             G::HandleCallFunError => Self::emit_handle_call_fun_error,
+            G::BsSizeCheckShared => Self::emit_bs_size_check_shared,
+            G::BsGetTailShared => Self::emit_bs_get_tail_shared,
+            G::BsGetUtf8Shared => Self::emit_bs_get_utf8_shared,
+            G::BsCreateBinErrorShared => Self::emit_bs_create_bin_error_shared,
+            G::GetSint64Shared => Self::emit_get_sint64_shared,
+            G::ConstructUtf8Shared => Self::emit_construct_utf8_shared,
+            G::StoreUnaligned => Self::emit_store_unaligned,
             _ => return None,
         })
     }
@@ -544,6 +551,15 @@ impl BeamGlobalAssembler {
             }
         }
         Ok(ga)
+    }
+
+    /// `get_<fragment>()` once the global code is placed at `base`: `getCode(labels[label])`.
+    /// `None` for a fragment not emitted.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_global.hpp.pl (decl_get_funcs) and
+    // jit/beam_jit_common.hpp (BeamAssemblerCommon::getCode), OTP-29.1.1.
+    pub fn get(&self, base: usize, label: GlobalLabels) -> Option<usize> {
+        let location = self.asm.a.label_location(self.label(label))?;
+        Some(base + location.offset)
     }
 
     /// The `AsmRange` of every emitted fragment, as code offsets: from its label to the next

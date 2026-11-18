@@ -679,6 +679,16 @@ impl BeamAssembler {
         self.aligned_call_label(target)
     }
 
+    /// `fragment_call(FuncPtr)`: a fragment called by its absolute address (the module
+    /// assembler's `fragment_call(ga->get_x())`, which `BeamAssembler::fragment_call` resolves
+    /// to `aligned_call(FuncPtr *)`).
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:355-370 (fragment_call) and 388-393
+    // (aligned_call(FuncPtr *)), OTP-29.1.1.
+    pub fn fragment_call_abs(&mut self, target: usize) -> Result<(), AsmError> {
+        self.emit_assert_redzone_unused();
+        self.aligned_call_abs(target)
+    }
+
     /// `erlang_call(Label, spill)`: with `NATIVE_ERLANG_STACK` an Erlang call is a native
     /// `call` whose return address is the CP.
     // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:327-348 (erlang_call), OTP-29.1.1.

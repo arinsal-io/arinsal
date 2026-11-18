@@ -140,12 +140,49 @@ pub(crate) const ERTS_PROCESS_OFFSETS: [(i32, i32); 11] = {
     ]
 };
 
+/// asmjit's `kOptimizeForSize` choices the dump text does not show (x86assembler.cpp,
+/// kEncodingX86Arith and kEncodingX86Mov): `and r64, imm` and `mov r64, imm` with an unsigned
+/// 32-bit immediate are encoded with the 32-bit register, which zero-extends.
+fn asmjit_size_optimized(line: &str) -> String {
+    const R64: [(&str, &str); 16] = [
+        ("rax", "eax"),
+        ("rcx", "ecx"),
+        ("rdx", "edx"),
+        ("rbx", "ebx"),
+        ("rsp", "esp"),
+        ("rbp", "ebp"),
+        ("rsi", "esi"),
+        ("rdi", "edi"),
+        ("r8", "r8d"),
+        ("r9", "r9d"),
+        ("r10", "r10d"),
+        ("r11", "r11d"),
+        ("r12", "r12d"),
+        ("r13", "r13d"),
+        ("r14", "r14d"),
+        ("r15", "r15d"),
+    ];
+    let Some((op, operands)) = line.split_once(' ') else {
+        return line.to_string();
+    };
+    let Some((dst, imm)) = operands.split_once(", ") else {
+        return line.to_string();
+    };
+    if (op == "and" || op == "mov")
+        && imm.parse::<u32>().is_ok()
+        && let Some((_, r32)) = R64.iter().find(|(r64, _)| *r64 == dst)
+    {
+        return format!("{op} {r32}, {imm}");
+    }
+    line.to_string()
+}
+
 /// Rewrites one erts dump line to Arinsal's layouts: `Process` fields (`[r13+N]`) and the
 /// scheduler registers' auxiliary area (`[rbx-N]`: erts' `runtime_stack` is at -64 and
 /// `TMP_MEM1..5` follow it; Arinsal's start at -128).
 pub(crate) fn erts_to_arinsal(line: &str) -> String {
     use crate::x86::beam_asm::{get_runtime_stack_ref, tmp_mem_q_disp};
-    let mut line = line.trim_start_matches("rex ").replace(".db ", ".byte ");
+    let mut line = asmjit_size_optimized(line.trim_start_matches("rex ")).replace(".db ", ".byte ");
     // A short jump to a local label: GNU `as` picks rel8 itself for a label in reach.
     if line.starts_with("short j") && !line.contains("global::") {
         line = line.trim_start_matches("short ").to_string();

@@ -154,6 +154,84 @@ unsafe extern "C" {
     ) -> u64;
 }
 
+// Port of erts/emulator/beam/jit/x86/instr_bs.cpp (`extern "C" { #include "erl_binary.h"
+// #include "erl_bits.h" #include "beam_common.h" }` and the beam_jit_bs_* helpers of
+// jit/beam_jit_common.hpp), OTP-29.1.1: the runtime functions the bit syntax emitters and
+// fragments call by address. `ErlSubBits *` and `const BinRef *` cross as addresses (native
+// code only passes them on); `instr_bs` re-exports them.
+unsafe extern "C" {
+    /// `void beam_jit_bs_field_size_argument_error(Process *c_p, Eterm size)`
+    /// (beam_jit_common.hpp).
+    pub safe fn beam_jit_bs_field_size_argument_error(c_p: *mut crate::ProcessHeader, size: u64);
+    /// `Eterm beam_jit_bs_get_integer(Process *c_p, Eterm *reg, Eterm context, Uint flags,
+    /// Uint size, Uint Live)` (beam_jit_common.hpp).
+    pub safe fn beam_jit_bs_get_integer(
+        c_p: *mut crate::ProcessHeader,
+        reg: *mut u64,
+        context: u64,
+        flags: u64,
+        size: u64,
+        live: u64,
+    ) -> u64;
+    /// `void beam_jit_bs_construct_fail_info(Process *c_p, Uint packed_error_info,
+    /// Eterm arg3, Eterm arg1)` (beam_jit_common.hpp).
+    pub safe fn beam_jit_bs_construct_fail_info(
+        c_p: *mut crate::ProcessHeader,
+        packed_error_info: u64,
+        arg3: u64,
+        arg1: u64,
+    );
+    /// `ErlSubBits *erts_bs_start_match_3(Process *p, Eterm Bin)` (erl_bits.h).
+    pub safe fn erts_bs_start_match_3(c_p: *mut crate::ProcessHeader, bin: u64) -> usize;
+    /// `Eterm erts_bs_get_integer_2(Process *p, Uint num_bits, unsigned flags,
+    /// ErlSubBits *sb)` (erl_bits.h).
+    pub safe fn erts_bs_get_integer_2(
+        c_p: *mut crate::ProcessHeader,
+        num_bits: u64,
+        flags: u32,
+        sb: usize,
+    ) -> u64;
+    /// `Eterm erts_bs_get_float_2(Process *p, Uint num_bits, unsigned flags,
+    /// ErlSubBits *sb)` (erl_bits.h).
+    pub safe fn erts_bs_get_float_2(
+        c_p: *mut crate::ProcessHeader,
+        num_bits: u64,
+        flags: u32,
+        sb: usize,
+    ) -> u64;
+    /// `Eterm erts_bs_get_binary_2(Process *p, Uint num_bits, ErlSubBits *sb)` (erl_bits.h).
+    pub safe fn erts_bs_get_binary_2(
+        c_p: *mut crate::ProcessHeader,
+        num_bits: u64,
+        sb: usize,
+    ) -> u64;
+    /// `Eterm erts_bs_get_utf8(ErlSubBits *sb)` (erl_bits.h).
+    pub safe fn erts_bs_get_utf8(sb: usize) -> u64;
+    /// `Eterm erts_bs_get_utf16(ErlSubBits *sb, Uint flags)` (erl_bits.h).
+    pub safe fn erts_bs_get_utf16(sb: usize, flags: u64) -> u64;
+    /// `Eterm erts_bs_init_writable(Process *p, Eterm sz)` (erl_bits.h).
+    pub safe fn erts_bs_init_writable(c_p: *mut crate::ProcessHeader, sz: u64) -> u64;
+    /// `int erts_cmp_bits(const byte *a_ptr, Uint a_offs, const byte *b_ptr, Uint b_offs,
+    /// Uint size)` (erl_bits.h).
+    pub safe fn erts_cmp_bits(
+        a_ptr: *const u8,
+        a_offs: u64,
+        b_ptr: *const u8,
+        b_offs: u64,
+        size: u64,
+    ) -> i32;
+    /// `Eterm erts_build_sub_bitstring(Eterm **hp, Eterm br_flags, const BinRef *br,
+    /// const byte *base, Uint offset, Uint size)` (erl_bits.h).
+    pub safe fn erts_build_sub_bitstring(
+        hp: *mut *mut u64,
+        br_flags: u64,
+        br: usize,
+        base: *const u8,
+        offset: u64,
+        size: u64,
+    ) -> u64;
+}
+
 /// Displacements (from `registers`) the bridge shares with native fragments and the VM, as on
 /// arm64. `tmp_mem[0..2]`: the exit target and resume address a trace hook leaves.
 const TMP_MEM0: i32 = tmp_mem_disp(0);
@@ -369,6 +447,89 @@ mod tests {
     }
     #[unsafe(no_mangle)]
     extern "C" fn save_calls(_c_p: *mut crate::ProcessHeader, _export: usize) {
+        unreachable!("byte-test fixture")
+    }
+
+    // Fixtures for the instr_bs.cpp runtime functions.
+    #[unsafe(no_mangle)]
+    extern "C" fn beam_jit_bs_field_size_argument_error(_c_p: *mut crate::ProcessHeader, _s: u64) {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn beam_jit_bs_get_integer(
+        _c_p: *mut crate::ProcessHeader,
+        _reg: *mut u64,
+        _context: u64,
+        _flags: u64,
+        _size: u64,
+        _live: u64,
+    ) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn beam_jit_bs_construct_fail_info(
+        _c_p: *mut crate::ProcessHeader,
+        _info: u64,
+        _arg3: u64,
+        _arg1: u64,
+    ) {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_bs_start_match_3(_c_p: *mut crate::ProcessHeader, _bin: u64) -> usize {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_bs_get_integer_2(
+        _c_p: *mut crate::ProcessHeader,
+        _bits: u64,
+        _flags: u32,
+        _sb: usize,
+    ) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_bs_get_float_2(
+        _c_p: *mut crate::ProcessHeader,
+        _bits: u64,
+        _flags: u32,
+        _sb: usize,
+    ) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_bs_get_binary_2(
+        _c_p: *mut crate::ProcessHeader,
+        _bits: u64,
+        _sb: usize,
+    ) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_bs_get_utf8(_sb: usize) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_bs_get_utf16(_sb: usize, _flags: u64) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_bs_init_writable(_c_p: *mut crate::ProcessHeader, _sz: u64) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_cmp_bits(_a: *const u8, _ao: u64, _b: *const u8, _bo: u64, _n: u64) -> i32 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_build_sub_bitstring(
+        _hp: *mut *mut u64,
+        _br_flags: u64,
+        _br: usize,
+        _base: *const u8,
+        _offset: u64,
+        _size: u64,
+    ) -> u64 {
         unreachable!("byte-test fixture")
     }
 

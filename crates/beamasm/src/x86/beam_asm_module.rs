@@ -11,6 +11,7 @@ use arinsal_x64::enc::{Gp, Mem, MemBase};
 
 use super::beam_asm::register::{ARG1, ARG3, ARG4, ARG5, ARG6, E, REGISTERS, RET, TMP1, TMP2};
 use super::beam_asm::{AsmError, BeamAssembler, Distance, get_arg_ref};
+use super::beam_asm_global::{BeamGlobalAssembler, GLOBAL_LABELS, GlobalLabels};
 use crate::common::args::ArgVal;
 use crate::common::register_cache::{CacheMem, RegisterCache};
 
@@ -141,6 +142,9 @@ pub struct BeamModuleAssembler {
     dispatch_table: HashMap<usize, Label>,
     /// `last_error_offset`: the last code offset that may raise.
     pub last_error_offset: usize,
+    /// `ga`: the address of every global fragment (`ga->get_<fragment>()`), indexed by
+    /// [`GlobalLabels`]; empty for an assembler made without the global code.
+    ga: Vec<Option<usize>>,
 }
 
 // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:1137-1142 (reg_cache), OTP-29.1.1.
@@ -204,7 +208,34 @@ impl BeamModuleAssembler {
             ),
             dispatch_table: HashMap::new(),
             last_error_offset: 0,
+            ga: Vec::new(),
         }
+    }
+
+    /// A module assembler calling the fragments of `ga`, whose code is placed at `ga_base`.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:83-95
+    // (BeamModuleAssembler::BeamModuleAssembler(BeamGlobalAssembler *ga, ...)), OTP-29.1.1.
+    pub fn with_global(num_labels: u32, ga: &BeamGlobalAssembler, ga_base: usize) -> Self {
+        let addresses = GLOBAL_LABELS.iter().map(|l| ga.get(ga_base, *l)).collect();
+        Self::with_fragment_addresses(num_labels, addresses)
+    }
+
+    /// A module assembler whose `ga->get_<fragment>()` is `addresses[fragment]`, indexed by
+    /// [`GlobalLabels`].
+    pub fn with_fragment_addresses(num_labels: u32, addresses: Vec<Option<usize>>) -> Self {
+        let mut m = Self::new(num_labels);
+        m.ga = addresses;
+        m
+    }
+
+    /// `ga->get_<fragment>()`.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_global.hpp.pl (decl_get_funcs), OTP-29.1.1.
+    pub fn ga_get(&self, label: GlobalLabels) -> Result<usize, AsmError> {
+        self.ga
+            .get(label as usize)
+            .copied()
+            .flatten()
+            .ok_or(AsmError::Operand("global fragment not emitted"))
     }
 
     fn offset(&self) -> usize {

@@ -556,7 +556,7 @@ impl BeamModuleAssembler {
 
     /// `emit_is_boxed(Fail, Src, Arg, dist)` after specializing for compiler type information.
     // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:1324-1342 (emit_is_boxed), OTP-29.1.1.
-    fn emit_is_boxed_source(
+    pub(crate) fn emit_is_boxed_source(
         &mut self,
         fail: arinsal_x64::buf::Label,
         source: TypedArg,
@@ -1190,6 +1190,58 @@ impl BeamGlobalAssembler {
         a.emit(|e| e.mov_mr(get_x_ref(0, 8), RET))?;
         a.emit_leave_frame()?;
         a.emit(|e| e.ret())
+    }
+}
+
+impl BeamModuleAssembler {
+    /// `emit_gc_test_preserve(Need, Live, Preserve, preserve_reg)`: a heap test whose garbage
+    /// collection keeps `preserve` (held in `preserve_reg`) alive.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:109-152 (emit_gc_test_preserve),
+    // OTP-29.1.1.
+    pub fn emit_gc_test_preserve(
+        &mut self,
+        need: u64,
+        live: u64,
+        preserve: ArgVal,
+        preserve_reg: enc::Gp,
+    ) -> Result<(), AsmError> {
+        let bytes_needed = ((need + arinsal_term::S_RESERVED as u64) * 8) as i32;
+        let after_gc_check = self.asm.new_label();
+        assert_ne!(preserve_reg, ARG3);
+        self.asm
+            .emit(|e| e.lea(ARG3, qword_ptr(HTOP, bytes_needed)))?;
+        self.asm.emit(|e| e.cmp_rr(ARG3, E))?;
+        self.asm.short_jcc(CondCode::BE, after_gc_check)?;
+        let garbage_collect = self.ga_get(GlobalLabels::GarbageCollect)?;
+        // The preserved term need not be stashed when it is currently live.
+        if !matches!(preserve, ArgVal::X(x) if u64::from(x) >= live) {
+            self.asm.mov_imm(ARG4, live)?;
+            self.asm.fragment_call_abs(garbage_collect)?;
+            self.mov_arg_to_reg(preserve_reg, preserve)?;
+        } else {
+            let slot = get_x_ref(live as u32, 8);
+            self.asm.emit(|e| e.mov_mr(slot, preserve_reg))?;
+            self.asm.mov_imm(ARG4, live + 1)?;
+            self.asm.fragment_call_abs(garbage_collect)?;
+            self.asm.emit(|e| e.mov_rm(preserve_reg, slot))?;
+        }
+        self.asm.bind(after_gc_check)
+    }
+
+    /// `emit_gc_test(Ns, Nh, Live)`: collects garbage unless `ns` stack and `nh` heap words
+    /// are free.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:154-175 (emit_gc_test), OTP-29.1.1.
+    pub fn emit_gc_test(&mut self, ns: u64, nh: u64, live: u64) -> Result<(), AsmError> {
+        let bytes_needed = ((ns + nh + arinsal_term::S_RESERVED as u64) * 8) as i32;
+        let after_gc_check = self.asm.new_label();
+        self.asm
+            .emit(|e| e.lea(ARG3, qword_ptr(HTOP, bytes_needed)))?;
+        self.asm.emit(|e| e.cmp_rr(ARG3, E))?;
+        self.asm.short_jcc(CondCode::BE, after_gc_check)?;
+        self.asm.mov_imm(ARG4, live)?;
+        let garbage_collect = self.ga_get(GlobalLabels::GarbageCollect)?;
+        self.asm.fragment_call_abs(garbage_collect)?;
+        self.asm.bind(after_gc_check)
     }
 }
 
