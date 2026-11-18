@@ -552,86 +552,22 @@ fn native_generation() -> &'static AtomicU64 {
     &GENERATION
 }
 
-/// One catch-table slot: the native handler's code address (`bccix[].p[].cp`). Slots stay
-/// in the published table until the module is purged (`beam_catches_delmod`).
-// Port of erts/emulator/beam/beam_catches.c (beam_catch_t), OTP-29.1.1.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct CatchTarget(usize);
-
 /// Port of erts/emulator/beam/beam_catches.c:146 (`beam_catches_car`), OTP-29.1.1.
 /// Indexes `bccix[erts_active_code_ix()]`. The active index is the node's atomic.
-fn catch_slot(index: u32) -> Option<CatchTarget> {
-    crate::code_ix::global()
-        .with_active_catches(|table| table.get(usize::try_from(index).ok()?).copied().flatten())
-}
-
-/// Publishes `change` into the listed code indexes. Readers keep the previous `Arc`.
-fn publish_catches(indexes: &[usize], change: impl Fn(&mut Vec<Option<CatchTarget>>)) {
-    let code = crate::code_ix::global();
-    let _publish = code.lock_catch_publish();
-    let mut seen = [false; arinsal_term::ERTS_NUM_CODE_IX];
-    for &index in indexes {
-        if index >= arinsal_term::ERTS_NUM_CODE_IX || seen[index] {
-            continue;
-        }
-        seen[index] = true;
-        let mut table = code.catch_table_at(index).as_ref().clone();
-        change(&mut table);
-        code.store_catch_table(index, table);
-    }
-}
-
-fn place_catch(table: &mut Vec<Option<CatchTarget>>, index: u32, target: CatchTarget) {
-    let Some(index) = usize::try_from(index).ok() else {
-        return;
-    };
-    if table.len() <= index {
-        table.resize(index + 1, None);
-    }
-    table[index] = Some(target);
+fn catch_slot(index: u32) -> Option<usize> {
+    crate::beam_catches::beam_catches_car(crate::code_ix::global(), index)
 }
 
 /// Whether a stack word is a catch tag registered by native code (`catch`/`try` in a BeamAsm
 /// frame), whose handler only `next_catch` can resolve.
 pub(crate) fn is_native_catch_tag(word: Term) -> bool {
     let raw = word.tagged_word();
-    raw & 63 == 0x1b
-        && u32::try_from(raw >> 6)
-            .is_ok_and(|index| matches!(catch_slot(index), Some(CatchTarget(_))))
-}
-
-pub(crate) fn register_native_catches(base: u32, handlers: &[*const u8]) -> Vec<u32> {
-    let ids = (0..handlers.len())
-        .filter_map(|offset| u32::try_from(offset).ok()?.checked_add(base))
-        .collect::<Vec<_>>();
-    // Port of erts/emulator/beam/beam_catches.c:108-143 (`beam_catches_cons` writes the
-    // staging pool), OTP-29.1.1. The commit that ends this staging area makes that pool active.
-    let staging = crate::code_ix::global().staging();
-    publish_catches(&[staging], |table| {
-        for (&id, handler) in ids.iter().zip(handlers) {
-            place_catch(table, id, CatchTarget(*handler as usize));
-        }
-    });
-    ids
-}
-
-pub(crate) fn unregister_native_catches(ids: &[u32]) {
-    // A purged module's handlers must not stay reachable from any code index still published.
-    let all = [0, 1, 2];
-    publish_catches(&all, |table| {
-        for id in ids {
-            if let Ok(index) = usize::try_from(*id)
-                && let Some(slot) = table.get_mut(index)
-            {
-                *slot = None;
-            }
-        }
-    });
+    raw & 63 == 0x1b && u32::try_from(raw >> 6).is_ok_and(|index| catch_slot(index).is_some())
 }
 
 /// Native handler address of a catch-table index, if it names native code.
 pub(crate) fn native_catch(index: u32) -> Option<usize> {
-    catch_slot(index).map(|CatchTarget(address)| address)
+    catch_slot(index)
 }
 
 /// A catch the scan found. The stack is unchanged until [`commit_catch`].
@@ -641,7 +577,7 @@ pub(crate) struct LocatedCatch {
     index: usize,
     /// Stack index `E` resumes at: the catching frame's first Y slot.
     resume: usize,
-    target: CatchTarget,
+    target: usize,
     /// An exception-trace frame sits above the catch. The scheduler unwind emits
     /// `exception_from` for those frames; the native resolver leaves them to it.
     /// Word-sized on purpose: a trailing `bool` made the compiler move this struct with
@@ -661,16 +597,14 @@ fn locate_catch(process: &mut Process) -> Option<LocatedCatch> {
     // `bccix[erts_active_code_ix()]`), OTP-29.1.1: the slot is read directly, a raise allocates
     // nothing on the process.
     if let Some(runtime) = process.runtime.as_ref() {
-        return runtime
-            .code_indexes()
-            .with_active_catches(|table| scan_catch(heap, table));
+        return scan_catch(heap, runtime.code_indexes());
     }
-    crate::code_ix::global().with_active_catches(|table| scan_catch(heap, table))
+    scan_catch(heap, crate::code_ix::global())
 }
 
 fn scan_catch(
     heap: &arinsal_term::ProcessHeap,
-    table: &[Option<CatchTarget>],
+    code: &crate::code_ix::CodeIndexes,
 ) -> Option<LocatedCatch> {
     let mut stack = heap.stack_terms().enumerate();
     let mut previous_cp = 0usize;
@@ -680,9 +614,7 @@ fn scan_catch(
         let raw = word.tagged_word();
         if raw & 63 == 0x1b
             && let Some(catch_index) = u32::try_from(raw >> 6).ok()
-            && let Some(target) = usize::try_from(catch_index)
-                .ok()
-                .and_then(|slot| table.get(slot).copied().flatten())
+            && let Some(target) = crate::beam_catches::beam_catches_car(code, catch_index)
         {
             // A frame keeps the caller-pushed CP above its Y slots (a call pushes the CP,
             // `allocate` then reserves the Y slots below it), so the
@@ -740,7 +672,7 @@ pub(crate) fn native_found_catch(
     trace: Term,
 ) -> Option<usize> {
     let found = locate_catch(process)?;
-    let CatchTarget(handler) = found.target;
+    let handler = found.target;
     if found.traced != 0 {
         return None;
     }
@@ -771,7 +703,7 @@ pub(crate) fn next_catch(
     // it directly, so these Rust-side resume records are this caller's, not `found_catch`'s.
     process.exc_class = Some(class);
     found_catch(process, reg, found, class, reason, trace);
-    let CatchTarget(handler) = found.target;
+    let handler = found.target;
     process.native_continuation_resume = true;
     process.set_native_resume_arity(4);
     Some(handler)

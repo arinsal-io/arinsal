@@ -8,7 +8,7 @@ use arinsal_a64::{
 
 use crate::{
     Update,
-    arm::beam_asm::{load_x_reg_array, tmp_mem_ref},
+    arm::beam_asm::tmp_mem_ref,
     emit_enter_runtime, emit_leave_runtime,
     receive::{ReceiveHelperHook, WaitHook},
 };
@@ -118,7 +118,9 @@ impl ReceiveFragments {
             e.mov_reg(ARG1, C_P)?;
             e.mov_reg(Gpr::w(1), FCALLS)?;
             e.mov_const(ARG3, 0)?;
-            load_x_reg_array(e, ARG4)?;
+            // `lea(ARG4, TMP_MEM2q); lea(ARG5, TMP_MEM3q)`
+            e.add_imm(ARG4, SCHEDULER_REGS, MESSAGE_PTR as u16, false)?;
+            e.add_imm(Gpr::x(4), SCHEDULER_REGS, GET_OUT as u16, false)?;
             e.mov_const(SUPER_TMP, receive_helper as *const () as u64)?;
             e.blr(SUPER_TMP)
         })

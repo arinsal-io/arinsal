@@ -14,8 +14,9 @@ const HEADER_POS_BIG: u64 = (1 << 6) | 0x08;
 const HEADER_NEG_BIG: u64 = (1 << 6) | 0x0c;
 const MAX_FINITE_BITS: u64 = 0x7fefffffffffffff;
 
-/// Runtime conversion hook for a validated bignum term to IEEE-754 bits.
-pub type BigToFloat = extern "C" fn(*mut crate::ProcessHeader, u64) -> u64;
+/// `int big_to_double(Eterm x, double *resp)` (big.h): 0 and `*resp` set, or -1 when the
+/// bignum does not fit a double.
+pub type BigToFloat = extern "C" fn(u64, *mut f64) -> i32;
 
 /// Selects an operation emitted by [`BeamModuleAssembler::emit_float_instr`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,29 +86,6 @@ impl BeamModuleAssembler {
             self.code
                 .emit(|e| e.str_d_uoff(value, SCHEDULER_REGS, offset))?;
         }
-        Ok(())
-    }
-
-    fn emit_float_runtime_hook(&mut self, helper: usize, args: &[Gpr]) -> Result<(), ModuleError> {
-        if args.len() > 5 {
-            return Err(ModuleError::InvalidOperand(
-                "runtime hook has too many arguments",
-            ));
-        }
-        // Port of erts/emulator/beam/jit/arm/instr_float.cpp:114-122, OTP-29.1.1.
-        let update = crate::Update::HEAP;
-        crate::emit_enter_runtime(&mut self.code, 6, update)?;
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(0), C_P)?;
-            for (index, arg) in args.iter().copied().enumerate() {
-                e.mov_reg(Gpr::x(index as u8 + 1), arg)?;
-            }
-            Ok(())
-        })?;
-        self.fragment_call(helper)?;
-        crate::emit_leave_runtime(&mut self.code, 6, update)?;
-        self.code.emit(|e| e.ldr_uoff(Gpr::x(9), C_P, 40))?;
-        self.error_if_nonzero(Gpr::x(9))?;
         Ok(())
     }
 
@@ -258,8 +236,25 @@ impl BeamModuleAssembler {
         self.code.emit(|e| e.ldur_d(dst, Gpr::x(10), 8))?;
         self.code.b(done)?;
         self.code.bind(bignum)?;
-        self.emit_float_runtime_hook(big_to_float as usize, &[source])?;
-        self.code.emit(|e| e.fmov_d_from_x(dst, Gpr::x(0)))?;
+        // Port of erts/emulator/beam/jit/arm/instr_float.cpp:114-124 (emit_fconv_shared),
+        // OTP-29.1.1: `big_to_double(ARG1, &TMP_MEM1q)`; a negative result is badarith.
+        let update = crate::Update::NONE;
+        let tmp_mem1 = crate::arm::beam_asm::tmp_mem_ref(0);
+        crate::emit_enter_runtime(&mut self.code, 6, update)?;
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(0), source)?;
+            e.add_imm(Gpr::x(1), SCHEDULER_REGS, tmp_mem1 as u16, false)
+        })?;
+        self.fragment_call(big_to_float as usize)?;
+        crate::emit_leave_runtime(&mut self.code, 6, update)?;
+        let converted = self.code.new_label();
+        self.code
+            .emit(|e| e.and_imm(Gpr::x(9), Gpr::x(0), 0xffff_ffff))?;
+        self.code.cbz(Gpr::x(9), converted)?;
+        self.badarith()?;
+        self.code.bind(converted)?;
+        self.code
+            .emit(|e| e.ldr_d_uoff(dst, SCHEDULER_REGS, tmp_mem1))?;
         self.code.bind(done)?;
         self.float_flush(loc, dst)
     }

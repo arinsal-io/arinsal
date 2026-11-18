@@ -120,9 +120,11 @@ fn construct_helpers() -> BsCreateBinHelpers {
     }
 }
 
-extern "C" fn float_hook(_process: *mut ProcessHeader, _value: u64) -> u64 {
+extern "C" fn float_hook(_value: u64, resp: *mut f64) -> i32 {
     SEEN.with(|seen| *seen.borrow_mut() = vec![0xfeed]);
-    0x4009_21fb_5444_2d18
+    // SAFETY: the fconv fragment passes the address of TMP_MEM1q.
+    unsafe { resp.write(f64::from_bits(0x4009_21fb_5444_2d18)) };
+    0
 }
 
 #[cfg(target_arch = "aarch64")]

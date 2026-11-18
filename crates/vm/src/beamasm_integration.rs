@@ -496,9 +496,9 @@ fn receive_fragments() -> Option<&'static arinsal_beamasm::receive_frag::Receive
     FRAGMENTS
         .get_or_init(|| {
             arinsal_beamasm::receive_frag::ReceiveFragments::new(
-                crate::native_helpers::arinsal_beamasm_receive_helper,
-                crate::native_helpers::arinsal_beamasm_wait,
-                crate::native_helpers::arinsal_beamasm_wait,
+                crate::receive::erts_proc_sig_receive_helper,
+                crate::beam_jit_common::beam_jit_wait_unlocked,
+                crate::beam_jit_common::beam_jit_wait_locked,
                 yield_fragments()?.context_switch(),
                 arinsal_beamasm::receive_frag::MsgOffsets {
                     sig_qs_save: crate::PROCESS_SIGQ_SAVE_OFFSET as u32,
@@ -862,9 +862,11 @@ pub(crate) struct CompiledVersion {
     export_addresses: Vec<(Mfa, usize)>,
     code_start: usize,
     code_end: usize,
-    catch_base: u32,
-    catch_table: Vec<usize>,
-    catch_ids: std::sync::Mutex<Vec<u32>>,
+    /// The `catches` of the module assembler: (code-memory offset of the tag load, handler address).
+    catches: Vec<(usize, usize)>,
+    /// `catches` of the module (`ErtsCodeIndex`-independent list head into `bccix`), set by
+    /// `patch_catches` at install.
+    catch_head: std::sync::atomic::AtomicU32,
     lambda_entries: Vec<Arc<arinsal_term::FunEntry>>,
     lambda_targets: Vec<(Arc<arinsal_term::FunEntry>, usize)>,
 }
@@ -1052,15 +1054,7 @@ impl CompiledVersion {
         {
             return false;
         }
-        let catch_ids = crate::native_bridge::register_native_catches(
-            self.catch_base,
-            &self
-                .catch_table
-                .iter()
-                .map(|address| *address as *const u8)
-                .collect::<Vec<_>>(),
-        );
-        *self.catch_ids.lock().unwrap() = catch_ids;
+        self.patch_catches();
         let code_index = crate::code_ix::global().staging();
         for (entry, target) in &self.lambda_targets {
             entry.set_fun_code(code_index, *target);
@@ -1090,7 +1084,46 @@ impl CompiledVersion {
     // Port of erts/emulator/beam/beam_bif_load.c (erts_internal_purge_module_2 complete:
     // erts_queue_release_literals after the code is freed), OTP-29.1.1.
     pub(crate) fn unpublish(&self) {
+        // Port of erts/emulator/beam/beam_bif_load.c:2269 (beam_catches_delmod in purge
+        // complete), OTP-29.1.1.
+        let code = crate::code_ix::global();
+        crate::beam_catches::beam_catches_delmod(
+            code,
+            self.catch_head
+                .swap(crate::beam_catches::BEAM_CATCHES_NIL, Ordering::Relaxed),
+            self.code_start,
+            self.code_end - self.code_start,
+            code.active(),
+        );
         self.retire_literals();
+    }
+
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:507-530 (patchCatches) and
+    // jit/asm_load.c:1175 (`inst_p->catches = beamasm_patch_catches`), OTP-29.1.1: every catch of
+    // the module is consed onto the staging pool and its tag written into the `mov` that loads it.
+    fn patch_catches(&self) {
+        let code = crate::code_ix::global();
+        let mut catch_no = crate::beam_catches::BEAM_CATCHES_NIL;
+        let mut memory = self
+            .memory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for &(patch, handler) in &self.catches {
+            catch_no = crate::beam_catches::beam_catches_cons(code, handler, catch_no);
+            let tag = arinsal_beamasm::catch::make_catch(catch_no);
+            // With the current tag scheme, more than 33 million catches can exist at once.
+            assert!(tag >> 31 == 0, "catch table exhausted");
+            // `movz w9, #lo; movk w9, #hi, lsl 16`.
+            let movz = 0x5280_0009_u32 | (((tag & 0xffff) as u32) << 5);
+            let movk = 0x72a0_0009_u32 | ((((tag >> 16) & 0xffff) as u32) << 5);
+            let mut words = [0u8; 8];
+            words[..4].copy_from_slice(&movz.to_le_bytes());
+            words[4..].copy_from_slice(&movk.to_le_bytes());
+            memory
+                .write_bytes(patch, &words)
+                .expect("catch tag site is inside the module's code");
+        }
+        self.catch_head.store(catch_no, Ordering::Relaxed);
     }
 
     fn retire_literals(&self) {
@@ -1152,12 +1185,6 @@ impl Drop for CompiledVersion {
         if self.installed.load(Ordering::Acquire) && !self.native_functions.is_empty() {
             crate::native_bridge::unregister_native_module(self.code_start, self.code_end);
         }
-        crate::native_bridge::unregister_native_catches(
-            &self
-                .catch_ids
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
         if lifetime_trace_enabled() {
             eprintln!(
                 "[beamasm-lifetime] CodeMemory drop module={} range={:#x}..{:#x}",
@@ -1504,7 +1531,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
     }
 
     fn raw_raise_helper(&self) -> usize {
-        crate::native_helpers::arinsal_beamasm_raw_raise as *const () as usize
+        crate::exceptions::raw_raise as *const () as usize
     }
 
     fn sys_perf_counter(&self) -> usize {
@@ -1516,7 +1543,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
     }
 
     fn build_stacktrace_helper(&self) -> Option<arinsal_beamasm::catch::BuildStacktraceHook> {
-        Some(crate::native_helpers::arinsal_beamasm_build_stacktrace)
+        Some(crate::exceptions::build_stacktrace)
     }
 
     fn process_dictionary_get_helper(&self) -> usize {
@@ -1586,9 +1613,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:595-610 (emit_call_light_bif, the BIF
     // pointer passed in ARG8), OTP-29.1.1.
     fn light_bif_func(&self, entry: usize) -> usize {
-        // SAFETY: `entry` is an export slot address taken from `export_entries`. Slots are
-        // leaked when created and never freed, like erts' export entries.
-        let slot = unsafe { &*(entry as *const arinsal_beamasm::bif::ExportEntry) };
+        let slot = crate::raw::jit_ffi::export_entry(entry);
         crate::bif_table::function(slot.bif_number())
     }
     fn breakpoint_fragment(&self) -> usize {
@@ -1767,24 +1792,23 @@ impl ModuleEnv for VmModuleEnv<'_> {
         crate::native_helpers::arinsal_beamasm_add_stacktrace
     }
     fn big_to_float_helper(&self) -> arinsal_beamasm::float::BigToFloat {
-        crate::native_helpers::arinsal_beamasm_big_to_float
+        crate::big::big_to_double
     }
     fn bs_init_writable_helper(&self) -> arinsal_beamasm::bs_construct::BsInitWritableHelper {
-        crate::native_helpers::arinsal_beamasm_bs_init_writable
+        crate::erl_bits::erts_bs_init_writable
     }
     fn receive_hooks(&self) -> arinsal_beamasm::receive::ReceiveHooks {
-        use crate::native_helpers as h;
         arinsal_beamasm::receive::ReceiveHooks {
-            recv_marker_reserve: h::arinsal_beamasm_recv_marker_reserve,
-            recv_marker_bind: h::arinsal_beamasm_recv_marker_bind,
-            recv_marker_clear: h::arinsal_beamasm_recv_marker_clear,
-            recv_marker_use: h::arinsal_beamasm_recv_marker_use,
+            recv_marker_reserve: crate::receive::erts_msgq_recv_marker_insert,
+            recv_marker_bind: crate::receive::erts_msgq_recv_marker_bind,
+            recv_marker_clear: crate::receive::erts_msgq_recv_marker_clear,
+            recv_marker_use: crate::receive::erts_msgq_recv_marker_set_save,
             loop_rec_shared: receive_fragments().map_or(
                 0,
                 arinsal_beamasm::receive_frag::ReceiveFragments::loop_rec_shared,
             ),
-            remove_message: h::arinsal_beamasm_remove_message,
-            set_save_next: h::arinsal_beamasm_set_save_next,
+            remove_message: crate::beam_jit_common::beam_jit_remove_message,
+            set_save_next: crate::receive::erts_msgq_set_save_next,
             wait_unlocked_shared: receive_fragments().map_or(
                 0,
                 arinsal_beamasm::receive_frag::ReceiveFragments::wait_unlocked_shared,
@@ -1793,10 +1817,10 @@ impl ModuleEnv for VmModuleEnv<'_> {
                 0,
                 arinsal_beamasm::receive_frag::ReceiveFragments::wait_locked_shared,
             ),
-            take_receive_lock: h::arinsal_beamasm_take_receive_lock,
-            wait_timeout: h::arinsal_beamasm_wait_timeout,
-            timeout_locked: h::arinsal_beamasm_timeout,
-            timeout: h::arinsal_beamasm_timeout,
+            take_receive_lock: crate::beam_jit_common::beam_jit_take_receive_lock,
+            wait_timeout: crate::beam_jit_common::beam_jit_wait_timeout,
+            timeout_locked: crate::beam_jit_common::beam_jit_timeout_locked,
+            timeout: crate::beam_jit_common::beam_jit_timeout,
         }
     }
     fn apply_runtime(&self) -> arinsal_beamasm::misc::ApplyRuntime {
@@ -2140,14 +2164,13 @@ pub(crate) fn compile(
         export_addresses,
         code_start,
         code_end,
-        catch_base: compiled.native.catch_base,
-        catch_table: compiled
+        catches: compiled
             .native
-            .catch_table
+            .catches
             .iter()
-            .map(|address| *address as usize)
+            .map(|site| (site.patch, site.handler as usize))
             .collect(),
-        catch_ids: std::sync::Mutex::new(Vec::new()),
+        catch_head: std::sync::atomic::AtomicU32::new(crate::beam_catches::BEAM_CATCHES_NIL),
         lambda_entries,
         lambda_targets,
     });

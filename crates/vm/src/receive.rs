@@ -1144,6 +1144,125 @@ impl Process {
     }
 }
 
+/// Reserves a receive marker (`recv_marker_reserve`).
+// Port of erts/emulator/beam/erl_proc_sig_queue.h:2226 (erts_msgq_recv_marker_insert),
+// OTP-29.1.1: the outer queue is fetched (`erts_proc_sig_fetch`) before the marker is
+// inserted, with the scheduler data the process reaches through `c_p`.
+#[unsafe(no_mangle)]
+pub extern "C" fn erts_msgq_recv_marker_insert(header: *mut arinsal_beamasm::ProcessHeader) -> u64 {
+    let Some(process) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    let fetched = crate::process::sched_data::with_sched_data(process, |_vm, process, ctx| {
+        if process.signal_probe().is_none() {
+            process.set_signal_probe(ctx.signal_probe());
+        }
+        process.fetch_signals(ctx)
+    })
+    .expect("native code runs inside an executor slice, which publishes its scheduler data");
+    match fetched.and_then(|()| process.reserve_receive_marker()) {
+        Ok(marker) => crate::native_hooks::raw(marker),
+        Err(_) => {
+            crate::native_hooks::set_error(process, "system_limit");
+            0
+        }
+    }
+}
+
+/// Binds a receive marker to a reference (`recv_marker_bind`).
+#[unsafe(no_mangle)]
+pub extern "C" fn erts_msgq_recv_marker_bind(
+    header: *mut arinsal_beamasm::ProcessHeader,
+    marker: u64,
+    reference: u64,
+) {
+    if let Some(process) = crate::native_hooks::enter_runtime(header) {
+        process.bind_receive_marker(
+            crate::native_hooks::from_raw(marker),
+            crate::native_hooks::from_raw(reference),
+        );
+    }
+}
+
+/// Clears the marker of a reference (`recv_marker_clear`).
+#[unsafe(no_mangle)]
+pub extern "C" fn erts_msgq_recv_marker_clear(
+    header: *mut arinsal_beamasm::ProcessHeader,
+    reference: u64,
+) {
+    if let Some(process) = crate::native_hooks::enter_runtime(header) {
+        process.clear_receive_marker(crate::native_hooks::from_raw(reference));
+    }
+}
+
+/// Moves the save pointer to the marker of a reference (`recv_marker_use`).
+#[unsafe(no_mangle)]
+pub extern "C" fn erts_msgq_recv_marker_set_save(
+    header: *mut arinsal_beamasm::ProcessHeader,
+    reference: u64,
+) {
+    if let Some(process) = crate::native_hooks::enter_runtime(header) {
+        process.use_receive_marker(crate::native_hooks::from_raw(reference));
+    }
+}
+
+/// `erts_proc_sig_receive_helper`, called by `i_loop_rec_shared` when the message queue is
+/// exhausted at the save pointer: fetch the outer queue and handle signals until a message is
+/// available, the queues are empty, or the reductions run out. The message node goes to
+/// `*msgpp`, `get_out` to `*get_outp`; returns the reductions consumed.
+// Port of erts/emulator/beam/erl_proc_sig_queue.c:7730-7880 (erts_proc_sig_receive_helper)
+// and erts/emulator/beam/jit/arm/instr_msg.cpp (emit_i_loop_rec_shared), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn erts_proc_sig_receive_helper(
+    header: *mut arinsal_beamasm::ProcessHeader,
+    fcalls: i32,
+    neg_o_reds: i32,
+    msgpp: *mut u64,
+    get_outp: *mut i32,
+) -> i32 {
+    let Some(process) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    let result = crate::process::sched_data::with_sched_data(process, |_vm, process, ctx| {
+        if process.signal_probe().is_none() {
+            process.set_signal_probe(ctx.signal_probe());
+        }
+        process.receive_helper(ctx, fcalls - neg_o_reds)
+    })
+    .expect("native code runs inside an executor slice, which publishes its scheduler data");
+    let (consumed, message, get_out) = match result {
+        Ok((consumed, crate::process::ReceiveHelper::Message)) => (
+            consumed,
+            process
+                .inbox
+                .entries
+                .peek_node()
+                .map_or(0, |node| node.as_ptr() as u64),
+            0,
+        ),
+        Ok((consumed, crate::process::ReceiveHelper::Wait)) => (consumed, 0, 0),
+        Ok((consumed, crate::process::ReceiveHelper::Yield)) => (consumed, 0, 1),
+        // A handled signal ends the process (erts: ERTS_PSFLG_EXITING, `*get_outp = 1`): it
+        // schedules out and the scheduler completes the exit.
+        Err(error) => {
+            process.native_exit_kind = crate::proc_create::NativeExit::Exiting;
+            process.cold_mut().native_exiting = Some(Box::new(error));
+            (0, 0, 1)
+        }
+    };
+    crate::raw::jit_ffi::write_out(msgpp, message);
+    crate::raw::jit_ffi::write_out(get_outp, get_out);
+    consumed
+}
+
+/// Advances the save pointer (`loop_rec_end`).
+#[unsafe(no_mangle)]
+pub extern "C" fn erts_msgq_set_save_next(header: *mut arinsal_beamasm::ProcessHeader) {
+    if let Some(process) = crate::native_hooks::enter_runtime(header) {
+        process.loop_rec_end();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{MARKER_SLOTS, Process, Term};

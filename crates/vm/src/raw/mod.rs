@@ -1,3 +1,5 @@
-//! Raw-pointer entry points of runtime functions that native code calls by symbol.
+//! Raw-memory access of the vm crate: the one place where code reached from JIT-generated
+//! native code touches addresses it was handed as integers or pointers.
 
 pub(crate) mod gc_ffi;
+pub(crate) mod jit_ffi;

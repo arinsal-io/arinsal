@@ -355,11 +355,11 @@ fn atom_word(name: &str) -> u64 {
 }
 
 extern "C" fn raw_raise_for_test(
-    process: *mut ProcessHeader,
     trace: u64,
     class: u64,
     value: u64,
-) -> u64 {
+    process: *mut ProcessHeader,
+) -> i32 {
     arinsal_beamasm::rt::process_header_mut(process, |header| {
         let freason = if class == atom_word("error") {
             arinsal_beamasm::exc::EXC_ERROR

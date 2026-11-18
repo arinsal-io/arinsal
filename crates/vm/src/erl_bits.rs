@@ -143,3 +143,26 @@ fn fail(process: &mut crate::Process, error: BitsError) -> u64 {
     crate::native_helpers::set_native_error_info(process, &reason, info);
     0
 }
+
+/// Creates the empty writable binary for a native `bs_init_writable`.
+// Port of erts/emulator/beam/jit/arm/instr_bs.cpp:985-1000 and erl_bits.c:2002
+// (erts_bs_init_writable), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn erts_bs_init_writable(header: *mut ProcessHeader, size: u64) -> u64 {
+    let Some(process) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    let size = crate::native_hooks::from_raw(size).as_small();
+    if process.ensure_objv(8, &mut []).is_err() {
+        crate::native_hooks::set_error(process, "system_limit");
+        return 0;
+    }
+    let result = arinsal_bits::init_writable_with_size(size, &mut process.heap);
+    match result {
+        Ok(value) => crate::native_hooks::raw(value),
+        Err(_) => {
+            crate::native_hooks::set_error(process, "system_limit");
+            0
+        }
+    }
+}

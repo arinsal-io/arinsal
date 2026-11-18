@@ -95,6 +95,15 @@ impl From<ExecError> for ModuleError {
     }
 }
 
+/// One `catches` entry of the module assembler (`BeamModuleAssembler::catches`).
+#[derive(Clone, Copy, Debug)]
+pub struct CatchSite {
+    /// Code-memory offset of the `movz`/`movk` pair that loads the `make_catch` tag.
+    pub patch: usize,
+    /// Address of the catch handler (`getCode(c.handler)`).
+    pub handler: *const u8,
+}
+
 /// Finalized executable module and native entry addresses.
 pub struct FinalizedModule {
     /// Owns the executable mapping; entry addresses remain valid while this is alive.
@@ -106,10 +115,9 @@ pub struct FinalizedModule {
     entry_offsets: IdMap<usize>,
     /// Native trampoline by zero-based BEAM lambda-table index.
     pub lambda_entries: IdMap<*const u8>,
-    /// Native catch handler addresses in this module's `make_catch` order.
-    pub catch_table: Vec<*const u8>,
-    /// First globally unique catch index assigned to this module.
-    pub catch_base: u32,
+    /// Catches of this module in `patchCatches` order: the loader numbers each with
+    /// `beam_catches_cons` and patches the tag into the site.
+    pub catches: Vec<CatchSite>,
     /// Native code addresses associated with the nearest source line marker.
     pub line_table: Vec<ModuleLine>,
     /// Patch sites for per-function tracing breakpoints: label to entry word and skip branch.
@@ -2588,7 +2596,7 @@ impl BeamModuleAssembler {
                 e.br(Gpr::x(17))
             })?;
         }
-        let (mut words, labels, literal_relocations) =
+        let (words, labels, literal_relocations) =
             self.code.finish_with_labels_and_relocations()?;
         let trace_breakpoints = self
             .trace_breakpoints
@@ -2612,20 +2620,15 @@ impl BeamModuleAssembler {
                 Some((line, offset, 0x1400_0000 | (immediate & 0x03ff_ffff)))
             })
             .collect::<Vec<_>>();
-        let catch_base = crate::catch::reserve_catch_indices(self.catch_patches.len())?;
-        // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:952-974 (patchCatches), OTP-29.1.1
-        let catch_table = self
+        // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:952-974 (patchCatches), OTP-29.1.1:
+        // the handler offsets are kept in `catches` order; the loader numbers them with
+        // `beam_catches_cons` and patches the tag (beam_jit_common.cpp:507-530).
+        let catch_sites = self
             .catch_patches
             .iter()
-            .enumerate()
-            .map(|(index, (offset, handler))| {
+            .map(|(offset, handler)| {
                 let handler_offset = *labels.get(handler).expect("catch handler label is bound");
-                let catch_index = catch_base + index as u32;
-                let immediate = crate::catch::make_catch(catch_index);
-                let word = offset / 4;
-                words[word] = 0x5280_0009 | (((immediate & 0xffff) as u32) << 5);
-                words[word + 1] = 0x72a0_0009 | ((((immediate >> 16) & 0xffff) as u32) << 5);
-                handler_offset
+                (*offset, handler_offset)
             })
             .collect::<Vec<_>>();
         let code_bytes_len = words.len() * 4;
@@ -2698,9 +2701,12 @@ impl BeamModuleAssembler {
                     .map(|&lambda_offset| (index, memory.ptr_at(offset + lambda_offset)))
             })
             .collect();
-        let catch_table = catch_table
+        let catches = catch_sites
             .into_iter()
-            .map(|off| memory.ptr_at(offset + off))
+            .map(|(patch, handler)| CatchSite {
+                patch: offset + patch,
+                handler: memory.ptr_at(offset + handler),
+            })
             .collect();
         Ok(FinalizedModule {
             memory,
@@ -2708,8 +2714,7 @@ impl BeamModuleAssembler {
             entries,
             entry_offsets,
             lambda_entries,
-            catch_table,
-            catch_base,
+            catches,
             line_table: self
                 .line_table
                 .into_iter()

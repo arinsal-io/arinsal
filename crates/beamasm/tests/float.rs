@@ -13,8 +13,10 @@ const HEADER_POS_BIG: u64 = (1 << 6) | 0x08;
 /// `freason` of an `error` exception; the reason atom travels in `fvalue`.
 const BADARITH: u64 = arinsal_beamasm::exc::EXC_BADARITH;
 
-extern "C" fn big_to_float(_: *mut ProcessHeader, _: u64) -> u64 {
-    1_152_921_504_606_846_976.0_f64.to_bits()
+extern "C" fn big_to_float(_: u64, _resp_slot: *mut f64) -> i32 {
+    // SAFETY: the fconv fragment passes the address of TMP_MEM1q.
+    unsafe { _resp_slot.write(1_152_921_504_606_846_976.0_f64) };
+    0
 }
 
 fn erl_bits(expression: &str) -> u64 {

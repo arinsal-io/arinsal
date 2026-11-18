@@ -18,17 +18,12 @@ fn catch_module(labels: [u32; 2]) -> arinsal_beamasm::module::FinalizedModule {
 }
 
 #[test]
-fn modules_reserve_unique_global_catch_tags() {
-    let first = catch_module([1, 2]);
-    let second = catch_module([3, 4]);
-
-    assert_eq!(first.catch_table.len(), 1);
-    assert_eq!(second.catch_table.len(), 1);
-    assert_ne!(first.catch_base, second.catch_base);
-    assert_eq!(
-        arinsal_beamasm::catch::make_catch(first.catch_base),
-        (u64::from(first.catch_base) << 6) | 0x1b
-    );
+fn module_lists_its_catches_for_the_loader() {
+    let module = catch_module([1, 2]);
+    // The loader numbers each catch with `beam_catches_cons` and patches the tag.
+    assert_eq!(module.catches.len(), 1);
+    let handler = module.entries[&2];
+    assert_eq!(module.catches[0].handler, handler);
 }
 
 #[test]
@@ -36,5 +31,5 @@ fn process_header_tracks_active_catch_count() {
     let module = catch_module([10, 11]);
     let header = ProcessHeader::default();
     assert_eq!(header.catches, 0);
-    assert_eq!(module.catch_table.len(), 1);
+    assert_eq!(module.catches.len(), 1);
 }

@@ -10,7 +10,7 @@ use arinsal_beamasm::{
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
     receive::ReceiveHooks,
     receive_frag::{MsgOffsets, ReceiveFragments},
-    rt::{process_header_mut, scheduler_registers_mut},
+    rt::process_header_mut,
     yield_frag::YieldFragments,
 };
 
@@ -130,16 +130,29 @@ extern "C" fn use_marker(process: *mut ProcessHeader, reference: u64) {
 }
 
 /// The receive helper of an empty queue: no message, no reductions, on to the wait.
-extern "C" fn receive_helper(_: *mut ProcessHeader, _: i32, _: i32, reg: *mut u64) -> i32 {
-    scheduler_registers_mut(reg, |registers| {
-        registers.tmp_mem[1] = 0;
-        registers.tmp_mem[2] = 0;
-    });
+extern "C" fn receive_helper(
+    _: *mut ProcessHeader,
+    _: i32,
+    _: i32,
+    msgpp: *mut u64,
+    get_outp: *mut i32,
+) -> i32 {
+    // SAFETY: the fragment passes the addresses of TMP_MEM2q and TMP_MEM3q.
+    unsafe {
+        msgpp.write(0);
+        get_outp.write(0);
+    }
     0
 }
 
 /// Records the term of the message it removes in `fvalue`.
-extern "C" fn remove(process: *mut ProcessHeader, reductions: i32, _code_ix: usize) -> i32 {
+extern "C" fn remove(
+    process: *mut ProcessHeader,
+    reductions: i32,
+    _htop: *mut u64,
+    _e: *mut u64,
+    _code_ix: u32,
+) -> i32 {
     let term = save_node().expect("a message at the save pointer")[1].load(Ordering::Relaxed);
     process_header_mut(process, |header| {
         header.exc.fvalue = term;

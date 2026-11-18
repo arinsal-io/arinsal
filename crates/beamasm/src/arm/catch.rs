@@ -1,7 +1,6 @@
 //! Catch records, exception transfer, and error instructions.
 
 use arinsal_a64::enc::Gpr;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::{
     ProcessHeader,
@@ -36,18 +35,6 @@ const TAG_IMMED2_CATCH: u64 = 0x1b;
 /// Stands in for `THE_NON_VALUE` in X0 while a native handler runs: a catch immediate is
 /// never an Erlang term.
 pub const NON_VALUE_MARKER: u64 = TAG_IMMED2_CATCH;
-static NEXT_CATCH_INDEX: AtomicU32 = AtomicU32::new(0);
-
-/// Reserves globally unique catch-table indices for a loaded code module.
-pub fn reserve_catch_indices(count: usize) -> Result<u32, ModuleError> {
-    let count =
-        u32::try_from(count).map_err(|_| ModuleError::InvalidOperand("catch count overflow"))?;
-    NEXT_CATCH_INDEX
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |base| {
-            base.checked_add(count).filter(|end| *end < (1 << 25))
-        })
-        .map_err(|_| ModuleError::InvalidOperand("global catch table exhausted"))
-}
 
 /// Resolves an exception against the process catch chain and returns a native handler address.
 /// A zero result means that the exception is uncaught and should return to the runtime.
@@ -336,10 +323,11 @@ impl BeamModuleAssembler {
         // and beam_common.c:1148-1178 (`raw_raise`), OTP-29.1.1.
         crate::emit_enter_runtime(&mut self.code, 3, crate::Update::NONE)?;
         self.code.emit(|e| {
-            e.mov_reg(Gpr::x(0), C_P)?;
-            e.mov_reg(Gpr::x(1), XREGS[2])?;
-            e.mov_reg(Gpr::x(2), XREGS[0])?;
-            e.mov_reg(Gpr::x(3), XREGS[1])
+            // `raw_raise(stacktrace, exc_class, value, c_p)`
+            e.mov_reg(Gpr::x(0), XREGS[2])?;
+            e.mov_reg(Gpr::x(1), XREGS[0])?;
+            e.mov_reg(Gpr::x(2), XREGS[1])?;
+            e.mov_reg(Gpr::x(3), C_P)
         })?;
         self.fragment_call(raw_raise_helper)?;
         crate::emit_leave_runtime(&mut self.code, 3, crate::Update::NONE)?;

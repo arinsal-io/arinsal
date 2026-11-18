@@ -22,9 +22,9 @@ pub type RecvMarkerUseHook = extern "C" fn(*mut ProcessHeader, u64);
 /// `i_loop_rec_shared` at the end of the message queue. The last argument is the register file
 /// (`reg`): the helper leaves the message node in TMP_MEM2q (`*msgpp`) and `get_out` in
 /// TMP_MEM3q, the slots erts passes the addresses of. Returns the reductions consumed.
-pub type ReceiveHelperHook = extern "C" fn(*mut ProcessHeader, i32, i32, *mut u64) -> i32;
+pub type ReceiveHelperHook = extern "C" fn(*mut ProcessHeader, i32, i32, *mut u64, *mut i32) -> i32;
 /// Runtime callback which removes the current message and returns reductions left.
-pub type RemoveMessageHook = extern "C" fn(*mut ProcessHeader, i32, usize) -> i32;
+pub type RemoveMessageHook = extern "C" fn(*mut ProcessHeader, i32, *mut u64, *mut u64, u32) -> i32;
 /// Runtime callback which advances the saved mailbox pointer.
 pub type SetSaveNextHook = extern "C" fn(*mut ProcessHeader);
 /// Runtime callback which starts a wait at a native destination.
@@ -154,7 +154,8 @@ impl BeamModuleAssembler {
     pub fn emit_remove_message(&mut self, hooks: ReceiveHooks) -> Result<(), ModuleError> {
         self.emit_runtime_hook_with(
             hooks.remove_message as usize,
-            &[Gpr::x(22), Gpr::x(24)],
+            // `beam_jit_remove_message(c_p, FCALLS, HTOP, E, active_code_ix)`
+            &[Gpr::x(22), Gpr::x(23), Gpr::x(20), Gpr::x(24)],
             6,
             // erts passes HTOP/E by value; the hook runs process-heap code (message
             // accounting, seq_trace), so the cursors are published and reloaded around it.

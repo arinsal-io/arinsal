@@ -775,6 +775,56 @@ pub(super) fn from_legacy(reason: &str) -> Result<Trap, VmError> {
     Ok(Trap::error(atom(reason)?))
 }
 
+/// Stores the class, value, and already saved trace used by OTP's raw_raise.
+// Port of erts/emulator/beam/beam_common.c:1148-1178 (`raw_raise`), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn raw_raise(
+    trace_raw: u64,
+    class_raw: u64,
+    value_raw: u64,
+    header: *mut arinsal_beamasm::ProcessHeader,
+) -> i32 {
+    let Some(process) = crate::native_hooks::process_from_header(header) else {
+        return 1;
+    };
+    let class_term = crate::native_hooks::from_raw(class_raw);
+    let class = match class_term.as_atom() {
+        Some(atom) if atom == arinsal_term::atoms::ERROR => arinsal_bifs::Class::Error,
+        Some(atom) if atom == arinsal_term::atoms::EXIT => arinsal_bifs::Class::Exit,
+        Some(atom) if atom == arinsal_term::atoms::THROW => arinsal_bifs::Class::Throw,
+        _ => return 1,
+    };
+    let trace = crate::native_hooks::from_raw(trace_raw);
+    // `get_freason_ptr_from_exc` updates saved traces and tolerates NIL through its dummy word.
+    crate::stacktrace::set_raw_class(process, trace, class);
+    process.heap.abi.exc.freason =
+        crate::stacktrace::class_to_freason(Some(class)) & !arinsal_beamasm::exc::EXF_SAVETRACE;
+    process.heap.abi.exc.fvalue = value_raw;
+    process.heap.abi.exc.ftrace = trace_raw;
+    0
+}
+
+/// Materializes a process-owned raw trace on the process heap.
+// Port of erts/emulator/beam/beam_common.c (build_stacktrace), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn build_stacktrace(
+    header: *mut arinsal_beamasm::ProcessHeader,
+    trace_raw: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    let trace = crate::native_hooks::from_raw(trace_raw);
+    match crate::exceptions::materialize(process, trace) {
+        // The fragment places the value in X0 (instr_common.cpp:3054).
+        Ok(value) => crate::native_hooks::raw(value),
+        Err(_) => {
+            crate::native_hooks::set_error(process, "system_limit");
+            0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tail_apply_exception_stacktrace_matches_otp {
     use crate::VmError;

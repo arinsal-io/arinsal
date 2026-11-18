@@ -351,7 +351,9 @@ extern "C" fn unused_recv_one(_process: *mut ProcessHeader, _reference: u64) {}
 extern "C" fn unused_remove_message(
     _process: *mut ProcessHeader,
     fcalls: i32,
-    _unused: usize,
+    _htop: *mut u64,
+    _e: *mut u64,
+    _active_code_ix: u32,
 ) -> i32 {
     fcalls
 }
@@ -414,7 +416,7 @@ extern "C" fn unused_bs_init_writable(_process: *mut ProcessHeader, _size: u64) 
     0
 }
 
-extern "C" fn unused_big_to_float(_process: *mut ProcessHeader, _term: u64) -> u64 {
+extern "C" fn unused_big_to_float(_term: u64, _resp: *mut f64) -> i32 {
     0
 }
 

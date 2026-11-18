@@ -1,8 +1,12 @@
 //! Single-process BEAM interpreter for OTP 29 generic bytecode.
 mod atom_cache;
+mod beam_catches;
+mod beam_jit_common;
 mod beamasm_integration;
 mod bif_traps;
+mod big;
 mod fun_dispatch;
+mod raw;
 // c_boot: Launcher entry point for the preloaded OTP boot process.
 mod bif_dispatch;
 mod bif_table;
