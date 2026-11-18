@@ -664,17 +664,17 @@ impl Copier<'_> {
                 } else if kind == FUN {
                     (2, 2 + ((gval >> 16) & 255) as usize)
                 } else if kind == MAP {
-                    let range = boxed_term_range(gval, ptr);
-                    let object_words = range.end;
-                    for offset in range {
+                    // Port of erts/emulator/beam/erl_gc.c:2281 (`sweep`), OTP-29.1.1.
+                    // The copied map node is scanned from its header layout in place.
+                    let map_type = (gval >> 6) & 3;
+                    let object_words = boxed_object_words(gval, ptr);
+                    let first_child = if map_type == 1 { 1 } else { 2 };
+                    for offset in first_child..object_words {
                         let slot = ptr.add(offset);
                         *slot = self.evacuate::<INTO_OLD>(*slot, &mut n_htop, &mut old_htop);
                         #[cfg(debug_assertions)]
                         crate::validate::verify_copied_term_after_collection(self.to, Term(*slot));
                     }
-                    // The map child range ends at the copied object's word count. Reuse
-                    // that result, as `sweep` advances through the copied heap once.
-                    // Port of erts/emulator/beam/erl_gc.c:2281 (`sweep`), OTP-29.1.1.
                     n_hp += object_words * 8;
                     continue;
                 } else if kind == SUB_BITS {
@@ -1339,13 +1339,21 @@ impl ProcessHeap {
             let ptr = unsafe { self.old_words.as_ptr().add(index).cast::<u64>() };
             // SAFETY: All copied objects have complete initialized layouts.
             let first = unsafe { *ptr };
-            let (range, words) = if first & 3 != 0 {
-                (0..1, 1)
+            let (first_child, words) = if first & 3 != 0 {
+                (0, 1)
             } else {
                 // SAFETY: A header begins a complete boxed object.
-                unsafe { (boxed_term_range(first, ptr), boxed_object_words(first, ptr)) }
+                unsafe {
+                    let words = boxed_object_words(first, ptr);
+                    let first_child = if first & 63 == MAP {
+                        if (first >> 6) & 3 == 1 { 1 } else { 2 }
+                    } else {
+                        boxed_term_range(first, ptr).start
+                    };
+                    (first_child, words)
+                }
             };
-            for offset in range {
+            for offset in first_child..words {
                 // SAFETY: The range selects initialized tagged term fields.
                 let word = unsafe { *ptr.add(offset) };
                 if word & 3 == 1 || word & 3 == 2 {
@@ -2302,11 +2310,16 @@ fn offset_young_objects(
             continue;
         }
         // SAFETY: A header begins a complete object that the collector just copied.
-        let (range, words) = unsafe {
-            (
-                boxed_term_range(first, base.add(index)),
-                boxed_object_words(first, base.add(index)),
-            )
+        // SAFETY: `index` starts a complete object in the copied heap.
+        let (words, first_child, end_child) = unsafe {
+            let words = boxed_object_words(first, base.add(index));
+            if first & 63 == MAP {
+                let first_child = if (first >> 6) & 3 == 1 { 1 } else { 2 };
+                (words, first_child, words)
+            } else {
+                let range = boxed_term_range(first, base.add(index));
+                (words, range.start, range.end)
+            }
         };
         if first & 63 == SUB_BITS {
             // Word 1 is an absolute byte pointer with flag bits in the low pair.
@@ -2322,7 +2335,7 @@ fn offset_young_objects(
                 }
             }
         }
-        for offset in range {
+        for offset in first_child..end_child {
             // SAFETY: `range` selects initialized term fields of this object.
             unsafe {
                 let slot = base.add(index + offset);

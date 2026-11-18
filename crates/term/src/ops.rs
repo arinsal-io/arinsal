@@ -378,6 +378,18 @@ pub(crate) fn children(term: Term) -> Children {
     if let Some(header) = term.header() {
         // SAFETY: the caller keeps the boxed object live and initialized.
         let ptr = unsafe { term.raw_ptr() };
+        if header & 63 == crate::MAP {
+            // Port of erts/emulator/beam/copy.c:88 (`size_object_x`), OTP-29.1.1.
+            // Map children are laid out directly after the raw node header fields.
+            let map_type = (header >> 6) & 3;
+            // SAFETY: `ptr` points to a live, initialized map object.
+            let end = unsafe { crate::hamt::boxed_object_words(header, ptr) };
+            return Children {
+                ptr,
+                next: if map_type == 1 { 1 } else { 2 },
+                end,
+            };
+        }
         // SAFETY: the header determines initialized term-bearing slots.
         let range = unsafe { crate::hamt::boxed_term_range(header, ptr) };
         return Children {
