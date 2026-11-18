@@ -49,16 +49,6 @@ pub(crate) fn system_info(process: &mut Process, selector: Term) -> Option<Resul
             )))
         }));
     }
-    if let [OwnedTerm::Atom(operation), OwnedTerm::Atom(allocator)] = parts.as_slice()
-        && operation == "allocator"
-        && allocator == "mseg_alloc"
-    {
-        // OTP returns `false` when this optional allocator is not present.
-        // Arinsal does not use the erts mseg allocator. The call still interns
-        // the mseg info atoms (erl_mseg.c:854) on builds where mseg exists.
-        super::alloc_atoms::note_mseg();
-        return Some(Ok(Term::atom(arinsal_term::atoms::FALSE)));
-    }
     if parts.len() != 3 {
         return None;
     }
