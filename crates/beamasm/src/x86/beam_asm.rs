@@ -371,10 +371,7 @@ impl BeamAssembler {
         &mut self,
         f: impl FnOnce(&mut Emitter) -> Result<(), EncodeError>,
     ) -> Result<(), AsmError> {
-        let mut e = Emitter::new();
-        f(&mut e)?;
-        self.a.append(&e.bytes);
-        Ok(())
+        Ok(self.a.emit(f)?)
     }
 
     /// `a.new_label()`.
@@ -514,11 +511,7 @@ impl BeamAssembler {
     // Port of erts/emulator/asmjit/x86/x86assembler.cpp (kEncodingX86Jmp, label target),
     // OTP-29.1.1.
     pub fn jmp(&mut self, label: Label) -> Result<(), AsmError> {
-        if self.bound_within_rel8(label, 2) {
-            Ok(self.a.jmp_short(label)?)
-        } else {
-            Ok(self.a.jmp_near(label)?)
-        }
+        Ok(self.a.jmp(label)?)
     }
 
     /// `a.short_().jmp(label)`.
@@ -530,11 +523,7 @@ impl BeamAssembler {
     // Port of erts/emulator/asmjit/x86/x86assembler.cpp (kEncodingX86Jcc, label target),
     // OTP-29.1.1.
     pub fn jcc(&mut self, cc: CondCode, label: Label) -> Result<(), AsmError> {
-        if self.bound_within_rel8(label, 2) {
-            Ok(self.a.jcc_short(cc as u8, label)?)
-        } else {
-            Ok(self.a.jcc_near(cc as u8, label)?)
-        }
+        Ok(self.a.jcc(cc as u8, label)?)
     }
 
     /// `a.short_().j<cc>(label)`.
@@ -548,15 +537,6 @@ impl BeamAssembler {
             Distance::Short => self.short_jcc(cc, label),
             Distance::Long => self.jcc(cc, label),
         }
-    }
-
-    fn bound_within_rel8(&self, label: Label, short_size: usize) -> bool {
-        self.a.label_location(label).is_some_and(|location| {
-            location.section == self.a.active_section() && {
-                let disp = location.offset as i64 - (self.a.offset() + short_size) as i64;
-                i8::try_from(disp).is_ok()
-            }
-        })
     }
 
     /// `hasCpuFeature(feature)`: the host CPU features asmjit's `CpuInfo` reports.
@@ -578,13 +558,7 @@ impl BeamAssembler {
     /// `a.align(AlignMode::kCode, alignment)`: asmjit's optimized NOP fill up to the next
     /// multiple of `alignment` of the section offset.
     pub fn align_code(&mut self, alignment: u32) -> Result<(), AsmError> {
-        // The encoder aligns its own byte count; start it at the section offset's remainder.
-        let pre = self.a.offset() % alignment.max(1) as usize;
-        let mut e = Emitter::new();
-        e.bytes.resize(pre, 0);
-        e.align_code(alignment)?;
-        self.a.append(&e.bytes[pre..]);
-        Ok(())
+        Ok(self.a.align(alignment as usize)?)
     }
 
     /// `align_erlang_cp()`: aligns so that the current address forms a valid CP.
@@ -662,19 +636,20 @@ impl BeamAssembler {
     /// `size`-byte call that follows forms a valid CP (4-byte aligned).
     // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:417-439 (aligned_call(target, size)) and
     // jit/x86/process_main.cpp:33-36 (nops), OTP-29.1.1.
-    fn pad_for_call(&mut self, size: usize) {
+    fn pad_for_call(&mut self, size: usize) -> Result<(), AsmError> {
         const NOPS: [&[u8]; 3] = [&[0x90], &[0x66, 0x90], &[0x0F, 0x1F, 0x00]];
         let next_address = self.a.offset() + size;
         if !next_address.is_multiple_of(4) {
             let nop_count = 4 - next_address % 4;
-            self.a.append(NOPS[nop_count - 1]);
+            self.a.embed(NOPS[nop_count - 1])?;
         }
+        Ok(())
     }
 
     /// `aligned_call(Label)`: relative calls are always 5 bytes long.
     // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:395-398, OTP-29.1.1.
     pub fn aligned_call_label(&mut self, target: Label) -> Result<(), AsmError> {
-        self.pad_for_call(5);
+        self.pad_for_call(5)?;
         self.a.call(target)?;
         debug_assert!(self.a.offset().is_multiple_of(4));
         Ok(())
@@ -689,7 +664,7 @@ impl BeamAssembler {
     ) -> Result<(), AsmError> {
         let mut probe = Emitter::new();
         call(&mut probe)?;
-        self.pad_for_call(probe.len());
+        self.pad_for_call(probe.len())?;
         self.emit(call)?;
         debug_assert!(self.a.offset().is_multiple_of(4));
         Ok(())
@@ -716,6 +691,55 @@ impl BeamAssembler {
         self.emit_assert_redzone_unused();
         self.aligned_call_with(|e| e.call_m(target))
     }
+
+    /// `runtime_call<Sig, Func>()` on the SysV ABI: `call imm(Func)`, which asmjit encodes
+    /// as a 6-byte `REX call rel32`, relocated to a rel32 or to an address-table call. `func`
+    /// is the address of an erts-named runtime function (`x86::rt`), taken with `f as usize`.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:488-530 (runtime_call), OTP-29.1.1.
+    pub fn runtime_call(&mut self, func: usize) -> Result<(), AsmError> {
+        self.emit_assert_runtime_stack();
+        self.a.call_external(func as u64)?;
+        Ok(())
+    }
+
+    /// `dynamic_runtime_call<Arity>(func)`: a call through a register.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:532-546 (dynamic_runtime_call),
+    // OTP-29.1.1.
+    pub fn dynamic_runtime_call(&mut self, func: Gp) -> Result<(), AsmError> {
+        self.emit_assert_runtime_stack();
+        self.emit(|e| e.call_r(func))
+    }
+
+    /// `abs_jmp(addr)`: `jmp imm(addr)`, a 6-byte `REX jmp rel32` relocated like a runtime
+    /// call.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:548-551 (abs_jmp), OTP-29.1.1.
+    pub fn abs_jmp(&mut self, addr: usize) -> Result<(), AsmError> {
+        self.a.jmp_external(addr as u64)?;
+        Ok(())
+    }
+
+    /// `safe_fragment_call(Target)` of the global assembler: `call imm(Target)`.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:383-386 (safe_fragment_call),
+    // OTP-29.1.1.
+    pub fn safe_fragment_call_abs(&mut self, target: usize) -> Result<(), AsmError> {
+        self.emit_assert_redzone_unused();
+        self.a.call_external(target as u64)?;
+        Ok(())
+    }
+
+    /// `aligned_call(FuncPtr *target)`: calls to absolute addresses (encoded through the
+    /// address table) are always 6 bytes long.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:388-393, OTP-29.1.1.
+    pub fn aligned_call_abs(&mut self, target: usize) -> Result<(), AsmError> {
+        self.pad_for_call(6)?;
+        self.a.call_external(target as u64)?;
+        debug_assert!(self.a.offset().is_multiple_of(4));
+        Ok(())
+    }
+
+    /// `emit_assert_runtime_stack()`: emits nothing outside `JIT_HARD_DEBUG`.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp (emit_assert_runtime_stack), OTP-29.1.1.
+    pub fn emit_assert_runtime_stack(&mut self) {}
 
     /// `emit_assert_redzone_unused()`: emits nothing outside `JIT_HARD_DEBUG`.
     // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:302-322, OTP-29.1.1.
@@ -987,7 +1011,7 @@ mod tests {
         asm.jcc(CondCode::NE, back).unwrap(); // bound, in reach: rel8
         asm.jcc(CondCode::NE, forward).unwrap(); // unbound: rel32
         asm.jmp(back).unwrap(); // rel8
-        asm.a.append(&[0x90; 200]);
+        asm.a.embed(&[0x90; 200]).unwrap();
         asm.jmp(back).unwrap(); // out of rel8 reach: rel32
         asm.bind(forward).unwrap();
         let code = asm.a.bytes(arinsal_x64::buf::Section::Code).to_vec();
@@ -1002,7 +1026,7 @@ mod tests {
     fn aligned_calls_return_to_a_cp() {
         let mut asm = BeamAssembler::new();
         let target = asm.new_label();
-        asm.a.append(&[0x90]);
+        asm.a.embed(&[0x90]).unwrap();
         // 1 + 5 = 6: two NOP bytes (`66 90`) put the return address at 8.
         asm.aligned_call_label(target).unwrap();
         asm.bind(target).unwrap();

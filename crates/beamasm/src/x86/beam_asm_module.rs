@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use arinsal_x64::buf::Label;
+use arinsal_x64::buf::{Label, Section};
 use arinsal_x64::enc::{Gp, Mem, MemBase};
 
 use super::beam_asm::register::{ARG1, ARG3, ARG4, ARG5, ARG6, E, REGISTERS, RET, TMP1, TMP2};
@@ -342,6 +342,98 @@ impl BeamModuleAssembler {
             .or_insert_with(|| asm.new_label())
     }
 
+    /// `safe_fragment_call(fragment)` of the module assembler: a call to the module-local
+    /// thunk of the global fragment at `fragment`.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:1541-1544 (safe_fragment_call),
+    // OTP-29.1.1.
+    pub fn safe_fragment_call(&mut self, fragment: usize) -> Result<(), AsmError> {
+        self.asm.emit_assert_redzone_unused();
+        let label = self.resolve_fragment(fragment);
+        Ok(self.asm.a.call(label)?)
+    }
+
+    /// `aligned_call(FuncPtr *target)` of the module assembler: through the fragment's thunk.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:1546-1549, OTP-29.1.1.
+    pub fn aligned_call_fragment(&mut self, fragment: usize) -> Result<(), AsmError> {
+        let label = self.resolve_fragment(fragment);
+        self.asm.aligned_call_label(label)
+    }
+
+    /// The dispatch-table thunks at the end of the module: `jmp imm(fragment)` behind each
+    /// label [`Self::resolve_fragment`] handed out. erts walks an `unordered_map`; the thunks
+    /// are emitted here by fragment address.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:532-535 (emit_int_code_end,
+    // the `_dispatchTable` loop), OTP-29.1.1.
+    pub fn emit_dispatch_table(&mut self) -> Result<(), AsmError> {
+        let mut thunks: Vec<(usize, Label)> = self.dispatch_table.drain().collect();
+        thunks.sort_unstable_by_key(|(fragment, _)| *fragment);
+        for (fragment, label) in thunks {
+            self.asm.bind(label)?;
+            self.asm.abs_jmp(fragment)?;
+        }
+        Ok(())
+    }
+
+    /// `embed_vararg_rodata(args, reg, y_offset)`: `lea reg, [label]` to a table of the
+    /// operands in the read-only data section, one 8-byte-aligned word each: X and Y registers
+    /// as loader-tagged words, literals as patch words, labels as their addresses.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:97-141 (embed_vararg_rodata),
+    // OTP-29.1.1.
+    pub fn embed_vararg_rodata(
+        &mut self,
+        args: &[ArgVal],
+        reg: Gp,
+        y_offset: u32,
+    ) -> Result<(), AsmError> {
+        // erl_term.h: `make_loader_x_reg`, `make_loader_y_reg` (the PID and PORT immediate
+        // tags, `_TAG_IMMED1_SIZE` bits).
+        const LOADER_TAG_SIZE: u32 = 4;
+        const LOADER_X_REG: u64 = 0x3;
+        const LOADER_Y_REG: u64 = 0x7;
+        let label = self.asm.new_label();
+        self.asm
+            .a
+            .emit_rip_label(label, |e| e.lea(reg, Mem::rip(0, 8)))?;
+        self.asm.a.select(Section::Data);
+        let result = (|| {
+            self.asm.bind(label)?;
+            for arg in args {
+                self.asm.a.align(8)?;
+                match *arg {
+                    ArgVal::X(index) => {
+                        self.asm
+                            .a
+                            .embed_u64((u64::from(index) << LOADER_TAG_SIZE) | LOADER_X_REG)?;
+                    }
+                    ArgVal::Y(index) => {
+                        self.asm.a.embed_u64(
+                            (u64::from(index + y_offset) << LOADER_TAG_SIZE) | LOADER_Y_REG,
+                        )?;
+                    }
+                    ArgVal::Literal(term) => {
+                        let mut patches = self.literals.remove(&term).unwrap_or_default();
+                        let result = Self::make_word_patch(&mut self.asm, &mut patches);
+                        self.literals.insert(term, patches);
+                        result?;
+                    }
+                    ArgVal::Label(beam_label) => {
+                        let target = self
+                            .resolve_beam_label(beam_label)
+                            .ok_or(AsmError::Operand("vararg label"))?;
+                        self.asm.a.embed_label(target)?;
+                    }
+                    ArgVal::Immediate(word) | ArgVal::Word(word) => {
+                        self.asm.a.embed_u64(word)?;
+                    }
+                    _ => return Err(AsmError::Operand("vararg rodata operand")),
+                }
+            }
+            Ok(())
+        })();
+        self.asm.a.select(Section::Code);
+        result
+    }
+
     /// `flush_last_error()`: a `nop` when an instruction that may raise at its very end is
     /// followed by a new line, so the error refers to the preceding line.
     // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:586-597 (flush_last_error),
@@ -588,7 +680,7 @@ impl BeamModuleAssembler {
     ) -> Result<(), AsmError> {
         let label = asm.new_label();
         asm.bind(label)?;
-        asm.a.append_u64(i64::MAX as u64);
+        asm.a.embed_u64(i64::MAX as u64)?;
         patches.push(Patch {
             at: label,
             ptr_offs: 0,
@@ -602,7 +694,6 @@ impl BeamModuleAssembler {
 mod tests {
     use super::*;
     use crate::x86::beam_asm::register::{ARG1, ARG4};
-    use arinsal_x64::buf::Section;
 
     #[test]
     fn labels_cover_beam_labels() {
@@ -635,5 +726,42 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(0, 2, 3), (10, 0, 0), (18, 2, 0)]
         );
+    }
+
+    // `lea ARG1, [rip+table]` to 8-byte rodata words: x0 and y1 (+1 for the frame) as loader
+    // tags, a word, a label address; then a module's fragment thunk as `REX jmp rel32`.
+    #[test]
+    fn vararg_rodata_and_dispatch_thunks() {
+        let mut m = BeamModuleAssembler::new(3);
+        m.embed_vararg_rodata(
+            &[
+                ArgVal::X(0),
+                ArgVal::Y(1),
+                ArgVal::Word(42),
+                ArgVal::Label(2),
+            ],
+            ARG1,
+            1,
+        )
+        .unwrap();
+        let label = m.resolve_beam_label(2).unwrap();
+        m.asm.bind(label).unwrap();
+        m.safe_fragment_call(0x5000).unwrap();
+        m.emit_dispatch_table().unwrap();
+        let mut code = m.asm.a.finish().unwrap();
+        // lea rdi, [rip+disp]: the table starts at the 8-aligned end of the code.
+        assert_eq!(&code.code[..3], &[0x48, 0x8d, 0x3d]);
+        assert_eq!(code.data_offset, 24);
+        assert_eq!(&code.code[3..7], &(24 - 7_i32).to_le_bytes());
+        // call thunk (rel32 to offset 12), thunk: REX jmp rel32.
+        assert_eq!(&code.code[7..12], &[0xe8, 0, 0, 0, 0]);
+        assert_eq!(&code.code[12..14], &[0x40, 0xe9]);
+        code.relocate(0x1000).unwrap();
+        let word = |i: usize| u64::from_le_bytes(code.data[i * 8..i * 8 + 8].try_into().unwrap());
+        assert_eq!(word(0), 0x3);
+        assert_eq!(word(1), (2 << 4) | 0x7);
+        assert_eq!(word(2), 42);
+        assert_eq!(word(3), 0x1007);
+        assert_eq!(&code.code[14..18], &(0x5000_i32 - 0x1012).to_le_bytes());
     }
 }

@@ -114,6 +114,39 @@ fn generate_erts_tables() {
         tables.emit_beamasm_glue(),
     )
     .unwrap();
+    // Both JIT architectures' `opc[]`, for build scripts that run on the host but generate
+    // code for the target (beamjit's arm dispatch): when this crate is a build-dependency,
+    // `CARGO_CFG_TARGET_ARCH` above is the host's.
+    let mut generics = String::from("// Generated from the OTP-29.1.1 tables by build.rs.\n");
+    for (jit, ident) in [("arm", "OPC_GENERICS_ARM"), ("x86", "OPC_GENERICS_X86")] {
+        let names = [
+            "genop.tab".to_owned(),
+            "common_predicates.tab".to_owned(),
+            "common_generators.tab".to_owned(),
+            format!("{jit}/ops.tab"),
+            format!("{jit}/predicates.tab"),
+            format!("{jit}/generators.tab"),
+        ];
+        let texts: Vec<String> = names
+            .iter()
+            .map(|name| fs::read_to_string(root.join("tab").join(name)).expect("tab file"))
+            .collect();
+        let files: Vec<(&str, &str)> = names
+            .iter()
+            .zip(&texts)
+            .map(|(name, text)| (name.as_str(), text.as_str()))
+            .collect();
+        let defs = [("ARCH_32", 0), ("ARCH_64", 1), ("USE_VM_PROBES", 0)]
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect();
+        generics.push_str(&makeops::Makeops::parse(&files, &defs).emit_opc_generics(ident));
+    }
+    fs::write(
+        PathBuf::from(env::var("OUT_DIR").unwrap()).join("opc_generics.rs"),
+        generics,
+    )
+    .unwrap();
     let programs = tables.tr_gen();
     fs::write(
         PathBuf::from(env::var("OUT_DIR").unwrap()).join("erts_programs.txt"),

@@ -50,6 +50,14 @@ pub struct FinalizedCode {
     pub data: Vec<u8>,
     /// Byte offset at which the data section begins in a contiguous image.
     pub data_offset: usize,
+    /// Byte offset of the `.addrtab` section, after the data: one 8-byte slot reserved per
+    /// distinct external `call`/`jmp` target, used only by the calls that cannot reach their
+    /// target with a rel32.
+    pub address_table_offset: usize,
+    /// The distinct external `call`/`jmp` targets (`CodeHolder::_address_table_entries`).
+    pub address_table: Vec<u64>,
+    /// The slots [`Self::relocate`] assigned, in order (`AddressTableEntry::_slot`).
+    pub address_table_slots: Vec<u64>,
     /// Base-dependent relocation records.
     pub relocations: Vec<Relocation>,
     /// Label locations in allocation order.
@@ -60,20 +68,44 @@ impl FinalizedCode {
     /// Combines the sections using the finalized aligned data offset.
     pub fn image(&self) -> Result<Vec<u8>, BufferError> {
         let end = self
-            .data_offset
-            .checked_add(self.data.len())
+            .address_table_offset
+            .checked_add(self.address_table.len() * 8)
             .ok_or(BufferError::LayoutOverflow)?;
         let mut image = vec![0; end];
         image[..self.code.len()].copy_from_slice(&self.code);
-        image[self.data_offset..].copy_from_slice(&self.data);
+        image[self.data_offset..self.data_offset + self.data.len()].copy_from_slice(&self.data);
+        for (slot, entry) in self.address_table_slots.iter().enumerate() {
+            let at = self.address_table_offset + slot * 8;
+            image[at..at + 8].copy_from_slice(&entry.to_le_bytes());
+        }
         Ok(image)
     }
 
     /// Applies recorded addresses after the combined image has been assigned `base_address`.
     // Port of asmjit `CodeHolder::relocate_to_base`, `core/codeholder.cpp:1144`, OTP-29.1.1.
     pub fn relocate(&mut self, base_address: u64) -> Result<(), BufferError> {
-        for relocation in &self.relocations {
+        let relocations = std::mem::take(&mut self.relocations);
+        let result = self.apply_relocations(&relocations, base_address);
+        self.relocations = relocations;
+        result
+    }
+
+    fn apply_relocations(
+        &mut self,
+        relocations: &[Relocation],
+        base_address: u64,
+    ) -> Result<(), BufferError> {
+        for relocation in relocations {
+            if let RelocationKind::AddressEntry {
+                address,
+                next_offset,
+            } = relocation.kind
+            {
+                self.relocate_address_entry(base_address, relocation.offset, address, next_offset)?;
+                continue;
+            }
             let (target, addend) = match relocation.kind {
+                RelocationKind::AddressEntry { .. } => unreachable!("handled above"),
                 RelocationKind::Absolute64 { target, addend }
                 | RelocationKind::Relative32 { target, addend, .. } => {
                     let address = match target {
@@ -112,6 +144,7 @@ impl FinalizedCode {
                 Section::Data => &mut self.data,
             };
             match relocation.kind {
+                RelocationKind::AddressEntry { .. } => unreachable!("handled above"),
                 RelocationKind::Absolute64 { .. } => {
                     let end = relocation
                         .offset
@@ -154,6 +187,59 @@ impl FinalizedCode {
     }
 }
 
+impl FinalizedCode {
+    /// `kX64AddressEntry`: a `REX call/jmp rel32` keeps its rel32 when the target is within
+    /// reach of the code's final address; otherwise it becomes `call/jmp [rip+slot]` through a
+    /// slot of the `.addrtab` section, assigned on first use.
+    // Port of erts/emulator/asmjit/core/codeholder.cpp:1235-1286 (relocate_to_base,
+    // RelocType::kX64AddressEntry), OTP-29.1.1.
+    fn relocate_address_entry(
+        &mut self,
+        base_address: u64,
+        offset: usize,
+        address: u64,
+        next_offset: usize,
+    ) -> Result<(), BufferError> {
+        if offset < 2 || offset + 4 > self.code.len() {
+            return Err(BufferError::InvalidRelocation);
+        }
+        let next = base_address
+            .checked_add(next_offset as u64)
+            .ok_or(BufferError::LayoutOverflow)?;
+        let mut value = address as i128 - next as i128;
+        if !(i32::MIN as i128..=i32::MAX as i128).contains(&value) {
+            let slot = match self.address_table_slots.iter().position(|a| *a == address) {
+                Some(slot) => slot,
+                None => {
+                    self.address_table_slots.push(address);
+                    self.address_table_slots.len() - 1
+                }
+            };
+            if slot >= self.address_table.len() {
+                return Err(BufferError::InvalidRelocation);
+            }
+            value = (self.address_table_offset + slot * 8) as i128 - next_offset as i128;
+            if !(i32::MIN as i128..=i32::MAX as i128).contains(&value) {
+                return Err(BufferError::DisplacementOutOfRange {
+                    from: next_offset,
+                    to: self.address_table_offset + slot * 8,
+                    width: 4,
+                });
+            }
+            // Bytes that replace [REX, OPCODE]: CALL becomes FF /2, JMP FF /4, `[rip+disp32]`.
+            let modrm = match self.code[offset - 1] {
+                0xe8 => 0x15,
+                0xe9 => 0x25,
+                _ => return Err(BufferError::InvalidRelocation),
+            };
+            self.code[offset - 2] = 0xff;
+            self.code[offset - 1] = modrm;
+        }
+        self.code[offset..offset + 4].copy_from_slice(&(value as i32).to_le_bytes());
+        Ok(())
+    }
+}
+
 fn add_signed(base: u64, addend: i64) -> Result<u64, BufferError> {
     if addend >= 0 {
         base.checked_add(addend as u64)
@@ -177,6 +263,9 @@ pub enum RelocationKind {
         addend: i64,
         next_offset: usize,
     },
+    /// asmjit's `kX64AddressEntry`: the rel32 of a `REX call/jmp` to the absolute `address`,
+    /// or, out of rel32 reach, `call/jmp [rip]` through the address table.
+    AddressEntry { address: u64, next_offset: usize },
 }
 
 /// A local label or an absolute external address used by a relocation.
@@ -207,8 +296,6 @@ pub enum BufferError {
     UnboundRelocation(Label),
     /// A condition code is outside x86's 0..=15 range.
     InvalidCondition(u8),
-    /// A data embedding was attempted while the code section was selected.
-    DataSectionRequired,
     /// A code emission was attempted while the data section was selected.
     CodeSectionRequired,
     /// The emitted instruction did not contain a RIP-relative memory operand.
@@ -268,6 +355,8 @@ pub struct CodeBuffer {
     fixups: Vec<Fixup>,
     waiting: Vec<Option<usize>>,
     relocations: Vec<Relocation>,
+    /// `_address_table_entries`: distinct external `call`/`jmp` targets.
+    address_table: Vec<u64>,
 }
 
 impl Default for CodeBuffer {
@@ -281,6 +370,7 @@ impl Default for CodeBuffer {
             fixups: Vec::new(),
             waiting: Vec::new(),
             relocations: Vec::new(),
+            address_table: Vec::new(),
         }
     }
 }
@@ -493,14 +583,38 @@ impl CodeBuffer {
         )
     }
 
-    /// Emits an external `call rel32` and records its base-dependent relocation.
+    /// `a.call(imm(address))` with the base address unknown: `REX call rel32` (6 bytes),
+    /// relocated to a rel32 or to `call [rip+slot]` of the address table.
     pub fn call_external(&mut self, address: u64) -> Result<usize, BufferError> {
-        self.external_branch(&[0xe8], address)
+        self.address_entry_branch(0xe8, address)
     }
 
-    /// Emits an external near `jmp rel32` and records its base-dependent relocation.
+    /// `a.jmp(imm(address))` with the base address unknown: `REX jmp rel32` (6 bytes),
+    /// relocated to a rel32 or to `jmp [rip+slot]` of the address table.
     pub fn jmp_external(&mut self, address: u64) -> Result<usize, BufferError> {
-        self.external_branch(&[0xe9], address)
+        self.address_entry_branch(0xe9, address)
+    }
+
+    // Port of erts/emulator/asmjit/x86/x86assembler.cpp:4855-4911 (EmitJmpCall, immediate
+    // target, no base address: REX prefix, `add_address_to_address_table`,
+    // RelocType::kX64AddressEntry), OTP-29.1.1.
+    fn address_entry_branch(&mut self, opcode: u8, address: u64) -> Result<usize, BufferError> {
+        if self.active != Section::Code {
+            return Err(BufferError::CodeSectionRequired);
+        }
+        if !self.address_table.contains(&address) {
+            self.address_table.push(address);
+        }
+        let (offset, next_offset) = self.code.emit_relative_placeholder(&[0x40, opcode], 4);
+        self.relocations.push(Relocation {
+            section: Section::Code,
+            offset,
+            kind: RelocationKind::AddressEntry {
+                address,
+                next_offset,
+            },
+        });
+        Ok(offset)
     }
 
     /// Emits an external near conditional branch and records its base-dependent relocation.
@@ -647,37 +761,43 @@ impl CodeBuffer {
         Ok(())
     }
 
-    /// Embeds bytes in the data section and returns their offset.
-    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:108-141 and asmjit `Assembler::embed`.
+    /// Embeds bytes in the active section and returns their offset: erts embeds the canned
+    /// NOPs of `aligned_call` and the patch words of `make_word_patch` in the code section,
+    /// and its read-only tables in the data section.
+    // Port of asmjit core/assembler.cpp (BaseAssembler::embed) as used by
+    // erts/emulator/beam/jit/x86/beam_asm.hpp (aligned_call, make_word_patch) and
+    // beam_asm_module.cpp:108-141 (embed_vararg_rodata), OTP-29.1.1.
     pub fn embed(&mut self, bytes: &[u8]) -> Result<usize, BufferError> {
-        self.require_data()?;
-        let offset = self.data.len();
-        self.data.extend_from_slice(bytes);
+        let offset = self.offset();
+        match self.active {
+            Section::Code => self.code.bytes.extend_from_slice(bytes),
+            Section::Data => self.data.extend_from_slice(bytes),
+        }
         Ok(offset)
     }
 
-    /// Embeds a little-endian byte in the data section.
+    /// Embeds a byte in the active section.
     pub fn embed_u8(&mut self, value: u8) -> Result<usize, BufferError> {
         self.embed(&[value])
     }
 
-    /// Embeds a little-endian 16-bit value in the data section.
+    /// Embeds a little-endian 16-bit value in the active section.
     pub fn embed_u16(&mut self, value: u16) -> Result<usize, BufferError> {
         self.embed(&value.to_le_bytes())
     }
 
-    /// Embeds a little-endian 32-bit value in the data section.
+    /// Embeds a little-endian 32-bit value in the active section.
     pub fn embed_u32(&mut self, value: u32) -> Result<usize, BufferError> {
         self.embed(&value.to_le_bytes())
     }
 
-    /// Embeds a little-endian 64-bit value in the data section.
+    /// Embeds a little-endian 64-bit value in the active section.
     // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:116-133 (`embed_uint64`), OTP-29.1.1.
     pub fn embed_u64(&mut self, value: u64) -> Result<usize, BufferError> {
         self.embed(&value.to_le_bytes())
     }
 
-    /// Embeds an IEEE-754 double in the data section.
+    /// Embeds an IEEE-754 double in the active section.
     // Port of erts/emulator/beam/jit/x86/instr_float.cpp:59-63 (`embed_double`), OTP-29.1.1.
     pub fn embed_f64(&mut self, value: f64) -> Result<usize, BufferError> {
         self.embed_u64(value.to_bits())
@@ -687,10 +807,9 @@ impl CodeBuffer {
     // Port of x86 `BeamModuleAssembler::embed_vararg_rodata`, beam_asm_module.cpp:126-128.
     pub fn embed_label(&mut self, label: Label) -> Result<usize, BufferError> {
         self.ensure_label(label)?;
-        self.require_data()?;
         let offset = self.embed_u64(0)?;
         self.relocations.push(Relocation {
-            section: Section::Data,
+            section: self.active,
             offset,
             kind: RelocationKind::Absolute64 {
                 target: RelocationTarget::Label(label),
@@ -702,10 +821,9 @@ impl CodeBuffer {
 
     /// Embeds an external absolute 64-bit address and records its relocation.
     pub fn embed_external(&mut self, address: u64) -> Result<usize, BufferError> {
-        self.require_data()?;
         let offset = self.embed_u64(0)?;
         self.relocations.push(Relocation {
-            section: Section::Data,
+            section: self.active,
             offset,
             kind: RelocationKind::Absolute64 {
                 target: RelocationTarget::External(address),
@@ -792,10 +910,19 @@ impl CodeBuffer {
                 }
             }
         }
+        // `.addrtab` follows the data, 8-byte aligned.
+        let address_table_offset = data_offset
+            .checked_add(self.data.len())
+            .and_then(|end| end.checked_add(7))
+            .ok_or(BufferError::LayoutOverflow)?
+            & !7;
         Ok(FinalizedCode {
             code: self.code.bytes,
             data: self.data,
             data_offset,
+            address_table_offset,
+            address_table: self.address_table,
+            address_table_slots: Vec::new(),
             relocations: self.relocations,
             labels: self.labels,
         })
@@ -814,14 +941,6 @@ impl CodeBuffer {
             Ok(())
         } else {
             Err(BufferError::InvalidLabel(label))
-        }
-    }
-
-    fn require_data(&self) -> Result<(), BufferError> {
-        if self.active == Section::Data {
-            Ok(())
-        } else {
-            Err(BufferError::DataSectionRequired)
         }
     }
 }
@@ -936,10 +1055,33 @@ mod tests {
         buffer.embed_external(0x1040).unwrap();
         let mut finalized = buffer.finish().unwrap();
         finalized.relocate(0x1000).unwrap();
-        similar_asserts::assert_eq!(&finalized.code[..5], &[0xe8, 0x0b, 0, 0, 0]);
-        similar_asserts::assert_eq!(&finalized.code[5..10], &[0xe9, 0x16, 0, 0, 0]);
-        similar_asserts::assert_eq!(&finalized.code[10..16], &[0x0f, 0x84, 0x20, 0, 0, 0]);
+        // asmjit keeps the REX prefix of a call/jmp whose target is within rel32 reach.
+        similar_asserts::assert_eq!(&finalized.code[..6], &[0x40, 0xe8, 0x0a, 0, 0, 0]);
+        similar_asserts::assert_eq!(&finalized.code[6..12], &[0x40, 0xe9, 0x14, 0, 0, 0]);
+        similar_asserts::assert_eq!(&finalized.code[12..18], &[0x0f, 0x84, 0x1e, 0, 0, 0]);
         similar_asserts::assert_eq!(finalized.data, 0x1040_u64.to_le_bytes());
+        assert!(finalized.address_table_slots.is_empty());
+    }
+
+    // Out of rel32 reach, a call/jmp goes through its `.addrtab` slot: `FF 15`/`FF 25
+    // [rip+disp32]`, one slot per distinct target.
+    #[test]
+    fn far_external_calls_use_the_address_table() {
+        let far = 0x7f00_0000_0000_u64;
+        let mut buffer = CodeBuffer::new();
+        buffer.call_external(far).unwrap();
+        buffer.jmp_external(far).unwrap();
+        buffer.call_external(0x2000).unwrap();
+        let mut finalized = buffer.finish().unwrap();
+        assert_eq!(finalized.address_table, [far, 0x2000]);
+        assert_eq!(finalized.address_table_offset, 24);
+        finalized.relocate(0x1000).unwrap();
+        similar_asserts::assert_eq!(&finalized.code[..6], &[0xff, 0x15, 18, 0, 0, 0]);
+        similar_asserts::assert_eq!(&finalized.code[6..12], &[0xff, 0x25, 12, 0, 0, 0]);
+        similar_asserts::assert_eq!(&finalized.code[12..18], &[0x40, 0xe8, 0xee, 0x0f, 0, 0]);
+        let image = finalized.image().unwrap();
+        assert_eq!(image.len(), 40);
+        assert_eq!(&image[24..32], &far.to_le_bytes());
     }
 
     #[test]
@@ -949,16 +1091,31 @@ mod tests {
             buffer.align(128),
             Err(BufferError::InvalidAlignment(128))
         ));
-        assert!(matches!(
-            buffer.embed_u8(1),
-            Err(BufferError::DataSectionRequired)
-        ));
         buffer.select(Section::Data);
         assert!(matches!(
             buffer.emit(|emitter| emitter.mov_ri(EAX, 1)),
             Err(BufferError::CodeSectionRequired)
         ));
         assert!(buffer.bytes(Section::Code).is_empty());
+    }
+
+    // asmjit's embed writes into the active section: erts embeds canned NOPs and patch words
+    // in code.
+    #[test]
+    fn embed_writes_the_active_section() {
+        let mut buffer = CodeBuffer::new();
+        buffer.emit(|emitter| emitter.nop()).unwrap();
+        assert_eq!(buffer.embed(&[0x66, 0x90]).unwrap(), 1);
+        let label = buffer.new_label();
+        buffer.bind(label).unwrap();
+        assert_eq!(buffer.embed_label(label).unwrap(), 3);
+        buffer.select(Section::Data);
+        assert_eq!(buffer.embed_u8(7).unwrap(), 0);
+        let mut finalized = buffer.finish().unwrap();
+        finalized.relocate(0x1000).unwrap();
+        assert_eq!(&finalized.code[..3], &[0x90, 0x66, 0x90]);
+        assert_eq!(&finalized.code[3..11], &0x1003_u64.to_le_bytes());
+        assert_eq!(finalized.data, [7]);
     }
 
     #[test]

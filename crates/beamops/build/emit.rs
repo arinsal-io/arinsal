@@ -152,6 +152,26 @@ impl Makeops {
         order
     }
 
+    /// `opc[]` of this table set as `(generic name, generic number)` per specific instruction,
+    /// as `pub static <ident>`: what a build script of another crate needs to dispatch on the
+    /// specific instructions of a JIT architecture other than the one this crate is built for.
+    pub fn emit_opc_generics(&self, ident: &str) -> String {
+        let mut out = format!("pub static {ident}: &[(&str, u16)] = &[\n");
+        for (key, defs) in &self.specific_op {
+            let (name, arity) = key.rsplit_once('/').expect("name/arity key");
+            let arity: usize = arity.parse().expect("arity");
+            let generic = self
+                .gen_opnum
+                .get(&(name.to_owned(), arity))
+                .unwrap_or_else(|| panic!("no generic number for {key}"));
+            for _ in defs {
+                out.push_str(&format!("    ({name:?}, {generic}),\n"));
+            }
+        }
+        out.push_str("];\n");
+        out
+    }
+
     /// The BeamAsm glue of the `-jit yes` branch: `beamasm_emit.h` (one
     /// `case op_<print_name>: emit_<name>(args[0], ..., [Span of the rest])`) as the macro
     /// `beamasm_emit!(assembler, specific_op, args)`, and `beamasm_protos.h` as

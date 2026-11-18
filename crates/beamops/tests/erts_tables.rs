@@ -44,3 +44,40 @@ fn beamasm_protos_equal_the_ones_beam_makeops_generates() {
         .collect();
     assert_eq!(actual, expected);
 }
+
+/// `opc_generics` of both JIT architectures, whichever one this crate was built for, equals the
+/// specific-to-generic mapping of the real `gen_opc[]` of that architecture: build scripts
+/// that run on the host generate the target's dispatch from it.
+#[test]
+fn opc_generics_of_both_architectures_equal_beam_makeops() {
+    for (jit, fixture) in [
+        ("arm", include_str!("fixtures/arm/erts_opcode_tables.txt")),
+        ("x86", include_str!("fixtures/x86/erts_opcode_tables.txt")),
+    ] {
+        let mut expected = Vec::new();
+        for line in fixture.lines().filter(|line| line.starts_with("gen ")) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let (number, name) = (
+                fields[1].parse::<u16>().unwrap(),
+                fields[2].trim_matches('"'),
+            );
+            let (specific, count) = (
+                fields[4].parse::<i64>().unwrap(),
+                fields[5].parse().unwrap(),
+            );
+            if specific >= 0 {
+                expected.push((specific as usize, count, name, number));
+            }
+        }
+        expected.sort();
+        let expected: Vec<(&str, u16)> = expected
+            .into_iter()
+            .flat_map(|(_, count, name, number)| std::iter::repeat_n((name, number), count))
+            .collect();
+        assert_eq!(
+            arinsal_beamops::opc_generics(jit).unwrap(),
+            expected,
+            "{jit}"
+        );
+    }
+}

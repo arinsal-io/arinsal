@@ -126,6 +126,20 @@ pub fn specific_op_count() -> usize {
     erts_tables::NUM_SPECIFIC_OPS
 }
 
+// `OPC_GENERICS_ARM`, `OPC_GENERICS_X86`.
+include!(concat!(env!("OUT_DIR"), "/opc_generics.rs"));
+
+/// The `opc[]` of the JIT architecture `jit` (`"arm"` or `"x86"`, erts' `JIT_ARCH`) as
+/// `(generic name, generic number)` per specific instruction, whatever architecture this crate
+/// was built for: a build script runs on the host but generates code for the target.
+pub fn opc_generics(jit: &str) -> Option<&'static [(&'static str, u16)]> {
+    match jit {
+        "arm" => Some(OPC_GENERICS_ARM),
+        "x86" => Some(OPC_GENERICS_X86),
+        _ => None,
+    }
+}
+
 /// Returns details for one specific operation in OTP's generated `opc[]` table.
 pub fn specific_op_info(specific: u16) -> Option<SpecificOpInfo> {
     let specific = usize::from(specific);

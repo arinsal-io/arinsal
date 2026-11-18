@@ -1,4 +1,4 @@
-use arinsal_beamops::{specific_op_count, specific_op_info};
+use arinsal_beamops::opc_generics;
 use std::{collections::BTreeMap, env, fs, path::PathBuf};
 
 /// The arm module assembler driver still dispatches through its `EmitterKind` table
@@ -31,11 +31,11 @@ fn main() {
             match specific {\n",
     );
 
-    for specific in 0..specific_op_count() {
-        let Some(info) = specific_op_info(specific as u16) else {
-            panic!("missing OPC entry {specific}");
-        };
-        let Some(emitter) = emitters.get(info.generic_name) else {
+    // This script runs on the host: the tables are the target's (`jit/arm`), not those the
+    // build-dependency was built for.
+    let opc = opc_generics("arm").expect("arm opc[]");
+    for (specific, &(generic_name, generic_op)) in opc.iter().enumerate() {
+        let Some(emitter) = emitters.get(generic_name) else {
             continue;
         };
         let Some(emitter_id) = emitter_ids.get(emitter) else {
@@ -43,7 +43,7 @@ fn main() {
         };
         generated.push_str(&format!(
             "                {specific} => emit_op::<{}, {emitter_id}>(assembler, op, beam, env, function, arity),\n",
-            info.generic_op
+            generic_op
         ));
     }
     generated.push_str(
