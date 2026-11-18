@@ -9,6 +9,7 @@
 mod beam_op;
 #[doc(hidden)]
 pub mod erts_tables;
+pub use erts_tables::beam_opcodes;
 mod load_code;
 mod loader_state;
 pub use load_code::LoadCodeError;

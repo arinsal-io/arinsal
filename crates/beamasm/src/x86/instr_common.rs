@@ -1245,6 +1245,64 @@ impl BeamModuleAssembler {
     }
 }
 
+impl BeamModuleAssembler {
+    /// `emit_i_test_yield()`: the reduction test of a function prologue, right after the
+    /// breakpoint trampoline. `ARG3` is the return address `i_test_yield_shared` resumes at
+    /// (`current_label + TEST_YIELD_RETURN_OFFSET`, the end of this instruction).
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:3217-3252 (emit_i_test_yield),
+    // OTP-29.1.1. `erts_alcu_enable_code_atags` (an undocumented `+M` option Arinsal does not
+    // have) is off, so `c_p->i` is not stored.
+    pub fn emit_i_test_yield(&mut self) -> Result<(), AsmError> {
+        use super::beam_asm::register::FCALLS;
+        use super::beam_asm_global::{BEAM_ASM_FUNC_PROLOGUE_SIZE, TEST_YIELD_RETURN_OFFSET};
+        let current = self
+            .current_label()
+            .ok_or(AsmError::Operand("i_test_yield outside a function"))?;
+        debug_assert_eq!(
+            self.current_label_offset(),
+            Some(self.asm.a.offset() - BEAM_ASM_FUNC_PROLOGUE_SIZE as usize)
+        );
+        self.asm.emit_enter_frame()?;
+        self.asm.a.emit_rip_label(current, |e| {
+            e.lea(ARG3, Mem::rip(TEST_YIELD_RETURN_OFFSET as i32, 8))
+        })?;
+        self.asm.emit(|e| e.dec_r(FCALLS))?;
+        let fragment = self.ga_get(GlobalLabels::ITestYieldShared)?;
+        let target = self.resolve_fragment(fragment);
+        self.asm.a.jcc_near(CondCode::LE as u8, target)?;
+        self.asm.align_code(4)?;
+        debug_assert_eq!(
+            self.current_label_offset(),
+            Some(self.asm.a.offset() - TEST_YIELD_RETURN_OFFSET as usize)
+        );
+        Ok(())
+    }
+
+    /// `emit_coverage(coverage, index, size)`: marks (byte flags) or counts (word counters)
+    /// the execution of coverage point `index`.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:3332-3351 (emit_coverage),
+    // OTP-29.1.1.
+    pub fn emit_coverage(
+        &mut self,
+        coverage: usize,
+        index: u64,
+        size: u64,
+    ) -> Result<(), AsmError> {
+        let address = coverage as u64 + index * size;
+        self.asm.mov_imm(RET, address)?;
+        match size {
+            8 => self.asm.emit(|e| e.lock_inc_m(qword_ptr(RET, 0))),
+            1 if address & 0xff != 0 => {
+                // The size of this instruction is two bytes.
+                self.asm.emit(|e| e.mov_mr(enc::byte_ptr(RET, 0), RETB))
+            }
+            // The size of this instruction is three bytes.
+            1 => self.asm.emit(|e| e.mov_mi(enc::byte_ptr(RET, 0), 1)),
+            _ => Err(AsmError::Operand("coverage counter size")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

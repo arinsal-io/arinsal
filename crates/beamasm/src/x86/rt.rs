@@ -119,6 +119,19 @@ unsafe extern "C" {
     ) -> i32;
 }
 
+// Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:397-399 (i_emit_nyi) and
+// erts/emulator/beam/beam_catches.h:38 (beam_catches_cons), OTP-29.1.1. erts defines
+// `i_emit_nyi` static in beam_asm_module.cpp around `erts_exit(ERTS_ERROR_EXIT, "NYI: %s\n",
+// msg)`; `erts_exit` belongs to the VM, which therefore defines the symbol. `beam_catches_cons`
+// is called by the loader side of `patchCatches`. `beam_asm_module` re-exports both.
+unsafe extern "C" {
+    /// `static void i_emit_nyi(char *msg)`: halts the emulator with `NYI: <msg>`.
+    pub safe fn i_emit_nyi(msg: *const core::ffi::c_char);
+    /// `unsigned beam_catches_cons(ErtsCodePtr cp, unsigned cdr, ErtsCodePtr **)`: a new
+    /// catch index for the handler `cp`, chained to `cdr`.
+    pub safe fn beam_catches_cons(cp: usize, cdr: u32, cdrpp: *mut *mut usize) -> u32;
+}
+
 // Port of erts/emulator/beam/jit/x86/instr_common.cpp and instr_call.cpp (`extern "C" {
 // #include "beam_common.h" }`), OTP-29.1.1: the beam_common.h functions their global fragments
 // call by address. `instr_common` and `instr_call` re-export them.
@@ -447,6 +460,15 @@ mod tests {
     }
     #[unsafe(no_mangle)]
     extern "C" fn save_calls(_c_p: *mut crate::ProcessHeader, _export: usize) {
+        unreachable!("byte-test fixture")
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn i_emit_nyi(_msg: *const core::ffi::c_char) {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn beam_catches_cons(_cp: usize, _cdr: u32, _cdrpp: *mut *mut usize) -> u32 {
         unreachable!("byte-test fixture")
     }
 

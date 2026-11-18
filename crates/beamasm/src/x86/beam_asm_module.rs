@@ -10,8 +10,11 @@ use arinsal_x64::buf::{Label, Section};
 use arinsal_x64::enc::{Gp, Mem, MemBase};
 
 use super::beam_asm::register::{ARG1, ARG3, ARG4, ARG5, ARG6, E, REGISTERS, RET, TMP1, TMP2};
-use super::beam_asm::{AsmError, BeamAssembler, Distance, get_arg_ref};
-use super::beam_asm_global::{BeamGlobalAssembler, GLOBAL_LABELS, GlobalLabels};
+use super::beam_asm::{AsmError, BeamAssembler, Distance, Update, get_arg_ref};
+use super::beam_asm_global::{
+    BEAM_ASM_FUNC_PROLOGUE_SIZE, BeamGlobalAssembler, GLOBAL_LABELS, GlobalLabels,
+};
+pub use super::rt::{beam_catches_cons, i_emit_nyi};
 use crate::common::args::ArgVal;
 use crate::common::register_cache::{CacheMem, RegisterCache};
 
@@ -145,6 +148,126 @@ pub struct BeamModuleAssembler {
     /// `ga`: the address of every global fragment (`ga->get_<fragment>()`), indexed by
     /// [`GlobalLabels`]; empty for an assembler made without the global code.
     ga: Vec<Option<usize>>,
+    /// `catches`: the `catch` patch sites and their handlers.
+    pub catches: Vec<PatchCatch>,
+    /// `functions`: the label of every function seen so far (`i_func_info`).
+    pub functions: Vec<u32>,
+    /// `current_label`: the label bound last.
+    current_label: Option<Label>,
+    /// `code_header`: the module's `BeamCodeHeader`, if any.
+    code_header: Option<Label>,
+    /// `on_load`: the entry label of the `-on_load` function, if any.
+    on_load: Option<Label>,
+    /// `code_end`: the end of the last function; the dispatch table and data may follow.
+    code_end: Option<Label>,
+}
+
+/// `struct patch_catch`: a `mov` whose 32-bit immediate is filled with the catch tag of
+/// `handler` once catch indices are allocated.
+// Port of erts/emulator/beam/jit/beam_jit_common.hpp:147-150 (struct patch_catch), OTP-29.1.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PatchCatch {
+    /// `patch`.
+    pub patch: Patch,
+    /// `handler`.
+    pub handler: Label,
+}
+
+/// `BeamCodeHeader` of a BeamAsm build: the module header the code begins with, followed by
+/// the `functions` table (one entry per function plus the end of the last one). Pointers are
+/// carried as addresses.
+// Port of erts/emulator/beam/beam_code.h:58-146 (struct beam_code_header), OTP-29.1.1.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BeamCodeHeader {
+    /// `num_functions`.
+    pub num_functions: u64,
+    /// `attr_ptr`.
+    pub attr_ptr: usize,
+    /// `attr_size`.
+    pub attr_size: u64,
+    /// `attr_size_on_heap`.
+    pub attr_size_on_heap: u64,
+    /// `compile_ptr`.
+    pub compile_ptr: usize,
+    /// `compile_size`.
+    pub compile_size: u64,
+    /// `compile_size_on_heap`.
+    pub compile_size_on_heap: u64,
+    /// `literal_area`.
+    pub literal_area: usize,
+    /// `on_load`: the `ErtsCodeInfo` of the `-on_load` function, or 0.
+    pub on_load: usize,
+    /// `line_table`.
+    pub line_table: usize,
+    /// `coverage_mode`.
+    pub coverage_mode: u64,
+    /// `coverage`.
+    pub coverage: usize,
+    /// `line_coverage_valid`.
+    pub line_coverage_valid: usize,
+    /// `loc_index_to_cover_id`.
+    pub loc_index_to_cover_id: usize,
+    /// `line_coverage_len`.
+    pub line_coverage_len: u64,
+    /// `debug`.
+    pub debug: usize,
+    /// `debugger_flags`.
+    pub debugger_flags: u64,
+    /// `md5_ptr`.
+    pub md5_ptr: usize,
+    /// `are_nifs`.
+    pub are_nifs: usize,
+    /// `functions[1]`: the first entry of the function table.
+    pub functions: [usize; 1],
+}
+
+impl BeamCodeHeader {
+    /// The words before `functions`, in field order (every field is one word).
+    fn head_words(&self) -> [u64; 19] {
+        [
+            self.num_functions,
+            self.attr_ptr as u64,
+            self.attr_size,
+            self.attr_size_on_heap,
+            self.compile_ptr as u64,
+            self.compile_size,
+            self.compile_size_on_heap,
+            self.literal_area as u64,
+            self.on_load as u64,
+            self.line_table as u64,
+            self.coverage_mode,
+            self.coverage as u64,
+            self.line_coverage_valid as u64,
+            self.loc_index_to_cover_id as u64,
+            self.line_coverage_len,
+            self.debug as u64,
+            self.debugger_flags,
+            self.md5_ptr as u64,
+            self.are_nifs as u64,
+        ]
+    }
+}
+
+const _: () = assert!(core::mem::offset_of!(BeamCodeHeader, functions) == 19 * 8);
+
+/// `BEAM_NATIVE_MIN_FUNC_SZ` with `BEAMASM`: the minimum size of a function a NIF can
+/// replace, in words.
+// Port of erts/emulator/beam/beam_code.h:43-48, OTP-29.1.1.
+pub const BEAM_NATIVE_MIN_FUNC_SZ: usize = 30;
+
+/// `ERTS_ASM_BP_FLAG_NONE`.
+// Port of erts/emulator/beam/jit/beam_asm.h:172-178, OTP-29.1.1.
+const ERTS_ASM_BP_FLAG_NONE: u8 = 0;
+
+/// `BEAM_CATCHES_NIL`.
+// Port of erts/emulator/beam/beam_catches.h:33, OTP-29.1.1.
+pub const BEAM_CATCHES_NIL: u32 = u32::MAX;
+
+/// `make_catch(x)`: `x << _TAG_IMMED2_SIZE | _TAG_IMMED2_CATCH`.
+// Port of erts/emulator/beam/erl_term.h:89,1385 (make_catch), OTP-29.1.1.
+const fn make_catch(index: u32) -> u64 {
+    ((index as u64) << 6) | 0x1b
 }
 
 // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:1137-1142 (reg_cache), OTP-29.1.1.
@@ -209,7 +332,34 @@ impl BeamModuleAssembler {
             dispatch_table: HashMap::new(),
             last_error_offset: 0,
             ga: Vec::new(),
+            catches: Vec::new(),
+            functions: Vec::new(),
+            current_label: None,
+            code_header: None,
+            on_load: None,
+            code_end: None,
         }
+    }
+
+    /// The assembler of a module load: calls the fragments of `ga` (already in executable
+    /// memory) and starts with the module's `BeamCodeHeader` and its table of
+    /// `num_functions + 1` function pointers, zeroed until [`Self::codegen`] fills them.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:83-95
+    // (BeamModuleAssembler::BeamModuleAssembler(ga, mod, num_labels, num_functions, file)),
+    // OTP-29.1.1.
+    pub fn new_module(
+        ga: &BeamGlobalAssembler,
+        num_labels: u32,
+        num_functions: usize,
+    ) -> Result<Self, AsmError> {
+        let mut m = Self::with_fragment_addresses(num_labels, ga.ptrs().to_vec());
+        let code_header = m.asm.new_label();
+        m.asm.align_code(8)?;
+        m.asm.bind(code_header)?;
+        m.code_header = Some(code_header);
+        m.asm
+            .embed_zeros(core::mem::size_of::<BeamCodeHeader>() + 8 * num_functions)?;
+        Ok(m)
     }
 
     /// A module assembler calling the fragments of `ga`, whose code is placed at `ga_base`.
@@ -717,6 +867,432 @@ impl BeamModuleAssembler {
             ptr_offs: 0,
             val_offs: 0,
         });
+        Ok(())
+    }
+}
+
+/// The meta instructions of erts/emulator/beam/jit/x86/beam_asm_module.cpp: function and
+/// label boundaries, line markers, breakpoint trampolines and the stubs of instructions that
+/// are never executed.
+impl BeamModuleAssembler {
+    /// `emit_nyi(msg)`: calls `i_emit_nyi`, which halts the emulator; never returns.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:401-412 (emit_nyi), OTP-29.1.1.
+    pub fn emit_nyi(&mut self, msg: &'static core::ffi::CStr) -> Result<(), AsmError> {
+        self.asm.emit_enter_runtime(Update::NONE)?;
+        let msg = msg.as_ptr() as i64;
+        self.asm.emit(|e| e.mov_ri(ARG1, msg))?;
+        self.asm.runtime_call(i_emit_nyi as *const () as usize)
+    }
+
+    /// `emit_i_nif_padding()`: pads the previous function to the size a NIF stub replacing
+    /// it needs.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:143-154 (emit_i_nif_padding),
+    // OTP-29.1.1.
+    pub fn emit_i_nif_padding(&mut self) -> Result<(), AsmError> {
+        const MINIMUM_SIZE: usize = 8 * BEAM_NATIVE_MIN_FUNC_SZ;
+        let last = *self
+            .functions
+            .last()
+            .ok_or(AsmError::Operand("i_nif_padding outside a function"))?;
+        let entry = self
+            .resolve_beam_label(last + 1)
+            .ok_or(AsmError::Operand("function entry label"))?;
+        let prev_func_start = self
+            .asm
+            .a
+            .label_location(entry)
+            .ok_or(AsmError::Operand("function entry label not bound"))?
+            .offset;
+        let diff = self.offset() - prev_func_start;
+        if diff < MINIMUM_SIZE {
+            self.asm.embed_zeros(MINIMUM_SIZE - diff)?;
+        }
+        Ok(())
+    }
+
+    /// `emit_i_breakpoint_trampoline()`: the prologue NIF loading and tracing patch: a short
+    /// jump over an aligned call to the breakpoint trampoline, which enabling a breakpoint
+    /// turns into a fall-through.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:207-231
+    // (emit_i_breakpoint_trampoline), OTP-29.1.1.
+    pub fn emit_i_breakpoint_trampoline(&mut self) -> Result<(), AsmError> {
+        let next = self.asm.new_label();
+        self.asm.short_jmp(next)?;
+        if self.code_header.is_some() {
+            let fragment = self.ga_get(GlobalLabels::IBreakpointTrampolineShared)?;
+            self.aligned_call_fragment(fragment)?;
+        } else {
+            // NIF or BIF stub; this trampoline is not used as-is, but its space is reserved.
+            self.asm.emit(|e| e.ud2())?;
+            self.asm.align_code(8)?;
+        }
+        debug_assert!(self.offset().is_multiple_of(8));
+        self.asm.bind(next)?;
+        debug_assert_eq!(
+            Some(self.offset() - BEAM_ASM_FUNC_PROLOGUE_SIZE as usize),
+            self.current_label_offset()
+        );
+        Ok(())
+    }
+
+    /// `emit_i_line_breakpoint_trampoline()`: a short jump over an aligned call to the line
+    /// breakpoint fragment; enabling the breakpoint replaces the jump.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:329-340
+    // (emit_i_line_breakpoint_trampoline), OTP-29.1.1.
+    pub fn emit_i_line_breakpoint_trampoline(&mut self) -> Result<(), AsmError> {
+        let next = self.asm.new_label();
+        self.asm.short_jmp(next)?;
+        let fragment = self.ga_get(GlobalLabels::ILineBreakpointTrampolineShared)?;
+        self.aligned_call_fragment(fragment)?;
+        self.asm.bind(next)
+    }
+
+    /// `emit_i_func_info(Label, Module, Function, Arity)`: the `ErtsCodeInfo` in front of a
+    /// function. Its first word is a valid x86 `call` to `i_func_info_shared` (so a
+    /// `function_clause` traces back to it) followed by two `nop`s and the breakpoint flag;
+    /// then `gen_bp` and the MFA.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:468-500 (emit_i_func_info),
+    // OTP-29.1.1.
+    pub fn emit_i_func_info(
+        &mut self,
+        label: ArgVal,
+        module: ArgVal,
+        function: ArgVal,
+        arity: ArgVal,
+    ) -> Result<(), AsmError> {
+        // `op_i_func_info_IaaI`: the label is a word, not a label operand.
+        let label = u32::try_from(arg_word(label)?).map_err(|_| AsmError::Operand("label"))?;
+        self.functions.push(label);
+        let atom = |arg| match arg {
+            ArgVal::Immediate(word) => Ok(word),
+            _ => Err(AsmError::Operand("atom operand")),
+        };
+        let mfa = arinsal_term::ErtsCodeMfa {
+            module: atom(module)?,
+            function: atom(function)?,
+            arity: arg_word(arity)?,
+        };
+        let fragment = self.ga_get(GlobalLabels::IFuncInfoShared)?;
+        let target = self.resolve_fragment(fragment);
+        self.asm.a.call(target)?;
+        self.asm.emit(|e| e.nop())?;
+        self.asm.emit(|e| e.nop())?;
+        self.asm.a.embed_u8(ERTS_ASM_BP_FLAG_NONE)?;
+        debug_assert!(self.offset().is_multiple_of(8));
+        // `info.gen_bp`, then `info.mfa`.
+        self.asm.a.embed_u64(0)?;
+        self.asm.a.embed_u64(mfa.module)?;
+        self.asm.a.embed_u64(mfa.function)?;
+        self.asm.a.embed_u64(mfa.arity)?;
+        Ok(())
+    }
+
+    /// `emit_label(Label)`: binds a BEAM label; nothing is known about the registers there.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:502-509 (emit_label), OTP-29.1.1.
+    pub fn emit_label(&mut self, label: ArgVal) -> Result<(), AsmError> {
+        let label = self
+            .resolve_beam_label(arg_label(label)?)
+            .ok_or(AsmError::Operand("label number"))?;
+        self.current_label = Some(label);
+        self.asm.bind(label)?;
+        self.reg_cache.invalidate_all();
+        Ok(())
+    }
+
+    /// `emit_aligned_label(Label, Alignment)`.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:511-515 (emit_aligned_label),
+    // OTP-29.1.1.
+    pub fn emit_aligned_label(&mut self, label: ArgVal, alignment: ArgVal) -> Result<(), AsmError> {
+        let alignment =
+            u32::try_from(arg_word(alignment)?).map_err(|_| AsmError::Operand("alignment"))?;
+        self.asm.align_code(alignment)?;
+        self.emit_label(label)
+    }
+
+    /// `emit_i_func_label(Label)`: the 8-byte aligned label of a function's `ErtsCodeInfo`.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:517-520 (emit_i_func_label),
+    // OTP-29.1.1.
+    pub fn emit_i_func_label(&mut self, label: ArgVal) -> Result<(), AsmError> {
+        self.flush_last_error()?;
+        self.emit_aligned_label(label, ArgVal::Word(8))
+    }
+
+    /// `emit_on_load()`: the current function is the module's `-on_load` function.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:522-524 (emit_on_load),
+    // OTP-29.1.1.
+    pub fn emit_on_load(&mut self) -> Result<(), AsmError> {
+        self.on_load = self.current_label;
+        Ok(())
+    }
+
+    /// `emit_int_code_end()`: marks the end of the last function, guards it with a halt, and
+    /// emits the dispatch-table thunks of the global fragments the module calls.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:526-536 (emit_int_code_end),
+    // OTP-29.1.1.
+    pub fn emit_int_code_end(&mut self) -> Result<(), AsmError> {
+        let code_end = self.asm.new_label();
+        self.asm.bind(code_end)?;
+        self.code_end = Some(code_end);
+        self.emit_nyi(c"int_code_end")?;
+        self.emit_dispatch_table()
+    }
+
+    /// `emit_line(Loc)`: lines need no code; only an error at the very end of the previous
+    /// instruction must not be attributed to this line.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:538-544 (emit_line), OTP-29.1.1.
+    pub fn emit_line(&mut self, _loc: ArgVal) -> Result<(), AsmError> {
+        self.flush_last_error()
+    }
+
+    /// `emit_func_line(Loc)`: emits nothing.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:546-547 (emit_func_line),
+    // OTP-29.1.1.
+    pub fn emit_func_line(&mut self, _loc: ArgVal) -> Result<(), AsmError> {
+        Ok(())
+    }
+
+    /// `emit_empty_func_line()`: emits nothing.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:549-550 (emit_empty_func_line),
+    // OTP-29.1.1.
+    pub fn emit_empty_func_line(&mut self) -> Result<(), AsmError> {
+        Ok(())
+    }
+
+    /// `emit_executable_line(Loc, Index)`: emits nothing; its coverage counter is emitted by
+    /// the loader (`beamasm_emit_coverage`).
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:552-554 (emit_executable_line),
+    // OTP-29.1.1.
+    pub fn emit_executable_line(&mut self, _loc: ArgVal, _index: ArgVal) -> Result<(), AsmError> {
+        Ok(())
+    }
+
+    /// `emit_i_debug_breakpoint()`: never executed.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:560-562, OTP-29.1.1.
+    pub fn emit_i_debug_breakpoint(&mut self) -> Result<(), AsmError> {
+        self.emit_nyi(c"i_debug_breakpoint should never be called")
+    }
+
+    /// `emit_i_generic_breakpoint()`: never executed.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:564-566, OTP-29.1.1.
+    pub fn emit_i_generic_breakpoint(&mut self) -> Result<(), AsmError> {
+        self.emit_nyi(c"i_generic_breakpoint should never be called")
+    }
+
+    /// `emit_trace_jump(_)`: never executed.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:568-570, OTP-29.1.1.
+    pub fn emit_trace_jump(&mut self, _arg: ArgVal) -> Result<(), AsmError> {
+        self.emit_nyi(c"trace_jump should never be called")
+    }
+
+    /// `emit_call_error_handler()`: never executed.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:572-574, OTP-29.1.1.
+    pub fn emit_call_error_handler(&mut self) -> Result<(), AsmError> {
+        self.emit_nyi(c"call_error_handler should never be called")
+    }
+
+    /// `code.label_offset_from_base(current_label)` while emitting.
+    pub(crate) fn current_label_offset(&self) -> Option<usize> {
+        Some(self.asm.a.label_location(self.current_label?)?.offset)
+    }
+
+    /// `current_label`.
+    pub(crate) fn current_label(&self) -> Option<Label> {
+        self.current_label
+    }
+}
+
+/// Code generation and the patching of the loaded module, erts'
+/// erts/emulator/beam/jit/beam_jit_common.cpp `BeamModuleAssembler::codegen` / `getCode` /
+/// `patch*` on x86.
+impl BeamModuleAssembler {
+    /// `codegen(allocator, &executable, &writable, in_hdr, &out_exec_hdr, &out_rw_hdr)`:
+    /// moves the code into executable memory, copies `in_hdr` into the module's header and
+    /// fills its `on_load` and function table (each function's `ErtsCodeInfo`, then the end of
+    /// the module code). Returns the span (both views) and the executable header address.
+    /// The module stays writable through the span for the `patch_*` calls that follow.
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:217-256 (BeamModuleAssembler::codegen),
+    // OTP-29.1.1.
+    pub fn codegen(
+        &mut self,
+        in_hdr: &BeamCodeHeader,
+    ) -> Result<(arinsal_x64::exec::CodeMemory, usize), AsmError> {
+        let code_header = self
+            .code_header
+            .ok_or(AsmError::Operand("module assembler without a code header"))?;
+        let mut memory = self.asm.codegen()?;
+        let offset = self
+            .asm
+            .label_offset_from_base(code_header)
+            .ok_or(AsmError::Operand("code header"))?;
+        let mut hdr = *in_hdr;
+        hdr.on_load = self.get_on_load().unwrap_or(0);
+        let write = |memory: &mut arinsal_x64::exec::CodeMemory, at: usize, word: u64| {
+            memory
+                .write(at, &word.to_le_bytes())
+                .map_err(|_| AsmError::AllocCode)
+        };
+        for (i, word) in hdr.head_words().into_iter().enumerate() {
+            write(&mut memory, offset + i * 8, word)?;
+        }
+        let functions = offset + core::mem::offset_of!(BeamCodeHeader, functions);
+        for (i, label) in self.functions.iter().enumerate() {
+            let ci = self
+                .get_code(*label)
+                .ok_or(AsmError::Operand("function label"))?;
+            write(&mut memory, functions + i * 8, ci as u64)?;
+        }
+        let base = memory.as_ptr() as usize;
+        let module_end = base + self.asm.get_offset();
+        write(
+            &mut memory,
+            functions + self.functions.len() * 8,
+            module_end as u64,
+        )?;
+        Ok((memory, base + offset))
+    }
+
+    /// `getCode(BeamLabel)`: the executable address of a BEAM label after codegen.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:73-76 (getCode), OTP-29.1.1.
+    pub fn get_code(&self, label: u32) -> Option<usize> {
+        self.asm.get_code(self.resolve_beam_label(label)?)
+    }
+
+    /// `getCodeHeader()`.
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:494-496 (getCodeHeader), OTP-29.1.1.
+    pub fn get_code_header(&self) -> Option<usize> {
+        self.asm.get_code(self.code_header?)
+    }
+
+    /// `getCodeSize()`: the size of the whole module image.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:1294-1297 (getCodeSize), OTP-29.1.1.
+    pub fn get_code_size(&self) -> Option<usize> {
+        self.asm.code_size()
+    }
+
+    /// `getOnLoad()`: the `ErtsCodeInfo` of the `-on_load` function (`erts_code_to_codeinfo`
+    /// of its entry), if any.
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:498-504 (getOnLoad), OTP-29.1.1.
+    pub fn get_on_load(&self) -> Option<usize> {
+        Some(self.asm.get_code(self.on_load?)? - core::mem::size_of::<ErtsCodeInfo>())
+    }
+
+    /// `code_end` after codegen: the end of the last function.
+    pub fn get_code_end(&self) -> Option<usize> {
+        self.asm.get_code(self.code_end?)
+    }
+
+    /// Writes `value` over a patch site's `LLONG_MAX` placeholder.
+    fn write_patch(
+        &self,
+        rw: &mut arinsal_x64::exec::CodeMemory,
+        patch: &Patch,
+        value: u64,
+    ) -> Result<(), AsmError> {
+        let offset = self
+            .asm
+            .label_offset_from_base(patch.at)
+            .ok_or(AsmError::Operand("patch label"))?;
+        let where_ = offset + patch.ptr_offs;
+        if cfg!(debug_assertions) {
+            // `ASSERT(LLONG_MAX == *where)`.
+            let mut placeholder = [0; 8];
+            rw.read(where_, &mut placeholder)
+                .map_err(|_| AsmError::AllocCode)?;
+            debug_assert_eq!(u64::from_le_bytes(placeholder), i64::MAX as u64);
+        }
+        rw.write(where_, &value.to_le_bytes())
+            .map_err(|_| AsmError::AllocCode)
+    }
+
+    /// `patchCatches(rw_base)`: allocates a catch index for every `catch` handler, chaining
+    /// them from `BEAM_CATCHES_NIL`, and patches each site's `mov` with its catch tag. Returns
+    /// the head of the module's catch chain.
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:506-531 (patchCatches), OTP-29.1.1.
+    pub fn patch_catches(&self, rw: &mut arinsal_x64::exec::CodeMemory) -> Result<u32, AsmError> {
+        let mut catch_no = BEAM_CATCHES_NIL;
+        for c in &self.catches {
+            let handler = self
+                .asm
+                .get_code(c.handler)
+                .ok_or(AsmError::Operand("catch handler"))?;
+            catch_no = beam_catches_cons(handler, catch_no, core::ptr::null_mut());
+            let catch_term = make_catch(catch_no);
+            // With the current tag scheme, more than 33 million catches can exist at once.
+            assert!(catch_term >> 31 == 0);
+            let offset = self
+                .asm
+                .label_offset_from_base(c.patch.at)
+                .ok_or(AsmError::Operand("catch patch label"))?;
+            let where_ = offset + c.patch.ptr_offs;
+            if cfg!(debug_assertions) {
+                // `ASSERT(INT_MAX == *where)`.
+                let mut placeholder = [0; 4];
+                rw.read(where_, &mut placeholder)
+                    .map_err(|_| AsmError::AllocCode)?;
+                debug_assert_eq!(u32::from_le_bytes(placeholder), i32::MAX as u32);
+            }
+            rw.write(where_, &(catch_term as u32).to_le_bytes())
+                .map_err(|_| AsmError::AllocCode)?;
+        }
+        Ok(catch_no)
+    }
+
+    /// `patchImport(rw_base, index, import)`: `import + val_offs` into every use of the
+    /// import entry `index`.
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:533-543 (patchImport), OTP-29.1.1.
+    pub fn patch_import(
+        &self,
+        rw: &mut arinsal_x64::exec::CodeMemory,
+        index: u32,
+        import: usize,
+    ) -> Result<(), AsmError> {
+        for patch in self.imports.get(&index).into_iter().flatten() {
+            self.write_patch(rw, patch, import as u64 + patch.val_offs as u64)?;
+        }
+        Ok(())
+    }
+
+    /// `patchLambda(rw_base, index, fe)`: the fun entry `fe` into every use of lambda `index`.
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:545-555 (patchLambda), OTP-29.1.1.
+    pub fn patch_lambda(
+        &self,
+        rw: &mut arinsal_x64::exec::CodeMemory,
+        index: u32,
+        fe: usize,
+    ) -> Result<(), AsmError> {
+        for patch in self.lambdas.get(&index).into_iter().flatten() {
+            self.write_patch(rw, patch, fe as u64 + patch.val_offs as u64)?;
+        }
+        Ok(())
+    }
+
+    /// `patchLiteral(rw_base, index, lit)`: the moved literal `lit` into every use of the
+    /// literal keyed `key` (Arinsal keys literal patches by the term the loader resolved, see
+    /// [`Self::literals`]).
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:557-567 (patchLiteral), OTP-29.1.1.
+    pub fn patch_literal(
+        &self,
+        rw: &mut arinsal_x64::exec::CodeMemory,
+        key: u64,
+        lit: u64,
+    ) -> Result<(), AsmError> {
+        for patch in self.literals.get(&key).into_iter().flatten() {
+            self.write_patch(rw, patch, lit + patch.val_offs as u64)?;
+        }
+        Ok(())
+    }
+
+    /// `patchStrings(rw_base, string_table)`: the address of each string in the module's
+    /// string table into its uses.
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:569-579 (patchStrings), OTP-29.1.1.
+    pub fn patch_strings(
+        &self,
+        rw: &mut arinsal_x64::exec::CodeMemory,
+        string_table: usize,
+    ) -> Result<(), AsmError> {
+        for patch in &self.strings {
+            self.write_patch(rw, patch, string_table as u64 + patch.val_offs as u64)?;
+        }
         Ok(())
     }
 }

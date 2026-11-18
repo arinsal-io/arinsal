@@ -5,6 +5,9 @@
 pub mod beam_asm;
 pub mod beam_asm_global;
 pub mod beam_asm_module;
+#[cfg(test)]
+#[allow(unsafe_code)]
+mod codegen_tests;
 pub mod instr_arith;
 pub mod instr_bs;
 pub mod instr_call;

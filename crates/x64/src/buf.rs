@@ -65,6 +65,24 @@ pub struct FinalizedCode {
 }
 
 impl FinalizedCode {
+    /// `CodeHolder::code_size()`: the size of the flattened image, every section included.
+    // Port of erts/emulator/asmjit/core/codeholder.cpp (CodeHolder::code_size), OTP-29.1.1.
+    pub fn code_size(&self) -> usize {
+        self.address_table_offset + self.address_table.len() * 8
+    }
+
+    /// `CodeHolder::label_offset_from_base(label)`: the offset of a bound label from the start
+    /// of the flattened image; `None` for an unbound or unknown label.
+    // Port of erts/emulator/asmjit/core/codeholder.h (CodeHolder::label_offset_from_base),
+    // OTP-29.1.1.
+    pub fn label_offset_from_base(&self, label: Label) -> Option<usize> {
+        let location = self.labels.get(label.0 as usize).copied().flatten()?;
+        Some(match location.section {
+            Section::Code => location.offset,
+            Section::Data => self.data_offset + location.offset,
+        })
+    }
+
     /// Combines the sections using the finalized aligned data offset.
     pub fn image(&self) -> Result<Vec<u8>, BufferError> {
         let end = self

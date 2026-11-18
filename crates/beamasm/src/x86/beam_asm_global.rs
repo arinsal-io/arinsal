@@ -450,6 +450,8 @@ pub struct BeamGlobalAssembler {
     pub asm: BeamAssembler,
     /// `labels`: one predeclared label per [`GlobalLabels`].
     labels: Vec<Label>,
+    /// `ptrs`: the executable address of every label, filled by [`Self::codegen`].
+    ptrs: Vec<Option<usize>>,
 }
 
 /// `ErtsCodeMFA` a global fragment raises with (`static ErtsCodeMFA mfa` in its emitter).
@@ -492,7 +494,11 @@ impl BeamGlobalAssembler {
     pub fn declare_labels() -> Self {
         let mut asm = BeamAssembler::new();
         let labels = GLOBAL_LABELS.iter().map(|_| asm.new_label()).collect();
-        Self { asm, labels }
+        Self {
+            asm,
+            labels,
+            ptrs: Vec::new(),
+        }
     }
 
     /// `labels[lbl]`.
@@ -551,6 +557,35 @@ impl BeamGlobalAssembler {
             }
         }
         Ok(ga)
+    }
+
+    /// Moves the emitted fragments into executable memory and publishes `ptrs`, last so that
+    /// global code can only refer to its labels. The returned span holds the global code for
+    /// as long as the emulator runs (erts never releases it). `beamasm_metadata_insert` (the
+    /// gdb/perf ranges) is not done: Arinsal has no JIT metadata registry yet.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:57-100
+    // (BeamGlobalAssembler::BeamGlobalAssembler, from codegen), OTP-29.1.1.
+    pub fn codegen(&mut self) -> Result<arinsal_x64::exec::CodeMemory, AsmError> {
+        // `VirtMem::flush_instruction_cache` is a no-op on x86-64 and the dual mapping keeps
+        // the RX view executable, so `protect_jit_memory` has nothing to change.
+        let memory = self.asm.codegen()?;
+        self.ptrs = self
+            .labels
+            .iter()
+            .map(|label| self.asm.get_code(*label))
+            .collect();
+        Ok(memory)
+    }
+
+    /// `get_<fragment>()` after [`Self::codegen`]: `ptrs[label]`.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_global.hpp.pl (decl_get_funcs), OTP-29.1.1.
+    pub fn get_ptr(&self, label: GlobalLabels) -> Option<usize> {
+        self.ptrs.get(label as usize).copied().flatten()
+    }
+
+    /// `ptrs` indexed by [`GlobalLabels`], for the module assemblers' `ga`.
+    pub fn ptrs(&self) -> &[Option<usize>] {
+        &self.ptrs
     }
 
     /// `get_<fragment>()` once the global code is placed at `base`: `getCode(labels[label])`.

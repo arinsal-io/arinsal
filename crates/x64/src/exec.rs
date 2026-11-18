@@ -481,6 +481,33 @@ impl CodeMemory {
         Ok(())
     }
 
+    /// Copies bytes out of the span through the RW alias (the patch sites' placeholders the
+    /// loader `ASSERT`s before patching).
+    pub fn read(&self, offset: usize, bytes: &mut [u8]) -> Result<(), ExecError> {
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or(ExecError::InvalidSize)?;
+        if end > self.capacity {
+            return Err(ExecError::OutOfBounds {
+                offset,
+                len: bytes.len(),
+                capacity: self.capacity,
+            });
+        }
+        if !bytes.is_empty() {
+            // SAFETY: the requested range was checked against this live span, whose RW alias
+            // stays mapped and readable for as long as `self` lives.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.rw.wrapping_add(offset),
+                    bytes.as_mut_ptr(),
+                    bytes.len(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the RX alias address.
     pub fn as_ptr(&self) -> *const u8 {
         self.rx

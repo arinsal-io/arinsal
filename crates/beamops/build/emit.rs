@@ -12,6 +12,7 @@ impl Makeops {
         let mut gen_to_spec: HashMap<&str, usize> = HashMap::new();
         let mut num_specific: HashMap<&str, usize> = HashMap::new();
         let mut opc = String::new();
+        let mut opcodes = String::new();
         let mut spec_opnum = 0usize;
         for (key, defs) in &self.specific_op {
             gen_to_spec.insert(key, spec_opnum);
@@ -56,6 +57,11 @@ impl Makeops {
                     mask[2],
                     sign,
                     spec_opnum
+                ));
+                // `#define op_<print_name> <number>`.
+                opcodes.push_str(&format!(
+                    "    pub const op_{}: u16 = {spec_opnum};\n",
+                    print_name(&def.name, &def.args)
                 ));
                 spec_opnum += 1;
             }
@@ -112,6 +118,11 @@ impl Makeops {
         out.push_str("];\n\npub(crate) static GEN_OPC: [GenOpEntry; NUM_GENERIC_OPS] = [\n");
         out.push_str(&generic);
         out.push_str("];\n\n");
+        out.push_str(
+            "/// beam_opcodes.h `op_<name>_<signature>`: the number of each specific instruction.\n#[allow(non_upper_case_globals, dead_code)]\npub mod beam_opcodes {\n",
+        );
+        out.push_str(&opcodes);
+        out.push_str("}\n\n");
         // `#define genop_<name>_<arity> <number>`.
         for (i, name) in self.gen_opname.iter().enumerate() {
             if let Some(name) = name {

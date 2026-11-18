@@ -8,8 +8,9 @@
 //! `x86::Assembler` attached to the assembler's `CodeHolder`: here the `arinsal_x64`
 //! [`CodeBuffer`], whose instructions are encoded by [`Emitter`] one asmjit call at a time.
 
-use arinsal_x64::buf::{BufferError, CodeBuffer, Label};
+use arinsal_x64::buf::{BufferError, CodeBuffer, FinalizedCode, Label};
 use arinsal_x64::enc::{self, CondCode, Emitter, EncodeError, Gp, Mem};
+use arinsal_x64::exec::CodeMemory;
 
 use crate::common::args::ArgVal;
 use crate::{
@@ -331,6 +332,9 @@ pub enum AsmError {
     Buffer(BufferError),
     /// An operand the instruction does not take (erts `ASSERT`s it at load time).
     Operand(&'static str),
+    /// The JIT allocator could not allocate or write the code (erts `ERTS_ASSERT`s "Failed
+    /// to allocate module code").
+    AllocCode,
 }
 
 impl From<EncodeError> for AsmError {
@@ -360,6 +364,11 @@ impl std::error::Error for AsmError {}
 pub struct BeamAssembler {
     /// `a` attached to `code`: the code and read-only data sections, labels and fixups.
     pub a: CodeBuffer,
+    /// `code` once flattened and relocated by [`Self::codegen`]: the label offsets from the
+    /// base address and the text size, which `getCode` and `getOffset` read afterwards.
+    code: Option<FinalizedCode>,
+    /// `code.base_address()`: the executable address the code was relocated to.
+    base_address: Option<usize>,
 }
 
 impl BeamAssembler {
@@ -374,6 +383,69 @@ impl BeamAssembler {
         f: impl FnOnce(&mut Emitter) -> Result<(), EncodeError>,
     ) -> Result<(), AsmError> {
         Ok(self.a.emit(f)?)
+    }
+
+    /// Flattens the code, resolves every label, allocates executable memory from the JIT
+    /// allocator (dual-mapped: an RX and an RW view of the same pages), relocates the code to
+    /// the RX address and copies it in through the RW view. The returned span owns both views
+    /// (erts' `executable_ptr` / `writable_ptr`); the code stays inspectable through
+    /// [`Self::get_code`] and [`Self::get_offset`].
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:87-140 (BeamAssemblerCommon::codegen),
+    // OTP-29.1.1.
+    pub fn codegen(&mut self) -> Result<CodeMemory, AsmError> {
+        // `code.flatten()`, `code.resolve_cross_section_fixups()`; an unresolved label fails
+        // here as erts' "Could not resolve all labels" assertion.
+        let mut code = std::mem::take(&mut self.a).finish()?;
+        // `allocator->alloc(out, code.code_size() + 16)`.
+        let mut memory = CodeMemory::new(code.code_size() + 16).map_err(|_| AsmError::AllocCode)?;
+        let base = memory.as_ptr() as usize;
+        // `code.relocate_to_base(executable)`, `code.copy_flattened_data(writable, ...)`.
+        code.relocate(base as u64)?;
+        let image = code.image()?;
+        memory.write(0, &image).map_err(|_| AsmError::AllocCode)?;
+        self.code = Some(code);
+        self.base_address = Some(base);
+        Ok(memory)
+    }
+
+    /// `getBaseAddress()`: the address the code was relocated to; `None` before codegen.
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:78-81 (getBaseAddress), OTP-29.1.1.
+    pub fn get_base_address(&self) -> Option<usize> {
+        self.base_address
+    }
+
+    /// `getCode(Label)`: the executable address of a bound label after codegen.
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:142-145 (getCode), OTP-29.1.1.
+    pub fn get_code(&self, label: Label) -> Option<usize> {
+        let code = self.code.as_ref()?;
+        Some(self.base_address? + code.label_offset_from_base(label)?)
+    }
+
+    /// `code.label_offset_from_base(label)` after codegen.
+    pub fn label_offset_from_base(&self, label: Label) -> Option<usize> {
+        self.code.as_ref()?.label_offset_from_base(label)
+    }
+
+    /// `getOffset()`: `a.offset()`, the offset in the text section; after codegen the size
+    /// of the text section.
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:83-85 (getOffset), OTP-29.1.1.
+    pub fn get_offset(&self) -> usize {
+        match &self.code {
+            Some(code) => code.code.len(),
+            None => self.a.offset(),
+        }
+    }
+
+    /// `code.code_size()` after codegen: the size of the whole image.
+    pub fn code_size(&self) -> Option<usize> {
+        self.code.as_ref().map(FinalizedCode::code_size)
+    }
+
+    /// `embed_zeros(size)`.
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:185-197 (embed_zeros), OTP-29.1.1.
+    pub fn embed_zeros(&mut self, size: usize) -> Result<(), AsmError> {
+        self.a.embed(&vec![0; size])?;
+        Ok(())
     }
 
     /// `a.new_label()`.

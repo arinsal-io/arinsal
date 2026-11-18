@@ -169,7 +169,11 @@ pub fn beam_load_emit_op(
             }
             ('t' | 'I' | 'W', operand) => ArgVal::Word(word(operand, letter)?),
             ('A', operand) => ArgVal::Word(make_arityval(word(operand, letter)?)),
-            ('f' | 'j' | 'L', SpecificOperand::Label(label)) => ArgVal::Label(*label),
+            ('f' | 'j', SpecificOperand::Label(label)) => ArgVal::Label(*label),
+            // `BeamLoadVerifyTag(stp, tag, TAG_u)`, then `curr->type = TAG_f`.
+            ('L', operand) => ArgVal::Label(
+                u32::try_from(word(operand, letter)?).map_err(|_| "label number overflow")?,
+            ),
             ('e', operand) => {
                 let index = word(operand, letter)?;
                 if index >= beam.imports.len() as u64 {

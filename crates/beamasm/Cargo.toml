@@ -16,4 +16,6 @@ arinsal-term = { path = "../term" }
 arinsal-x64 = { path = "../x64" }
 
 [dev-dependencies]
+arinsal-beam.workspace = true
+arinsal-beamops = { path = "../beamops" }
 similar-asserts = "2"
