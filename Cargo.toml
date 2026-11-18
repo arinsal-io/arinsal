@@ -87,6 +87,9 @@ multiple_unsafe_ops_per_block = "warn"
 
 [profile.release]
 debug = 1
+# erts aborts on an internal fault (erts_exit / abort with a crash dump); a Rust panic in the
+# runtime is such a fault, so it aborts instead of unwinding.
+panic = "abort"
 codegen-units = 1
 lto = "thin"
 
