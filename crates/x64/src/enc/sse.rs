@@ -37,11 +37,10 @@ impl Emitter {
     }
 
     fn gp_id_width(reg: Gp) -> Result<(u8, u8), EncodeError> {
-        if !matches!(reg.size(), 4 | 8) {
-            return Err(EncodeError::InvalidInstruction);
+        if reg.id > 15 {
+            return Err(EncodeError::InvalidRegister(reg));
         }
-        let id = Self::gp_id(reg, &mut ByteRex::default())?;
-        Ok((id, reg.size()))
+        Ok((reg.id, reg.size()))
     }
 
     fn xmm_rm(&mut self, opcode: Opcode, dst: Xmm, src: Xmm) -> Result<(), EncodeError> {
@@ -96,10 +95,7 @@ impl Emitter {
 
     /// `movq xmm, gp` (asmjit `a.movq(Xmm, Gp64)`).
     pub fn movq_xr(&mut self, dst: Xmm, src: Gp) -> Result<(), EncodeError> {
-        let (id, size) = Self::gp_id_width(src)?;
-        if size != 8 {
-            return Err(EncodeError::InvalidInstruction);
-        }
+        let (id, _) = Self::gp_id_width(src)?;
         let d = Self::xmm_id(dst)?;
         self.x86_rm(MOVQ_GP_LOAD, d, Rm::Reg(id), ByteRex::default(), Imm::NONE)
     }
@@ -116,10 +112,7 @@ impl Emitter {
 
     /// `movq gp, xmm` (asmjit `a.movq(Gp64, Xmm)`).
     pub fn movq_rx(&mut self, dst: Gp, src: Xmm) -> Result<(), EncodeError> {
-        let (id, size) = Self::gp_id_width(dst)?;
-        if size != 8 {
-            return Err(EncodeError::InvalidInstruction);
-        }
+        let (id, _) = Self::gp_id_width(dst)?;
         let s = Self::xmm_id(src)?;
         self.x86_rm(MOVQ_GP_STORE, s, Rm::Reg(id), ByteRex::default(), Imm::NONE)
     }
@@ -281,13 +274,9 @@ impl Emitter {
 
     /// `cvtsi2sd xmm, [mem]` (asmjit `a.cvtsi2sd(Xmm, Mem)`).
     pub fn cvtsi2sd_xm(&mut self, dst: Xmm, src: Mem) -> Result<(), EncodeError> {
-        let size = Self::mem_size(&src)?;
-        if !matches!(size, 4 | 8) {
-            return Err(EncodeError::InvalidInstruction);
-        }
         let d = Self::xmm_id(dst)?;
         self.x86_rm(
-            CVTSI2SD.with_w(size == 8),
+            CVTSI2SD.with_w(src.size == 8),
             d,
             Rm::Mem(&src),
             ByteRex::default(),

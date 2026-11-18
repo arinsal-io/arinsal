@@ -88,7 +88,9 @@ macro_rules! family_tests {
     };
 }
 
-family_tests!(alu, mov, avx);
+family_tests!(
+    alu, mov, branch, cond, stack, muldiv, shift, misc, bmi, sse, avx
+);
 
 /// Label-relative jumps and `align(kCode, n)` padding through the oracle. The branch families
 /// (encoded by a label layer, not `Emitter`) append their cases to `oracle_cases` as `;`-separated

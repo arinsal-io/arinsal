@@ -33,12 +33,12 @@ impl Emitter {
     }
 
     fn muldiv_m(&mut self, src: Mem, extension: u8) -> Result<(), EncodeError> {
-        let size = Self::mem_size(&src)?;
-        if !matches!(size, 1 | 2 | 4 | 8) {
-            return Err(EncodeError::InvalidInstruction);
+        let size = src.size;
+        if size == 0 {
+            return Err(EncodeError::AmbiguousOperandSize);
         }
         self.x86_rm(
-            width_opcode(if size == 1 { 0xF6 } else { 0xF7 }, size),
+            Opcode::legacy(0xF6).arith_by_size(size),
             extension,
             Rm::Mem(&src),
             ByteRex::default(),
@@ -46,28 +46,26 @@ impl Emitter {
         )
     }
 
-    fn imul_imm(&mut self, dst: Gp, src: ImulSource<'_>, imm: i64) -> Result<(), EncodeError> {
+    fn imul_imm(
+        &mut self,
+        dst: Gp,
+        src: ImulSource<'_>,
+        imm: i64,
+        sign_extend_i32_for_short: bool,
+    ) -> Result<(), EncodeError> {
         let size = dst.size();
-        if !matches!(size, 2 | 4 | 8) {
-            return Err(EncodeError::InvalidInstruction);
-        }
         let imm_size = if size == 2 { 2 } else { 4 };
-        let imm_value = if size == 4 { imm as i32 as i64 } else { imm };
+        let imm_value = if size == 4 && sign_extend_i32_for_short {
+            imm as i32 as i64
+        } else {
+            imm
+        };
         let short = is_int(imm_value, 8);
         let opcode = width_opcode(if short { 0x6B } else { 0x69 }, size);
-        let mut rex = ByteRex::default();
-        let dst_id = Self::gp_id(dst, &mut rex)?;
+        let dst_id = raw_gp_id(dst)?;
+        let rex = ByteRex::default();
         let rm = match src {
-            ImulSource::Reg(src) => {
-                let mut src_rex = ByteRex::default();
-                if src.size() != size {
-                    return Err(EncodeError::OperandSizeMismatch);
-                }
-                let src_id = Self::gp_id(src, &mut src_rex)?;
-                rex.force |= src_rex.force;
-                rex.invalid |= src_rex.invalid;
-                Rm::Reg(src_id)
-            }
+            ImulSource::Reg(src) => Rm::Reg(raw_gp_id(src)?),
             ImulSource::Mem(mem) => Rm::Mem(mem),
         };
         let output_imm_size = if short { 1 } else { imm_size };
@@ -136,33 +134,29 @@ impl Emitter {
                 Imm::NONE,
             );
         }
-        if !matches!(size, 2 | 4 | 8) {
-            return Err(EncodeError::InvalidInstruction);
-        }
-        let mut rex = ByteRex::default();
-        let dst_id = Self::gp_id(dst, &mut rex)?;
+        let dst_id = raw_gp_id(dst)?;
         self.x86_rm(
             Opcode::m0f(0xAF).prefix_by_size(size),
             dst_id,
             Rm::Mem(&src),
-            rex,
+            ByteRex::default(),
             Imm::NONE,
         )
     }
 
     /// Three-operand signed `imul dst, src, imm` (asmjit `a.imul(Gp, Gp, Imm)`).
     pub fn imul_rri(&mut self, dst: Gp, src: Gp, imm: i64) -> Result<(), EncodeError> {
-        self.imul_imm(dst, ImulSource::Reg(src), imm)
+        self.imul_imm(dst, ImulSource::Reg(src), imm, false)
     }
 
     /// Three-operand signed `imul dst, mem, imm` (asmjit `a.imul(Gp, Mem, Imm)`).
     pub fn imul_rmi(&mut self, dst: Gp, src: Mem, imm: i64) -> Result<(), EncodeError> {
-        self.imul_imm(dst, ImulSource::Mem(&src), imm)
+        self.imul_imm(dst, ImulSource::Mem(&src), imm, true)
     }
 
     /// Two-operand immediate `imul dst, imm` shorthand (asmjit `a.imul(Gp, Imm)`).
     pub fn imul_ri(&mut self, dst: Gp, imm: i64) -> Result<(), EncodeError> {
-        self.imul_imm(dst, ImulSource::Reg(dst), imm)
+        self.imul_imm(dst, ImulSource::Reg(dst), imm, true)
     }
 
     /// Unsigned `div reg` (asmjit `a.div(Gp)`), dividing implicit RDX:RAX.
@@ -193,5 +187,13 @@ impl Emitter {
     /// Sign-extends EAX into EDX:EAX (asmjit `a.cdq()`).
     pub fn cdq(&mut self) -> Result<(), EncodeError> {
         self.x86_op(Opcode::legacy(0x99), Imm::NONE)
+    }
+}
+
+fn raw_gp_id(reg: Gp) -> Result<u8, EncodeError> {
+    if reg.id <= 15 {
+        Ok(reg.id)
+    } else {
+        Err(EncodeError::InvalidRegister(reg))
     }
 }

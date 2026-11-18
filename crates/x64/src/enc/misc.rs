@@ -25,7 +25,7 @@ impl Emitter {
                 return self.x86_op_reg(opcode, other, ByteRex::default(), Imm::NONE);
             }
             if size == 8 {
-                return self.x86_op(Opcode::legacy(0x90).with_w(true), Imm::NONE);
+                return self.x86_op(Opcode::legacy(0x90), Imm::NONE);
             }
         }
 
@@ -66,12 +66,12 @@ impl Emitter {
 
     /// `lock inc qword ptr [mem]` (asmjit `a.lock().inc(Mem)`).
     pub fn lock_inc_m(&mut self, dst: Mem) -> Result<(), EncodeError> {
-        if dst.size != 0 && dst.size != 8 {
-            return Err(EncodeError::InvalidInstruction);
+        if dst.size == 0 {
+            return Err(EncodeError::AmbiguousOperandSize);
         }
         self.x86_rm_with_prefix(
             Some(0xF0),
-            Opcode::legacy(0xFF).with_w(true),
+            Opcode::legacy(0xFE).arith_by_size(dst.size),
             0,
             Rm::Mem(&dst),
             ByteRex::default(),

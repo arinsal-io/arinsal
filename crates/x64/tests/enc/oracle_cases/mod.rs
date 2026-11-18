@@ -10,7 +10,15 @@ use arinsal_x64::enc::*;
 
 mod alu;
 mod avx;
+mod bmi;
+mod branch;
+mod cond;
+mod misc;
 mod mov;
+mod muldiv;
+mod shift;
+mod sse;
+mod stack;
 
 /// The emitter side of a case.
 pub type EmitFn = Box<dyn Fn(&mut Emitter) -> Result<(), EncodeError>>;
@@ -41,6 +49,14 @@ pub fn case(
 pub const FAMILIES: &[(&str, Generator)] = &[
     ("alu", alu::cases),
     ("mov", mov::cases),
+    ("branch", branch::cases),
+    ("cond", cond::cases),
+    ("stack", stack::cases),
+    ("muldiv", muldiv::cases),
+    ("shift", shift::cases),
+    ("misc", misc::cases),
+    ("bmi", bmi::cases),
+    ("sse", sse::cases),
     ("avx", avx::cases),
 ];
 

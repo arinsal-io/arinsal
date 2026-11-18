@@ -52,23 +52,23 @@ fn bmi_register_forms() {
 }
 
 #[test]
-fn bmi_rejects_invalid_widths_without_emitting() {
-    let mut e = Emitter::new();
-    assert_eq!(e.andn_rrr(AL, CL, DL), Err(EncodeError::InvalidInstruction));
-    assert!(e.is_empty());
+fn bmi_follows_asmjit_operand_handling() {
+    let mut narrow = Emitter::new();
+    assert!(narrow.andn_rrr(AL, CL, DL).is_ok());
+    assert!(!narrow.is_empty());
+
+    let mut mixed_widths = Emitter::new();
+    assert!(mixed_widths.bzhi_rrr(RAX, EBX, RCX).is_ok());
+    assert!(!mixed_widths.is_empty());
+
+    let mut narrow_mulx = Emitter::new();
+    assert!(narrow_mulx.mulx_rrr(EAX, EBX, ECX).is_ok());
+    assert!(!narrow_mulx.is_empty());
+
+    let mut invalid_id = Emitter::new();
     assert_eq!(
-        e.bzhi_rrr(RAX, EBX, RCX),
-        Err(EncodeError::OperandSizeMismatch)
-    );
-    assert!(e.is_empty());
-    assert_eq!(
-        e.mulx_rrr(EAX, EBX, ECX),
-        Err(EncodeError::InvalidInstruction)
-    );
-    assert!(e.is_empty());
-    assert_eq!(
-        e.pext_rrr(EAX, EBX, Gp::d(16)),
+        invalid_id.pext_rrr(EAX, EBX, Gp::d(16)),
         Err(EncodeError::InvalidRegister(Gp::d(16)))
     );
-    assert!(e.is_empty());
+    assert!(invalid_id.is_empty());
 }

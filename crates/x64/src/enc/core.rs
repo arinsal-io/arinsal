@@ -113,21 +113,30 @@ impl Opcode {
         self.w = w;
         self
     }
-    /// asmjit `Opcode::add_prefix_by_size`: 66h for 16-bit, REX.W for 64-bit.
+    /// asmjit `Opcode::add_prefix_by_size`: indexed by the low size nibble.
     pub const fn prefix_by_size(mut self, size: u8) -> Self {
-        match size {
+        match size & 0x0f {
             2 => self.pp = Pp::P66,
             8 => self.w = true,
             _ => {}
         }
         self
     }
-    /// asmjit `Opcode::add_arith_by_size`: `+1` for non-byte forms plus [`Self::prefix_by_size`].
+    /// asmjit `Opcode::add_arith_by_size`: uses its 16-entry size mask, including the low nibble.
     pub const fn arith_by_size(mut self, size: u8) -> Self {
-        if size != 1 {
-            self.byte += 1;
+        match size & 0x0f {
+            2 => {
+                self.byte += 1;
+                self.pp = Pp::P66;
+            }
+            4 => self.byte += 1,
+            8 => {
+                self.byte += 1;
+                self.w = true;
+            }
+            _ => {}
         }
-        self.prefix_by_size(size)
+        self
     }
 }
 
@@ -253,13 +262,9 @@ impl Emitter {
         }
     }
 
-    /// Validates a vector register id (0..=15; EVEX registers 16..=31 are not used by erts).
+    /// Passes through the physical id because asmjit's release encoder truncates it in the fields.
     pub(crate) fn vec_id(id: u8) -> Result<u8, EncodeError> {
-        if id > 15 {
-            Err(EncodeError::InvalidVecRegister(id))
-        } else {
-            Ok(id)
-        }
+        Ok(id)
     }
 
     /// Port of asmjit `EmitModSib`/`EmitModVSib` (64-bit, non-VSIB): ModRM, SIB and displacement
@@ -547,7 +552,8 @@ impl Emitter {
         Ok(())
     }
 
-    /// asmjit `EmitVexEvexR` / `EmitVexEvexM` (VEX only): `C5`/`C4` prefix, opcode, ModRM tail.
+    /// Port of asmjit `EmitVexEvexR` / `EmitVexEvexM` in `x86assembler.cpp`, OTP-29.1.1:
+    /// selects EVEX when a register needs its fifth id bit, otherwise emits VEX.
     ///
     /// `reg` is ModRM.reg, `vvvv` the extra source register (0 when unused), `l256` selects
     /// VEX.L. The two-byte `C5` form is used when W, X and B are clear and the map is `0F`.
@@ -567,10 +573,30 @@ impl Emitter {
             Rm::Reg(rb) => Target::Reg(rb),
             Rm::Mem(mem) => Target::Mem(Self::encode_mem(mem, reg)?),
         };
-        let (x, b) = match &target {
-            Target::Reg(rb) => (0, rb >> 3),
-            Target::Mem(enc) => (enc.x, enc.b),
+        let (x, b, rm_hi, is_reg) = match &target {
+            Target::Reg(rb) => (0, rb >> 3, (rb >> 4) & 1, true),
+            Target::Mem(enc) => (enc.x, enc.b, 0, false),
         };
+        if (reg | vvvv) & 0x10 != 0 || rm_hi != 0 {
+            let p0 = (((!(reg >> 3)) & 1) << 7)
+                | (((!(if is_reg { rm_hi } else { x })) & 1) << 6)
+                | (((!b) & 1) << 5)
+                | (((!(reg >> 4)) & 1) << 4)
+                | opcode.map.vex();
+            let p1 = ((opcode.w as u8) << 7) | ((!vvvv & 0xF) << 3) | 0x04 | opcode.pp.vex();
+            let p2 = ((l256 as u8) << 5) | (((!vvvv >> 4) & 1) << 3);
+            self.bytes
+                .extend_from_slice(&[0x62, p0, p1, p2, opcode.byte]);
+            match target {
+                Target::Reg(rb) => {
+                    self.bytes.push(modrm(3, reg, rb));
+                    self.put_imm(imm);
+                    self.last_rip = None;
+                }
+                Target::Mem(enc) => self.put_mem_tail(&enc, imm),
+            }
+            return Ok(());
+        }
         let r = (reg >> 3) & 1;
         let tail = ((!vvvv & 0xF) << 3) | ((l256 as u8) << 2) | opcode.pp.vex();
         if !opcode.w && x == 0 && b == 0 && opcode.map == Map::M0F {

@@ -120,11 +120,9 @@ fn invalid_misc_forms_leave_emitter_unchanged() {
         Err(EncodeError::InvalidAlignment)
     ));
     assert!(e.is_empty());
-    assert!(matches!(
-        e.lock_inc_m(dword_ptr(RAX, 0)),
-        Err(EncodeError::InvalidInstruction)
-    ));
-    assert!(e.is_empty());
+    let mut lock_inc = Emitter::new();
+    assert!(lock_inc.lock_inc_m(dword_ptr(RAX, 0)).is_ok());
+    assert!(!lock_inc.is_empty());
     assert!(matches!(
         e.xchg_rr(RAX, EBX),
         Err(EncodeError::OperandSizeMismatch)

@@ -104,21 +104,11 @@ fn sse_packed_forms() {
 }
 
 #[test]
-fn sse_rejects_invalid_widths_without_emitting() {
+fn sse_follows_asmjit_width_and_register_field_handling() {
     let mut e = Emitter::new();
-    assert_eq!(
-        e.cvtsi2sd_xr(Xmm(0), AL),
-        Err(EncodeError::InvalidInstruction)
-    );
-    assert!(e.is_empty());
-    assert_eq!(
-        e.movq_xr(Xmm(1), RAX.r32()),
-        Err(EncodeError::InvalidInstruction)
-    );
-    assert!(e.is_empty());
-    assert_eq!(
-        e.movdqu_xx(Xmm(16), Xmm(0)),
-        Err(EncodeError::InvalidVecRegister(16))
-    );
-    assert!(e.is_empty());
+    assert!(e.cvtsi2sd_xr(Xmm(0), AL).is_ok());
+    assert!(e.movq_xr(Xmm(1), RAX.r32()).is_ok());
+    let mut wrapped = Emitter::new();
+    assert!(wrapped.movdqu_xx(Xmm(16), Xmm(0)).is_ok());
+    assert_eq!(wrapped.bytes, [0xF3, 0x0F, 0x6F, 0xC0]);
 }

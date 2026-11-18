@@ -213,12 +213,22 @@ std::string run_case(const std::string &line, std::string &hex) {
         size_t sp = stmt.find_first_of(" \t");
         std::string mn = sp == std::string::npos ? stmt : stmt.substr(0, sp);
         std::string rest = sp == std::string::npos ? "" : trim(stmt.substr(sp));
+        std::string prefix;
+        if (mn == "lock" || mn == "rep") {
+            prefix = mn;
+            size_t inner_sp = rest.find_first_of(" \t");
+            mn = inner_sp == std::string::npos ? rest : rest.substr(0, inner_sp);
+            rest = inner_sp == std::string::npos ? "" : trim(rest.substr(inner_sp));
+        }
         Error err;
         if (mn == "bind") {
             err = a.bind(c.label(rest));
             bound[rest] = true;
         } else if (mn == "align") {
             err = a.align(AlignMode::kCode, (uint32_t)strtoul(rest.c_str(), nullptr, 0));
+        } else if (mn == "stosq") {
+            if (prefix == "rep") a.rep();
+            err = a.stosq();
         } else {
             InstId id = InstAPI::string_to_inst_id(Arch::kX64, mn.c_str(), mn.size());
             if (id == 0) return "UnknownMnemonic:" + mn;
@@ -232,6 +242,8 @@ std::string run_case(const std::string &line, std::string &hex) {
             Operand_ none;
             Operand_ o[6];
             for (size_t k = 0; k < 6; k++) o[k] = k < ops.size() ? ops[k] : none;
+            if (prefix == "lock") a.lock();
+            if (prefix == "rep") a.rep();
             err = a.emit(id, o[0], o[1], o[2], o[3], o[4], o[5]);
         }
         if (err != Error::kOk) return DebugUtils::error_as_string(err);

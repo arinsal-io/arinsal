@@ -16,9 +16,9 @@ const VMOVUPS_LOAD: Opcode = Opcode::m0f(0x10);
 const VMOVUPS_STORE: Opcode = Opcode::m0f(0x11);
 const VMOVSD_LOAD: Opcode = Opcode::m0f(0x10).with_pp(Pp::PF2);
 const VMOVSD_STORE: Opcode = Opcode::m0f(0x11).with_pp(Pp::PF2);
-const VMOVQ_GP_LOAD: Opcode = Opcode::m0f(0x6E).with_pp(Pp::P66).with_w(true);
+const VMOVQ_GP_LOAD: Opcode = Opcode::m0f(0x6E).with_pp(Pp::P66);
 const VMOVQ_XMM_LOAD: Opcode = Opcode::m0f(0x7E).with_pp(Pp::PF3);
-const VMOVQ_GP_STORE: Opcode = Opcode::m0f(0x7E).with_pp(Pp::P66).with_w(true);
+const VMOVQ_GP_STORE: Opcode = Opcode::m0f(0x7E).with_pp(Pp::P66);
 const VMOVQ_XMM_STORE: Opcode = Opcode::m0f(0xD6).with_pp(Pp::P66);
 const VPERMILPD: Opcode = Opcode::m0f3a(0x05).with_pp(Pp::P66);
 const VPERMQ: Opcode = Opcode::m0f3a(0x00).with_pp(Pp::P66).with_w(true);
@@ -30,11 +30,14 @@ const VZEROUPPER: Opcode = Opcode::m0f(0x77);
 
 impl Emitter {
     fn avx_gp_id(reg: Gp) -> Result<(u8, u8), EncodeError> {
-        if !matches!(reg.size(), 4 | 8) {
-            return Err(EncodeError::InvalidInstruction);
+        if reg.id > 15 {
+            return Err(EncodeError::InvalidRegister(reg));
         }
-        let id = Self::gp_id(reg, &mut super::core::ByteRex::default())?;
-        Ok((id, reg.size()))
+        Ok((reg.id, reg.size()))
+    }
+
+    fn avx_l_by_size(size: u8) -> bool {
+        (size / 16) & 2 != 0
     }
 
     fn vex_xx(
@@ -137,13 +140,9 @@ impl Emitter {
 
     /// `vcvtsi2sd xmm, xmm, [mem]` (asmjit `a.vcvtsi2sd(Xmm, Xmm, Mem)`, AVX).
     pub fn vcvtsi2sd_xxm(&mut self, dst: Xmm, a: Xmm, src: Mem) -> Result<(), EncodeError> {
-        let size = Self::mem_size(&src)?;
-        if !matches!(size, 4 | 8) {
-            return Err(EncodeError::InvalidInstruction);
-        }
         let (d, v) = (Self::vec_id(dst.0)?, Self::vec_id(a.0)?);
         self.vex_rm(
-            VCVTSI2SD.with_w(size == 8),
+            VCVTSI2SD.with_w(src.size == 8),
             false,
             d,
             v,
@@ -159,12 +158,28 @@ impl Emitter {
 
     /// `vmovdqu xmm, [mem]` (asmjit `a.vmovdqu(Xmm, Mem)`, AVX).
     pub fn vmovdqu_xm(&mut self, dst: Xmm, src: Mem) -> Result<(), EncodeError> {
-        self.vex_xm(VMOVDQU_LOAD, false, dst, src)
+        let d = Self::vec_id(dst.0)?;
+        self.vex_rm(
+            VMOVDQU_LOAD,
+            Self::avx_l_by_size(16 | src.size),
+            d,
+            0,
+            Rm::Mem(&src),
+            Imm::NONE,
+        )
     }
 
     /// `vmovdqu [mem], xmm` (asmjit `a.vmovdqu(Mem, Xmm)`, AVX).
     pub fn vmovdqu_mx(&mut self, dst: Mem, src: Xmm) -> Result<(), EncodeError> {
-        self.vex_mx(VMOVDQU_STORE, false, dst, src)
+        let s = Self::vec_id(src.0)?;
+        self.vex_rm(
+            VMOVDQU_STORE,
+            Self::avx_l_by_size(dst.size | 16),
+            s,
+            0,
+            Rm::Mem(&dst),
+            Imm::NONE,
+        )
     }
 
     /// `vmovdqu ymm, ymm` (asmjit `a.vmovdqu(Ymm, Ymm)`, AVX).
@@ -188,11 +203,15 @@ impl Emitter {
     /// `vmovq xmm, gp` (asmjit `a.vmovq(Xmm, Gp64)`, AVX).
     pub fn vmovq_xr(&mut self, dst: Xmm, src: Gp) -> Result<(), EncodeError> {
         let (r, size) = Self::avx_gp_id(src)?;
-        if size != 8 {
-            return Err(EncodeError::InvalidInstruction);
-        }
         let d = Self::vec_id(dst.0)?;
-        self.vex_rm(VMOVQ_GP_LOAD, false, d, 0, Rm::Reg(r), Imm::NONE)
+        self.vex_rm(
+            VMOVQ_GP_LOAD.with_w(size == 8),
+            false,
+            d,
+            0,
+            Rm::Reg(r),
+            Imm::NONE,
+        )
     }
 
     /// `vmovq xmm, xmm` (asmjit `a.vmovq(Xmm, Xmm)`, AVX).
@@ -208,11 +227,15 @@ impl Emitter {
     /// `vmovq gp, xmm` (asmjit `a.vmovq(Gp64, Xmm)`, AVX).
     pub fn vmovq_rx(&mut self, dst: Gp, src: Xmm) -> Result<(), EncodeError> {
         let (r, size) = Self::avx_gp_id(dst)?;
-        if size != 8 {
-            return Err(EncodeError::InvalidInstruction);
-        }
         let s = Self::vec_id(src.0)?;
-        self.vex_rm(VMOVQ_GP_STORE, false, s, 0, Rm::Reg(r), Imm::NONE)
+        self.vex_rm(
+            VMOVQ_GP_STORE.with_w(size == 8),
+            false,
+            s,
+            0,
+            Rm::Reg(r),
+            Imm::NONE,
+        )
     }
 
     /// `vmovq [mem], xmm` (asmjit `a.vmovq(Mem, Xmm)`, AVX).
@@ -243,12 +266,28 @@ impl Emitter {
 
     /// `vmovups xmm, [mem]` (asmjit `a.vmovups(Xmm, Mem)`, AVX).
     pub fn vmovups_xm(&mut self, dst: Xmm, src: Mem) -> Result<(), EncodeError> {
-        self.vex_xm(VMOVUPS_LOAD, false, dst, src)
+        let d = Self::vec_id(dst.0)?;
+        self.vex_rm(
+            VMOVUPS_LOAD,
+            Self::avx_l_by_size(16 | src.size),
+            d,
+            0,
+            Rm::Mem(&src),
+            Imm::NONE,
+        )
     }
 
     /// `vmovups [mem], xmm` (asmjit `a.vmovups(Mem, Xmm)`, AVX).
     pub fn vmovups_mx(&mut self, dst: Mem, src: Xmm) -> Result<(), EncodeError> {
-        self.vex_mx(VMOVUPS_STORE, false, dst, src)
+        let s = Self::vec_id(src.0)?;
+        self.vex_rm(
+            VMOVUPS_STORE,
+            Self::avx_l_by_size(dst.size | 16),
+            s,
+            0,
+            Rm::Mem(&dst),
+            Imm::NONE,
+        )
     }
 
     /// `vmovups ymm, ymm` (asmjit `a.vmovups(Ymm, Ymm)`, AVX).
@@ -280,7 +319,7 @@ impl Emitter {
         let d = Self::vec_id(dst.0)?;
         self.vex_rm(
             VPERMILPD,
-            false,
+            Self::avx_l_by_size(16 | src.size),
             d,
             0,
             Rm::Mem(&src),
@@ -299,7 +338,7 @@ impl Emitter {
         let d = Self::vec_id(dst.0)?;
         self.vex_rm(
             VPERMILPD,
-            true,
+            Self::avx_l_by_size(32 | src.size),
             d,
             0,
             Rm::Mem(&src),
@@ -316,15 +355,19 @@ impl Emitter {
     /// `vpermq ymm, [mem], imm8` (asmjit `a.vpermq(Ymm, Mem, Imm)`, AVX2).
     pub fn vpermq_ymi(&mut self, dst: Ymm, src: Mem, imm: i64) -> Result<(), EncodeError> {
         let d = Self::vec_id(dst.0)?;
-        self.vex_rm(VPERMQ, true, d, 0, Rm::Mem(&src), Imm::new(imm as u64, 1))
+        self.vex_rm(
+            VPERMQ,
+            Self::avx_l_by_size(32 | src.size),
+            d,
+            0,
+            Rm::Mem(&src),
+            Imm::new(imm as u64, 1),
+        )
     }
 
     /// `vpinsrq xmm, xmm, gp, imm8` (asmjit `a.vpinsrq(Xmm, Xmm, Gp64, Imm)`, AVX).
     pub fn vpinsrq_xxri(&mut self, dst: Xmm, a: Xmm, src: Gp, imm: i64) -> Result<(), EncodeError> {
-        let (r, size) = Self::avx_gp_id(src)?;
-        if size != 8 {
-            return Err(EncodeError::InvalidInstruction);
-        }
+        let (r, _) = Self::avx_gp_id(src)?;
         let (d, v) = (Self::vec_id(dst.0)?, Self::vec_id(a.0)?);
         self.vex_rm(VPINSRQ, false, d, v, Rm::Reg(r), Imm::new(imm as u64, 1))
     }
@@ -383,7 +426,15 @@ impl Emitter {
 
     /// `vptest xmm, [mem]` (asmjit `a.vptest(Xmm, Mem)`, AVX).
     pub fn vptest_xm(&mut self, dst: Xmm, src: Mem) -> Result<(), EncodeError> {
-        self.vex_xm(VPTEST, false, dst, src)
+        let d = Self::vec_id(dst.0)?;
+        self.vex_rm(
+            VPTEST,
+            Self::avx_l_by_size(16 | src.size),
+            d,
+            0,
+            Rm::Mem(&src),
+            Imm::NONE,
+        )
     }
 
     /// `vptest ymm, ymm` (asmjit `a.vptest(Ymm, Ymm)`, AVX).
@@ -395,7 +446,14 @@ impl Emitter {
     /// `vptest ymm, [mem]` (asmjit `a.vptest(Ymm, Mem)`, AVX).
     pub fn vptest_ym(&mut self, dst: Ymm, src: Mem) -> Result<(), EncodeError> {
         let d = Self::vec_id(dst.0)?;
-        self.vex_rm(VPTEST, true, d, 0, Rm::Mem(&src), Imm::NONE)
+        self.vex_rm(
+            VPTEST,
+            Self::avx_l_by_size(32 | src.size),
+            d,
+            0,
+            Rm::Mem(&src),
+            Imm::NONE,
+        )
     }
 
     /// `vucomisd xmm, xmm` (asmjit `a.vucomisd(Xmm, Xmm)`, AVX).

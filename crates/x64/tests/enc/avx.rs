@@ -225,21 +225,16 @@ fn avx_test_and_upper_state_forms() {
 }
 
 #[test]
-fn avx_rejects_bad_registers_without_emitting() {
-    let mut e = Emitter::new();
-    assert_eq!(
-        e.vpxor_xxx(Xmm(16), Xmm(0), Xmm(0)),
-        Err(EncodeError::InvalidVecRegister(16))
-    );
-    assert!(e.is_empty());
-    assert_eq!(
-        e.vcvtsi2sd_xxr(Xmm(0), Xmm(1), AL),
-        Err(EncodeError::InvalidInstruction)
-    );
-    assert!(e.is_empty());
-    assert_eq!(
-        e.vpinsrq_xxri(Xmm(0), Xmm(1), EAX, 0),
-        Err(EncodeError::InvalidInstruction)
-    );
-    assert!(e.is_empty());
+fn avx_follows_asmjit_register_and_width_handling() {
+    let mut high_register = Emitter::new();
+    assert!(high_register.vpxor_xxx(Xmm(16), Xmm(0), Xmm(1)).is_ok());
+    assert_eq!(high_register.bytes, [0x62, 0xE1, 0x7D, 0x08, 0xEF, 0xC1]);
+
+    let mut narrow_gp = Emitter::new();
+    assert!(narrow_gp.vcvtsi2sd_xxr(Xmm(0), Xmm(1), AL).is_ok());
+    assert!(!narrow_gp.is_empty());
+
+    let mut narrow_insert = Emitter::new();
+    assert!(narrow_insert.vpinsrq_xxri(Xmm(0), Xmm(1), EAX, 0).is_ok());
+    assert!(!narrow_insert.is_empty());
 }
