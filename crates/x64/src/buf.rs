@@ -725,7 +725,10 @@ impl CodeBuffer {
             return Err(BufferError::InvalidAlignment(alignment));
         }
         match self.active {
-            Section::Code => self.code.align_code(alignment),
+            Section::Code => self
+                .code
+                .align_code(alignment as u32)
+                .map_err(|_| BufferError::InvalidAlignment(alignment))?,
             Section::Data => {
                 let padding = self.data.len().wrapping_neg() & (alignment - 1);
                 let new_len = self

@@ -618,28 +618,4 @@ impl Emitter {
         self.bytes.truncate(len);
         self.last_rip = None;
     }
-
-    /// Emits optimized x86 NOP padding as asmjit `Assembler::align(AlignMode::kCode, ...)` does.
-    ///
-    /// The caller checks alignment before this method is entered.
-    pub(crate) fn align_code(&mut self, alignment: usize) {
-        const NOPS: [&[u8]; 9] = [
-            &[0x90],
-            &[0x66, 0x90],
-            &[0x0f, 0x1f, 0x00],
-            &[0x0f, 0x1f, 0x40, 0x00],
-            &[0x0f, 0x1f, 0x44, 0x00, 0x00],
-            &[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00],
-            &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00],
-            &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
-            &[0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
-        ];
-        let mut padding = self.bytes.len().wrapping_neg() & (alignment - 1);
-        while padding > 0 {
-            let size = padding.min(NOPS.len());
-            self.bytes.extend_from_slice(NOPS[size - 1]);
-            padding -= size;
-        }
-        self.last_rip = None;
-    }
 }
