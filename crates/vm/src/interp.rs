@@ -64,8 +64,7 @@ impl Vm {
                 let mut heap = ProcessHeapHandle(&mut process.heap);
                 let mut state = arinsal_bifs::BifState::default();
                 let mut ctx = Ctx::with_fcalls(&mut heap, &mut state);
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bif(&mut ctx, args)))
-                    .map_err(|_| VmError::Unsupported(format!("BIF {frame} panicked")))?
+                bif(&mut ctx, args)
             };
             // ---- vm_exc ----
             Some(result.map_err(|e| {

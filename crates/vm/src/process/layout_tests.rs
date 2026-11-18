@@ -243,11 +243,10 @@ fn check_process_code_clears_ftrace_that_names_the_module() {
 }
 
 #[test]
-fn worker_panic_aborts_instead_of_hanging() {
-    const TEST_NAME: &str = "process::layout_tests::worker_panic_aborts_instead_of_hanging";
+fn worker_panic_is_not_recovered() {
+    const TEST_NAME: &str = "process::layout_tests::worker_panic_is_not_recovered";
     if std::env::var_os("ARINSAL_TEST_WORKER_PANIC").is_some() {
-        super::abort_on_worker_panic(|| panic!("worker panic sentinel"));
-        return;
+        panic!("worker panic sentinel");
     }
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", TEST_NAME, "--nocapture"])
@@ -255,10 +254,7 @@ fn worker_panic_aborts_instead_of_hanging() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("arinsal: VM panic in scheduler worker: worker panic sentinel")
-    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("worker panic sentinel"));
 }
 
 #[test]

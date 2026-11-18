@@ -108,7 +108,7 @@ impl Task for Process {
                 self.take_work(|w| w.dirty_pickup.take())
                     .unwrap_or_else(std::time::Instant::now)
             });
-        let outcome = abort_on_worker_panic(|| self.run_task(ctx, data));
+        let outcome = self.run_task(ctx, data);
         self.context_switch(ctx, dirty_start);
         self.heap.set_alloc_ix(None);
         self.native = None;
@@ -299,22 +299,6 @@ impl Task for Process {
                     reason: Box::new(reason),
                 },
             );
-        }
-    }
-}
-
-#[inline(always)]
-pub(super) fn abort_on_worker_panic(run: impl FnOnce() -> RunOutcome) -> RunOutcome {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
-        Ok(outcome) => outcome,
-        Err(payload) => {
-            let message = payload
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| payload.downcast_ref::<&str>().copied())
-                .unwrap_or("non-string panic payload");
-            eprintln!("arinsal: VM panic in scheduler worker: {message}");
-            std::process::abort();
         }
     }
 }

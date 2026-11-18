@@ -942,15 +942,9 @@ impl PendingNif {
         let mut state = arinsal_bifs::BifState::default();
         let mut ctx = Ctx::with_fcalls(&mut fragment, &mut state);
         let (lib, index, trap) = (&self.lib, self.index, &self.trap);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            lib.function(index)?
-                .call_on(&mut ctx, trap.fptr, &trap.args, pid, current)
-        }))
-        .unwrap_or_else(|_| {
-            Err(BifError::Error(Term::atom(
-                global_atoms().intern("error").expect("built-in atom"),
-            )))
-        });
+        let result = lib
+            .function(index)
+            .and_then(|function| function.call_on(&mut ctx, trap.fptr, &trap.args, pid, current));
         self.done = Some(result);
     }
 }

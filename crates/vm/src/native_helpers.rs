@@ -510,16 +510,7 @@ pub(crate) fn static_nif_job(
         .then(|| process.self_pid.and_then(|pid| pid.to_term()));
     Some(crate::dirty::static_nif_job(move |heap| {
         heap.abi.fcalls = fcalls;
-        let mut run = || {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::calls::call_bif(heap, entry, &args)
-            }))
-            .unwrap_or_else(|_| {
-                Err(arinsal_bifs::BifError::Error(Term::atom(
-                    arinsal_term::atoms::ERROR,
-                )))
-            })
-        };
+        let mut run = || crate::calls::call_bif(heap, entry, &args);
         match pinned_caller {
             Some(caller) => arinsal_nif_zlib::with_caller(caller, run),
             None => run(),
@@ -567,15 +558,10 @@ pub(crate) fn run_static_nif(
         .and_then(|cold| cold.static_nif_done.take());
     let result = match done {
         Some(result) => result,
-        None => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match pending {
+        None => match pending {
             Some(pending) => crate::natives::nif::resume_pending(&mut process.heap, pending),
             None => crate::calls::call_bif(&mut process.heap, entry, &args),
-        }))
-        .unwrap_or_else(|_| {
-            Err(arinsal_bifs::BifError::Error(Term::atom(
-                arinsal_term::atoms::ERROR,
-            )))
-        }),
+        },
     };
     result.map_err(|error| crate::exceptions::bif_error(process, &module, &function, &args, error))
 }
@@ -599,14 +585,7 @@ fn run_bound_nif(process: &mut crate::Process, reg: &[Term]) -> Result<Term, cra
     };
     crate::natives::nif::refresh_hub_native(process);
     let args = reg.get(..arity).unwrap_or_default().to_vec();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::natives::nif::resume_pending(&mut process.heap, pending)
-    }))
-    .unwrap_or_else(|_| {
-        Err(arinsal_bifs::BifError::Error(Term::atom(
-            arinsal_term::atoms::ERROR,
-        )))
-    });
+    let result = crate::natives::nif::resume_pending(&mut process.heap, pending);
     result.map_err(|error| crate::exceptions::bif_error(process, &module, &function, &args, error))
 }
 
@@ -615,15 +594,15 @@ fn run_bound_nif(process: &mut crate::Process, reg: &[Term]) -> Result<Term, cra
 fn leave_native_nif(
     process: &mut crate::Process,
     reg: &mut [Term],
-    result: std::thread::Result<Result<Term, arinsal_bifs::BifError>>,
+    result: Result<Term, arinsal_bifs::BifError>,
     (identity, arity): (usize, u8),
 ) -> u64 {
     match result {
-        Ok(Ok(value)) => {
+        Ok(value) => {
             reg[0] = value;
             crate::native_hooks::raw(value)
         }
-        Ok(Err(arinsal_bifs::BifError::Dirty(class))) => {
+        Err(arinsal_bifs::BifError::Dirty(class)) => {
             // Port of erts/emulator/beam/erl_nif.c:3460 (static_schedule_dirty_nif) and
             // erl_nif.c:3540 (enif_schedule_nif), OTP-29.1.1: the call traps to a
             // continuation the executor runs on a scheduler of `class`.
@@ -632,15 +611,11 @@ fn leave_native_nif(
             }
             trap_to_dirty_nif(process, identity, class, arity)
         }
-        Ok(Err(error)) => {
+        Err(error) => {
             let args = reg[..usize::from(arity)].to_vec();
             let bif_mfa = crate::beamasm_integration::export_dispatch(identity)
                 .map_or(0, |export| std::ptr::from_ref(export.mfa()) as usize);
             set_native_bif_error(process, bif_mfa, &args, error);
-            0
-        }
-        Err(_) => {
-            crate::native_hooks::set_error(process, "error");
             0
         }
     }
@@ -688,9 +663,8 @@ pub extern "C" fn arinsal_beamasm_static_nif(
     {
         process.heap.abi.current = std::ptr::from_ref(export.mfa()).cast();
     }
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::calls::call_bif(&mut process.heap, nif.entry, &reg[..usize::from(nif.arity)])
-    }));
+    let result =
+        crate::calls::call_bif(&mut process.heap, nif.entry, &reg[..usize::from(nif.arity)]);
     leave_native_nif(process, reg, result, (identity as usize, nif.arity))
 }
 
@@ -718,9 +692,11 @@ pub extern "C" fn arinsal_beamasm_call_nif(
     };
     // Port of erts/emulator/beam/jit/beam_jit_common.cpp:635 (beam_jit_call_nif).
     process.heap.abi.current = site.mfa as *const std::ffi::c_void;
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::natives::nif::call_native(&mut process.heap, native, &reg[..usize::from(site.arity)])
-    }));
+    let result = crate::natives::nif::call_native(
+        &mut process.heap,
+        native,
+        &reg[..usize::from(site.arity)],
+    );
     leave_native_nif(process, reg, result, (BOUND_NIF, site.arity))
 }
 
