@@ -89,7 +89,7 @@ macro_rules! family_tests {
 }
 
 family_tests!(
-    alu, mov, branch, cond, stack, muldiv, shift, misc, bmi, sse, avx
+    alu, mov, branch, cond, stack, muldiv, shift, misc, bmi, sse, avx, evex
 );
 
 /// Label-relative jumps and `align(kCode, n)` padding through the oracle. The branch families

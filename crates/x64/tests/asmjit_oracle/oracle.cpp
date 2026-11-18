@@ -87,11 +87,11 @@ bool parse_reg(const std::string &n, x86::Gp *gp, x86::Vec *vec, int *vec_bits) 
             if (suf == "b") return *gp = x86::gpb_lo(id), true;
         }
     }
-    for (const char *pre : {"xmm", "ymm"}) {
+    for (const char *pre : {"xmm", "ymm", "zmm"}) {
         if (n.compare(0, 3, pre) == 0 && n.size() > 3 && isdigit((unsigned char)n[3])) {
             long id = strtol(n.c_str() + 3, nullptr, 10);
-            *vec = pre[0] == 'x' ? x86::xmm(id) : x86::ymm(id);
-            *vec_bits = pre[0] == 'x' ? 128 : 256;
+            *vec = pre[0] == 'x' ? x86::xmm(id) : pre[0] == 'y' ? x86::ymm(id) : x86::zmm(id);
+            *vec_bits = pre[0] == 'x' ? 128 : pre[0] == 'y' ? 256 : 512;
             return true;
         }
     }
@@ -119,6 +119,7 @@ uint32_t size_of(const std::string &kw) {
     if (kw == "qword") return 8;
     if (kw == "xmmword") return 16;
     if (kw == "ymmword") return 32;
+    if (kw == "zmmword") return 64;
     return 0;
 }
 

@@ -1,10 +1,10 @@
-//! Shared x86_64 encoding machinery: legacy/REX/VEX prefixes, opcode maps, ModRM/SIB and
+//! Shared x86_64 encoding machinery: legacy/REX/VEX/EVEX prefixes, opcode maps, ModRM/SIB and
 //! displacement selection, RIP-relative operands and immediates.
 //!
 //! Port of the emit tail of `x86::Assembler::_emit` in
 //! `erts/emulator/asmjit/x86/x86assembler.cpp`, OTP-29.1.1 (`EmitX86Op`, `EmitX86OpReg`,
 //! `EmitX86R`, `EmitX86M`, `EmitModSib`, `EmitVexEvexR`, `EmitVexEvexM`) for 64-bit mode and the
-//! operands erts uses: no segment overrides, no 32-bit addressing, no EVEX. Every family file
+//! operands erts uses: no segment overrides or 32-bit addressing. Every family file
 //! builds an [`Opcode`] and calls one of these; nothing else writes instruction bytes.
 
 use super::{Emitter, EncodeError, Gp, GpKind, Mem, MemBase, RipFixup};
@@ -270,6 +270,40 @@ impl Emitter {
     /// Port of asmjit `EmitModSib`/`EmitModVSib` (64-bit, non-VSIB): ModRM, SIB and displacement
     /// for `mem` with ModRM.reg = `reg`.
     fn encode_mem(mem: &Mem, reg: u8) -> Result<MemEnc, EncodeError> {
+        Self::encode_mem_scaled(mem, reg, 1)
+    }
+
+    fn push_mem_displacement(
+        enc: &mut MemEnc,
+        reg: u8,
+        rm: u8,
+        sib_byte: Option<u8>,
+        disp: i32,
+        disp_scale: i32,
+        allow_no_disp: bool,
+    ) {
+        let scaled = disp / disp_scale;
+        let (mode, disp8) = if disp == 0 && allow_no_disp {
+            (0, None)
+        } else if disp % disp_scale == 0 && is_int(scaled as i64, 8) {
+            (1, Some(scaled as u8))
+        } else {
+            (2, None)
+        };
+        enc.push(modrm(mode, reg, rm));
+        if let Some(sib_byte) = sib_byte {
+            enc.push(sib_byte);
+        }
+        match (mode, disp8) {
+            (1, Some(value)) => enc.push(value),
+            (2, None) => enc.push32(disp),
+            _ => {}
+        }
+    }
+
+    /// Port of asmjit `EmitModSib` EVEX compressed disp8 handling in `x86assembler.cpp`,
+    /// OTP-29.1.1. `disp_scale` is the tuple size (64 for a 512-bit full-vector operand).
+    fn encode_mem_scaled(mem: &Mem, reg: u8, disp_scale: i32) -> Result<MemEnc, EncodeError> {
         let mut enc = MemEnc {
             x: 0,
             b: 0,
@@ -301,26 +335,17 @@ impl Emitter {
                 let rb = base.id & 7;
                 if rb == 4 {
                     // [RSP|R12 (+ DISP8|DISP32)] needs a SIB byte.
-                    if disp == 0 {
-                        enc.push(modrm(0, reg, 4));
-                        enc.push(sib(0, 4, rb));
-                    } else if is_int(disp as i64, 8) {
-                        enc.push(modrm(1, reg, 4));
-                        enc.push(sib(0, 4, rb));
-                        enc.push(disp as u8);
-                    } else {
-                        enc.push(modrm(2, reg, 4));
-                        enc.push(sib(0, 4, rb));
-                        enc.push32(disp);
-                    }
-                } else if rb != 5 && disp == 0 {
-                    enc.push(modrm(0, reg, rb));
-                } else if is_int(disp as i64, 8) {
-                    enc.push(modrm(1, reg, rb));
-                    enc.push(disp as u8);
+                    Self::push_mem_displacement(
+                        &mut enc,
+                        reg,
+                        4,
+                        Some(sib(0, 4, rb)),
+                        disp,
+                        disp_scale,
+                        true,
+                    );
                 } else {
-                    enc.push(modrm(2, reg, rb));
-                    enc.push32(disp);
+                    Self::push_mem_displacement(&mut enc, reg, rb, None, disp, disp_scale, rb != 5);
                 }
             }
             (Some(MemBase::Gp(base)), Some(index)) => {
@@ -330,18 +355,7 @@ impl Emitter {
                 enc.b = base.id >> 3;
                 let rb = base.id & 7;
                 let s = sib(mem.shift, index, rb);
-                if disp == 0 && rb != 5 {
-                    enc.push(modrm(0, reg, 4));
-                    enc.push(s);
-                } else if is_int(disp as i64, 8) {
-                    enc.push(modrm(1, reg, 4));
-                    enc.push(s);
-                    enc.push(disp as u8);
-                } else {
-                    enc.push(modrm(2, reg, 4));
-                    enc.push(s);
-                    enc.push32(disp);
-                }
+                Self::push_mem_displacement(&mut enc, reg, 4, Some(s), disp, disp_scale, rb != 5);
             }
             (Some(MemBase::Rip), None) => {
                 enc.push(modrm(0, reg, 5));
@@ -618,6 +632,33 @@ impl Emitter {
             }
             Target::Mem(enc) => self.put_mem_tail(&enc, imm),
         }
+        Ok(())
+    }
+
+    /// Port of asmjit `EmitVexEvexM` in `x86assembler.cpp`, OTP-29.1.1, for the 512-bit
+    /// full-vector memory tuple used by `vmovups zmm, [mem]` and `vmovups [mem], zmm`.
+    pub(crate) fn evex_rm_512(
+        &mut self,
+        opcode: Opcode,
+        reg: u8,
+        mem: &Mem,
+        imm: Imm,
+    ) -> Result<(), EncodeError> {
+        if opcode.map == Map::Legacy {
+            return Err(EncodeError::InvalidInstruction);
+        }
+        let enc = Self::encode_mem_scaled(mem, reg, 64)?;
+        let p0 = (((!(reg >> 3)) & 1) << 7)
+            | (((!enc.x) & 1) << 6)
+            | (((!enc.b) & 1) << 5)
+            | (((!(reg >> 4)) & 1) << 4)
+            | opcode.map.vex();
+        let p1 = ((opcode.w as u8) << 7) | 0x7C | opcode.pp.vex();
+        // LL=10 selects 512 bits, V'=1 denotes the unused vvvv operand, and aaa=0 selects k0.
+        let p2 = 0x48;
+        self.bytes
+            .extend_from_slice(&[0x62, p0, p1, p2, opcode.byte]);
+        self.put_mem_tail(&enc, imm);
         Ok(())
     }
 

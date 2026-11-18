@@ -19,6 +19,14 @@ fn predicates_match_std_arch_detection() {
     assert_eq!(cpu::has_avx(), std::arch::is_x86_feature_detected!("avx"));
     assert_eq!(cpu::has_avx2(), std::arch::is_x86_feature_detected!("avx2"));
     assert_eq!(
+        cpu::has_avx512f(),
+        std::arch::is_x86_feature_detected!("avx512f")
+    );
+    assert_eq!(
+        cpu::has_avx512vl(),
+        std::arch::is_x86_feature_detected!("avx512vl")
+    );
+    assert_eq!(
         cpu::has_movbe(),
         std::arch::is_x86_feature_detected!("movbe")
     );

@@ -471,7 +471,11 @@ impl CodeMemory {
             // SAFETY: the requested range was checked against this live span and the RW alias is
             // writable by the dual-mapping allocator.
             unsafe {
-                core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.rw.add(offset), bytes.len());
+                core::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    self.rw.wrapping_add(offset),
+                    bytes.len(),
+                );
             }
         }
         Ok(())
@@ -694,13 +698,17 @@ fn map_fd(fd: &OwnedFd, size: usize, protection: ProtFlags) -> Result<*mut u8, E
 #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "x86_64")))]
 // Port of asmjit `VirtMem::release_dual_mapping`, virtmem.cpp:935-950.
 fn unmap_aliases(rx: *mut u8, rw: *mut u8, size: usize) {
-    // SAFETY: the pointers are live mappings owned by this allocator, and `size` is their mapped
-    // page-rounded block length. The second alias can be null when only the RX mapping succeeded.
+    unmap_alias(rx, size);
+    if !rw.is_null() && rw != rx {
+        unmap_alias(rw, size);
+    }
+}
+
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "x86_64")))]
+fn unmap_alias(address: *mut u8, size: usize) {
+    // SAFETY: callers pass a live mapping owned by this allocator and its page-rounded size.
     unsafe {
-        let _ = rustix::mm::munmap(rx.cast(), size);
-        if !rw.is_null() && rw != rx {
-            let _ = rustix::mm::munmap(rw.cast(), size);
-        }
+        let _ = rustix::mm::munmap(address.cast(), size);
     }
 }
 

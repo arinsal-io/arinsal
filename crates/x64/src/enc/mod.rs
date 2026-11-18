@@ -8,7 +8,8 @@
 //! the shared prefix/ModRM/SIB/immediate machinery is in `core`. See `docs/design/x86_encoder_api.md`.
 //!
 //! Method names are the asmjit mnemonic plus an operand-shape suffix: `r` = [`Gp`], `m` = [`Mem`],
-//! `i` = immediate, `x` = [`Xmm`], `y` = [`Ymm`] (`add_ri` is asmjit `a.add(Gp, Imm)`).
+//! `i` = immediate, `x` = [`Xmm`], `y` = [`Ymm`], `z` = [`Zmm`] (`add_ri` is asmjit
+//! `a.add(Gp, Imm)`).
 
 mod alu;
 mod avx;
@@ -17,6 +18,7 @@ mod branch;
 mod cond;
 mod core;
 pub mod cpu;
+mod evex;
 mod misc;
 mod mov;
 mod muldiv;

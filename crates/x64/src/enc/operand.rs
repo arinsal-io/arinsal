@@ -2,7 +2,7 @@
 //!
 //! Port of the operand types erts' `jit/x86` code builds through asmjit
 //! (`erts/emulator/asmjit/x86/x86operand.h`, OTP-29.1.1): `x86::Gp` with its
-//! 8/16/32/64-bit views, `x86::Xmm`/`x86::Ymm`, and `x86::Mem`. Register ids are
+//! 8/16/32/64-bit views, `x86::Xmm`/`x86::Ymm`/`x86::Zmm`, and `x86::Mem`. Register ids are
 //! asmjit's physical ids (`Gp::kIdAx` = 0 ... `kIdR15` = 15), which are also the
 //! hardware encodings; `jit/x86/beam_asm.hpp` names its fixed registers with them
 //! (`c_p` = r13, `HTOP` = r15, `registers` = rbx, `E` = rsp/rbp, ...).
@@ -129,6 +129,10 @@ pub struct Xmm(pub u8);
 /// A 256-bit AVX register: asmjit `x86::Ymm`, ids 0..=15.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ymm(pub u8);
+
+/// A 512-bit AVX-512 register: asmjit `x86::Zmm`, ids 0..=31.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Zmm(pub u8);
 
 impl Xmm {
     /// asmjit `Vec::ymm()`.

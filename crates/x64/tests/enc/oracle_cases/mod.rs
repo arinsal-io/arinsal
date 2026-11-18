@@ -13,6 +13,7 @@ mod avx;
 mod bmi;
 mod branch;
 mod cond;
+mod evex;
 mod misc;
 mod mov;
 mod muldiv;
@@ -58,6 +59,7 @@ pub const FAMILIES: &[(&str, Generator)] = &[
     ("bmi", bmi::cases),
     ("sse", sse::cases),
     ("avx", avx::cases),
+    ("evex", evex::cases),
 ];
 
 const Q: [&str; 16] = [

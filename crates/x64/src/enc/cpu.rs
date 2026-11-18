@@ -76,6 +76,30 @@ pub fn has_avx2() -> bool {
     false
 }
 
+/// Returns whether the CPU and OS support AVX-512 Foundation.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub fn has_avx512f() -> bool {
+    std::arch::is_x86_feature_detected!("avx512f")
+}
+
+/// Returns `false` because this target is not x86.
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+pub fn has_avx512f() -> bool {
+    false
+}
+
+/// Returns whether the CPU and OS support AVX-512 Vector Length extensions.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub fn has_avx512vl() -> bool {
+    std::arch::is_x86_feature_detected!("avx512vl")
+}
+
+/// Returns `false` because this target is not x86.
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+pub fn has_avx512vl() -> bool {
+    false
+}
+
 /// Returns whether the CPU supports MOVBE.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub fn has_movbe() -> bool {
