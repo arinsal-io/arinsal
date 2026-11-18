@@ -1,8 +1,81 @@
 //! Raw heap layout operations ported from `erts/emulator/beam/erl_map.c`.
 
 use crate::{MAP_HEADER_FLATMAP, bits, boxed, key_cmp, term};
-use arinsal_term::{HeapAlloc, Term, TermError};
+use arinsal_term::{HeapAlloc, Term, TermError, exact_eq};
 use std::cmp::Ordering;
+
+/// Returns the address of a value in a live flatmap or HAMT.
+// Port of erts/emulator/beam/erl_map.c:186-217 (erts_maps_get), OTP-29.1.1.
+pub(crate) fn get_ptr(map: Term, key: Term, mut hash: u64) -> Option<*const u64> {
+    // SAFETY: callers checked that `map` is a live map; its nodes and value slots remain
+    // allocated until the owning process performs a moving collection.
+    unsafe {
+        let ptr = map.raw_ptr();
+        let header = ptr.read();
+        if header & 0xc0 == 0 {
+            let n = *ptr.add(1) as usize;
+            if n == 0 {
+                return None;
+            }
+            let keys = term(*ptr.add(2)).raw_ptr().add(1);
+            let values = ptr.add(3);
+            if key.is_immed() {
+                let key = key.raw_bits();
+                for index in 0..n {
+                    if *keys.add(index) == key {
+                        return Some(values.add(index));
+                    }
+                }
+            } else {
+                for index in 0..n {
+                    if exact_eq(term(*keys.add(index)), key) {
+                        return Some(values.add(index));
+                    }
+                }
+            }
+            return None;
+        }
+
+        let mut node_ptr = ptr.add(1);
+        let mut node_header = header;
+        loop {
+            let bitmap = ((node_header >> 16) & 0xffff) as u16;
+            let mut index = (hash & 0xf) as usize;
+            if bitmap != u16::MAX {
+                let bit = 1_u16 << index;
+                if bitmap & bit == 0 {
+                    return None;
+                }
+                index = (bitmap & (bit - 1)).count_ones() as usize;
+            }
+            let child = term(*node_ptr.add(index + 1));
+            if bits(child) & 3 == 1 {
+                let pair = child.raw_ptr();
+                return exact_eq(term(*pair), key).then_some(pair.add(1));
+            }
+
+            hash >>= 4;
+            node_ptr = child.raw_ptr();
+            node_header = *node_ptr;
+            if node_header & 63 == 0 {
+                let arity = (node_header >> 6) as usize;
+                for index in 0..arity {
+                    let pair = term(*node_ptr.add(index + 1)).raw_ptr();
+                    if exact_eq(term(*pair), key) {
+                        return Some(pair.add(1));
+                    }
+                }
+                return None;
+            }
+        }
+    }
+}
+
+/// Copies the term at a pointer returned by [`get_ptr`].
+pub(crate) fn read_get_ptr(value: *const u64) -> Term {
+    // SAFETY: `get_ptr` returns a value slot inside the still-live input map.
+    term(unsafe { value.read() })
+}
 
 /// Cursor over HAMT child words, matching the advancing `Eterm*` cursors in
 /// `hashmap_merge`.

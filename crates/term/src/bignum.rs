@@ -442,14 +442,67 @@ fn i_add_operation(x: Digits, y: Digits, r: *mut u64) -> usize {
 
 // Port of erts/emulator/beam/big.c (big_times), OTP-29.1.1.
 pub(crate) fn times_into(x: &[u64], y: &[u64], r: *mut u64) -> usize {
+    times_into_raw(x.as_ptr(), x.len(), y.as_ptr(), y.len(), r)
+}
+
+/// Multiplies two initialized digit ranges into `result` using `big_times`' digit dispatch.
+pub(crate) fn times_into_raw(
+    x: *const u64,
+    x_len: usize,
+    y: *const u64,
+    y_len: usize,
+    result: *mut u64,
+) -> usize {
+    let x = Digits::from_raw(x, x_len);
+    let y = Digits::from_raw(y, y_len);
+    if y.len == 1 {
+        d_mul(x, y.get(0), result)
+    } else if x.len == 1 {
+        d_mul(y, x.get(0), result)
+    } else {
+        i_mul_operation(x, y, result)
+    }
+}
+
+/// Multiply two magnitudes and add or subtract the third in the same result buffer.
+// Port of erts/emulator/beam/big.c:3854-3879 (`big_mul_add`), OTP-29.1.1.
+pub(crate) fn mul_add_into(
+    x: &[u64],
+    x_negative: bool,
+    y: &[u64],
+    y_negative: bool,
+    z: &[u64],
+    z_negative: bool,
+    result: *mut u64,
+) -> (usize, bool) {
     let x = Digits::from_slice(x);
     let y = Digits::from_slice(y);
-    if y.len == 1 {
-        d_mul(x, y.get(0), r)
+    let z = Digits::from_slice(z);
+    let product_negative = x_negative != y_negative;
+    let product_size = if y.len == 1 {
+        d_mul(x, y.get(0), result)
     } else if x.len == 1 {
-        d_mul(y, x.get(0), r)
+        d_mul(y, x.get(0), result)
     } else {
-        i_mul_operation(x, y, r)
+        i_mul_operation(x, y, result)
+    };
+    let product = Digits::from_raw(result.cast_const(), product_size);
+    if product_negative == z_negative {
+        let size = if product.len >= z.len {
+            i_add(product, z, result)
+        } else {
+            i_add(z, product, result)
+        };
+        (size, product_negative)
+    } else {
+        match i_comp(product, z) {
+            std::cmp::Ordering::Equal => {
+                store(result, 0);
+                (1, false)
+            }
+            std::cmp::Ordering::Greater => (i_sub(product, z, result), product_negative),
+            std::cmp::Ordering::Less => (i_sub(z, product, result), z_negative),
+        }
     }
 }
 

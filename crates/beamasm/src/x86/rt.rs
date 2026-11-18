@@ -442,6 +442,19 @@ const HTOP: usize = core::mem::offset_of!(ProcessHeader, htop);
 const STOP: usize = core::mem::offset_of!(ProcessHeader, stop);
 const FCALLS: usize = core::mem::offset_of!(ProcessHeader, fcalls);
 
+// Port of erts/emulator/beam/erl_gc.h:171, OTP-29.1.1.
+unsafe extern "C" {
+    /// `int erts_garbage_collect_nobump(Process *p, Uint need, Eterm *objv, int nobj,
+    /// int fcalls)`; `Uint` has the machine word width.
+    pub safe fn erts_garbage_collect_nobump(
+        c_p: *mut ProcessHeader,
+        need: usize,
+        objv: *mut u64,
+        nobj: i32,
+        fcalls: i32,
+    ) -> i32;
+}
+
 #[cfg(windows)]
 compile_error!("the x86-64 BeamAsm entry bridge implements the System V ABI only");
 

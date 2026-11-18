@@ -1,6 +1,9 @@
 //! Process and message tracing for ERTS trace sessions.
+//!
+//! Port of erts/emulator/beam/erl_trace.c, OTP-29.1.1.
 
 use crate::{Process, Vm, VmError, process::Message};
+use arinsal_beamasm::ProcessHeader;
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::{Pid, RunCtx};
 use arinsal_term::{Term, TermBuilder, VecHeap, copy_term, from_owned, global_atoms, to_owned};
@@ -33,6 +36,7 @@ fn note_return_to(flags: u64) {
         RETURN_TO_USED.store(true, Ordering::Relaxed);
     }
 }
+
 pub(crate) const SILENT: u64 = 1 << 17;
 pub(crate) const FIRST_LINK: u64 = 1 << 9;
 pub(crate) const GARBAGE_COLLECTION: u64 = 1 << 14;
@@ -608,6 +612,7 @@ fn is_sensitive_scoped(owner: usize, pid: Pid) -> bool {
 #[derive(Clone, Copy)]
 pub(crate) enum SavedCall {
     Mfa(arinsal_term::Atom, arinsal_term::Atom, u8),
+    Export(usize),
     Send,
     Receive,
     Timeout,
@@ -682,6 +687,28 @@ pub(crate) fn save_call(process: &mut Process, call: SavedCall) {
     if scb.n < scb.len {
         scb.n += 1;
     }
+}
+
+/// Stores the caller's `Export *` in the same slot that erts stores in `saved_calls.ct`.
+pub(crate) fn save_export_call(process: &mut Process, export: usize) {
+    save_call(process, SavedCall::Export(export));
+}
+
+/// Records an export in the process's circular saved-call buffer.
+// Port of erts/emulator/beam/erl_trace.c:1409-1425 (save_calls), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn save_calls(c_p: *mut ProcessHeader, export: usize) {
+    let Some(process) = crate::native_hooks::enter_runtime(c_p) else {
+        return;
+    };
+    save_export_call(process, export);
+}
+
+/// Reads the MFA stored in a stable export entry.
+pub(crate) fn saved_export_mfa(
+    export: usize,
+) -> Option<(arinsal_term::Atom, arinsal_term::Atom, u8)> {
+    crate::raw::beam_common_ffi::export_mfa(export)
 }
 
 /// Saved calls, newest first.
@@ -5055,5 +5082,13 @@ mod tests {
             "trace_t6_new_fun_spawn",
             "-module(trace_t6_new_fun_spawn). -export([run/0]). run() -> Me=self(), T=spawn(fun() -> erlang:trace(new,true,[send]), Me!armed, receive stop -> ok end end), receive armed -> ok end, W=spawn(fun() -> receive go -> Me!done end end), {flags,F}=erlang:trace_info(W,flags), W!go, receive done -> ok end, T!stop, F.",
         );
+    }
+}
+
+#[cfg(test)]
+mod runtime_symbol_tests {
+    #[test]
+    fn save_calls_symbol_has_erts_signature() {
+        let _: extern "C" fn(*mut arinsal_beamasm::ProcessHeader, usize) = super::save_calls;
     }
 }

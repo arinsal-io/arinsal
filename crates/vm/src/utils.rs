@@ -8,6 +8,15 @@ use crate::process::{Message, Runtime};
 use arinsal_sched::Pid;
 use arinsal_term::{ProcessHeap, Term, TermBuilder, TermError, atoms};
 
+/// Exact equality of two terms. Non-zero means equal.
+// Port of erts/emulator/beam/utils.c:1125 (eq), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn eq(a: u64, b: u64) -> i32 {
+    let left = crate::native_hooks::from_raw(a);
+    let right = crate::native_hooks::from_raw(b);
+    i32::from(arinsal_term::exact_eq(left, right))
+}
+
 /// Port of utils.c `do_send_logger_message` with `do_allocate_logger_message`:
 /// `{log, Tag, Format, Args, #{error_logger => #{emulator => true, tag => ElTag}, gl => GL,
 /// pid => Pid, time => Us}}`, queued as the system message `erts_queue_error_logger_message`
@@ -130,4 +139,12 @@ pub(crate) fn send_error_term_to_logger(
         format,
         |_| Ok(args),
     );
+}
+
+#[cfg(test)]
+mod runtime_symbol_tests {
+    #[test]
+    fn eq_symbol_has_erts_signature() {
+        let _: extern "C" fn(u64, u64) -> i32 = super::eq;
+    }
 }

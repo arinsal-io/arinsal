@@ -1119,6 +1119,13 @@ fn saved_freason_word(term: Term) -> Option<Term> {
     tuple.get(0)
 }
 
+/// Reads the saved exception word carried by the raw stacktrace in an exception tuple.
+pub(crate) fn raw_freason(term: Term) -> Option<u64> {
+    saved_freason_word(term)?
+        .with_bignum_digits_mut(|digits| digits.first().copied())
+        .flatten()
+}
+
 /// Port of erts/emulator/beam/beam_common.c:1131-1178 (`get_freason_ptr_from_exc`,
 /// `raw_raise`), OTP-29.1.1: the class goes straight into `StackTrace.freason`, found as
 /// element 1 of the ftrace tuple. Anything else (NIL) has no saved class to update.

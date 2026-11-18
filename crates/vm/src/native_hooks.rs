@@ -234,12 +234,6 @@ fn order_bits(order: Ordering) -> i32 {
     }
 }
 
-/// Exact equality of two terms. Non-zero means equal.
-// Port of erts/emulator/beam/utils.c:1125 (eq), OTP-29.1.1.
-pub extern "C" fn arinsal_eq(a: u64, b: u64) -> i32 {
-    i32::from(exact_eq(from_raw(a), from_raw(b)))
-}
-
 /// Atom order. The shared fragment only calls this when both operands are atoms.
 // Port of erts/emulator/beam/erl_utils.h:193 (erts_cmp_atoms), OTP-29.1.1.
 pub extern "C" fn arinsal_cmp_atoms(a: u64, b: u64) -> i32 {

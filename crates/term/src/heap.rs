@@ -4177,6 +4177,50 @@ fn small_to_big_words(value: i64) -> [u64; 2] {
     ]
 }
 
+fn with_integer_parts<R>(term: Term, body: impl FnOnce(&[u64], bool) -> R) -> Option<R> {
+    if let Some(value) = term.as_small() {
+        let digits = [value.unsigned_abs()];
+        Some(body(&digits, value < 0))
+    } else {
+        term.with_bignum_parts_mut(|digits, negative| body(digits, negative))
+    }
+}
+
+fn normalized_integer_at(
+    header: *mut u64,
+    digits: *mut u64,
+    digit_count: usize,
+    negative: bool,
+) -> (Term, usize) {
+    let mut digit_count = digit_count;
+    while digit_count > 1 && load(digits.wrapping_add(digit_count - 1)) == 0 {
+        digit_count -= 1;
+    }
+    let magnitude = load(digits);
+    let small_limit = if negative {
+        MAX_SMALL as u64 + 1
+    } else {
+        MAX_SMALL as u64
+    };
+    if digit_count == 1 && magnitude <= small_limit {
+        let value = if negative {
+            -(magnitude as i64)
+        } else {
+            magnitude as i64
+        };
+        (
+            Term::small(value).expect("normalized integer fits a small term"),
+            0,
+        )
+    } else {
+        store(
+            header,
+            ((digit_count as u64) << 6) | if negative { NEG_BIG } else { POS_BIG },
+        );
+        (Term::from_ptr(header, 2), digit_count + 1)
+    }
+}
+
 /// File and line of one MFA frame: `[{file, File}, {line, Line}]`.
 ///
 /// `file_atom` and `line_atom` are the predefined `file` and `line` atoms.
@@ -4556,6 +4600,152 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     pub fn bignum_times(&mut self, a: Term, b: Term) -> Result<Term, TermError> {
         let mut operand_sizes = [0; 2];
         self.bignum_times_with_sizes(a, b, a.as_small(), b.as_small(), &mut operand_sizes)
+    }
+
+    /// Multiply two integers and add the third directly into one heap-fragment allocation.
+    // Port of erts/emulator/beam/erl_arith.c:919-1013 (`erts_mul_add`) and
+    // erts/emulator/beam/big.c:3854-3879 (`big_mul_add`), OTP-29.1.1.
+    pub fn integer_mul_add(&mut self, a: Term, b: Term, c: Term) -> Result<Term, TermError> {
+        let mut output = Err(TermError::BadArg);
+        with_integer_parts(a, |x, x_negative| {
+            with_integer_parts(b, |y, y_negative| {
+                with_integer_parts(c, |z, z_negative| {
+                    let allocated_words = x
+                        .len()
+                        .saturating_add(y.len())
+                        .max(z.len())
+                        .saturating_add(2);
+                    let Some(block) = self.heap.alloc_fragment_only(allocated_words) else {
+                        output = Err(TermError::SystemLimit);
+                        return;
+                    };
+                    let digits = block.wrapping_add(1);
+                    let (result_digits, negative) = crate::bignum::mul_add_into(
+                        x, x_negative, y, y_negative, z, z_negative, digits,
+                    );
+                    if result_digits == 1 {
+                        let magnitude = load(digits);
+                        let small_magnitude = if negative {
+                            MAX_SMALL as u64 + 1
+                        } else {
+                            MAX_SMALL as u64
+                        };
+                        if magnitude <= small_magnitude {
+                            self.heap.shrink_fragment_tail(block, allocated_words, 0);
+                            let value = if negative {
+                                -(magnitude as i64)
+                            } else {
+                                magnitude as i64
+                            };
+                            output = Ok(Term::small(value).unwrap());
+                            return;
+                        }
+                    }
+                    if result_digits > 65_535 {
+                        self.heap.shrink_fragment_tail(block, allocated_words, 0);
+                        output = Err(TermError::SystemLimit);
+                        return;
+                    }
+                    store(
+                        block,
+                        ((result_digits as u64) << 6) | if negative { NEG_BIG } else { POS_BIG },
+                    );
+                    let used_words = result_digits + 1;
+                    if used_words < allocated_words {
+                        self.heap
+                            .shrink_fragment_tail(block, allocated_words, used_words);
+                    }
+                    output = Ok(Term::from_ptr(block, 2));
+                })
+                .unwrap_or_else(|| output = Err(TermError::BadArg));
+            })
+            .unwrap_or_else(|| output = Err(TermError::BadArg));
+        })
+        .ok_or(TermError::BadArg)?;
+        output
+    }
+
+    /// Divide two integers into quotient and remainder using one fragment reservation.
+    // Port of `erts_int_div_rem` in erts/emulator/beam/erl_arith.c and `big_div_rem` in
+    // erts/emulator/beam/big.c, OTP-29.1.1.
+    pub fn integer_div_rem(&mut self, a: Term, b: Term) -> Result<(Term, Term), TermError> {
+        let mut output = Err(TermError::BadArg);
+        with_integer_parts(a, |x, x_negative| {
+            with_integer_parts(b, |y, y_negative| {
+                if y.len() == 1 && y[0] == 0 {
+                    output = Err(TermError::BadArg);
+                    return;
+                }
+                let ordering = match x.len().cmp(&y.len()) {
+                    std::cmp::Ordering::Equal => x.iter().rev().cmp(y.iter().rev()),
+                    ordering => ordering,
+                };
+                match ordering {
+                    std::cmp::Ordering::Less => {
+                        output = Ok((Term::small(0).unwrap(), a));
+                        return;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        let quotient =
+                            Term::small(if x_negative == y_negative { 1 } else { -1 }).unwrap();
+                        output = Ok((quotient, Term::small(0).unwrap()));
+                        return;
+                    }
+                    std::cmp::Ordering::Greater => {}
+                }
+
+                let quotient_digits = x.len() - y.len() + 1;
+                let quotient_words = quotient_digits + 1;
+                let remainder_words = x.len() + 1;
+                let Some(allocated_words) = quotient_words.checked_add(remainder_words) else {
+                    output = Err(TermError::SystemLimit);
+                    return;
+                };
+                let Some(fragment) = self.heap.alloc_fragment_only(allocated_words) else {
+                    output = Err(TermError::SystemLimit);
+                    return;
+                };
+                let quotient_buffer = fragment.wrapping_add(1);
+                let remainder_header = fragment.wrapping_add(quotient_words);
+                let remainder_buffer = remainder_header.wrapping_add(1);
+                let (quotient_size, remainder_size) =
+                    crate::bignum_div::div_rem_into(x, y, quotient_buffer, remainder_buffer);
+                let (quotient, quotient_used) = normalized_integer_at(
+                    fragment,
+                    quotient_buffer,
+                    quotient_size,
+                    x_negative != y_negative,
+                );
+                let (remainder, remainder_used) = normalized_integer_at(
+                    remainder_header,
+                    remainder_buffer,
+                    remainder_size,
+                    x_negative,
+                );
+
+                if remainder_used == 0 {
+                    self.heap
+                        .shrink_fragment_tail(fragment, allocated_words, quotient_used);
+                } else {
+                    if quotient_used < quotient_words {
+                        let hole_words = quotient_words - quotient_used;
+                        store(
+                            fragment.wrapping_add(quotient_used),
+                            (((hole_words - 1) as u64) << 6) | POS_BIG,
+                        );
+                    }
+                    self.heap.shrink_fragment_tail(
+                        fragment,
+                        allocated_words,
+                        quotient_words + remainder_used,
+                    );
+                }
+                output = Ok((quotient, remainder));
+            })
+            .unwrap_or_else(|| output = Err(TermError::BadArg));
+        })
+        .ok_or(TermError::BadArg)?;
+        output
     }
 
     /// Multiply and return the operand sizes already read by the tag dispatch.

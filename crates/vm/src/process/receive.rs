@@ -47,16 +47,20 @@ impl Process {
         }
     }
 
-    /// Whether `erts_garbage_collect` must fetch the outer signal queue first.
-    // Port of erts/emulator/beam/erl_gc.c:987-990, OTP-29.1.1: only an on-heap
-    // queue (or a queue changing onto the heap) is fetched, and only when the
-    // outer queue is non-empty (`sig_inq.first`).
+    /// Whether the process queue flags require signal fetching before GC.
+    // Port of erts/emulator/beam/erl_gc.c:967-976, OTP-29.1.1: `FS_ON_HEAP_MSGQ` requires a
+    // fetch before the collector moves message terms. Queue mode changes are synchronous here,
+    // so Arinsal has no in-flight `FS_OFF_HEAP_MSGQ_CHNG` state.
+    pub(crate) fn gc_must_fetch_signals(&self) -> bool {
+        self.message_queue_data() == MessageQueueData::OnHeap
+    }
+
+    /// Whether an outer signal is waiting on an on-heap message queue.
     pub(crate) fn gc_outer_queue_pending(&self) -> bool {
-        if self.message_queue_data() == MessageQueueData::OffHeap {
-            return false;
-        }
-        self.signal_probe()
-            .is_some_and(arinsal_sched::SignalProbe::has_pending)
+        self.message_queue_data() == MessageQueueData::OnHeap
+            && self
+                .signal_probe()
+                .is_some_and(arinsal_sched::SignalProbe::has_pending)
     }
 }
 

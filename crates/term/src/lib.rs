@@ -1,6 +1,7 @@
 //! OTP 29 tagged words and heap-backed runtime terms.
 mod atom;
 mod bignum;
+mod bignum_div;
 mod bits;
 mod copy;
 pub mod erl_bits;

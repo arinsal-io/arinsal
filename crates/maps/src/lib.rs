@@ -796,6 +796,13 @@ pub fn get(map: Term, key: Term) -> MapResult<Option<Term>> {
     Ok(lookup_header(map, key, header))
 }
 
+/// Returns a pointer to the stored value while the owning process heap remains unmoved.
+// Port of erts/emulator/beam/erl_map.c:186-217 (erts_maps_get), OTP-29.1.1.
+pub fn get_ptr(map: Term, key: Term) -> MapResult<Option<*const u64>> {
+    checked_header(map)?;
+    Ok(raw::get_ptr(map, key, internal_hash(key)))
+}
+
 /// Looks up a key using the hash already computed by a native caller.
 // Port of erts/emulator/beam/beam_common.c:1775-1799 (get_map_element), OTP-29.1.1.
 #[inline]
@@ -910,75 +917,16 @@ fn lookup_header_with_hash(map: Term, key: Term, h: u64, hash: u64) -> Option<Te
 
 // Port of erts/emulator/beam/erl_map.c:2424-2474 (erts_hashmap_get), OTP-29.1.1.
 #[inline(always)]
-fn lookup_hash(map: Term, key: Term, mut hash: u64) -> Option<Term> {
-    // SAFETY: each bitmap selects an initialized child; the HAMT header identifies the
-    // collision tuple, and every reached leaf and collision child remains live with `map`.
-    unsafe {
-        let mut ptr = map.raw_ptr();
-        let mut header = *ptr;
-        ptr = ptr.add(1);
-        loop {
-            let bitmap = ((header >> 16) & 0xffff) as u16;
-            let mut index = (hash & 0xf) as usize;
-            if bitmap != u16::MAX {
-                let bit = 1_u16 << index;
-                if bitmap & bit == 0 {
-                    return None;
-                }
-                index = (bitmap & (bit - 1)).count_ones() as usize;
-            }
-            let node = term(*ptr.add(index + 1));
-            if bits(node) & 3 == 1 {
-                let (candidate, value) = node.cons_ref().unwrap();
-                return exact_eq(candidate, key).then_some(value);
-            }
-
-            hash >>= 4;
-            ptr = node.raw_ptr();
-            header = *ptr;
-            if header & 63 == 0 {
-                for index in 0..(header >> 6) as usize {
-                    let leaf = term(*ptr.add(index + 1));
-                    let (candidate, value) = leaf.cons_ref().unwrap();
-                    if exact_eq(candidate, key) {
-                        return Some(value);
-                    }
-                }
-                return None;
-            }
-        }
-    }
+fn lookup_hash(map: Term, key: Term, hash: u64) -> Option<Term> {
+    let value = raw::get_ptr(map, key, hash)?;
+    Some(raw::read_get_ptr(value))
 }
 
 /// Flatmap half of `erts_maps_get`: word compare for an immediate key, `EQ` otherwise.
 // Port of erts/emulator/beam/erl_map.c:189-217 (erts_maps_get), OTP-29.1.1.
 fn flatmap_get(map: Term, key: Term) -> Option<Term> {
-    // SAFETY: `map` is a live flatmap. Word one is the size, word two the key tuple,
-    // and the values follow. The key tuple's elements start at its second word.
-    unsafe {
-        let mp = map.raw_ptr();
-        let n = *mp.add(1) as usize;
-        if n == 0 {
-            return None;
-        }
-        let ks = term(*mp.add(2)).raw_ptr().add(1);
-        let vs = mp.add(3);
-        if key.is_immed() {
-            let key = bits(key);
-            for i in 0..n {
-                if *ks.add(i) == key {
-                    return Some(term(*vs.add(i)));
-                }
-            }
-        } else {
-            for i in 0..n {
-                if exact_eq(term(*ks.add(i)), key) {
-                    return Some(term(*vs.add(i)));
-                }
-            }
-        }
-        None
-    }
+    let value = raw::get_ptr(map, key, internal_hash(key))?;
+    Some(raw::read_get_ptr(value))
 }
 
 /// `maps:find/2` value lookup.

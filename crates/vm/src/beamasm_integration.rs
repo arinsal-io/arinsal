@@ -139,6 +139,12 @@ fn light_kind(module: &str, function: &str, arity: u8) -> bool {
 }
 
 impl DispatchTarget {
+    /// The stable `Export *` passed to erts' `save_calls`.
+    // Port of erts/emulator/beam/export.h (`Export` allocation), OTP-29.1.1.
+    pub(crate) fn export_entry_address(&self) -> usize {
+        Arc::as_ptr(self.slot) as usize
+    }
+
     /// `Export.is_bif_traced`: the one decision whether a BIF call enters the export's
     /// breakpoint.
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:391 (call_light_bif_shared), OTP-29.1.1.
@@ -407,7 +413,7 @@ fn fragments() -> Option<&'static DispatchFragments> {
                     save_calls_fun: crate::fun_dispatch::arinsal_beamasm_save_calls_fun as *const ()
                         as usize,
                     compare: CompareHelpers {
-                        eq: crate::native_hooks::arinsal_eq as *const () as usize,
+                        eq: crate::utils::eq as *const () as usize,
                         cmp_atoms: crate::native_hooks::arinsal_cmp_atoms as *const () as usize,
                         cmp_compound: crate::native_hooks::arinsal_cmp_compound as *const ()
                             as usize,
@@ -1663,7 +1669,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
             eq: 0,
         });
         // The general path of `=:=` / `=/=` calls `eq` directly, with or without fragments.
-        shared.eq = crate::native_hooks::arinsal_eq as *const () as usize;
+        shared.eq = crate::utils::eq as *const () as usize;
         shared
     }
     fn atom_word_by_name(&self, name: &str) -> Option<u64> {
@@ -1789,7 +1795,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
         crate::native_helpers::arinsal_beamasm_fun_resolver
     }
     fn add_stacktrace_helper(&self) -> arinsal_beamasm::catch::AddStacktraceHook {
-        crate::native_helpers::arinsal_beamasm_add_stacktrace
+        crate::beam_common::add_stacktrace
     }
     fn big_to_float_helper(&self) -> arinsal_beamasm::float::BigToFloat {
         crate::big::big_to_double

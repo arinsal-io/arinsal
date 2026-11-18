@@ -1077,6 +1077,21 @@ fn process_info_aux(
                                 Term::small(i64::from(*a)).ok_or_else(badarg)?,
                             ],
                         )?,
+                        crate::trace::SavedCall::Export(export) => {
+                            let Some((module, function, arity)) =
+                                crate::trace::saved_export_mfa(*export)
+                            else {
+                                return Err(badarg());
+                            };
+                            make_tuple(
+                                process,
+                                &[
+                                    Term::atom(module),
+                                    Term::atom(function),
+                                    Term::small(i64::from(arity)).ok_or_else(badarg)?,
+                                ],
+                            )?
+                        }
                     });
                 }
                 make_list(process, terms)?

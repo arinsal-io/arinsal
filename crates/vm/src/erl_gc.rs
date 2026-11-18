@@ -1,7 +1,10 @@
-//! Port of erts/emulator/beam/erl_gc.c, OTP-29.1.1: the collection after a BIF call.
+//! Port of erts/emulator/beam/erl_gc.c, OTP-29.1.1: the collection entry points BeamAsm
+//! generated code and the BIF return path call by symbol.
 
 use crate::Process;
-use arinsal_term::{THE_NON_VALUE, Term};
+use crate::process::sched_data::with_sched_data;
+use arinsal_beamasm::ProcessHeader;
+use arinsal_term::{THE_NON_VALUE, Term, exc};
 
 /// `erts_gc_after_bif_call_lhf(p, live_hf_end, result, regs, arity)`: collects after a BIF
 /// whose result left a collection desired. A term result is the only root and is returned
@@ -19,13 +22,13 @@ pub(crate) fn erts_gc_after_bif_call_lhf(
     p.heap.set_live_hf_end(live_hf_end);
     if !p.heap.gc_enabled() {
         // The first trap with collection disabled saves live_hf_end in `c_p->live_hf_end`.
-        if result == THE_NON_VALUE && p.heap.abi.exc.freason == arinsal_term::exc::TRAP {
+        if result == THE_NON_VALUE && p.heap.abi.exc.freason == exc::TRAP {
             p.heap.save_live_frags_mark();
         }
         return result;
     }
     let collected = if result == THE_NON_VALUE {
-        let live = if p.heap.abi.exc.freason == arinsal_term::exc::TRAP {
+        let live = if p.heap.abi.exc.freason == exc::TRAP {
             usize::from(p.heap.abi.arity)
         } else {
             arity
@@ -49,5 +52,61 @@ pub(crate) fn erts_gc_after_bif_call_lhf(
             crate::native_hooks::set_error(p, "system_limit");
             THE_NON_VALUE
         }
+    }
+}
+
+/// Collects without changing the process reduction count and returns reductions spent.
+// Port of erts/emulator/beam/erl_gc.c:967-980 (erts_garbage_collect_nobump), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn erts_garbage_collect_nobump(
+    c_p: *mut ProcessHeader,
+    need: usize,
+    objv: *mut u64,
+    nobj: i32,
+    fcalls: i32,
+) -> i32 {
+    let Some(process) = crate::native_hooks::enter_runtime(c_p) else {
+        return 0;
+    };
+    let Ok(nobj) = usize::try_from(nobj) else {
+        set_system_limit(process);
+        return 0;
+    };
+    if process.gc_must_fetch_signals() {
+        let fetched = with_sched_data(process, |_, process, ctx| process.fetch_signals(ctx));
+        if !matches!(fetched, Some(Ok(()))) {
+            set_system_limit(process);
+            return 0;
+        }
+    }
+    let Some(result) = crate::raw::beam_common_ffi::with_mut_terms(objv, nobj, |roots| {
+        process.ensure_uncharged(need, roots)
+    }) else {
+        set_system_limit(process);
+        return 0;
+    };
+    match result {
+        Ok(reds) => i32::try_from(reds).unwrap_or(i32::MAX).min(fcalls.max(0)),
+        Err(_) => {
+            set_system_limit(process);
+            0
+        }
+    }
+}
+
+fn set_system_limit(process: &mut Process) {
+    process.heap.abi.exc.freason = exc::EXC_SYSTEM_LIMIT;
+    process.heap.abi.exc.fvalue =
+        crate::native_hooks::raw(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn garbage_collection_symbol_signature_matches_otp() {
+        let _: extern "C" fn(*mut ProcessHeader, usize, *mut u64, i32, i32) -> i32 =
+            erts_garbage_collect_nobump;
     }
 }

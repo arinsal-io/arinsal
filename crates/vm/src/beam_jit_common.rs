@@ -345,6 +345,74 @@ pub extern "C" fn beam_jit_timeout_locked(header: *mut ProcessHeader) {
     beam_jit_timeout(header);
 }
 
+/// Gets the requested map elements from loader operands and stores them in X/Y registers.
+// Port of erts/emulator/beam/jit/beam_jit_common.cpp:706-760 (beam_jit_get_map_elements), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn beam_jit_get_map_elements(
+    map: u64,
+    reg: *mut u64,
+    stack: *mut u64,
+    n: u64,
+    fs: *mut u64,
+) -> u64 {
+    let Ok(n) = usize::try_from(n) else {
+        return 0;
+    };
+    let map = crate::native_hooks::from_raw(map);
+    let result = arinsal_maps::get_map_elements_with(
+        map,
+        n,
+        |index| {
+            crate::native_hooks::from_raw(crate::raw::beam_common_ffi::read_word(fs, index * 3))
+        },
+        |index| crate::raw::beam_common_ffi::read_word(fs, index * 3 + 2),
+        |index, value| {
+            raw::write_destination(
+                crate::raw::beam_common_ffi::read_word(fs, index * 3 + 1),
+                value,
+                reg,
+                stack,
+            )
+        },
+    );
+    match result {
+        Ok(true) => 1,
+        Ok(false) | Err(_) => 0,
+    }
+}
+
+mod raw {
+    //! Raw operand table access for the `beam_jit_get_map_elements` C ABI.
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:706-760, OTP-29.1.1.
+
+    const LOADER_TAG_MASK: u64 = 0x0f;
+    const LOADER_TAG_SIZE: u32 = 4;
+    const LOADER_X_REG: u64 = 0x3;
+    const LOADER_Y_REG: u64 = 0x7;
+
+    /// Stores a matched map value to the loader-tagged destination register.
+    pub(super) fn write_destination(
+        descriptor: u64,
+        value: arinsal_term::Term,
+        reg: *mut u64,
+        stack: *mut u64,
+    ) -> bool {
+        let index = (descriptor >> LOADER_TAG_SIZE) as usize;
+        let destination = match descriptor & LOADER_TAG_MASK {
+            LOADER_X_REG => reg,
+            LOADER_Y_REG => stack,
+            _ => return false,
+        };
+        if destination.is_null() {
+            return false;
+        }
+        crate::raw::beam_common_ffi::write_word(
+            destination.wrapping_add(index),
+            value.tagged_word(),
+        )
+    }
+}
+
 /// The runtime symbols native code calls keep their erts names and C signatures: a type
 /// mismatch is a compile error here, and `no_mangle` keeps the erts name for the linker.
 #[cfg(test)]
@@ -376,5 +444,7 @@ mod tests {
         let _: extern "C" fn(*mut P) = crate::receive::erts_msgq_set_save_next;
         let _: extern "C" fn(*mut P, i32, i32, *mut u64, *mut i32) -> i32 =
             crate::receive::erts_proc_sig_receive_helper;
+        let _: extern "C" fn(u64, *mut u64, *mut u64, u64, *mut u64) -> u64 =
+            super::beam_jit_get_map_elements;
     }
 }

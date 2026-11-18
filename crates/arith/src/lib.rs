@@ -1,4 +1,5 @@
 //! OTP 29 arithmetic over small integers, bignums, and floats.
+// Port of erts/emulator/beam/erl_arith.c, OTP-29.1.1.
 
 #![forbid(unsafe_code)]
 
@@ -160,6 +161,78 @@ pub fn mul_reduction_charge_words(left_words: usize, right_words: usize) -> u32 
     } else {
         (left_words * right_words / 16 + 1) as u32
     }
+}
+
+/// The integer multiply/add path's quadratic reduction charge, including zero and unit factors.
+// Port of erts/emulator/beam/erl_arith.c:991 (`erts_mul_add`), OTP-29.1.1.
+pub fn mul_add_reduction_charge(left: Term, right: Term) -> u32 {
+    let (Some(left_words), Some(right_words)) = (integer_words(left), integer_words(right)) else {
+        return 0;
+    };
+    mul_reduction_charge_words(left_words, right_words)
+}
+
+fn integer_words(term: Term) -> Option<usize> {
+    term.as_small()
+        .map(|_| 1)
+        .or_else(|| term.bignum_digit_count())
+}
+
+/// Divide two integers in one quotient/remainder pass and report its erts reduction charge.
+// Port of `erts_int_div_rem` in erts/emulator/beam/erl_arith.c, OTP-29.1.1.
+pub fn integer_div_rem<H: HeapAlloc + ?Sized>(
+    a: Term,
+    b: Term,
+    heap: &mut H,
+) -> (Result<(Term, Term), ArithError>, u32) {
+    let charge = int_div_rem_reduction_charge(a, b);
+    if integer_words(a).is_none() || integer_words(b).is_none() {
+        return (Err(ArithError::Badarith), charge);
+    }
+    if b.as_small() == Some(0)
+        || arinsal_term::integer_magnitude_cmp(b, Term::small(0).unwrap())
+            == Some(std::cmp::Ordering::Equal)
+    {
+        return (Err(ArithError::Badarith), charge);
+    }
+    let result = TermBuilder::new(&mut HeapProxy(heap))
+        .integer_div_rem(a, b)
+        .map_err(|error| match error {
+            TermError::BadArg => ArithError::Badarith,
+            error => construction_error(error, 0),
+        });
+    (result, charge)
+}
+
+/// Estimate `bump_reds_quadratic` for the fused integer quotient/remainder operation.
+// Port of the estimate in erts/emulator/beam/erl_arith.c:1208-1213, OTP-29.1.1.
+pub fn int_div_rem_reduction_charge(a: Term, b: Term) -> u32 {
+    let (Some(left_words), Some(right_words)) = (integer_words(a), integer_words(b)) else {
+        return 0;
+    };
+    if arinsal_term::integer_magnitude_cmp(a, b) != Some(std::cmp::Ordering::Greater) {
+        return 0;
+    }
+    mul_reduction_charge_words(left_words.saturating_sub(right_words) + 1, right_words)
+}
+
+/// `A * B + C` for three integers, with one `HeapFragOnlyAlloc` result reservation.
+// Port of erts/emulator/beam/erl_arith.c:919-1013 (`erts_mul_add`) and
+// erts/emulator/beam/big.c:3854-3879 (`big_mul_add`), OTP-29.1.1.
+pub fn integer_mul_add<H: HeapAlloc + ?Sized>(
+    a: Term,
+    b: Term,
+    c: Term,
+    heap: &mut H,
+) -> ArithResult {
+    let need_words = integer_words(a)
+        .zip(integer_words(b))
+        .zip(integer_words(c))
+        .map(|((a, b), c)| a.saturating_add(b).max(c).saturating_add(2))
+        .unwrap_or(0);
+    TermBuilder::new(&mut HeapProxy(heap))
+        .integer_mul_add(a, b, c)
+        .map_err(|error| construction_error(error, need_words))
 }
 
 // TermBuilder is sized; this proxy preserves the frozen ?Sized heap API.
