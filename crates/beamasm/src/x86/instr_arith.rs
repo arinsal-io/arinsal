@@ -966,7 +966,7 @@ impl BeamModuleAssembler {
             self.mov_arg_to_reg(ARG3, rhs)?;
             self.mov_arg_from_reg(ArgVal::X(0), ARG2)?;
             self.mov_arg_from_reg(ArgVal::X(1), ARG3)?;
-            self.emit_raise_exception(&DIV2_MFA)?;
+            self.emit_raise_exception_mfa(&DIV2_MFA)?;
         }
         self.asm.bind(next)?;
         self.mov_arg_from_reg(dst, RET)

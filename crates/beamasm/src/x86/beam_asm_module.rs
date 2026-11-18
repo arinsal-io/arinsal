@@ -1330,7 +1330,8 @@ impl BeamModuleAssembler {
     /// Loads the exception MFA and calls the shared raise fragment, recording the throwing PC.
     // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:264-271
     // (BeamModuleAssembler::emit_raise_exception(const ErtsCodeMFA *)), OTP-29.1.1.
-    pub(crate) fn emit_raise_exception(
+    /// erts overloads `emit_raise_exception`; this is the `(const ErtsCodeMFA *)` overload.
+    pub(crate) fn emit_raise_exception_mfa(
         &mut self,
         mfa: &'static arinsal_term::ErtsCodeMfa,
     ) -> Result<(), AsmError> {
