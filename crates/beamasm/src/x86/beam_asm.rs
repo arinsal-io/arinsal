@@ -302,6 +302,8 @@ pub mod process {
     pub const FREASON: i32 = offset_of!(ProcessHeader, exc.freason) as i32;
     /// `offsetof(Process, fvalue)`.
     pub const FVALUE: i32 = offset_of!(ProcessHeader, exc.fvalue) as i32;
+    /// `offsetof(Process, ftrace)`.
+    pub const FTRACE: i32 = offset_of!(ProcessHeader, exc.ftrace) as i32;
     /// `offsetof(Process, i)`.
     pub const I: i32 = offset_of!(ProcessHeader, i) as i32;
     /// `offsetof(Process, arity)`.

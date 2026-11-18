@@ -1,13 +1,20 @@
 //! Port of erts/emulator/beam/jit/x86/instr_common.cpp, OTP-29.1.1: the move, trim and jump
-//! instructions of box I1 so far. Every `emit_*` here is one erts `BeamModuleAssembler::emit_*`.
+//! instructions of box I1 so far. Every `emit_*` here is one erts `BeamModuleAssembler::emit_*`,
+//! and the global fragments `raise_shared` and `catch_end_shared`.
 
 use arinsal_x64::enc::{self, Xmm};
 
-use super::beam_asm::register::{ARG1, ARG2};
+use arinsal_term::{Term, atoms};
+use arinsal_x64::enc::{CondCode, qword_ptr};
+
+use super::beam_asm::register::{ARG1, ARG2, ARG3, ARG4, C_P, E, HTOP, RET};
 use super::beam_asm::{
     AsmError, BeamAssembler, CpuFeature, get_arg_ref, get_y_ref, process, process_ref,
 };
+use super::beam_asm::{Update, get_x_ref};
+use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
 use super::beam_asm_module::{BeamModuleAssembler, arg_label, arg_word};
+pub use super::rt::{add_stacktrace, erts_sanitize_freason};
 use crate::common::args::ArgVal;
 use crate::common::args::{Relation, memory_relation};
 
@@ -177,6 +184,80 @@ impl BeamModuleAssembler {
             .resolve_beam_label(arg_label(fail)?)
             .ok_or(AsmError::Operand("jump to an unknown label"))?;
         self.asm.jmp(label)
+    }
+}
+
+impl BeamGlobalAssembler {
+    /// Attaches a stacktrace to an error reason: `ARG3` is the reason, `ARG2` the trace.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:3138-3152 (emit_raise_shared),
+    // OTP-29.1.1.
+    pub(crate) fn emit_raise_shared(&mut self) -> Result<(), AsmError> {
+        let a = &mut self.asm;
+        a.emit(|e| e.mov_mr(process_ref(process::FVALUE, 8), ARG3))?;
+        a.emit(|e| e.mov_mr(process_ref(process::FTRACE, 8), ARG2))?;
+        a.emit_enter_runtime(Update::NONE)?;
+        a.emit(|e| e.mov_rr(ARG1, C_P))?;
+        a.runtime_call(erts_sanitize_freason as *const () as usize)?;
+        a.emit_leave_runtime(Update::NONE)?;
+        a.mov_imm(ARG4, 0)?;
+        let label = self.label(GlobalLabels::RaiseException);
+        self.asm.jmp(label)
+    }
+
+    /// The value of a `catch`: a thrown value as is, an error reason with its stacktrace,
+    /// anything else as `{'EXIT', Reason}`; class in x3, value in x1, trace in x2, result in
+    /// x0.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:3021-3083 (emit_catch_end_shared),
+    // OTP-29.1.1.
+    pub(crate) fn emit_catch_end_shared(&mut self) -> Result<(), AsmError> {
+        let throw = Term::atom(atoms::THROW).word() as i64;
+        let error = Term::atom(atoms::ERROR).word() as i64;
+        let exit = Term::atom(atoms::EXIT_2).word() as i64;
+        let garbage_collect = self.label(GlobalLabels::GarbageCollect);
+        let a = &mut self.asm;
+        let (not_throw, not_error, after_gc) = (a.new_label(), a.new_label(), a.new_label());
+        a.emit_enter_frame()?;
+        // Load thrown value / reason into ARG2 for add_stacktrace.
+        a.emit(|e| e.mov_rm(ARG2, get_x_ref(1, 8)))?;
+        a.emit(|e| e.cmp_mi(get_x_ref(3, 8), throw))?;
+        a.short_jcc(CondCode::NE, not_throw)?;
+        // Thrown value, return it in x0.
+        a.emit(|e| e.mov_mr(get_x_ref(0, 8), ARG2))?;
+        a.emit_leave_frame()?;
+        a.emit(|e| e.ret())?;
+
+        a.bind(not_throw)?;
+        a.emit(|e| e.cmp_mi(get_x_ref(3, 8), error))?;
+        a.jcc(CondCode::NE, not_error)?;
+        // This is an error, attach a stacktrace to the reason.
+        a.emit_enter_runtime(Update::HEAP_ALLOC)?;
+        a.emit(|e| e.mov_rr(ARG1, C_P))?;
+        a.emit(|e| e.mov_rm(ARG3, get_x_ref(2, 8)))?;
+        a.runtime_call(add_stacktrace as *const () as usize)?;
+        a.emit_leave_runtime(Update::HEAP_ALLOC)?;
+        // not_error assumes stacktrace/reason is in ARG2.
+        a.emit(|e| e.mov_rr(ARG2, RET))?;
+
+        a.bind(not_error)?;
+        let bytes_needed = ((3 + arinsal_term::S_RESERVED) * 8) as i32;
+        a.emit(|e| e.lea(ARG3, qword_ptr(HTOP, bytes_needed)))?;
+        a.emit(|e| e.cmp_rr(ARG3, E))?;
+        a.short_jcc(CondCode::BE, after_gc)?;
+        // Preserve stacktrace / reason.
+        a.emit(|e| e.mov_mr(get_x_ref(0, 8), ARG2))?;
+        a.mov_imm(ARG4, 1)?;
+        a.aligned_call_label(garbage_collect)?;
+        a.emit(|e| e.mov_rm(ARG2, get_x_ref(0, 8)))?;
+        a.bind(after_gc)?;
+        // make_arityval(2).
+        a.emit(|e| e.mov_mi(qword_ptr(HTOP, 0), 2 << 6))?;
+        a.emit(|e| e.mov_mi(qword_ptr(HTOP, 8), exit))?;
+        a.emit(|e| e.mov_mr(qword_ptr(HTOP, 16), ARG2))?;
+        a.emit(|e| e.lea(RET, qword_ptr(HTOP, 2)))?;
+        a.emit(|e| e.add_ri(HTOP, 24))?;
+        a.emit(|e| e.mov_mr(get_x_ref(0, 8), RET))?;
+        a.emit_leave_frame()?;
+        a.emit(|e| e.ret())
     }
 }
 

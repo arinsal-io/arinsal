@@ -123,7 +123,7 @@ pub(crate) fn beam_register(operand: &str) -> Option<crate::common::args::ArgVal
 
 /// erts 29.1.1 x86-64 `Process` field offsets in the dumps (`[r13+N]`), with Arinsal's
 /// `ProcessHeader` offset of the same field.
-pub(crate) const ERTS_PROCESS_OFFSETS: [(i32, i32); 10] = {
+pub(crate) const ERTS_PROCESS_OFFSETS: [(i32, i32); 11] = {
     use crate::x86::beam_asm::process;
     [
         (0, process::SELF_PID),
@@ -134,6 +134,7 @@ pub(crate) const ERTS_PROCESS_OFFSETS: [(i32, i32); 10] = {
         (120, process::FCALLS),
         (133, process::ARITY),
         (248, process::I),
+        (288, process::FTRACE),
         (464, process::CURRENT),
         (96, process::HEAP),
     ]
@@ -148,6 +149,10 @@ pub(crate) fn erts_to_arinsal(line: &str) -> String {
     // A short jump to a local label: GNU `as` picks rel8 itself for a label in reach.
     if line.starts_with("short j") && !line.contains("global::") {
         line = line.trim_start_matches("short ").to_string();
+    } else if line.starts_with('j') && line.contains(" L") && !line.starts_with("jmp r") {
+        // asmjit's dump marks every rel8 jump `short`; any other local jump is rel32, which
+        // GNU `as` would relax to rel8 when in reach.
+        line = format!("{{disp32}} {line}");
     }
     for (erts, ours) in ERTS_PROCESS_OFFSETS {
         let from = if erts == 0 {
@@ -177,13 +182,36 @@ pub(crate) fn erts_to_arinsal(line: &str) -> String {
 /// Compares `ours` with erts' fragment text, ignoring the displacements of jumps to other
 /// fragments (`jmp global::x`, `short jmp global::x`, `jz global::x`), whose targets lie
 /// elsewhere in each layout. `None` without binutils.
-pub(crate) fn matches_with_global_jumps(lines: &[String], ours: &[u8]) -> Option<bool> {
-    let placeholder = |fill: u8| -> Vec<String> {
+pub(crate) fn matches_with_global_jumps(
+    lines: &[String],
+    ours: &[u8],
+    unbound: &[&str],
+) -> Option<bool> {
+    let placeholder = |fill: u8, all_near: bool| -> Vec<String> {
         lines
             .iter()
             .map(|line| {
-                let Some((op, _)) = line.split_once(" global::") else {
+                // `runtime_call` / `abs_jmp`: asmjit's 6-byte `REX call/jmp rel32` to an
+                // absolute address, relocated at load; the address is erts' own.
+                if let Some((op, target)) = line.split_once(' ')
+                    && (op == "call" || op == "jmp")
+                    && target.parse::<u64>().is_ok()
+                {
+                    let opcode = if op == "call" { 0xe8 } else { 0xe9 };
+                    return format!(
+                        ".byte 0x40, {opcode:#04x}, {fill:#04x}, {fill:#04x}, {fill:#04x}, {fill:#04x}"
+                    );
+                }
+                let Some((op, target)) = line.split_once(" global::") else {
                     return line.clone();
+                };
+                // A fragment Arinsal does not emit yet is unbound here, so asmjit's rule gives
+                // the near form where erts reached it backward with rel8; with fragments
+                // missing, the layout also moves bound targets out of rel8 reach
+                // (`all_near`).
+                let op = match op.strip_prefix("short ") {
+                    Some(near) if all_near || unbound.contains(&target) => near,
+                    _ => op,
                 };
                 let opcode: &[u8] = match op {
                     "short jmp" => &[0xeb],
@@ -206,13 +234,16 @@ pub(crate) fn matches_with_global_jumps(lines: &[String], ours: &[u8]) -> Option
             })
             .collect()
     };
-    let zeros = gnu_as(&placeholder(0))?;
-    let ones = gnu_as(&placeholder(0xff))?;
-    Some(
-        ours.len() == zeros.len()
-            && ours
-                .iter()
-                .zip(zeros.iter().zip(&ones))
-                .all(|(o, (z, f))| z != f || o == z),
-    )
+    let matches = |all_near: bool| -> Option<bool> {
+        let zeros = gnu_as(&placeholder(0, all_near))?;
+        let ones = gnu_as(&placeholder(0xff, all_near))?;
+        Some(
+            ours.len() == zeros.len()
+                && ours
+                    .iter()
+                    .zip(zeros.iter().zip(&ones))
+                    .all(|(o, (z, f))| z != f || o == z),
+        )
+    };
+    Some(matches(false)? || (!unbound.is_empty() && matches(true)?))
 }

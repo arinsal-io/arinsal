@@ -14,8 +14,10 @@ use arinsal_term::{ErtsCodeMfa, Term, atoms};
 use arinsal_x64::buf::Label;
 use arinsal_x64::enc::qword_ptr;
 
-use super::beam_asm::register::{ARG1, ARG2, ARG2D, ARG3, ARG4, RET};
-use super::beam_asm::{AsmError, BeamAssembler, get_x_ref, process, process_ref};
+use arinsal_x64::enc::CondCode;
+
+use super::beam_asm::register::{ARG1, ARG2, ARG2D, ARG3, ARG4, C_P, RET};
+use super::beam_asm::{AsmError, BeamAssembler, Update, get_x_ref, process, process_ref};
 pub use super::rt::{call_error_handler, erts_garbage_collect_nobump, handle_error};
 use crate::exc::{EXC_BADARG, EXC_BADKEY, EXC_BADMAP};
 
@@ -517,6 +519,13 @@ impl BeamGlobalAssembler {
             G::IBreakpointTrampolineShared => Self::emit_i_breakpoint_trampoline_shared,
             G::RaiseException => Self::emit_raise_exception,
             G::RaiseExceptionNullExp => Self::emit_raise_exception_null_exp,
+            G::ProcessExit => Self::emit_process_exit,
+            G::RaiseExceptionShared => Self::emit_raise_exception_shared,
+            G::RaiseShared => Self::emit_raise_shared,
+            G::CatchEndShared => Self::emit_catch_end_shared,
+            G::DispatchSaveCallsExport => Self::emit_dispatch_save_calls_export,
+            G::UnloadedFun => Self::emit_unloaded_fun,
+            G::HandleCallFunError => Self::emit_handle_call_fun_error,
             _ => return None,
         })
     }
@@ -600,6 +609,53 @@ impl BeamGlobalAssembler {
         };
         let label = self.label(GlobalLabels::RaiseExceptionShared);
         self.asm.jmp(label)
+    }
+
+    /// Ends a process whose exception has no handler: `handle_error` with no error address
+    /// and no MFA; a null handler schedules out.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:304-323 (emit_process_exit),
+    // OTP-29.1.1.
+    fn emit_process_exit(&mut self) -> Result<(), AsmError> {
+        let spec = Update::HEAP_ALLOC.union(Update::REDUCTIONS);
+        let a = &mut self.asm;
+        a.emit_enter_runtime(spec)?;
+        a.emit(|e| e.mov_rr(ARG1, C_P))?;
+        a.mov_imm(ARG2, 0)?;
+        a.mov_imm(ARG4, 0)?;
+        a.load_x_reg_array(ARG3)?;
+        a.runtime_call(handle_error as *const () as usize)?;
+        a.emit_leave_runtime(spec)?;
+        a.emit(|e| e.test_rr(RET, RET))?;
+        let do_schedule = self.label(GlobalLabels::DoSchedule);
+        self.asm.jcc(CondCode::E, do_schedule)?;
+        // End of process.
+        self.asm.emit(|e| e.ud2())
+    }
+
+    /// Resolves the exception of `c_p` at error address `ARG2` (a CP or null) with MFA `ARG4`
+    /// to its handler and continues there, or schedules out without one.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:356-385
+    // (emit_raise_exception_shared), OTP-29.1.1.
+    fn emit_raise_exception_shared(&mut self) -> Result<(), AsmError> {
+        const CPMASK: i64 = 3;
+        let a = &mut self.asm;
+        let crash = a.new_label();
+        a.emit_enter_runtime(Update::HEAP_ALLOC)?;
+        // The error address must be a valid CP or NULL.
+        a.emit(|e| e.test_ri(ARG2D, CPMASK))?;
+        a.short_jcc(CondCode::NE, crash)?;
+        // ARG2 and ARG4 must be set prior to jumping here.
+        a.emit(|e| e.mov_rr(ARG1, C_P))?;
+        a.load_x_reg_array(ARG3)?;
+        a.runtime_call(handle_error as *const () as usize)?;
+        a.emit_leave_runtime(Update::HEAP_ALLOC)?;
+        a.emit(|e| e.test_rr(RET, RET))?;
+        let do_schedule = self.label(GlobalLabels::DoSchedule);
+        self.asm.jcc(CondCode::E, do_schedule)?;
+        self.asm.emit(|e| e.jmp_r(RET))?;
+        self.asm.bind(crash)?;
+        // Error address is not a CP or NULL or ARG2 and ARG4 are unset.
+        self.asm.emit(|e| e.ud2())
     }
 
     /// `a.jmp(labels[target])`.
@@ -788,7 +844,7 @@ mod tests {
                 G::HandleMapGetBadmap => mfa_address(&MAP_GET_BADMAP_MFA),
                 G::HandleMapSizeError => mfa_address(&MAP_SIZE_MFA),
                 G::HandleNodeError => mfa_address(&NODE_MFA),
-                G::DispatchSaveCallsFun => active,
+                G::DispatchSaveCallsFun | G::DispatchSaveCallsExport | G::UnloadedFun => active,
                 _ => return None,
             })
         };
@@ -799,7 +855,12 @@ mod tests {
         let ga = BeamGlobalAssembler::new().unwrap();
         let code = ga.asm.a.bytes(Section::Code);
         let ranges = ga.ranges();
-        assert!(ranges.len() >= 13);
+        let unbound: Vec<&str> = GLOBAL_LABELS
+            .iter()
+            .filter(|label| ga.asm.a.label_location(ga.label(**label)).is_none())
+            .map(|label| label.name())
+            .collect();
+        assert!(ranges.len() >= 21);
         for (label, range) in ranges {
             assert_eq!(range.start % 8, 0);
             let lines: Vec<String> = fragment_lines(&dump, label.name())
@@ -816,7 +877,8 @@ mod tests {
             // erts' range runs to the next fragment; its last bytes are `align 8` padding.
             let ours = &code[range.clone()];
             let matched = (1..=ours.len()).rev().any(|n| {
-                crate::x86::jdump::matches_with_global_jumps(&lines, &ours[..n]) == Some(true)
+                crate::x86::jdump::matches_with_global_jumps(&lines, &ours[..n], &unbound)
+                    == Some(true)
                     && ours[n..].len() < 8
             });
             assert!(matched, "{label:?}: {lines:?} vs {:02x?}", ours);

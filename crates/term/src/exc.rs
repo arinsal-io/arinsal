@@ -68,6 +68,10 @@ pub const EXC_CASE_CLAUSE: u64 = coded(7);
 pub const EXC_IF_CLAUSE: u64 = coded(8);
 /// No function of that arity.
 pub const EXC_UNDEF: u64 = coded(9);
+/// Not a fun.
+pub const EXC_BADFUN: u64 = coded(10);
+/// Fun called with the wrong arity.
+pub const EXC_BADARITY: u64 = coded(11);
 /// Ran out of something.
 pub const EXC_SYSTEM_LIMIT: u64 = coded(15);
 /// No matching try clause.

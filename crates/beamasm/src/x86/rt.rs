@@ -119,6 +119,41 @@ unsafe extern "C" {
     ) -> i32;
 }
 
+// Port of erts/emulator/beam/jit/x86/instr_common.cpp and instr_call.cpp (`extern "C" {
+// #include "beam_common.h" }`), OTP-29.1.1: the beam_common.h functions their global fragments
+// call by address. `instr_common` and `instr_call` re-export them.
+unsafe extern "C" {
+    /// `Eterm add_stacktrace(Process *c_p, Eterm Value, Eterm exc)` (beam_common.h).
+    pub safe fn add_stacktrace(c_p: *mut crate::ProcessHeader, value: u64, exc: u64) -> u64;
+    /// `void erts_sanitize_freason(Process *c_p, Eterm exc)` (beam_common.h).
+    pub safe fn erts_sanitize_freason(c_p: *mut crate::ProcessHeader, exc: u64);
+    /// `void save_calls(Process *p, const Export *)` (beam_common.h). `Export` crosses as an
+    /// address, as for `call_error_handler`.
+    pub safe fn save_calls(c_p: *mut crate::ProcessHeader, export: usize);
+}
+
+// Port of erts/emulator/beam/jit/beam_jit_common.hpp, OTP-29.1.1: the JIT-only runtime
+// helpers of jit/beam_jit_common.cpp the x86 fragments call by address. `instr_fun` re-exports
+// them.
+unsafe extern "C" {
+    /// `const Export *beam_jit_handle_unloaded_fun(Process *c_p, Eterm *reg, int arity,
+    /// Eterm fun_thing, ErtsCodeIndex code_ix)`: the export to call, or null with
+    /// `c_p->freason` set. `Export` crosses as an address.
+    pub safe fn beam_jit_handle_unloaded_fun(
+        c_p: *mut crate::ProcessHeader,
+        reg: *mut u64,
+        arity: i32,
+        fun_thing: u64,
+        code_ix: u32,
+    ) -> usize;
+    /// `Eterm beam_jit_build_argument_list(Process *c_p, const Eterm *regs, int arity)`.
+    pub safe fn beam_jit_build_argument_list(
+        c_p: *mut crate::ProcessHeader,
+        regs: *const u64,
+        arity: i32,
+    ) -> u64;
+}
+
 /// Displacements (from `registers`) the bridge shares with native fragments and the VM, as on
 /// arm64. `tmp_mem[0..2]`: the exit target and resume address a trace hook leaves.
 const TMP_MEM0: i32 = tmp_mem_disp(0);
@@ -294,6 +329,48 @@ mod tests {
     /// `emit_leave_runtime(Update::CODE_INDEX)` link.
     #[unsafe(no_mangle)]
     static the_active_code_index: u32 = 0;
+
+    // Fixtures for the runtime functions the fragments of the byte tests call, so the test
+    // binary links; the tests only take their addresses.
+    #[unsafe(no_mangle)]
+    extern "C" fn handle_error(
+        _c_p: *mut crate::ProcessHeader,
+        _pc: usize,
+        _reg: *mut u64,
+        _bif_mfa: *const arinsal_term::ErtsCodeMfa,
+    ) -> usize {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn add_stacktrace(_c_p: *mut crate::ProcessHeader, _value: u64, _exc: u64) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_sanitize_freason(_c_p: *mut crate::ProcessHeader, _exc: u64) {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn beam_jit_handle_unloaded_fun(
+        _c_p: *mut crate::ProcessHeader,
+        _reg: *mut u64,
+        _arity: i32,
+        _fun_thing: u64,
+        _code_ix: u32,
+    ) -> usize {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn beam_jit_build_argument_list(
+        _c_p: *mut crate::ProcessHeader,
+        _regs: *const u64,
+        _arity: i32,
+    ) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn save_calls(_c_p: *mut crate::ProcessHeader, _export: usize) {
+        unreachable!("byte-test fixture")
+    }
 
     // Native functions following the x86-64 BeamAsm register contract, entered through the
     // bridge. `preserve` is a host-side caller that checks the bridge keeps every System V
