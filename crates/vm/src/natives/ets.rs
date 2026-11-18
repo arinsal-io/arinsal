@@ -1,6 +1,6 @@
 //! ETS BIFs whose storage and access policy belong to the scheduled runtime.
 
-use crate::proc_create::{EtsFree, EtsInsert, SelectStage};
+use crate::proc_create::{EtsInsert, SelectStage};
 use crate::process::Message;
 use crate::{Process, VmError};
 use arinsal_ets::match_spec::MatchDialect;
@@ -1579,13 +1579,13 @@ pub(crate) fn help_busy_table(
 }
 
 /// `ets:delete/1` and `ets:internal_delete_all/2`: release the storage a slice of reductions
-/// at a time, trapping to the same BIF until it is all released.
+/// at a time. `ets:delete/1` traps to `ets:delete_trap/1` with its state binary,
+/// `ets:internal_delete_all/2` to itself with `(Tid, NItems)`.
 ///
 /// Port of erts/emulator/beam/erl_db.c (ets_delete_1), :3234 (ets_internal_delete_all_2),
 /// :5378 (ets_delete_trap) and :5405 (free_table_continue), OTP-29.1.1.
 fn delete_or_clear(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
     function: EtsBif,
     args: &[Term],
     caller: Term,
@@ -1593,70 +1593,68 @@ fn delete_or_clear(
     let rt = process.runtime.ok_or_else(badarg)?;
     let initial = process.heap.abi.fcalls.max(0) as isize;
     let mut reds = initial;
-    let mut state = process.cold.as_mut().and_then(|cold| cold.ets_free.take());
-    let done = if let Some(state) = state.as_mut() {
-        match state.tid {
-            None => state.garbage.step(&mut reds),
-            // Trapped before: the table stopped being busy (whoever finished it), so the
-            // objects are gone and only the count is left to return.
-            Some(_) => true,
-        }
-    } else if function == EtsBif::Delete {
+    if function == EtsBif::Delete {
         let mut registry = rt.ets.write().unwrap();
         let tid = handle(&registry, args[0])?;
         if !allowed(&*registry.get(tid).map_err(err)?, caller, true) {
             return Err(badarg_cause("access"));
         }
-        let (garbage, fixations) = registry.detach(tid).map_err(err)?;
+        let (mut garbage, fixations) = registry.detach(tid).map_err(err)?;
         drop(registry);
         reds -= fixations as isize;
-        let mut fresh = EtsFree {
-            tid: None,
-            nitems: 0,
-            garbage,
-        };
-        let done = fresh.garbage.step(&mut reds);
-        state = Some(Box::new(fresh));
-        done
-    } else {
-        let registry = rt.ets.read().unwrap();
-        let tid = handle(&registry, args[0])?;
-        let mut table = registry.get_mut(tid).map_err(err)?;
-        if !allowed(&table, caller, true) {
-            return Err(badarg_cause("access"));
+        if !garbage.step(&mut reds) {
+            bump_direct(process, isize::MAX);
+            let state = crate::natives::erl_db::new_free_state(process, garbage)?;
+            return Err(VmError::TrapExport(crate::ExportTrap::new(
+                process,
+                "ets:delete_trap/1",
+                vec![state],
+            )));
         }
-        if args[1] != Term::atom(arinsal_term::atoms::UNDEFINED) {
-            return Err(badarg());
-        }
-        let nitems = table.len();
-        let mut garbage = table.take_garbage(false);
-        let done = table.free_garbage(&mut garbage, &mut reds);
-        if !done {
-            // Port of erts/emulator/beam/erl_db.c (ets_internal_delete_all_2): the
-            // table turns busy and every process that meets it continues the release.
-            table.begin_busy_delete_all(garbage);
-        }
-        state = Some(Box::new(EtsFree {
-            tid: Some(tid),
-            nitems,
-            garbage: arinsal_ets::Garbage::empty(),
-        }));
-        done
-    };
-    let state = state.expect("delete state present");
-    if !done {
-        bump_reds(process, ctx, isize::MAX);
-        process.cold_mut().ets_free = Some(state);
-        return Err(VmError::Yield);
-    }
-    bump_reds(process, ctx, initial - reds);
-    if function == EtsBif::Delete {
+        bump_direct(process, initial - reds);
         return Ok(Term::atom(arinsal_term::atoms::TRUE));
     }
+    let registry = rt.ets.read().unwrap();
+    let tid = handle(&registry, args[0])?;
+    let mut table = registry.get_mut(tid).map_err(err)?;
+    if !allowed(&table, caller, true) {
+        return Err(badarg_cause("access"));
+    }
+    // `BIF_ARG_2 != undefined`: this is the continuation, and the table is no longer busy.
+    if args[1] != Term::atom(arinsal_term::atoms::UNDEFINED) {
+        return Ok(args[1]);
+    }
+    let nitems = table.len();
+    let mut garbage = table.take_garbage(false);
+    let done = table.free_garbage(&mut garbage, &mut reds);
+    if !done {
+        // Port of erts/emulator/beam/erl_db.c (ets_internal_delete_all_2): the
+        // table turns busy and every process that meets it continues the release.
+        table.begin_busy_delete_all(garbage);
+    }
+    let tid_term = if args[0].as_atom().is_some() {
+        registry
+            .tid_term(tid, &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+            .map_err(err)?
+    } else {
+        args[0]
+    };
+    drop(table);
+    drop(registry);
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    TermBuilder::new(&mut heap)
-        .int_from_i128(state.nitems as i128)
-        .map_err(|_| badarg())
+    let holder = TermBuilder::new(&mut heap)
+        .int_from_i128(nitems as i128)
+        .map_err(|_| badarg())?;
+    if !done {
+        bump_direct(process, isize::MAX);
+        return Err(VmError::TrapExport(crate::ExportTrap::new(
+            process,
+            "ets:internal_delete_all/2",
+            vec![tid_term, holder],
+        )));
+    }
+    bump_direct(process, initial - reds);
+    Ok(holder)
 }
 
 /// Fix a table for `caller`, stamping the first fixation with the current times.
@@ -2612,8 +2610,7 @@ fn call_inner(
         (function, args.len()),
         (EtsBif::Delete, 1) | (EtsBif::InternalDeleteAll, 2)
     ) {
-        let ctx = ctx.ok_or_else(needs_context)?;
-        return delete_or_clear(process, ctx, function, args, caller);
+        return delete_or_clear(process, function, args, caller);
     }
     if matches!(
         (function, args.len()),

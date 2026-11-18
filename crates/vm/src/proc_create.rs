@@ -1413,9 +1413,6 @@ pub(crate) struct ProcessCold {
     /// Breakpoint update a trace BIF caller finishes between code barriers while it holds
     /// the code modification permission.
     pub(crate) trace_finish: Option<Box<crate::trace_bp::TraceFinish>>,
-    /// Storage of a table being released by a trapped `ets:delete/1` or
-    /// `ets:internal_delete_all/2`.
-    pub(crate) ets_free: Option<Box<EtsFree>>,
     /// Progress of a trapped `ets:select/2`, `match/2`, `match_object/2` or `select_count/2`.
     pub(crate) ets_select: Option<Box<EtsSelect>>,
     /// Operand registers of `apply` calls in progress. A callee may collect before it
@@ -2242,16 +2239,6 @@ pub(crate) enum DirtyGc {
     Major,
     /// erts `F_DIRTY_MINOR_GC`.
     Minor,
-}
-
-/// Port of erts/emulator/beam/erl_db.c:3006-3080 (ets_delete_1 continuation) and
-/// erl_db.c:3234 (ets_internal_delete_all_2), OTP-29.1.1: what a trapped call still has to free.
-pub(crate) struct EtsFree {
-    /// Table whose objects were detached by `ets:internal_delete_all/2`; `None` for `ets:delete/1`.
-    pub(crate) tid: Option<arinsal_ets::Tid>,
-    /// Object count `ets:internal_delete_all/2` returns when done.
-    pub(crate) nitems: usize,
-    pub(crate) garbage: arinsal_ets::Garbage,
 }
 
 /// Port of erts/emulator/beam/erl_db_hash.c (select_chunk_on_trap and select_count_on_trap),

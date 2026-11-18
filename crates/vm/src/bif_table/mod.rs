@@ -660,6 +660,7 @@ pub(crate) fn trap_function(module: &str, function: &str, arity: u8) -> Option<u
             bif!(crate::natives::bif::dsend_continue_trap_1)
         }
         ("maps", "merge_trap", 1) => bif!(erl_map::maps_merge_trap_1),
+        ("ets", "delete_trap", 1) => bif!(erl_db::ets_delete_trap_1),
         ("erlang", "length", 3) => bif!(erl_bif_guard::erlang_length_trap),
         ("erts_internal", "term_to_binary_trap", 1) => bif!(external::term_to_binary_trap_1),
         ("erts_internal", "binary_to_term_trap", 1) => bif!(external::binary_to_term_trap_1),

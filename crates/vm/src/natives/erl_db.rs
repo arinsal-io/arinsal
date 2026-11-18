@@ -464,3 +464,61 @@ ets_bif!(
     "update_counter",
     4
 );
+
+type FreeState = TrapContext<Option<arinsal_ets::Garbage>>;
+
+arinsal_term::magic_payload!(FreeState => free_table_continue_destructor,);
+
+/// The state binary of a trapped `ets:delete/1`: the storage still to release.
+// Port of erts/emulator/beam/erl_db.c (ets_delete_1: the DbTable pointer packaged for the
+// trap), OTP-29.1.1.
+pub(crate) fn new_free_state(
+    process: &mut Process,
+    garbage: arinsal_ets::Garbage,
+) -> Result<Term, VmError> {
+    let owner = MagicBin::with_erts_payload_size_and_refn(
+        TrapContext::new(Some(garbage)),
+        ERTS_FREE_STATE_SIZE,
+        arinsal_sched::unique::next_ref_words(),
+    );
+    let mut heap = ProcessHeapHandle(&mut process.heap);
+    TermBuilder::new(&mut heap).magic_ref(owner).map_err(|_| {
+        VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+            atoms::SYSTEM_LIMIT,
+        )))
+    })
+}
+
+const ERTS_FREE_STATE_SIZE: usize = 64;
+
+/// `ets:delete_trap/1`, the hidden export `ets:delete/1` traps to.
+// Port of erts/emulator/beam/erl_db.c (ets_delete_trap, free_table_continue), OTP-29.1.1.
+pub(crate) extern "C" fn ets_delete_trap_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [state] = bif_args::<1>(reg);
+    let initial = process.heap.abi.fcalls.max(0) as isize;
+    let mut reds = initial;
+    let step = state.with_magic_payload_mut::<FreeState, _>(|holder| {
+        holder.0.as_mut().map(|garbage| garbage.step(&mut reds))
+    });
+    match step.flatten() {
+        None => crate::natives::bif::bif_badarg(c_p),
+        Some(false) => {
+            ets::bump_direct(process, isize::MAX);
+            let trap = VmError::TrapExport(crate::ExportTrap::new(
+                process,
+                "ets:delete_trap/1",
+                vec![state],
+            ));
+            crate::native_helpers::bif_return_current(c_p, i, trap)
+        }
+        Some(true) => {
+            state.with_magic_payload_mut::<FreeState, _>(|holder| holder.0 = None);
+            ets::bump_direct(process, initial - reds);
+            crate::native_hooks::raw(Term::atom(atoms::TRUE))
+        }
+    }
+}
