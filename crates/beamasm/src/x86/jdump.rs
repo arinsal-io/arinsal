@@ -120,3 +120,99 @@ pub(crate) fn beam_register(operand: &str) -> Option<crate::common::args::ArgVal
         _ => None,
     }
 }
+
+/// erts 29.1.1 x86-64 `Process` field offsets in the dumps (`[r13+N]`), with Arinsal's
+/// `ProcessHeader` offset of the same field.
+pub(crate) const ERTS_PROCESS_OFFSETS: [(i32, i32); 10] = {
+    use crate::x86::beam_asm::process;
+    [
+        (0, process::SELF_PID),
+        (80, process::HTOP),
+        (88, process::STOP),
+        (104, process::FREASON),
+        (112, process::FVALUE),
+        (120, process::FCALLS),
+        (133, process::ARITY),
+        (248, process::I),
+        (464, process::CURRENT),
+        (96, process::HEAP),
+    ]
+};
+
+/// Rewrites one erts dump line to Arinsal's layouts: `Process` fields (`[r13+N]`) and the
+/// scheduler registers' auxiliary area (`[rbx-N]`: erts' `runtime_stack` is at -64 and
+/// `TMP_MEM1..5` follow it; Arinsal's start at -128).
+pub(crate) fn erts_to_arinsal(line: &str) -> String {
+    use crate::x86::beam_asm::{get_runtime_stack_ref, tmp_mem_q_disp};
+    let mut line = line.trim_start_matches("rex ").replace(".db ", ".byte ");
+    // A short jump to a local label: GNU `as` picks rel8 itself for a label in reach.
+    if line.starts_with("short j") && !line.contains("global::") {
+        line = line.trim_start_matches("short ").to_string();
+    }
+    for (erts, ours) in ERTS_PROCESS_OFFSETS {
+        let from = if erts == 0 {
+            "[r13]".to_string()
+        } else {
+            format!("[r13+{erts}]")
+        };
+        if line.contains(&from) {
+            line = line.replace(&from, &format!("[r13+{ours}]"));
+            break;
+        }
+    }
+    let aux = |disp: i32| format!("[rbx{disp}]");
+    if line.contains(&aux(-64)) {
+        line = line.replace(&aux(-64), &aux(get_runtime_stack_ref().disp));
+    }
+    for index in 0..5u32 {
+        let erts = -56 + 8 * index as i32;
+        if line.contains(&aux(erts)) {
+            line = line.replace(&aux(erts), &aux(tmp_mem_q_disp(index)));
+            break;
+        }
+    }
+    line
+}
+
+/// Compares `ours` with erts' fragment text, ignoring the displacements of jumps to other
+/// fragments (`jmp global::x`, `short jmp global::x`, `jz global::x`), whose targets lie
+/// elsewhere in each layout. `None` without binutils.
+pub(crate) fn matches_with_global_jumps(lines: &[String], ours: &[u8]) -> Option<bool> {
+    let placeholder = |fill: u8| -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                let Some((op, _)) = line.split_once(" global::") else {
+                    return line.clone();
+                };
+                let opcode: &[u8] = match op {
+                    "short jmp" => &[0xeb],
+                    "call" => &[0xe8],
+                    "jmp" => &[0xe9],
+                    "jz" => &[0x0f, 0x84],
+                    "jnz" => &[0x0f, 0x85],
+                    "short jz" => &[0x74],
+                    "short jnz" => &[0x75],
+                    other => panic!("unknown jump `{other}`"),
+                };
+                let width = if op.starts_with("short") { 1 } else { 4 };
+                let bytes: Vec<String> = opcode
+                    .iter()
+                    .copied()
+                    .chain(std::iter::repeat_n(fill, width))
+                    .map(|b| format!("{b:#04x}"))
+                    .collect();
+                format!(".byte {}", bytes.join(", "))
+            })
+            .collect()
+    };
+    let zeros = gnu_as(&placeholder(0))?;
+    let ones = gnu_as(&placeholder(0xff))?;
+    Some(
+        ours.len() == zeros.len()
+            && ours
+                .iter()
+                .zip(zeros.iter().zip(&ones))
+                .all(|(o, (z, f))| z != f || o == z),
+    )
+}

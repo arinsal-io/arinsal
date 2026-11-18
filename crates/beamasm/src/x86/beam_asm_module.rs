@@ -27,6 +27,94 @@ pub struct Patch {
     pub val_offs: usize,
 }
 
+/// `ErtsCodeInfo` with `BEAMASM`: the `i_func_info` block in front of every function.
+// Port of erts/emulator/beam/code_ix.h:104-125 (ErtsCodeInfo), OTP-29.1.1.
+#[repr(C)]
+pub struct ErtsCodeInfo {
+    /// `u.metadata`: `raise_function_clause[7]` and `breakpoint_flag`.
+    pub metadata: [u8; 8],
+    /// `gen_bp`: the trace breakpoint.
+    pub gen_bp: usize,
+    /// `mfa`.
+    pub mfa: arinsal_term::ErtsCodeMfa,
+}
+
+impl super::beam_asm_global::BeamGlobalAssembler {
+    /// Raises `function_clause` for the function whose `ErtsCodeInfo` called here: the
+    /// return address of that call, with the call's offset masked off, is the code info.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:451-466 (emit_i_func_info_shared),
+    // OTP-29.1.1.
+    pub(crate) fn emit_i_func_info_shared(&mut self) -> Result<(), AsmError> {
+        use super::beam_asm::register::ARG2;
+        use super::beam_asm::{process, process_ref};
+        let a = &mut self.asm;
+        a.emit(|e| e.pop_r(ARG1))?;
+        a.emit(|e| e.and_ri(ARG1, !0x7))?;
+        let mfa = core::mem::offset_of!(ErtsCodeInfo, mfa) as i64;
+        a.emit(|e| e.add_ri(ARG1, mfa))?;
+        a.emit(|e| {
+            e.mov_mi(
+                process_ref(process::FREASON, 8),
+                crate::exc::EXC_FUNCTION_CLAUSE as i64,
+            )
+        })?;
+        a.emit(|e| e.mov_mr(process_ref(process::CURRENT, 8), ARG1))?;
+        a.mov_imm(ARG2, 0)?;
+        a.mov_imm(ARG4, 0)?;
+        let label = self.label(super::beam_asm_global::GlobalLabels::RaiseExceptionShared);
+        self.asm.jmp(label)
+    }
+}
+
+/// `enum erts_asm_bp_flag`: what the breakpoint trampoline of a function does.
+// Port of erts/emulator/beam/jit/beam_asm.h:172-178, OTP-29.1.1.
+pub mod bp_flag {
+    /// `ERTS_ASM_BP_FLAG_CALL_NIF_EARLY`.
+    pub const CALL_NIF_EARLY: i64 = 1 << 0;
+    /// `ERTS_ASM_BP_FLAG_BP`.
+    pub const BP: i64 = 1 << 1;
+    /// `ERTS_ASM_BP_FLAG_BP_NIF_CALL_NIF_EARLY`.
+    pub const BP_NIF_CALL_NIF_EARLY: i64 = CALL_NIF_EARLY | BP;
+}
+
+impl super::beam_asm_global::BeamGlobalAssembler {
+    /// Dispatches an enabled function prologue on the breakpoint flag of its `ErtsCodeInfo`,
+    /// found from the return address of the prologue's call.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:166-209
+    // (emit_i_breakpoint_trampoline_shared), OTP-29.1.1.
+    pub(crate) fn emit_i_breakpoint_trampoline_shared(&mut self) -> Result<(), AsmError> {
+        use super::beam_asm::register::RETD;
+        use super::beam_asm_global::{BEAM_ASM_FUNC_PROLOGUE_SIZE, GlobalLabels};
+        use arinsal_x64::enc::{CondCode, byte_ptr, qword_ptr};
+        // `offsetof(ErtsCodeInfo, u.metadata.breakpoint_flag)` is the last byte of `u`.
+        let flag_offset =
+            (core::mem::size_of::<ErtsCodeInfo>() as i32) + BEAM_ASM_FUNC_PROLOGUE_SIZE as i32 - 7;
+        let generic_bp_local = self.label(GlobalLabels::GenericBpLocal);
+        let call_nif_early = self.label(GlobalLabels::CallNifEarly);
+        let a = &mut self.asm;
+        let (bp_and_nif, bp_only, nif_only) = (a.new_label(), a.new_label(), a.new_label());
+        a.emit(|e| e.mov_rm(RET, qword_ptr(arinsal_x64::enc::RSP, 0)))?;
+        a.emit(|e| e.movzx_rm(RETD, byte_ptr(RET, -flag_offset)))?;
+        a.emit(|e| e.cmp_ri(RETD, bp_flag::BP_NIF_CALL_NIF_EARLY))?;
+        a.short_jcc(CondCode::E, bp_and_nif)?;
+        a.emit(|e| e.cmp_ri(RETD, bp_flag::CALL_NIF_EARLY))?;
+        a.short_jcc(CondCode::E, nif_only)?;
+        a.emit(|e| e.cmp_ri(RETD, bp_flag::BP))?;
+        a.short_jcc(CondCode::E, bp_only)?;
+        a.emit(|e| e.ret())?;
+
+        a.bind(bp_and_nif)?;
+        a.aligned_call_label(generic_bp_local)?;
+        // Falls through: call_nif_early returns on its own, unlike generic_bp_local.
+        a.bind(nif_only)?;
+        a.jmp(call_nif_early)?;
+
+        a.bind(bp_only)?;
+        a.aligned_call_label(generic_bp_local)?;
+        a.emit(|e| e.ret())
+    }
+}
+
 /// erts `class BeamModuleAssembler : public BeamAssembler, public BeamModuleAssemblerCommon`.
 // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:1130-1875 and
 // erts/emulator/beam/jit/beam_jit_common.hpp:130-198 (BeamModuleAssemblerCommon), OTP-29.1.1.
@@ -233,6 +321,17 @@ impl BeamModuleAssembler {
             .dispatch_table
             .entry(fragment)
             .or_insert_with(|| asm.new_label())
+    }
+
+    /// `flush_last_error()`: a `nop` when an instruction that may raise at its very end is
+    /// followed by a new line, so the error refers to the preceding line.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:586-597 (flush_last_error),
+    // OTP-29.1.1.
+    pub fn flush_last_error(&mut self) -> Result<(), AsmError> {
+        if self.offset() == self.last_error_offset {
+            self.asm.emit(|e| e.nop())?;
+        }
+        Ok(())
     }
 
     /// `emit_is_boxed(Fail, Src, dist)` keeping the register cache.

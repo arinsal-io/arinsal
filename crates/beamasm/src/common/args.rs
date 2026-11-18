@@ -28,3 +28,31 @@ pub(crate) fn trimmed_arg(dst: ArgVal, words: u32) -> Option<ArgVal> {
         _ => None,
     }
 }
+
+/// How two register operands lie in memory (`ArgVal::Relation`).
+// Port of erts/emulator/beam/jit/beam_jit_args.hpp:142 (ArgVal::Relation), OTP-29.1.1.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Relation {
+    /// Not adjacent.
+    None,
+    /// `rhs` is the register after `lhs`.
+    Consecutive,
+    /// `rhs` is the register before `lhs`.
+    ReverseConsecutive,
+}
+
+/// `ArgVal::memory_relation(lhs, rhs)`.
+// Port of erts/emulator/beam/jit/beam_jit_args.hpp:144-154 (memory_relation), OTP-29.1.1.
+pub fn memory_relation(lhs: ArgVal, rhs: ArgVal) -> Relation {
+    let (l, r) = match (lhs, rhs) {
+        (ArgVal::X(l), ArgVal::X(r)) | (ArgVal::Y(l), ArgVal::Y(r)) => (l, r),
+        _ => return Relation::None,
+    };
+    if l + 1 == r {
+        Relation::Consecutive
+    } else if l == r + 1 {
+        Relation::ReverseConsecutive
+    } else {
+        Relation::None
+    }
+}

@@ -510,8 +510,96 @@ impl BeamGlobalAssembler {
             G::HandleMapSizeError => Self::emit_handle_map_size_error,
             G::HandleNodeError => Self::emit_handle_node_error,
             G::ITestYieldShared => Self::emit_i_test_yield_shared,
+            G::BifExportTrap => Self::emit_bif_export_trap,
+            G::DispatchReturn => Self::emit_dispatch_return,
+            G::DispatchSaveCallsFun => Self::emit_dispatch_save_calls_fun,
+            G::IFuncInfoShared => Self::emit_i_func_info_shared,
+            G::IBreakpointTrampolineShared => Self::emit_i_breakpoint_trampoline_shared,
+            G::RaiseException => Self::emit_raise_exception,
+            G::RaiseExceptionNullExp => Self::emit_raise_exception_null_exp,
             _ => return None,
         })
+    }
+
+    /// Emits the fragment table: every fragment of `emitPtrs` in enum order, aligned to 8
+    /// bytes and bound to its predeclared label. Fragments not ported yet are absent.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:35-55
+    // (BeamGlobalAssembler::BeamGlobalAssembler, up to codegen), OTP-29.1.1.
+    pub fn new() -> Result<Self, AsmError> {
+        let mut ga = Self::declare_labels();
+        for label in &GLOBAL_LABELS[..GLOBAL_FRAGMENT_COUNT] {
+            if let Some(emit) = Self::emit_ptr(*label) {
+                ga.asm.align_code(8)?;
+                ga.asm.bind(ga.label(*label))?;
+                emit(&mut ga)?;
+            }
+        }
+        Ok(ga)
+    }
+
+    /// The `AsmRange` of every emitted fragment, as code offsets: from its label to the next
+    /// fragment's label, the last one to the end of the code.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:67-90 (the `ranges` loop),
+    // OTP-29.1.1.
+    pub fn ranges(&self) -> Vec<(GlobalLabels, std::ops::Range<usize>)> {
+        let starts: Vec<(GlobalLabels, usize)> = GLOBAL_LABELS[..GLOBAL_FRAGMENT_COUNT]
+            .iter()
+            .filter_map(|label| {
+                let location = self.asm.a.label_location(self.label(*label))?;
+                Some((*label, location.offset))
+            })
+            .collect();
+        let end = self.asm.a.section_offset(arinsal_x64::buf::Section::Code);
+        starts
+            .iter()
+            .enumerate()
+            .map(|(i, (label, start))| {
+                let stop = starts.get(i + 1).map_or(end, |next| next.1);
+                (*label, *start..stop)
+            })
+            .collect()
+    }
+
+    /// Handles trapping to exports from C code: `c_p->current` points into the MFA of an
+    /// export entry; continues at its dispatch address as `call_ext` would.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:143-154 (emit_bif_export_trap),
+    // OTP-29.1.1.
+    fn emit_bif_export_trap(&mut self) -> Result<(), AsmError> {
+        let a = &mut self.asm;
+        a.emit(|e| e.mov_rm(RET, process_ref(process::CURRENT, 8)))?;
+        a.emit(|e| e.sub_ri(RET, i64::from(arinsal_term::EXPORT_MFA_OFFSET)))?;
+        a.emit_leave_frame()?;
+        let target = a.emit_setup_dispatchable_call_active(RET)?;
+        a.emit(|e| e.jmp_m(target))
+    }
+
+    /// `raise_exception_null_exp`: `raise_exception` without an MFA.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:338-341
+    // (emit_raise_exception_null_exp), OTP-29.1.1.
+    fn emit_raise_exception_null_exp(&mut self) -> Result<(), AsmError> {
+        self.asm.mov_imm(ARG4, 0)?;
+        let label = self.label(GlobalLabels::RaiseException);
+        self.asm.jmp(label)
+    }
+
+    /// Throws from a global fragment: the return address on the machine stack, aligned to a
+    /// CP, becomes the error address of a fake call frame.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:343-366 (emit_raise_exception),
+    // OTP-29.1.1.
+    fn emit_raise_exception(&mut self) -> Result<(), AsmError> {
+        const CPMASK: i64 = 3;
+        let a = &mut self.asm;
+        a.emit(|e| e.pop_r(ARG2))?;
+        a.emit(|e| e.and_ri(ARG2, !CPMASK))?;
+        a.emit(|e| e.push_r(ARG2))?;
+        const {
+            assert!(matches!(
+                super::beam_asm::FRAME_LAYOUT,
+                super::beam_asm::FrameLayout::Ra
+            ))
+        };
+        let label = self.label(GlobalLabels::RaiseExceptionShared);
+        self.asm.jmp(label)
     }
 
     /// `a.jmp(labels[target])`.
@@ -606,8 +694,6 @@ impl BeamGlobalAssembler {
 mod tests {
     use super::*;
     use arinsal_x64::buf::Section;
-    use std::path::Path;
-    use std::process::Command;
 
     #[test]
     fn label_table_matches_generator() {
@@ -635,70 +721,39 @@ mod tests {
             .skip(1)
             .map(str::trim)
             .take_while(|line| *line != "align 8" && !line.starts_with("global::"))
+            .filter(|line| !line.starts_with('#'))
             .collect()
     }
 
-    /// Assembles Intel-syntax `lines` with GNU `as`; `None` without binutils.
-    fn gnu_as(lines: &[String]) -> Option<Vec<u8>> {
-        let dir = std::env::temp_dir().join(format!(
-            "arinsal-x86-as-{}-{}",
-            std::process::id(),
-            lines.len()
-        ));
-        std::fs::create_dir_all(&dir).ok()?;
-        let src = format!(
-            ".intel_syntax noprefix\n.text\n{}\n.skip 256\n__later_fragment:\n",
-            lines.join("\n")
-        );
-        let (s, o, bin) = (dir.join("f.s"), dir.join("f.o"), dir.join("f.bin"));
-        std::fs::write(&s, src).ok()?;
-        let ok = |cmd: &mut Command| cmd.status().map(|s| s.success()).unwrap_or(false);
-        let built = ok(Command::new("as").arg("--64").arg("-o").arg(&o).arg(&s))
-            && ok(Command::new("objcopy")
-                .args(["-O", "binary", "-j", ".text"])
-                .arg(&o)
-                .arg(&bin));
-        let bytes = built.then(|| std::fs::read(Path::new(&bin)).ok()).flatten();
-        let _ = std::fs::remove_dir_all(&dir);
-        bytes.map(|mut b| {
-            b.truncate(b.len() - 256);
-            b
-        })
-    }
-
-    /// erts' `Process` offsets in the 29.1.1 x86-64 dump, as Arinsal's `ProcessHeader` has them.
-    const ERTS_PROCESS_OFFSETS: [(i32, i32); 4] = [
-        (104, process::FREASON),
-        (112, process::FVALUE),
-        (464, process::CURRENT),
-        (133, process::ARITY),
-    ];
-
-    /// Rewrites one erts dump line to Arinsal's process layout and MFA address.
-    fn rewrite(line: &str, mfa: Option<u64>) -> String {
-        let mut line = line.trim_start_matches("rex ").to_string();
-        for (erts, ours) in ERTS_PROCESS_OFFSETS {
-            line = line.replace(&format!("[r13+{erts}]"), &format!("[r13+{ours}]"));
-        }
-        if let (Some(rest), Some(mfa)) = (line.strip_prefix("mov rcx, "), mfa)
-            && rest.parse::<u64>().is_ok()
+    /// Rewrites erts' static addresses to Arinsal's: the MFA or `the_active_code_index` an
+    /// absolute `mov` loads (asmjit's `mov r64, imm` is 32-bit when the value fits).
+    fn rewrite(line: &str, address: Option<u64>) -> String {
+        let line = crate::x86::jdump::erts_to_arinsal(line);
+        if let Some(address) = address
+            && let Some((dst, value)) = line.strip_prefix("mov ").and_then(|r| r.split_once(", "))
+            && value.parse::<u64>().is_ok_and(|v| v > u64::from(u32::MAX))
         {
-            // asmjit's `mov r64, imm` takes the zero-extending 32-bit form when it can.
-            line = if mfa <= u64::from(u32::MAX) {
-                format!("mov ecx, {mfa}")
+            let reg = arinsal_x64::enc::Gp::q(match dst {
+                "rcx" => 1,
+                "rdi" => 7,
+                other => panic!("absolute load into {other}"),
+            });
+            return if address <= u64::from(u32::MAX) {
+                format!(
+                    "mov {}, {address}",
+                    ["ecx", "edi"][usize::from(reg.id == 7)]
+                )
             } else {
-                format!("movabs rcx, {mfa}")
+                format!("movabs {dst}, {address}")
             };
-        }
-        if line.starts_with("jmp global::") {
-            line = "jmp __later_fragment".to_string();
         }
         line
     }
 
     // Differential check against erts: the fragment table is emitted in the order of the
-    // `global::` labels of `erl +JDdump true`, and every ported fragment encodes the same
-    // instructions as erts' (with Arinsal's process field offsets and static MFA addresses).
+    // `global::` labels of `erl +JDdump true`, and every fragment the constructor emits encodes
+    // the same instructions as erts' (with Arinsal's process and scheduler register layouts and
+    // static addresses), jumps to other fragments compared by form.
     #[test]
     fn fragments_match_erts_dump() {
         let Some(dump) = crate::x86::jdump::erts_dump("beam_asm_global") else {
@@ -723,34 +778,48 @@ mod tests {
         fragments.insert(line_bp + 1, "i_line_breakpoint_cleanup");
         assert_eq!(dumped, fragments);
 
-        let cases: [(GlobalLabels, Option<&'static ErtsCodeMfa>); 7] = [
-            (GlobalLabels::ITestYieldShared, None),
-            (GlobalLabels::HandleElementError, Some(&ELEMENT_MFA)),
-            (GlobalLabels::HandleHdError, Some(&HD_MFA)),
-            (GlobalLabels::HandleMapGetBadkey, Some(&MAP_GET_BADKEY_MFA)),
-            (GlobalLabels::HandleMapGetBadmap, Some(&MAP_GET_BADMAP_MFA)),
-            (GlobalLabels::HandleMapSizeError, Some(&MAP_SIZE_MFA)),
-            (GlobalLabels::HandleNodeError, Some(&NODE_MFA)),
-        ];
-        for (label, mfa) in cases {
+        let active = &raw const crate::x86::rt::the_active_code_index as u64;
+        let address = |label: GlobalLabels| -> Option<u64> {
+            use GlobalLabels as G;
+            Some(match label {
+                G::HandleElementError => mfa_address(&ELEMENT_MFA),
+                G::HandleHdError => mfa_address(&HD_MFA),
+                G::HandleMapGetBadkey => mfa_address(&MAP_GET_BADKEY_MFA),
+                G::HandleMapGetBadmap => mfa_address(&MAP_GET_BADMAP_MFA),
+                G::HandleMapSizeError => mfa_address(&MAP_SIZE_MFA),
+                G::HandleNodeError => mfa_address(&NODE_MFA),
+                G::DispatchSaveCallsFun => active,
+                _ => return None,
+            })
+        };
+        if crate::x86::jdump::gnu_as(&[]).is_none() {
+            eprintln!("skipping byte comparison: GNU binutils unavailable");
+            return;
+        }
+        let ga = BeamGlobalAssembler::new().unwrap();
+        let code = ga.asm.a.bytes(Section::Code);
+        let ranges = ga.ranges();
+        assert!(ranges.len() >= 13);
+        for (label, range) in ranges {
+            assert_eq!(range.start % 8, 0);
             let lines: Vec<String> = fragment_lines(&dump, label.name())
                 .into_iter()
-                .map(|l| rewrite(l, mfa.map(mfa_address)))
+                .map(|l| rewrite(l, address(label)))
+                // `offsetof(Export, info.mfa)`: 64 in erts, Arinsal's `ExportEntry.mfa`.
+                .map(|l| match (label, l.as_str()) {
+                    (GlobalLabels::BifExportTrap, "sub rax, 64") => {
+                        format!("sub rax, {}", arinsal_term::EXPORT_MFA_OFFSET)
+                    }
+                    _ => l,
+                })
                 .collect();
-            let Some(expected) = gnu_as(&lines) else {
-                eprintln!("skipping byte comparison: GNU binutils unavailable");
-                return;
-            };
-            let mut ga = BeamGlobalAssembler::declare_labels();
-            let emit = BeamGlobalAssembler::emit_ptr(label).unwrap();
-            emit(&mut ga).unwrap();
-            let ours = ga.asm.a.bytes(Section::Code);
-            // The trailing `jmp rel32` targets a fragment emitted later; compare its opcode
-            // and length, not the displacement.
-            let n = ours.len();
-            assert_eq!(n, expected.len(), "{label:?}: {lines:?}");
-            assert_eq!(ours[..n - 4], expected[..n - 4], "{label:?}: {lines:?}");
-            assert_eq!(ours[n - 5], 0xe9);
+            // erts' range runs to the next fragment; its last bytes are `align 8` padding.
+            let ours = &code[range.clone()];
+            let matched = (1..=ours.len()).rev().any(|n| {
+                crate::x86::jdump::matches_with_global_jumps(&lines, &ours[..n]) == Some(true)
+                    && ours[n..].len() < 8
+            });
+            assert!(matched, "{label:?}: {lines:?} vs {:02x?}", ours);
         }
     }
 

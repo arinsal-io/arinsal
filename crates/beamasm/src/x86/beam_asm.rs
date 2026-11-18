@@ -563,14 +563,99 @@ impl BeamAssembler {
     // Port of erts/emulator/beam/jit/beam_jit_common.cpp (BeamAssemblerCommon::hasCpuFeature),
     // OTP-29.1.1.
     pub fn has_cpu_feature(feature: CpuFeature) -> bool {
+        use arinsal_x64::enc::cpu;
         match feature {
-            CpuFeature::Avx => std::arch::is_x86_feature_detected!("avx"),
-            CpuFeature::Avx2 => std::arch::is_x86_feature_detected!("avx2"),
-            CpuFeature::Bmi2 => std::arch::is_x86_feature_detected!("bmi2"),
-            CpuFeature::Lzcnt => std::arch::is_x86_feature_detected!("lzcnt"),
-            CpuFeature::Popcnt => std::arch::is_x86_feature_detected!("popcnt"),
-            CpuFeature::Movbe => std::arch::is_x86_feature_detected!("movbe"),
+            CpuFeature::Avx => cpu::has_avx(),
+            CpuFeature::Avx2 => cpu::has_avx2(),
+            CpuFeature::Bmi1 => cpu::has_bmi1(),
+            CpuFeature::Bmi2 => cpu::has_bmi2(),
+            CpuFeature::Lzcnt => cpu::has_lzcnt(),
+            CpuFeature::Popcnt => cpu::has_popcnt(),
+            CpuFeature::Movbe => cpu::has_movbe(),
         }
+    }
+
+    /// `a.align(AlignMode::kCode, alignment)`: asmjit's optimized NOP fill up to the next
+    /// multiple of `alignment` of the section offset.
+    pub fn align_code(&mut self, alignment: u32) -> Result<(), AsmError> {
+        // The encoder aligns its own byte count; start it at the section offset's remainder.
+        let pre = self.a.offset() % alignment.max(1) as usize;
+        let mut e = Emitter::new();
+        e.bytes.resize(pre, 0);
+        e.align_code(alignment)?;
+        self.a.append(&e.bytes[pre..]);
+        Ok(())
+    }
+
+    /// `align_erlang_cp()`: aligns so that the current address forms a valid CP.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:280-285 (align_erlang_cp), OTP-29.1.1.
+    pub fn align_erlang_cp(&mut self) -> Result<(), AsmError> {
+        self.align_code(4)
+    }
+
+    /// `vmovups(dst, src)` to memory: `vmovups` with AVX, `movups` otherwise.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:1002-1009 (vmovups), OTP-29.1.1.
+    pub fn vmovups_mx(&mut self, dst: Mem, src: enc::Xmm) -> Result<(), AsmError> {
+        if Self::has_cpu_feature(CpuFeature::Avx) {
+            self.emit(|e| e.vmovups_mx(dst, src))
+        } else {
+            self.emit(|e| e.movups_mx(dst, src))
+        }
+    }
+
+    /// `vmovups(dst, src)` from memory.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:1002-1009 (vmovups), OTP-29.1.1.
+    pub fn vmovups_xm(&mut self, dst: enc::Xmm, src: Mem) -> Result<(), AsmError> {
+        if Self::has_cpu_feature(CpuFeature::Avx) {
+            self.emit(|e| e.vmovups_xm(dst, src))
+        } else {
+            self.emit(|e| e.movups_xm(dst, src))
+        }
+    }
+
+    /// `emit_enter_runtime<Spec>()` for the `RA` frame layout with `NATIVE_ERLANG_STACK`:
+    /// publishes what `Spec` names and switches to the runtime stack.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:699-816 (emit_enter_runtime),
+    // OTP-29.1.1.
+    pub fn emit_enter_runtime(&mut self, spec: Update) -> Result<(), AsmError> {
+        const { assert!(matches!(FRAME_LAYOUT, FrameLayout::Ra)) };
+        assert!(!spec.contains(Update::CODE_INDEX));
+        let avx = Self::has_cpu_feature(CpuFeature::Avx);
+        let (xmm0, xmm1) = (enc::Xmm(0), enc::Xmm(1));
+        if spec.contains(Update::HEAP_ALLOC) {
+            // Both heap and stack with one 16-byte store, as gcc -O3 does.
+            let htop_stop = enc::xmmword_ptr(C_P, process::HTOP);
+            if avx {
+                self.emit(|e| e.vmovq_xr(xmm1, HTOP))?;
+                self.emit(|e| e.vpinsrq_xxri(xmm0, xmm1, E, 1))?;
+                self.emit(|e| e.vmovdqu_mx(htop_stop, xmm0))?;
+            } else {
+                self.emit(|e| e.movq_xr(xmm0, HTOP))?;
+                self.emit(|e| e.movq_xr(xmm1, E))?;
+                self.emit(|e| e.punpcklqdq_xx(xmm0, xmm1))?;
+                self.emit(|e| e.movups_mx(htop_stop, xmm0))?;
+            }
+        } else {
+            if spec.contains(Update::HEAP) {
+                self.emit(|e| e.mov_mr(process_ref(process::HTOP, 8), HTOP))?;
+            }
+            if spec.contains(Update::STACK) {
+                self.emit(|e| e.mov_mr(process_ref(process::STOP, 8), E))?;
+            }
+        }
+        if !spec.contains(Update::STACK) {
+            self.emit(|e| e.mov_rr(E_SAVED, E))?;
+        }
+        if spec.contains(Update::REDUCTIONS) {
+            self.emit(|e| e.mov_mr(process_ref(process::FCALLS, 4), FCALLS))?;
+        }
+        self.emit(|e| e.lea(E, get_runtime_stack_ref()))?;
+        // The emulator is not built with AVX, so clear the upper halves to avoid AVX/SSE
+        // transition penalties.
+        if avx {
+            self.emit(|e| e.vzeroupper())?;
+        }
+        Ok(())
     }
 
     /// `aligned_call(target, size)`: pads with erts' canned NOPs so the return address of the
@@ -717,6 +802,8 @@ pub enum CpuFeature {
     Avx,
     /// `kAVX2`.
     Avx2,
+    /// `kBMI`.
+    Bmi1,
     /// `kBMI2`.
     Bmi2,
     /// `kLZCNT`.
@@ -925,5 +1012,36 @@ mod tests {
         let code = asm.a.bytes(arinsal_x64::buf::Section::Code).to_vec();
         assert_eq!(&code[1..4], &[0x66, 0x90, 0xe8]);
         assert_eq!(code.len(), 12);
+    }
+
+    // erts' emit_enter_runtime<eHeapAlloc | eReductions> opens global::process_exit and
+    // <eStack | eHeap> sits in global::garbage_collect after its prologue.
+    #[test]
+    fn enter_runtime_matches_erts_dump() {
+        let Some(dump) = crate::x86::jdump::erts_dump("beam_asm_global") else {
+            eprintln!("skipping: `erl +JDdump true` unavailable");
+            return;
+        };
+        let fragment = |name: &str, skip: usize, take: usize| -> Vec<String> {
+            dump.lines()
+                .skip_while(|l| l.trim() != format!("global::{name}:"))
+                .skip(1 + skip)
+                .take(take)
+                .map(|l| crate::x86::jdump::erts_to_arinsal(l.trim()))
+                .collect()
+        };
+        let cases = [
+            (
+                Update::HEAP_ALLOC.union(Update::REDUCTIONS),
+                fragment("process_exit", 0, 6),
+            ),
+            (Update::HEAP_ALLOC, fragment("garbage_collect", 5, 5)),
+        ];
+        for (spec, lines) in cases {
+            let Some(expected) = crate::x86::jdump::gnu_as(&lines) else {
+                return;
+            };
+            assert_eq!(bytes(|a| a.emit_enter_runtime(spec)), expected, "{lines:?}");
+        }
     }
 }
