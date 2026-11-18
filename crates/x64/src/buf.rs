@@ -1,17 +1,19 @@
 //! Code/data sections, labels, x86 relative fixups, and address relocations.
 //!
-//! Port of asmjit's `CodeHolder` label/section machinery used by
+//! Port of asmjit's `CodeHolder`, `Assembler::align`, and `EmitJmpCall` paths used by
 //! `erts/emulator/beam/jit/x86/beam_asm_module.cpp`, OTP-29.1.1.
 
 use std::fmt;
 
+use crate::enc::{Emitter, EncodeError, RipFixup};
+
 /// The active section in a [`CodeBuffer`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Section {
-    /// Executable bytes.
+    /// Executable bytes emitted by [`CodeBuffer::emit`].
     #[default]
     Code,
-    /// Read-only constants and embedded data.
+    /// Read-only data embedded by [`CodeBuffer::embed`].
     Data,
 }
 
@@ -68,6 +70,7 @@ impl FinalizedCode {
     }
 
     /// Applies recorded addresses after the combined image has been assigned `base_address`.
+    // Port of asmjit `CodeHolder::relocate_to_base`, `core/codeholder.cpp:1144`, OTP-29.1.1.
     pub fn relocate(&mut self, base_address: u64) -> Result<(), BufferError> {
         for relocation in &self.relocations {
             let (target, addend) = match relocation.kind {
@@ -82,12 +85,14 @@ impl FinalizedCode {
                                 .copied()
                                 .flatten()
                                 .ok_or(BufferError::UnboundRelocation(label))?;
-                            let offset = location.offset
-                                + if location.section == Section::Data {
+                            let offset = location
+                                .offset
+                                .checked_add(if location.section == Section::Data {
                                     self.data_offset
                                 } else {
                                     0
-                                };
+                                })
+                                .ok_or(BufferError::LayoutOverflow)?;
                             base_address
                                 .checked_add(offset as u64)
                                 .ok_or(BufferError::LayoutOverflow)?
@@ -96,12 +101,7 @@ impl FinalizedCode {
                     (address, addend)
                 }
             };
-            let address = if addend >= 0 {
-                target.checked_add(addend as u64)
-            } else {
-                target.checked_sub(addend.unsigned_abs())
-            }
-            .ok_or(BufferError::LayoutOverflow)?;
+            let address = add_signed(target, addend)?;
             let source_base = if relocation.section == Section::Data {
                 self.data_offset
             } else {
@@ -113,12 +113,23 @@ impl FinalizedCode {
             };
             match relocation.kind {
                 RelocationKind::Absolute64 { .. } => {
-                    section[relocation.offset..relocation.offset + 8]
-                        .copy_from_slice(&address.to_le_bytes());
+                    let end = relocation
+                        .offset
+                        .checked_add(8)
+                        .ok_or(BufferError::LayoutOverflow)?;
+                    let field = section
+                        .get_mut(relocation.offset..end)
+                        .ok_or(BufferError::InvalidRelocation)?;
+                    field.copy_from_slice(&address.to_le_bytes());
                 }
                 RelocationKind::Relative32 { next_offset, .. } => {
                     let next = base_address
-                        .checked_add((source_base + next_offset) as u64)
+                        .checked_add(
+                            source_base
+                                .checked_add(next_offset)
+                                .ok_or(BufferError::LayoutOverflow)?
+                                as u64,
+                        )
                         .ok_or(BufferError::LayoutOverflow)?;
                     let delta = address as i128 - next as i128;
                     if !(i32::MIN as i128..=i32::MAX as i128).contains(&delta) {
@@ -128,13 +139,28 @@ impl FinalizedCode {
                             width: 4,
                         });
                     }
-                    section[relocation.offset..relocation.offset + 4]
-                        .copy_from_slice(&(delta as i32).to_le_bytes());
+                    let end = relocation
+                        .offset
+                        .checked_add(4)
+                        .ok_or(BufferError::LayoutOverflow)?;
+                    let field = section
+                        .get_mut(relocation.offset..end)
+                        .ok_or(BufferError::InvalidRelocation)?;
+                    field.copy_from_slice(&(delta as i32).to_le_bytes());
                 }
             }
         }
         Ok(())
     }
+}
+
+fn add_signed(base: u64, addend: i64) -> Result<u64, BufferError> {
+    if addend >= 0 {
+        base.checked_add(addend as u64)
+    } else {
+        base.checked_sub(addend.unsigned_abs())
+    }
+    .ok_or(BufferError::LayoutOverflow)
 }
 
 /// Supported x86 address relocation payloads.
@@ -165,11 +191,13 @@ pub enum RelocationTarget {
 /// Errors returned by buffer operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BufferError {
-    /// Alignment must be a nonzero power of two.
+    /// An instruction could not be encoded.
+    Encode(EncodeError),
+    /// Alignment exceeds asmjit's supported range or is not a power of two.
     InvalidAlignment(usize),
-    /// Label was not allocated by this buffer.
+    /// A label was not allocated by this buffer.
     InvalidLabel(Label),
-    /// Label has already been bound.
+    /// A label has already been bound.
     AlreadyBound(Label),
     /// A label still had unresolved references at finalization.
     UnboundLabel(Label),
@@ -177,6 +205,16 @@ pub enum BufferError {
     DisplacementOutOfRange { from: usize, to: usize, width: u8 },
     /// Relocation references a label not bound before finalization.
     UnboundRelocation(Label),
+    /// A condition code is outside x86's 0..=15 range.
+    InvalidCondition(u8),
+    /// A data embedding was attempted while the code section was selected.
+    DataSectionRequired,
+    /// A code emission was attempted while the data section was selected.
+    CodeSectionRequired,
+    /// The emitted instruction did not contain a RIP-relative memory operand.
+    MissingRipFixup,
+    /// A relocation field does not fit the finalized section.
+    InvalidRelocation,
     /// Arithmetic overflow while laying out sections.
     LayoutOverflow,
 }
@@ -187,6 +225,11 @@ impl fmt::Display for BufferError {
     }
 }
 impl std::error::Error for BufferError {}
+impl From<EncodeError> for BufferError {
+    fn from(value: EncodeError) -> Self {
+        Self::Encode(value)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Fixup {
@@ -195,14 +238,29 @@ struct Fixup {
     displacement_offset: usize,
     next_offset: usize,
     width: u8,
+    addend: i64,
     next: Option<usize>,
     resolved: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BranchKind {
+    Jump,
+    Call,
+    Conditional(u8),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BranchWidth {
+    Auto,
+    Short,
+    Near,
 }
 
 /// Mutable x86 code and data sections with label fixups and relocation records.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodeBuffer {
-    code: Vec<u8>,
+    code: Emitter,
     data: Vec<u8>,
     active: Section,
     data_alignment: usize,
@@ -215,7 +273,7 @@ pub struct CodeBuffer {
 impl Default for CodeBuffer {
     fn default() -> Self {
         Self {
-            code: Vec::new(),
+            code: Emitter::new(),
             data: Vec::new(),
             active: Section::Code,
             data_alignment: 1,
@@ -233,29 +291,35 @@ impl CodeBuffer {
         Self::default()
     }
 
-    /// Selects the section used by following append operations.
+    /// Selects the section used by following emission and embedding operations.
+    // Port of `BeamModuleAssembler::embed_vararg_rodata`, x86 `beam_asm_module.cpp:108-141`.
     pub fn select(&mut self, section: Section) {
         self.active = section;
     }
+
     /// Returns the currently selected section.
     pub fn active_section(&self) -> Section {
         self.active
     }
+
     /// Returns the active section's byte offset.
     pub fn offset(&self) -> usize {
         self.section_offset(self.active)
     }
+
     /// Returns a section's byte offset.
     pub fn section_offset(&self, section: Section) -> usize {
         self.bytes(section).len()
     }
+
     /// Returns bytes accumulated in a section.
     pub fn bytes(&self, section: Section) -> &[u8] {
         match section {
-            Section::Code => &self.code,
+            Section::Code => &self.code.bytes,
             Section::Data => &self.data,
         }
     }
+
     /// Returns all bound labels and their section-relative locations.
     pub fn label_locations(&self) -> impl Iterator<Item = (Label, LabelLocation)> + '_ {
         self.labels
@@ -263,17 +327,19 @@ impl CodeBuffer {
             .enumerate()
             .filter_map(|(id, location)| location.map(|loc| (Label(id as u32), loc)))
     }
+
     /// Returns the location of a bound label.
     pub fn label_location(&self, label: Label) -> Option<LabelLocation> {
         self.labels.get(label.0 as usize).copied().flatten()
     }
+
     /// Returns recorded base-dependent relocations.
     pub fn relocations(&self) -> &[Relocation] {
         &self.relocations
     }
 
     /// Allocates an unbound label.
-    // Port of asmjit `CodeHolder::new_label` and `CodeHolder::new_label_entry`, OTP-29.1.1.
+    // Port of erts/emulator/asmjit/core/codeholder.cpp:685-698 (CodeHolder::new_label_id), OTP-29.1.1.
     pub fn new_label(&mut self) -> Label {
         let label = Label(u32::try_from(self.labels.len()).expect("x86 label id exhausted"));
         self.labels.push(None);
@@ -282,104 +348,269 @@ impl CodeBuffer {
     }
 
     /// Binds a label at the current section offset and resolves its pending local references.
-    // Port of asmjit `CodeHolder::bind`, OTP-29.1.1.
+    // Port of erts/emulator/asmjit/core/codeholder.cpp:874 (CodeHolder::bind_label), OTP-29.1.1.
     pub fn bind(&mut self, label: Label) -> Result<(), BufferError> {
         let index = label.0 as usize;
-        let entry = self
+        if self
             .labels
             .get(index)
-            .ok_or(BufferError::InvalidLabel(label))?;
-        if entry.is_some() {
+            .ok_or(BufferError::InvalidLabel(label))?
+            .is_some()
+        {
             return Err(BufferError::AlreadyBound(label));
         }
         let location = LabelLocation {
             section: self.active,
             offset: self.offset(),
         };
+
+        // Validate every same-section reference before changing the label or any code bytes.
+        let mut pending = self.waiting[index];
+        while let Some(fixup_index) = pending {
+            let fixup = self.fixups[fixup_index];
+            pending = fixup.next;
+            if fixup.section == location.section {
+                self.displacement(fixup, location.offset)?;
+            }
+        }
+
         self.labels[index] = Some(location);
-        let mut fixup_index = self.waiting[index].take();
-        while let Some(fixup_index_value) = fixup_index {
-            let fixup = self.fixups[fixup_index_value];
-            fixup_index = fixup.next;
+        pending = self.waiting[index].take();
+        while let Some(fixup_index) = pending {
+            let fixup = self.fixups[fixup_index];
+            pending = fixup.next;
             if fixup.section == location.section {
                 self.patch_displacement(fixup, location.offset)?;
-                self.fixups[fixup_index_value].resolved = true;
+                self.fixups[fixup_index].resolved = true;
             }
         }
         Ok(())
     }
 
-    /// Appends a near `jmp rel32` to a label.
-    // Port of x86 branch emission through asmjit `Assembler::jmp`, OTP-29.1.1.
-    pub fn jmp_near(&mut self, label: Label) -> Result<(), BufferError> {
-        self.branch(label, &[0xe9], 4)
-    }
-    /// Appends a short `jmp rel8` to a label.
-    pub fn jmp_short(&mut self, label: Label) -> Result<(), BufferError> {
-        self.branch(label, &[0xeb], 1)
-    }
-    /// Appends a `call rel32` to a label.
-    // Port of x86 `BeamAssembler::aligned_call(Label)` using the fixed five-byte call encoding.
-    pub fn call(&mut self, label: Label) -> Result<(), BufferError> {
-        self.branch(label, &[0xe8], 4)
-    }
-    /// Appends a near conditional branch (`0F 8x rel32`).
-    pub fn jcc_near(&mut self, condition: u8, label: Label) -> Result<(), BufferError> {
-        if condition > 15 {
-            return Err(BufferError::DisplacementOutOfRange {
-                from: condition as usize,
-                to: 15,
-                width: 4,
-            });
+    /// Emits an instruction or sequence of instructions through the one x86 [`Emitter`].
+    pub fn emit<F>(&mut self, encode: F) -> Result<(), BufferError>
+    where
+        F: FnOnce(&mut Emitter) -> Result<(), EncodeError>,
+    {
+        if self.active != Section::Code {
+            return Err(BufferError::CodeSectionRequired);
         }
-        self.branch(label, &[0x0f, 0x80 | condition], 4)
-    }
-    /// Appends a short conditional branch (`7x rel8`).
-    pub fn jcc_short(&mut self, condition: u8, label: Label) -> Result<(), BufferError> {
-        if condition > 15 {
-            return Err(BufferError::DisplacementOutOfRange {
-                from: condition as usize,
-                to: 15,
-                width: 1,
-            });
+        let old_len = self.code.len();
+        if let Err(error) = encode(&mut self.code) {
+            self.code.truncate(old_len);
+            return Err(error.into());
         }
-        self.branch(label, &[0x70 | condition], 1)
-    }
-    fn branch(&mut self, label: Label, opcode: &[u8], width: u8) -> Result<(), BufferError> {
-        if label.0 as usize >= self.labels.len() {
-            return Err(BufferError::InvalidLabel(label));
-        }
-        let start = self.offset();
-        self.append(opcode);
-        let displacement_offset = self.offset();
-        self.append(&vec![0; width as usize]);
-        let fixup = Fixup {
-            label,
-            section: self.active,
-            displacement_offset,
-            next_offset: self.offset(),
-            width,
-            next: self.waiting[label.0 as usize],
-            resolved: false,
-        };
-        if let Some(location) = self.label_location(label) {
-            if location.section == self.active {
-                self.patch_displacement(fixup, location.offset)?;
-            } else {
-                let index = self.fixups.len();
-                self.fixups.push(fixup);
-                self.waiting[label.0 as usize] = Some(index);
-            }
-        } else {
-            let index = self.fixups.len();
-            self.fixups.push(fixup);
-            self.waiting[label.0 as usize] = Some(index);
-        }
-        let _ = start;
         Ok(())
     }
-    fn patch_displacement(&mut self, fixup: Fixup, target: usize) -> Result<(), BufferError> {
-        let delta = target as i128 - fixup.next_offset as i128;
+
+    /// Emits an instruction containing `[rip + addend]` and binds its displacement to `label`.
+    ///
+    /// The callback must emit a RIP-relative memory operand using `Mem::rip`; the displacement
+    /// and end offsets come from [`Emitter::last_rip_fixup`], including a trailing immediate.
+    // Port of asmjit x86assembler.cpp `EmitModSib`, kX86MemInfo_BaseLabel, OTP-29.1.1.
+    pub fn emit_rip_label<F>(&mut self, label: Label, encode: F) -> Result<(), BufferError>
+    where
+        F: FnOnce(&mut Emitter) -> Result<(), EncodeError>,
+    {
+        self.ensure_label(label)?;
+        if self.active != Section::Code {
+            return Err(BufferError::CodeSectionRequired);
+        }
+        let old_len = self.code.len();
+        self.emit(encode)?;
+        let Some(RipFixup { disp_at, end }) = self.code.last_rip_fixup() else {
+            self.code.truncate(old_len);
+            return Err(BufferError::MissingRipFixup);
+        };
+        if disp_at < old_len || end < disp_at + 4 || end > self.code.len() {
+            self.code.truncate(old_len);
+            return Err(BufferError::MissingRipFixup);
+        }
+        let addend = i32::from_le_bytes(
+            self.code.bytes[disp_at..disp_at + 4]
+                .try_into()
+                .expect("validated RIP displacement field"),
+        ) as i64;
+        let result = self.record_fixup(Fixup {
+            label,
+            section: Section::Code,
+            displacement_offset: disp_at,
+            next_offset: end,
+            width: 4,
+            addend,
+            next: None,
+            resolved: false,
+        });
+        if result.is_err() {
+            self.code.truncate(old_len);
+        }
+        result
+    }
+
+    /// Emits a `jmp` to a label, selecting short only for a bound in-range target.
+    // Port of asmjit `EmitJmpCall`, OTP-29.1.1. Unbound labels are emitted as rel32.
+    pub fn jmp(&mut self, label: Label) -> Result<(), BufferError> {
+        self.branch(BranchKind::Jump, BranchWidth::Auto, label)
+    }
+
+    /// Emits a near `jmp rel32` to a label.
+    pub fn jmp_near(&mut self, label: Label) -> Result<(), BufferError> {
+        self.branch(BranchKind::Jump, BranchWidth::Near, label)
+    }
+
+    /// Emits a short `jmp rel8` to a label.
+    pub fn jmp_short(&mut self, label: Label) -> Result<(), BufferError> {
+        self.branch(BranchKind::Jump, BranchWidth::Short, label)
+    }
+
+    /// Emits a `call rel32` to a label.
+    pub fn call(&mut self, label: Label) -> Result<(), BufferError> {
+        self.branch(BranchKind::Call, BranchWidth::Near, label)
+    }
+
+    /// Emits a conditional branch to a label, selecting short only for a bound in-range target.
+    ///
+    /// `condition` is the x86 condition-code nibble (the `CondCode` enum is being added with the
+    /// condition instruction family).
+    pub fn jcc(&mut self, condition: u8, label: Label) -> Result<(), BufferError> {
+        self.check_condition(condition)?;
+        self.branch(BranchKind::Conditional(condition), BranchWidth::Auto, label)
+    }
+
+    /// Emits a near conditional branch (`0F 8x rel32`).
+    pub fn jcc_near(&mut self, condition: u8, label: Label) -> Result<(), BufferError> {
+        self.check_condition(condition)?;
+        self.branch(BranchKind::Conditional(condition), BranchWidth::Near, label)
+    }
+
+    /// Emits a short conditional branch (`7x rel8`).
+    pub fn jcc_short(&mut self, condition: u8, label: Label) -> Result<(), BufferError> {
+        self.check_condition(condition)?;
+        self.branch(
+            BranchKind::Conditional(condition),
+            BranchWidth::Short,
+            label,
+        )
+    }
+
+    /// Emits an external `call rel32` and records its base-dependent relocation.
+    pub fn call_external(&mut self, address: u64) -> Result<usize, BufferError> {
+        self.external_branch(&[0xe8], address)
+    }
+
+    /// Emits an external near `jmp rel32` and records its base-dependent relocation.
+    pub fn jmp_external(&mut self, address: u64) -> Result<usize, BufferError> {
+        self.external_branch(&[0xe9], address)
+    }
+
+    /// Emits an external near conditional branch and records its base-dependent relocation.
+    pub fn jcc_external(&mut self, condition: u8, address: u64) -> Result<usize, BufferError> {
+        self.check_condition(condition)?;
+        self.external_branch(&[0x0f, 0x80 | condition], address)
+    }
+
+    // Port of asmjit x86assembler.cpp `EmitJmpCall` and `RelocType::kAbsToRel`, OTP-29.1.1.
+    fn external_branch(&mut self, opcode: &[u8], address: u64) -> Result<usize, BufferError> {
+        if self.active != Section::Code {
+            return Err(BufferError::CodeSectionRequired);
+        }
+        let (offset, next_offset) = self.code.emit_relative_placeholder(opcode, 4);
+        self.relocations.push(Relocation {
+            section: Section::Code,
+            offset,
+            kind: RelocationKind::Relative32 {
+                target: RelocationTarget::External(address),
+                addend: 0,
+                next_offset,
+            },
+        });
+        Ok(offset)
+    }
+
+    fn branch(
+        &mut self,
+        kind: BranchKind,
+        requested: BranchWidth,
+        label: Label,
+    ) -> Result<(), BufferError> {
+        self.ensure_label(label)?;
+        if self.active != Section::Code {
+            return Err(BufferError::CodeSectionRequired);
+        }
+        let site = self.code.len();
+        let bound_here = self
+            .label_location(label)
+            .filter(|location| location.section == Section::Code);
+        let width = match requested {
+            BranchWidth::Short => 1,
+            BranchWidth::Near => 4,
+            BranchWidth::Auto => {
+                if let Some(location) = bound_here {
+                    let short_len = opcode(kind, 1).len() + 1;
+                    let displacement = location.offset as i128 - (site + short_len) as i128;
+                    if (-128..=127).contains(&displacement) {
+                        1
+                    } else {
+                        4
+                    }
+                } else {
+                    4
+                }
+            }
+        };
+        let branch_opcode = opcode(kind, width);
+        if let Some(location) = bound_here {
+            let next_offset = site
+                .checked_add(branch_opcode.len())
+                .and_then(|offset| offset.checked_add(width as usize))
+                .ok_or(BufferError::LayoutOverflow)?;
+            self.displacement(
+                Fixup {
+                    label,
+                    section: Section::Code,
+                    displacement_offset: next_offset - width as usize,
+                    next_offset,
+                    width,
+                    addend: 0,
+                    next: None,
+                    resolved: false,
+                },
+                location.offset,
+            )?;
+        }
+        let (displacement_offset, next_offset) =
+            self.code.emit_relative_placeholder(&branch_opcode, width);
+        self.record_fixup(Fixup {
+            label,
+            section: Section::Code,
+            displacement_offset,
+            next_offset,
+            width,
+            addend: 0,
+            next: None,
+            resolved: false,
+        })
+    }
+
+    fn record_fixup(&mut self, mut fixup: Fixup) -> Result<(), BufferError> {
+        if let Some(location) = self.label_location(fixup.label) {
+            if location.section == fixup.section {
+                self.patch_displacement(fixup, location.offset)?;
+                return Ok(());
+            }
+            self.fixups.push(fixup);
+            return Ok(());
+        }
+        let label_index = fixup.label.0 as usize;
+        fixup.next = self.waiting[label_index];
+        let index = self.fixups.len();
+        self.fixups.push(fixup);
+        self.waiting[label_index] = Some(index);
+        Ok(())
+    }
+
+    fn displacement(&self, fixup: Fixup, target: usize) -> Result<[u8; 4], BufferError> {
+        let delta = target as i128 - fixup.next_offset as i128 + fixup.addend as i128;
         let valid = if fixup.width == 1 {
             (-128..=127).contains(&delta)
         } else {
@@ -392,27 +623,74 @@ impl CodeBuffer {
                 width: fixup.width,
             });
         }
-        let bytes = if fixup.width == 1 {
-            vec![delta as i8 as u8]
+        let mut bytes = [0; 4];
+        if fixup.width == 1 {
+            bytes[0] = delta as i8 as u8;
         } else {
-            (delta as i32).to_le_bytes().to_vec()
-        };
-        let section = self.section_mut(fixup.section);
-        section[fixup.displacement_offset..fixup.displacement_offset + fixup.width as usize]
-            .copy_from_slice(&bytes);
+            bytes.copy_from_slice(&(delta as i32).to_le_bytes());
+        }
+        Ok(bytes)
+    }
+
+    fn patch_displacement(&mut self, fixup: Fixup, target: usize) -> Result<(), BufferError> {
+        let bytes = self.displacement(fixup, target)?;
+        match fixup.section {
+            Section::Code => self
+                .code
+                .patch(fixup.displacement_offset, &bytes[..fixup.width as usize]),
+            Section::Data => {
+                let end = fixup.displacement_offset + fixup.width as usize;
+                self.data[fixup.displacement_offset..end]
+                    .copy_from_slice(&bytes[..fixup.width as usize]);
+            }
+        }
         Ok(())
     }
 
-    /// Appends an absolute 64-bit label address placeholder and records its relocation.
-    // Port of x86 `BeamModuleAssembler::embed_vararg_rodata` / `a.embed_label`, OTP-29.1.1.
+    /// Embeds bytes in the data section and returns their offset.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:108-141 and asmjit `Assembler::embed`.
+    pub fn embed(&mut self, bytes: &[u8]) -> Result<usize, BufferError> {
+        self.require_data()?;
+        let offset = self.data.len();
+        self.data.extend_from_slice(bytes);
+        Ok(offset)
+    }
+
+    /// Embeds a little-endian byte in the data section.
+    pub fn embed_u8(&mut self, value: u8) -> Result<usize, BufferError> {
+        self.embed(&[value])
+    }
+
+    /// Embeds a little-endian 16-bit value in the data section.
+    pub fn embed_u16(&mut self, value: u16) -> Result<usize, BufferError> {
+        self.embed(&value.to_le_bytes())
+    }
+
+    /// Embeds a little-endian 32-bit value in the data section.
+    pub fn embed_u32(&mut self, value: u32) -> Result<usize, BufferError> {
+        self.embed(&value.to_le_bytes())
+    }
+
+    /// Embeds a little-endian 64-bit value in the data section.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:116-133 (`embed_uint64`), OTP-29.1.1.
+    pub fn embed_u64(&mut self, value: u64) -> Result<usize, BufferError> {
+        self.embed(&value.to_le_bytes())
+    }
+
+    /// Embeds an IEEE-754 double in the data section.
+    // Port of erts/emulator/beam/jit/x86/instr_float.cpp:59-63 (`embed_double`), OTP-29.1.1.
+    pub fn embed_f64(&mut self, value: f64) -> Result<usize, BufferError> {
+        self.embed_u64(value.to_bits())
+    }
+
+    /// Embeds an absolute 64-bit label address and records its relocation.
+    // Port of x86 `BeamModuleAssembler::embed_vararg_rodata`, beam_asm_module.cpp:126-128.
     pub fn embed_label(&mut self, label: Label) -> Result<usize, BufferError> {
-        if label.0 as usize >= self.labels.len() {
-            return Err(BufferError::InvalidLabel(label));
-        }
-        let offset = self.offset();
-        self.append_u64(0);
+        self.ensure_label(label)?;
+        self.require_data()?;
+        let offset = self.embed_u64(0)?;
         self.relocations.push(Relocation {
-            section: self.active,
+            section: Section::Data,
             offset,
             kind: RelocationKind::Absolute64 {
                 target: RelocationTarget::Label(label),
@@ -421,78 +699,48 @@ impl CodeBuffer {
         });
         Ok(offset)
     }
-    /// Appends an external absolute 64-bit address placeholder and records its relocation.
-    pub fn embed_external(&mut self, address: u64) -> usize {
-        let offset = self.offset();
-        self.append_u64(0);
+
+    /// Embeds an external absolute 64-bit address and records its relocation.
+    pub fn embed_external(&mut self, address: u64) -> Result<usize, BufferError> {
+        self.require_data()?;
+        let offset = self.embed_u64(0)?;
         self.relocations.push(Relocation {
-            section: self.active,
+            section: Section::Data,
             offset,
             kind: RelocationKind::Absolute64 {
                 target: RelocationTarget::External(address),
                 addend: 0,
             },
         });
-        offset
-    }
-    /// Records an external relative call target at a rel32 displacement field.
-    pub fn call_external(&mut self, address: u64) -> usize {
-        self.append_u8(0xe8);
-        let offset = self.offset();
-        self.append_u32(0);
-        self.relocations.push(Relocation {
-            section: self.active,
-            offset,
-            kind: RelocationKind::Relative32 {
-                target: RelocationTarget::External(address),
-                addend: 0,
-                next_offset: offset + 4,
-            },
-        });
-        offset
+        Ok(offset)
     }
 
-    /// Appends bytes to the active section.
-    pub fn append(&mut self, bytes: &[u8]) {
-        self.active_bytes_mut().extend_from_slice(bytes);
-    }
-    /// Appends one byte to the active section.
-    pub fn append_u8(&mut self, value: u8) {
-        self.active_bytes_mut().push(value);
-    }
-    /// Appends a little-endian 16-bit value.
-    pub fn append_u16(&mut self, value: u16) {
-        self.append(&value.to_le_bytes());
-    }
-    /// Appends a little-endian 32-bit value.
-    pub fn append_u32(&mut self, value: u32) {
-        self.append(&value.to_le_bytes());
-    }
-    /// Appends a little-endian 64-bit value.
-    pub fn append_u64(&mut self, value: u64) {
-        self.append(&value.to_le_bytes());
-    }
-    /// Appends an IEEE-754 double in little-endian form.
-    pub fn append_f64(&mut self, value: f64) {
-        self.append_u64(value.to_bits());
-    }
-    /// Pads the active section until its offset satisfies `alignment`.
-    pub fn align(&mut self, alignment: usize, fill: u8) -> Result<(), BufferError> {
-        if alignment == 0 || !alignment.is_power_of_two() {
+    /// Aligns the active section using asmjit's code-NOP or data-`0xCC` fill pattern.
+    // Port of erts/emulator/asmjit/x86/x86assembler.cpp:5025-5080 (Assembler::align), OTP-29.1.1.
+    pub fn align(&mut self, alignment: usize) -> Result<(), BufferError> {
+        if alignment <= 1 {
+            return Ok(());
+        }
+        if alignment > 64 || !alignment.is_power_of_two() {
             return Err(BufferError::InvalidAlignment(alignment));
         }
-        let padding = self.offset().wrapping_neg() & (alignment - 1);
-        let new_len = self
-            .offset()
-            .checked_add(padding)
-            .ok_or(BufferError::LayoutOverflow)?;
-        self.active_bytes_mut().resize(new_len, fill);
-        if self.active == Section::Data {
-            self.data_alignment = self.data_alignment.max(alignment);
+        match self.active {
+            Section::Code => self.code.align_code(alignment),
+            Section::Data => {
+                let padding = self.data.len().wrapping_neg() & (alignment - 1);
+                let new_len = self
+                    .data
+                    .len()
+                    .checked_add(padding)
+                    .ok_or(BufferError::LayoutOverflow)?;
+                self.data.resize(new_len, 0xcc);
+                self.data_alignment = self.data_alignment.max(alignment);
+            }
         }
         Ok(())
     }
-    /// Resolves references that cross sections and returns both sections and relocation records.
+
+    /// Resolves cross-section references and returns both sections and relocation records.
     pub fn finish(mut self) -> Result<FinalizedCode, BufferError> {
         if let Some(fixup) = self
             .fixups
@@ -501,24 +749,24 @@ impl CodeBuffer {
         {
             return Err(BufferError::UnboundLabel(fixup.label));
         }
-        // Cross-section rel32 references use the final code-then-data layout.
-        let data_base = self.code.len();
-        let data_offset = data_base
+        let data_offset = self
+            .code
+            .len()
             .checked_add(self.data_alignment - 1)
             .ok_or(BufferError::LayoutOverflow)?
             & !(self.data_alignment - 1);
-        let fixups = std::mem::take(&mut self.fixups);
-        for fixup in fixups.into_iter().filter(|fixup| !fixup.resolved) {
+        for fixup in self.fixups.iter().copied().filter(|fixup| !fixup.resolved) {
             let target = self
                 .label_location(fixup.label)
                 .ok_or(BufferError::UnboundLabel(fixup.label))?;
-            let target = if target.section == Section::Data {
-                data_offset
-                    .checked_add(target.offset)
-                    .ok_or(BufferError::LayoutOverflow)?
-            } else {
-                target.offset
-            };
+            let absolute_target = target
+                .offset
+                .checked_add(if target.section == Section::Data {
+                    data_offset
+                } else {
+                    0
+                })
+                .ok_or(BufferError::LayoutOverflow)?;
             let source_base = if fixup.section == Section::Data {
                 data_offset
             } else {
@@ -527,111 +775,230 @@ impl CodeBuffer {
             let absolute_next = source_base
                 .checked_add(fixup.next_offset)
                 .ok_or(BufferError::LayoutOverflow)?;
-            let delta = target as i128 - absolute_next as i128;
-            let valid = if fixup.width == 1 {
-                (-128..=127).contains(&delta)
-            } else {
-                (i32::MIN as i128..=i32::MAX as i128).contains(&delta)
+            let absolute_fixup = Fixup {
+                next_offset: absolute_next,
+                ..fixup
             };
-            if !valid {
-                return Err(BufferError::DisplacementOutOfRange {
-                    from: absolute_next,
-                    to: target,
-                    width: fixup.width,
-                });
+            let bytes = self.displacement(absolute_fixup, absolute_target)?;
+            let patch = &bytes[..fixup.width as usize];
+            match fixup.section {
+                Section::Code => self.code.patch(fixup.displacement_offset, patch),
+                Section::Data => {
+                    let end = fixup.displacement_offset + fixup.width as usize;
+                    self.data[fixup.displacement_offset..end].copy_from_slice(patch);
+                }
             }
-            let patch = if fixup.width == 1 {
-                vec![delta as i8 as u8]
-            } else {
-                (delta as i32).to_le_bytes().to_vec()
-            };
-            let section = self.section_mut(fixup.section);
-            section[fixup.displacement_offset..fixup.displacement_offset + fixup.width as usize]
-                .copy_from_slice(&patch);
         }
         Ok(FinalizedCode {
-            code: self.code,
+            code: self.code.bytes,
             data: self.data,
             data_offset,
             relocations: self.relocations,
             labels: self.labels,
         })
     }
-    fn active_bytes_mut(&mut self) -> &mut Vec<u8> {
-        self.section_mut(self.active)
-    }
-    fn section_mut(&mut self, section: Section) -> &mut Vec<u8> {
-        match section {
-            Section::Code => &mut self.code,
-            Section::Data => &mut self.data,
+
+    fn check_condition(&self, condition: u8) -> Result<(), BufferError> {
+        if condition <= 15 {
+            Ok(())
+        } else {
+            Err(BufferError::InvalidCondition(condition))
         }
+    }
+
+    fn ensure_label(&self, label: Label) -> Result<(), BufferError> {
+        if (label.0 as usize) < self.labels.len() {
+            Ok(())
+        } else {
+            Err(BufferError::InvalidLabel(label))
+        }
+    }
+
+    fn require_data(&self) -> Result<(), BufferError> {
+        if self.active == Section::Data {
+            Ok(())
+        } else {
+            Err(BufferError::DataSectionRequired)
+        }
+    }
+}
+
+fn opcode(kind: BranchKind, width: u8) -> Vec<u8> {
+    match (kind, width) {
+        (BranchKind::Jump, 1) => vec![0xeb],
+        (BranchKind::Jump, _) => vec![0xe9],
+        (BranchKind::Call, _) => vec![0xe8],
+        (BranchKind::Conditional(condition), 1) => vec![0x70 | condition],
+        (BranchKind::Conditional(condition), _) => vec![0x0f, 0x80 | condition],
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::enc::{EAX, Mem, RAX};
+
     use super::{BufferError, CodeBuffer, RelocationKind, RelocationTarget, Section};
 
     #[test]
-    fn local_forward_and_backward_fixups_use_x86_end_relative_displacements() {
-        let mut b = CodeBuffer::new();
-        let target = b.new_label();
-        b.jmp_near(target).unwrap();
-        b.append(&[0x90, 0x90]);
-        b.bind(target).unwrap();
-        b.jmp_short(target).unwrap();
-        assert_eq!(
-            b.bytes(Section::Code),
-            &[0xe9, 2, 0, 0, 0, 0x90, 0x90, 0xeb, 0xfe]
-        );
-    }
-    #[test]
-    fn short_branch_range_is_checked_at_bind() {
-        let mut b = CodeBuffer::new();
-        let target = b.new_label();
-        b.jmp_short(target).unwrap();
-        b.append(&[0x90; 128]);
-        assert!(matches!(
-            b.bind(target),
-            Err(BufferError::DisplacementOutOfRange { width: 1, .. })
-        ));
-    }
-    #[test]
-    fn sections_align_and_embed_data() {
-        let mut b = CodeBuffer::new();
-        b.append_u8(0xcc);
-        b.select(Section::Data);
-        b.align(8, 0).unwrap();
-        b.append_f64(1.5);
-        assert_eq!(b.bytes(Section::Data), &[0, 0, 0, 0, 0, 0, 0xf8, 0x3f]);
-    }
-    #[test]
-    fn labels_and_external_calls_create_relocations() {
-        let mut b = CodeBuffer::new();
-        let label = b.new_label();
-        b.select(Section::Data);
-        b.embed_label(label).unwrap();
-        let off = b.call_external(0x1234);
-        b.select(Section::Code);
-        b.bind(label).unwrap();
-        let finalized = b.finish().unwrap();
-        assert!(
-            matches!(finalized.relocations[0].kind, RelocationKind::Absolute64 { target: RelocationTarget::Label(l), .. } if l == label)
-        );
-        assert_eq!(finalized.relocations[1].offset, off);
+    fn bound_backward_jumps_shorten_and_unbound_forward_jumps_stay_near() {
+        let mut buffer = CodeBuffer::new();
+        let back = buffer.new_label();
+        buffer.emit(|emitter| emitter.mov_ri(EAX, 1)).unwrap();
+        buffer.bind(back).unwrap();
+        buffer.jmp(back).unwrap();
+        let forward = buffer.new_label();
+        buffer.jmp(forward).unwrap();
+        buffer.emit(|emitter| emitter.mov_ri(EAX, 2)).unwrap();
+        buffer.bind(forward).unwrap();
+        similar_asserts::assert_eq!(&buffer.bytes(Section::Code)[5..7], &[0xeb, 0xfe]);
+        similar_asserts::assert_eq!(&buffer.bytes(Section::Code)[7..12], &[0xe9, 5, 0, 0, 0]);
     }
 
     #[test]
-    fn relocation_writes_label_addresses_and_external_call_displacements() {
-        let mut b = CodeBuffer::new();
-        let target = b.new_label();
-        b.call_external(0x1010);
-        b.select(Section::Data);
-        b.bind(target).unwrap();
-        b.embed_label(target).unwrap();
-        let mut finalized = b.finish().unwrap();
+    fn local_condition_and_call_fixups_use_rel8_and_rel32() {
+        let mut buffer = CodeBuffer::new();
+        let target = buffer.new_label();
+        buffer.jcc(4, target).unwrap();
+        buffer.call(target).unwrap();
+        buffer.bind(target).unwrap();
+        similar_asserts::assert_eq!(
+            buffer.bytes(Section::Code),
+            &[0x0f, 0x84, 5, 0, 0, 0, 0xe8, 0, 0, 0, 0]
+        );
+        let mut backwards = CodeBuffer::new();
+        let target = backwards.new_label();
+        backwards.bind(target).unwrap();
+        backwards.jcc(5, target).unwrap();
+        similar_asserts::assert_eq!(backwards.bytes(Section::Code), &[0x75, 0xfe]);
+    }
+
+    #[test]
+    fn rip_fixup_uses_emitter_offsets_and_mem_addend() {
+        let mut buffer = CodeBuffer::new();
+        let target = buffer.new_label();
+        buffer
+            .emit_rip_label(target, |emitter| emitter.mov_rm(RAX, Mem::rip(4, 8)))
+            .unwrap();
+        buffer.bind(target).unwrap();
+        similar_asserts::assert_eq!(&buffer.bytes(Section::Code)[3..7], &[4, 0, 0, 0]);
+    }
+
+    #[test]
+    fn rip_fixup_resolves_across_code_and_data_sections() {
+        let mut buffer = CodeBuffer::new();
+        let target = buffer.new_label();
+        buffer
+            .emit_rip_label(target, |emitter| emitter.mov_rm(RAX, Mem::rip(3, 8)))
+            .unwrap();
+        buffer.select(Section::Data);
+        buffer.bind(target).unwrap();
+        buffer.embed_u64(9).unwrap();
+        let finalized = buffer.finish().unwrap();
+        similar_asserts::assert_eq!(&finalized.code[3..7], &[3, 0, 0, 0]);
+    }
+
+    #[test]
+    fn sections_align_and_embed_integer_double_and_label_data() {
+        let mut buffer = CodeBuffer::new();
+        let label = buffer.new_label();
+        buffer.emit(|emitter| emitter.mov_ri(EAX, 1)).unwrap();
+        buffer.select(Section::Data);
+        buffer.embed_u8(0xaa).unwrap();
+        buffer.align(8).unwrap();
+        buffer.embed_f64(1.5).unwrap();
+        buffer.embed_u64(9).unwrap();
+        buffer.embed_label(label).unwrap();
+        buffer.select(Section::Code);
+        buffer.bind(label).unwrap();
+        let finalized = buffer.finish().unwrap();
+        similar_asserts::assert_eq!(finalized.data_offset, 8);
+        similar_asserts::assert_eq!(
+            &finalized.data[..8],
+            &[0xaa, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc]
+        );
+        similar_asserts::assert_eq!(&finalized.data[8..16], &1.5_f64.to_bits().to_le_bytes());
+        similar_asserts::assert_eq!(&finalized.data[16..24], &9_u64.to_le_bytes());
+        let mut relocated = finalized;
+        relocated.relocate(0x1000).unwrap();
+        similar_asserts::assert_eq!(&relocated.data[24..32], &0x1005_u64.to_le_bytes());
+    }
+
+    #[test]
+    fn external_branch_and_address_relocations_use_final_image_base() {
+        let mut buffer = CodeBuffer::new();
+        buffer.call_external(0x1010).unwrap();
+        buffer.jmp_external(0x1020).unwrap();
+        buffer.jcc_external(4, 0x1030).unwrap();
+        buffer.select(Section::Data);
+        buffer.embed_external(0x1040).unwrap();
+        let mut finalized = buffer.finish().unwrap();
         finalized.relocate(0x1000).unwrap();
-        assert_eq!(finalized.code, [0xe8, 0x0b, 0, 0, 0]);
-        assert_eq!(finalized.data, 0x1005_u64.to_le_bytes());
+        similar_asserts::assert_eq!(&finalized.code[..5], &[0xe8, 0x0b, 0, 0, 0]);
+        similar_asserts::assert_eq!(&finalized.code[5..10], &[0xe9, 0x16, 0, 0, 0]);
+        similar_asserts::assert_eq!(&finalized.code[10..16], &[0x0f, 0x84, 0x20, 0, 0, 0]);
+        similar_asserts::assert_eq!(finalized.data, 0x1040_u64.to_le_bytes());
+    }
+
+    #[test]
+    fn alignment_and_section_errors_leave_bytes_unchanged() {
+        let mut buffer = CodeBuffer::new();
+        assert!(matches!(
+            buffer.align(128),
+            Err(BufferError::InvalidAlignment(128))
+        ));
+        assert!(matches!(
+            buffer.embed_u8(1),
+            Err(BufferError::DataSectionRequired)
+        ));
+        buffer.select(Section::Data);
+        assert!(matches!(
+            buffer.emit(|emitter| emitter.mov_ri(EAX, 1)),
+            Err(BufferError::CodeSectionRequired)
+        ));
+        assert!(buffer.bytes(Section::Code).is_empty());
+    }
+
+    #[test]
+    fn code_alignment_uses_asmjit_optimized_nop_sequences() {
+        let mut buffer = CodeBuffer::new();
+        buffer.emit(|emitter| emitter.mov_ri(EAX, 1)).unwrap();
+        buffer.align(8).unwrap();
+        similar_asserts::assert_eq!(&buffer.bytes(Section::Code)[5..], &[0x0f, 0x1f, 0x00]);
+    }
+
+    #[test]
+    fn bound_short_branch_range_is_checked_before_emission() {
+        let mut buffer = CodeBuffer::new();
+        let target = buffer.new_label();
+        buffer.jmp_short(target).unwrap();
+        for value in 0..26 {
+            buffer.emit(|emitter| emitter.mov_ri(EAX, value)).unwrap();
+        }
+        let before_bind = buffer.bytes(Section::Code).to_vec();
+        assert!(matches!(
+            buffer.bind(target),
+            Err(BufferError::DisplacementOutOfRange { width: 1, .. })
+        ));
+        similar_asserts::assert_eq!(buffer.bytes(Section::Code), before_bind);
+    }
+
+    #[test]
+    fn label_and_external_data_create_absolute_relocations() {
+        let mut buffer = CodeBuffer::new();
+        let label = buffer.new_label();
+        buffer.select(Section::Data);
+        buffer.embed_label(label).unwrap();
+        buffer.embed_external(0x1234).unwrap();
+        buffer.select(Section::Code);
+        buffer.bind(label).unwrap();
+        let finalized = buffer.finish().unwrap();
+        assert!(matches!(
+            finalized.relocations[0].kind,
+            RelocationKind::Absolute64 {
+                target: RelocationTarget::Label(found),
+                ..
+            } if found == label
+        ));
+        similar_asserts::assert_eq!(finalized.relocations[1].offset, 8);
     }
 }
