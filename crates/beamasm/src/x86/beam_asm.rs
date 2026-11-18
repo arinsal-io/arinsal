@@ -315,6 +315,9 @@ pub mod process {
     pub const SELF_PID: i32 = offset_of!(ProcessHeader, self_pid) as i32;
     /// `offsetof(Process, flags)`.
     pub const FLAGS: i32 = offset_of!(ProcessHeader, flags) as i32;
+    /// `offsetof(Process, catches)`.
+    // Port of erts/emulator/beam/erl_process.h (struct process), OTP-29.1.1.
+    pub const CATCHES: i32 = offset_of!(ProcessHeader, catches) as i32;
 }
 
 /// `x86::ptr(c_p, offsetof(Process, field), size)`.
@@ -626,6 +629,9 @@ impl BeamAssembler {
             CpuFeature::Lzcnt => cpu::has_lzcnt(),
             CpuFeature::Popcnt => cpu::has_popcnt(),
             CpuFeature::Movbe => cpu::has_movbe(),
+            CpuFeature::Avx512Vl => cpu::has_avx512vl(),
+            CpuFeature::Avx512F => cpu::has_avx512f(),
+            CpuFeature::Sse => true,
         }
     }
 
@@ -920,11 +926,118 @@ pub enum CpuFeature {
     Popcnt,
     /// `kMOVBE`.
     Movbe,
+    /// `kAVX512_VL`, used by `emit_copy_words`.
+    Avx512Vl,
+    /// `kAVX512_F`, used by `emit_copy_words`.
+    Avx512F,
+    /// `kSSE`, the x86-64 baseline feature.
+    Sse,
 }
 
 /// `ERTS_SAVE_CALLS_CODE_IX`.
 // Port of erts/emulator/beam/code_ix.h:72-95, OTP-29.1.1.
 pub const ERTS_SAVE_CALLS_CODE_IX: u32 = arinsal_term::ERTS_SAVE_CALLS_CODE_IX as u32;
+
+// Port of erts/emulator/beam/jit/x86/beam_asm.hpp:1032-1110 (emit_copy_words), OTP-29.1.1.
+impl BeamAssembler {
+    /// Copies words through erts' ordered vector feature choices, then its scalar tail.
+    pub fn emit_copy_words(
+        &mut self,
+        mut from: Mem,
+        mut to: Mem,
+        mut count: i32,
+        spill: Gp,
+    ) -> Result<(), AsmError> {
+        debug_assert!(from.index.is_none() && to.index.is_none());
+        debug_assert!((0..(i32::MAX / 8)).contains(&count));
+        debug_assert!(from.disp < i32::MAX - count * 8);
+        debug_assert!(to.disp < i32::MAX - count * 8);
+
+        from = from.with_size(0);
+        to = to.with_size(0);
+
+        // erts checks every row in this order; a narrower supported row copies any remainder.
+        const VECTORS: [(CpuFeature, i32, bool); 5] = [
+            (CpuFeature::Avx512Vl, 8, true),
+            (CpuFeature::Avx512F, 8, true),
+            (CpuFeature::Avx, 4, true),
+            (CpuFeature::Avx, 2, true),
+            (CpuFeature::Sse, 2, false),
+        ];
+
+        for (feature, vector_words, use_vmovups) in VECTORS {
+            if !Self::has_cpu_feature(feature) {
+                continue;
+            }
+
+            if count <= vector_words * 4 {
+                while count >= vector_words {
+                    self.emit_copy_words_vector(from, to, vector_words, use_vmovups)?;
+                    let offset = vector_words * 8;
+                    from = from.adjusted(offset);
+                    to = to.adjusted(offset);
+                    count -= vector_words;
+                }
+            } else {
+                let loop_iterations = count / vector_words;
+                let loop_size = loop_iterations * vector_words * 8;
+                from = from.adjusted(loop_size);
+                to = to.adjusted(loop_size);
+                from.index = Some(spill.r64());
+                to.index = Some(spill.r64());
+
+                self.mov_imm(spill, (-i64::from(loop_size)) as u64)?;
+                let copy_next = self.new_label();
+                self.bind(copy_next)?;
+                self.emit_copy_words_vector(from, to, vector_words, use_vmovups)?;
+                self.emit(|e| e.add_ri(spill, i64::from(vector_words * 8)))?;
+                self.short_jcc(CondCode::NE, copy_next)?;
+
+                from.index = None;
+                to.index = None;
+                count %= vector_words;
+            }
+        }
+
+        if count == 1 {
+            self.emit(|e| e.mov_rm(spill, from))?;
+            self.emit(|e| e.mov_mr(to, spill))?;
+            count -= 1;
+        }
+
+        debug_assert_eq!(count, 0);
+        Ok(())
+    }
+
+    fn emit_copy_words_vector(
+        &mut self,
+        from: Mem,
+        to: Mem,
+        vector_words: i32,
+        use_vmovups: bool,
+    ) -> Result<(), AsmError> {
+        match (vector_words, use_vmovups) {
+            (8, true) => {
+                self.emit(|e| e.vmovups_zm(enc::Zmm(0), from))?;
+                self.emit(|e| e.vmovups_mz(to, enc::Zmm(0)))?;
+            }
+            (4, true) => {
+                self.emit(|e| e.vmovups_ym(enc::Ymm(0), from))?;
+                self.emit(|e| e.vmovups_my(to, enc::Ymm(0)))?;
+            }
+            (2, true) => {
+                self.emit(|e| e.vmovups_xm(enc::Xmm(0), from))?;
+                self.emit(|e| e.vmovups_mx(to, enc::Xmm(0)))?;
+            }
+            (2, false) => {
+                self.emit(|e| e.movups_xm(enc::Xmm(0), from))?;
+                self.emit(|e| e.movups_mx(to, enc::Xmm(0)))?;
+            }
+            _ => unreachable!("emit_copy_words vector specification"),
+        }
+        Ok(())
+    }
+}
 
 // Port of erts/emulator/beam/jit/beam_jit_main.cpp:291-305 (beamasm_init), OTP-29.1.1: the
 // commonly used process fields must be reachable with an 8-bit displacement from `c_p`.

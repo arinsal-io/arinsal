@@ -187,6 +187,24 @@ unsafe extern "C" {
     pub safe fn save_calls(c_p: *mut crate::ProcessHeader, export: usize);
 }
 
+// Port of erts/emulator/beam/jit/x86/instr_common.cpp runtime declarations, OTP-29.1.1.
+unsafe extern "C" {
+    /// `int raw_raise(Eterm stacktrace, Eterm exc_class, Eterm value, Process *c_p)`
+    /// (beam_common.h).
+    pub safe fn raw_raise(
+        stacktrace: u64,
+        exc_class: u64,
+        value: u64,
+        c_p: *mut crate::ProcessHeader,
+    ) -> i32;
+    /// `Eterm build_stacktrace(Process *c_p, Eterm exc)` (global.h).
+    pub safe fn build_stacktrace(c_p: *mut crate::ProcessHeader, exc: u64) -> u64;
+    /// `void erts_do_exit_process(Process *p, Eterm reason)` (erl_process.h).
+    pub safe fn erts_do_exit_process(c_p: *mut crate::ProcessHeader, reason: u64);
+    /// `void erts_continue_exit_process(Process *p)` (erl_process.h).
+    pub safe fn erts_continue_exit_process(c_p: *mut crate::ProcessHeader);
+}
+
 // Port of erts/emulator/beam/jit/beam_jit_common.hpp, OTP-29.1.1: the JIT-only runtime
 // helpers of jit/beam_jit_common.cpp the x86 fragments call by address. `instr_fun` re-exports
 // them.
@@ -661,6 +679,27 @@ mod tests {
     }
     #[unsafe(no_mangle)]
     extern "C" fn add_stacktrace(_c_p: *mut crate::ProcessHeader, _value: u64, _exc: u64) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn build_stacktrace(_c_p: *mut crate::ProcessHeader, _exc: u64) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn raw_raise(
+        _stacktrace: u64,
+        _exc_class: u64,
+        _value: u64,
+        _c_p: *mut crate::ProcessHeader,
+    ) -> i32 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_do_exit_process(_c_p: *mut crate::ProcessHeader, _reason: u64) {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_continue_exit_process(_c_p: *mut crate::ProcessHeader) {
         unreachable!("byte-test fixture")
     }
     #[unsafe(no_mangle)]

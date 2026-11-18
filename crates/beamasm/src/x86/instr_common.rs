@@ -16,8 +16,11 @@ use super::beam_asm::{
 };
 use super::beam_asm::{Update, get_x_ref};
 use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
-use super::beam_asm_module::{BeamModuleAssembler, arg_label, arg_word};
-pub use super::rt::{add_stacktrace, erts_sanitize_freason};
+use super::beam_asm_module::{BeamModuleAssembler, Patch, PatchCatch, arg_label, arg_word};
+pub use super::rt::{
+    add_stacktrace, build_stacktrace, erts_continue_exit_process, erts_do_exit_process,
+    erts_sanitize_freason, raw_raise,
+};
 use crate::common::args::ArgVal;
 use crate::common::args::{Relation, memory_relation};
 use crate::common::types::{BeamModuleAssemblerCommon, type_id};
@@ -1304,15 +1307,17 @@ impl BeamModuleAssembler {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crate::common::types::ArgType;
     use crate::x86::beam_asm::register::TMP1;
     use crate::x86::jdump::{beam_register, erts_dump, gnu_as, op_blocks};
     use arinsal_x64::buf::Section;
+    use similar_asserts::assert_eq;
 
     /// Real boot modules whose dumps the x86 emitter tests compare against.
-    const MODULES: [&str; 10] = [
+    const MODULES: [&str; 16] = [
         "lists",
         "maps",
         "gen_server",
@@ -1323,6 +1328,12 @@ mod tests {
         "io_lib_format",
         "io_lib",
         "application_controller",
+        "group",
+        "ets",
+        "peer",
+        "file",
+        "erlang",
+        "erts_beamasm",
     ];
 
     /// The `i_move_sd` operands of an erts block emitted with a fresh register cache: one
@@ -1350,6 +1361,160 @@ mod tests {
         let mut m = BeamModuleAssembler::new(1);
         f(&mut m).unwrap();
         m.asm.a.bytes(Section::Code).to_vec()
+    }
+
+    fn emitted_with_fragments_at(
+        start_offset: usize,
+        f: impl FnOnce(&mut BeamModuleAssembler) -> Result<(), AsmError>,
+    ) -> Vec<u8> {
+        let addresses = vec![Some(0x1000); super::super::beam_asm_global::GLOBAL_LABELS.len()];
+        let mut m = BeamModuleAssembler::with_fragment_addresses(8, addresses);
+        for _ in 0..start_offset {
+            m.asm.emit(|e| e.nop()).unwrap();
+        }
+        let start = m.asm.a.offset();
+        f(&mut m).unwrap();
+        m.asm.a.bytes(Section::Code)[start..].to_vec()
+    }
+
+    fn expected_erts_block(block: &[String]) -> Option<Vec<u8>> {
+        use std::collections::HashSet;
+
+        let labels: HashSet<&str> = block
+            .iter()
+            .filter_map(|line| line.strip_suffix(':'))
+            .collect();
+        let lines = block
+            .iter()
+            .map(|line| {
+                let line = crate::x86::jdump::erts_to_arinsal(line);
+                let (prefix, instruction) = if let Some(rest) = line.strip_prefix("short ") {
+                    (Some(true), rest)
+                } else if let Some(rest) = line.strip_prefix("long ") {
+                    (Some(false), rest)
+                } else {
+                    (None, line.as_str())
+                };
+                let Some((op, target)) = instruction.split_once(' ') else {
+                    return line;
+                };
+                if op == "call" && (target.parse::<u64>().is_ok() || !labels.contains(target)) {
+                    return ".byte 0x40, 0xe8, 0, 0, 0, 0".to_owned();
+                }
+                let target_is_local = labels.contains(target);
+                if !target_is_local && op.starts_with('j') {
+                    let condition = match op {
+                        "jo" => 0x0,
+                        "jno" => 0x1,
+                        "jb" | "jc" | "jnae" => 0x2,
+                        "jae" | "jnb" | "jnc" => 0x3,
+                        "je" | "jz" => 0x4,
+                        "jne" | "jnz" => 0x5,
+                        "jbe" | "jna" => 0x6,
+                        "ja" | "jnbe" => 0x7,
+                        "js" => 0x8,
+                        "jns" => 0x9,
+                        "jp" | "jpe" => 0xa,
+                        "jnp" | "jpo" => 0xb,
+                        "jl" | "jnge" => 0xc,
+                        "jge" | "jnl" => 0xd,
+                        "jle" | "jng" => 0xe,
+                        "jg" | "jnle" => 0xf,
+                        "jmp" => {
+                            return if prefix == Some(true) {
+                                ".byte 0xeb, 0".to_owned()
+                            } else {
+                                ".byte 0xe9, 0, 0, 0, 0".to_owned()
+                            };
+                        }
+                        _ => return line,
+                    };
+                    let short = prefix == Some(true);
+                    if short {
+                        return format!(".byte {:#04x}, 0", 0x70 + condition);
+                    }
+                    return format!(".byte 0x0f, {:#04x}, 0, 0, 0, 0", 0x80 + condition);
+                }
+                line
+            })
+            .collect::<Vec<_>>();
+        gnu_as(&lines)
+    }
+
+    fn assert_erts_block_matches(
+        block: &[String],
+        emit: impl Fn(&mut BeamModuleAssembler) -> Result<(), AsmError>,
+    ) {
+        let expected = expected_erts_block(block).expect("GNU binutils must assemble erts dump");
+        let mut last = Vec::new();
+        for start_offset in 0..4 {
+            last = emitted_with_fragments_at(start_offset, |m| emit(m));
+            if last == expected {
+                return;
+            }
+        }
+        assert_eq!(last, expected, "{block:#?}");
+    }
+
+    fn dump_block(op: &str, accept: impl Fn(&[String]) -> bool) -> Vec<String> {
+        dump_blocks(op)
+            .unwrap_or_else(|| panic!("OTP 29 +JDdump unavailable for {op}"))
+            .into_iter()
+            .find(|block| accept(block))
+            .unwrap_or_else(|| panic!("OTP 29 +JDdump has no usable {op} block"))
+    }
+
+    fn stack_words(block: &[String]) -> Option<u64> {
+        Some(
+            block
+                .iter()
+                .find_map(|line| line.strip_prefix("sub rsp, "))
+                .and_then(|words| words.parse::<u64>().ok().map(|bytes| bytes / 8))
+                .unwrap_or(0),
+        )
+    }
+
+    fn heap_test_args(block: &[String]) -> Option<(u64, u64)> {
+        let live = block.iter().find_map(|line| {
+            if let Some(words) = line.strip_prefix("mov ecx, ") {
+                words.parse::<u64>().ok()
+            } else if line == "xor ecx, ecx" {
+                Some(0)
+            } else {
+                None
+            }
+        })?;
+        let bytes = block.iter().find_map(|line| {
+            let (_, rhs) = line.split_once(", ")?;
+            let (base, disp) = parse_mem(rhs)?;
+            (base == "r15" && line.starts_with("lea rdx, ")).then_some(u64::try_from(disp).ok()?)
+        })?;
+        Some((bytes / 8 - arinsal_term::S_RESERVED as u64, live))
+    }
+
+    fn source_for_register(block: &[String], register: &str) -> Option<ArgVal> {
+        block.iter().find_map(|line| {
+            let (dst, src) = line.strip_prefix("mov ")?.split_once(", ")?;
+            (dst == register).then(|| arg_slot(src)).flatten()
+        })
+    }
+
+    fn stack_slot(block: &[String]) -> Option<ArgVal> {
+        stored_slots(block)
+            .into_iter()
+            .rev()
+            .find(|arg| matches!(arg, ArgVal::Y(_)))
+    }
+
+    fn deallocate_words(block: &[String]) -> Option<u64> {
+        block
+            .iter()
+            .find_map(|line| {
+                line.strip_prefix("add rsp, ")
+                    .and_then(|words| words.parse::<u64>().ok())
+                    .map(|bytes| bytes / 8)
+            })
+            .or(Some(0))
     }
 
     // Differential check against erts: every `i_move_sd` and `i_trim_t` erts emitted for real
@@ -2264,5 +2429,630 @@ mod tests {
             };
             m.emit_i_test_arity(ArgVal::Label(fail), src, ArgVal::Word(arity))
         });
+    }
+
+    #[test]
+    fn frames_and_heap_emitters_match_erts_dump() {
+        let allocate = dump_block("allocate_tt", |_| true);
+        let (_, live) = heap_test_args(&allocate).expect("allocate_tt operands");
+        assert_erts_block_matches(&allocate, |m| {
+            m.emit_allocate(
+                ArgVal::Word(stack_words(&allocate).unwrap()),
+                ArgVal::Word(live),
+            )
+        });
+
+        let allocate_heap = dump_block("allocate_heap_tIt", |_| true);
+        let (need_heap, live) = heap_test_args(&allocate_heap).expect("allocate_heap operands");
+        let need_stack = stack_words(&allocate_heap).unwrap();
+        assert_erts_block_matches(&allocate_heap, |m| {
+            m.emit_allocate_heap(
+                ArgVal::Word(need_stack),
+                ArgVal::Word(need_heap),
+                ArgVal::Word(live),
+            )
+        });
+
+        let test_heap = dump_block("test_heap_It", |_| true);
+        let (need_heap, live) = heap_test_args(&test_heap).expect("test_heap operands");
+        assert_erts_block_matches(&test_heap, |m| {
+            m.emit_test_heap(ArgVal::Word(need_heap), ArgVal::Word(live))
+        });
+
+        let deallocate = dump_block("deallocate_t", |_| true);
+        assert_erts_block_matches(&deallocate, |m| {
+            m.emit_deallocate(ArgVal::Word(deallocate_words(&deallocate).unwrap()))
+        });
+    }
+
+    #[test]
+    fn record_emitters_and_copy_words_match_erts_dump() {
+        let update = dump_block("update_record_aIsdI", |block| {
+            block
+                .iter()
+                .any(|line| line == "cmp qword ptr [rdi+70], 907" && line.starts_with("cmp"))
+        });
+        assert_erts_block_matches(&update, |m| {
+            m.emit_update_record(
+                ArgVal::Immediate(Term::atom(atoms::REUSE).word()),
+                ArgVal::Word(15),
+                ArgVal::X(1),
+                ArgVal::X(0),
+                ArgVal::Word(2),
+                &[ArgVal::Word(9), ArgVal::Immediate(907)],
+            )
+        });
+
+        let safe = dump_block("update_record_in_place_IsdI", |block| {
+            block
+                .iter()
+                .any(|line| line == "mov qword ptr [rax+30], 75")
+        });
+        assert_erts_block_matches(&safe, |m| {
+            m.emit_update_record_in_place(
+                ArgVal::Word(4),
+                ArgVal::X(1),
+                ArgVal::X(1),
+                ArgVal::Word(2),
+                &[ArgVal::Word(4), ArgVal::Immediate(75)],
+            )
+        });
+
+        let fallback = dump_block("update_record_in_place_IsdI", |block| {
+            block
+                .iter()
+                .any(|line| line == "mov rax, qword ptr [rsp+40]")
+                && block
+                    .iter()
+                    .any(|line| line == "mov qword ptr [rax+46], rdi")
+        });
+        assert_erts_block_matches(&fallback, |m| {
+            m.emit_update_record_in_place(
+                ArgVal::Word(12),
+                ArgVal::Y(5),
+                ArgVal::X(0),
+                ArgVal::Word(2),
+                &[ArgVal::Word(6), ArgVal::Y(6)],
+            )
+        });
+    }
+
+    #[test]
+    fn exception_catch_raise_and_yield_emitters_match_erts_dump() {
+        for (op, emit) in [
+            ("badmatch_s", 0u8),
+            ("case_end_s", 1),
+            ("badrecord_s", 2),
+            ("try_case_end_s", 3),
+        ] {
+            let block = dump_block(op, |block| source_slot(block).is_some());
+            let src = source_slot(&block).unwrap();
+            assert_erts_block_matches(&block, |m| match emit {
+                0 => m.emit_badmatch(src),
+                1 => m.emit_case_end(src),
+                2 => m.emit_badrecord(src),
+                _ => m.emit_try_case_end(src),
+            });
+        }
+
+        let if_end = dump_block("if_end", |_| true);
+        assert_erts_block_matches(&if_end, |m| m.emit_if_end());
+
+        let catch = dump_block("catch_yf", |block| stack_slot(block).is_some());
+        let catch_tag = stack_slot(&catch).unwrap();
+        assert_erts_block_matches(&catch, |m| m.emit_catch(catch_tag, ArgVal::Label(1)));
+
+        let catch_end = dump_block("catch_end_y", |block| stack_slot(block).is_some());
+        let catch_tag = stack_slot(&catch_end).unwrap();
+        assert_erts_block_matches(&catch_end, |m| m.emit_catch_end(catch_tag));
+
+        let try_end = dump_block("try_end_y", |block| stack_slot(block).is_some());
+        let catch_tag = stack_slot(&try_end).unwrap();
+        assert_erts_block_matches(&try_end, |m| m.emit_try_end(catch_tag));
+
+        let try_end_deallocate = dump_block("try_end_deallocate_t", |_| true);
+        assert_erts_block_matches(&try_end_deallocate, |m| {
+            m.emit_try_end_deallocate(ArgVal::Word(deallocate_words(&try_end_deallocate).unwrap()))
+        });
+
+        let try_case = dump_block("try_case_y", |_| true);
+        assert_erts_block_matches(&try_case, |m| m.emit_try_case(ArgVal::Y(0)));
+
+        let raise = dump_block("raise_ss", |block| {
+            source_for_register(block, "rdx").is_some()
+                && source_for_register(block, "rsi").is_some()
+        });
+        let trace = source_for_register(&raise, "rsi").unwrap();
+        let value = source_for_register(&raise, "rdx").unwrap();
+        assert_erts_block_matches(&raise, |m| m.emit_raise(trace, value));
+
+        let mut build_stacktrace = dump_block("build_stacktrace", |block| {
+            block.first().is_some_and(|line| line == "mov rsi, r10")
+        });
+        let mut with_cached_x0 = vec![
+            "mov r10, qword ptr [rsp]".to_owned(),
+            "mov qword ptr [rbx], r10".to_owned(),
+        ];
+        with_cached_x0.append(&mut build_stacktrace);
+        assert_erts_block_matches(&with_cached_x0, |m| {
+            m.emit_i_move(ArgVal::Y(0), ArgVal::X(0))?;
+            m.emit_build_stacktrace()
+        });
+
+        let raw_raise = dump_block("raw_raise", |_| true);
+        assert_erts_block_matches(&raw_raise, |m| m.emit_raw_raise());
+
+        let yield_block = dump_block("i_yield", |_| true);
+        assert_erts_block_matches(&yield_block, |m| m.emit_i_yield());
+    }
+
+    #[test]
+    fn exits_match_erts_dump() {
+        let normal_exit = dump_block("normal_exit", |_| true);
+        assert_erts_block_matches(&normal_exit, |m| m.emit_normal_exit());
+
+        let continue_exit = dump_block("continue_exit", |_| true);
+        assert_erts_block_matches(&continue_exit, |m| m.emit_continue_exit());
+    }
+
+    #[test]
+    fn test_yield_matches_erts_dump() {
+        let dump = erts_dump("erts_code_purger").expect("OTP 29 +JDdump unavailable");
+        let block = full_op_blocks(&dump, "i_test_yield")
+            .into_iter()
+            .next()
+            .expect("OTP 29 dump has no i_test_yield block");
+
+        let expected_context = block
+            .iter()
+            .filter(|line| line.as_str() != "align 4")
+            .map(|line| line.replace("[start/0+24]", "[rip+9]"))
+            .collect::<Vec<_>>();
+        let expected = expected_erts_block(&expected_context).expect("assemble erts block");
+
+        let addresses = vec![Some(0x1000); super::super::beam_asm_global::GLOBAL_LABELS.len()];
+        let mut m = BeamModuleAssembler::with_fragment_addresses(2, addresses);
+        m.emit_label(ArgVal::Label(1)).unwrap();
+        for _ in 0..8 {
+            m.asm.emit(|e| e.nop()).unwrap();
+        }
+        let start = m.asm.a.offset();
+        m.emit_i_test_yield().unwrap();
+        assert_eq!(
+            m.asm.a.bytes(Section::Code)[start..],
+            *expected,
+            "{block:#?}"
+        );
+    }
+}
+
+// Port of erts/emulator/beam/jit/x86/instr_common.cpp:219-266, 926-1089, OTP-29.1.1.
+impl BeamModuleAssembler {
+    /// `allocate_heap(NeedStack, NeedHeap, Live)` on erts' native Erlang stack.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:219-238 (emit_allocate_heap),
+    // OTP-29.1.1.
+    pub fn emit_allocate_heap(
+        &mut self,
+        need_stack: ArgVal,
+        need_heap: ArgVal,
+        live: ArgVal,
+    ) -> Result<(), AsmError> {
+        let stack_words = arg_word(need_stack)?;
+        debug_assert!(stack_words <= 1024);
+        self.emit_gc_test(stack_words, arg_word(need_heap)?, arg_word(live)?)?;
+        if stack_words > 0 {
+            self.asm.emit(|e| e.sub_ri(E, (stack_words * 8) as i64))?;
+        }
+        Ok(())
+    }
+
+    /// `allocate(NeedStack, Live)`.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:240-243 (emit_allocate), OTP-29.1.1.
+    pub fn emit_allocate(&mut self, need_stack: ArgVal, live: ArgVal) -> Result<(), AsmError> {
+        self.emit_allocate_heap(need_stack, ArgVal::Word(0), live)
+    }
+
+    /// Deallocates an RA frame on erts' native Erlang stack.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:245-261 (emit_deallocate), OTP-29.1.1.
+    pub fn emit_deallocate(&mut self, deallocate: ArgVal) -> Result<(), AsmError> {
+        let words = arg_word(deallocate)?;
+        debug_assert!(words <= 1023);
+        if words > 0 {
+            self.asm.emit(|e| e.add_ri(E, (words * 8) as i64))?;
+        }
+        Ok(())
+    }
+
+    /// `test_heap(Nh, Live)`.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:263-266 (emit_test_heap), OTP-29.1.1.
+    pub fn emit_test_heap(&mut self, need_heap: ArgVal, live: ArgVal) -> Result<(), AsmError> {
+        self.emit_gc_test(0, arg_word(need_heap)?, arg_word(live)?)
+    }
+
+    /// Copies unchanged tuple spans while constructing an updated record.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:926-990 (emit_update_record),
+    // OTP-29.1.1.
+    pub fn emit_update_record(
+        &mut self,
+        hint: ArgVal,
+        tuple_size: ArgVal,
+        src: ArgVal,
+        dst: ArgVal,
+        update_count: ArgVal,
+        updates: &[ArgVal],
+    ) -> Result<(), AsmError> {
+        let tuple_size = usize::try_from(arg_word(tuple_size)?)
+            .map_err(|_| AsmError::Operand("record tuple size"))?;
+        let update_count = usize::try_from(arg_word(update_count)?)
+            .map_err(|_| AsmError::Operand("record update count"))?;
+        debug_assert_eq!(update_count, updates.len());
+        debug_assert!(update_count.is_multiple_of(2));
+        let size_on_heap = tuple_size + 1;
+        debug_assert!(size_on_heap > 2);
+
+        let mut copy_index = 0usize;
+        let next = self.asm.new_label();
+        self.mov_arg_to_reg(RET, src)?;
+        if matches!(hint, ArgVal::Immediate(value) if value == Term::atom(atoms::REUSE).word())
+            && updates.len() == 2
+        {
+            let field = usize::try_from(arg_word(updates[0])?)
+                .map_err(|_| AsmError::Operand("record field index"))?;
+            let offset =
+                i32::try_from(field * 8).map_err(|_| AsmError::Operand("record field offset"))?;
+            self.asm.emit(|e| e.mov_rr(ARG1, RET))?;
+            let ptr = self.asm.emit_ptr_val(ARG1, ARG1);
+            self.cmp_arg_mem(emit_boxed_val(ptr, offset, 8), updates[1], ARG2)?;
+            self.asm.jcc(CondCode::E, next)?;
+        }
+
+        let ptr = self.asm.emit_ptr_val(RET, RET);
+        for pair in updates.as_chunks::<2>().0 {
+            let field = usize::try_from(arg_word(pair[0])?)
+                .map_err(|_| AsmError::Operand("record field index"))?;
+            debug_assert!(field > 0 && field >= copy_index);
+            let count = i32::try_from(field - copy_index)
+                .map_err(|_| AsmError::Operand("record copy length"))?;
+            let offset = i32::try_from(copy_index * 8)
+                .map_err(|_| AsmError::Operand("record copy offset"))?;
+            self.asm.emit_copy_words(
+                emit_boxed_val(ptr, offset, 0),
+                qword_ptr(HTOP, offset),
+                count,
+                ARG1,
+            )?;
+            let field_offset =
+                i32::try_from(field * 8).map_err(|_| AsmError::Operand("record field offset"))?;
+            self.mov_arg_to_mem(qword_ptr(HTOP, field_offset), pair[1], ARG1)?;
+            copy_index = field + 1;
+        }
+
+        let count = i32::try_from(size_on_heap - copy_index)
+            .map_err(|_| AsmError::Operand("record copy length"))?;
+        let offset =
+            i32::try_from(copy_index * 8).map_err(|_| AsmError::Operand("record copy offset"))?;
+        self.asm.emit_copy_words(
+            emit_boxed_val(ptr, offset, 0),
+            qword_ptr(HTOP, offset),
+            count,
+            ARG1,
+        )?;
+        self.asm
+            .emit(|e| e.lea(RET, qword_ptr(HTOP, i32::from(TAG_PRIMARY_BOXED))))?;
+        self.asm
+            .emit(|e| e.add_ri(HTOP, (size_on_heap * 8) as i64))?;
+        self.asm.bind(next)?;
+        self.mov_arg_from_reg(dst, RET)
+    }
+
+    /// Mutates a tuple when its heap range and update values make that safe.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:991-1089
+    // (emit_update_record_in_place), OTP-29.1.1.
+    pub fn emit_update_record_in_place(
+        &mut self,
+        tuple_size: ArgVal,
+        src: ArgVal,
+        dst: ArgVal,
+        update_count: ArgVal,
+        updates: &[ArgVal],
+    ) -> Result<(), AsmError> {
+        let tuple_size = usize::try_from(arg_word(tuple_size)?)
+            .map_err(|_| AsmError::Operand("record tuple size"))?;
+        let update_count = usize::try_from(arg_word(update_count)?)
+            .map_err(|_| AsmError::Operand("record update count"))?;
+        debug_assert_eq!(update_count, updates.len());
+        debug_assert!(update_count.is_multiple_of(2));
+        let size_on_heap = tuple_size + 1;
+        debug_assert!(size_on_heap > 2);
+
+        let mut all_safe = true;
+        let mut maybe_immediate = None;
+        for pair in updates.as_chunks::<2>().0 {
+            let value = pair[1];
+            if !(self.always_immediate(value) || value.is_literal()) {
+                all_safe = false;
+                if maybe_immediate.is_none() && self.always_one_of(value, type_id::MAYBE_IMMEDIATE)
+                {
+                    maybe_immediate = Some(value);
+                } else {
+                    maybe_immediate = None;
+                    break;
+                }
+            }
+        }
+
+        self.mov_arg_to_reg(RET, src)?;
+        if !all_safe {
+            let update = self.asm.new_label();
+            if let Some(value) = maybe_immediate {
+                self.mov_arg_to_reg(ARG4, value)?;
+                self.emit_is_boxed(update, ARG4, Distance::Short)?;
+            }
+
+            self.preserve_cache(&[ARG1], &[], |m| {
+                let copy = m.asm.new_label();
+                let high_water = core::mem::offset_of!(crate::ProcessHeader, high_water) as i32;
+                m.asm.emit(|e| e.mov_rm(ARG1, process_ref(high_water, 8)))?;
+                m.asm.emit(|e| e.cmp_rr(RET, HTOP))?;
+                m.asm.short_jcc(CondCode::AE, copy)?;
+                m.asm.emit(|e| e.cmp_rr(RET, ARG1))?;
+                m.asm.short_jcc(CondCode::AE, update)?;
+                m.asm.bind(copy)?;
+                m.asm.emit_copy_words(
+                    emit_boxed_val(RET, 0, 0),
+                    qword_ptr(HTOP, 0),
+                    i32::try_from(size_on_heap)
+                        .map_err(|_| AsmError::Operand("record copy length"))?,
+                    ARG1,
+                )?;
+                m.asm
+                    .emit(|e| e.lea(RET, qword_ptr(HTOP, i32::from(TAG_PRIMARY_BOXED))))?;
+                m.asm.emit(|e| e.add_ri(HTOP, (size_on_heap * 8) as i64))?;
+                Ok(())
+            })?;
+            self.asm.bind(update)?;
+        }
+
+        for pair in updates.as_chunks::<2>().0 {
+            let field = usize::try_from(arg_word(pair[0])?)
+                .map_err(|_| AsmError::Operand("record field index"))?;
+            debug_assert!(field > 0);
+            let offset =
+                i32::try_from(field * 8).map_err(|_| AsmError::Operand("record field offset"))?;
+            self.mov_arg_to_mem(emit_boxed_val(RET, offset, 8), pair[1], ARG1)?;
+        }
+
+        self.mov_arg_from_reg(dst, RET)
+    }
+}
+
+// Port of erts/emulator/beam/jit/x86/instr_common.cpp:82-106, 2966-3197, OTP-29.1.1.
+impl BeamModuleAssembler {
+    /// Emits the common raise path after setting `freason`.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:82-86 (emit_error), OTP-29.1.1.
+    fn emit_error(&mut self, reason: u64) -> Result<(), AsmError> {
+        self.asm
+            .emit(|e| e.mov_mi(process_ref(process::FREASON, 8), reason as i64))?;
+        self.emit_raise_exception()
+    }
+
+    /// Calls `raise_exception_null_exp` with a non-CP return address.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:256-262
+    // (BeamModuleAssembler::emit_raise_exception), OTP-29.1.1.
+    fn emit_raise_exception(&mut self) -> Result<(), AsmError> {
+        let fragment = self.ga_get(GlobalLabels::RaiseExceptionNullExp)?;
+        self.asm.safe_fragment_call_abs(fragment)?;
+        self.last_error_offset = self.asm.a.offset();
+        Ok(())
+    }
+
+    /// `badmatch(Src)`.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:2966-2969 (emit_badmatch), OTP-29.1.1.
+    pub fn emit_badmatch(&mut self, src: ArgVal) -> Result<(), AsmError> {
+        self.mov_arg_to_mem(process_ref(process::FVALUE, 8), src, ARG1)?;
+        self.emit_error(crate::exc::EXC_BADMATCH)
+    }
+
+    /// `case_end(Src)`.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:2971-2974 (emit_case_end), OTP-29.1.1.
+    pub fn emit_case_end(&mut self, src: ArgVal) -> Result<(), AsmError> {
+        self.mov_arg_to_mem(process_ref(process::FVALUE, 8), src, ARG1)?;
+        self.emit_error(crate::exc::EXC_CASE_CLAUSE)
+    }
+
+    /// Raises `system_limit`.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:2976-2978
+    // (emit_system_limit_body), OTP-29.1.1.
+    pub fn emit_system_limit_body(&mut self) -> Result<(), AsmError> {
+        self.emit_error(crate::exc::EXC_SYSTEM_LIMIT)
+    }
+
+    /// Raises `if_clause`.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:2980-2982 (emit_if_end), OTP-29.1.1.
+    pub fn emit_if_end(&mut self) -> Result<(), AsmError> {
+        self.emit_error(crate::exc::EXC_IF_CLAUSE)
+    }
+
+    /// `badrecord(Src)`.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:2984-2987 (emit_badrecord), OTP-29.1.1.
+    pub fn emit_badrecord(&mut self, src: ArgVal) -> Result<(), AsmError> {
+        self.mov_arg_to_mem(process_ref(process::FVALUE, 8), src, ARG1)?;
+        self.emit_error(crate::exc::EXC_BADRECORD)
+    }
+
+    /// Registers a catch handler and leaves its tag for `patch_catches`.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:2989-3011 (emit_catch), OTP-29.1.1.
+    pub fn emit_catch(&mut self, catch_tag: ArgVal, handler: ArgVal) -> Result<(), AsmError> {
+        if !catch_tag.is_y_register() {
+            return Err(AsmError::Operand("catch tag must be a Y register"));
+        }
+        let handler = self
+            .resolve_beam_label(arg_label(handler)?)
+            .ok_or(AsmError::Operand("catch handler label"))?;
+        self.asm
+            .emit(|e| e.inc_m(process_ref(process::CATCHES, 8)))?;
+        let patch_at = self.asm.new_label();
+        self.asm.bind(patch_at)?;
+        self.asm.emit(|e| e.mov_ri(RETD, i32::MAX as i64))?;
+        self.mov_arg_from_reg(catch_tag, RET)?;
+        self.catches.push(PatchCatch {
+            patch: Patch {
+                at: patch_at,
+                ptr_offs: 1,
+                val_offs: 0,
+            },
+            handler,
+        });
+        Ok(())
+    }
+
+    /// Stores `Src` and raises with the `try_clause` reason.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:3133-3135 (emit_try_case_end),
+    // OTP-29.1.1.
+    pub fn emit_try_case_end(&mut self, src: ArgVal) -> Result<(), AsmError> {
+        self.mov_arg_to_mem(process_ref(process::FVALUE, 8), src, ARG1)?;
+        self.emit_error(crate::exc::EXC_TRY_CLAUSE)
+    }
+
+    /// Handles an exception marker in X0 after clearing the active catch.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:3089-3097 (emit_catch_end),
+    // OTP-29.1.1.
+    pub fn emit_catch_end(&mut self, catch_tag: ArgVal) -> Result<(), AsmError> {
+        let next = self.asm.new_label();
+        self.emit_try_end(catch_tag)?;
+        self.asm
+            .emit(|e| e.cmp_mi(get_x_ref(0, 8), arinsal_term::THE_NON_VALUE as i64))?;
+        self.asm.short_jcc(CondCode::NE, next)?;
+        let fragment = self.ga_get(GlobalLabels::CatchEndShared)?;
+        self.asm.fragment_call_abs(fragment)?;
+        self.asm.bind(next)
+    }
+
+    /// Decrements the catch count and clears its Y slot.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:3100-3103 (emit_try_end), OTP-29.1.1.
+    pub fn emit_try_end(&mut self, catch_tag: ArgVal) -> Result<(), AsmError> {
+        self.asm
+            .emit(|e| e.dec_m(process_ref(process::CATCHES, 8)))?;
+        self.mov_arg_word(catch_tag, Term::NIL.word(), ARG1)
+    }
+
+    /// Decrements the catch count and deallocates its frame.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:3105-3108
+    // (emit_try_end_deallocate), OTP-29.1.1.
+    pub fn emit_try_end_deallocate(&mut self, deallocate: ArgVal) -> Result<(), AsmError> {
+        self.asm
+            .emit(|e| e.dec_m(process_ref(process::CATCHES, 8)))?;
+        self.emit_deallocate(deallocate)
+    }
+
+    /// Transfers the caught exception class from X3 to X0.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:3110-3130 (emit_try_case), OTP-29.1.1.
+    pub fn emit_try_case(&mut self, _catch_tag: ArgVal) -> Result<(), AsmError> {
+        self.asm
+            .emit(|e| e.dec_m(process_ref(process::CATCHES, 8)))?;
+        self.asm.emit(|e| e.mov_rm(RET, get_x_ref(3, 8)))?;
+        self.asm.emit(|e| e.mov_mr(get_x_ref(0, 8), RET))?;
+        Ok(())
+    }
+
+    /// Raises with the provided stacktrace and value through the shared fragment.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:3154-3164 (emit_raise), OTP-29.1.1.
+    pub fn emit_raise(&mut self, trace: ArgVal, value: ArgVal) -> Result<(), AsmError> {
+        let fragment = self.ga_get(GlobalLabels::RaiseShared)?;
+        self.mov_arg_to_reg(ARG3, value)?;
+        self.mov_arg_to_reg(ARG2, trace)?;
+        self.asm.fragment_call_abs(fragment)?;
+        self.last_error_offset = self.asm.a.offset();
+        Ok(())
+    }
+
+    /// Builds the stacktrace for X0 through the runtime helper.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:3166-3178
+    // (emit_build_stacktrace), OTP-29.1.1.
+    pub fn emit_build_stacktrace(&mut self) -> Result<(), AsmError> {
+        self.mov_arg_to_reg(ARG2, ArgVal::X(0))?;
+        self.asm.emit_enter_runtime(Update::HEAP_ALLOC)?;
+        self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
+        self.asm
+            .runtime_call(build_stacktrace as *const () as usize)?;
+        self.asm.emit_leave_runtime(Update::HEAP_ALLOC)?;
+        self.asm.emit(|e| e.mov_mr(get_x_ref(0, 8), RET))?;
+        Ok(())
+    }
+
+    /// Re-raises X2's saved trace, X0's class, and X1's value.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:3179-3197 (emit_raw_raise),
+    // OTP-29.1.1.
+    pub fn emit_raw_raise(&mut self) -> Result<(), AsmError> {
+        let next = self.asm.new_label();
+        self.mov_arg_to_reg(ARG1, ArgVal::X(2))?;
+        self.mov_arg_to_reg(ARG2, ArgVal::X(0))?;
+        self.mov_arg_to_reg(ARG3, ArgVal::X(1))?;
+        self.asm.emit_enter_runtime(Update::NONE)?;
+        self.asm.emit(|e| e.mov_rr(ARG4, C_P))?;
+        self.asm.runtime_call(raw_raise as *const () as usize)?;
+        self.asm.emit_leave_runtime(Update::NONE)?;
+        self.asm.emit(|e| e.test_rr(RET, RET))?;
+        self.asm.short_jcc(CondCode::NE, next)?;
+        self.emit_raise_exception()?;
+        self.asm.bind(next)?;
+        self.mov_arg_to_mem(
+            get_x_ref(0, 8),
+            ArgVal::Immediate(Term::atom(atoms::BADARG).word()),
+            ARG1,
+        )
+    }
+
+    /// Returns `true` in X0 and calls the shared dispatch return fragment.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:3254-3263 (emit_i_yield), OTP-29.1.1.
+    pub fn emit_i_yield(&mut self) -> Result<(), AsmError> {
+        let fragment = self.ga_get(GlobalLabels::DispatchReturn)?;
+        self.mov_arg_to_mem(
+            get_x_ref(0, 8),
+            ArgVal::Immediate(Term::atom(atoms::TRUE).word()),
+            ARG1,
+        )?;
+        self.asm.fragment_call_abs(fragment)
+    }
+}
+
+// Port of erts/emulator/beam/jit/x86/instr_common.cpp:268-300, OTP-29.1.1.
+impl BeamModuleAssembler {
+    /// Exits normally, then jumps to the global scheduler loop.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:268-285 (emit_normal_exit), OTP-29.1.1.
+    pub fn emit_normal_exit(&mut self) -> Result<(), AsmError> {
+        let do_schedule = self.ga_get(GlobalLabels::DoSchedule)?;
+        let spec = Update::HEAP_ALLOC.union(Update::REDUCTIONS);
+        self.asm.emit_enter_runtime(spec)?;
+        self.asm.emit(|e| {
+            e.mov_mi(
+                process_ref(process::FREASON, 8),
+                (crate::exc::EXC_EXIT | (1 << crate::exc::EXC_OFFSET)) as i64,
+            )
+        })?;
+        self.asm
+            .emit(|e| e.mov_mi(process_ref(process::ARITY, 1), 0))?;
+        self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
+        self.asm.mov_imm(ARG2, Term::atom(atoms::NORMAL).word())?;
+        self.asm
+            .runtime_call(erts_do_exit_process as *const () as usize)?;
+        self.asm.emit_leave_runtime(spec)?;
+        let schedule = self.resolve_fragment(do_schedule);
+        self.asm.jmp(schedule)
+    }
+
+    /// Continues an exit already in progress, then jumps to the scheduler loop.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:287-300 (emit_continue_exit),
+    // OTP-29.1.1.
+    pub fn emit_continue_exit(&mut self) -> Result<(), AsmError> {
+        let do_schedule = self.ga_get(GlobalLabels::DoSchedule)?;
+        let spec = Update::HEAP_ALLOC.union(Update::REDUCTIONS);
+        self.asm.emit_enter_runtime(spec)?;
+        self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
+        self.asm
+            .runtime_call(erts_continue_exit_process as *const () as usize)?;
+        self.asm.emit_leave_runtime(spec)?;
+        let schedule = self.resolve_fragment(do_schedule);
+        self.asm.jmp(schedule)
     }
 }
