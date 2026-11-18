@@ -2,6 +2,7 @@
 mod atom_cache;
 mod beam_catches;
 mod beam_jit_common;
+mod beam_jit_main;
 mod beamasm_integration;
 mod bif_traps;
 mod big;

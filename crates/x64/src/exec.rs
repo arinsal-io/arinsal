@@ -421,6 +421,14 @@ pub struct CodeMemory {
     capacity: usize,
 }
 
+// SAFETY: the handle owns its span of the process-wide allocator, whose mappings stay put while
+// it lives; moving it to another thread moves that ownership.
+unsafe impl Send for CodeMemory {}
+
+// SAFETY: every write takes `&mut self`; through `&self` the span is only read or entered, as
+// the global code of `beamasm_init` is by every scheduler.
+unsafe impl Sync for CodeMemory {}
+
 impl CodeMemory {
     /// Allocates a span with separate writable and executable aliases.
     // Port of `beam_jit_main.cpp:181-229` and asmjit `JitAllocator::alloc`, OTP-29.1.1.

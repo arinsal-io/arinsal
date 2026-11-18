@@ -89,7 +89,7 @@ pub(crate) fn export_entry_or_stub(mfa: Mfa) -> Option<&'static Arc<ExportEntry>
 
 /// The shared `beam_export_trampoline` every export enters while its trampoline is active.
 fn export_trampoline() -> usize {
-    crate::beamasm_integration::export_trampoline()
+    crate::beam_jit_main::beam_export_trampoline()
 }
 
 /// `erts_activate_export_trampoline`: code index `ix` of `ep` enters the export trampoline.

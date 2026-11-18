@@ -882,7 +882,7 @@ pub(crate) fn global() -> &'static Arc<CodeIndexes> {
     }
     // `CodeIndexes::new` installs the BIF exports (install_bifs), which erts does only after
     // beamasm_init.
-    crate::beamasm_integration::beamasm_init();
+    crate::beam_jit_main::beamasm_init();
     CODE_IX.get_or_init(|| Arc::new(CodeIndexes::new()))
 }
 
@@ -907,7 +907,7 @@ mod tests {
     /// A fresh index set: these tests assert exact index and table state, which the process's
     /// own indexes (shared with every other test) do not keep.
     fn node() -> Arc<CodeIndexes> {
-        crate::beamasm_integration::beamasm_init();
+        crate::beam_jit_main::beamasm_init();
         Arc::new(CodeIndexes::new())
     }
 

@@ -549,7 +549,7 @@ fn inspect_frames(process: &Process, max_size: usize, hibernation: Option<u8>) -
         let raw = word.tagged_word() as usize;
         let normal_exit = raw == crate::native_bridge::bridge_return_address();
         reached_exit |= normal_exit;
-        let breakpoint_cleanup = crate::beamasm_integration::is_line_breakpoint_cleanup(raw);
+        let breakpoint_cleanup = raw == crate::beam_jit_main::beam_i_line_breakpoint_cleanup();
         // A trace frame's return address is a CP like any other (erts `is_CP`), of no
         // function (erts_internal_fun_description_from_pc); its data words are its slots.
         let trace_frame = crate::trace::TraceFrameKind::of(raw).is_some();
@@ -614,7 +614,7 @@ fn function_info_native(address: usize, is_return_address: bool) -> O {
         // (erts_internal_fun_description_from_pc), OTP-29.1.1.
         return O::Atom("<terminate process normally>".into());
     }
-    if is_return_address && crate::beamasm_integration::is_line_breakpoint_cleanup(address) {
+    if is_return_address && address == crate::beam_jit_main::beam_i_line_breakpoint_cleanup() {
         // Port of erts/emulator/beam/erl_process.c:14945-14946, OTP-29.1.1.
         return O::Atom("<breakpoint>".into());
     }

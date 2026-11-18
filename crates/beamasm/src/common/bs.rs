@@ -1,6 +1,9 @@
 //! Port of erts/emulator/beam/jit/beam_jit_bs.hpp and erts/emulator/beam/jit/beam_jit_bs.cpp
 //! (`beam_jit_bsc_combine_segments`, `beam_jit_bsm_init`, `beam_jit_opt_bsm_segments`),
-//! OTP-29.1.1: the architecture-neutral bit syntax segment planning both emitters use.
+//! OTP-29.1.1: the architecture-neutral bit syntax segment planning both emitters use. The
+//! arm64 emitters still read their loader's decoded commands, so the `bsc` operand reading
+//! (`beam_jit_bsc_init` and its packed `error_info`) is built for x86-64 only until they read
+//! the loader's `ArgVal` lists as erts does.
 
 use crate::common::args::ArgVal;
 use arinsal_term::{Term, atoms};
@@ -45,6 +48,7 @@ pub(crate) enum BscAction {
 }
 
 /// Operation encoded in the packed `error_info` field.
+#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
 pub(crate) enum BscOp {
@@ -57,6 +61,7 @@ pub(crate) enum BscOp {
 }
 
 /// Failure class encoded in the packed `error_info` field.
+#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
 pub(crate) enum BscReason {
@@ -66,6 +71,7 @@ pub(crate) enum BscReason {
 }
 
 /// Failed operand encoded in the packed `error_info` field.
+#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
 pub(crate) enum BscInfo {
@@ -77,6 +83,7 @@ pub(crate) enum BscInfo {
 }
 
 /// Value location encoded in the packed `error_info` field.
+#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
 pub(crate) enum BscValue {
@@ -91,6 +98,7 @@ pub(crate) enum BscValue {
 
 /// Packs a segment index and its operation as `beam_jit_set_bsc_segment_op` does.
 // Port of erts/emulator/beam/jit/beam_jit_common.hpp:466-475, OTP-29.1.1.
+#[cfg(target_arch = "x86_64")]
 fn set_bsc_segment_op(segment: u64, op: BscOp) -> u64 {
     (segment << 10) | ((op as u64) << 7)
 }
@@ -98,6 +106,7 @@ fn set_bsc_segment_op(segment: u64, op: BscOp) -> u64 {
 /// Adds failure details to an existing packed segment error value.
 // Port of erts/emulator/beam/jit/beam_jit_common.hpp:478-483 (beam_jit_update_bsc_reason_info),
 // OTP-29.1.1.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn update_bsc_reason_info(
     packed_info: u64,
     reason: BscReason,
@@ -113,6 +122,7 @@ fn atom_arg(atom: arinsal_term::Atom) -> ArgVal {
 
 /// Reads the six typed operands for every `bs_create_bin` segment and packs its error origin.
 // Port of erts/emulator/beam/jit/beam_jit_bs.cpp:35-85 (beam_jit_bsc_init), OTP-29.1.1.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn beam_jit_bsc_init(args: &[ArgVal]) -> Vec<BscSegment> {
     let mut segments = Vec::new();
     for args in args.as_chunks::<6>().0 {

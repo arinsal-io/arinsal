@@ -417,12 +417,7 @@ impl Process {
     /// resuming at its code address with three live registers.
     // Port of erts/emulator/beam/erl_process.c:12616 (erl_create_process), OTP-29.1.1.
     pub(crate) fn set_run_process_entry(&mut self) -> Result<(), VmError> {
-        let Some((start, _)) = crate::beamasm_integration::run_process_entry() else {
-            return Err(VmError::Unsupported(
-                "the beam_run_process stub is not built".into(),
-            ));
-        };
-        self.set_native_pc(Some(start));
+        self.set_native_pc(Some(crate::beam_jit_main::beam_run_process()));
         self.native_continuation_resume = true;
         self.set_native_resume_arity(3);
         Ok(())
