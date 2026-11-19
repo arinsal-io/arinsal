@@ -538,7 +538,7 @@ fn native_test_arity() {
     native_predicate(
         |a| {
             a.emit_is_tuple(ArgVal::X(0), 2)?;
-            a.emit_test_arity(ArgVal::X(0), ArgVal::Immediate(bits(small(1))), 2)
+            a.emit_test_arity(ArgVal::X(0), ArgVal::Immediate(1 << 6), 2)
         },
         |x, y| type_matches(6, x, y),
         |_| small(1),
@@ -549,12 +549,7 @@ fn native_is_tagged_tuple() {
     let fixture = terms();
     let tag = fixture.alpha;
     let finalized = module(|a| {
-        a.emit_is_tagged_tuple(
-            ArgVal::X(0),
-            ArgVal::Immediate(bits(small(1))),
-            ArgVal::X(2),
-            2,
-        )?;
+        a.emit_is_tagged_tuple(ArgVal::X(0), ArgVal::Immediate(1 << 6), ArgVal::X(2), 2)?;
         a.move_(ArgVal::Immediate(1), ArgVal::X(1))?;
         a.emit_raw(|e| {
             e.mov_reg(Gpr::x(0), Gpr::xzr())?;
@@ -1327,7 +1322,9 @@ fn native_is_tuple_of_arity() {
     // OTP-29.1.1.
     for arity in [1, 2] {
         native_predicate(
-            |a| a.emit_is_tuple_of_arity(ArgVal::X(0), ArgVal::Immediate(bits(small(arity))), 2, 2),
+            |a| {
+                a.emit_is_tuple_of_arity(ArgVal::X(0), ArgVal::Immediate((arity as u64) << 6), 2, 2)
+            },
             |x, _| arity_matches(x, Some(small(arity))),
             zero_term,
         );
@@ -1342,7 +1339,7 @@ fn native_is_tuple_of_arity_ff() {
     let fixture = terms();
     for arity in [1, 2] {
         let finalized = module(|a| {
-            a.emit_is_tuple_of_arity(ArgVal::X(0), ArgVal::Immediate(bits(small(arity))), 2, 3)?;
+            a.emit_is_tuple_of_arity(ArgVal::X(0), ArgVal::Immediate((arity as u64) << 6), 2, 3)?;
             a.move_(ArgVal::Immediate(1), ArgVal::X(1))?;
             a.emit_raw(|e| {
                 e.mov_reg(Gpr::x(0), Gpr::xzr())?;
@@ -1451,7 +1448,8 @@ fn native_type_guards_match_otp_29() {
     };
     let fixture = terms();
     assert_eq!(fixture.values.len(), 18);
-    let one = ArgVal::Immediate(bits(small(1)));
+    let one = ArgVal::Immediate(1 << 6);
+    let function_one = ArgVal::Immediate(bits(small(1)));
     let tag = ArgVal::Immediate(bits(fixture.alpha));
     type Emitter = Box<dyn Fn(&mut BeamModuleAssembler) -> Result<(), ModuleError>>;
     let cases: Vec<(usize, Emitter)> = vec![
@@ -1495,7 +1493,7 @@ fn native_type_guards_match_otp_29() {
         (17, Box::new(|asm| asm.emit_is_function(ArgVal::X(0), 2))),
         (
             18,
-            Box::new(move |asm| asm.emit_is_function2_guard(ArgVal::X(0), one, 2)),
+            Box::new(move |asm| asm.emit_is_function2_guard(ArgVal::X(0), function_one, 2)),
         ),
     ];
     for (row, emit) in cases {
@@ -1523,7 +1521,7 @@ fn native_type_guards_match_otp_29() {
     let finalized = module(|asm| {
         asm.emit_is_function2(
             ArgVal::X(0),
-            one,
+            function_one,
             arinsal_beamasm::guard::Function2TestTarget::LegacyBoolean(guard_helper),
         )
     });

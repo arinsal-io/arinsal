@@ -215,7 +215,7 @@ fn native_get_list_alias_survives_y_frame_return() {
     let (header, regs, _, base) = run_native(
         |m, hook| {
             m.emit_is_tuple(ArgVal::X(0), 100)?;
-            m.emit_test_arity(ArgVal::X(0), ArgVal::Immediate(tagged_small(2)), 101)?;
+            m.emit_test_arity(ArgVal::X(0), ArgVal::Immediate(2 << 6), 101)?;
             m.emit_get_tuple_element(ArgVal::X(0), 8, ArgVal::X(1))?;
             m.emit_get_tuple_element(ArgVal::X(0), 16, ArgVal::X(2))?;
             m.emit_is_nonempty_list(ArgVal::X(1), 102)?;

@@ -197,8 +197,13 @@ fn small_operand(value: ArgVal) -> Result<i64, ModuleError> {
     }
 }
 
-fn arity_word(arity: i64) -> u64 {
-    (arity as u64).wrapping_shl(6)
+fn arity_header(value: ArgVal) -> Result<u64, ModuleError> {
+    match value {
+        ArgVal::Immediate(header) => Ok(header),
+        _ => Err(ModuleError::InvalidOperand(
+            "tuple arity must be a make_arityval immediate",
+        )),
+    }
 }
 
 impl BeamModuleAssembler {
@@ -420,20 +425,18 @@ impl BeamModuleAssembler {
                 }
             }
             InlineType::Arity => {
-                let arity = small_operand(second.ok_or(ModuleError::InvalidOperand(
-                    "arity operand must be an immediate small",
-                ))?)?;
-                let arity_word = arity_word(arity);
+                let header = arity_header(
+                    second.ok_or(ModuleError::InvalidOperand("arity operand required"))?,
+                )?;
                 self.code.emit(|e| e.and_imm(Gpr::x(0), src, !7))?;
                 self.code.emit(|e| e.ldr_uoff(tmp1, Gpr::x(0), 0))?;
-                self.emit_cmp_constant(tmp1, arity_word, Gpr::x(14))?;
+                self.emit_cmp_constant(tmp1, header, Gpr::x(14))?;
                 self.code.b_cond(Cond::Ne, fail)?;
             }
             InlineType::TaggedTuple => {
-                let arity = small_operand(second.ok_or(ModuleError::InvalidOperand(
-                    "arity operand must be an immediate small",
-                ))?)?;
-                let arity_word = arity_word(arity);
+                let header = arity_header(
+                    second.ok_or(ModuleError::InvalidOperand("arity operand required"))?,
+                )?;
                 let tag = third.ok_or(ModuleError::InvalidOperand("tag operand required"))?;
                 self.emit_boxed_check(source, src, fail)?;
                 self.code.emit(|e| e.and_imm(Gpr::x(0), src, !7))?;
@@ -441,7 +444,7 @@ impl BeamModuleAssembler {
                 let tag_reg = self.source_reg_into(tag, Gpr::x(14))?;
                 self.code
                     .emit(|e| e.cmp_reg(tmp2, tag_reg, arinsal_a64::enc::Shift::Lsl, 0))?;
-                self.code.emit(|e| e.mov_const(tmp3, arity_word))?;
+                self.code.emit(|e| e.mov_const(tmp3, header))?;
                 self.code.emit(|e| e.ccmp_reg(tmp1, tmp3, 0, Cond::Eq))?;
                 self.code.b_cond(Cond::Ne, fail)?;
             }
@@ -647,10 +650,8 @@ impl BeamModuleAssembler {
                 self.code.emit(|e| e.and_imm(Gpr::x(12), Gpr::x(12), 63))?;
                 self.code.emit(|e| e.cmp_imm(Gpr::x(12), 0, false))?;
                 self.code.b_cond(Cond::Ne, no)?;
-                self.code.emit(|e| e.lsr_imm(Gpr::x(12), Gpr::x(10), 6))?;
-                self.code.emit(|e| e.asr_imm(Gpr::x(13), Gpr::x(13), 4))?;
                 self.code
-                    .emit(|e| e.cmp_reg(Gpr::x(12), Gpr::x(13), arinsal_a64::enc::Shift::Lsl, 0))?;
+                    .emit(|e| e.cmp_reg(Gpr::x(10), Gpr::x(13), arinsal_a64::enc::Shift::Lsl, 0))?;
                 self.code.b_cond(Cond::Ne, no)?;
                 if matches!(op, InlineType::TaggedTuple) {
                     self.code.emit(|e| {
@@ -1246,9 +1247,9 @@ impl BeamModuleAssembler {
 
     /// Emits the fused `is_tuple` + `test_arity` test: one boxed check and one header load,
     /// failing to `not_tuple` or, when the tuple has another arity, to `bad_arity`.
-    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1611-1653 (emit_i_is_tuple_of_arity,
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1611-1664 (emit_i_is_tuple_of_arity,
     // emit_i_is_tuple_of_arity_ff), OTP-29.1.1. The arity operand is the loader's small
-    // integer; the header compare is against its `make_arityval`.
+    // integer transformed to `make_arityval`; compare the header word directly.
     pub fn emit_is_tuple_of_arity(
         &mut self,
         src: impl Into<TypedArg>,
@@ -1257,8 +1258,7 @@ impl BeamModuleAssembler {
         bad_arity: u32,
     ) -> Result<(), ModuleError> {
         let source = src.into();
-        let arity = small_operand(arity)?;
-        let header = arity_word(arity);
+        let header = arity_header(arity)?;
         let not_tuple = self.label(not_tuple);
         let bad_arity = self.label(bad_arity);
         let value = self.source_reg_into(source.val, Gpr::x(11))?;
@@ -1306,14 +1306,13 @@ impl BeamModuleAssembler {
         let src_reg = self.source_reg_into(source.val, Gpr::x(11))?;
         let not_tuple = self.label(not_tuple);
         let not_record = self.label(not_record);
-        let arity = small_operand(arity)?;
-        let arity_word = arity_word(arity);
+        let header = arity_header(arity)?;
         self.emit_boxed_check(source, src_reg, not_tuple)?;
         self.code.emit(|e| e.and_imm(Gpr::x(0), src_reg, !7))?;
         self.code
             .emit(|e| e.ldp(Gpr::x(8), Gpr::x(9), Gpr::x(0), 0))?;
         let correct_arity = self.code.new_label();
-        self.emit_cmp_constant(Gpr::x(8), arity_word, Gpr::x(14))?;
+        self.emit_cmp_constant(Gpr::x(8), header, Gpr::x(14))?;
         self.code.b_cond(Cond::Eq, correct_arity)?;
         self.code.emit(|e| e.tst_imm(Gpr::x(8), 63))?;
         self.code.b_cond(Cond::Eq, not_record)?;

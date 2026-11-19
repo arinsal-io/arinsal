@@ -506,7 +506,8 @@ impl BeamModuleAssembler {
     }
 
     /// Emits tuple validation followed by the sorted arity search.
-    // Port of erts/emulator/beam/jit/arm/instr_select.cpp:258-281, OTP-29.1.1
+    // Port of erts/emulator/beam/jit/arm/instr_select.cpp:258-281
+    // (emit_i_select_tuple_arity), OTP-29.1.1.
     pub fn emit_i_select_tuple_arity(
         &mut self,
         src: ArgVal,
@@ -518,7 +519,8 @@ impl BeamModuleAssembler {
     }
 
     /// Emits the two-entry tuple-arity specialization.
-    // Port of erts/emulator/beam/jit/arm/instr_select.cpp:258-281, OTP-29.1.1
+    // Port of erts/emulator/beam/jit/arm/instr_select.cpp:258-281
+    // (emit_i_select_tuple_arity), OTP-29.1.1.
     pub fn emit_i_select_tuple_arity2(
         &mut self,
         src: ArgVal,
@@ -531,6 +533,8 @@ impl BeamModuleAssembler {
         self.emit_tuple_arity(src, fail, 4, &[first, second, first_label, second_label])
     }
 
+    // Port of erts/emulator/beam/jit/arm/instr_select.cpp:258-281
+    // (emit_i_select_tuple_arity), OTP-29.1.1: compare make_arityval header words.
     fn emit_tuple_arity(
         &mut self,
         src: ArgVal,
@@ -551,7 +555,6 @@ impl BeamModuleAssembler {
         self.code.emit(|e| e.and_imm(TMP2, TMP1, 0x3f))?;
         self.code.emit(|e| e.cmp_imm(TMP2, 0, false))?;
         self.code.b_cond(Cond::Ne, fail)?;
-        self.code.emit(|e| e.lsr_imm(TMP1, TMP1, 6))?;
         let pairs = [args[..count].to_vec(), args[count..].to_vec()].concat();
         for (value, label) in pairs[..count].iter().zip(&pairs[count..]) {
             let ArgVal::Label(id) = label else {

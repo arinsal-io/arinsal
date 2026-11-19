@@ -315,7 +315,12 @@ fn native_i_jump_on_val_large_otp_table() {
 
 #[test]
 fn native_i_select_tuple_arity() {
-    let args = [ArgVal::Immediate(2), ArgVal::Immediate(5), dest(0), dest(1)];
+    let args = [
+        ArgVal::Immediate(2 << 6),
+        ArgVal::Immediate(5 << 6),
+        dest(0),
+        dest(1),
+    ];
     for (arity, expected) in [(2, 100), (5, 101)] {
         assert_eq!(
             run(
@@ -344,9 +349,9 @@ fn native_i_select_tuple_arity2() {
                 m.emit_i_select_tuple_arity2(
                     ArgVal::X(0),
                     ArgVal::Label(99),
-                    ArgVal::Immediate(1),
+                    ArgVal::Immediate(1 << 6),
                     dest(0),
-                    ArgVal::Immediate(4),
+                    ArgVal::Immediate(4 << 6),
                     dest(1),
                 )
             },
@@ -361,9 +366,9 @@ fn native_i_select_tuple_arity2() {
                 m.emit_i_select_tuple_arity2(
                     ArgVal::X(0),
                     ArgVal::Label(99),
-                    ArgVal::Immediate(1),
+                    ArgVal::Immediate(1 << 6),
                     dest(0),
-                    ArgVal::Immediate(4),
+                    ArgVal::Immediate(4 << 6),
                     dest(1),
                 )
             },

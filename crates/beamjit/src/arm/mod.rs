@@ -2162,8 +2162,9 @@ fn arg(
         }
         SpecificOperand::SmallInt(value) => env.integer_literal(*value).map(ArgVal::Literal),
         SpecificOperand::Unsigned(value) => Ok(ArgVal::Immediate(*value)),
-        // The arm `emit_tuple_arity` compares the arity shifted out of the header word.
-        SpecificOperand::ArityVal(header) => Ok(ArgVal::Immediate(*header >> 6)),
+        // Port of erts/emulator/beam/jit/asm_load.c:604-607 (case TAG_v), OTP-29.1.1:
+        // preserve the tuple's make_arityval header immediate.
+        SpecificOperand::ArityVal(header) => Ok(ArgVal::Immediate(*header)),
         SpecificOperand::Nil => Ok(ArgVal::Immediate(0x3b)),
         _ => Err("operand form is not accepted by the module assembler".to_owned()),
     }
@@ -2288,6 +2289,20 @@ fn tagged_small_number(
         Some(SpecificOperand::Unsigned(value)) if *value < (1 << 59) => {
             Ok(ArgVal::Immediate((value << 4) | 0xf))
         }
+        other => arg(other, beam, env).map_err(EmitError::Operand),
+    }
+}
+
+/// Converts an untagged tuple arity to the header immediate used by BeamAsm.
+// Port of erts/emulator/beam/jit/asm_load.c:486-490 (case 'A'), OTP-29.1.1.
+fn arity_value(
+    value: Option<&SpecificOperand>,
+    beam: &BeamFile,
+    env: &impl ModuleEnv,
+) -> Result<ArgVal, EmitError> {
+    match value {
+        Some(SpecificOperand::Unsigned(value)) => Ok(ArgVal::Immediate(*value << 6)),
+        Some(SpecificOperand::ArityVal(header)) => Ok(ArgVal::Immediate(*header)),
         other => arg(other, beam, env).map_err(EmitError::Operand),
     }
 }
@@ -2864,7 +2879,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                     count(4)?;
                     assembler.emit_is_tuple_of_arity(
                         typed_source,
-                        tagged_small_number(args.get(3), beam, env)?,
+                        arity_value(args.get(3), beam, env)?,
                         fail,
                         n(1)?,
                     )?;
@@ -2874,7 +2889,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                     count(5)?;
                     assembler.emit_is_tagged_tuple_ff(
                         typed_source,
-                        tagged_small_number(args.get(3), beam, env)?,
+                        arity_value(args.get(3), beam, env)?,
                         value(4)?,
                         fail,
                         n(1)?,
@@ -2952,7 +2967,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                     erts_tables::GENOP_I_IS_TUPLE_OF_ARITY_3 => {
                         assembler.emit_is_tuple_of_arity(
                             typed_source,
-                            tagged_small_number(args.get(2), beam, env)?,
+                            arity_value(args.get(2), beam, env)?,
                             fail,
                             fail,
                         )?;
@@ -2960,7 +2975,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                     erts_tables::GENOP_TEST_ARITY_3 | erts_tables::GENOP_I_TEST_ARITY_3 => {
                         assembler.emit_test_arity(
                             typed_source,
-                            tagged_small_number(args.get(2), beam, env)?,
+                            arity_value(args.get(2), beam, env)?,
                             fail,
                         )?;
                     }
@@ -2968,7 +2983,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                     | erts_tables::GENOP_I_IS_TAGGED_TUPLE_4 => {
                         assembler.emit_is_tagged_tuple(
                             typed_source,
-                            tagged_small_number(args.get(2), beam, env)?,
+                            arity_value(args.get(2), beam, env)?,
                             value(3)?,
                             fail,
                         )?;
@@ -4143,10 +4158,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 .enumerate()
                 .map(|(i, item)| {
                     if is_tuple_arity && i < size / 2 {
-                        match item {
-                            SpecificOperand::Unsigned(val) => Ok(ArgVal::Immediate(*val)),
-                            _ => arg(Some(item), beam, env).map_err(EmitError::Operand),
-                        }
+                        arity_value(Some(item), beam, env)
                     } else {
                         arg(Some(item), beam, env).map_err(EmitError::Operand)
                     }
@@ -4176,19 +4188,13 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
             let fail = value(1)?;
             let is_tuple_arity = emitter == EmitterKind::SelectTupleArity2;
             let first = if is_tuple_arity {
-                match args.get(2) {
-                    Some(SpecificOperand::Unsigned(val)) => ArgVal::Immediate(*val),
-                    _ => value(2)?,
-                }
+                arity_value(args.get(2), beam, env)?
             } else {
                 value(2)?
             };
             let first_label = value(3)?;
             let second = if is_tuple_arity {
-                match args.get(4) {
-                    Some(SpecificOperand::Unsigned(val)) => ArgVal::Immediate(*val),
-                    _ => value(4)?,
-                }
+                arity_value(args.get(4), beam, env)?
             } else {
                 value(4)?
             };
