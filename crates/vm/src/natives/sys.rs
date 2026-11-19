@@ -2625,15 +2625,23 @@ fn dist_ctrl_info(process: &mut Process) -> Result<Term, VmError> {
         .entries
         .values()
         .filter_map(|entry| {
-            let state = entry.lock();
-            state
-                .connected
-                .then(|| (state.name.clone(), state.connection_id))
+            let entry = entry.lock();
+            // `{dep->sysname, dep->cid}`: the controlling port or process.
+            let cid = entry
+                .dist
+                .as_ref()
+                .filter(|_| entry.connected)
+                .and_then(|state| {
+                    state
+                        .port_id
+                        .and_then(Term::port)
+                        .or_else(|| state.owner.to_term())
+                })?;
+            Some((entry.name.clone(), cid))
         })
-        .map(|(node, connection_id)| {
+        .map(|(node, cid)| {
             let node = crate::atom_cache::put(&node);
-            let connection_id = Term::small(connection_id as i64).ok_or_else(badarg)?;
-            tuple(process, &[node, connection_id])
+            tuple(process, &[node, cid])
         })
         .collect::<Result<Vec<_>, _>>()?;
     cons_list(process, &entries)

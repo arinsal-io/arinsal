@@ -522,20 +522,23 @@ fn finish_command(sock: &Arc<Sock>, outcome: SendOutcome, reply: Option<(Pid, [u
     settle(sock);
 }
 
-/// Write a raw distribution packet (no caller-ref prefix, no `inet_reply`) with the port
-/// locked, as the dist command task does.
+/// `dist_port_commandv`: the driver's `outputv` with a distribution output buffer's I/O
+/// vector (no caller-ref prefix, no `inet_reply`), its binaries referenced, with the port
+/// locked as the dist command task does. Returns whether the port became busy.
 ///
-/// Port of dist.c:3794 (`dist_port_command`) calling `tcp_inet_command` with
+/// Port of dist.c (`dist_port_commandv`) calling `tcp_inet_commandv` with
 /// `prt->caller = NIL`, so `init_caller` skips the ref header, OTP-29.1.1.
-pub(crate) fn dist_output(sock: &Arc<Sock>, data: &[u8]) -> Result<bool, VmError> {
+pub(crate) fn dist_outputv(
+    sock: &Arc<Sock>,
+    eiov: arinsal_drv::CommandVector,
+) -> Result<bool, VmError> {
     let (Some(port), Some(_handle)) = (sock.port(), sock.handle.upgrade()) else {
         return Err(badarg());
     };
     port.serialized(|| {
         let outcome = {
             let mut inner = sock.inner.lock();
-            // Dummy caller/ids: dist never waits on inet_reply for these writes.
-            accept_send(&mut inner, SendData::Borrowed(data))
+            accept_send(&mut inner, SendData::Pieces(eiov, 0))
         };
         finish_command(sock, outcome, None);
         Ok(sock.inner.lock().busy)
@@ -549,22 +552,20 @@ enum SendOutcome {
 }
 
 /// Bytes handed to `tcp_sendv`: the port command keeps its flattened buffer (the
-/// payload starts at the offset), distribution borrows its packet.
+/// payload starts at the offset), or a vector with its binaries referenced.
 // OTP passes an inline ErlIOVec through tcp_inet_commandv and tcp_sendv.
 #[allow(clippy::large_enum_variant)]
-enum SendData<'a> {
+enum SendData {
     Owned(Vec<u8>, usize),
-    Borrowed(&'a [u8]),
     /// A command vector; the payload starts at the offset in its first element.
     Pieces(arinsal_drv::CommandVector, usize),
 }
 
-impl SendData<'_> {
+impl SendData {
     /// Payload length (`ErlIOVec.size` less the caller prefix).
     fn len(&self) -> usize {
         match self {
             SendData::Owned(buf, start) => buf.len() - start,
-            SendData::Borrowed(bytes) => bytes.len(),
             SendData::Pieces(pieces, start) => {
                 pieces
                     .iter()
@@ -587,7 +588,6 @@ impl SendData<'_> {
         };
         match self {
             SendData::Owned(buf, start) => entry(&buf[*start..]),
-            SendData::Borrowed(bytes) => entry(bytes),
             SendData::Pieces(pieces, start) => {
                 for (index, piece) in pieces.iter().enumerate() {
                     entry(&piece.bytes()[if index == 0 { *start } else { 0 }..]);
@@ -601,7 +601,6 @@ impl SendData<'_> {
     fn enqueue(self, q: &mut IoQueue, skip: usize) {
         match self {
             SendData::Owned(buf, start) => q.enq_owned(buf, start + skip),
-            SendData::Borrowed(bytes) => q.enq(&bytes[skip..]),
             SendData::Pieces(pieces, start) => {
                 let mut skip = start + skip;
                 for piece in pieces {
@@ -618,7 +617,7 @@ impl SendData<'_> {
     }
 }
 
-fn accept_send(inner: &mut Inner, payload: SendData<'_>) -> SendOutcome {
+fn accept_send(inner: &mut Inner, payload: SendData) -> SendOutcome {
     // Port of erts/emulator/drivers/common/inet_drv.c:13736-13847 (tcp_sendv), OTP-29.1.1.
     // With `{exit_on_close, false}` an EOF only closes the read side (desc_close_read); the
     // socket stays connected for sending until the send fails or it is closed.

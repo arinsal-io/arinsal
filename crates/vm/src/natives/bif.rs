@@ -749,6 +749,13 @@ pub(crate) extern "C" fn dsend_continue_trap_1(
                 vec![return_term, Term::atom(atoms::UNDEFINED)],
             )))
         }
+        crate::dist::DsendContinue::TooLarge => {
+            // ERTS_DSIG_SEND_TOO_LRG: erts_set_gc_state(BIF_P, 1); BIF_ERROR(SYSTEM_LIMIT).
+            process.set_gc_enabled(true);
+            Err(VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+                atoms::SYSTEM_LIMIT,
+            ))))
+        }
         crate::dist::DsendContinue::Continue => {
             // BUMP_ALL_REDS(BIF_P); BIF_TRAP1(&dsend_continue_trap_export, BIF_P, BIF_ARG_1).
             process.heap.abi.fcalls = 0;
@@ -891,6 +898,7 @@ fn remote_send(
             !opts.noconnect,
             !opts.nosuspend,
             true,
+            opts.priority,
         )? {
             RemoteSendOutcome::Sent => {
                 crate::trace::emit_process(
@@ -1520,7 +1528,7 @@ fn send_exit_signal_bif(
     }
     match external(id, true, false) {
         External::Remote(node) => with_sched(process, reg, |_vm, process, ctx| {
-            crate::dist::exit2_remote(process, ctx, &node, id, reason)
+            crate::dist::exit2_remote(process, ctx, &node, id, reason, prio)
         })?,
         External::ThisNode => ok,
         // is_external_port: an old incarnation of this node is `true`, another node `badarg`.
@@ -1714,13 +1722,14 @@ pub(crate) extern "C" fn spawn_request_abandon_1(
         }
     } else {
         // A local request has completed when spawn_request returned; only a distributed one
-        // has a spawn-pending monitor (kept in the distribution tables).
-        let me = process.self_pid.ok_or_else(badarg);
-        me.map(|me| {
-            let abandoned = crate::signals::ref_id(id)
-                .is_some_and(|key| crate::dist::spawn_request_abandon(process, me, key));
-            Term::atom(if abandoned { atoms::TRUE } else { atoms::FALSE })
-        })
+        // has a spawn-pending monitor in the process monitor tree.
+        let abandoned = crate::signals::ref_id(id)
+            .is_some_and(|key| crate::dist::spawn_request_abandon(process, key));
+        Ok(Term::atom(if abandoned {
+            atoms::TRUE
+        } else {
+            atoms::FALSE
+        }))
     };
     bif_ret(c_p, i, result)
 }

@@ -112,6 +112,10 @@ fn stop_process_group(child: &mut Child) {
 }
 
 fn start_erl() -> (ErlNode, String, String, String) {
+    start_erl_with(&[])
+}
+
+fn start_erl_with(extra: &[&str]) -> (ErlNode, String, String, String) {
     let id = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
     let suffix = unique_suffix(id);
     let node = format!("dm_e{suffix}");
@@ -132,9 +136,9 @@ fn start_erl() -> (ErlNode, String, String, String) {
             "{127,0,0,1}",
             "-setcookie",
             &cookie,
-            "-eval",
-            expression,
         ])
+        .args(extra)
+        .args(["-eval", expression])
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -167,6 +171,16 @@ fn arinsal_eval_with_dist_buffer(
     expression: &str,
     busy_limit_kb: Option<&str>,
 ) -> String {
+    arinsal_eval_with(cookie, host, expression, busy_limit_kb, &[])
+}
+
+fn arinsal_eval_with(
+    cookie: &str,
+    host: &str,
+    expression: &str,
+    busy_limit_kb: Option<&str>,
+    extra: &[&str],
+) -> String {
     let id = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
     let node = format!("dm_a{}", unique_suffix(id));
     let local_node = format!("{node}@{host}");
@@ -189,6 +203,7 @@ fn arinsal_eval_with_dist_buffer(
     if let Some(limit) = busy_limit_kb {
         command.args(["+zdbbl", limit]);
     }
+    command.args(extra);
     let output = command
         .args([
             "-sname",
@@ -511,7 +526,8 @@ fn dist_mixed_otp_to_arinsal_pid_name_alias_and_rich_payload() {
 /// `process_info(messages)` decodes them (erts_proc_sig_prep_msgq_for_inspection), atoms that
 /// arrive only through the atom cache are translated (ATOM_CACHE_REF), the receive decodes the
 /// rest (beam_jit_decode_dist), and a send to a name nobody has is dropped without taking the
-/// connection down (dist.c, DOP_REG_SEND).
+/// connection down (dist.c, DOP_REG_SEND). A pid returned by `erpc:call` travels in the
+/// monitor-exit payload and must name the Arinsal node (external.c enc_pid, erts_this_node).
 #[test]
 fn dist_mixed_otp_messages_decoded_on_receive() {
     let _serial = serial_test();
@@ -539,12 +555,190 @@ fn dist_mixed_otp_messages_decoded_on_receive() {
             "receive {{got,Pid,Msgs}} -> ok after 10000 -> exit(no_got) end, ",
             "receive {{nodedown,N}} -> exit(nodedown) after 200 -> ok end, ",
             "true=lists:member(N,nodes()), ",
+            "Pid2=erpc:call(N,erlang,spawn,[fun() -> receive {{ping,F}} -> F ! {{pong,self()}} end end]), ",
+            "N=node(Pid2), ",
+            "Pid2 ! {{ping,Me}}, ",
+            "receive {{pong,Pid2}} -> ok after 10000 -> exit({{no_pong,Pid2}}) end, ",
             "io:format(\"DIST_MIXED_OK deferred_decode~n\")"
         ),
         n = n
     );
     let output = otp_eval(&cookie, &expression);
     assert!(output.contains("DIST_MIXED_OK"), "{output}");
+}
+
+/// The client of [`dist_mixed_seq_trace_tokens_cross_both_ways`]: tokens travel in
+/// `DOP_SEND_SENDER_TT` / `DOP_REG_SEND_TT` control messages both ways, a reply sent without a
+/// token clears the receiver's token (`ERL_MESSAGE_TOKEN == NIL`), and a trapped `exit/2` leaves
+/// the receiver without one. Expectations taken from `erl` 29.1.1 node pairs; serials are not
+/// compared because the `erl_eval` fun on the far side talks to its code server.
+const SEQ_TRACE_CLIENT: &str = concat!(
+    "N=@N@, pong=net_adm:ping(N), Me=self(), ",
+    "Pid=erpc:call(N,erlang,spawn,[fun() -> process_flag(trap_exit,true), (fun Loop() -> receive ",
+    "{echo,F,X} -> F ! {echoed,seq_trace:get_token(),X}, Loop(); ",
+    "{clear,F} -> seq_trace:set_token([]), F ! cleared, Loop(); ",
+    "{'EXIT',F,R} -> F ! {exit_seen,seq_trace:get_token(),R}, Loop() end end)() end]), ",
+    "true=erpc:call(N,erlang,register,[st_echo,Pid]), ",
+    "seq_trace:set_token(label,17), Pid ! {echo,Me,a}, ",
+    "{0,17,_,_,_}=receive {echoed,T1,a} -> T1 after 10000 -> exit(no_echo_a) end, ",
+    "{0,17,_,Pid,_}=seq_trace:get_token(), ",
+    "{st_echo,N} ! {echo,Me,b}, ",
+    "{0,17,_,_,_}=receive {echoed,T2,b} -> T2 after 10000 -> exit(no_echo_b) end, ",
+    "{0,17,_,Pid,_}=seq_trace:get_token(), ",
+    "Pid ! {clear,Me}, receive cleared -> ok after 10000 -> exit(no_cleared) end, ",
+    "[]=seq_trace:get_token(), ",
+    "seq_trace:set_token(label,18), exit(Pid,st_reason), seq_trace:set_token([]), ",
+    "[]=receive {exit_seen,T3,st_reason} -> T3 after 10000 -> exit(no_exit_seen) end, ",
+    "io:format(\"DIST_MIXED_OK seq_trace~n\")"
+);
+
+/// seq_trace tokens of distributed sends, OTP client against an Arinsal echo and Arinsal client
+/// against an OTP echo (dist.c erts_dsig_send_msg / erts_net_message `*_TT`,
+/// erl_message.c erts_queue_dist_message with the token).
+#[test]
+fn dist_mixed_seq_trace_tokens_cross_both_ways() {
+    let _serial = serial_test();
+    let id = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
+    let cookie = format!("dm_cookie_{}_{id:04x}", std::process::id() % 100_000);
+    let host = short_hostname();
+    let (_arinsal, node) = start_arinsal_server(&cookie, &host);
+    let output = otp_eval(
+        &cookie,
+        &SEQ_TRACE_CLIENT.replace("@N@", &node_literal(&node)),
+    );
+    assert!(output.contains("DIST_MIXED_OK"), "{output}");
+    drop(_arinsal);
+    let (_erl, node, cookie, host) = start_erl();
+    arinsal_eval(
+        &cookie,
+        &host,
+        &SEQ_TRACE_CLIENT.replace("@N@", &node_literal(&node)),
+    );
+}
+
+/// Signals sent while the connection is pending are encoded with the hopeful flags (a priority
+/// send to a name becomes `DOP_ALTACT_SIG_SEND`) and finalized for the peer's flags when output
+/// (external.c transcode_dist_obuf); a remote spawn runs with the caller's group leader
+/// (dist.c dsig_send_spawn_request). Expectations taken from `erl` 29.1.1 node pairs.
+#[test]
+fn dist_mixed_pending_signals_and_spawn_group_leader() {
+    let _serial = serial_test();
+    let (_erl, node, cookie, host) = start_erl();
+    let n = node_literal(&node);
+    arinsal_eval(
+        &cookie,
+        &host,
+        &format!(
+            concat!(
+                "N={n}, Me=self(), [] = nodes(), ",
+                "ok=erlang:send({{echo,N}},{{alias_roundtrip,Me,pending_prio}},[priority]), ",
+                "{{echo,N}} ! {{alias_roundtrip,Me,pending_plain}}, ",
+                "pending_prio=receive {{alias_ack,A}} -> A after 10000 -> exit(no_prio_ack) end, ",
+                "pending_plain=receive {{alias_ack,B}} -> B after 10000 -> exit(no_plain_ack) end, ",
+                "GL=group_leader(), GL=erpc:call(N,erlang,group_leader,[]), ",
+                "io:format(\"DIST_MIXED_OK pending~n\")"
+            ),
+            n = n
+        ),
+    );
+}
+
+/// A signal larger than `ERTS_DIST_FRAGMENT_SIZE` (a binary inside a 1000-deep list) is
+/// encoded in `erts_dsig_send` phases on the sender's reductions, cut into fragments inside the
+/// encode (external.c store_in_vec), and arrives intact at an OTP node (1 MB). A 4 MB send
+/// fills the busy limit, so it traps and the sender is scheduled out in
+/// `erts_internal:dsend_continue_trap/1`, as `erl` 29.1.1 shows in a `running` trace.
+#[test]
+fn dist_mixed_large_fragmented_send_yields() {
+    let _serial = serial_test();
+    let (_erl, node, cookie, host) = start_erl();
+    let n = node_literal(&node);
+    arinsal_eval(
+        &cookie,
+        &host,
+        &format!(
+            concat!(
+                "N={n}, pong=net_adm:ping(N), Me=self(), ",
+                "Deep=fun(Sz) -> B=binary:copy(<<\"0123456789abcdef\">>, Sz div 16), ",
+                "lists:foldl(fun(I, Acc) -> [I, Acc] end, B, lists:seq(1, 1000)) end, ",
+                "D1=Deep(1048576), Sum=erlang:md5(term_to_binary(D1)), ",
+                "Pid=erpc:call(N,erlang,spawn,[fun() -> receive {{big,F,T}} -> ",
+                "F ! {{got,erlang:md5(term_to_binary(T))}} end end]), ",
+                "Pid ! {{big,Me,D1}}, ",
+                "receive {{got,Sum}} -> ok after 20000 -> exit(no_big) end, ",
+                "D4=Deep(4194304), ",
+                "Q=erpc:call(N,erlang,spawn,[fun() -> receive _ -> ok end end]), ",
+                "T=spawn(fun() -> receive go -> ok end, Q ! D4, Me ! done end), ",
+                "1=erlang:trace(T, true, [running]), T ! go, ",
+                "receive done -> ok after 20000 -> exit(no_done) end, timer:sleep(100), ",
+                "Outs=fun F() -> receive {{trace,T,out,MFA}} -> [MFA|F()]; {{trace,T,_,_}} -> F() ",
+                "after 0 -> [] end end, ",
+                "Out=Outs(), ",
+                "true=lists:member({{erts_internal,dsend_continue_trap,1}},Out) ",
+                "orelse exit({{no_dsend_yield,Out}}), ",
+                "io:format(\"DIST_MIXED_OK large~n\")"
+            ),
+            n = n
+        ),
+    );
+}
+
+/// OTP's `gen_tcp_dist` example (lib/kernel/examples), compiled into a fresh directory: a
+/// distribution carrier whose controller is a process (`dist_ctrl_get_data`).
+fn gen_tcp_dist_dir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "arinsal_gen_tcp_dist_{}_{}",
+        std::process::id(),
+        NEXT_CASE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("gen_tcp_dist build directory");
+    let source =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gen_tcp_dist.erl");
+    let status = Command::new("erlc")
+        .arg("-o")
+        .arg(&dir)
+        .arg(&source)
+        .status()
+        .expect("run erlc");
+    assert!(status.success(), "erlc gen_tcp_dist.erl failed");
+    dir
+}
+
+#[test]
+fn dist_mixed_process_controller_large_send() {
+    // Both nodes run the gen_tcp_dist carrier: Arinsal's connection is controlled by a process
+    // that takes the encoded fragments with dist_ctrl_get_data (erts_dsig_send PHASE_SEND for
+    // a process controller, dist_data notification, refc binaries in the returned I/O vector).
+    let _serial = serial_test();
+    let dir = gen_tcp_dist_dir();
+    let dir = dir.to_str().expect("UTF-8 temp path");
+    let extra = ["-proto_dist", "gen_tcp", "-pa", dir];
+    let (_erl, node, cookie, host) = start_erl_with(&extra);
+    let n = node_literal(&node);
+    arinsal_eval_with(
+        &cookie,
+        &host,
+        &format!(
+            concat!(
+                "N={n}, pong=net_adm:ping(N), Me=self(), ",
+                "Deep=fun(Sz) -> B=binary:copy(<<\"0123456789abcdef\">>, Sz div 16), ",
+                "lists:foldl(fun(I, Acc) -> [I, Acc] end, B, lists:seq(1, 1000)) end, ",
+                "D1=Deep(1048576), Sum=erlang:md5(term_to_binary(D1)), ",
+                "Pid=erpc:call(N,erlang,spawn,[fun() -> receive {{big,F,T}} -> ",
+                "F ! {{got,erlang:md5(term_to_binary(T)),T}} end end]), ",
+                "Pid ! {{big,Me,D1}}, ",
+                "receive {{got,Sum,Back}} -> Sum=erlang:md5(term_to_binary(Back)) ",
+                "after 30000 -> exit(no_big) end, ",
+                "[{{_,Ctrl}}]=[{{Nd,C}} || {{Nd,C}} <- erlang:system_info(dist_ctrl), Nd=:=N], ",
+                "true=is_pid(Ctrl), ",
+                "io:format(\"DIST_MIXED_OK process controller~n\")"
+            ),
+            n = n
+        ),
+        None,
+        &extra,
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]

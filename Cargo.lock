@@ -226,6 +226,7 @@ dependencies = [
 name = "arinsal-external"
 version = "0.0.1"
 dependencies = [
+ "arinsal-alloc",
  "arinsal-maps",
  "arinsal-term",
  "flate2",

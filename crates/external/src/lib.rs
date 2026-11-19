@@ -2,6 +2,7 @@
 // Port of erts/emulator/beam/external.c (erts_encode_ext_size, encode_size_struct_int,
 // enc_term_int, erts_term_to_binary_int), OTP-29.1.1.
 
+pub mod dist;
 mod raw;
 
 use std::cmp::Ordering;
@@ -177,6 +178,9 @@ struct EncodeOpts {
     /// `term_to_binary(Term, [local])`. Port of external.c LOCAL_EXT, OTP-29.1.1.
     local: bool,
     local_node: Option<(arinsal_term::Atom, u32)>,
+    /// A dist encode (`erts_encode_dist_ext`): appended after the dist header, with
+    /// `ATOM_CACHE_REF`s, so the output is not the sized `term_to_binary` buffer.
+    dist: bool,
 }
 
 // Port of erts/emulator/beam/external.c:1480-1535 (parse_t2b_opts), OTP-29.1.1.
@@ -233,6 +237,18 @@ trait ByteOutput {
     fn slice_mut(&mut self, range: std::ops::Range<usize>) -> &mut [u8];
     fn failed(&self) -> bool {
         false
+    }
+
+    /// `store_in_vec(ctx, ep, br->val, obj, base, size)`: reference `len` bytes at `offset`
+    /// of the Binary `bin` in the output's I/O vector instead of copying them. Only the
+    /// output of a dist encode has an I/O vector (`ctx->iov`).
+    fn store_in_vec(
+        &mut self,
+        _bin: arinsal_alloc::raw::OwnedBinaryRef,
+        _offset: usize,
+        _len: usize,
+    ) -> Result<(), EncodeError> {
+        Err(EncodeError::BadArg)
     }
 
     fn write_bitstring(
@@ -328,6 +344,8 @@ struct OutputSlice<'a> {
     bytes: &'a mut [u8],
     position: usize,
     failed: bool,
+    /// The I/O vector of a dist encode (`ctx->iov`), which referenced binaries go into.
+    iov: Option<&'a mut dist::TtbDistEncodeContext>,
 }
 
 impl<'a> OutputSlice<'a> {
@@ -336,6 +354,7 @@ impl<'a> OutputSlice<'a> {
             bytes,
             position,
             failed: false,
+            iov: None,
         }
     }
 }
@@ -382,6 +401,17 @@ impl ByteOutput for OutputSlice<'_> {
         self.failed
     }
 
+    fn store_in_vec(
+        &mut self,
+        bin: arinsal_alloc::raw::OwnedBinaryRef,
+        offset: usize,
+        len: usize,
+    ) -> Result<(), EncodeError> {
+        let iov = self.iov.as_mut().ok_or(EncodeError::BadArg)?;
+        iov.store_in_vec(self.position, Some((bin, offset, len)));
+        Ok(())
+    }
+
     fn write_bitstring(
         &mut self,
         term: Term,
@@ -424,20 +454,24 @@ fn int_bytes(out: &mut impl ByteOutput, n: &BigInt) {
     out.extend_from_slice(&digits);
 }
 
-// Port of erts/emulator/beam/external.c:2877 (enc_atom), OTP-29.1.1.
-fn atom_bytes(out: &mut impl ByteOutput, atom: Atom, minor: u8) -> Result<(), EncodeError> {
-    atom_bytes_in(global_atoms(), out, atom, minor)
-}
-
 /// `enc_atom` with the atom table already in hand, one record lookup per atom.
+// Port of erts/emulator/beam/external.c:2877 (enc_atom), OTP-29.1.1.
 #[inline(always)]
 fn atom_bytes_in(
-    table: &arinsal_term::AtomTable,
+    atoms: Atoms<'_>,
     out: &mut impl ByteOutput,
     atom: Atom,
     minor: u8,
 ) -> Result<(), EncodeError> {
-    let (name, latin1_chars) = table.encoding_info(atom).ok_or(EncodeError::BadArg)?;
+    // Port of external.c (enc_atom): an atom of the dist header's cache map is an
+    // ATOM_CACHE_REF to its internal index.
+    if let Some(acmp) = atoms.acmp
+        && let Some(iix) = acmp.get_iix(atom)
+    {
+        out.extend_from_slice(&[82, iix]);
+        return Ok(());
+    }
+    let (name, latin1_chars) = atoms.table.encoding_info(atom).ok_or(EncodeError::BadArg)?;
     if minor <= 1
         && let Some(chars) = latin1_chars
     {
@@ -461,18 +495,23 @@ fn atom_bytes_in(
     Ok(())
 }
 
-fn atom_term(out: &mut impl ByteOutput, term: Term, minor: u8) -> Result<(), EncodeError> {
-    atom_bytes(out, term.as_atom().ok_or(EncodeError::BadArg)?, minor)
+/// The atom table and, for a dist encode, the message's atom cache map (`acmp` of erts'
+/// `enc_term_int` / `encode_size_struct_int`).
+#[derive(Clone, Copy)]
+struct Atoms<'a> {
+    table: &'a arinsal_term::AtomTable,
+    acmp: Option<&'a dist::ErtsAtomCacheMap>,
 }
 
 // Port of erts/emulator/beam/external.c:encode_atom_size, OTP-29.1.1.
 #[inline(always)]
-fn atom_size_in(
-    table: &arinsal_term::AtomTable,
-    atom: Atom,
-    minor: u8,
-) -> Result<usize, EncodeError> {
-    let (name, latin1_chars) = table.encoding_info(atom).ok_or(EncodeError::BadArg)?;
+fn atom_size_in(atoms: Atoms<'_>, atom: Atom, minor: u8) -> Result<usize, EncodeError> {
+    let (name, latin1_chars) = atoms.table.encoding_info(atom).ok_or(EncodeError::BadArg)?;
+    // Port of external.c (encode_atom_size): the full size is counted and the atom is
+    // entered in the cache map (insert_acache_map).
+    if let Some(acmp) = atoms.acmp {
+        acmp.insert(atom);
+    }
     Ok(
         if minor <= 1
             && let Some(chars) = latin1_chars
@@ -663,7 +702,7 @@ fn size_rare(
     opts: &mut EncodeOpts,
     node_source: Option<fn() -> (Atom, u32)>,
     stack: &mut WStack,
-    table: &arinsal_term::AtomTable,
+    table: Atoms<'_>,
 ) -> Result<(usize, usize, Option<Term>), EncodeError> {
     let minor = opts.minor;
     let mut added = 0usize;
@@ -808,7 +847,7 @@ fn enc_rare<O: ByteOutput>(
     stack: &mut WStack,
     opts: &mut EncodeOpts,
     node_source: Option<fn() -> (Atom, u32)>,
-    table: &arinsal_term::AtomTable,
+    table: Atoms<'_>,
     cold: &mut Option<Box<EncodeCold>>,
 ) -> Result<(), EncodeError> {
     match kind {
@@ -882,14 +921,14 @@ fn enc_rare<O: ByteOutput>(
                 } => {
                     out.push(88);
                     // Port of erts/emulator/beam/external.c:3651 (local pid node), OTP-29.1.1.
-                    write_node(out, node, internal, *opts)?;
+                    write_node(out, table, node, internal, *opts)?;
                     out.extend_from_slice(&index.to_be_bytes());
                     out.extend_from_slice(&serial.to_be_bytes());
                     out.extend_from_slice(&local_creation(creation, internal, *opts).to_be_bytes());
                 }
                 Identity::Port { node, creation, id } => {
                     out.push(120);
-                    write_node(out, node, internal, *opts)?;
+                    write_node(out, table, node, internal, *opts)?;
                     out.extend_from_slice(&id.to_be_bytes());
                     out.extend_from_slice(&local_creation(creation, internal, *opts).to_be_bytes());
                 }
@@ -903,7 +942,7 @@ fn enc_rare<O: ByteOutput>(
                     term.save_magic_ref();
                     out.push(90);
                     out.extend_from_slice(&(ids.len() as u16).to_be_bytes());
-                    write_node(out, node, internal, *opts)?;
+                    write_node(out, table, node, internal, *opts)?;
                     out.extend_from_slice(&local_creation(creation, internal, *opts).to_be_bytes());
                     for id in ids {
                         out.extend_from_slice(&id.to_be_bytes());
@@ -997,6 +1036,10 @@ const ENC_TERM_CODE: u64 = 0;
 const ENC_ONE_CONS_CODE: u64 = 1;
 const ENC_PATCH_FUN_SIZE_CODE: u64 = 2;
 const ENC_BIN_COPY_CODE: u64 = 3;
+/// `ERL_ONHEAP_BITS_LIMIT` (erl_bits.h).
+const ERL_ONHEAP_BITS_LIMIT: usize = 64 * 8;
+/// `MAX_SYSIOVEC_IOVLEN` (erl_io_queue.h): the largest `iov_len` of one I/O vector element.
+pub(crate) const MAX_SYSIOVEC_IOVLEN: usize = 1 << 31;
 const ENC_MAP_PAIR_CODE: u64 = 4;
 const ENC_HASHMAP_NODE_CODE: u64 = 5;
 const ENC_START_SORTING_MAP_CODE: u64 = 7;
@@ -1767,11 +1810,22 @@ impl TtbContext {
 
     /// Advance the size pass used before result allocation.
     pub fn step_size(&mut self, budget: usize) -> Result<(bool, usize), EncodeError> {
+        self.step_size_acmp(None, None, budget)
+    }
+
+    /// The size pass with the dist atom cache map, which collects the atoms of the term
+    /// (`encode_size_struct_int(ctx, acmp, ...)`).
+    fn step_size_acmp(
+        &mut self,
+        acmp: Option<&dist::ErtsAtomCacheMap>,
+        iov: Option<&mut dist::TtbIovSize>,
+        budget: usize,
+    ) -> Result<(bool, usize), EncodeError> {
         if self.size.done {
             return Ok((true, 0));
         }
         let mut consumed = 0;
-        let done = encode_size_struct_int(self, budget, &mut consumed)?;
+        let done = encode_size_struct_int(self, acmp, iov, budget, &mut consumed)?;
         if done {
             self.size.done = true;
         }
@@ -1787,7 +1841,7 @@ impl TtbContext {
                 output.extend_from_slice(&[121, 0, 0, 0, 0]);
             }
         }
-        let result = enc_term_int(self, budget, &mut output, 0);
+        let result = enc_term_int(self, None, budget, &mut output, 0);
         self.cold().out = output;
         result
     }
@@ -1821,7 +1875,7 @@ impl TtbContext {
             }
         }
         let mut writer = OutputSlice::new(output, self.encode.written);
-        let (mut done, used) = enc_term_int(self, budget, &mut writer, size_work)?;
+        let (mut done, used) = enc_term_int(self, None, budget, &mut writer, size_work)?;
         self.encode.written = writer.len();
         if writer.failed() {
             return Err(EncodeError::SystemLimit);
@@ -2121,6 +2175,7 @@ fn is_internal_identity(term: Term) -> bool {
 // Port of erts/emulator/beam/external.c:2974-3019, 3651, 3686, OTP-29.1.1.
 fn write_node(
     out: &mut impl ByteOutput,
+    atoms: Atoms<'_>,
     node: arinsal_term::Atom,
     internal: bool,
     opts: EncodeOpts,
@@ -2129,7 +2184,7 @@ fn write_node(
         out.push(106);
         Ok(())
     } else {
-        atom_term(out, Term::atom(node), opts.minor)
+        atom_bytes_in(atoms, out, node, opts.minor)
     }
 }
 
@@ -2162,6 +2217,8 @@ fn encode_bytes(plain: Vec<u8>, opts: EncodeOpts) -> Result<Vec<u8>, EncodeError
 #[inline(always)]
 fn encode_size_struct_int(
     ctx: &mut TtbContext,
+    acmp: Option<&dist::ErtsAtomCacheMap>,
+    mut iov: Option<&mut dist::TtbIovSize>,
     budget: usize,
     consumed: &mut usize,
 ) -> Result<bool, EncodeError> {
@@ -2169,7 +2226,10 @@ fn encode_size_struct_int(
     let node_source = ctx.node_source;
     let mut stack = WStack::new();
     stack.restore(&mut ctx.size.work);
-    let table = global_atoms();
+    let table = Atoms {
+        table: global_atoms(),
+        acmp,
+    };
     let minor = opts.minor;
     let mut total = ctx.size.encoded;
     let mut output_total = ctx.size.output;
@@ -2238,11 +2298,34 @@ fn encode_size_struct_int(
                 }
             }
             FastEncodeKind::Rare(TermKind::Bitstring) => {
+                // ERTS_PIN_BITSTRING: a writable binary is pinned in place (shrunk, no longer
+                // writable), so the dist encode can reference it.
+                // Port of erts/emulator/beam/external.c (encode_size_struct_int, BITSTRING_DEF)
+                // and erl_bits.c (erts_pin_writable_binary), OTP-29.1.1.
+                arinsal_term::writable_finalize(obj);
                 let bits =
                     arinsal_term::erl_bits::bitstring_bit_len(obj).ok_or(EncodeError::BadArg)?;
                 let len = bits.div_ceil(8);
                 let header: usize = if bits.is_multiple_of(8) { 5 } else { 6 };
-                add!(header.checked_add(len).ok_or(EncodeError::SystemLimit)?);
+                // Port of erts/emulator/beam/external.c (encode_size_struct_int, BITSTRING_DEF
+                // with `copy_payload == 0`), OTP-29.1.1: a dist encode (`vlen >= 0`) references
+                // a large aligned refc payload in the I/O vector.
+                if let Some(iov) = iov.as_deref_mut()
+                    && bits > ERL_ONHEAP_BITS_LIMIT
+                    && raw::refc_payload(obj).is_some()
+                {
+                    add!(header);
+                    let csz = output_total - iov.last_result;
+                    iov.last_result = output_total;
+                    // Trailing bits, if any.
+                    add!(usize::from(!bits.is_multiple_of(8)));
+                    let size = bits / 8;
+                    iov.vlen +=
+                        (2 + csz / MAX_SYSIOVEC_IOVLEN + size / MAX_SYSIOVEC_IOVLEN) as isize;
+                    iov.extra_size += size;
+                } else {
+                    add!(header.checked_add(len).ok_or(EncodeError::SystemLimit)?);
+                }
             }
             FastEncodeKind::Rare(TermKind::Number) => {
                 if obj.header().is_some_and(|header| header & 63 == 0x18) {
@@ -2277,12 +2360,13 @@ fn encode_size_struct_int(
 // Port of erts/emulator/beam/external.c:3253 (enc_term_int), OTP-29.1.1.
 fn enc_term_int(
     ctx: &mut TtbContext,
+    acmp: Option<&dist::ErtsAtomCacheMap>,
     budget: usize,
     out: &mut impl ByteOutput,
     mut consumed: usize,
 ) -> Result<(bool, usize), EncodeError> {
     if !ctx.size.done {
-        let (done, size_work) = ctx.step_size(budget)?;
+        let (done, size_work) = ctx.step_size_acmp(acmp, None, budget)?;
         consumed += size_work;
         if !done {
             return Ok((false, budget));
@@ -2292,7 +2376,10 @@ fn enc_term_int(
     let node_source = ctx.node_source;
     let record_splits = ctx.record_splits;
     let iovec = ctx.iovec;
-    let table = global_atoms();
+    let table = Atoms {
+        table: global_atoms(),
+        acmp,
+    };
     // The stack and the pending object live in locals so that the output writes cannot
     // alias them; erts keeps them in registers (`DECLARE_WSTACK`, `obj`).
     let mut stack = WStack::new();
@@ -2495,6 +2582,10 @@ fn enc_term_int(
                 }
             }
             FastEncodeKind::Rare(TermKind::Bitstring) => {
+                // ERTS_PIN_BITSTRING before the base is read: pinning may move the bytes.
+                // Port of erts/emulator/beam/external.c (enc_term_int, BITSTRING_DEF) and
+                // erl_bits.c (erts_pin_writable_binary), OTP-29.1.1.
+                arinsal_term::writable_finalize(term);
                 // SAFETY: the binary owner remains live and no append runs during encoding.
                 let view = unsafe { term.binary_ref() }.ok_or(EncodeError::BadArg)?;
                 let bits = view.bit_len();
@@ -2511,9 +2602,22 @@ fn enc_term_int(
                 if len != 0 {
                     // Port of erts/emulator/beam/external.c (BITSTRING_DEF), OTP-29.1.1.
                     let aligned = view.start_bit().is_multiple_of(8);
-                    let copy_payload = bits <= 64 * 8 || !iovec || !aligned;
+                    let copy_payload = bits <= ERL_ONHEAP_BITS_LIMIT || !iovec || !aligned;
                     let left = budget.saturating_sub(consumed);
-                    if copy_payload && len > left.saturating_mul(8) {
+                    let referenced = if !copy_payload && opts.dist {
+                        raw::refc_payload(term)
+                    } else {
+                        None
+                    };
+                    if let Some((bin, offset)) = referenced {
+                        // Reference the stored data directly; the trailing bits, which the
+                        // I/O vector cannot address, are copied after it.
+                        out.store_in_vec(bin, offset, bits / 8)?;
+                        if !bits.is_multiple_of(8) {
+                            out.write_bitstring(term, bits / 8 * 8, bits % 8)?;
+                            out.mask_last(0xff << (8 - bits % 8));
+                        }
+                    } else if copy_payload && len > left.saturating_mul(8) {
                         stack.push(stack_small(start)?);
                         stack.push(stack_small(0)?);
                         stack.push(stack_small(bits)?);
@@ -2561,7 +2665,7 @@ fn enc_term_int(
     stack.save(&mut ctx.encode.work);
     ctx.encode.current = cur;
     ctx.encode.free_first = !done;
-    if out.failed() || (done && !iovec && out.len() != ctx.size.output) {
+    if out.failed() || (done && !iovec && !opts.dist && out.len() != ctx.size.output) {
         return Err(EncodeError::SystemLimit);
     }
     Ok((done, if done { consumed } else { budget.max(consumed) }))

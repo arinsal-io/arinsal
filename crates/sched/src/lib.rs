@@ -692,10 +692,10 @@ pub enum Signal<M: SignalMessage> {
     /// `{Ref, true}` to the sender.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_GROUP_LEADER), OTP-29.1.1.
     GroupLeader(Box<GroupLeaderRequest>),
-    /// `erts_internal:process_flag/3` (save_calls) and `process_display/2` request: the
-    /// receiver runs the operation and answers `{Ref, Result}` to the sender.
+    /// `erts_proc_sig_send_rpc_request`: the receiver runs `func(arg)` and answers
+    /// `{Ref, Result}` to the sender when a reply was asked for.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_RPC), OTP-29.1.1.
-    Rpc(Box<RpcRequest<M>>),
+    Rpc(Box<RpcRequest>),
     /// Acknowledgement for the link protocol's unlink operation.
     UnlinkAckSignal(u64),
     /// Monitor request carrying a VM reference and the monitor's shared data.
@@ -850,22 +850,16 @@ pub struct GroupLeaderRequest {
     pub leader: Pid,
 }
 
-/// The operation of an [`RpcRequest`].
+/// The fields of [`Signal::Rpc`] (erts `ErtsProcSigRPC`). `id` is the reply reference, `None`
+/// when the requester wants no reply (`requester = NIL`); `call` carries the `func` and `arg`
+/// the receiver runs, which the VM downcasts.
+// Port of erts/emulator/beam/erl_proc_sig_queue.c:213 (ErtsProcSigRPC), OTP-29.1.1.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RpcOp<M: SignalMessage> {
-    /// `process_flag(Pid, save_calls, Value)`.
-    SaveCalls(M),
-    /// `process_display(Pid, backtrace)`.
-    Display,
-}
-
-/// The fields of [`Signal::Rpc`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RpcRequest<M: SignalMessage> {
+pub struct RpcRequest {
     /// The reply reference id.
-    pub id: u64,
-    /// What the receiver runs.
-    pub op: RpcOp<M>,
+    pub id: Option<u64>,
+    /// `func` and `arg`.
+    pub call: SharedPayload,
 }
 
 /// The fields of [`Signal::ProcessInfo`].
@@ -1693,10 +1687,6 @@ pub mod proc_flags {
     pub const REG: u32 = 1 << 7;
     pub const TRACE: u32 = 1 << 8;
     pub const TRACER: u32 = 1 << 9;
-    /// The process made a distributed `spawn_request`: its pending-spawn monitors live in the
-    /// distribution tables (erts keeps them in the process monitor tree with
-    /// ERTS_ML_FLG_SPAWN_PENDING, dist.c:6112 erts_internal_dist_spawn_request_4).
-    pub const DIST_SPAWN: u32 = 1 << 10;
     pub const OWNED_TIMERS: u32 = 1 << 11;
     pub const ALL: u32 = (1 << 12) - 1;
     const DONE_SHIFT: u32 = 16;

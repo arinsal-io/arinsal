@@ -1281,7 +1281,10 @@ fn process_info_item_monitors(process: &mut Process, pid: Pid) -> Result<Term, V
                 Some(crate::proc_create::OriginMonitor::Process(_)) => {
                     Pid::from_data(monitor.other()).to_term().map(Ok)
                 }
-                Some(crate::proc_create::OriginMonitor::Distributed) => {
+                // erl_bif_info.c:609: a pending spawn request is not an active monitor.
+                Some(crate::proc_create::OriginMonitor::Distributed)
+                    if !monitor.spawn_pending() =>
+                {
                     crate::dist::remote_object(monitor.info()).map(Err)
                 }
                 _ => None,
@@ -1293,11 +1296,11 @@ fn process_info_item_monitors(process: &mut Process, pid: Pid) -> Result<Term, V
             .map(|object| {
                 let object = match object {
                     Ok(pid) => pid,
-                    Err(remote) => arinsal_term::from_owned(
-                        &remote,
-                        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
-                    )
-                    .map_err(|error| VmError::Unsupported(format!("monitor object: {error:?}")))?,
+                    Err(remote) => remote
+                        .build(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+                        .map_err(|error| {
+                            VmError::Unsupported(format!("monitor object: {error:?}"))
+                        })?,
                 };
                 make_tuple(process, &[Term::atom(arinsal_term::atoms::PROCESS), object])
             })
@@ -2735,12 +2738,6 @@ pub(crate) fn fulfill_request(
             set_group_leader(process, leader)?;
             make_tuple(process, &[reference, Term::atom(arinsal_term::atoms::TRUE)])
         }
-        crate::signals::RemoteOp::SaveCalls { value } => {
-            let value = value.decode_into(process)?;
-            let previous = save_calls_flag(process, value)
-                .unwrap_or_else(|_| Term::atom(arinsal_term::atoms::BADARG));
-            make_tuple(process, &[reference, previous])
-        }
         crate::signals::RemoteOp::Collect { .. }
         | crate::signals::RemoteOp::CopyLiteralArea { .. } => Err(VmError::Unsupported(
             "garbage_collect and copy-literal-area tasks are answered by reply_request".into(),
@@ -2755,10 +2752,6 @@ pub(crate) fn fulfill_request(
                     Term::atom(arinsal_term::atoms::TRUE),
                 ],
             )
-        }
-        crate::signals::RemoteOp::Display => {
-            eprintln!("process {:?}: backtrace", ctx.pid());
-            make_tuple(process, &[reference, Term::atom(arinsal_term::atoms::TRUE)])
         }
         crate::signals::RemoteOp::PrioSig => Err(VmError::Unsupported(
             "priority signal task has no reply".into(),
@@ -2814,13 +2807,7 @@ pub(crate) fn failure_reply(
             process,
             &[reference, Term::atom(arinsal_term::atoms::UNDEFINED)],
         ),
-        crate::signals::RemoteOp::GroupLeader { .. } | crate::signals::RemoteOp::Display => {
-            make_tuple(
-                process,
-                &[reference, Term::atom(arinsal_term::atoms::BADARG)],
-            )
-        }
-        crate::signals::RemoteOp::SaveCalls { .. } => make_tuple(
+        crate::signals::RemoteOp::GroupLeader { .. } => make_tuple(
             process,
             &[reference, Term::atom(arinsal_term::atoms::BADARG)],
         ),
@@ -2924,40 +2911,64 @@ fn process_display_call(
         };
     };
     if pid == ctx.pid() {
-        eprintln!("process {pid:?}: backtrace");
-        return Ok(Term::atom(arinsal_term::atoms::TRUE));
+        return process_display(process, ctx, None, None, None);
     }
-    if !live(process, pid)? {
-        return if internal {
-            Ok(Term::atom(arinsal_term::atoms::BADARG))
-        } else {
-            Err(badarg())
-        };
+    match crate::process::erts_proc_sig_send_rpc_request(
+        process,
+        ctx,
+        pid,
+        true,
+        process_display,
+        None,
+    )? {
+        Some(res) => Ok(res),
+        None if internal => Ok(Term::atom(arinsal_term::atoms::BADARG)),
+        None => Err(badarg()),
     }
-    // Port of erts/emulator/beam/erl_bif_info.c:4133 (erts_internal_process_display_2:
-    // erts_proc_sig_send_rpc_request returns the reference the Erlang wrapper receives on),
-    // OTP-29.1.1.
-    let id = process.next_ref();
-    let signal = arinsal_sched::Signal::Rpc(Box::new(arinsal_sched::RpcRequest {
-        id,
-        op: arinsal_sched::RpcOp::Display,
-    }));
-    match ctx.signal(pid, signal) {
-        Ok(()) => {
-            crate::signals::elevate_for_signal_request(process, ctx, pid)?;
-            crate::signals::reference(process, id)
-        }
-        Err(arinsal_sched::Error::NoProcess) => {
-            if internal {
-                Ok(Term::atom(arinsal_term::atoms::BADARG))
-            } else {
-                Err(badarg())
-            }
-        }
-        Err(error) => Err(VmError::Unsupported(format!(
-            "process_display request: {error}"
-        ))),
+}
+
+/// Whether `c_p` is exiting (`ERTS_PROC_IS_EXITING`).
+fn proc_is_exiting(ctx: &mut RunCtx<'_, crate::Process>) -> bool {
+    ctx.proc_state().load(std::sync::atomic::Ordering::Acquire) & arinsal_sched::psflg::EXITING != 0
+}
+
+// Port of erts/emulator/beam/erl_bif_info.c:4116 (process_display), OTP-29.1.1.
+fn process_display(
+    c_p: &mut Process,
+    ctx: &mut RunCtx<'_, crate::Process>,
+    _arg: Option<Box<dyn std::any::Any + Send>>,
+    redsp: Option<&mut i32>,
+    _bpp: Option<&mut Option<arinsal_term::message::MessageHeapBlock>>,
+) -> Result<Term, VmError> {
+    let _ = c_p;
+    if let Some(redsp) = redsp {
+        *redsp = 1;
     }
+    if proc_is_exiting(ctx) {
+        return Ok(Term::atom(arinsal_term::atoms::BADARG));
+    }
+    // erts_stack_dump(ERTS_PRINT_STDERR, NULL, c_p)
+    eprintln!("process {:?}: backtrace", ctx.pid());
+    Ok(Term::atom(arinsal_term::atoms::TRUE))
+}
+
+// Port of erts/emulator/beam/bif.c:2245 (exec_process_flag_3), OTP-29.1.1: `arg` is the
+// copy of the value (ErtsProcessFlag3Args).
+fn exec_process_flag_3(
+    c_p: &mut Process,
+    ctx: &mut RunCtx<'_, crate::Process>,
+    arg: Option<Box<dyn std::any::Any + Send>>,
+    _redsp: Option<&mut i32>,
+    _bpp: Option<&mut Option<arinsal_term::message::MessageHeapBlock>>,
+) -> Result<Term, VmError> {
+    let value = *arg
+        .and_then(|arg| arg.downcast::<Message>().ok())
+        .expect("process_flag/3 rpc carries its value");
+    if proc_is_exiting(ctx) {
+        return Ok(Term::atom(arinsal_term::atoms::BADARG));
+    }
+    let value = value.decode_into(c_p)?;
+    Ok(save_calls_flag(c_p, value).unwrap_or_else(|_| Term::atom(arinsal_term::atoms::BADARG)))
 }
 
 /// Dispatch process-local BIFs that use the scheduler context.
@@ -3071,22 +3082,16 @@ fn call_values(
                     return Err(badarg());
                 }
                 let value = Message::copy_from(*value)?;
-                let id = process.next_ref();
-                let signal = arinsal_sched::Signal::Rpc(Box::new(arinsal_sched::RpcRequest {
-                    id,
-                    op: arinsal_sched::RpcOp::SaveCalls(value),
-                }));
-                match ctx.signal(pid, signal) {
-                    Ok(()) => {
-                        crate::signals::elevate_for_signal_request(process, ctx, pid)?;
-                        crate::signals::reference(process, id)
-                    }
-                    Err(arinsal_sched::Error::NoProcess) => {
-                        Ok(Term::atom(arinsal_term::atoms::BADTYPE))
-                    }
-                    Err(error) => Err(VmError::Unsupported(format!(
-                        "process_flag request: {error}"
-                    ))),
+                match crate::process::erts_proc_sig_send_rpc_request(
+                    process,
+                    ctx,
+                    pid,
+                    true,
+                    exec_process_flag_3,
+                    Some(Box::new(value)),
+                )? {
+                    Some(res) => Ok(res),
+                    None => Ok(Term::atom(arinsal_term::atoms::BADTYPE)),
                 }
             }
             ("process_info", [pid]) => process_info_call(vm, process, ctx, *pid, None),

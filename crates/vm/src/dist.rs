@@ -7,8 +7,12 @@ use crate::node_tables::{self, DistState};
 use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_etf::{DistributionHeader, OwnedTerm};
+use arinsal_external::dist::{
+    DistHeaderFinalize, DsigEncode, DsigEncodeResult, ErtsDistOutputBuf,
+    erts_encode_ext_dist_header_finalize,
+};
 use arinsal_sched::{Pid, RunCtx, Signal};
-use arinsal_term::{Term, TermBuilder, from_owned, global_atoms, to_owned};
+use arinsal_term::{Term, TermBuilder, copy_term, from_owned, global_atoms, to_owned};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -91,7 +95,7 @@ fn dispatch(
         ("erts_internal", "get_dflags", 0) => get_dflags(process),
         ("erts_internal", "get_creation", 0) => get_creation(),
         ("erlang", "dist_ctrl_get_data", 1) => get_data(process, ctx, args[0]),
-        ("erlang", "dist_ctrl_put_data", 2) => put_data(vm, process, ctx, args[0], args[1]),
+        ("erlang", "dist_ctrl_put_data", 2) => put_data(process, ctx, args[0], args[1]),
         ("erlang", "dist_ctrl_get_data_notification", 1) => get_data_notification(ctx, args[0]),
         ("erlang", "dist_ctrl_input_handler", 2) => input_handler(ctx, args[0], args[1]),
         ("erlang", "dist_ctrl_get_opt", 2) => get_opt(ctx, args[0], args[1]),
@@ -169,7 +173,7 @@ fn abort_pending_connection(process: &Process, node: Term, dhandle: Term) -> Res
         return Err(badarg());
     };
     let (conn_id, entry_ref) = parse_dhandle(dhandle)?;
-    let (result, spawn_downs, mld) = {
+    let (result, mld) = {
         let mut tables = node_tables::lock();
         // The pending connection's spawn-pending monitors are cleaned up with it
         // (dist.c:5681 abort_pending_connection: schedule_con_monitor_link_seq_cleanup).
@@ -182,21 +186,15 @@ fn abort_pending_connection(process: &Process, node: Term, dhandle: Term) -> Res
                     && entry.connection_id == conn_id
                     && entry.state == node_tables::ConnState::Pending
             });
-        let spawn_downs = if aborts {
-            take_connection_spawn_requests(&mut tables, name)
-        } else {
-            Vec::new()
-        };
         let mld = if aborts { tables.take_mld(name) } else { None };
         let result = tables
             .abort_pending(name, conn_id, entry_ref)
             .ok_or_else(badarg)?;
-        (result, spawn_downs, mld)
+        (result, mld)
     };
     if let Some(runtime) = process.runtime {
         elink::links_connection_down(runtime, mld.clone());
         emon::monitors_connection_down(runtime, mld.as_ref());
-        notify_connection_spawn_requests(runtime, spawn_downs)?;
     }
     Ok(boolean(result))
 }
@@ -219,162 +217,328 @@ fn parse_dhandle(term: Term) -> Result<(u32, u64), VmError> {
     Ok((conn_id, entry_ref))
 }
 
+/// The argument of `setup_connection_distctrl`.
+// Port of erts/emulator/beam/dist.c:5108 (ErtsSetupConnDistCtrl), OTP-29.1.1.
+struct SetupConnDistCtrl {
+    dep: Arc<node_tables::DistEntry>,
+    node: Term,
+    dflags: u64,
+    creation: u32,
+    setup_pid: Pid,
+}
+
+// Port of erts/emulator/beam/dist.c:5127 (erts_internal_create_dist_channel_3), OTP-29.1.1:
+// failures are returned as the atoms `badarg` / `system_limit`, which erlang:setnode/3 raises.
 fn create_channel(
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    // Port of erts/emulator/beam/dist.c:5127 (erts_internal_create_dist_channel_3), OTP-29.1.1.
-    let node = owned(args[0])?;
-    let OwnedTerm::Atom(node) = &node else {
-        return Err(badarg());
+    let badarg_res = Ok(Term::atom(arinsal_term::atoms::BADARG));
+    // `net_kernel` must be the true net_kernel (ERTS_PROC_GET_DIST_ENTRY == this entry).
+    let Some(runtime) = process.runtime else {
+        return badarg_res;
     };
-    let controller = owned(args[1])?;
-    let port_controller = match &controller {
-        OwnedTerm::Port { id, .. } => Some(*id),
+    if runtime.reg.whereis_proc_str("net_kernel").is_none() || !node_tables::is_alive() {
+        return badarg_res;
+    }
+    // Node name...
+    let OwnedTerm::Atom(ref node) = owned(args[0])? else {
+        return badarg_res;
+    };
+    if !node.contains('@') {
+        return badarg_res;
+    }
+    // Distribution controller...
+    let port_controller = match owned(args[1])? {
+        OwnedTerm::Port { id, .. } => Some(id),
         OwnedTerm::Pid { .. } => None,
-        _ => return Err(badarg()),
+        _ => return badarg_res,
     };
-    let options = owned(args[2])?;
-    let OwnedTerm::Tuple(options) = &options else {
-        return Err(badarg());
+    let OwnedTerm::Tuple(ref options) = owned(args[2])? else {
+        return badarg_res;
     };
     if options.len() != 2 {
-        return Err(badarg());
+        return badarg_res;
     }
-    let flags = as_u64(&options[0]).ok_or_else(badarg)?;
-    let creation = as_u32(&options[1]).ok_or_else(badarg)?;
+    // Dist flags... Creation...
+    let (Some(flags), Some(creation)) = (as_u64(&options[0]), as_u32(&options[1])) else {
+        return badarg_res;
+    };
     if flags & node_tables::DFLAG_DIST_MANDATORY != node_tables::DFLAG_DIST_MANDATORY {
-        return Err(badarg());
+        return badarg_res;
     }
-    let owner = ctx.pid();
-    let visible = flags & 0x01 != 0; // DFLAG_PUBLISHED
-    let mut tables = node_tables::lock();
-    if !node_tables::is_alive() || node == crate::node_tables::this_node().0 {
-        return Err(badarg());
-    }
-    let local_name = crate::node_tables::this_node().0.to_owned();
-    let local_creation = crate::node_tables::this_node().1;
-    let busy_limit = tables.distribution_buffer_busy_limit;
-    if !tables.entries.contains_key(node) {
-        let _ = tables.new_connection(node);
-    }
-    let dep = tables.entries.get(node).cloned().ok_or_else(badarg)?;
-    let mut entry = dep.lock();
-    // Accept path may race ahead of new_connection; promote Idle → Pending.
+    // erts_find_or_insert_dist_entry
+    let dep = {
+        let mut tables = node_tables::lock();
+        if node == crate::node_tables::this_node().0 {
+            return badarg_res;
+        }
+        if !tables.entries.contains_key(node.as_str()) {
+            let _ = tables.new_connection(node);
+        }
+        match tables.entries.get(node.as_str()).cloned() {
+            Some(dep) => dep,
+            None => return Ok(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT)),
+        }
+    };
+    let (res_tag, res) = match port_controller {
+        None => {
+            let Some(ctrlr) = Pid::from_term(args[1]) else {
+                return badarg_res;
+            };
+            let scdc = SetupConnDistCtrl {
+                dep,
+                node: args[0],
+                dflags: flags,
+                creation,
+                setup_pid: ctx.pid(),
+            };
+            if ctrlr == ctx.pid() {
+                let res =
+                    setup_connection_distctrl(process, ctx, Some(Box::new(scdc)), None, None)?;
+                // BUMP_REDS(BIF_P, 5)
+                bump_reds(process, 5);
+                if res == Term::atom(arinsal_term::atoms::BADARG) {
+                    return badarg_res;
+                }
+                (arinsal_term::atoms::OK, res)
+            } else {
+                let Some(res) = crate::process::erts_proc_sig_send_rpc_request(
+                    process,
+                    ctx,
+                    ctrlr,
+                    true,
+                    setup_connection_distctrl,
+                    Some(Box::new(scdc)),
+                )?
+                else {
+                    return badarg_res; // Was not able to send signal...
+                };
+                // Caller need to wait for dhandle in message
+                (arinsal_term::atoms::MESSAGE, res)
+            }
+        }
+        Some(port_id) => {
+            let busy_limit = node_tables::lock().distribution_buffer_busy_limit;
+            let mut entry = dep.lock();
+            promote_pending(&mut entry);
+            if entry.state != node_tables::ConnState::Pending {
+                return badarg_res;
+            }
+            // Port DistCtrlr: a live inet port with ERL_DRV_FLAG_SOFT_BUSY.
+            let owns_tcp_port = runtime
+                .ports
+                .get(port_id)
+                .is_some_and(|handle| handle.tcp_driver_data().is_some());
+            if !owns_tcp_port || entry.dist.is_some() {
+                return badarg_res;
+            }
+            // erts_prtsd_set(pp, ERTS_PRTSD_DIST_ENTRY, dep)
+            if let Some(port) = runtime.ports.get(port_id) {
+                port.set_dist_entry(Some(dep.clone()));
+            }
+            let conn_id = entry.connection_id;
+            let entry_ref = entry.entry_ref;
+            if !setup_connection_epiloge_rwunlock(
+                process,
+                ctx,
+                entry,
+                args[1],
+                Some(port_id),
+                args[0],
+                flags,
+                creation,
+                ctx.pid(),
+                busy_limit,
+            )? {
+                if let Some(port) = runtime.ports.get(port_id) {
+                    port.set_dist_entry(None);
+                }
+                return badarg_res;
+            }
+            (
+                arinsal_term::atoms::OK,
+                dhandle_term(process, conn_id, entry_ref)?,
+            )
+        }
+    };
+    tuple(process, vec![Term::atom(res_tag), res])
+}
+
+/// `BUMP_REDS(p, gc)` (bif.h): charge `reds` to the running BIF's process.
+fn bump_reds(process: &mut Process, reds: i32) {
+    process.heap.abi.fcalls = process.heap.abi.fcalls.saturating_sub(reds).max(0);
+}
+
+/// An auto-connect entry may still be idle when the accept side commits: it becomes pending.
+fn promote_pending(entry: &mut node_tables::NodeEntry) {
     if entry.state == node_tables::ConnState::Idle {
         entry.connection_id = (entry.connection_id + 1) & 0x00ff_ffff;
         entry.state = node_tables::ConnState::Pending;
         entry.mld = Some(node_tables::new_mld(&entry.name, entry.connection_id));
     }
-    if entry.state != node_tables::ConnState::Pending {
-        return Err(badarg());
-    }
-    let conn_id = entry.connection_id;
-    let entry_ref = entry.entry_ref;
-    let handle = match port_controller {
-        Some(port_id) => {
-            // Port DistCtrlr: the real inet port is the channel.
-            let owns_tcp_port = process.runtime.as_ref().is_some_and(|runtime| {
-                runtime
-                    .ports
-                    .get(port_id)
-                    .is_some_and(|handle| handle.tcp_driver_data().is_some())
-            });
-            if !owns_tcp_port {
-                return Err(badarg());
-            }
-            port_id
-        }
-        None => NEXT_HANDLE.fetch_add(1, Ordering::Relaxed),
+}
+
+/// Commit a pending connection to controller `ctrlr`: notify net_kernel, then connect the entry,
+/// output what was queued while pending and send the nodeup messages. `false` when net_kernel is
+/// gone. The entry lock is released.
+// Port of erts/emulator/beam/dist.c:5385 (setup_connection_epiloge_rwunlock), OTP-29.1.1.
+#[allow(clippy::too_many_arguments)]
+fn setup_connection_epiloge_rwunlock(
+    c_p: &mut Process,
+    ctx: &mut RunCtx<'_, crate::Process>,
+    mut entry: parking_lot::MutexGuard<'_, node_tables::NodeEntry>,
+    ctrlr: Term,
+    port_id: Option<u64>,
+    node: Term,
+    flags: u64,
+    creation: u32,
+    setup_pid: Pid,
+    busy_limit: u64,
+) -> Result<bool, VmError> {
+    let runtime = c_p.runtime.ok_or_else(badarg)?;
+    // Notify net_kernel about the new dist controller...
+    let Some(net_kernel) = runtime.reg.whereis_proc_str("net_kernel") else {
+        return Ok(false);
     };
+    notify_dist_ctrlr(c_p, ctx, net_kernel, ctrlr, node, setup_pid)?;
+    entry.creation = creation;
+    let visible = flags & 0x01 != 0; // DFLAG_PUBLISHED
+    let owner = match port_id {
+        Some(_) => setup_pid,
+        None => Pid::from_term(ctrlr).ok_or_else(badarg)?,
+    };
+    let handle = port_id.unwrap_or_else(|| NEXT_HANDLE.fetch_add(1, Ordering::Relaxed));
+    // erts_set_dist_entry_connected(dep, ctrlr, flags); create_cache with the atom cache flag.
     let mut state = DistState::new(handle, owner, flags);
     state.busy_limit = busy_limit;
-    state.port_id = port_controller;
+    state.port_id = port_id;
     state.read = 0;
-    entry.creation = creation;
     entry.visible = visible;
     entry.connected = true;
     entry.state = node_tables::ConnState::Connected;
+    let conn_id = entry.connection_id;
+    let sysname = entry.name.clone();
+    // The signals buffered while pending stay in the connection's output queue as encoded;
+    // erts_encode_ext_dist_header_finalize transcodes them when they are output.
     let pending = std::mem::take(&mut entry.pending_out);
-    let pending_spawn_requests = std::mem::take(&mut entry.pending_spawn_requests);
-    entry.dist = Some(state);
-    if let Some(state) = entry.dist.as_mut() {
-        state.spawn_requests.extend(pending_spawn_requests);
-    }
-    // Port of erts/emulator/beam/dist.c:5299 (setup_connection): the controlling port
-    // keeps a reference to the entry in its port-specific data.
-    if let Some(port_id) = port_controller
-        && let Some(port) = process
-            .runtime
-            .as_ref()
-            .and_then(|runtime| runtime.ports.get(port_id))
-    {
-        port.set_dist_entry(Some(dep.clone()));
-    }
-    // Flush signals buffered during auto-connect (erts pending queue).
-    let mut flush_notify = None;
-    if let Some(state) = entry.dist.as_mut() {
-        for (control, message) in pending {
-            let control = node_tables::relabel_local_node(control, &local_name, local_creation);
-            let message =
-                message.map(|m| node_tables::relabel_local_node(m, &local_name, local_creation));
-            if state.port_id.is_some() {
-                let packets = state.encode_term(control, message).map_err(|_| badarg())?;
-                state.written = state.written.saturating_add(1);
-                enqueue_port_output_no_suspend_locked(state, packets);
-            } else {
-                state.queue_term(control, message).map_err(|_| badarg())?;
-                if state.notify {
-                    flush_notify = Some(state.owner);
-                    state.notify = false;
-                }
-            }
+    let mut notify_proc = None;
+    for signal in pending {
+        let mut reds = 0;
+        if let DistCmdKick::Notify(pid) = dsig_send_enqueue_locked(
+            &mut state,
+            &mut VecDeque::from([signal]),
+            &mut reds,
+            true,
+            true,
+        ) {
+            notify_proc = Some(pid);
         }
     }
+    entry.dist = Some(state);
     drop(entry);
-    // Port of erts/emulator/beam/dist.c:5450 (erts_internal_create_dist_channel_3).
-    node_tables::inc_no_nodes();
-    let nodeup_events = tables.nodes_monitor_events("nodeup", node, conn_id, visible, None);
-    drop(tables);
-    // OTP queues the net_kernel controller notification before node monitor
-    // messages in setup_connection_epiloge_rwunlock.
-    notify_dist_ctrlr(process, ctx, args[1], args[0])?;
-    if let Some(port_id) = port_controller {
-        flush_port_output(process.runtime.as_ref().ok_or_else(badarg)?, port_id)?;
+    // `erts_schedule_dist_command(NULL, dep)` for a port with queued data.
+    if let Some(port_id) = port_id {
+        flush_port_output(runtime, port_id)?;
     }
-    send_nodes_monitor_events(
-        process.runtime.as_ref().ok_or_else(badarg)?.scheduler()?,
-        nodeup_events,
-    )?;
-    if let Some(handler) = flush_notify {
+    if let Some(handler) = notify_proc {
         ctx.send(
             handler,
             Message::copy_from(Term::atom(arinsal_term::atoms::DIST_DATA))?,
         )
         .map_err(|error| VmError::Unsupported(format!("dist data notification: {error}")))?;
     }
-    let dhandle = dhandle_term(process, conn_id, entry_ref)?;
-    tuple(process, vec![Term::atom(arinsal_term::atoms::OK), dhandle])
+    node_tables::inc_no_nodes();
+    let nodeup_events =
+        node_tables::lock().nodes_monitor_events("nodeup", &sysname, conn_id, visible, None);
+    send_nodes_monitor_events(runtime.scheduler()?, nodeup_events)?;
+    Ok(true)
+}
+
+/// Make the calling process `c_p` the controller of the pending connection in `arg` and return
+/// its dhandle, built on `c_p`'s heap for a direct call or in `*bpp` as an rpc request.
+// Port of erts/emulator/beam/dist.c:5461 (setup_connection_distctrl), OTP-29.1.1.
+fn setup_connection_distctrl(
+    c_p: &mut Process,
+    ctx: &mut RunCtx<'_, crate::Process>,
+    arg: Option<Box<dyn std::any::Any + Send>>,
+    mut redsp: Option<&mut i32>,
+    bpp: Option<&mut Option<arinsal_term::message::MessageHeapBlock>>,
+) -> Result<Term, VmError> {
+    let scdcp = *arg
+        .and_then(|arg| arg.downcast::<SetupConnDistCtrl>().ok())
+        .expect("setup_connection_distctrl argument");
+    let badarg_res = Ok(Term::atom(arinsal_term::atoms::BADARG));
+    if let Some(redsp) = redsp.as_deref_mut() {
+        *redsp = 1;
+    }
+    if ctx.proc_state().load(Ordering::Acquire) & arinsal_sched::psflg::EXITING != 0 {
+        return badarg_res;
+    }
+    // The table lock comes before the entry lock.
+    let busy_limit = node_tables::lock().distribution_buffer_busy_limit;
+    let mut entry = scdcp.dep.lock();
+    promote_pending(&mut entry);
+    if entry.state != node_tables::ConnState::Pending {
+        return badarg_res;
+    }
+    let conn_id = entry.connection_id;
+    let entry_ref = entry.entry_ref;
+    // is_not_nil(dep->cid)
+    if entry.dist.is_some() {
+        return badarg_res;
+    }
+    if let Some(redsp) = redsp {
+        *redsp = 5;
+    }
+    let ctrlr = ctx.pid().to_term().ok_or_else(badarg)?;
+    if !setup_connection_epiloge_rwunlock(
+        c_p,
+        ctx,
+        entry,
+        ctrlr,
+        None,
+        scdcp.node,
+        scdcp.dflags,
+        scdcp.creation,
+        scdcp.setup_pid,
+        busy_limit,
+    )? {
+        return badarg_res;
+    }
+    let Some(bpp) = bpp else {
+        // called directly...
+        return dhandle_term(c_p, conn_id, entry_ref);
+    };
+    // *bpp = new_message_buffer(ERTS_DHANDLE_SIZE)
+    let mut bp = arinsal_term::message::MessageHeapBlock::with_words(3 + 3);
+    let reference = Term::local_ref(
+        &mut bp,
+        arinsal_sched::unique::ordinary_ref_words(entry_ref),
+    )
+    .map_err(|error| VmError::Unsupported(format!("dhandle: {error:?}")))?;
+    let dhandle = TermBuilder::new(&mut bp)
+        .tuple(&[integer(u64::from(conn_id)), reference])
+        .map_err(|error| VmError::Unsupported(format!("dhandle: {error:?}")))?;
+    *bpp = Some(bp);
+    Ok(dhandle)
 }
 
 fn notify_dist_ctrlr(
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
+    net_kernel: Pid,
     ctrlr: Term,
     node: Term,
+    setup_pid: Pid,
 ) -> Result<(), VmError> {
-    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let net_kernel = runtime.reg.whereis_proc_str("net_kernel");
-    let Some(net_kernel) = net_kernel else {
-        return Ok(());
-    };
     let msg = TermBuilder::new(&mut process.heap)
         .tuple(&[
             Term::atom(arinsal_term::atoms::DIST_CTRLR),
             ctrlr,
             node,
-            ctx.pid().to_term().ok_or_else(badarg)?,
+            setup_pid.to_term().ok_or_else(badarg)?,
         ])
         .map_err(|_| badarg())?;
     ctx.send(net_kernel, Message::copy_from(msg)?)
@@ -392,32 +556,110 @@ fn get_data(
     ctx: &mut RunCtx<'_, crate::Process>,
     handle: Term,
 ) -> Result<Term, VmError> {
+    // Port of erts/emulator/beam/dist.c (dist_ctrl_get_data_1): the buffer is finalized for
+    // the connection's flags when taken (erts_encode_ext_dist_header_finalize); senders
+    // suspended on the busy queue resume once it is below half the busy limit.
+    // `initial_reds = ERTS_BIF_REDS_LEFT(BIF_P)`; the call returns with
+    // `BIF_RET2(res, initial_reds - reds)`.
+    let initial_reds = i64::from(process.heap.abi.fcalls);
+    let mut reds = initial_reds;
     let bytes = with_dhandle(handle, ctx.pid(), true, |state| {
-        let Some(packet) = state.output.pop_front() else {
+        let Some(mut packet) = state.output.pop_front() else {
             return Ok(None);
         };
-        state.pending_bytes = state.pending_bytes.saturating_sub(packet.len() as u64);
+        state.pending_bytes = state.pending_bytes.saturating_sub(packet.size() as u64);
+        let finalize = erts_encode_ext_dist_header_finalize(
+            &mut packet,
+            &mut state.outgoing_cache,
+            state.flags,
+            &mut reds,
+        );
         state.written = state.written.saturating_add(1);
-        Ok(Some((packet, state.get_size)))
+        let resume = if state.busy && state.pending_bytes < state.busy_limit / 2 {
+            state.busy = false;
+            std::mem::take(&mut state.suspended_senders)
+        } else {
+            Vec::new()
+        };
+        Ok(Some((
+            packet,
+            state.get_size,
+            finalize,
+            state.handle,
+            resume,
+        )))
     })?;
-    let Some((bytes, sized)) = bytes else {
+    let Some((packet, sized, finalize, conn_handle, resume)) = bytes else {
         return Ok(Term::atom(arinsal_term::atoms::NONE));
     };
-    let size = bytes.len() as u64;
-    let list = from_owned(
-        &OwnedTerm::list(vec![OwnedTerm::Binary(bytes)]),
-        &mut process.heap,
-    )
-    .map_err(|_| badarg())?;
+    let runtime = process.runtime.ok_or_else(badarg)?;
+    if let DistHeaderFinalize::SpawnNotSupported(ctl) = finalize {
+        transcode_spawn_notsup(runtime, conn_handle, &ctl);
+    }
+    let resumed = resume_dist_senders(runtime, resume);
+    reds -= resumed as i64 * ERTS_PORT_REDS_DIST_CMD_RESUMED;
+    bump_reds(
+        process,
+        i32::try_from(initial_reds - reds).unwrap_or(i32::MAX),
+    );
+    let size = packet.size();
+    // The buffer's I/O vector as a list of binaries referencing its Binaries
+    // (erts_wrap_refc_bitstring), all in one HAlloc of `hsz` words; an empty buffer (a signal
+    // transcoded into a tick) is the empty I/O vector. The header rewritten for the wire is in
+    // a Binary of its own (erts rewrites it in place in the buffer's Binary).
+    let (header, iov) = packet.into_iov();
+    let mut elems = Vec::with_capacity(iov.len() + 1);
+    if !header.is_empty() {
+        let mut bin = arinsal_term::RefcBinary::new_uninit(header.len()).map_err(|_| badarg())?;
+        bin.bytes_mut_unique()
+            .ok_or_else(badarg)?
+            .copy_from_slice(&header);
+        elems.push(DistCtrlElem::Header(bin, header.len()));
+    }
+    elems.extend(iov.into_iter().map(DistCtrlElem::Iov));
+    let mut hsz = (2 + ERL_REFC_BITS_SIZE) * elems.len();
     if sized {
-        tuple(process, vec![list, integer(size)])
+        // 2-tuple; the size is a small.
+        hsz += 3;
+    }
+    let mut hp =
+        arinsal_term::HeapReservation::new(&mut process.heap, hsz).map_err(|_| badarg())?;
+    let mut builder = arinsal_term::TermBuilder::new(&mut hp);
+    let mut parts = Vec::with_capacity(elems.len());
+    for elem in elems {
+        parts.push(
+            match elem {
+                DistCtrlElem::Header(bin, len) => builder.refc_binary(bin, len * 8),
+                DistCtrlElem::Iov(iov) => {
+                    let (bin, offset, len) = iov.into_parts();
+                    builder.wrap_refc_bitstring(bin, offset, len)
+                }
+            }
+            .map_err(|_| badarg())?,
+        );
+    }
+    let list = builder.list_from_slice(&parts).map_err(|_| badarg())?;
+    if sized {
+        let size = Term::small(size as i64).ok_or_else(badarg)?;
+        builder.tuple(&[size, list]).map_err(|_| badarg())
     } else {
         Ok(list)
     }
 }
 
+/// Reductions per process resumed when a dist queue drains (dist.c).
+const ERTS_PORT_REDS_DIST_CMD_RESUMED: i64 = 5;
+
+/// One element of the I/O vector `dist_ctrl_get_data` returns.
+enum DistCtrlElem {
+    Header(arinsal_term::RefcBinary, usize),
+    Iov(arinsal_external::dist::DistIov),
+}
+
+/// `ERL_REFC_BITS_SIZE` (erl_bits.h): the heap words of a BinRef and its SubBits.
+const ERL_REFC_BITS_SIZE: usize = 3 + 5;
+
 fn put_data(
-    vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     handle: Term,
@@ -434,7 +676,12 @@ fn put_data(
         OwnedTerm::Nil => Vec::new(),
         _ => return Err(badarg()),
     };
-    let local_name = node_tables::this_node().0.to_owned();
+    // Port of erts/emulator/beam/dist.c (dist_ctrl_put_data_2), OTP-29.1.1: an empty
+    // binary is a tick; the rest goes to erts_net_message, whose header decode and fragment
+    // reassembly are shared with the port controller.
+    if bytes.is_empty() {
+        return Ok(Term::atom(arinsal_term::atoms::OK));
+    }
     let (handle_id, sysname, connection_id, packet) =
         with_dhandle_input(handle, ctx.pid(), |state, sysname, connection_id| {
             state.read = state.read.saturating_add(1);
@@ -453,60 +700,152 @@ fn put_data(
                         .map(str::to_owned)
                 },
             )
-            .map_err(|_| badarg())?;
-            let DistributionHeader::Start { .. } = packet.header else {
-                return Ok((state.handle, String::new(), connection_id, None));
-            };
-            Ok((
-                state.handle,
-                sysname.to_owned(),
-                connection_id,
-                Some(packet),
-            ))
+            .ok()
+            .map(|packet| reassemble_fragment(state, packet));
+            Ok((state.handle, sysname.to_owned(), connection_id, packet))
         })?;
-    let Some(packet) = packet else {
-        return Ok(Term::atom(arinsal_term::atoms::OK));
-    };
     let runtime = process.runtime.ok_or_else(badarg)?;
-    let (control, extp) = arinsal_etf::decode_dist_control(&packet).map_err(|_| badarg())?;
-    if is_send_op(&control) {
-        let edep = dist_ext(packet, extp, &sysname, connection_id);
-        net_message_send(runtime, handle_id, &local_name, &control, edep)?;
-        return Ok(Term::atom(arinsal_term::atoms::OK));
-    }
-    let decoded = arinsal_etf::decode_dist_payload_with_sizes(&packet).map_err(|_| badarg())?;
-    route_incoming(vm, process, ctx, handle_id, &local_name, decoded)?;
+    let packet = match packet {
+        Some(Ok(Some(packet))) => packet,
+        // A fragment of a signal still being reassembled.
+        Some(Ok(None)) => return Ok(Term::atom(arinsal_term::atoms::OK)),
+        // dist.c erts_net_message `data_error`: erts_kill_dist_connection.
+        Some(Err(_)) | None => {
+            let _ = kill_connection(runtime, &sysname, connection_id);
+            return Ok(Term::atom(arinsal_term::atoms::OK));
+        }
+    };
+    // Decode failures are ignored here; erts_net_message takes the connection down.
+    erts_net_message(runtime, handle_id, &sysname, connection_id, packet);
     Ok(Term::atom(arinsal_term::atoms::OK))
 }
 
-/// Whether `control` is a `DOP_*SEND*` operation whose message `erts_net_message` queues
-/// undecoded (`erts_queue_dist_message` / `erts_proc_sig_send_dist_altact_msg`): every send,
-/// and a `DOP_ALTACT_SIG_SEND` that is not an exit.
-// Port of erts/emulator/beam/dist.c (erts_net_message, the DOP_REG_SEND .. DOP_ALTACT_SIG_SEND
-// cases), OTP-29.1.1.
-fn is_send_op(control: &OwnedTerm) -> bool {
-    const FLG_EXIT: u64 = 1 << 4;
-    let OwnedTerm::Tuple(parts) = control else {
-        return false;
+/// The seq_trace token `term` of a `*_TT` control tuple (`None`: the operation has none,
+/// `ERL_MESSAGE_TOKEN == NIL`). A token that is not `[]` or a token tuple is an invalid
+/// control message.
+// Port of erts/emulator/beam/dist.c (erts_net_message, `token = tuple[N]` / `token = NIL`),
+// OTP-29.1.1.
+fn dist_token(term: Option<Term>) -> Result<Option<Box<crate::seq_trace::Token>>, VmError> {
+    let Some(term) = term else {
+        return Ok(None);
     };
-    match (parts.first(), parts.len()) {
-        (Some(OwnedTerm::Int(2 | 22 | 33)), 3) => true,
-        (Some(OwnedTerm::Int(12 | 23 | 34)), 4) => true,
-        (Some(OwnedTerm::Int(6)), 4) | (Some(OwnedTerm::Int(16)), 5) => true,
-        (Some(OwnedTerm::Int(37)), len) if len >= 4 => {
-            as_u64(&parts[1]).is_some_and(|flags| flags & FLG_EXIT == 0)
-        }
-        _ => false,
+    let owned = to_owned(term).map_err(|_| badarg())?;
+    crate::seq_trace::Token::from_dist(&owned).map_err(|()| badarg())
+}
+
+/// `is_external_pid(term)`: the stored external pid (`STORE_NC`).
+// Port of erts/emulator/beam/erl_term.h (is_external_pid, external_pid_node), OTP-29.1.1.
+fn ctl_external_pid(term: Term) -> Option<crate::monitor_link::ExternalPid> {
+    if term.is_pid() || term.classify() != arinsal_term::TermKind::Pid {
+        return None;
+    }
+    match term.identity()? {
+        arinsal_term::Identity::Pid {
+            node,
+            creation,
+            index,
+            serial,
+        } => Some(crate::monitor_link::ExternalPid {
+            sysname: node.0,
+            creation,
+            number: index,
+            serial,
+        }),
+        _ => None,
     }
 }
 
-/// The `ErtsDistExternal` of the message after the control message: the payload from `extp`
-/// on, the atom translation table of the distribution header, the connection it came in on.
-// Port of erts/emulator/beam/external.c (erts_prepare_dist_ext) and dist.c (erts_net_message,
-// `edep` after the control message is decoded), OTP-29.1.1.
+/// `is_internal_pid(term)`.
+fn ctl_internal_pid(term: Term) -> Option<Pid> {
+    term.as_pid_data().map(Pid::from_data)
+}
+
+/// `is_pid(term)`.
+fn ctl_is_pid(term: Term) -> bool {
+    term.classify() == arinsal_term::TermKind::Pid
+}
+
+/// `is_ref(term)`.
+fn ctl_is_ref(term: Term) -> bool {
+    term.classify() == arinsal_term::TermKind::Ref
+}
+
+/// `is_internal_ref(term)`.
+fn ctl_is_internal_ref(term: Term) -> bool {
+    term.local_ref_numbers().is_some() || term.is_magic_ref()
+}
+
+/// `is_external(term) && external_dist_entry(term) == erts_this_dist_entry`: an external
+/// pid, port or reference of an old incarnation of this node.
+fn ctl_is_this_node(term: Term) -> bool {
+    if term.is_pid() || term.is_port() || ctl_is_internal_ref(term) {
+        return false;
+    }
+    let this = arinsal_term::this_node().0;
+    matches!(
+        term.identity(),
+        Some(
+            arinsal_term::Identity::Pid { node, .. }
+                | arinsal_term::Identity::Port { node, .. }
+                | arinsal_term::Identity::Ref { node, .. }
+        ) if node == this
+    )
+}
+
+/// The key of reference `term`: its first three numbers.
+fn ctl_ref_id(term: Term) -> Option<u64> {
+    match term.identity()? {
+        arinsal_term::Identity::Ref { ids, .. } => ref_key(&ids),
+        _ => None,
+    }
+}
+
+/// `erts_get_pid_of_ref(to)` of an internal pid reference (an alias); other references name
+/// no local process.
+// Port of erts/emulator/beam/erl_bif_unique.h (erts_get_pid_of_ref), OTP-29.1.1.
+fn ctl_alias_pid(term: Term) -> Option<Pid> {
+    term.local_pid_ref_pid_data().map(Pid::from_data)
+}
+
+/// `term_to_Uint64(term, &value)`.
+// Port of erts/emulator/beam/big.c (term_to_Uint64), OTP-29.1.1.
+fn ctl_u64(term: Term) -> Option<u64> {
+    match term.as_small() {
+        Some(value) => u64::try_from(value).ok(),
+        None => u64::try_from(arinsal_term::raw::big_value(term)?).ok(),
+    }
+}
+
+/// The ALTACT flags byte: the least significant byte of a non-negative integer.
+// Port of erts/emulator/beam/dist.c (erts_net_message, DOP_ALTACT_SIG_SEND flags), OTP-29.1.1.
+fn ctl_altact_flags(term: Term) -> Option<u64> {
+    match term.as_small() {
+        Some(value) => (value >= 0).then_some((value & 0xff) as u64),
+        None => {
+            let big = arinsal_term::raw::big_value(term)?;
+            if big.sign() == num_bigint::Sign::Minus {
+                return None;
+            }
+            Some(big.iter_u64_digits().next().unwrap_or(0) & 0xff)
+        }
+    }
+}
+
+/// The scheduler sender of a signal from pid `from`: a local pid as itself, an external pid
+/// through its proxy.
+fn ctl_sender(handle: u64, from: Term) -> Result<Pid, VmError> {
+    match ctl_internal_pid(from) {
+        Some(pid) => Ok(pid),
+        None => remote_proxy(handle, ctl_external_pid(from).ok_or_else(badarg)?),
+    }
+}
+
+/// The `ErtsDistExternal` of a complete signal (`erts_prepare_dist_ext`): the bytes after the
+/// distribution header, the atom translation table of the header, the connection it came in
+/// on. The control message is decoded from it first, which moves `extp` to the payload.
+// Port of erts/emulator/beam/external.c (erts_prepare_dist_ext), OTP-29.1.1.
 fn dist_ext(
     packet: arinsal_etf::DistributionPacket,
-    extp: usize,
     sysname: &str,
     connection_id: u32,
 ) -> Box<crate::natives::external_dist::ErtsDistExternal> {
@@ -525,7 +864,7 @@ fn dist_ext(
     let binp = packet.payload.into_boxed_slice();
     Box::new(ErtsDistExternal {
         data: ErtsDistExternalData {
-            extp,
+            extp: 0,
             ext_endp: binp.len(),
             binp,
         },
@@ -540,253 +879,428 @@ fn dist_ext(
     })
 }
 
-/// The `DOP_*SEND*` cases of `erts_net_message`: the message is queued on the receiver with
-/// its payload still encoded; a send to a name or alias nobody has is dropped.
-// Port of erts/emulator/beam/dist.c (erts_net_message: DOP_REG_SEND, DOP_REG_SEND_TT,
-// DOP_SEND, DOP_SEND_TT, DOP_SEND_SENDER, DOP_SEND_SENDER_TT, DOP_ALIAS_SEND,
-// DOP_ALIAS_SEND_TT, DOP_ALTACT_SIG_SEND), OTP-29.1.1.
-fn net_message_send(
+/// `erts_net_message(prt, dep, conn_id, ...)`: one complete distribution signal from either
+/// input path (the port controller or `erlang:dist_ctrl_put_data/2`). The control message is
+/// decoded into a temporary heap; a message, an exit reason or a monitor-exit reason in the
+/// payload is passed on still encoded (`ErtsDistExternal`) and decoded by the receiver. An
+/// invalid signal takes the connection down (`invalid_message` / `decode_error` /
+/// `data_error`: `erts_kill_dist_connection`).
+// Port of erts/emulator/beam/dist.c (erts_net_message), OTP-29.1.1.
+fn erts_net_message(
     runtime: &'static crate::process::Runtime,
     handle: u64,
-    local: &str,
-    control: &OwnedTerm,
-    edep: Box<crate::natives::external_dist::ErtsDistExternal>,
-) -> Result<(), VmError> {
-    let OwnedTerm::Tuple(parts) = control else {
-        return Err(badarg());
-    };
-    let Some(OwnedTerm::Int(op)) = parts.first() else {
-        return Err(badarg());
-    };
-    let sched = runtime.scheduler()?;
-    let altact = |from: Pid, target: Pid, message: Message| {
-        sched
-            .send(from, target, message)
-            .map_err(|error| VmError::Unsupported(format!("dist altact send: {error}")))
-    };
-    match *op {
-        2 | 22 | 12 | 23 => {
-            let target = local_pid(&parts[2], local).ok_or_else(badarg)?;
-            let from = if matches!(*op, 22 | 23) {
-                remote_proxy(handle, &parts[1])?
-            } else {
-                target
-            };
-            crate::process::erts_queue_dist_message(sched, target, edep, from)
-        }
-        6 | 16 => {
-            let OwnedTerm::Atom(name) = &parts[3] else {
-                return Err(badarg());
-            };
-            match runtime.reg.whereis_proc_str(name) {
-                Some(target) => {
-                    crate::process::erts_queue_dist_message(sched, target, edep, target)
-                }
-                None => Ok(()),
-            }
-        }
-        33 | 34 => {
-            let OwnedTerm::Ref { .. } = &parts[2] else {
-                return Err(badarg());
-            };
-            let reference = remote_ref_id(&parts[2]).ok_or_else(badarg)?;
-            match remote_alias_pid(&parts[2]) {
-                Some(target) => altact(
-                    target,
-                    target,
-                    Message::dist_external(edep).with_alias(reference),
-                ),
-                None => Ok(()),
-            }
-        }
-        37 => {
-            // `{37, Flags, SenderPid, To}` — alias bit delivers like DOP_ALIAS_SEND.
-            const FLG_PRIO: u64 = 1 << 0;
-            const FLG_ALIAS: u64 = 1 << 2;
-            const FLG_NAME: u64 = 1 << 3;
-            let flags = as_u64(&parts[1]).ok_or_else(badarg)?;
-            let from = remote_proxy(handle, &parts[2])?;
-            let mut message = Message::dist_external(edep);
-            let target = if flags & FLG_ALIAS != 0 {
-                message = message.with_alias(remote_ref_id(&parts[3]).ok_or_else(badarg)?);
-                remote_alias_pid(&parts[3])
-            } else if flags & FLG_NAME != 0 {
-                let OwnedTerm::Atom(name) = &parts[3] else {
-                    return Err(badarg());
-                };
-                runtime.reg.whereis_proc_str(name)
-            } else {
-                local_pid(&parts[3], local)
-            };
-            if flags & FLG_PRIO != 0 {
-                message = message.with_priority();
-            }
-            match target {
-                Some(target) => altact(from, target, message),
-                None => Ok(()),
-            }
-        }
-        _ => Err(badarg()),
+    sysname: &str,
+    connection_id: u32,
+    packet: arinsal_etf::DistributionPacket,
+) {
+    if net_message(runtime, handle, sysname, connection_id, packet).is_err() {
+        let _ = kill_connection(runtime, sysname, connection_id);
     }
 }
 
-fn route_incoming(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
+/// The body of [`erts_net_message`]; an error is an invalid signal.
+fn net_message(
+    runtime: &'static crate::process::Runtime,
     handle: u64,
-    local: &str,
-    mut terms: Vec<(OwnedTerm, usize)>,
+    sysname: &str,
+    connection_id: u32,
+    packet: arinsal_etf::DistributionPacket,
 ) -> Result<(), VmError> {
-    if terms.is_empty() {
-        return Ok(());
+    use crate::natives::external_dist::{erts_decode_dist_ext, erts_decode_dist_ext_size};
+    let mut edep = dist_ext(packet, sysname, connection_id);
+    // `ctl_len = erts_decode_dist_ext_size(&ede, 1, 0)`; the connection is killed by the
+    // caller on any error, as `data_error` / `decode_error` do.
+    let ctl_len = erts_decode_dist_ext_size(None, &mut edep, false);
+    if ctl_len < 0 {
+        return Err(badarg());
     }
-    let (control, _) = terms.remove(0);
-    let local_creation = node_tables::this_node().1;
-    let terms: Vec<(OwnedTerm, usize)> = terms
-        .into_iter()
-        .map(|(term, heap_words)| {
-            (
-                internalize_local_node(term, local, local_creation),
-                heap_words,
-            )
-        })
-        .collect();
-    let OwnedTerm::Tuple(parts) = &control else {
+    // `erts_factory_tmp_init(&factory, ctl, ctl_len, ERTS_ALC_T_DCTRL_BUF)`: the control
+    // message lives in this buffer until the signal is dispatched.
+    let mut ctl = arinsal_term::message::NodeFragment::new_message_buffer(ctl_len as usize);
+    let arg = {
+        let mut target = ctl.fragment_mut();
+        let mut factory = arinsal_term::HeapReservation::new(&mut target, ctl_len as usize)
+            .map_err(|_| badarg())?;
+        erts_decode_dist_ext(None, &mut factory, &mut edep, false).ok_or_else(badarg)?
+    };
+    // The payload is sized by its receiver (`erts_decode_dist_ext_size(edep, 1, 1)`).
+    edep.heap_size = -1;
+    let tuple = arinsal_term::raw::Tuple::try_from(arg).map_err(|_| badarg())?;
+    // `tuple[1..=arity]`, `parts[0]` being `tuple[1]`.
+    let parts: Vec<Term> = (0..tuple.arity()).filter_map(|i| tuple.get(i)).collect();
+    let Some(op) = parts.first().and_then(|op| op.as_small()) else {
         return Err(badarg());
     };
-    let Some(OwnedTerm::Int(op)) = parts.first() else {
-        return Err(badarg());
-    };
-    match *op {
-        // Port of erts/emulator/beam/dist.c (DOP_LINK), OTP-29.1.1.
-        1 if parts.len() == 3 => {
-            let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-            let from = remote_proxy(handle, &parts[1])?;
-            let target = local_pid(&parts[2], local);
-            elink::incoming_link(runtime, handle, from, &parts[1], target)?;
-        }
-        // Port of erts/emulator/beam/dist.c (DOP_EXIT, DOP_PAYLOAD_EXIT, DOP_EXIT2,
-        // DOP_PAYLOAD_EXIT2), OTP-29.1.1.
-        3 | 8 | 24 | 26 if parts.len() >= 3 => {
-            let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-            let from = remote_proxy(handle, &parts[1])?;
-            let target = local_pid(&parts[2], local).ok_or_else(badarg)?;
-            let reason = if parts.len() == 4 {
-                &parts[3]
-            } else {
-                &terms.first().ok_or_else(badarg)?.0
-            };
-            let reason = owned_to_message(reason)?;
-            elink::incoming_exit(
-                runtime,
-                from,
-                &parts[1],
-                target,
-                matches!(*op, 3 | 24),
-                reason,
-            )?;
-        }
-        // Port of erts/emulator/beam/dist.c (DOP_UNLINK_ID, DOP_UNLINK_ID_ACK), OTP-29.1.1.
-        35 | 36 if parts.len() == 4 => {
-            let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-            let unlink_id = as_u64(&parts[1]).ok_or_else(badarg)?;
-            if *op == 35 && unlink_id == 0 {
+    let result = net_message_dispatch(runtime, handle, sysname, op, &parts, edep);
+    drop(ctl);
+    result
+}
+
+/// The `switch (type)` of [`erts_net_message`] over the decoded control tuple `parts`
+/// (`parts[i]` is erts' `tuple[i + 1]`).
+// Port of erts/emulator/beam/dist.c (erts_net_message), OTP-29.1.1.
+fn net_message_dispatch(
+    runtime: &'static crate::process::Runtime,
+    handle: u64,
+    sysname: &str,
+    op: i64,
+    parts: &[Term],
+    edep: Box<crate::natives::external_dist::ErtsDistExternal>,
+) -> Result<(), VmError> {
+    const FLG_PRIO: u64 = 1 << 0;
+    const FLG_TOKEN: u64 = 1 << 1;
+    const FLG_ALIAS: u64 = 1 << 2;
+    const FLG_NAME: u64 = 1 << 3;
+    const FLG_EXIT: u64 = 1 << 4;
+    let arity = parts.len();
+    let dep = global_atoms().intern(sysname).map_err(|_| badarg())?.0;
+    // `is_external_pid(from) && dep == external_pid_dist_entry(from)`.
+    let dep_pid = |term: Term| ctl_external_pid(term).filter(|pid| pid.sysname == dep);
+    let sched = runtime.scheduler()?;
+    match op {
+        // DOP_LINK {1, From, To}
+        1 => {
+            if arity != 3 {
                 return Err(badarg());
             }
-            let from = remote_proxy(handle, &parts[2])?;
-            let target = local_pid(&parts[3], local).ok_or_else(badarg)?;
-            elink::incoming_unlink(
-                runtime,
-                handle,
-                from,
-                unlink_id,
-                &parts[2],
-                target,
-                *op == 36,
-            )?;
+            let (from, to) = (parts[1], parts[2]);
+            let remote = dep_pid(from).ok_or_else(badarg)?;
+            if ctl_external_pid(to).is_some() && !ctl_is_this_node(to) {
+                return Err(badarg());
+            }
+            let proxy = remote_proxy(handle, remote)?;
+            elink::incoming_link(runtime, handle, proxy, remote, to)?;
         }
-        // Port of erts/emulator/beam/dist.c (DOP_MONITOR_P, DOP_DEMONITOR_P), OTP-29.1.1.
-        19 | 20 if parts.len() == 4 => {
-            let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-            let proxy = remote_proxy(handle, &parts[1])?;
-            if *op == 19 {
-                emon::incoming_monitor(
-                    runtime, handle, proxy, &parts[1], &parts[2], &parts[3], local,
-                )?;
+        // DOP_UNLINK: the new link protocol is mandatory as of OTP 26.
+        4 => return Err(badarg()),
+        // DOP_UNLINK_ID {35, Id, From, To}, DOP_UNLINK_ID_ACK {36, Id, From, To}
+        35 | 36 => {
+            if arity != 4 {
+                return Err(badarg());
+            }
+            let id = ctl_u64(parts[1]).ok_or_else(badarg)?;
+            if op == 35 && id == 0 {
+                return Err(badarg());
+            }
+            let remote = dep_pid(parts[2]).ok_or_else(badarg)?;
+            // erts tests `erts_this_dist_entry == external_pid_dist_entry(from)` here, which
+            // never holds for a pid of `dep`; an external `to` is an invalid message.
+            let to = ctl_internal_pid(parts[3]).ok_or_else(badarg)?;
+            let proxy = remote_proxy(handle, remote)?;
+            elink::incoming_unlink(runtime, handle, proxy, id, remote, to, op == 36)?;
+        }
+        // DOP_MONITOR_P {19, Watcher, Watched, Ref}, DOP_DEMONITOR_P {20, ..}
+        19 | 20 => {
+            if arity != 4 {
+                return Err(badarg());
+            }
+            let (watcher, watched, reference) = (parts[1], parts[2], parts[3]);
+            if op == 19 {
+                let remote = dep_pid(watcher).ok_or_else(badarg)?;
+                if !ctl_is_ref(reference) {
+                    return Err(badarg());
+                }
+                let proxy = remote_proxy(handle, remote)?;
+                emon::incoming_monitor(runtime, handle, proxy, remote, watched, reference)?;
             } else {
-                emon::incoming_demonitor(
-                    runtime, handle, proxy, &parts[1], &parts[2], &parts[3], local,
-                )?;
+                if !ctl_is_ref(reference) {
+                    return Err(badarg());
+                }
+                let remote = dep_pid(watcher).ok_or_else(badarg)?;
+                let proxy = remote_proxy(handle, remote)?;
+                emon::incoming_demonitor(runtime, handle, proxy, watched, reference)?;
             }
         }
-        21 | 28 if (parts.len() == 5 && *op == 21) || (parts.len() == 4 && *op == 28) => {
-            let target_owned = &parts[1];
-            let watcher = local_pid(&parts[2], local).ok_or_else(badarg)?;
-            let reference = remote_ref_id(&parts[3]).ok_or_else(badarg)?;
-            let reason = if *op == 21 {
-                &parts[4]
+        // DOP_REG_SEND {6, From, '', ToName}, DOP_REG_SEND_TT {16, From, '', ToName, Token}
+        6 | 16 => {
+            if (op == 16 && arity != 5) || (op == 6 && arity != 4) {
+                return Err(badarg());
+            }
+            let (from, to) = (parts[1], parts[3]);
+            if !ctl_is_pid(from) {
+                return Err(badarg());
+            }
+            let name = to.as_atom().ok_or_else(badarg)?;
+            if let Some(rp) = runtime.reg.whereis_proc(name) {
+                let token = dist_token((op == 16).then(|| parts[4]))?;
+                crate::process::erts_queue_dist_message(sched, rp, edep, token, rp)?;
+            }
+        }
+        // DOP_SEND {2, '', To}, DOP_SEND_SENDER {22, From, To}, DOP_SEND_TT {12, '', To, Token},
+        // DOP_SEND_SENDER_TT {23, From, To, Token}
+        2 | 22 | 12 | 23 => {
+            let tt = matches!(op, 12 | 23);
+            if arity != if tt { 4 } else { 3 } {
+                return Err(badarg());
+            }
+            let token = dist_token(tt.then(|| parts[3]))?;
+            let to = parts[2];
+            if !ctl_is_pid(to) {
+                return Err(badarg());
+            }
+            // `erts_proc_lookup(to)`: an external pid names no local process.
+            if let Some(rp) = ctl_internal_pid(to) {
+                let from = if matches!(op, 22 | 23) {
+                    ctl_sender(handle, parts[1])?
+                } else {
+                    rp
+                };
+                crate::process::erts_queue_dist_message(sched, rp, edep, token, from)?;
+            }
+        }
+        // DOP_ALIAS_SEND {33, From, Alias}, DOP_ALIAS_SEND_TT {34, From, Alias, Token}
+        33 | 34 => {
+            if arity != if op == 34 { 4 } else { 3 } {
+                return Err(badarg());
+            }
+            let token = dist_token((op == 34).then(|| parts[3]))?;
+            let to = parts[2];
+            if !ctl_is_ref(to) {
+                return Err(badarg());
+            }
+            erts_proc_sig_send_dist_altact_msg(
+                sched,
+                None,
+                to,
+                Message::dist_external(edep, token),
+                false,
+            )?;
+        }
+        // DOP_ALTACT_SIG_SEND {37, Flags, SenderPid, To} | {37, Flags, SenderPid, To, Token}
+        37 => {
+            if arity < 4 {
+                return Err(badarg());
+            }
+            let flags = ctl_altact_flags(parts[1]).ok_or_else(badarg)?;
+            let from = parts[2];
+            if !ctl_is_pid(from) {
+                return Err(badarg());
+            }
+            let mut to = parts[3];
+            let token = if flags & FLG_TOKEN == 0 {
+                None
+            } else if arity < 5 {
+                return Err(badarg());
             } else {
-                &terms.first().ok_or_else(badarg)?.0
+                dist_token(Some(parts[4]))?
             };
-            // erts_proc_sig_send_dist_monitor_down: the watcher finds the origin half by
-            // reference; the sender orders the DOWN behind the dead process' signals.
-            let from = match target_owned {
-                OwnedTerm::Pid { .. } => remote_proxy(handle, target_owned)?,
-                OwnedTerm::Atom(_) => watcher,
-                _ => return Err(badarg()),
-            };
-            let reason = if *op == 21 {
-                from_owned(reason, &mut process.heap).map_err(|_| badarg())?
+            if flags & FLG_ALIAS != 0 {
+                if !ctl_is_ref(to) || flags & FLG_NAME != 0 {
+                    return Err(badarg());
+                }
+            } else if flags & FLG_NAME != 0 {
+                let name = to.as_atom().ok_or_else(badarg)?;
+                match runtime.reg.whereis_proc(name) {
+                    Some(pid) => to = Term::pid_from_data(pid.data()),
+                    // No such process registered; drop message.
+                    None => return Ok(()),
+                }
+            } else if !ctl_is_pid(to) {
+                return Err(badarg());
+            }
+            let prio = flags & FLG_PRIO != 0;
+            let sender = ctl_sender(handle, from)?;
+            let message = Message::dist_external(edep, token);
+            if flags & FLG_EXIT != 0 {
+                // erts_proc_sig_send_dist_exit with the reason still encoded.
+                erts_proc_sig_send_dist_altact_exit(sched, sender, to, message, prio)?;
             } else {
-                from_owned(&terms.first().ok_or_else(badarg)?.0, &mut process.heap)
-                    .map_err(|_| badarg())?
+                erts_proc_sig_send_dist_altact_msg(sched, Some(sender), to, message, prio)?;
+            }
+        }
+        // DOP_MONITOR_P_EXIT {21, Watched, Watcher, Ref, Reason},
+        // DOP_PAYLOAD_MONITOR_P_EXIT {28, Watched, Watcher, Ref}:
+        // erts_proc_sig_send_dist_monitor_down.
+        21 | 28 => {
+            if arity != if op == 28 { 4 } else { 5 } {
+                return Err(badarg());
+            }
+            let (watched, watcher, reference) = (parts[1], parts[2], parts[3]);
+            if !ctl_is_ref(reference) {
+                return Err(badarg());
+            }
+            let watched_pid = ctl_external_pid(watched);
+            if watched_pid.is_none() && watched.as_atom().is_none() {
+                return Err(badarg());
+            }
+            let Some(watcher) = ctl_internal_pid(watcher) else {
+                if ctl_external_pid(watcher).is_some() && ctl_is_this_node(watcher) {
+                    // Monitored process not alive.
+                    return Ok(());
+                }
+                return Err(badarg());
             };
-            publish_remote_signal(
-                process,
+            let id = ctl_ref_id(reference).ok_or_else(badarg)?;
+            // The watcher finds the origin half by reference; the sender orders the DOWN
+            // behind the dead process' signals.
+            let from = match watched_pid {
+                Some(pid) => remote_proxy(handle, pid)?,
+                None => watcher,
+            };
+            let reason = if op == 21 {
+                Message::copy_from(parts[4])?
+            } else {
+                Message::dist_external(edep, None)
+            };
+            // A dead watcher drops it ("Process not alive").
+            let _ = sched.signal(
                 from,
                 watcher,
                 Signal::MonitorDown {
-                    reference,
-                    reason: Box::new(Message::copy_from(reason)?),
+                    reference: id,
+                    reason: Box::new(reason),
                 },
-            )?;
+            );
         }
-        29 if parts.len() == 6 && terms.len() == 1 => {
-            handle_spawn_request(vm, process, ctx, handle, parts, &terms[0].0)?;
+        // DOP_EXIT {3, From, To, Reason}, DOP_EXIT_TT {13, From, To, Token, Reason},
+        // DOP_PAYLOAD_EXIT {24, From, To}, DOP_PAYLOAD_EXIT_TT {25, From, To, Token}:
+        // erts_proc_sig_send_dist_link_exit.
+        3 | 13 | 24 | 25 => {
+            let expected = match op {
+                3 => 4,
+                13 => 5,
+                24 => 3,
+                _ => 4,
+            };
+            if arity != expected {
+                return Err(badarg());
+            }
+            let token = dist_token(matches!(op, 13 | 25).then(|| parts[3]))?;
+            let remote = dep_pid(parts[1]).ok_or_else(badarg)?;
+            let to = ctl_internal_pid(parts[2]).ok_or_else(badarg)?;
+            let reason = dist_exit_reason(op < 24, parts, edep, token)?;
+            let proxy = remote_proxy(handle, remote)?;
+            elink::incoming_exit(runtime, proxy, remote, to, true, reason)?;
         }
-        31 | 32 if (parts.len() == 5 && *op == 31) || (parts.len() == 6 && *op == 32) => {
-            // Port of erts/emulator/beam/dist.c:3017-3124 (DOP_SPAWN_REPLY), OTP-29.1.1.
-            let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+        // DOP_EXIT2 {8, ..}, DOP_EXIT2_TT {18, ..}, DOP_PAYLOAD_EXIT2 {26, ..},
+        // DOP_PAYLOAD_EXIT2_TT {27, ..}: erts_proc_sig_send_dist_exit.
+        8 | 18 | 26 | 27 => {
+            let expected = match op {
+                8 => 4,
+                18 => 5,
+                26 => 3,
+                _ => 4,
+            };
+            if arity != expected {
+                return Err(badarg());
+            }
+            let token = dist_token(matches!(op, 18 | 27).then(|| parts[3]))?;
+            let from = parts[1];
+            let remote = dep_pid(from).ok_or_else(badarg)?;
+            let to = parts[2];
+            let Some(to) = ctl_internal_pid(to) else {
+                if ctl_external_pid(to).is_some() && ctl_is_this_node(to) {
+                    // Old incarnation of this node.
+                    return Ok(());
+                }
+                return Err(badarg());
+            };
+            let reason = dist_exit_reason(op < 24, parts, edep, token)?;
+            let proxy = remote_proxy(handle, remote)?;
+            elink::incoming_exit(runtime, proxy, remote, to, false, reason)?;
+        }
+        // DOP_SPAWN_REQUEST {29, ReqId, From, GroupLeader, {M,F,Arity}, Opts},
+        // DOP_SPAWN_REQUEST_TT {30, .., Token} (token dropped, DIST-TOKEN-1); the argument
+        // list in the payload.
+        29 | 30 => {
+            if arity != if op == 30 { 7 } else { 6 } {
+                return Err(badarg());
+            }
+            handle_spawn_request(runtime, handle, parts, edep)?;
+        }
+        // DOP_SPAWN_REPLY {31, ReqId, To, Flags, Result}, DOP_SPAWN_REPLY_TT {32, .., Token}.
+        31 | 32 => {
+            if arity != if op == 32 { 6 } else { 5 } {
+                return Err(badarg());
+            }
             dist_spawn_reply(runtime, handle, parts)?;
         }
-        30 | 31 => {
-            return Err(VmError::Unsupported(format!(
-                "distribution spawn control {op}"
-            )));
-        }
-        // Unknown controls are malformed under OTP's negotiated protocol.
-        _ => {
-            return Err(VmError::Unsupported(format!(
-                "unsupported distribution control {op}"
-            )));
-        }
+        _ => return Err(badarg()),
     }
     Ok(())
 }
 
-fn remote_proxy(handle: u64, remote: &OwnedTerm) -> Result<Pid, VmError> {
-    let OwnedTerm::Pid {
-        node,
-        id,
-        serial,
-        creation,
-    } = remote
-    else {
-        return Err(badarg());
+/// The reason of a `DOP_EXIT*` / `DOP_EXIT2*` signal: the last control element copied into
+/// the signal (`reason = tuple[N]`, `edep = NULL`), or the payload still encoded for the
+/// `DOP_PAYLOAD_*` variants; the token travels with it.
+// Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_send_dist_link_exit,
+// erts_proc_sig_send_dist_exit: send_gen_exit_signal with `reason` or `edep`), OTP-29.1.1.
+fn dist_exit_reason(
+    in_control: bool,
+    parts: &[Term],
+    edep: Box<crate::natives::external_dist::ErtsDistExternal>,
+    token: Option<Box<crate::seq_trace::Token>>,
+) -> Result<Message, VmError> {
+    if !in_control {
+        return Ok(Message::dist_external(edep, token));
+    }
+    let mut reason = Message::copy_from(parts[parts.len() - 1])?;
+    if let Some(token) = token {
+        reason.attach_seq_token(token);
+    }
+    Ok(reason)
+}
+
+/// `erts_proc_sig_send_dist_altact_msg(from, to, edep, hfrag, token, prio)`: a message to a
+/// pid or an alias, its payload still encoded. A target that names no local process drops it.
+// Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_send_dist_altact_msg),
+// OTP-29.1.1.
+fn erts_proc_sig_send_dist_altact_msg(
+    sched: &arinsal_sched::Scheduler<Process>,
+    from: Option<Pid>,
+    to: Term,
+    mut message: Message,
+    prio: bool,
+) -> Result<(), VmError> {
+    let target = if ctl_is_ref(to) {
+        message = message.with_alias(ctl_ref_id(to).ok_or_else(badarg)?);
+        ctl_alias_pid(to)
+    } else {
+        ctl_internal_pid(to)
     };
-    let key = (*id, *serial, *creation);
+    let Some(target) = target else {
+        return Ok(());
+    };
+    if prio {
+        message = message.with_priority();
+    }
+    sched
+        .send(from.unwrap_or(target), target, message)
+        .map_err(|error| VmError::Unsupported(format!("dist altact send: {error}")))
+}
+
+/// `erts_proc_sig_send_dist_exit(dep, from, to, edep, hfrag, THE_NON_VALUE, token, prio)` of a
+/// `DOP_ALTACT_SIG_SEND` with `ERTS_DOP_ALTACT_SIG_FLG_EXIT`.
+// Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_send_dist_exit), OTP-29.1.1.
+fn erts_proc_sig_send_dist_altact_exit(
+    sched: &arinsal_sched::Scheduler<Process>,
+    from: Pid,
+    to: Term,
+    mut message: Message,
+    prio: bool,
+) -> Result<(), VmError> {
+    let target = if ctl_is_ref(to) {
+        message = message.with_alias(ctl_ref_id(to).ok_or_else(badarg)?);
+        ctl_alias_pid(to)
+    } else {
+        ctl_internal_pid(to)
+    };
+    let Some(target) = target else {
+        return Ok(());
+    };
+    if prio {
+        message = message.with_priority();
+    }
+    let _ = sched.signal(from, target, Signal::Exit(Box::new(message)));
+    Ok(())
+}
+
+fn remote_proxy(handle: u64, remote: crate::monitor_link::ExternalPid) -> Result<Pid, VmError> {
+    let key = (remote.number, remote.serial, remote.creation);
     let local_creation = node_tables::this_node().1;
+    let node = global_atoms()
+        .text(arinsal_term::Atom(remote.sysname))
+        .ok_or_else(badarg)?;
     let dep = node_tables::find_dist_entry(node).ok_or_else(badarg)?;
     let mut entry = dep.lock();
     let state = entry
@@ -797,13 +1311,14 @@ fn remote_proxy(handle: u64, remote: &OwnedTerm) -> Result<Pid, VmError> {
     if let Some(pid) = state.remote_pids.get(&key) {
         return Ok(*pid);
     }
+    let owned = elink::external_pid_owned(remote).ok_or_else(badarg)?;
     let pid = Pid::new(
         NEXT_REMOTE_PID.fetch_add(1, Ordering::Relaxed) & ((1 << 28) - 1),
         local_creation,
     );
     PROXIES_CREATED.store(true, Ordering::Release);
     state.remote_pids.insert(key, pid);
-    state.proxy_to_remote.insert(pid, remote.clone());
+    state.proxy_to_remote.insert(pid, owned);
     Ok(pid)
 }
 
@@ -826,59 +1341,8 @@ pub(crate) fn remote_pid_term(process: &mut Process, proxy: Pid) -> Result<Optio
         .transpose()
 }
 
-fn publish_remote_signal(
-    process: &Process,
-    from: Pid,
-    to: Pid,
-    signal: Signal<Message>,
-) -> Result<(), VmError> {
-    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    runtime
-        .scheduler()?
-        .signal(from, to, signal)
-        .map_err(|error| VmError::Unsupported(format!("incoming dist signal: {error}")))
-}
-
-fn queue_remote_control(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
-    handle: u64,
-    control: OwnedTerm,
-) -> Result<(), VmError> {
-    let (local_name, local_creation) = node_tables::this_node();
-    let control = node_tables::relabel_local_node(control, local_name, local_creation);
-    let dep = node_tables::lock()
-        .dep_by_handle(handle)
-        .ok_or_else(badarg)?;
-    let mut entry = dep.lock();
-    let state = entry.dist.as_mut().ok_or_else(badarg)?;
-    if let Some(port_id) = state.port_id {
-        let packets = state.encode_term(control, None).map_err(|_| badarg())?;
-        state.written = state.written.saturating_add(1);
-        enqueue_port_output_no_suspend_locked(state, packets);
-        drop(entry);
-        let runtime = process.runtime.ok_or_else(badarg)?;
-        return flush_port_output(runtime, port_id);
-    }
-    state.queue_term(control, None).map_err(|_| badarg())?;
-    let notify = state.notify.then_some(state.owner);
-    state.notify = false;
-    drop(entry);
-    if let Some(handler) = notify {
-        ctx.send(
-            handler,
-            Message::copy_from(Term::atom(arinsal_term::atoms::DIST_DATA))?,
-        )
-        .map_err(|error| VmError::Unsupported(format!("dist data notification: {error}")))?;
-    }
-    let _ = process;
-    Ok(())
-}
-
-fn remote_ref_id(reference: &OwnedTerm) -> Option<u64> {
-    let OwnedTerm::Ref { ids, .. } = reference else {
-        return None;
-    };
+/// The key of a reference with numbers `ids` (in ETF order).
+fn ref_key(ids: &[u32]) -> Option<u64> {
     if ids.len() >= 3 {
         return Some(arinsal_sched::unique::ordinary_ref_key([
             ids[0], ids[1], ids[2],
@@ -891,30 +1355,6 @@ fn remote_ref_id(reference: &OwnedTerm) -> Option<u64> {
     Some(value)
 }
 
-fn remote_alias_pid(reference: &OwnedTerm) -> Option<Pid> {
-    let OwnedTerm::Ref {
-        node,
-        creation,
-        ids,
-    } = reference
-    else {
-        return None;
-    };
-    // Port of erts_pid_ref_lookup (erl_bif_unique.h), OTP-29.1.1: ETF carries the
-    // reference-number PID marker and creator PID, and only a local creator is routable.
-    let (local_node, local_creation) = arinsal_term::this_node();
-    if ids.len() != 5
-        || ids[1] & (1 << 16) == 0
-        || *creation != local_creation
-        || global_atoms().text(local_node)? != node
-    {
-        return None;
-    }
-    Some(Pid::from_data(Term::local_pid_ref_data_from_words(
-        ids[3], ids[4],
-    )?))
-}
-
 /// Queue one remote signal packet using the destination's negotiated atom cache.
 ///
 /// Port of erts/emulator/beam/dist.c (`erts_dsig_prepare` + pending queue), OTP-29.1.1.
@@ -924,8 +1364,8 @@ pub(crate) fn queue_outgoing(
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     node: &str,
-    control: OwnedTerm,
-    message: Option<OwnedTerm>,
+    control: Term,
+    message: Option<Term>,
 ) -> Result<(), VmError> {
     match queue_outgoing_with_options(
         process, ctx, node, control, message, true, true, false, None,
@@ -1006,8 +1446,8 @@ pub(crate) fn queue_outgoing_on(
     ctx: &mut RunCtx<'_, crate::Process>,
     node: &str,
     connection_id: u32,
-    control: OwnedTerm,
-    message: Option<OwnedTerm>,
+    control: Term,
+    message: Option<Term>,
 ) -> Result<(), VmError> {
     match queue_outgoing_with_options(
         process,
@@ -1041,8 +1481,8 @@ fn queue_outgoing_with_options(
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     node: &str,
-    control: OwnedTerm,
-    message: Option<OwnedTerm>,
+    control: Term,
+    message: Option<Term>,
     connect: bool,
     suspend: bool,
     trap: bool,
@@ -1051,12 +1491,9 @@ fn queue_outgoing_with_options(
     if !node_tables::is_alive() {
         return Ok(DistSendResult::NotConnected);
     }
-    let (local_name, local_creation) = node_tables::this_node();
-    if node == local_name {
+    if node == node_tables::this_node().0 {
         return Err(badarg());
     }
-    let control = node_tables::relabel_local_node(control, local_name, local_creation);
-    let message = message.map(|m| node_tables::relabel_local_node(m, local_name, local_creation));
     // The table lock is held for the membership lookup only (find_dist_entry); the send
     // itself runs under the entry's own lock, as erts_dsig_prepare/erts_dsig_send do.
     let mut dep = node_tables::find_dist_entry(node);
@@ -1100,49 +1537,56 @@ fn queue_outgoing_with_options(
         if !suspend && state.busy {
             return Ok(DistSendResult::WouldSuspend);
         }
-        if let Some(port_id) = state.port_id {
-            let packets = state.encode_term(control, message).map_err(|_| badarg())?;
-            state.written = state.written.saturating_add(1);
-            if !suspend {
-                enqueue_port_output_no_suspend_locked(state, packets);
+        // erts_dsig_send with `ctx->no_trap = !trap` and `ctx->no_suspend = !suspend`, for a
+        // port or a process controller alike: the encode phases run on the sender's
+        // reductions and a trapping send continues in dsend_continue_trap/1.
+        let mut encode = DsigEncode::new(
+            control,
+            message,
+            state.flags,
+            dsig_from(Some(ctx.pid())),
+            arinsal_term::this_node,
+        );
+        let initial_reds = dsig_initial_reds(process);
+        let mut reds = initial_reds;
+        let res = encode.step(Some(&state.acmp), &mut reds, !trap);
+        let mut send_ctx = DsigSendContext {
+            dep: dep.clone(),
+            connection_id: conn_id,
+            encode: None,
+            fragments: VecDeque::new(),
+            no_suspend: !suspend,
+            return_term: Term::NIL,
+        };
+        match res.map_err(|_| badarg())? {
+            DsigEncodeResult::TooLarge => {
                 drop(entry);
-                flush_port_output(process.runtime.as_ref().ok_or_else(badarg)?, port_id)?;
-                return Ok(DistSendResult::Queued);
+                dsig_bump_reds(process, initial_reds, reds);
+                return Err(dsig_system_limit());
             }
-            let mut send_ctx = DsigSendContext {
-                dep: dep.clone(),
-                connection_id: conn_id,
-                port_id,
-                fragments: packets.into(),
-                no_suspend: false,
-                return_term: Term::NIL,
-            };
-            drop(entry);
-            return Ok(match dsig_send(process, &mut send_ctx, ctx.pid(), !trap)? {
-                DsigSend::Continue => DistSendResult::Continue(send_ctx),
-                DsigSend::Ok | DsigSend::Yield => DistSendResult::Queued,
-            });
+            DsigEncodeResult::Continue => {
+                // erts_dsend_export_trap_context.
+                encode.export(Some(&state.acmp));
+                send_ctx.encode = Some(Box::new(encode));
+                drop(entry);
+                dsig_bump_reds(process, initial_reds, reds);
+                return Ok(DistSendResult::Continue(send_ctx));
+            }
+            DsigEncodeResult::Send => send_ctx.fragments = encode.take_obufs().into(),
         }
-        state.queue_term(control, message).map_err(|_| badarg())?;
-        if state.pending_bytes >= state.busy_limit {
-            state.busy = true;
-        }
-        let notify = state.notify.then_some(state.owner);
-        state.notify = false;
         drop(entry);
-        if let Some(handler) = notify {
-            ctx.send(
-                handler,
-                Message::copy_from(Term::atom(arinsal_term::atoms::DIST_DATA))?,
-            )
-            .map_err(|error| VmError::Unsupported(format!("dist data notification: {error}")))?;
-        }
-        let _ = process;
-        return Ok(DistSendResult::Queued);
+        dsig_bump_reds(process, initial_reds, reds);
+        return Ok(match dsig_send(process, &mut send_ctx, ctx.pid(), !trap)? {
+            DsigSend::Continue => DistSendResult::Continue(send_ctx),
+            DsigSend::Ok | DsigSend::Yield => DistSendResult::Queued,
+        });
     }
 
-    // Pending (or Connected without a controller yet): buffer until channel is up.
-    entry.pending_out.push_back((control, message));
+    // Pending (or Connected without a controller yet): encoded with DFLAG_PENDING_CONNECT
+    // and buffered until the channel is up.
+    let signal = node_tables::encode_pending(control, message, dsig_from(Some(ctx.pid())))
+        .map_err(|_| badarg())?;
+    entry.pending_out.push_back(signal);
     let notify = was_idle.then(|| (node.to_string(), conn_id, entry_ref));
     drop(entry);
     if let Some((node, conn_id, entry_ref)) = notify
@@ -1170,23 +1614,18 @@ fn notify_auto_connect(
         abort_pending_connection_locally(runtime, node, conn_id, entry_ref)?;
         return Ok(false);
     };
-    let (local_name, local_creation) = {
-        let (name, creation) = crate::node_tables::this_node();
-        (name.to_owned(), creation)
-    };
-    let msg = OwnedTerm::tuple(vec![
-        OwnedTerm::Atom("auto_connect".into()),
-        OwnedTerm::Atom(node.into()),
-        OwnedTerm::tuple(vec![
-            OwnedTerm::Int(i64::from(conn_id)),
-            OwnedTerm::Ref {
-                node: local_name,
-                creation: local_creation,
-                ids: arinsal_sched::unique::ordinary_ref_words(entry_ref).to_vec(),
-            },
-        ]),
-    ]);
-    ctx.send(net_kernel, owned_to_message(&msg)?)
+    // {auto_connect, Node, DHandle} with the erts_build_dhandle {ConnId, Ref} handle.
+    let mut heap = arinsal_term::VecHeap::with_initial_chunk_words(16);
+    let conn = Term::small(i64::from(conn_id)).ok_or_else(badarg)?;
+    let mut builder = TermBuilder::new(&mut heap);
+    let dref = builder
+        .local_ref(arinsal_sched::unique::ordinary_ref_words(entry_ref))
+        .map_err(|_| badarg())?;
+    let dhandle = builder.tuple(&[conn, dref]).map_err(|_| badarg())?;
+    let msg = builder
+        .tuple(&[atom_term("auto_connect")?, atom_term(node)?, dhandle])
+        .map_err(|_| badarg())?;
+    ctx.send(net_kernel, Message::copy_from(msg)?)
         .map_err(|error| VmError::Unsupported(format!("auto_connect notify: {error}")))?;
     Ok(true)
 }
@@ -1199,7 +1638,7 @@ fn abort_pending_connection_locally(
     conn_id: u32,
     entry_ref: u64,
 ) -> Result<(), VmError> {
-    let (mld, spawn_downs) = {
+    let mld = {
         let mut tables = node_tables::lock();
         let aborts = tables
             .entries
@@ -1210,20 +1649,13 @@ fn abort_pending_connection_locally(
                     && entry.connection_id == conn_id
                     && entry.state == node_tables::ConnState::Pending
             });
-        let (mld, spawn_downs) = if aborts {
-            (
-                tables.take_mld(node),
-                take_connection_spawn_requests(&mut tables, node),
-            )
-        } else {
-            (None, Vec::new())
-        };
+        let mld = if aborts { tables.take_mld(node) } else { None };
         let _ = tables.abort_pending(node, conn_id, entry_ref);
-        (mld, spawn_downs)
+        mld
     };
     elink::links_connection_down(runtime, mld.clone());
     emon::monitors_connection_down(runtime, mld.as_ref());
-    notify_connection_spawn_requests(runtime, spawn_downs)
+    Ok(())
 }
 
 /// `net_kernel` exited: kill every distribution controller port, abort the pending
@@ -1285,7 +1717,6 @@ pub(crate) fn ingest_port_data(
     if bytes.is_empty() {
         return Ok(());
     }
-    let (local_name, _) = node_tables::this_node();
     // The port's own `ERTS_PRTSD_DIST_ENTRY` reference: only the entry lock is taken.
     let (handle, connection_id, packet) = {
         let mut entry = dep.lock();
@@ -1311,25 +1742,28 @@ pub(crate) fn ingest_port_data(
                     .map(str::to_owned)
             },
         )
-        .map_err(|_| badarg())?;
-        let Some(packet) = reassemble_port_fragment(state, packet)? else {
-            return Ok(());
-        };
+        .ok()
+        .map(|packet| reassemble_fragment(state, packet));
         (state.handle, connection_id, packet)
     };
-    let (control, extp) = arinsal_etf::decode_dist_control(&packet).map_err(|_| badarg())?;
-    if is_send_op(&control) {
-        let edep = dist_ext(packet, extp, &dep.sysname, connection_id);
-        return net_message_send(runtime, handle, local_name, &control, edep);
+    match packet {
+        Some(Ok(Some(packet))) => {
+            erts_net_message(runtime, handle, &dep.sysname, connection_id, packet);
+        }
+        // A fragment of a signal still being reassembled.
+        Some(Ok(None)) => {}
+        // dist.c erts_net_message `data_error`: erts_kill_dist_connection.
+        Some(Err(_)) | None => {
+            let _ = kill_connection(runtime, &dep.sysname, connection_id);
+        }
     }
-    let decoded = arinsal_etf::decode_dist_payload_with_sizes(&packet).map_err(|_| badarg())?;
-    route_incoming_port(runtime, handle, local_name, decoded)
+    Ok(())
 }
 
 /// Reassemble one ordered OTP distribution signal before decoding its ETF terms.
 ///
 /// Port of erts/emulator/beam/dist.c:2119-2165, OTP-29.1.1.
-fn reassemble_port_fragment(
+fn reassemble_fragment(
     state: &mut node_tables::DistState,
     packet: arinsal_etf::DistributionPacket,
 ) -> Result<Option<arinsal_etf::DistributionPacket>, VmError> {
@@ -1409,10 +1843,10 @@ pub(crate) fn port_connection_closed(
         return Ok(());
     };
     let node = dep.sysname.clone();
-    let (watchers, node_events, spawn_downs, mld) = {
+    let (watchers, node_events, mld, suspendees) = {
         let mut tables = node_tables::lock();
-        let (connection_id, visible) = {
-            let entry = dep.lock();
+        let (connection_id, visible, suspendees) = {
+            let mut entry = dep.lock();
             // Port of erts/emulator/beam/dist.c:3599-3611 (discard output from an obsolete
             // connection), OTP-29.1.1.
             if !entry
@@ -1422,9 +1856,12 @@ pub(crate) fn port_connection_closed(
             {
                 return Ok(());
             }
-            (entry.connection_id, entry.visible)
+            (
+                entry.connection_id,
+                entry.visible,
+                get_suspended_on_de(&mut entry),
+            )
         };
-        let spawn_downs = take_connection_spawn_requests(&mut tables, &node);
         let mld = tables.take_mld(&node);
         let watchers = tables.disconnect(&node);
         let events = tables.nodes_monitor_events(
@@ -1434,12 +1871,12 @@ pub(crate) fn port_connection_closed(
             visible,
             Some("connection_closed"),
         );
-        (watchers, events, spawn_downs, mld)
+        (watchers, events, mld, suspendees)
     };
     elink::links_connection_down(runtime, mld.clone());
     emon::monitors_connection_down(runtime, mld.as_ref());
+    resume_dist_senders(runtime, suspendees);
     notify_node_watchers(runtime, &node, watchers)?;
-    notify_connection_spawn_requests(runtime, spawn_downs)?;
     send_nodes_monitor_events(runtime.scheduler()?, node_events)?;
     // Port of erts/emulator/beam/dist.c:1114 (erts_do_net_exits: dec_no_nodes).
     node_tables::dec_no_nodes(runtime);
@@ -1453,27 +1890,27 @@ pub(crate) fn kill_connection(
     node: &str,
     connection_id: u32,
 ) -> Result<bool, VmError> {
-    let (watchers, node_events, spawn_downs, mld) = {
+    let (watchers, node_events, mld, suspendees) = {
         let mut tables = node_tables::lock();
-        let Some(entry) = tables.entries.get(node).map(|dep| dep.lock()) else {
+        let Some(mut entry) = tables.entries.get(node).map(|dep| dep.lock()) else {
             return Ok(false);
         };
         if !entry.connected || entry.connection_id != connection_id {
             return Ok(false);
         }
         let visible = entry.visible;
+        let suspendees = get_suspended_on_de(&mut entry);
         drop(entry);
-        let spawn_downs = take_connection_spawn_requests(&mut tables, node);
         let mld = tables.take_mld(node);
         let watchers = tables.disconnect(node);
         let events =
             tables.nodes_monitor_events("nodedown", node, connection_id, visible, Some("killed"));
-        (watchers, events, spawn_downs, mld)
+        (watchers, events, mld, suspendees)
     };
     elink::links_connection_down(runtime, mld.clone());
     emon::monitors_connection_down(runtime, mld.as_ref());
+    resume_dist_senders(runtime, suspendees);
     notify_node_watchers(runtime, node, watchers)?;
-    notify_connection_spawn_requests(runtime, spawn_downs)?;
     send_nodes_monitor_events(runtime.scheduler()?, node_events)?;
     // Port of erts/emulator/beam/dist.c:1114 (erts_do_net_exits: dec_no_nodes).
     node_tables::dec_no_nodes(runtime);
@@ -1498,100 +1935,6 @@ fn notify_node_watchers(
     Ok(())
 }
 
-/// The spawn-pending monitors of a connection that goes down, taken out of the tables before
-/// the connection state is dropped.
-///
-/// Port of erts/emulator/beam/dist.c (monitor_connection_down for monitors with
-/// ERTS_ML_FLG_SPAWN_PENDING, and dist.c:326 dist_pend_spawn_exit_connection_down), OTP-29.1.1.
-fn take_connection_spawn_requests(
-    tables: &mut node_tables::NodeTables,
-    node: &str,
-) -> Vec<(u64, node_tables::SpawnRequest)> {
-    let Some(mut entry) = tables.entries.get(node).map(|dep| dep.lock()) else {
-        return Vec::new();
-    };
-    let mut requests = std::mem::take(&mut entry.pending_spawn_requests);
-    if let Some(state) = entry.dist.as_mut() {
-        requests.append(&mut state.spawn_requests);
-    }
-    requests.into_iter().collect()
-}
-
-/// A spawn request whose connection went down, as its parent receives it: the monitor-down
-/// signal of a spawn-pending monitor (erl_proc_sig_queue.c:4864 convert_to_down_message),
-/// queued as a [`Signal::DistSpawnReply`].
-pub(crate) struct DistSpawnNoconnection {
-    id: u64,
-    tag: OwnedTerm,
-    /// ERTS_ML_FLG_SPAWN_ABANDONED or ERTS_ML_FLG_SPAWN_NO_EMSG: no message.
-    quiet: bool,
-    /// The pending origin monitor held a priority item until this monitor-down signal.
-    monitor_priority: bool,
-}
-
-/// Tell the parents of the spawn requests of a lost connection: a live parent gets
-/// `{Tag, Ref, error, noconnection}`; a parent suspended in its exit is resumed by dropping
-/// its waiter.
-fn notify_connection_spawn_requests(
-    runtime: &crate::process::Runtime,
-    requests: Vec<(u64, node_tables::SpawnRequest)>,
-) -> Result<(), VmError> {
-    if requests.is_empty() {
-        return Ok(());
-    }
-    let scheduler = runtime.scheduler()?;
-    for (id, request) in requests {
-        if request.parent_exiting {
-            // dist_pend_spawn_exit_connection_down: erts_resume of a waiting parent.
-            drop(request);
-            continue;
-        }
-        let payload: std::sync::Arc<dyn std::any::Any + Send + Sync> =
-            std::sync::Arc::new(DistSpawnNoconnection {
-                id,
-                tag: request.tag.clone(),
-                quiet: request.abandoned || request.no_error_msg,
-                monitor_priority: request.monitor_priority,
-            });
-        // A parent that is gone needs nothing more.
-        let _ = scheduler.signal(
-            request.caller,
-            request.caller,
-            Signal::DistSpawnReply(arinsal_sched::SharedPayload(payload)),
-        );
-    }
-    Ok(())
-}
-
-/// The `{Tag, Ref, error, noconnection}` message of a spawn request whose connection went
-/// down, or `None` when the request was abandoned or error replies are off.
-///
-/// Port of erts/emulator/beam/erl_proc_sig_queue.c:4864-4920 (convert_to_down_message for a
-/// spawn-pending monitor), OTP-29.1.1.
-pub(crate) fn spawn_noconnection_message(
-    process: &mut Process,
-    down: &DistSpawnNoconnection,
-) -> Result<Option<Term>, VmError> {
-    if down.monitor_priority {
-        process.prio_item_deleted(crate::receive::PrioItemType::Monitor);
-    }
-    if down.quiet {
-        return Ok(None);
-    }
-    let reference = crate::signals::reference(process, down.id)?;
-    let tag = from_owned(&down.tag, &mut process.heap).map_err(|_| badarg())?;
-    tuple(
-        process,
-        vec![
-            tag,
-            reference,
-            Term::atom(arinsal_term::atoms::ERROR),
-            Term::atom(arinsal_term::atoms::NOCONNECTION),
-        ],
-    )
-    .map(Some)
-}
-
 pub(crate) fn send_nodes_monitor_events(
     scheduler: &arinsal_sched::Scheduler<Process>,
     events: Vec<node_tables::NodesMonitorEvent>,
@@ -1605,248 +1948,6 @@ pub(crate) fn send_nodes_monitor_events(
             .map_err(|error| VmError::Unsupported(format!("node monitor delivery: {error}")))?;
     }
     Ok(())
-}
-
-fn route_incoming_port(
-    runtime: &'static crate::process::Runtime,
-    handle: u64,
-    local: &str,
-    mut terms: Vec<(OwnedTerm, usize)>,
-) -> Result<(), VmError> {
-    if terms.is_empty() {
-        return Ok(());
-    }
-    let (control, control_heap_words) = terms.remove(0);
-    let OwnedTerm::Tuple(parts) = &control else {
-        return Err(badarg());
-    };
-    let Some(OwnedTerm::Int(op)) = parts.first() else {
-        return Err(badarg());
-    };
-    let sched = runtime.scheduler()?;
-    match *op {
-        // Port of erts/emulator/beam/dist.c (DOP_LINK), OTP-29.1.1.
-        1 if parts.len() == 3 => {
-            let from = remote_proxy(handle, &parts[1])?;
-            let target = local_pid(&parts[2], local);
-            elink::incoming_link(runtime, handle, from, &parts[1], target)?;
-        }
-        // Port of erts/emulator/beam/dist.c (DOP_EXIT, DOP_PAYLOAD_EXIT, DOP_EXIT2,
-        // DOP_PAYLOAD_EXIT2), OTP-29.1.1. Payload exits carry the reason outside the
-        // control tuple so large reasons can use fragmented distribution frames.
-        3 | 8 | 24 | 26 if parts.len() >= 3 => {
-            let from = remote_proxy(handle, &parts[1])?;
-            let target = local_pid(&parts[2], local).ok_or_else(badarg)?;
-            let reason = if parts.len() == 4 {
-                &parts[3]
-            } else {
-                &terms.first().ok_or_else(badarg)?.0
-            };
-            let heap_words = if parts.len() == 4 {
-                control_heap_words
-            } else {
-                terms.first().ok_or_else(badarg)?.1
-            };
-            let reason = owned_to_message_with_heap_size(reason, heap_words)?;
-            elink::incoming_exit(
-                runtime,
-                from,
-                &parts[1],
-                target,
-                matches!(*op, 3 | 24),
-                reason,
-            )?;
-        }
-        // Port of erts/emulator/beam/dist.c (DOP_UNLINK_ID, DOP_UNLINK_ID_ACK), OTP-29.1.1.
-        35 | 36 if parts.len() == 4 => {
-            let unlink_id = as_u64(&parts[1]).ok_or_else(badarg)?;
-            if *op == 35 && unlink_id == 0 {
-                return Err(badarg());
-            }
-            let from = remote_proxy(handle, &parts[2])?;
-            let target = local_pid(&parts[3], local).ok_or_else(badarg)?;
-            elink::incoming_unlink(
-                runtime,
-                handle,
-                from,
-                unlink_id,
-                &parts[2],
-                target,
-                *op == 36,
-            )?;
-        }
-        // Port of dist.c:2341 (DOP_MONITOR_P); ToProc may be a pid or registered name.
-        19 | 20 if parts.len() == 4 => {
-            let proxy = remote_proxy(handle, &parts[1])?;
-            if *op == 19 {
-                emon::incoming_monitor(
-                    runtime, handle, proxy, &parts[1], &parts[2], &parts[3], local,
-                )?;
-            } else {
-                emon::incoming_demonitor(
-                    runtime, handle, proxy, &parts[1], &parts[2], &parts[3], local,
-                )?;
-            }
-        }
-        // Port of dist.c (DOP_MONITOR_P_EXIT / payload exit).
-        21 | 28 if (parts.len() == 5 && *op == 21) || (parts.len() == 4 && *op == 28) => {
-            let target_owned = &parts[1];
-            let watcher = local_pid(&parts[2], local).ok_or_else(badarg)?;
-            let reference = remote_ref_id(&parts[3]).ok_or_else(badarg)?;
-            let reason = if *op == 21 {
-                &parts[4]
-            } else {
-                &terms.first().ok_or_else(badarg)?.0
-            };
-            // erts_proc_sig_send_dist_monitor_down: the watcher finds the origin half by
-            // reference; the sender orders the DOWN behind the dead process' signals.
-            let from = match target_owned {
-                OwnedTerm::Pid { .. } => remote_proxy(handle, target_owned)?,
-                OwnedTerm::Atom(_) => watcher,
-                _ => return Err(badarg()),
-            };
-            let heap_words = if *op == 21 {
-                control_heap_words
-            } else {
-                terms.first().ok_or_else(badarg)?.1
-            };
-            let reason_msg = owned_to_message_with_heap_size(reason, heap_words)?;
-            sched
-                .signal(
-                    from,
-                    watcher,
-                    Signal::MonitorDown {
-                        reference,
-                        reason: Box::new(reason_msg),
-                    },
-                )
-                .map_err(|error| VmError::Unsupported(format!("incoming dist signal: {error}")))?;
-        }
-        // Port of dist.c:2580 (DOP_ALTACT_SIG_SEND), OTP-29.1.1: the exit variant (a message
-        // is queued undecoded by `net_message_send`).
-        // `{37, Flags, SenderPid, To}` — alias bit delivers like DOP_ALIAS_SEND.
-        37 if parts.len() >= 4 => {
-            let flags = as_u64(&parts[1]).ok_or_else(badarg)?;
-            const FLG_PRIO: u64 = 1 << 0;
-            const FLG_ALIAS: u64 = 1 << 2;
-            const FLG_NAME: u64 = 1 << 3;
-            let from = remote_proxy(handle, &parts[2])?;
-            let (target, alias) = if flags & FLG_ALIAS != 0 {
-                (
-                    remote_alias_pid(&parts[3]),
-                    Some(remote_ref_id(&parts[3]).ok_or_else(badarg)?),
-                )
-            } else if flags & FLG_NAME != 0 {
-                let OwnedTerm::Atom(name) = &parts[3] else {
-                    return Err(badarg());
-                };
-                (runtime.reg.whereis_proc_str(name), None)
-            } else {
-                (local_pid(&parts[3], local), None)
-            };
-            if let Some(target) = target {
-                for (term, heap_words) in terms {
-                    let mut message = owned_to_message_with_heap_size(&term, heap_words)?;
-                    if let Some(reference) = alias {
-                        message = message.with_alias(reference);
-                    }
-                    if flags & FLG_PRIO != 0 {
-                        message = message.with_priority();
-                    }
-                    sched
-                        .signal(from, target, Signal::Exit(Box::new(message)))
-                        .map_err(|error| {
-                            VmError::Unsupported(format!("dist altact exit: {error}"))
-                        })?;
-                }
-            }
-        }
-        // Port of dist.c:2885 (DOP_SPAWN_REQUEST) / DOP_SPAWN_REPLY on Port DistCtrlr.
-        29 if parts.len() == 6 && terms.len() == 1 => {
-            handle_spawn_request_port(runtime, handle, local, parts, &terms[0].0)?;
-        }
-        31 | 32 if (parts.len() == 5 && *op == 31) || (parts.len() == 6 && *op == 32) => {
-            // Port of erts/emulator/beam/dist.c:3017-3124 (DOP_SPAWN_REPLY), OTP-29.1.1.
-            dist_spawn_reply(runtime, handle, parts)?;
-        }
-        other => {
-            let _ = other;
-            return Ok(());
-        }
-    }
-    Ok(())
-}
-
-fn owned_to_message(term: &OwnedTerm) -> Result<Message, VmError> {
-    owned_to_message_with_heap_size(term, 256)
-}
-
-fn owned_to_message_with_heap_size(
-    term: &OwnedTerm,
-    heap_words: usize,
-) -> Result<Message, VmError> {
-    let (local, creation) = {
-        let (name, creation) = crate::node_tables::this_node();
-        (name.to_owned(), creation)
-    };
-    let term = internalize_local_node(term.clone(), &local, creation);
-    let mut heap = arinsal_term::ProcessHeap::with_words(heap_words);
-    let term = from_owned(&term, &mut heap).map_err(|_| badarg())?;
-    Message::copy_from(term)
-}
-
-/// Port of erts/emulator/beam/external.c (dec_is_this_node, dec_pid, dec_term), OTP-29.1.1.
-/// Decode peer-encoded local identities as internal pids, ports, and references so they compare
-/// equal to locally created terms.
-fn internalize_local_node(mut term: OwnedTerm, local: &str, local_creation: u32) -> OwnedTerm {
-    match &mut term {
-        OwnedTerm::Pid { node, creation, .. }
-        | OwnedTerm::Port { node, creation, .. }
-        | OwnedTerm::Ref { node, creation, .. }
-            if node.as_str() == local && *creation == local_creation =>
-        {
-            *node = "nonode@nohost".into();
-            *creation = 0;
-        }
-        OwnedTerm::Tuple(parts) => {
-            for part in parts.iter_mut() {
-                let taken = std::mem::replace(part, OwnedTerm::Nil);
-                *part = internalize_local_node(taken, local, local_creation);
-            }
-        }
-        OwnedTerm::List { elems, tail } => {
-            for elem in elems.iter_mut() {
-                let taken = std::mem::replace(elem, OwnedTerm::Nil);
-                *elem = internalize_local_node(taken, local, local_creation);
-            }
-            let taken = std::mem::replace(tail.as_mut(), OwnedTerm::Nil);
-            *tail.as_mut() = internalize_local_node(taken, local, local_creation);
-        }
-        OwnedTerm::Map(entries) => {
-            for (key, value) in entries.iter_mut() {
-                let taken_k = std::mem::replace(key, OwnedTerm::Nil);
-                *key = internalize_local_node(taken_k, local, local_creation);
-                let taken_v = std::mem::replace(value, OwnedTerm::Nil);
-                *value = internalize_local_node(taken_v, local, local_creation);
-            }
-        }
-        OwnedTerm::Fun { pid, free_vars, .. } => {
-            let creator = std::mem::replace(pid.as_mut(), OwnedTerm::Nil);
-            **pid = internalize_local_node(creator, local, local_creation);
-            for value in free_vars.iter_mut() {
-                let taken = std::mem::replace(value, OwnedTerm::Nil);
-                *value = internalize_local_node(taken, local, local_creation);
-            }
-        }
-        OwnedTerm::Record { fields, .. } => {
-            for (_, value) in fields {
-                let taken = std::mem::replace(value, OwnedTerm::Nil);
-                *value = internalize_local_node(taken, local, local_creation);
-            }
-        }
-        _ => {}
-    }
-    term
 }
 
 fn dist_spawn_request(
@@ -1870,8 +1971,8 @@ fn dist_spawn_request(
     }
     // dist.c erts_internal_dist_spawn_request_4: ERTS_DSIG_PREP_NOT_ALIVE and
     // ERTS_DSIG_PREP_NOT_CONNECTED reply `{error, noconnection}` at once.
-    let connection_id = match dsig_prepare(process, ctx, &node)? {
-        DsigPrepare::Connected { connection_id, .. } => connection_id,
+    let (connection_id, mld) = match dsig_prepare(process, ctx, &node)? {
+        DsigPrepare::Connected { connection_id, mld } => (connection_id, mld),
         DsigPrepare::NotAlive | DsigPrepare::NotConnected => {
             return fallback_dist_spawn(vm, process, ctx, args);
         }
@@ -1892,8 +1993,8 @@ fn dist_spawn_request(
     let kind = atom_name(args[3]).ok_or_else(badarg)?;
     let id = arinsal_sched::unique::next_ref_id();
     let reference = crate::signals::reference(process, id)?;
-    let reference_owned = owned(reference)?;
-    let mut tag = OwnedTerm::Atom("spawn_reply".into());
+    let mut tag = Term::atom(arinsal_term::atoms::SPAWN_REPLY);
+    let mut monitor_tag = None;
     let mut monitor = false;
     let mut monitor_priority = false;
     let mut link = false;
@@ -1920,7 +2021,7 @@ fn dist_spawn_request(
                             if kind != "spawn_request" {
                                 return Err(badarg());
                             }
-                            tag = pair[1].clone();
+                            tag = crate::natives::proc::tuple2(original).ok_or_else(badarg)?.1;
                         }
                         OwnedTerm::Atom(name) if name == "reply" => match &pair[1] {
                             // dist.c:5900-5920: ERTS_ML_FLG_SPAWN_NO_SMSG / _NO_EMSG.
@@ -1944,10 +2045,11 @@ fn dist_spawn_request(
                         },
                         OwnedTerm::Atom(name) if name == "monitor" => {
                             monitor = true;
-                            let (_, _, priority) = crate::signals::spawn_monitor_options(
+                            let (down_tag, _, priority) = crate::signals::spawn_monitor_options(
                                 crate::natives::proc::tuple2(original).ok_or_else(badarg)?.1,
                             )
                             .ok_or_else(badarg)?;
+                            monitor_tag = down_tag;
                             monitor_priority = priority;
                             wire_opts.push(OwnedTerm::Atom("monitor".into()));
                         }
@@ -1983,52 +2085,70 @@ fn dist_spawn_request(
         values[1].clone(),
         OwnedTerm::Int(list_owned_len(&values[2]).ok_or_else(badarg)? as i64),
     ]);
-    let control = control(
-        29,
-        vec![
-            reference_owned,
-            local_pid_owned(ctx.pid()),
-            local_pid_owned(ctx.pid()),
-            mfa_control,
-            wire_options,
-        ],
-    );
-    // Port of erts/emulator/beam/dist.c:6112-6120 (erts_internal_dist_spawn_request_4), OTP-29.1.1:
-    // the pending-spawn monitor of the request; its origin is found on exit through the
-    // resource bit (erts: the process monitor tree).
-    let _ =
-        arinsal_sched::proc_flags::publish(ctx.exit_flags(), arinsal_sched::proc_flags::DIST_SPAWN);
-    let request = node_tables::SpawnRequest {
-        caller: ctx.pid(),
-        tag,
-        monitor,
-        monitor_priority,
-        no_success_msg,
-        no_error_msg,
-        abandoned: false,
-        link,
-        link_priority,
-        parent_exiting: false,
-        child: None,
-        waiter: None,
+    // dist.c dsig_send_spawn_request: {DOP_SPAWN_REQUEST, Ref, From, GL, {M,F,A}, Opts}
+    // with the argument list as the payload.
+    // dist.c erts_internal_dist_spawn_request_4: `dsig_send_spawn_request(&ctx, ref,
+    // BIF_P->common.id, BIF_P->group_leader, ...)`, the caller's group leader.
+    let me = ctx.pid();
+    let leader = process.group_leader_pid(me);
+    let group_leader = match remote_pid_term(process, leader)? {
+        Some(remote) => remote,
+        None => local_pid_term(leader),
     };
-    // A node without a table entry gets it from the auto-connect of the first send
-    // (erts_auto_connect, dist.c:3260); no reply can precede the connection, so the request is
-    // registered right after that send in this case.
-    let mut request = Some(request);
+    let mut ctl = CtlHeap::new();
+    let fields = [
+        reference,
+        local_pid_term(me),
+        group_leader,
+        ctl.owned(&mfa_control)?,
+        ctl.owned(&wire_options)?,
+    ];
+    let control = ctl.control(29, &fields)?;
+    let spawn_args = ctl.owned(&values[2])?;
+    // Port of erts/emulator/beam/dist.c:6112-6125 (erts_internal_dist_spawn_request_4),
+    // OTP-29.1.1: the pending-spawn monitor of the request. Its origin half, with `am_pending`
+    // as other item and the reply tag in the monitor, goes into the caller's monitor tree;
+    // its target half into the connection.
+    use crate::monitor_link::node_flag;
+    let mut oflags = node_flag::SPAWN_PENDING;
+    for (set, flag) in [
+        (monitor, node_flag::SPAWN_MONITOR),
+        (link, node_flag::SPAWN_LINK),
+        (link_priority, node_flag::SPAWN_LINK_PRIO),
+        (no_success_msg, node_flag::SPAWN_NO_SMSG),
+        (no_error_msg, node_flag::SPAWN_NO_EMSG),
+        (monitor_priority, node_flag::PRIO_ML),
+    ] {
+        if set {
+            oflags |= flag;
+        }
+    }
+    let info = crate::proc_create::MonitorInfo::new(monitor_tag, None).with_dist_target(
+        crate::proc_create::DistTarget::spawn_pending(reference, tag, mld.clone()),
+    );
+    let (mut origin, target) = crate::monitor_link::Monitor::create(
+        crate::monitor_link::node_type::MONITOR_DIST_PROC,
+        crate::monitor_link::MonitorReference::ordinary(id),
+        me.data(),
+        0,
+        0,
+        info,
+        crate::proc_create::OriginMonitor::Distributed,
+    );
+    origin.add_flags(oflags);
+    process.monitors.insert(origin);
+    if let Err(target) = mld.monitor_insert(target) {
+        // The connection went down after dsig_prepare: its monitor-down reaches this
+        // request as if the target half had been in it.
+        drop(target);
+        emon::send_monitor_down_noconnection(
+            process.runtime.as_ref().ok_or_else(badarg)?.scheduler()?,
+            me,
+            id,
+        );
+    }
     if monitor_priority {
         process.prio_item_added(crate::receive::PrioItemType::Monitor);
-    }
-    {
-        let tables = node_tables::lock();
-        if let Some(mut entry) = tables.entries.get(&node).map(|dep| dep.lock()) {
-            let request = request.take().expect("request present");
-            if let Some(state) = entry.dist.as_mut() {
-                state.spawn_requests.insert(id, request);
-            } else {
-                entry.pending_spawn_requests.insert(id, request);
-            }
-        }
     }
     if let Err(error) = queue_outgoing_on(
         process,
@@ -2036,45 +2156,15 @@ fn dist_spawn_request(
         &node,
         connection_id,
         control,
-        Some(values[2].clone()),
+        Some(spawn_args),
     ) {
-        let removed_priority_monitor = {
-            let tables = node_tables::lock();
-            tables.entries.get(&node).map(|dep| {
-                let mut entry = dep.lock();
-                entry
-                    .pending_spawn_requests
-                    .remove(&id)
-                    .or_else(|| {
-                        entry
-                            .dist
-                            .as_mut()
-                            .and_then(|state| state.spawn_requests.remove(&id))
-                    })
-                    .is_some_and(|request| request.monitor_priority)
-            })
-        };
-        if request
-            .as_ref()
-            .is_some_and(|request| request.monitor_priority)
-            || removed_priority_monitor == Some(true)
-        {
-            process.prio_item_deleted(crate::receive::PrioItemType::Monitor);
+        if let Some(origin) = process.monitors.remove(id) {
+            if origin.view().prio_ml() {
+                process.prio_item_deleted(crate::receive::PrioItemType::Monitor);
+            }
+            emon::release_origin(origin);
         }
         return Err(error);
-    }
-    if let Some(request) = request {
-        let tables = node_tables::lock();
-        let mut entry = tables
-            .entries
-            .get(&node)
-            .map(|dep| dep.lock())
-            .ok_or_else(badarg)?;
-        if let Some(state) = entry.dist.as_mut() {
-            state.spawn_requests.insert(id, request);
-        } else {
-            entry.pending_spawn_requests.insert(id, request);
-        }
     }
     if kind == "spawn_opt" {
         // Port of erts/emulator/beam/dist.c:6076 (ok_result = {Ref, SpawnsMonitor}), OTP-29.1.1.
@@ -2117,26 +2207,26 @@ const DIST_SPAWN_FLAG_MONITOR: u64 = 1 << 1;
 ///
 /// Port of erts/emulator/beam/erl_proc_sig_queue.c (ErtsDistSpawnReplySigData), OTP-29.1.1.
 /// erts builds the reply message on the sending side and patches the tag in on reception;
-/// Arinsal keeps the parts and builds the message on the receiver heap.
+/// Arinsal copies the reference and the result into the signal's heap the same way
+/// (`copy_struct` into `mp->hfrag`) and builds the message tuple on the receiver heap.
 pub(crate) struct DistSpawnReplyData {
     /// The connection the reply arrived on (erts: `dep` plus its connection id).
     handle: u64,
     /// Key of the request reference.
     id: u64,
-    /// `datap->ref`.
-    reference: OwnedTerm,
-    /// The parent as the wire names it, for DOP_DEMONITOR.
-    parent: OwnedTerm,
-    /// `datap->result`: the child pid, or the error atom of a failed spawn.
-    result: OwnedTerm,
+    /// `datap->ref`, in `heap`.
+    reference: Term,
+    /// The parent, for DOP_DEMONITOR.
+    parent: Pid,
+    /// `datap->result`: the child pid in `heap`, or the error atom of a failed spawn.
+    result: Term,
+    /// `mp->hfrag`: the copies of `reference` and `result`.
+    _heap: crate::proc_create::HeapFrag,
     /// The DOP_SPAWN_REPLY flags.
     flags: u64,
     /// `datap->link`: the proc half of the external link to the child of a successful spawn
     /// with link, its dist half already in the connection.
     link: Option<elink::DistLinkHalf>,
-    /// The origin half of the monitor of the child of a successful spawn with monitor, its
-    /// target half already in the connection.
-    monitor_half: Option<emon::DistMonitorHalf>,
 }
 
 impl DistSpawnReplyData {
@@ -2145,21 +2235,19 @@ impl DistSpawnReplyData {
         self.id
     }
 
+    /// `datap->result`: the child pid, or the error atom of a failed spawn.
+    pub(crate) fn result(&self) -> Term {
+        self.result
+    }
+
     /// The spawn succeeded: the result is the child pid.
     pub(crate) fn is_success(&self) -> bool {
-        matches!(self.result, OwnedTerm::Pid { .. })
+        self.result.as_atom().is_none()
     }
 
-    /// The remote monitors the child: the distribution half of the spawn monitor exists.
+    /// The remote monitors the child.
     fn monitor(&self) -> bool {
         self.is_success() && self.flags & DIST_SPAWN_FLAG_MONITOR != 0
-    }
-
-    /// Take the origin half of the spawn monitor.
-    fn take_monitor_half(&self) -> Option<crate::proc_create::ProcessMonitor> {
-        self.monitor_half
-            .as_ref()
-            .and_then(emon::DistMonitorHalf::take_half)
     }
 
     /// Take `datap->link`.
@@ -2175,11 +2263,11 @@ impl DistSpawnReplyData {
 fn dist_spawn_reply(
     runtime: &crate::process::Runtime,
     handle: u64,
-    parts: &[OwnedTerm],
+    parts: &[Term],
 ) -> Result<(), VmError> {
-    let (local, node) = {
+    let node = {
         let tables = node_tables::lock();
-        let node = tables
+        tables
             .entries
             .values()
             .map(|dep| dep.lock())
@@ -2189,67 +2277,63 @@ fn dist_spawn_reply(
                     .as_ref()
                     .is_some_and(|state| state.handle == handle)
             })
-            .map(|entry| entry.name.clone());
-        (crate::node_tables::this_node().0.to_owned(), node)
+            .map(|entry| entry.name.clone())
     };
     let Some(_node) = node else {
         // The connection went down while the reply was routed.
         return Ok(());
     };
-    let Some(parent) = local_pid(&parts[2], &local) else {
-        // Old incarnation of this node.
-        return Ok(());
+    let (reference, parent, flags_term, result) = (parts[1], parts[2], parts[3], parts[4]);
+    let Some(parent_pid) = ctl_internal_pid(parent) else {
+        if ctl_external_pid(parent).is_some() && ctl_is_this_node(parent) {
+            // Old incarnation of this node.
+            return Ok(());
+        }
+        return Err(badarg());
     };
-    let id = remote_ref_id(&parts[1]).ok_or_else(badarg)?;
-    let flags = as_u64(&parts[3]).ok_or_else(badarg)?;
+    let parent = parent_pid;
+    if !ctl_is_internal_ref(reference) {
+        if ctl_is_ref(reference) && ctl_is_this_node(reference) {
+            // Old incarnation of this node.
+            return Ok(());
+        }
+        return Err(badarg());
+    }
+    let id = ctl_ref_id(reference).ok_or_else(badarg)?;
+    let flags = flags_term
+        .as_small()
+        .and_then(|flags| u64::try_from(flags).ok())
+        .ok_or_else(badarg)?;
     if flags >= 1 << 27 {
         return Err(badarg());
     }
-    let result = parts[4].clone();
-    let child = match &result {
-        OwnedTerm::Pid { .. } => Some(remote_proxy(handle, &result)?),
-        OwnedTerm::Atom(_) => None,
-        _ => return Err(badarg()),
-    };
+    let remote_child = ctl_external_pid(result);
+    if remote_child.is_none() && result.as_atom().is_none() {
+        return Err(badarg());
+    }
+    let child = remote_child
+        .map(|remote| remote_proxy(handle, remote))
+        .transpose()?;
     // Successful spawn-link: the link the parent inserts (dist.c DOP_SPAWN_REPLY:
     // erts_link_external_create, erts_link_dist_insert).
-    let link = match child {
-        Some(_) if flags & DIST_SPAWN_FLAG_LINK != 0 => {
-            Some(elink::spawn_reply_link(runtime, handle, parent, &result)?)
+    let link = match remote_child {
+        Some(remote) if flags & DIST_SPAWN_FLAG_LINK != 0 => {
+            Some(elink::spawn_reply_link(runtime, handle, parent, remote)?)
         }
         _ => None,
     };
-    // The spawn monitor of the child: its target half goes into the connection, which erts
-    // does with the request (dist.c erts_internal_dist_spawn_request_4,
-    // erts_monitor_dist_insert), and the parent's origin half travels with the reply.
-    let monitor_half = if child.is_some() && flags & DIST_SPAWN_FLAG_MONITOR != 0 {
-        let (_node, _connection_id, mld) =
-            elink::connection_of_handle(handle).ok_or_else(badarg)?;
-        let origin = emon::create_origin_or_down(
-            runtime,
-            None,
-            crate::monitor_link::MonitorReference::ordinary(id),
-            parent,
-            crate::proc_create::MonitorInfo::default(),
-            crate::proc_create::DistTarget {
-                target: result.clone(),
-                reference: parts[1].clone(),
-                dist: mld,
-            },
-        )?;
-        Some(emon::DistMonitorHalf::new(origin))
-    } else {
-        None
-    };
+    // erl_proc_sig_queue.c erts_proc_sig_send_dist_spawn_reply: ref and result copied into
+    // the signal's heap fragment.
+    let (heap, [reference, result]) = crate::proc_create::HeapFrag::copy([reference, result]);
     let data = std::sync::Arc::new(DistSpawnReplyData {
         handle,
         id,
-        reference: parts[1].clone(),
-        parent: parts[2].clone(),
+        reference,
+        parent,
         result,
+        _heap: heap,
         flags,
         link,
-        monitor_half,
     });
     // Ordered against signals from the spawned process; a failed spawn is ordered from the
     // spawn service (erl_proc_sig_queue.c:3337-3352).
@@ -2269,171 +2353,255 @@ fn dist_spawn_reply(
     Ok(())
 }
 
+/// A `DOP_SPAWN_REQUEST[_TT]` queued toward a pending connection whose peer turned out not to
+/// support distributed spawn: decode its control message and answer the spawning process with
+/// `notsup`.
+// Port of erts/emulator/beam/external.c (transcode_dist_obuf: transcode_decode_ctl_msg,
+// erts_proc_sig_send_dist_spawn_reply(dep->sysname, ref, pid, NULL, am_notsup, token)),
+// OTP-29.1.1.
+fn transcode_spawn_notsup(runtime: &crate::process::Runtime, handle: u64, ctl: &[u8]) {
+    use crate::natives::external_dist::{
+        ERTS_DIST_EXT_DFLAG_HDR, ErtsDistExternal, ErtsDistExternalData, erts_decode_dist_ext,
+        erts_decode_dist_ext_size,
+    };
+    let mut edep = ErtsDistExternal {
+        data: ErtsDistExternalData {
+            extp: 0,
+            ext_endp: ctl.len(),
+            binp: ctl.into(),
+        },
+        flags: ERTS_DIST_EXT_DFLAG_HDR,
+        connection_id: 0,
+        heap_size: -1,
+        dep: arinsal_term::atoms::NONAME,
+        attab: Box::default(),
+        size_state: Default::default(),
+    };
+    // This node encoded the control message, so it decodes.
+    let Ok(hsz) = usize::try_from(erts_decode_dist_ext_size(None, &mut edep, false)) else {
+        return;
+    };
+    let mut heap = arinsal_term::message::NodeFragment::new_message_buffer(hsz);
+    let ctl_msg = {
+        let mut target = heap.fragment_mut();
+        let Ok(mut factory) = arinsal_term::HeapReservation::new(&mut target, hsz) else {
+            return;
+        };
+        erts_decode_dist_ext(None, &mut factory, &mut edep, false)
+    };
+    let Some(tuple) = ctl_msg.and_then(|ctl| arinsal_term::raw::Tuple::try_from(ctl).ok()) else {
+        return;
+    };
+    // {DOP_SPAWN_REPLY, Ref, Pid, 0, notsup}: the reply handling of dist_spawn_reply with an
+    // error result inserts no link or monitor and only signals the parent.
+    let (Some(reference), Some(pid), Ok(notsup)) =
+        (tuple.get(1), tuple.get(2), atom_term("notsup"))
+    else {
+        return;
+    };
+    let parts = [
+        Term::small(31).unwrap_or(Term::NIL),
+        reference,
+        pid,
+        Term::small(0).unwrap_or(Term::NIL),
+        notsup,
+    ];
+    let _ = dist_spawn_reply(runtime, handle, &parts);
+    drop(heap);
+}
+
 /// erts_proc_sig_send_dist_spawn_reply failed: the parent left the process table. A
 /// monitored child is demonitored, and for a spawn with link the result is saved so the
 /// terminating parent can send the child an exit signal with the correct exit reason.
 ///
 /// Port of erts/emulator/beam/dist.c:3090-3121 (DOP_SPAWN_REPLY), OTP-29.1.1. The link half
-/// was never inserted in a process, so there is nothing to release.
+/// was never inserted in a process; it is released with the reply data.
 pub(crate) fn spawn_reply_send_failed(
     runtime: &crate::process::Runtime,
     data: &DistSpawnReplyData,
 ) {
     if data.monitor() {
-        spawn_reply_drop_monitor(data);
         spawn_reply_demonitor(
             runtime,
             data.handle,
-            &data.parent,
-            &data.result,
-            &data.reference,
+            data.parent,
+            data.result,
+            data.reference,
         );
     }
-    if data.flags & DIST_SPAWN_FLAG_LINK != 0 {
-        dist_pend_spawn_exit_save_child_result(data.handle, data.id, &data.result);
+    if data.flags & DIST_SPAWN_FLAG_LINK != 0
+        && let Some((_node, _connection_id, mld)) = elink::connection_of_handle(data.handle)
+    {
+        dist_pend_spawn_exit_save_child_result(data.result, data.reference, data.id, &mld);
     }
+}
+
+/// The `am_pending` other item of a spawn request still waiting for its reply.
+fn is_pending(item: Term) -> bool {
+    item == Term::atom(arinsal_term::atoms::PENDING)
+}
+
+/// The distribution target of a pending-spawn monitor half.
+fn spawn_target<'a>(
+    monitor: crate::monitor_link::MonitorRef<
+        'a,
+        crate::proc_create::MonitorInfo,
+        crate::proc_create::OriginMonitor,
+        crate::proc_create::MonitorSignal,
+    >,
+) -> &'a crate::proc_create::DistTarget {
+    monitor
+        .info()
+        .dist_target()
+        .expect("a pending-spawn monitor has a distribution target")
 }
 
 /// Store the result of a spawn with link for its terminating parent and resume the parent if
 /// it suspended waiting for it. A parent that did not reach its pending-spawn phase yet finds
-/// the result in its request.
+/// the result in a record monitor in `dist_pend_spawn_exit`.
 ///
 /// Port of erts/emulator/beam/dist.c:552-640 (dist_pend_spawn_exit_save_child_result),
 /// OTP-29.1.1: erts_resume after `dist->mtx` is released.
-fn dist_pend_spawn_exit_save_child_result(handle: u64, id: u64, result: &OwnedTerm) {
-    let resume = {
-        let dep = node_tables::lock().dep_by_handle(handle);
-        let mut entry = dep.as_ref().map(|dep| dep.lock());
-        let Some(state) = entry
-            .as_mut()
-            .and_then(|entry| entry.dist.as_mut())
-            .filter(|state| state.handle == handle)
-        else {
-            // !dist->alive
-            return;
-        };
-        state.spawn_requests.get_mut(&id).and_then(|request| {
-            if request.child.is_none() {
-                request.child = Some(result.clone());
-            }
-            request.waiter.take()
-        })
-    };
-    drop(resume);
-}
-
-/// Take the live pending request `id` of `parent`: the spawn-pending origin monitor of
-/// handle_dist_spawn_reply (erl_proc_sig_queue.c:5706 erts_monitor_tree_lookup with
-/// ERTS_ML_FLG_SPAWN_PENDING). A request already moved aside by the exiting parent is not
-/// live.
-pub(crate) fn take_spawn_request(parent: Pid, id: u64) -> Option<node_tables::SpawnRequest> {
-    let tables = node_tables::lock();
-    for mut entry in tables.entries.values().map(|dep| dep.lock()) {
-        let pending = &mut entry.pending_spawn_requests;
-        if pending
-            .get(&id)
-            .is_some_and(|request| request.caller == parent && !request.parent_exiting)
-        {
-            return pending.remove(&id);
-        }
-        if let Some(state) = entry.dist.as_mut()
-            && state
-                .spawn_requests
-                .get(&id)
-                .is_some_and(|request| request.caller == parent && !request.parent_exiting)
-        {
-            return state.spawn_requests.remove(&id);
-        }
-    }
-    None
-}
-
-/// The reply needs no monitor: release the distribution half the reply handler created
-/// (erl_proc_sig_queue.c:5866-5880, `erts_monitor_dist_delete` without a demonitor signal).
-pub(crate) fn spawn_reply_drop_monitor(data: &DistSpawnReplyData) {
-    if let Some(origin) = data.take_monitor_half() {
-        emon::release_origin(origin);
-    }
-}
-
-/// Install the origin half of a successful monitored spawn in the caller's monitor tree.
-///
-/// Port of erts/emulator/beam/erl_proc_sig_queue.c:5740-5878
-/// (handle_dist_spawn_reply), OTP-29.1.1.
-pub(crate) fn spawn_reply_install_origin_monitor(
-    process: &mut Process,
-    data: &DistSpawnReplyData,
-    priority: bool,
+fn dist_pend_spawn_exit_save_child_result(
+    result: Term,
+    reference: Term,
+    id: u64,
+    dist: &std::sync::Arc<crate::monitor_link::MonLnkDist>,
 ) {
-    if let Some(origin) = data.take_monitor_half() {
-        let mut origin = origin;
-        origin.set_priority(priority);
-        process.cold_mut().dist_monitors.insert(data.id);
-        process.monitors.insert(origin);
+    let mut new_mdp: Option<crate::proc_create::ProcessMonitor> = None;
+    let mut resume = None;
+    loop {
+        let done = dist
+            .with_pend_spawn_exit(|tree: &mut crate::proc_create::MonitorTree| {
+                match tree.get(id) {
+                    None => match new_mdp.take() {
+                        Some(record) => {
+                            // Save info so the parent can get the child pid when handling
+                            // links during termination.
+                            tree.insert(record);
+                            true
+                        }
+                        None => false,
+                    },
+                    Some(monitor) => {
+                        // The terminating parent is waiting for this signal: store the
+                        // child's pid and resume the parent if it has suspended.
+                        let target = spawn_target(monitor);
+                        target.set_item(result);
+                        resume = target.swap_waiter(None);
+                        true
+                    }
+                }
+            })
+            // !dist->alive
+            .unwrap_or(true);
+        if done {
+            break;
+        }
+        // No monitor previously saved by the parent; create one and store the child pid.
+        let info = crate::proc_create::MonitorInfo::default().with_dist_target(
+            crate::proc_create::DistTarget::new(result, reference, dist.clone()),
+        );
+        let (origin, target) = crate::monitor_link::Monitor::create(
+            crate::monitor_link::node_type::MONITOR_DIST_PROC,
+            crate::monitor_link::MonitorReference::ordinary(id),
+            0,
+            0,
+            0,
+            info,
+            crate::proc_create::OriginMonitor::Distributed,
+        );
+        drop(origin);
+        new_mdp = Some(target);
     }
+    drop(resume);
+    drop(new_mdp);
 }
 
-/// Mark the live pending request `id` of `parent` abandoned, or drop it when it has no link.
-/// Returns false when `id` is not an outstanding request of `parent`.
+/// Mark the outstanding spawn request `id` of `process` abandoned, or drop it when it has no
+/// link. Returns false when `id` is not an outstanding request of `process`.
 ///
 /// Port of erts/emulator/beam/bif.c:1166 (spawn_request_abandon_1), OTP-29.1.1, for a
-/// distributed request: one with link is left for the reply, which sends the child an
-/// `abandoned` exit (erl_proc_sig_queue.c:5786-5830).
-pub(crate) fn spawn_request_abandon(process: &mut Process, parent: Pid, id: u64) -> bool {
-    let monitor_priority = {
-        let tables = node_tables::lock();
-        let mut result = None;
-        'entries: for dep in tables.entries.values() {
-            let mut guard = dep.lock();
-            let entry = &mut *guard;
-            let connected = entry.dist.as_mut().map(|state| &mut state.spawn_requests);
-            for requests in std::iter::once(&mut entry.pending_spawn_requests).chain(connected) {
-                let Some(request) = requests.get_mut(&id) else {
-                    continue;
-                };
-                if request.caller != parent || request.parent_exiting || request.abandoned {
-                    break 'entries;
-                }
-                let monitor_priority = request.monitor_priority;
-                if request.link {
-                    // bif.c clears PRIO_ML but retains the pending linked request for its reply.
-                    request.abandoned = true;
-                    request.monitor_priority = false;
-                } else {
-                    requests.remove(&id);
-                }
-                result = Some(monitor_priority);
-                break 'entries;
-            }
-        }
-        result
-    };
-    let Some(monitor_priority) = monitor_priority else {
+/// distributed request.
+pub(crate) fn spawn_request_abandon(process: &mut Process, id: u64) -> bool {
+    use crate::monitor_link::node_flag;
+    let Some(flags) = process.monitors.get(id).map(|omon| omon.flags()) else {
         return false;
     };
-    if monitor_priority {
+    if flags & (node_flag::SPAWN_PENDING | node_flag::SPAWN_ABANDONED) != node_flag::SPAWN_PENDING
+        || flags & node_flag::TARGET != 0
+    {
+        // Not an outstanding spawn_request of this process.
+        return false;
+    }
+    if flags & node_flag::SPAWN_LINK != 0 {
+        // Leave it for the reply.
+        if let Some(mut omon) = process.monitors.get_mut(id) {
+            omon.update_flags(node_flag::SPAWN_ABANDONED, node_flag::PRIO_ML);
+        }
+    } else if let Some(origin) = process.monitors.remove(id) {
+        // We don't need it anymore; remove it.
+        emon::release_origin(origin);
+    }
+    if flags & node_flag::PRIO_ML != 0 {
         process.prio_item_deleted(crate::receive::PrioItemType::Monitor);
     }
     true
+}
+
+/// The reply tag in the shared data `info` of a pending-spawn monitor (`mdep->u.name`).
+pub(crate) fn spawn_reply_tag_of(info: &crate::proc_create::MonitorInfo) -> Term {
+    info.dist_target()
+        .and_then(crate::proc_create::DistTarget::reply_tag)
+        .unwrap_or(Term::atom(arinsal_term::atoms::SPAWN_REPLY))
+}
+
+/// The reply tag of a pending-spawn monitor the process still holds, copied to its heap
+/// (`get_heap_frag_eterm(&tag_hfrag, &mdep->u.name)`).
+pub(crate) fn spawn_reply_tag(process: &mut Process, tag: Term) -> Result<Term, VmError> {
+    copy_term(tag, &mut process.heap).map_err(|_| badarg())
 }
 
 /// The `{Tag, Ref, ok|error, Pid|ErrorAtom}` reply message on the parent's heap
 /// (erl_proc_sig_queue.c:5741 patch point plus convert_prepared_sig_to_msg).
 pub(crate) fn spawn_reply_message(
     process: &mut Process,
-    tag: &OwnedTerm,
+    tag: Term,
     data: &DistSpawnReplyData,
 ) -> Result<Term, VmError> {
     let status = if data.is_success() { "ok" } else { "error" };
     // The reference is the request's own local reference (erts `ref` of the spawn request):
     // an owned remote-style copy would not compare equal to it with `=:=`.
     let reference = crate::signals::reference(process, data.id)?;
-    let tag = from_owned(tag, &mut process.heap).map_err(|_| badarg())?;
-    let result = from_owned(&data.result, &mut process.heap).map_err(|_| badarg())?;
+    let result = copy_term(data.result, &mut process.heap).map_err(|_| badarg())?;
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
         .tuple(&[tag, reference, crate::atom_cache::put(status), result])
         .map_err(|_| badarg())
+}
+
+/// The `{Tag, Ref, error, Reason}` message of a pending-spawn monitor whose connection went
+/// down, on the parent's heap.
+///
+/// Port of erts/emulator/beam/erl_proc_sig_queue.c:4864-4900 (convert_to_down_message for a
+/// spawn-pending monitor), OTP-29.1.1.
+pub(crate) fn spawn_down_message(
+    process: &mut Process,
+    info: &crate::proc_create::MonitorInfo,
+    id: u64,
+    reason: Term,
+) -> Result<Term, VmError> {
+    let tag = spawn_reply_tag(process, spawn_reply_tag_of(info))?;
+    let reference = crate::signals::reference(process, id)?;
+    tuple(
+        process,
+        vec![
+            tag,
+            reference,
+            Term::atom(arinsal_term::atoms::ERROR),
+            reason,
+        ],
+    )
 }
 
 /// The child term of a successful reply on the parent's heap, for the `link` trace event.
@@ -2441,91 +2609,81 @@ pub(crate) fn spawn_reply_child_term(
     process: &mut Process,
     data: &DistSpawnReplyData,
 ) -> Result<Term, VmError> {
-    from_owned(&data.result, &mut process.heap).map_err(|_| badarg())
+    copy_term(data.result, &mut process.heap).map_err(|_| badarg())
+}
+
+/// `erts_dist_pend_spawn_exit_delete(&mdp->u.target)`: take the target half of `origin` out of
+/// `dist_pend_spawn_exit`, when the connection is alive and holds it.
+// Port of erts/emulator/beam/dist.c:641 (erts_dist_pend_spawn_exit_delete), OTP-29.1.1.
+fn dist_pend_spawn_exit_delete(
+    origin: &crate::proc_create::ProcessMonitor,
+) -> Option<crate::proc_create::ProcessMonitor> {
+    let view = origin.view();
+    let dist = spawn_target(view).dist.clone();
+    let id = view.reference();
+    dist.with_pend_spawn_exit(|tree: &mut crate::proc_create::MonitorTree| tree.remove(id))
+        .flatten()
 }
 
 /// Handle a spawn reply that reaches its parent while the parent is exiting: a monitored child
 /// is demonitored and a linked child gets the parent's exit reason, or `abandoned`.
 ///
 /// Port of erts/emulator/beam/erl_proc_sig_queue.c:5927 (handle_dist_spawn_reply_exiting),
-/// OTP-29.1.1. The pending-spawn monitors were moved aside by
-/// [`pend_spawn_exit_parent_setup`] in the monitors phase before this runs.
+/// OTP-29.1.1, on the `pend_spawn_monitors` of the exit context.
 pub(crate) fn handle_dist_spawn_reply_exiting(
     runtime: &crate::process::Runtime,
     parent: Pid,
     reason: Term,
     shared: &arinsal_sched::SharedPayload,
+    pend_spawn_monitors: &mut crate::proc_create::MonitorTree,
 ) {
+    use crate::monitor_link::node_flag;
     let Some(data) = shared.0.downcast_ref::<DistSpawnReplyData>() else {
         return;
     };
-    // erts_monitor_tree_lookup(pe_ctxt_p->pend_spawn_monitors) with
-    // erts_dist_pend_spawn_exit_delete: `connected` is false when the connection closed.
-    let found = {
-        let tables = node_tables::lock();
-        let mut found = None;
-        for mut entry in tables.entries.values().map(|dep| dep.lock()) {
-            if entry
-                .pending_spawn_requests
-                .get(&data.id)
-                .is_some_and(|request| request.caller == parent && request.parent_exiting)
-            {
-                found = entry
-                    .pending_spawn_requests
-                    .remove(&data.id)
-                    .map(|request| (request, false));
-                break;
-            }
-            if let Some(state) = entry.dist.as_mut()
-                && state
-                    .spawn_requests
-                    .get(&data.id)
-                    .is_some_and(|request| request.caller == parent && request.parent_exiting)
-            {
-                let connected = state.handle == data.handle;
-                found = state
-                    .spawn_requests
-                    .remove(&data.id)
-                    .map(|request| (request, connected));
-                break;
-            }
-        }
-        found
-    };
-    let Some((mut request, connected)) = found else {
-        // May happen when the connection concurrently closed.
-        spawn_reply_drop_monitor(data);
+    let Some(omon) = pend_spawn_monitors.remove(data.id) else {
+        // May happen when the connection concurrently closed; the link is released with the
+        // reply data.
         return;
     };
-    if let Some(waiter) = request.waiter.take() {
+    let flags = omon.view().flags();
+    // `None`: the connection closed or is closing.
+    let target = dist_pend_spawn_exit_delete(&omon);
+    if let Some(waiter) = spawn_target(omon.view()).swap_waiter(None) {
         // The parent runs this itself; it is not suspended on the request.
         waiter.cancel();
     }
-    if !data.is_success() {
-        return;
+    if data.is_success() {
+        if flags & node_flag::SPAWN_MONITOR != 0 && target.is_some() {
+            // erts_proc_exit_dist_demonitor on the connection the monitor was made on.
+            let dist = spawn_target(omon.view()).dist.clone();
+            let mut ctl = CtlHeap::new();
+            if let Ok(control) =
+                ctl.control(20, &[local_pid_term(parent), data.result, data.reference])
+            {
+                elink::send_on_connection(
+                    runtime,
+                    dist.nodename,
+                    dist.connection_id,
+                    control,
+                    None,
+                );
+            }
+        }
+        if let Some(link) = data.link() {
+            // erts_proc_exit_handle_link: the link exit carries the actual reason, unless the
+            // operation was abandoned.
+            let reason = if flags & node_flag::SPAWN_ABANDONED != 0 {
+                Term::atom(arinsal_term::atoms::ABANDONED)
+            } else {
+                reason
+            };
+            proc_exit_handle_link(Some(runtime), parent, link, reason);
+        }
     }
-    if request.monitor && connected {
-        // erts_proc_exit_dist_demonitor.
-        spawn_reply_drop_monitor(data);
-        spawn_reply_demonitor(
-            runtime,
-            data.handle,
-            &data.parent,
-            &data.result,
-            &data.reference,
-        );
-    } else {
-        spawn_reply_drop_monitor(data);
-    }
-    if let Some(link) = data.link() {
-        // erts_proc_exit_handle_link: the link exit carries the actual reason, unless the
-        // operation was abandoned.
-        let reason = if request.abandoned {
-            Term::atom(arinsal_term::atoms::ABANDONED)
-        } else {
-            reason
-        };
-        proc_exit_handle_link(Some(runtime), parent, link, reason);
+    match target {
+        Some(target) => crate::proc_create::ProcessMonitor::release_both(omon, target),
+        None => drop(omon),
     }
 }
 
@@ -2534,32 +2692,66 @@ pub(crate) fn handle_dist_spawn_reply_exiting(
 fn spawn_reply_demonitor(
     runtime: &crate::process::Runtime,
     handle: u64,
-    parent: &OwnedTerm,
-    child: &OwnedTerm,
-    reference: &OwnedTerm,
+    parent: Pid,
+    child: Term,
+    reference: Term,
 ) {
-    let control = control(20, vec![parent.clone(), child.clone(), reference.clone()]);
+    let mut ctl = CtlHeap::new();
+    let Ok(control) = ctl.control(20, &[local_pid_term(parent), child, reference]) else {
+        return;
+    };
     let _ = emit_control_message_on_handle(runtime, handle, control, None);
 }
 
-/// Pending-spawn monitors of an exiting parent are moved aside: replies that arrive from now
-/// on are saved for the parent instead of delivered.
+/// The MONITORS phase of an exiting parent meets a pending-spawn origin monitor: move the
+/// target half from the connection to `dist_pend_spawn_exit`, where a reply that arrives from
+/// now on stores the child for this process. Returns false when the monitor is to be dropped:
+/// the connection is closing, or the spawn already failed.
 ///
-/// Port of erts/emulator/beam/erl_process.c:13932-13935 (proc_exit_handle_monitors) and
-/// dist.c:665 (erts_dist_pend_spawn_exit_parent_setup), OTP-29.1.1.
-pub(crate) fn pend_spawn_exit_parent_setup(parent: Pid) {
-    let tables = node_tables::lock();
-    for dep in tables.entries.values() {
-        let mut guard = dep.lock();
-        let entry = &mut *guard;
-        let pending = entry.pending_spawn_requests.values_mut();
-        let connected = entry
-            .dist
-            .iter_mut()
-            .flat_map(|state| state.spawn_requests.values_mut());
-        for request in pending.chain(connected) {
-            if request.caller == parent {
-                request.parent_exiting = true;
+/// Port of erts/emulator/beam/dist.c:665 (erts_dist_pend_spawn_exit_parent_setup),
+/// OTP-29.1.1.
+pub(crate) fn pend_spawn_exit_parent_setup(origin: &crate::proc_create::ProcessMonitor) -> bool {
+    let target = spawn_target(origin.view());
+    let dist = target.dist.clone();
+    let id = origin.view().reference();
+    let Some(target_half) = dist.monitor_delete_other(origin) else {
+        return false;
+    };
+    let mut target_half = Some(target_half);
+    loop {
+        // `mdp->u.target.other.ptr = NULL`
+        if let Some(waiter) = target.swap_waiter(None) {
+            waiter.cancel();
+        }
+        let found = dist.with_pend_spawn_exit(|tree: &mut crate::proc_create::MonitorTree| {
+            let found = tree.remove(id);
+            if found.is_none()
+                && let Some(half) = target_half.take()
+            {
+                tree.insert(half);
+            }
+            found
+        });
+        match found {
+            None => {
+                // !dist->alive
+                drop(target_half);
+                return false;
+            }
+            Some(None) => return true,
+            Some(Some(record)) => {
+                // The child had responded: copy its pid, then store the original target end.
+                let item = spawn_target(record.view()).target();
+                drop(record);
+                if item.as_atom().is_some() {
+                    // The spawn failed; drop it.
+                    drop(target_half);
+                    return false;
+                }
+                // A result already stored means the peer sent more than one response.
+                if is_pending(target.target()) {
+                    target.set_item(item);
+                }
             }
         }
     }
@@ -2573,187 +2765,90 @@ pub(crate) enum PendSpawnExit {
     Wait,
 }
 
-/// Handle the pending-spawn monitors of exiting `parent`: drop those without link, send the
-/// link exit to every child whose pid is known, and suspend on `waiter` for the others.
-/// Without a waiter (a synchronous exit that cannot suspend) those are dropped.
+/// Handle the pending-spawn monitors of exiting `parent`, in tree order: drop those without
+/// link, send the link exit to every child whose pid is known, and suspend on `waiter` at the
+/// first one still pending. Without a waiter (a synchronous exit that cannot suspend) a
+/// pending one is dropped.
 ///
 /// Port of erts/emulator/beam/erl_process.c:13647-13780 (proc_exit_handle_pend_spawn_monitors)
 /// with dist.c:641 (erts_dist_pend_spawn_exit_delete) and dist.c:758-790
-/// (erts_dist_pend_spawn_exit_parent_wait), OTP-29.1.1. The table lock is erts' `dist->mtx`:
-/// the suspend is recorded under it, so a reply cannot slip between test and suspend.
+/// (erts_dist_pend_spawn_exit_parent_wait), OTP-29.1.1. The suspend is recorded under
+/// `dist->mtx`, so a reply cannot slip between test and suspend. The monitor being waited
+/// for stays first in the tree (erts: `wait_pend_spawn_monitor`).
 pub(crate) fn pend_spawn_exit(
     runtime: &crate::process::Runtime,
     parent: Pid,
     reason: Term,
     waiter: Option<&arinsal_sched::ExitWaiter<Process>>,
+    pend_spawn_monitors: &mut crate::proc_create::MonitorTree,
 ) -> PendSpawnExit {
-    let mut exits: Vec<(u64, OwnedTerm, bool, bool)> = Vec::new();
-    let mut wait = false;
-    let (local_name, local_creation) = {
-        let tables = node_tables::lock();
-        let local = (
-            crate::node_tables::this_node().0.to_owned(),
-            crate::node_tables::this_node().1,
-        );
-        for mut entry in tables.entries.values().map(|dep| dep.lock()) {
-            let mut visit = |connection: Option<(u64, bool)>,
-                             requests: &mut std::collections::BTreeMap<
-                u64,
-                node_tables::SpawnRequest,
-            >| {
-                requests.retain(|_, request| {
-                    if request.caller != parent || !request.parent_exiting {
-                        return true;
-                    }
-                    if !request.link {
-                        // Just cleanup.
-                        return false;
-                    }
-                    match request.child.take() {
-                        // A failed spawn (an atom) needs no exit signal.
-                        Some(child) => {
-                            let is_pid = matches!(child, OwnedTerm::Pid { .. });
-                            if let (Some((handle, exit_payload)), true) = (connection, is_pid) {
-                                exits.push((handle, child, exit_payload, request.abandoned));
-                            }
-                            false
-                        }
-                        None => match waiter {
-                            Some(waiter) => {
-                                // `erts_suspend` plus `mdp->u.target.other.ptr = c_p`; a
-                                // waiter already stored from an earlier pass stays.
-                                if request.waiter.is_none() {
-                                    request.waiter = Some(waiter.clone());
-                                }
-                                wait = true;
-                                true
-                            }
-                            None => false,
-                        },
-                    }
-                });
-            };
-            visit(None, &mut entry.pending_spawn_requests);
-            if let Some(state) = entry.dist.as_mut() {
-                let exit_payload = state.flags & node_tables::DFLAG_EXIT_PAYLOAD != 0;
-                visit(
-                    Some((state.handle, exit_payload)),
-                    &mut state.spawn_requests,
-                );
+    use crate::monitor_link::node_flag;
+    let ids: Vec<u64> = pend_spawn_monitors.iter().map(|m| m.reference()).collect();
+    for id in ids {
+        let Some(view) = pend_spawn_monitors.get(id) else {
+            continue;
+        };
+        let flags = view.flags();
+        let target = spawn_target(view);
+        let dist = target.dist.clone();
+        if flags & node_flag::SPAWN_LINK == 0 {
+            // Just cleanup.
+            if let Some(omon) = pend_spawn_monitors.remove(id) {
+                match dist_pend_spawn_exit_delete(&omon) {
+                    Some(target) => crate::proc_create::ProcessMonitor::release_both(omon, target),
+                    None => drop(omon),
+                }
             }
+            continue;
         }
-        local
-    };
-    if !exits.is_empty()
-        && let Ok(reason) = to_owned(reason)
-    {
-        let reason = node_tables::relabel_local_node(reason, &local_name, local_creation);
-        let abandoned = OwnedTerm::Atom("abandoned".into());
-        let from = OwnedTerm::Pid {
-            node: local_name.clone(),
-            id: parent.number(),
-            serial: parent.serial(),
-            creation: local_creation,
-        };
-        for (handle, child, exit_payload, was_abandoned) in exits {
-            // erl_process.c:13715: ERTS_ML_FLG_SPAWN_ABANDONED exits the child with `abandoned`.
-            let reason = if was_abandoned { &abandoned } else { &reason };
-            // erts_dsig_send_exit_tt (dist.c:1773), as `forward_link_exit_if_proxy` encodes a
-            // link exit; a connection that went away in between drops it, as the
-            // connection-id test of erl_process.c:13722 does.
-            let (control, payload) = if exit_payload {
-                (control(24, vec![from.clone(), child]), Some(reason.clone()))
+        // erts_dist_pend_spawn_exit_parent_wait: > 0 the child pid is in the monitor, 0 the
+        // connection is not alive, < 0 suspended.
+        let code = dist.with_pend_spawn_exit(|tree: &mut crate::proc_create::MonitorTree| {
+            if !is_pending(target.target()) {
+                Ok(tree.remove(id))
+            } else if let Some(waiter) = waiter {
+                // `mdp->u.target.other.ptr = c_p` plus `erts_suspend`.
+                if let Some(old) = target.swap_waiter(Some(waiter.clone())) {
+                    old.cancel();
+                }
+                Err(())
             } else {
-                (control(3, vec![from.clone(), child, reason.clone()]), None)
+                // A synchronous exit cannot suspend: drop it.
+                Ok(tree.remove(id))
+            }
+        });
+        let (alive, target_half) = match code {
+            Some(Err(())) => return PendSpawnExit::Wait,
+            Some(Ok(target_half)) => (true, target_half),
+            None => (false, None),
+        };
+        let Some(omon) = pend_spawn_monitors.remove(id) else {
+            continue;
+        };
+        let item = spawn_target(omon.view()).target();
+        // An atom: the spawn failed; `am_pending`: dropped without a result.
+        if alive && let Some(child) = ctl_external_pid(item) {
+            let reason = if flags & node_flag::SPAWN_ABANDONED != 0 {
+                Term::atom(arinsal_term::atoms::ABANDONED)
+            } else {
+                reason
             };
-            let _ = emit_control_message_on_handle(runtime, handle, control, payload);
+            // erts_dsig_send_exit_tt when `dist->connection_id` is still the connection's.
+            elink::send_exit(
+                runtime,
+                dist.nodename,
+                dist.connection_id,
+                parent,
+                child,
+                reason,
+            );
+        }
+        match target_half {
+            Some(target) => crate::proc_create::ProcessMonitor::release_both(omon, target),
+            None => drop(omon),
         }
     }
-    if wait {
-        PendSpawnExit::Wait
-    } else {
-        PendSpawnExit::Done
-    }
-}
-
-fn handle_spawn_request(
-    _vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
-    handle: u64,
-    parts: &[OwnedTerm],
-    arguments: &OwnedTerm,
-) -> Result<(), VmError> {
-    // Port of erts/emulator/beam/dist.c:2885 (DOP_SPAWN_REQUEST), OTP-29.1.1.
-    let reference = parts[1].clone();
-    let from = parts[2].clone();
-    let mfa = &parts[4];
-    let options = &parts[5];
-    let local_name = node_tables::this_node().0.to_owned();
-    let local_creation = node_tables::this_node().1;
-    let arguments = internalize_local_node(arguments.clone(), &local_name, local_creation);
-    let (module, function, arity) = match mfa {
-        OwnedTerm::Tuple(items) if items.len() == 3 => (&items[0], &items[1], &items[2]),
-        _ => return Err(badarg()),
-    };
-    let (OwnedTerm::Atom(_), OwnedTerm::Atom(_)) = (module, function) else {
-        return Err(badarg());
-    };
-    if as_u64(arity) != list_owned_len(&arguments).map(|n| n as u64) {
-        return Err(badarg());
-    }
-    let (OwnedTerm::List { .. } | OwnedTerm::Nil) = &arguments else {
-        return Err(badarg());
-    };
-    let monitor = spawn_opts_want_monitor(options);
-    let link = spawn_opts_want_link(options);
-    let mut result = OwnedTerm::Atom("badopt".into());
-    let mut child_to_schedule = None;
-    if spawn_opts_acceptable(options) {
-        let OwnedTerm::Atom(module) = module else {
-            return Err(badarg());
-        };
-        let OwnedTerm::Atom(function) = function else {
-            return Err(badarg());
-        };
-        let args = match &arguments {
-            OwnedTerm::Nil => Vec::new(),
-            OwnedTerm::List { elems, tail } if **tail == OwnedTerm::Nil => elems.clone(),
-            _ => return Err(badarg()),
-        };
-        let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-        // The link of the child still has a proxy origin.
-        let watcher = link.then(|| remote_proxy(handle, &from)).transpose()?;
-        let monitor_origin = spawn_child_monitor_origin(handle, monitor, &from, &reference);
-        let child = runtime.spawn_mfa_unscheduled_watched(
-            module,
-            function,
-            &args,
-            link.then_some(watcher).flatten(),
-            monitor_origin,
-            &from,
-        );
-        if let Ok(child) = child {
-            result = local_pid_owned(child);
-            child_to_schedule = Some(child);
-        }
-    }
-    // Port of erts/emulator/beam/dist.c:1875-1898 (erts_dsig_send_spawn_reply), OTP-29.1.1.
-    let flags = if matches!(result, OwnedTerm::Pid { .. }) {
-        (i64::from(monitor) << 1) | i64::from(link)
-    } else {
-        0
-    };
-    let reply = control(31, vec![reference, from, OwnedTerm::Int(flags), result]);
-    queue_remote_control(process, ctx, handle, reply)?;
-    if let Some(child) = child_to_schedule {
-        process
-            .runtime
-            .as_ref()
-            .ok_or_else(badarg)?
-            .schedule_spawn(child)?;
-    }
-    Ok(())
+    PendSpawnExit::Done
 }
 
 fn spawn_opts_acceptable(options: &OwnedTerm) -> bool {
@@ -2795,28 +2890,58 @@ fn spawn_opts_want_link(options: &OwnedTerm) -> bool {
     }
 }
 
-/// Port DistCtrlr path for DOP_SPAWN_REQUEST (no Vm/Process context).
-fn handle_spawn_request_port(
+// Port of erts/emulator/beam/dist.c:2885 (erts_net_message, DOP_SPAWN_REQUEST), OTP-29.1.1.
+fn handle_spawn_request(
     runtime: &'static crate::process::Runtime,
     handle: u64,
-    local: &str,
-    parts: &[OwnedTerm],
-    arguments: &OwnedTerm,
+    parts: &[Term],
+    mut edep: Box<crate::natives::external_dist::ErtsDistExternal>,
 ) -> Result<(), VmError> {
-    let reference = parts[1].clone();
-    let from = parts[2].clone();
-    let mfa = &parts[4];
-    let options = &parts[5];
-    let local_creation = node_tables::this_node().1;
-    let arguments = internalize_local_node(arguments.clone(), local, local_creation);
-    let (module, function, arity) = match mfa {
-        OwnedTerm::Tuple(items) if items.len() == 3 => (&items[0], &items[1], &items[2]),
-        _ => return Err(badarg()),
-    };
-    let (OwnedTerm::Atom(mod_name), OwnedTerm::Atom(fun_name)) = (module, function) else {
+    use crate::natives::external_dist::{erts_decode_dist_ext, erts_decode_dist_ext_size};
+    let (ref_term, from_term, gl, mfa, opts) = (parts[1], parts[2], parts[3], parts[4], parts[5]);
+    if !ctl_is_ref(ref_term) || ctl_is_internal_ref(ref_term) {
+        return Err(badarg());
+    }
+    let remote = ctl_external_pid(from_term).ok_or_else(badarg)?;
+    if !ctl_is_pid(gl) {
+        return Err(badarg());
+    }
+    let mfa = arinsal_term::raw::Tuple::try_from(mfa).map_err(|_| badarg())?;
+    if mfa.arity() != 3 {
+        return Err(badarg());
+    }
+    let (Some(module), Some(function), Some(arity)) = (
+        mfa.get(0).and_then(Term::as_atom),
+        mfa.get(1).and_then(Term::as_atom),
+        mfa.get(2).and_then(Term::as_small),
+    ) else {
         return Err(badarg());
     };
-    if as_u64(arity) != list_owned_len(&arguments).map(|n| n as u64) {
+    let (Some(mod_name), Some(fun_name)) =
+        (global_atoms().text(module), global_atoms().text(function))
+    else {
+        return Err(badarg());
+    };
+    // The argument list, the payload (erts decodes it on the child's heap in
+    // erts_internal:dist_spawn_init from `so.edep`).
+    let need = erts_decode_dist_ext_size(None, &mut edep, false);
+    if need < 0 {
+        return Err(badarg());
+    }
+    let mut hfrag = arinsal_term::message::NodeFragment::new_message_buffer(need as usize);
+    let arguments = {
+        let mut target = hfrag.fragment_mut();
+        let mut factory =
+            arinsal_term::HeapReservation::new(&mut target, need as usize).map_err(|_| badarg())?;
+        let arguments =
+            erts_decode_dist_ext(None, &mut factory, &mut edep, false).ok_or_else(badarg)?;
+        to_owned(arguments).map_err(|_| badarg())?
+    };
+    drop(hfrag);
+    let reference = to_owned(ref_term).map_err(|_| badarg())?;
+    let from = to_owned(from_term).map_err(|_| badarg())?;
+    let options = &to_owned(opts).map_err(|_| badarg())?;
+    if Some(arity as u64) != list_owned_len(&arguments).map(|n| n as u64) {
         return Err(badarg());
     }
     let monitor = spawn_opts_want_monitor(options);
@@ -2828,11 +2953,11 @@ fn handle_spawn_request_port(
         _ => return Err(badarg()),
     };
     let watcher = if link {
-        Some(remote_proxy(handle, &from)?)
+        Some(remote_proxy(handle, remote)?)
     } else {
         None
     };
-    let monitor_origin = spawn_child_monitor_origin(handle, monitor, &from, &reference);
+    let monitor_origin = spawn_child_monitor_origin(handle, monitor, from_term, ref_term);
     let spawn_result = if spawn_opts_acceptable(options) {
         runtime.spawn_mfa_unscheduled_watched(
             mod_name,
@@ -2862,8 +2987,15 @@ fn handle_spawn_request_port(
     } else {
         0
     };
-    let reply = control(31, vec![reference, from, OwnedTerm::Int(flags), result]);
-    let _ = local;
+    // Port of erts/emulator/beam/dist.c:1875-1898 (erts_dsig_send_spawn_reply), OTP-29.1.1.
+    let mut ctl = CtlHeap::new();
+    let fields = [
+        ctl.owned(&reference)?,
+        ctl.owned(&from)?,
+        Term::small(flags).ok_or_else(badarg)?,
+        ctl.owned(&result)?,
+    ];
+    let reply = ctl.control(31, &fields)?;
     let reply_result = emit_control_message_on_handle(runtime, handle, reply, None);
     if let Some(child) = child_to_schedule {
         runtime.schedule_spawn(child)?;
@@ -2876,26 +3008,24 @@ fn handle_spawn_request_port(
 fn spawn_child_monitor_origin(
     handle: u64,
     monitor: bool,
-    from: &OwnedTerm,
-    reference: &OwnedTerm,
+    from: Term,
+    reference: Term,
 ) -> Option<crate::proc_create::DistOrigin> {
     if !monitor {
         return None;
     }
-    let watcher = elink::external_pid(from)?;
+    let watcher = ctl_external_pid(from)?;
     let (_node, _connection_id, dist) = elink::connection_of_handle(handle)?;
-    Some(crate::proc_create::DistOrigin {
-        watcher,
-        reference: reference.clone(),
-        dist,
-    })
+    Some(crate::proc_create::DistOrigin::new(
+        watcher, reference, dist,
+    ))
 }
 
 fn emit_control_message_on_handle(
     runtime: &crate::process::Runtime,
     handle: u64,
-    control: OwnedTerm,
-    message: Option<OwnedTerm>,
+    control: Term,
+    message: Option<Term>,
 ) -> Result<(), VmError> {
     let dep = node_tables::lock()
         .dep_by_handle(handle)
@@ -2909,26 +3039,18 @@ pub(crate) fn emit_control_message_on_entry(
     runtime: &crate::process::Runtime,
     dep: &node_tables::DistEntry,
     handle: u64,
-    control: OwnedTerm,
-    message: Option<OwnedTerm>,
+    control: Term,
+    message: Option<Term>,
 ) -> Result<(), VmError> {
-    let (local_name, local_creation) = node_tables::this_node();
-    let control = node_tables::relabel_local_node(control, local_name, local_creation);
     let mut entry = dep.lock();
     let state = entry
         .dist
         .as_mut()
         .filter(|state| state.handle == handle)
         .ok_or_else(badarg)?;
-    if let Some(port_id) = state.port_id {
-        let packets = state.encode_term(control, message).map_err(|_| badarg())?;
-        state.written = state.written.saturating_add(1);
-        enqueue_port_output_no_suspend_locked(state, packets);
-        drop(entry);
-        return flush_port_output(runtime, port_id);
-    }
-    state.queue_term(control, message).map_err(|_| badarg())?;
-    Ok(())
+    let kick = dsig_send_no_proc_locked(state, control, message)?;
+    drop(entry);
+    dist_cmd_kick(runtime, kick)
 }
 
 /// Send a process exit to a linked remote PID represented by a scheduler proxy.
@@ -2942,10 +3064,8 @@ pub(crate) fn forward_link_exit_if_proxy(
     if !may_be_proxy() {
         return false;
     }
-    let (remote_watcher, handle, local_name, local_creation, exit_payload) = {
+    let (remote_watcher, handle, exit_payload) = {
         let tables = node_tables::lock();
-        let local_name = crate::node_tables::this_node().0.to_owned();
-        let local_creation = crate::node_tables::this_node().1;
         let Some(mut entry) = tables.entries.values().map(|dep| dep.lock()).find(|entry| {
             entry
                 .dist
@@ -2961,27 +3081,24 @@ pub(crate) fn forward_link_exit_if_proxy(
         (
             remote_watcher,
             state.handle,
-            local_name,
-            local_creation,
             state.flags & node_tables::DFLAG_EXIT_PAYLOAD != 0,
         )
     };
-    let Ok(reason) = to_owned(reason) else {
+    let local = local_pid_term(deceased);
+    let mut ctl = CtlHeap::new();
+    let Ok(remote_watcher) = ctl.owned(&remote_watcher) else {
         return true;
     };
-    let local = OwnedTerm::Pid {
-        node: local_name.clone(),
-        id: deceased.number(),
-        serial: deceased.serial(),
-        creation: local_creation,
-    };
-    let reason = node_tables::relabel_local_node(reason, &local_name, local_creation);
-    let (control, payload) = if exit_payload {
-        (control(24, vec![local, remote_watcher]), Some(reason))
+    let built = if exit_payload {
+        ctl.control(24, &[local, remote_watcher])
+            .map(|c| (c, Some(reason)))
     } else {
-        (control(3, vec![local, remote_watcher, reason]), None)
+        ctl.control(3, &[local, remote_watcher, reason])
+            .map(|c| (c, None))
     };
-    let _ = emit_control_message_on_handle(runtime, handle, control, payload);
+    if let Ok((control, payload)) = built {
+        let _ = emit_control_message_on_handle(runtime, handle, control, payload);
+    }
     true
 }
 
@@ -3021,19 +3138,65 @@ pub(crate) fn exit2_remote(
     node: &str,
     target: Term,
     reason: Term,
+    prio: bool,
 ) -> Result<Term, VmError> {
-    let (target, reason) = (owned(target)?, owned(reason)?);
     if let DsigPrepare::Connected { connection_id, .. } = dsig_prepare(process, ctx, node)? {
-        queue_outgoing_on(
-            process,
-            ctx,
-            node,
-            connection_id,
-            control(8, vec![local_pid_owned(ctx.pid()), target, reason]),
-            None,
-        )?;
+        let dflags = node_tables::find_dist_entry(node)
+            .map_or(node_tables::DFLAG_PENDING_DFLAGS, |dep| dep.lock().dflags());
+        let mut ctl = CtlHeap::new();
+        if let Some((control, payload)) = dsig_send_exit2_ctl(
+            &mut ctl,
+            dflags,
+            local_pid_term(ctx.pid()),
+            target,
+            reason,
+            prio,
+        )? {
+            queue_outgoing_on(process, ctx, node, connection_id, control, payload)?;
+        }
     }
     Ok(Term::atom(arinsal_term::atoms::TRUE))
+}
+
+/// The control message and payload of `erts_dsig_send_exit2`: `DOP_ALTACT_SIG_SEND` with
+/// `ERTS_DOP_ALTACT_SIG_FLG_EXIT` for a priority or alias exit when the peer takes it, else
+/// `DOP_PAYLOAD_EXIT2` / `DOP_EXIT2`; `None` drops an alias exit the peer cannot take.
+// Port of erts/emulator/beam/dist.c (erts_dsig_send_exit2), OTP-29.1.1.
+fn dsig_send_exit2_ctl(
+    ctl: &mut CtlHeap,
+    dflags: u64,
+    local: Term,
+    remote: Term,
+    reason: Term,
+    prio: bool,
+) -> Result<Option<(Term, Option<Term>)>, VmError> {
+    const ERTS_DOP_ALTACT_SIG_FLG_PRIO: i64 = 1 << 0;
+    const ERTS_DOP_ALTACT_SIG_FLG_ALIAS: i64 = 1 << 2;
+    const ERTS_DOP_ALTACT_SIG_FLG_EXIT: i64 = 1 << 4;
+    let alias = ctl_is_ref(remote);
+    if (prio || alias) && dflags & node_tables::DFLAG_ALTACT_SIG != 0 {
+        let mut fs = ERTS_DOP_ALTACT_SIG_FLG_EXIT;
+        if alias {
+            fs |= ERTS_DOP_ALTACT_SIG_FLG_ALIAS;
+        }
+        if prio {
+            fs |= ERTS_DOP_ALTACT_SIG_FLG_PRIO;
+        }
+        let flags = Term::small(fs).ok_or_else(badarg)?;
+        return Ok(Some((
+            ctl.control(37, &[flags, local, remote])?,
+            Some(reason),
+        )));
+    }
+    if alias {
+        // Not supported by the receiver node; drop it.
+        return Ok(None);
+    }
+    Ok(Some(if dflags & node_tables::DFLAG_EXIT_PAYLOAD != 0 {
+        (ctl.control(26, &[local, remote])?, Some(reason))
+    } else {
+        (ctl.control(8, &[local, remote, reason])?, None)
+    }))
 }
 
 /// The `remote_process` arm of `monitor/2,3` (bif.c `monitor`): an external pid or
@@ -3066,7 +3229,6 @@ pub(crate) fn monitor_remote(
         }
         _ => target.clone(),
     };
-    let reference_owned = owned(reference)?;
     let name = match &target {
         OwnedTerm::Tuple(parts) if parts.len() == 2 => match &parts[0] {
             OwnedTerm::Atom(name) => Some(name.clone()),
@@ -3087,9 +3249,12 @@ pub(crate) fn monitor_remote(
     let runtime = process.runtime.ok_or_else(badarg)?;
     // origin `other.item`: the external pid, or the node of a monitor by name.
     let remote = if name.is_some() {
-        OwnedTerm::Atom(node.clone())
+        global_atoms()
+            .intern(&node)
+            .map(Term::atom)
+            .map_err(|_| badarg())?
     } else {
-        target.clone()
+        args[1]
     };
     let origin = emon::create_origin_or_down(
         runtime,
@@ -3100,11 +3265,7 @@ pub(crate) fn monitor_remote(
         ),
         ctx.pid(),
         info,
-        crate::proc_create::DistTarget {
-            target: remote,
-            reference: reference_owned.clone(),
-            dist,
-        },
+        crate::proc_create::DistTarget::new(remote, reference, dist),
     )?;
     process.monitors.insert(origin);
     process.cold_mut().dist_monitors.insert(id);
@@ -3113,17 +3274,14 @@ pub(crate) fn monitor_remote(
         process.prio_item_added(crate::receive::PrioItemType::Monitor);
     }
     if let DsigPrepare::Connected { connection_id, .. } = prepared {
-        queue_outgoing_on(
-            process,
-            ctx,
-            &node,
-            connection_id,
-            control(
-                19,
-                vec![local_pid_owned(ctx.pid()), wire_target, reference_owned],
-            ),
-            None,
-        )?;
+        let mut ctl = CtlHeap::new();
+        let fields = [
+            local_pid_term(ctx.pid()),
+            ctl.owned(&wire_target)?,
+            reference,
+        ];
+        let control = ctl.control(19, &fields)?;
+        queue_outgoing_on(process, ctx, &node, connection_id, control, None)?;
     }
     Ok(reference)
 }
@@ -3146,21 +3304,71 @@ pub(crate) fn remote_node(term: Term) -> Result<Option<String>, VmError> {
     Ok((node != local && node != "nonode@nohost").then_some(node))
 }
 
-fn local_pid_owned(pid: Pid) -> OwnedTerm {
-    let (node, creation) = node_tables::this_node();
-    OwnedTerm::Pid {
-        node: node.to_owned(),
-        id: pid.number(),
-        serial: pid.serial(),
-        creation,
+/// An internal pid as a term; the dist encoder names it by `erts_this_node` (enc_pid).
+pub(crate) fn local_pid_term(pid: Pid) -> Term {
+    Term::pid_from_data(pid.data())
+}
+
+/// `ctx->ctl_heap` of an `erts_dsig_send_*`: the heap its control message is built on. It
+/// lives until the signal is encoded.
+// Port of erts/emulator/beam/dist.h (ErtsDSigSendContext.ctl_heap), OTP-29.1.1.
+pub(crate) struct CtlHeap(arinsal_term::VecHeap);
+
+impl CtlHeap {
+    pub(crate) fn new() -> Self {
+        Self(arinsal_term::VecHeap::with_initial_chunk_words(32))
+    }
+
+    /// Place a datum Arinsal keeps as an [`OwnedTerm`] (a monitor reference, a spawn tag, a
+    /// seq_trace token, a stored exit reason) on the control heap.
+    pub(crate) fn owned(&mut self, term: &OwnedTerm) -> Result<Term, VmError> {
+        from_owned(term, &mut self.0).map_err(|_| badarg())
+    }
+
+    /// An external pid term.
+    pub(crate) fn external_pid(
+        &mut self,
+        pid: crate::monitor_link::ExternalPid,
+    ) -> Result<Term, VmError> {
+        let owned = elink::external_pid_owned(pid).ok_or_else(badarg)?;
+        self.owned(&owned)
+    }
+
+    /// The control tuple `{Op, Fields...}` (`TUPLEn(ctx->ctl_heap, make_small(DOP_*), ...)`).
+    pub(crate) fn control(&mut self, op: i64, fields: &[Term]) -> Result<Term, VmError> {
+        let mut tuple = Vec::with_capacity(fields.len() + 1);
+        tuple.push(Term::small(op).ok_or_else(badarg)?);
+        tuple.extend_from_slice(fields);
+        TermBuilder::new(&mut self.0)
+            .tuple(&tuple)
+            .map_err(|_| badarg())
     }
 }
 
-fn control(op: i64, mut fields: Vec<OwnedTerm>) -> OwnedTerm {
-    let mut tuple = Vec::with_capacity(fields.len() + 1);
-    tuple.push(OwnedTerm::Int(op));
-    tuple.append(&mut fields);
-    OwnedTerm::tuple(tuple)
+/// The connection's `ctx->dflags` and the seq_trace part of `erts_dsig_send_msg`: with a token,
+/// the sender's serial is bumped and the send is traced to `full_remote`; the token goes in the
+/// control message when the peer can take it (`can_send_seqtrace_token`). A connection not yet
+/// set up encodes with the pending entry's flags (`dep->dflags`, erts_dsig_prepare).
+// Port of erts/emulator/beam/dist.c (erts_dsig_send_msg, seq_trace_update_serial,
+// seq_trace_output SEQ_TRACE_SEND, can_send_seqtrace_token), OTP-29.1.1.
+fn dsig_send_msg_token(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, crate::Process>,
+    node: &str,
+    full_remote: Term,
+    message: Term,
+) -> (u64, Option<OwnedTerm>) {
+    // erts_dsig_prepare fails before any of this on a node that is not alive.
+    if !node_tables::is_alive() {
+        return (node_tables::DFLAG_PENDING_DFLAGS, None);
+    }
+    let dflags = node_tables::find_dist_entry(node)
+        .map_or(node_tables::DFLAG_PENDING_DFLAGS, |dep| dep.lock().dflags());
+    let sender = ctx.pid();
+    let token = crate::seq_trace::on_send(process, Some(ctx), sender, full_remote, message)
+        .filter(|token| token.can_send_to(dflags & node_tables::DFLAG_BIG_SEQTRACE_LABELS != 0))
+        .map(|token| token.to_dist());
+    (dflags, token)
 }
 
 /// Send via the distribution controller when `target` is remote.
@@ -3199,7 +3407,7 @@ pub(crate) fn try_remote_send(
     message: Term,
 ) -> Result<bool, VmError> {
     Ok(!matches!(
-        try_remote_send_with_options(process, ctx, target, message, true, true, false)?,
+        try_remote_send_with_options(process, ctx, target, message, true, true, false, false)?,
         RemoteSendOutcome::NotRemote
     ))
 }
@@ -3219,8 +3427,8 @@ fn queue_remote_send(
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     node: &str,
-    control: OwnedTerm,
-    message: Option<OwnedTerm>,
+    control: Term,
+    message: Option<Term>,
     connect: bool,
     suspend: bool,
     trap: bool,
@@ -3241,6 +3449,7 @@ fn queue_remote_send(
 }
 
 // Port of erts/emulator/beam/bif.c:2381-2401 (`remote_send`), OTP-29.1.1.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn try_remote_send_with_options(
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
@@ -3249,89 +3458,107 @@ pub(crate) fn try_remote_send_with_options(
     connect: bool,
     suspend: bool,
     trap: bool,
+    prio: bool,
 ) -> Result<RemoteSendOutcome, VmError> {
-    // {Name, Node} — registered send on a (possibly remote) node.
-    if let Some((name, node)) = name_node_tuple(target)? {
-        let local = node_tables::this_node().0.to_owned();
-        if node == local || node == "nonode@nohost" {
-            return Ok(RemoteSendOutcome::NotRemote);
+    // {Name, Node}: a registered send on a (possibly remote) node; else a remote pid or alias.
+    let (node, remote) = if let Some((name, node)) = name_node_tuple(target)? {
+        (node, atom_term(&name)?)
+    } else {
+        match &owned(target)? {
+            OwnedTerm::Ref { node, .. } | OwnedTerm::Pid { node, .. } => (node.clone(), target),
+            _ => return Ok(RemoteSendOutcome::NotRemote),
         }
-        // Port of erts/emulator/beam/bif.c:2381-2401 (`remote_send`), OTP-29.1.1.
-        // A send to a remote registered name on a non-distributed node is a successful
-        // best-effort send; there is no distribution controller to queue it through.
-        let control = control(
-            6,
-            vec![
-                local_pid_owned(ctx.pid()),
-                OwnedTerm::Atom(String::new()),
-                OwnedTerm::Atom(name),
-            ],
-        );
-        return queue_remote_send(
-            process,
-            ctx,
-            &node,
-            control,
-            Some(owned(message)?),
-            connect,
-            suspend,
-            trap,
-        );
-    }
-    let target_owned = owned(target)?;
-    if let OwnedTerm::Ref { node, .. } = &target_owned {
-        let target_node = node.clone();
-        let local = node_tables::this_node().0.to_owned();
-        if target_node == local || target_node == "nonode@nohost" {
-            return Ok(RemoteSendOutcome::NotRemote);
-        }
-        // Port of erts/emulator/beam/bif.c:2381-2401 (`remote_send`), OTP-29.1.1.
-        let control = control(33, vec![local_pid_owned(ctx.pid()), target_owned]);
-        return queue_remote_send(
-            process,
-            ctx,
-            &target_node,
-            control,
-            Some(owned(message)?),
-            connect,
-            suspend,
-            trap,
-        );
-    }
-    let OwnedTerm::Pid {
-        node,
-        id,
-        serial,
-        creation,
-    } = &target_owned
-    else {
-        return Ok(RemoteSendOutcome::NotRemote);
     };
     let local = node_tables::this_node().0.to_owned();
-    if node == &local || node == "nonode@nohost" {
+    if node == local || node == "nonode@nohost" {
         return Ok(RemoteSendOutcome::NotRemote);
     }
-    // Port of erts/emulator/beam/bif.c:2381-2401 (`remote_send`), OTP-29.1.1.
-    let control = OwnedTerm::tuple(vec![
-        OwnedTerm::Int(2),
-        OwnedTerm::Atom(String::new()),
-        OwnedTerm::Pid {
-            node: node.clone(),
-            id: *id,
-            serial: *serial,
-            creation: *creation,
-        },
-    ]);
+    let (dflags, token) = dsig_send_msg_token(process, ctx, &node, target, message);
+    let mut ctl = CtlHeap::new();
+    let token = token.map(|token| ctl.owned(&token)).transpose()?;
+    let control = dsig_send_msg_ctl(
+        &mut ctl,
+        dflags,
+        local_pid_term(ctx.pid()),
+        remote,
+        token,
+        prio,
+    )?;
     queue_remote_send(
         process,
         ctx,
-        node,
+        &node,
         control,
-        Some(owned(message)?),
+        Some(message),
         connect,
         suspend,
         trap,
     )
+}
+
+/// The control message of `erts_dsig_send_msg` for `remote` (an external pid or alias, or the
+/// registered name of a `{Name, Node}` send): `DOP_ALTACT_SIG_SEND` for a priority or alias
+/// message when the peer takes it, else `DOP_REG_SEND[_TT]`, `DOP_ALIAS_SEND[_TT]`,
+/// `DOP_SEND_SENDER[_TT]` or `DOP_SEND[_TT]` with the empty cookie. `token` is set when it
+/// goes in the control message (`can_send_seqtrace_token`).
+// Port of erts/emulator/beam/dist.c (erts_dsig_send_msg), OTP-29.1.1.
+fn dsig_send_msg_ctl(
+    ctl: &mut CtlHeap,
+    dflags: u64,
+    sender: Term,
+    remote: Term,
+    token: Option<Term>,
+    prio: bool,
+) -> Result<Term, VmError> {
+    const ERTS_DOP_ALTACT_SIG_FLG_PRIO: i64 = 1 << 0;
+    const ERTS_DOP_ALTACT_SIG_FLG_TOKEN: i64 = 1 << 1;
+    const ERTS_DOP_ALTACT_SIG_FLG_ALIAS: i64 = 1 << 2;
+    const ERTS_DOP_ALTACT_SIG_FLG_NAME: i64 = 1 << 3;
+    let alias = ctl_is_ref(remote);
+    let name = remote.as_atom().is_some();
+    let send_sender = dflags & node_tables::DFLAG_SEND_SENDER != 0;
+    let (op, mut fields) = if (prio || alias) && dflags & node_tables::DFLAG_ALTACT_SIG != 0 {
+        let mut fs = 0;
+        if alias {
+            fs |= ERTS_DOP_ALTACT_SIG_FLG_ALIAS;
+        } else if name {
+            fs |= ERTS_DOP_ALTACT_SIG_FLG_NAME;
+        }
+        if prio {
+            fs |= ERTS_DOP_ALTACT_SIG_FLG_PRIO;
+        }
+        if token.is_some() {
+            fs |= ERTS_DOP_ALTACT_SIG_FLG_TOKEN;
+        }
+        (
+            37,
+            vec![Term::small(fs).ok_or_else(badarg)?, sender, remote],
+        )
+    } else if name {
+        (
+            if token.is_some() { 16 } else { 6 },
+            vec![sender, atom_term("")?, remote],
+        )
+    } else if alias {
+        (if token.is_some() { 34 } else { 33 }, vec![sender, remote])
+    } else if send_sender {
+        (if token.is_some() { 23 } else { 22 }, vec![sender, remote])
+    } else {
+        (
+            if token.is_some() { 12 } else { 2 },
+            vec![atom_term("")?, remote],
+        )
+    };
+    fields.extend(token);
+    ctl.control(op, &fields)
+}
+
+/// An atom term (`am_*`) for a control message.
+fn atom_term(name: &str) -> Result<Term, VmError> {
+    global_atoms()
+        .intern(name)
+        .map(Term::atom)
+        .map_err(|_| badarg())
 }
 
 /// The part of `ErtsDSigSendContext` that outlives the encode: the fragments not yet in the
@@ -3344,9 +3571,11 @@ pub(crate) struct DsigSendContext {
     dep: Arc<node_tables::DistEntry>,
     /// `ctx->connection_id`: the connection the signal was encoded for.
     connection_id: u32,
-    port_id: u64,
+    /// The encode phases while the send is in `ERTS_DSIG_SEND_PHASE_MSG_SIZE` ..
+    /// `ERTS_DSIG_SEND_PHASE_FIN`, `None` once it reached `ERTS_DSIG_SEND_PHASE_SEND`.
+    encode: Option<Box<DsigEncode>>,
     /// `ctx->obuf[0..ctx->fragments]`: the encoded fragments still to be enqueued, in order.
-    fragments: VecDeque<Vec<u8>>,
+    fragments: VecDeque<ErtsDistOutputBuf>,
     /// `ctx->no_suspend`.
     no_suspend: bool,
     /// `ctx->return_term`: a process-heap term, kept valid by disabling garbage collection
@@ -3373,8 +3602,33 @@ impl DsigSendContext {
 // (erts_continue_exit_process, F_FRAGMENTED_SEND / ERTS_CONTINUE_EXIT_DIST_SEND), OTP-29.1.1.
 pub(crate) fn dsend_exit(process: &mut Process, ctx: &mut DsigSendContext, sender: Pid) {
     ctx.no_suspend = true;
+    // A send parked while encoding finishes the encode without trapping.
+    if let Some(mut encode) = ctx.encode.take() {
+        let mut reds = dsig_initial_reds(process);
+        if let Ok(DsigEncodeResult::Send) = encode.step(None, &mut reds, true) {
+            ctx.fragments = encode.take_obufs().into();
+        }
+    }
     // An error here is a vanished runtime; nothing is left to send to.
     let _ = dsig_send(process, ctx, sender, true);
+}
+
+/// `ctx->reds = ERTS_BIF_REDS_LEFT(c_p) * TERM_TO_BINARY_LOOP_FACTOR`.
+fn dsig_initial_reds(process: &Process) -> i64 {
+    i64::from(process.heap.abi.fcalls.max(0)) * DSIG_LOOP_FACTOR
+}
+
+/// `BUMP_REDS(c_p, (initial_reds - ctx->reds) / TERM_TO_BINARY_LOOP_FACTOR)`.
+fn dsig_bump_reds(process: &mut Process, initial_reds: i64, reds: i64) {
+    let bump = ((initial_reds - reds) / DSIG_LOOP_FACTOR).clamp(0, i64::from(i32::MAX)) as i32;
+    process.heap.abi.fcalls = process.heap.abi.fcalls.saturating_sub(bump).max(0);
+}
+
+/// `ERTS_DSIG_SEND_TOO_LRG` → `SYSTEM_LIMIT` (bif.c remote_send, dsend_continue_trap_1).
+fn dsig_system_limit() -> VmError {
+    VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::SYSTEM_LIMIT,
+    )))
 }
 
 impl std::fmt::Debug for DsigSendContext {
@@ -3398,8 +3652,8 @@ enum DsigSend {
 }
 
 /// `ERTS_DSIG_SEND_PHASE_SEND`: verify that the connection still exists, enqueue as many
-/// fragments as the reductions and the busy limit allow, and suspend the sender when the
-/// queue is busy.
+/// fragments as the reductions and the busy limit allow, suspend the sender when the queue
+/// is busy, and tell the controller (dist command of a port, `dist_data` of a process).
 // Port of erts/emulator/beam/dist.c:3594-3760 (erts_dsig_send, ERTS_DSIG_SEND_PHASE_SEND),
 // OTP-29.1.1. `no_trap` is `ctx->no_trap`: every fragment is queued whatever the reductions.
 fn dsig_send(
@@ -3408,47 +3662,63 @@ fn dsig_send(
     sender: Pid,
     no_trap: bool,
 ) -> Result<DsigSend, VmError> {
-    // ERTS_BIF_REDS_LEFT * TERM_TO_BINARY_LOOP_FACTOR.
-    let initial_reds = i64::from(process.heap.abi.fcalls.max(0)) * DSIG_LOOP_FACTOR;
+    let initial_reds = dsig_initial_reds(process);
     let mut reds = initial_reds;
     let dep = ctx.dep.clone();
     let mut entry = dep.lock();
     let connection_ok = entry.state != node_tables::ConnState::Exiting
         && entry.state != node_tables::ConnState::Idle
         && entry.connection_id == ctx.connection_id;
-    let Some(state) = entry
-        .dist
-        .as_mut()
-        .filter(|state| connection_ok && state.port_id == Some(ctx.port_id))
-    else {
+    let Some(state) = entry.dist.as_mut().filter(|_| connection_ok) else {
         // Not the same connection as when we started; drop message.
         ctx.fragments.clear();
         return Ok(DsigSend::Ok);
     };
-    let mut fragments = 0;
-    let mut obsz = 0u64;
-    while fragments < ctx.fragments.len()
-        && ((reds > 0 && state.pending_bytes + obsz < state.busy_limit)
-            || no_trap
-            || ctx.no_suspend)
-    {
-        if !no_trap && !ctx.no_suspend {
-            reds -= DSIG_FRAGMENT_REDS;
-        }
-        obsz += ctx.fragments[fragments].len() as u64;
-        fragments += 1;
-    }
-    state.pending_bytes += obsz;
-    if state.pending_bytes >= state.busy_limit {
-        state.busy = true;
-    }
-    state.output.extend(ctx.fragments.drain(..fragments));
+    let kick = dsig_send_enqueue_locked(
+        state,
+        &mut ctx.fragments,
+        &mut reds,
+        no_trap,
+        ctx.no_suspend,
+    );
     let busy = state.busy && !ctx.no_suspend;
-    drop(entry);
-    // BUMP_REDS(c_p, (initial_reds - ctx->reds) / TERM_TO_BINARY_LOOP_FACTOR).
-    let bump = ((initial_reds - reds) / DSIG_LOOP_FACTOR) as i32;
-    process.heap.abi.fcalls = process.heap.abi.fcalls.saturating_sub(bump).max(0);
-    let suspended = finish_port_enqueue(process, sender, ctx.port_id, busy)?;
+    let cid = match state.port_id {
+        Some(port_id) => crate::natives::erts_debug::DistCid::Port(port_id),
+        None => crate::natives::erts_debug::DistCid::Pid(state.owner),
+    };
+    let mut suspended = false;
+    let mut resume = false;
+    if busy {
+        // The queue lock is released around erts_suspend, then the busy flag is read again.
+        drop(entry);
+        suspended = suspend_dist_sender(process, sender);
+        if suspended {
+            // erts_suspend + ERTS_BIF_PREP_YIELD on a busy distribution entry (dist.c
+            // erts_dsig_send, ERTS_DSIG_SEND_YIELD): ERTS_VBUMP_ALL_REDS.
+            crate::bif_traps::vbump_all_reds(process);
+            let mut entry = dep.lock();
+            match entry.dist.as_mut() {
+                // Enqueue suspended process on dist entry (erts_proclist_store_last).
+                Some(state) if state.busy => state.suspended_senders.push(sender),
+                // was busy, but isn't now
+                _ => resume = true,
+            }
+        }
+    } else {
+        drop(entry);
+    }
+    dsig_bump_reds(process, initial_reds, reds);
+    dist_cmd_kick(process.runtime.ok_or_else(badarg)?, kick)?;
+    if resume {
+        // The caller still yields as if it suspended (erts_resume after the unlock).
+        resume_dist_senders(process.runtime.ok_or_else(badarg)?, vec![sender]);
+    }
+    // monitor_busy_dist_port(ctx->c_p, cid), with fragments left (ERTS_DSIG_SEND_CONTINUE) or
+    // after suspending (ERTS_DSIG_SEND_YIELD), unless the entry was no longer busy.
+    if !resume && (suspended || !ctx.fragments.is_empty()) {
+        crate::natives::erts_debug::monitor_busy_dist_port(process, sender, cid);
+    }
+    dist_cmd_kick(process.runtime.ok_or_else(badarg)?, kick)?;
     Ok(if !ctx.fragments.is_empty() {
         DsigSend::Continue
     } else if suspended {
@@ -3456,6 +3726,113 @@ fn dsig_send(
     } else {
         DsigSend::Ok
     })
+}
+
+/// What `ERTS_DSIG_SEND_PHASE_SEND` does once the entry is unlocked: schedule the dist
+/// command of a port controller (`erts_schedule_dist_command`), or send `dist_data` to a
+/// process controller that asked for it when its queue was empty (`notify_dist_data`).
+#[derive(Clone, Copy, Debug)]
+enum DistCmdKick {
+    Port(u64),
+    Notify(Pid),
+    None,
+}
+
+/// The enqueue step of `ERTS_DSIG_SEND_PHASE_SEND` with the entry locked: the fragments that
+/// fit the reductions and the busy limit go to the output queue (`update_qsizes`), the busy
+/// flag is set at the limit.
+// Port of erts/emulator/beam/dist.c:3612-3687 (erts_dsig_send, ERTS_DSIG_SEND_PHASE_SEND),
+// OTP-29.1.1.
+fn dsig_send_enqueue_locked(
+    state: &mut node_tables::DistState,
+    obufs: &mut VecDeque<ErtsDistOutputBuf>,
+    reds: &mut i64,
+    no_trap: bool,
+    no_suspend: bool,
+) -> DistCmdKick {
+    let mut fragments = 0;
+    let mut obsz = 0u64;
+    while fragments < obufs.len()
+        && ((*reds > 0 && state.pending_bytes + obsz < state.busy_limit) || no_trap || no_suspend)
+    {
+        if !no_trap && !no_suspend {
+            *reds -= DSIG_FRAGMENT_REDS;
+        }
+        obsz += obufs[fragments].size() as u64;
+        fragments += 1;
+    }
+    let empty_fill = state.pending_bytes == 0 && obsz > 0;
+    state.pending_bytes += obsz;
+    if state.pending_bytes >= state.busy_limit {
+        state.busy = true;
+    }
+    state.output.extend(obufs.drain(..fragments));
+    match state.port_id {
+        Some(port_id) => {
+            state.written = state.written.saturating_add(1);
+            DistCmdKick::Port(port_id)
+        }
+        None if empty_fill && std::mem::take(&mut state.notify) => DistCmdKick::Notify(state.owner),
+        None => DistCmdKick::None,
+    }
+}
+
+/// Run the [`DistCmdKick`] of a send.
+fn dist_cmd_kick(runtime: &crate::process::Runtime, kick: DistCmdKick) -> Result<(), VmError> {
+    match kick {
+        DistCmdKick::Port(port_id) => flush_port_output(runtime, port_id),
+        DistCmdKick::Notify(pid) => notify_dist_data(runtime, pid),
+        DistCmdKick::None => Ok(()),
+    }
+}
+
+/// `notify_dist_data`: an empty `dist_data` message from the system to the controller.
+// Port of erts/emulator/beam/dist.c (notify_dist_data), OTP-29.1.1.
+fn notify_dist_data(runtime: &crate::process::Runtime, pid: Pid) -> Result<(), VmError> {
+    runtime
+        .scheduler()?
+        .send(
+            pid,
+            pid,
+            Message::copy_from(Term::atom(arinsal_term::atoms::DIST_DATA))?,
+        )
+        .map_err(|error| VmError::Unsupported(format!("dist data notification: {error}")))
+}
+
+/// `ctx->from` of `erts_dsig_prepare`: the sending process, or `am_undefined` without one. It
+/// names the fragments of the signal (the sequence id of `DIST_FRAG_HEADER`).
+// Port of erts/emulator/beam/dist.c (erts_dsig_prepare: `ctx->from = proc ?
+// proc->common.id : am_undefined`), OTP-29.1.1.
+pub(crate) fn dsig_from(sender: Option<Pid>) -> u64 {
+    sender
+        .and_then(Pid::to_term)
+        .unwrap_or(Term::atom(arinsal_term::atoms::UNDEFINED))
+        .word()
+}
+
+/// `erts_dsig_send` without a process (`ctx->c_p == NULL`: `no_trap` and `no_suspend`) on
+/// a connected entry the caller holds locked: every phase runs to the end.
+// Port of erts/emulator/beam/dist.c (erts_dsig_send, PHASE_INIT with `!ctx->c_p`),
+// OTP-29.1.1.
+fn dsig_send_no_proc_locked(
+    state: &mut node_tables::DistState,
+    control: Term,
+    message: Option<Term>,
+) -> Result<DistCmdKick, VmError> {
+    let mut encode = DsigEncode::new(
+        control,
+        message,
+        state.flags,
+        dsig_from(None),
+        arinsal_term::this_node,
+    );
+    let mut obufs: VecDeque<_> = node_tables::encode_no_trap(&mut encode, Some(&state.acmp))
+        .map_err(|_| badarg())?
+        .into();
+    let mut reds = 0;
+    Ok(dsig_send_enqueue_locked(
+        state, &mut obufs, &mut reds, true, true,
+    ))
 }
 
 /// `TERM_TO_BINARY_LOOP_FACTOR`: the loop units one reduction buys `erts_dsig_send`.
@@ -3471,6 +3848,8 @@ pub(crate) enum DsendContinue {
     Yield { no_suspend: bool },
     /// `ERTS_DSIG_SEND_CONTINUE`: trap again.
     Continue,
+    /// `ERTS_DSIG_SEND_TOO_LRG`: `system_limit`.
+    TooLarge,
 }
 
 /// `dsend_continue_trap_1`: resume `erts_dsig_send` on the context of a parked send.
@@ -3480,6 +3859,21 @@ pub(crate) fn dsend_continue(
     ctx: &mut DsigSendContext,
     sender: Pid,
 ) -> Result<DsendContinue, VmError> {
+    // The encode phases first, on this slice's reductions (erts_dsig_send from ctx->phase).
+    if let Some(encode) = ctx.encode.as_mut() {
+        let initial_reds = dsig_initial_reds(process);
+        let mut reds = initial_reds;
+        let res = encode.step(None, &mut reds, false);
+        dsig_bump_reds(process, initial_reds, reds);
+        match res.map_err(|_| badarg())? {
+            DsigEncodeResult::Continue => return Ok(DsendContinue::Continue),
+            DsigEncodeResult::TooLarge => return Ok(DsendContinue::TooLarge),
+            DsigEncodeResult::Send => {
+                ctx.fragments = encode.take_obufs().into();
+                ctx.encode = None;
+            }
+        }
+    }
     Ok(match dsig_send(process, ctx, sender, false)? {
         DsigSend::Ok => DsendContinue::Done,
         DsigSend::Yield => DsendContinue::Yield {
@@ -3487,57 +3881,6 @@ pub(crate) fn dsend_continue(
         },
         DsigSend::Continue => DsendContinue::Continue,
     })
-}
-
-/// Enqueue encoded signals that never trap and never suspend the caller (`ctx->no_trap` and
-/// `ctx->no_suspend` of controller and exit paths): every fragment goes into the queue.
-// Port of erts/emulator/beam/dist.c:3645-3653 (`ctx->no_suspend`), OTP-29.1.1.
-fn enqueue_port_output_no_suspend_locked(
-    state: &mut node_tables::DistState,
-    packets: Vec<Vec<u8>>,
-) {
-    state.pending_bytes += packets
-        .iter()
-        .map(|packet| packet.len() as u64)
-        .sum::<u64>();
-    state.output.extend(packets);
-    if state.pending_bytes >= state.busy_limit {
-        state.busy = true;
-    }
-}
-
-/// Suspend the sender on a busy entry (`erts_suspend` and the suspended list of
-/// `ERTS_DSIG_SEND_PHASE_SEND`), then schedule the dist command. Returns whether the sender
-/// was suspended.
-fn finish_port_enqueue(
-    process: &mut Process,
-    sender: Pid,
-    port_id: u64,
-    should_suspend: bool,
-) -> Result<bool, VmError> {
-    let mut suspended = false;
-    if should_suspend {
-        suspended = suspend_dist_sender(process, sender);
-        if suspended {
-            // erts_suspend + ERTS_BIF_PREP_YIELD on a busy distribution port (dist.c
-            // erts_dsig_send, ERTS_DSIG_SEND_YIELD): ERTS_VBUMP_ALL_REDS.
-            crate::bif_traps::vbump_all_reds(process);
-            if let Some(dep) = process
-                .runtime
-                .and_then(|runtime| node_tables::port_dist_entry(runtime, port_id))
-                && let Some(state) = dep
-                    .lock()
-                    .dist
-                    .as_mut()
-                    .filter(|state| state.port_id == Some(port_id))
-            {
-                state.suspended_senders.push(sender);
-            }
-            crate::natives::erts_debug::notify_busy_dist_port(process, sender, port_id);
-        }
-    }
-    flush_port_output(process.runtime.as_ref().ok_or_else(badarg)?, port_id)?;
-    Ok(suspended)
 }
 
 /// Schedule the dist command task that drains the entry's queued buffers into its port.
@@ -3637,20 +3980,48 @@ fn dist_cmd(runtime: &crate::process::Runtime, port_id: u64) -> i32 {
                 state.flushing_output = false;
                 None
             } else {
-                state.output.pop_front()
+                // erts_dist_command: erts_encode_ext_dist_header_finalize on the buffer it
+                // is about to write.
+                state.output.pop_front().map(|mut packet| {
+                    let queued = packet.size();
+                    // dist_cmd counts its reductions per packet, not erts_dist_command's.
+                    let finalize = erts_encode_ext_dist_header_finalize(
+                        &mut packet,
+                        &mut state.outgoing_cache,
+                        state.flags,
+                        &mut 0,
+                    );
+                    (packet, queued, finalize, state.handle)
+                })
             }
         };
-        let Some(packet) = packet else {
+        let Some((packet, queued, finalize, conn_handle)) = packet else {
             break;
         };
+        if let DistHeaderFinalize::SpawnNotSupported(ctl) = finalize {
+            transcode_spawn_notsup(runtime, conn_handle, &ctl);
+        }
         let sock = {
             runtime
                 .ports
                 .get(port_id)
                 .and_then(|handle| handle.tcp_driver_data())
         };
+        // dist_port_commandv: the buffer's I/O vector, its binaries referenced.
+        let (header, iov) = packet.into_iov();
+        let mut eiov = arinsal_drv::CommandVector::new();
+        if !header.is_empty() {
+            eiov.push(arinsal_drv::CommandPiece::Bytes(header));
+        }
+        eiov.extend(iov.into_iter().map(|iov| {
+            let (bin, offset, len) = iov.into_parts();
+            arinsal_drv::CommandPiece::Refc(
+                arinsal_drv::RefcSegment::new(bin, offset, len)
+                    .expect("an I/O vector element lies inside its Binary"),
+            )
+        }));
         let port_busy = sock
-            .and_then(|sock| crate::inet_drv::dist_output(&sock, &packet).ok())
+            .and_then(|sock| crate::inet_drv::dist_outputv(&sock, eiov).ok())
             .unwrap_or_default();
         written += 1;
         let resumed = {
@@ -3663,7 +4034,7 @@ fn dist_cmd(runtime: &crate::process::Runtime, port_id: u64) -> i32 {
             else {
                 return 0;
             };
-            state.pending_bytes = state.pending_bytes.saturating_sub(packet.len() as u64);
+            state.pending_bytes = state.pending_bytes.saturating_sub(queued as u64);
             state.port_busy = port_busy;
             if port_busy {
                 state.flushing_output = false;
@@ -3695,15 +4066,33 @@ fn suspend_dist_sender(process: &mut Process, sender: Pid) -> bool {
         .is_some_and(|runtime| runtime.suspend_internal_remote(sender))
 }
 
-fn resume_dist_senders(runtime: &crate::process::Runtime, senders: Vec<Pid>) {
+/// `get_suspended_on_de(dep, ERTS_DE_QFLGS_ALL)` of a connection going down: the processes
+/// suspended on the busy entry, resumed once the entry is unlocked (`erts_do_net_exits`).
+// Port of erts/emulator/beam/dist.c (get_suspended_on_de; erts_do_net_exits), OTP-29.1.1.
+fn get_suspended_on_de(entry: &mut node_tables::NodeEntry) -> Vec<Pid> {
+    entry
+        .dist
+        .as_mut()
+        .map(|state| {
+            state.busy = false;
+            std::mem::take(&mut state.suspended_senders)
+        })
+        .unwrap_or_default()
+}
+
+/// `erts_resume_processes`: returns how many were resumed.
+fn resume_dist_senders(runtime: &crate::process::Runtime, senders: Vec<Pid>) -> usize {
     let Ok(scheduler) = runtime.scheduler() else {
-        return;
+        return 0;
     };
+    let mut resumed = 0;
     for sender in senders {
         if runtime.resume_internal(sender) {
+            resumed += 1;
             let _ = scheduler.wake(sender);
         }
     }
+    resumed
 }
 
 /// Reconcile the inet port's busy state with the dist entry queue and resume senders.
@@ -3769,31 +4158,6 @@ pub(crate) fn name_node_tuple(target: Term) -> Result<Option<(String, String)>, 
     };
     // Port of erts/emulator/beam/bif.c:2614-2626 (`do_send` accepts every arity-two atom tuple as a remote destination), OTP-29.1.1.
     Ok(Some((name.clone(), node.clone())))
-}
-
-fn local_pid(term: &OwnedTerm, local: &str) -> Option<Pid> {
-    // Port of erts/emulator/beam/external.c:3127-3141, OTP-29.1.1.
-    let OwnedTerm::Pid {
-        node,
-        id,
-        serial,
-        creation,
-    } = term
-    else {
-        return None;
-    };
-    let local_creation = node_tables::this_node().1;
-    if !local_pid_matches(node, *creation, local, local_creation)
-        || *id > arinsal_term::ptab::MAX_INTERNAL_PID_NUMBER
-    {
-        return None;
-    }
-    Some(Pid::new(*id, *serial))
-}
-
-fn local_pid_matches(node: &str, creation: u32, local: &str, local_creation: u32) -> bool {
-    // Port of erts/emulator/beam/external.c:3127-3141, OTP-29.1.1.
-    node == local && creation == local_creation
 }
 
 fn get_data_notification(
@@ -4032,51 +4396,110 @@ run() ->
         assert!(state.output.is_empty());
         assert_eq!(state.pending_bytes, 0);
         assert_eq!(state.incoming_cache.get(0), None);
-        assert_eq!(state.outgoing_cache.get(0), None);
+        assert_eq!(state.outgoing_cache.out(0), None);
+    }
+
+    fn heap_term(heap: &mut arinsal_term::VecHeap, term: &OwnedTerm) -> Term {
+        from_owned(term, heap).unwrap()
+    }
+
+    /// Queue a signal as a send without a process does.
+    fn queue(state: &mut DistState, control: Term, message: Option<Term>) {
+        dsig_send_no_proc_locked(state, control, message).unwrap();
+    }
+
+    /// Take the next output buffer and finalize it as the output path does.
+    fn pop_wire(state: &mut DistState) -> Vec<u8> {
+        let mut packet = state.output.pop_front().unwrap();
+        erts_encode_ext_dist_header_finalize(
+            &mut packet,
+            &mut state.outgoing_cache,
+            state.flags,
+            &mut 0,
+        );
+        packet.to_vec()
     }
 
     #[test]
     fn dist_output_encodes_distribution_header_and_send_control() {
-        let mut state = DistState::new(11, Pid::new(1, 2), 0);
-        let control = OwnedTerm::tuple(vec![
+        let mut state = DistState::new(11, Pid::new(1, 2), node_tables::DFLAG_DIST_DEFAULT);
+        let mut heap = arinsal_term::VecHeap::new();
+        let control_owned = OwnedTerm::tuple(vec![
             OwnedTerm::Int(2),
             OwnedTerm::Atom("from@host".into()),
             OwnedTerm::Atom("to@host".into()),
         ]);
-        state.queue_term(control, Some(OwnedTerm::Int(9))).unwrap();
-        let packet = state.output.pop_front().unwrap();
-        assert_eq!(&packet[..2], &[131, 68]);
+        let control = heap_term(&mut heap, &control_owned);
+        let message = heap_term(&mut heap, &OwnedTerm::Int(9));
+        queue(&mut state, control, Some(message));
+        let packet = pop_wire(&mut state);
+        assert_eq!(&packet[..3], &[131, 68, 2]);
         let mut cache = arinsal_etf::AtomCache::new();
         let decoded = arinsal_etf::decode_dist_packet(&packet, &mut cache).unwrap();
         let terms = arinsal_etf::decode_dist_payload(&decoded).unwrap();
-        assert_eq!(
-            terms[0],
-            OwnedTerm::tuple(vec![
-                OwnedTerm::Int(2),
-                OwnedTerm::Atom("from@host".into()),
-                OwnedTerm::Atom("to@host".into())
-            ])
-        );
+        assert_eq!(terms[0], control_owned);
         assert_eq!(terms[1], OwnedTerm::Int(9));
+        // The second signal finds both atoms in the connection's cache: no atom text.
+        queue(&mut state, control, Some(message));
+        let again = pop_wire(&mut state);
+        assert!(again.len() < packet.len());
+        let decoded = arinsal_etf::decode_dist_packet(&again, &mut cache).unwrap();
+        assert_eq!(
+            arinsal_etf::decode_dist_payload(&decoded).unwrap()[0],
+            control_owned
+        );
+    }
+
+    #[test]
+    fn dist_output_without_header_flags_is_pass_through() {
+        let mut state = DistState::new(11, Pid::new(1, 2), 0);
+        let mut heap = arinsal_term::VecHeap::new();
+        let control = heap_term(
+            &mut heap,
+            &OwnedTerm::tuple(vec![OwnedTerm::Int(2), OwnedTerm::Atom("a".into())]),
+        );
+        let message = heap_term(&mut heap, &OwnedTerm::Int(9));
+        queue(&mut state, control, Some(message));
+        let packet = pop_wire(&mut state);
+        assert_eq!(
+            packet,
+            vec![112, 131, 104, 2, 97, 2, 119, 1, b'a', 131, 97, 9]
+        );
+    }
+
+    #[test]
+    fn dist_pending_signal_is_finalized_with_the_connection_flags() {
+        let mut heap = arinsal_term::VecHeap::new();
+        let control = heap_term(
+            &mut heap,
+            &OwnedTerm::tuple(vec![OwnedTerm::Int(2), OwnedTerm::Atom("a".into())]),
+        );
+        let mut packet = node_tables::encode_pending(control, None, dsig_from(None)).unwrap();
+        assert_eq!(
+            erts_encode_ext_dist_header_finalize(
+                &mut packet,
+                &mut Default::default(),
+                node_tables::DFLAG_DIST_DEFAULT,
+                &mut 0
+            ),
+            DistHeaderFinalize::Done
+        );
+        assert_eq!(
+            packet.to_vec(),
+            vec![131, 68, 0, 104, 2, 97, 2, 119, 1, b'a']
+        );
     }
 
     #[test]
     fn dist_queue_accounts_for_pending_bytes() {
         let mut state = DistState::new(12, Pid::new(1, 0), 0);
-        state
-            .queue_term(OwnedTerm::tuple(vec![OwnedTerm::Int(2)]), None)
-            .unwrap();
+        let mut heap = arinsal_term::VecHeap::new();
+        let control = heap_term(&mut heap, &OwnedTerm::tuple(vec![OwnedTerm::Int(2)]));
+        queue(&mut state, control, None);
         assert_eq!(
             state.pending_bytes,
-            state.output.front().unwrap().len() as u64
+            state.output.front().unwrap().size() as u64
         );
-    }
-
-    #[test]
-    fn dist_local_pid_requires_matching_node_and_creation() {
-        assert!(local_pid_matches("node@host", 4, "node@host", 4));
-        assert!(!local_pid_matches("remote@host", 4, "node@host", 4));
-        assert!(!local_pid_matches("node@host", 5, "node@host", 4));
     }
 
     #[test]

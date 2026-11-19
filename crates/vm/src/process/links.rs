@@ -202,14 +202,12 @@ impl Process {
                         crate::signals::RemoteOp::GroupLeader { leader: from },
                     );
                 }
+                // ERTS_SIG_Q_OP_RPC: `func` runs in the exiting process too and answers for it
+                // (erts_proc_exit_handle_signal: `handle_rpc(c_p, sig, cnt, limit, &yield)`;
+                // this loop has no reduction budget, so `func` gets one reduction).
                 Payload::Signal(Signal::Rpc(request)) => {
-                    let op = match request.op {
-                        arinsal_sched::RpcOp::SaveCalls(value) => {
-                            crate::signals::RemoteOp::SaveCalls { value }
-                        }
-                        arinsal_sched::RpcOp::Display => crate::signals::RemoteOp::Display,
-                    };
-                    let _ = crate::signals::reply_failure(self, ctx, from, request.id, op);
+                    let mut yield_ = false;
+                    let _ = self.handle_rpc(ctx, from, *request, 0, 0, &mut yield_);
                 }
                 Payload::Signal(Signal::SysTask(task)) => {
                     crate::signals::sys_task_signal_failed(self, ctx, &task);
@@ -312,10 +310,43 @@ impl Process {
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:6355 (ERTS_SIG_Q_OP_MONITOR_DOWN),
         // OTP-29.1.1: a DOWN whose origin monitor is no longer in the table (a demonitor
         // raced with the target's exit) is dropped instead of becoming a message.
+        // erl_proc_sig_queue.c:6396-6405: a monitor exit from the peer for a pending spawn
+        // request (handle_missing_spawn_reply) leaves the monitor as is, so that the
+        // connection loss triggers the error spawn reply.
+        if reason != Term::atom(arinsal_term::atoms::NOCONNECTION)
+            && self
+                .monitors
+                .get(reference)
+                .is_some_and(|omon| !omon.is_target() && omon.spawn_pending())
+        {
+            return Ok(());
+        }
         let entry = crate::signals::take_origin_monitor_down(self, reference);
         let active = entry.is_some();
         let priority = entry.as_ref().is_some_and(|entry| entry.view().prio_ml());
         if !active {
+            return Ok(());
+        }
+        if let Some(entry) = entry.as_ref()
+            && entry.view().spawn_pending()
+        {
+            // Port of erts/emulator/beam/erl_proc_sig_queue.c:4864-4900
+            // (convert_to_down_message, ERTS_ML_FLG_SPAWN_PENDING), OTP-29.1.1: the
+            // connection of a pending spawn request broke; the signal becomes the
+            // `{Tag, Ref, error, Reason}` spawn reply unless the operation was abandoned or
+            // error messages are off. The target half already left the connection.
+            use crate::monitor_link::node_flag;
+            if entry.view().flags() & (node_flag::SPAWN_ABANDONED | node_flag::SPAWN_NO_EMSG) != 0 {
+                return Ok(());
+            }
+            let message =
+                crate::dist::spawn_down_message(self, entry.view().info(), reference, reason)?;
+            if priority {
+                self.push_priority_message(message)?;
+                self.prio_item_deleted(crate::receive::PrioItemType::Monitor);
+            } else {
+                self.inbox.push_back(message);
+            }
             return Ok(());
         }
         let (info, port_object) = match entry.as_ref().and_then(|entry| entry.state()) {
@@ -333,9 +364,9 @@ impl Process {
         };
         // The DOWN tag lives in the shared monitor data of every monitor type, ports included
         // (erts_monitor_create(.., tag); convert_to_down_message reads `mdep->heap`).
-        let tag = if let Some(owned) = entry.as_ref().and_then(|entry| entry.view().info().tag()) {
+        let tag = if let Some(tag) = entry.as_ref().and_then(|entry| entry.view().info().tag()) {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut self.heap);
-            arinsal_term::from_owned(owned, &mut heap)
+            arinsal_term::copy_term(tag, &mut heap)
                 .map_err(|error| VmError::Unsupported(format!("monitor tag: {error:?}")))?
         } else {
             Term::atom(arinsal_term::atoms::DOWN)
@@ -368,7 +399,8 @@ impl Process {
             // erts_proc_sig_send_dist_monitor_down), OTP-29.1.1: the external pid, or
             // `{Name, Node}` for a monitor by name.
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut self.heap);
-            let object = arinsal_term::from_owned(&object, &mut heap)
+            let object = object
+                .build(&mut heap)
                 .map_err(|error| VmError::Unsupported(format!("monitor object: {error:?}")))?;
             (Term::atom(arinsal_term::atoms::PROCESS), object)
         } else {
@@ -412,9 +444,9 @@ pub(super) fn down_message_on_sender(
     reason: Term,
 ) -> Result<Message, VmError> {
     let tag = match data.tag() {
-        Some(owned) => {
+        Some(tag) => {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-            arinsal_term::from_owned(owned, &mut heap)
+            arinsal_term::copy_term(tag, &mut heap)
                 .map_err(|error| VmError::Unsupported(format!("monitor tag: {error:?}")))?
         }
         None => Term::atom(arinsal_term::atoms::DOWN),

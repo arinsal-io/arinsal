@@ -791,9 +791,12 @@ pub(crate) enum OriginDemonitor {
 pub(crate) fn demonitor_origin(process: &mut Process, id: u64) -> OriginDemonitor {
     // The reference lookup also decides whether this is an alias placeholder; erts performs
     // the same classification from the found node's type before deleting it.
+    // bif.c demonitor: a pending-spawn monitor is not removed until the spawn operation has
+    // succeeded (`am_false`).
     let entry = match process.monitors.remove_if(id, |flags| {
         flags & crate::monitor_link::node_flag::TYPE_MASK
             != crate::monitor_link::node_type::MONITOR_ALIAS
+            && flags & crate::monitor_link::node_flag::SPAWN_PENDING == 0
     }) {
         Ok(Some(entry)) => entry,
         Ok(None) => return OriginDemonitor::Missing,
@@ -979,7 +982,7 @@ pub(crate) fn monitor_port(
         me.data(),
         0,
         crate::proc_create::MonitorInfo::with_port_name(
-            monitor_info_for(tag, None)?.tag().cloned(),
+            (tag != Term::atom(arinsal_term::atoms::DOWN)).then_some(tag),
             name,
         ),
         crate::proc_create::OriginMonitor::Port { port_id, name },
@@ -1079,7 +1082,7 @@ fn call_resolved(
 ///
 /// Port of the signal-request ops in
 /// `erts/emulator/beam/erl_proc_sig_queue.c` (`ERTS_SIG_Q_OP_PROCESS_INFO`,
-/// `ERTS_SIG_Q_OP_GROUP_LEADER`, `ERTS_SIG_Q_OP_RPC`, `ERTS_SIG_Q_OP_IS_ALIVE`),
+/// `ERTS_SIG_Q_OP_GROUP_LEADER`, `ERTS_SIG_Q_OP_IS_ALIVE`),
 /// OTP-29.1.1. The scheduler `Signal` enum has no request variant, so the
 /// payload lives here and [`Signal::UnlinkAck`] carries the id as a wakeup.
 pub(crate) enum RemoteOp {
@@ -1087,12 +1090,8 @@ pub(crate) enum RemoteOp {
     Info { items: Option<Message> },
     /// `group_leader(Leader, Pid)`.
     GroupLeader { leader: Pid },
-    /// `erts_internal:process_flag(Pid, save_calls, Value)` applies on the target process.
-    SaveCalls { value: Message },
     /// `garbage_collect` request. `request_id` is the term in the reply tuple.
     Collect { request_id: Message, major: bool },
-    /// `process_display(Pid, backtrace)`.
-    Display,
     /// Check whether the target still has a direct reference to old module code.
     CheckProcessCode {
         /// Old code of the checked module; `None` when it has none (the result is `false`).
@@ -1699,18 +1698,10 @@ pub(crate) fn monitor_options(
 // Port of erts/emulator/beam/bif.c (erts_monitor_opts), OTP-29.1.1.
 pub(crate) fn spawn_monitor_options(
     options: Term,
-) -> Option<(
-    Option<arinsal_etf::OwnedTerm>,
-    Option<crate::proc_create::AliasMode>,
-    bool,
-)> {
+) -> Option<(Option<Term>, Option<crate::proc_create::AliasMode>, bool)> {
     let items = list(options)?;
     let (tag, alias_mode, priority) = parse_monitor_option_items(&items, "spawn_request").ok()?;
-    let tag = if tag == Term::atom(arinsal_term::atoms::DOWN) {
-        None
-    } else {
-        Some(arinsal_term::to_owned(tag).ok()?)
-    };
+    let tag = (tag != Term::atom(arinsal_term::atoms::DOWN)).then_some(tag);
     Some((tag, alias_mode, priority))
 }
 
@@ -1768,14 +1759,7 @@ pub(crate) fn monitor_info_for(
     tag: Term,
     name: Option<&str>,
 ) -> Result<crate::proc_create::MonitorInfo, VmError> {
-    let tag = if tag == Term::atom(arinsal_term::atoms::DOWN) {
-        None
-    } else {
-        Some(
-            arinsal_term::to_owned(tag)
-                .map_err(|error| VmError::Unsupported(format!("monitor tag: {error:?}")))?,
-        )
-    };
+    let tag = (tag != Term::atom(arinsal_term::atoms::DOWN)).then_some(tag);
     Ok(crate::proc_create::MonitorInfo::new(
         tag,
         name.map(str::to_owned),

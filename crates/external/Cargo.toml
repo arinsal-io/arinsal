@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 arinsal-term.workspace = true
+arinsal-alloc = { path = "../alloc" }
 arinsal-maps.workspace = true
 flate2 = { workspace = true }
 num-bigint = { workspace = true }

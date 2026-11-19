@@ -360,6 +360,25 @@ impl Message {
         }
     }
 
+    /// A message whose term was built in `heap`, its own heap fragment
+    /// (`erts_alloc_message(hsz, &hp)`).
+    // Port of erts/emulator/beam/erl_message.c (erts_alloc_message), OTP-29.1.1.
+    pub(crate) fn from_heap_block(
+        term: Term,
+        heap: arinsal_term::message::MessageHeapBlock,
+    ) -> Self {
+        Self {
+            term,
+            data: Some(MessageData::attached(system_fragment(MessageFragment {
+                heap: Some(arinsal_term::message::MessageHeap::Heap(heap)),
+                seq_token: None,
+                timer_id: None,
+                dist_ext: None,
+            }))),
+            ..Self::immediate(term)
+        }
+    }
+
     /// Build the signal envelope that the literal-copy handler will reuse as its reply.
     // Port of erts/emulator/beam/beam_bif_load.c:1750-1787 (`erts_proc_sig_send_cla_request`), OTP-29.1.1.
     pub(crate) fn literal_copy_request(
@@ -674,13 +693,16 @@ impl Message {
     /// THE_NON_VALUE` with the `ErtsDistExternal` attached.
     // Port of erts/emulator/beam/erl_message.c (erts_queue_dist_message, the message it
     // builds), OTP-29.1.1.
+    // `ERL_MESSAGE_TOKEN(mp) = token`: `NIL` when the operation carried none.
     pub(crate) fn dist_external(
         dist_ext: Box<crate::natives::external_dist::ErtsDistExternal>,
+        token: Option<Box<crate::seq_trace::Token>>,
     ) -> Self {
         let mut message = Self::immediate(Term::NON_VALUE);
+        message.seq_nil = token.is_none();
         message.set_fragment(system_fragment(MessageFragment {
             heap: None,
-            seq_token: None,
+            seq_token: token,
             timer_id: None,
             dist_ext: Some(dist_ext),
         }));
@@ -701,6 +723,7 @@ pub(crate) fn erts_queue_dist_message(
     sched: &arinsal_sched::Scheduler<Process>,
     rcvr: Pid,
     dist_ext: Box<crate::natives::external_dist::ErtsDistExternal>,
+    token: Option<Box<crate::seq_trace::Token>>,
     from: Pid,
 ) -> Result<(), VmError> {
     sched
@@ -708,7 +731,7 @@ pub(crate) fn erts_queue_dist_message(
             rcvr,
             arinsal_sched::OwnedSignal::new(Event {
                 from,
-                payload: Payload::Message(Message::dist_external(dist_ext)),
+                payload: Payload::Message(Message::dist_external(dist_ext, token)),
             }),
         )
         .map_err(|error| VmError::Unsupported(format!("dist send: {error}")))

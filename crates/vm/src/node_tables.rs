@@ -1,7 +1,13 @@
 //! Runtime-wide node names, distribution entries, and node monitors.
 
 use arinsal_etf::{AtomCache, DistributionPacket, OwnedTerm};
+use arinsal_external::EncodeError;
+use arinsal_external::dist::{
+    DFLAG_DIST_HOPEFULLY, DFLAG_PENDING_CONNECT, DsigEncode, DsigEncodeResult, ErtsAtomCache,
+    ErtsAtomCacheMap, ErtsDistOutputBuf,
+};
 use arinsal_sched::Pid;
+use arinsal_term::Term;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
@@ -10,6 +16,9 @@ use std::time::Instant;
 
 pub(crate) const DFLAG_FRAGMENTS: u64 = 0x0080_0000;
 pub(crate) const DFLAG_EXIT_PAYLOAD: u64 = 0x0040_0000;
+pub(crate) const DFLAG_SEND_SENDER: u64 = 0x0008_0000;
+pub(crate) const DFLAG_BIG_SEQTRACE_LABELS: u64 = 0x0010_0000;
+pub(crate) const DFLAG_ALTACT_SIG: u64 = 0x20 << 32;
 
 /// Connection lifecycle for one [`NodeEntry`].
 ///
@@ -23,7 +32,7 @@ pub(crate) enum ConnState {
 }
 
 /// One node-table entry, including whether it currently has a connection.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct NodeEntry {
     pub(crate) name: String,
     pub(crate) creation: u32,
@@ -35,10 +44,10 @@ pub(crate) struct NodeEntry {
     pub(crate) visible: bool,
     pub(crate) connected: bool,
     pub(crate) dist: Option<DistState>,
-    /// Signals queued while the connection is still pending (auto-connect).
-    pub(crate) pending_out: VecDeque<(OwnedTerm, Option<OwnedTerm>)>,
-    /// Distributed spawn requests retained while auto-connect is pending.
-    pub(crate) pending_spawn_requests: BTreeMap<u64, SpawnRequest>,
+    /// Signals queued while the connection is still pending (auto-connect), encoded with
+    /// `DFLAG_PENDING_CONNECT` (`dep->out_queue` of a pending entry): `HOPEFUL_DATA` buffers
+    /// that `erts_encode_ext_dist_header_finalize` transcodes when they are output.
+    pub(crate) pending_out: VecDeque<ErtsDistOutputBuf>,
     /// `dep->mld`: the links and monitors of the current (pending or up) connection.
     pub(crate) mld: Option<std::sync::Arc<crate::monitor_link::MonLnkDist>>,
 }
@@ -74,21 +83,23 @@ impl DistEntry {
 }
 
 /// Controller-owned state for one active distribution connection.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct DistState {
     pub(crate) handle: u64,
     /// Real inet TCP port acting as DistCtrlr, when using the port-controller path.
     pub(crate) port_id: Option<u64>,
     pub(crate) owner: Pid,
     pub(crate) input_handler: Pid,
-    pub(crate) output: VecDeque<Vec<u8>>,
+    pub(crate) output: VecDeque<ErtsDistOutputBuf>,
     /// Serializes port writes so concurrent schedulers cannot reorder atom-cache headers.
     pub(crate) flushing_output: bool,
     pub(crate) incoming_cache: AtomCache,
-    pub(crate) outgoing_sequence_id: u64,
     /// Incomplete incoming fragmented signals, keyed by OTP sequence id.
     pub(crate) incoming_fragments: HashMap<u64, IncomingDistFragment>,
-    pub(crate) outgoing_cache: AtomCache,
+    pub(crate) outgoing_cache: ErtsAtomCache,
+    /// The atom cache map reused by every signal encoded for this connection; erts keeps it
+    /// per scheduler (`erts_get_atom_cache_map`).
+    pub(crate) acmp: ErtsAtomCacheMap,
     pub(crate) get_size: bool,
     pub(crate) notify: bool,
     pub(crate) read: u64,
@@ -103,7 +114,6 @@ pub(crate) struct DistState {
     pub(crate) remote_pids: HashMap<(u32, u32, u32), Pid>,
     /// Reverse map for local proxy pids created by [`Self::remote_pids`].
     pub(crate) proxy_to_remote: HashMap<Pid, OwnedTerm>,
-    pub(crate) spawn_requests: BTreeMap<u64, SpawnRequest>,
 }
 
 /// Reassembly state for an OTP `DIST_FRAG_HEADER` signal.
@@ -111,39 +121,6 @@ pub(crate) struct DistState {
 pub(crate) struct IncomingDistFragment {
     pub(crate) next_fragment_id: u64,
     pub(crate) packet: DistributionPacket,
-}
-
-/// Outstanding `spawn_request` waiting for `DOP_SPAWN_REPLY`.
-#[derive(Clone, Debug)]
-pub(crate) struct SpawnRequest {
-    pub(crate) caller: Pid,
-    pub(crate) tag: OwnedTerm,
-    pub(crate) monitor: bool,
-    /// `{reply, error_only}` / `{reply, no}` — suppress success mailbox message.
-    pub(crate) no_success_msg: bool,
-    /// `{reply, success_only}` / `{reply, no}` — suppress error mailbox message
-    /// (ERTS_ML_FLG_SPAWN_NO_EMSG).
-    pub(crate) no_error_msg: bool,
-    /// `ERTS_ML_FLG_SPAWN_ABANDONED`: `spawn_request_abandon/1` was called on a request with
-    /// link; the reply sends the child an `abandoned` exit (bif.c:1166).
-    pub(crate) abandoned: bool,
-    /// `ERTS_ML_FLG_SPAWN_LINK` of the pending-spawn origin monitor.
-    pub(crate) link: bool,
-    /// `ERTS_ML_FLG_SPAWN_LINK_PRIO`: the successful link gets `PRIO_ML` on reply.
-    pub(crate) link_priority: bool,
-    /// `ERTS_ML_FLG_PRIO_ML` of the pending-spawn origin monitor.
-    pub(crate) monitor_priority: bool,
-    /// The parent is exiting: erts moved the target half of the monitor to
-    /// `dist->dist_pend_spawn_exit` (dist.c:665 erts_dist_pend_spawn_exit_parent_setup).
-    pub(crate) parent_exiting: bool,
-    /// `mdp->origin.other.item` once a reply was saved for the exiting parent: the child pid,
-    /// or the error atom of a failed spawn. `None` is `am_pending`.
-    pub(crate) child: Option<OwnedTerm>,
-    /// `mdp->u.target.other.ptr`: the parent suspended until the reply arrives
-    /// (dist.c:758-790 erts_dist_pend_spawn_exit_parent_wait). Dropping it resumes the
-    /// parent, also when the connection goes down (dist.c:326
-    /// dist_pend_spawn_exit_connection_down).
-    pub(crate) waiter: Option<arinsal_sched::ExitWaiter<crate::Process>>,
 }
 
 impl DistState {
@@ -156,9 +133,9 @@ impl DistState {
             output: VecDeque::new(),
             flushing_output: false,
             incoming_cache: AtomCache::new(),
-            outgoing_sequence_id: 1,
             incoming_fragments: HashMap::new(),
-            outgoing_cache: AtomCache::new(),
+            outgoing_cache: ErtsAtomCache::default(),
+            acmp: ErtsAtomCacheMap::default(),
             get_size: false,
             notify: false,
             read: 0,
@@ -171,132 +148,57 @@ impl DistState {
             flags,
             remote_pids: HashMap::new(),
             proxy_to_remote: HashMap::new(),
-            spawn_requests: BTreeMap::new(),
         }
-    }
-
-    pub(crate) fn queue_term(
-        &mut self,
-        control: OwnedTerm,
-        message: Option<OwnedTerm>,
-    ) -> Result<(), arinsal_etf::DecodeError> {
-        let packets = self.encode_packets(&control, message.as_ref())?;
-        self.pending_bytes = self
-            .pending_bytes
-            .saturating_add(packets.iter().map(|packet| packet.len() as u64).sum());
-        self.output.extend(packets);
-        Ok(())
-    }
-
-    fn encode_packets(
-        &mut self,
-        control: &OwnedTerm,
-        message: Option<&OwnedTerm>,
-    ) -> Result<Vec<Vec<u8>>, arinsal_etf::DecodeError> {
-        let sequence_id = self.outgoing_sequence_id;
-        self.outgoing_sequence_id = self.outgoing_sequence_id.wrapping_add(1).max(1);
-        let mut terms = vec![control];
-        if let Some(message) = message {
-            terms.push(message);
-        }
-        let packets = if self.flags & DFLAG_FRAGMENTS != 0 {
-            arinsal_etf::encode_dist_packet_terms_fragmented_indexed(
-                &terms,
-                &mut self.outgoing_cache,
-                sequence_id,
-                64 * 1024,
-                |name| arinsal_term::global_atoms().get(name).map(|atom| atom.0),
-            )?
-        } else {
-            vec![arinsal_etf::encode_dist_packet_terms_indexed(
-                &terms,
-                &mut self.outgoing_cache,
-                None,
-                |name| arinsal_term::global_atoms().get(name).map(|atom| atom.0),
-            )]
-        };
-        Ok(packets)
-    }
-
-    /// Encode one signal as ordered framed distribution packets.
-    ///
-    /// Callers that hold [`lock`] must relabel local identities first — this
-    /// method must not take the node-tables lock.
-    pub(crate) fn encode_term(
-        &mut self,
-        control: OwnedTerm,
-        message: Option<OwnedTerm>,
-    ) -> Result<Vec<Vec<u8>>, arinsal_etf::DecodeError> {
-        // The queue size grows when the fragments enter `output` (dist.c PHASE_SEND,
-        // update_qsizes), not when they are encoded.
-        self.encode_packets(&control, message.as_ref())
     }
 }
 
-/// Rewrite `nonode@nohost` pid/port/ref identities to this node's name/creation.
-///
-/// Port of external.c encode path for internal things on a live node, OTP-29.1.1.
-pub(crate) fn relabel_local_node(mut term: OwnedTerm, local: &str, creation: u32) -> OwnedTerm {
-    match &mut term {
-        OwnedTerm::Pid {
-            node, creation: c, ..
-        } if node.as_str() == "nonode@nohost" => {
-            *node = local.to_string();
-            *c = creation;
-        }
-        OwnedTerm::Port {
-            node, creation: c, ..
-        } if node.as_str() == "nonode@nohost" => {
-            *node = local.to_string();
-            *c = creation;
-        }
-        OwnedTerm::Ref {
-            node, creation: c, ..
-        } if node.as_str() == "nonode@nohost" => {
-            *node = local.to_string();
-            *c = creation;
-        }
-        OwnedTerm::Tuple(parts) => {
-            for part in parts.iter_mut() {
-                let taken = std::mem::replace(part, OwnedTerm::Nil);
-                *part = relabel_local_node(taken, local, creation);
-            }
-        }
-        OwnedTerm::List { elems, tail } => {
-            for elem in elems.iter_mut() {
-                let taken = std::mem::replace(elem, OwnedTerm::Nil);
-                *elem = relabel_local_node(taken, local, creation);
-            }
-            let taken = std::mem::replace(tail.as_mut(), OwnedTerm::Nil);
-            *tail.as_mut() = relabel_local_node(taken, local, creation);
-        }
-        OwnedTerm::Map(entries) => {
-            for (key, value) in entries.iter_mut() {
-                let taken_k = std::mem::replace(key, OwnedTerm::Nil);
-                *key = relabel_local_node(taken_k, local, creation);
-                let taken_v = std::mem::replace(value, OwnedTerm::Nil);
-                *value = relabel_local_node(taken_v, local, creation);
-            }
-        }
-        // Port of erts/emulator/beam/external.c:3970-3992 (`enc_term`, FUN_DEF), OTP-29.1.1.
-        // The creator pid and environment are encoded as ordinary terms.
-        OwnedTerm::Fun { pid, free_vars, .. } => {
-            let creator = std::mem::replace(pid.as_mut(), OwnedTerm::Nil);
-            **pid = relabel_local_node(creator, local, creation);
-            for value in free_vars.iter_mut() {
-                let taken = std::mem::replace(value, OwnedTerm::Nil);
-                *value = relabel_local_node(taken, local, creation);
-            }
-        }
-        OwnedTerm::Record { fields, .. } => {
-            for (_, value) in fields {
-                let taken = std::mem::replace(value, OwnedTerm::Nil);
-                *value = relabel_local_node(taken, local, creation);
-            }
-        }
-        _ => {}
+/// Run a `no_trap` encode to `ERTS_DSIG_SEND_PHASE_SEND`.
+pub(crate) fn encode_no_trap(
+    enc: &mut DsigEncode,
+    acmp: Option<&ErtsAtomCacheMap>,
+) -> Result<Vec<ErtsDistOutputBuf>, EncodeError> {
+    let mut reds = i64::MAX / 2;
+    match enc.step(acmp, &mut reds, true)? {
+        DsigEncodeResult::Send => Ok(enc.take_obufs()),
+        DsigEncodeResult::TooLarge => Err(EncodeError::SystemLimit),
+        DsigEncodeResult::Continue => unreachable!("a no_trap encode runs to the end"),
     }
-    term
+}
+
+/// `dep->dflags` of an entry without a set-up connection: the flags erts gives a pending
+/// connection (erl_node_tables.c erts_set_dist_entry_pending), which is what an idle entry
+/// gets when a send auto-connects it (dist.c erts_dsig_prepare).
+pub(crate) const DFLAG_PENDING_DFLAGS: u64 =
+    DFLAG_DIST_MANDATORY | DFLAG_DIST_HOPEFULLY | DFLAG_PENDING_CONNECT;
+
+impl NodeEntry {
+    /// `dep->dflags`: the set-up connection's flags, else those of a pending connection.
+    pub(crate) fn dflags(&self) -> u64 {
+        self.dist
+            .as_ref()
+            .filter(|state| state.handle != 0)
+            .map_or(DFLAG_PENDING_DFLAGS, |state| state.flags)
+    }
+}
+
+/// Encode a signal toward a pending connection (dist.c erts_dsig_send with
+/// `DFLAG_PENDING_CONNECT`): one output buffer with the hopeful header. `from` is
+/// `ctx->from`.
+pub(crate) fn encode_pending(
+    control: Term,
+    message: Option<Term>,
+    from: u64,
+) -> Result<ErtsDistOutputBuf, EncodeError> {
+    let mut enc = DsigEncode::new(
+        control,
+        message,
+        DFLAG_PENDING_DFLAGS,
+        from,
+        arinsal_term::this_node,
+    );
+    let mut obufs = encode_no_trap(&mut enc, None)?;
+    debug_assert_eq!(obufs.len(), 1);
+    Ok(obufs.pop().expect("a pending signal is one buffer"))
 }
 
 #[derive(Clone, Debug)]
@@ -428,7 +330,6 @@ impl Default for NodeTables {
                 connected: false,
                 dist: None,
                 pending_out: VecDeque::new(),
-                pending_spawn_requests: BTreeMap::new(),
                 mld: None,
             }),
         );
@@ -635,7 +536,6 @@ fn fresh_entry(name: String) -> NodeEntry {
         connected: false,
         dist: None,
         pending_out: VecDeque::new(),
-        pending_spawn_requests: BTreeMap::new(),
         mld: None,
     }
 }
@@ -726,7 +626,6 @@ impl NodeTables {
                 connected: false,
                 dist: None,
                 pending_out: VecDeque::new(),
-                pending_spawn_requests: BTreeMap::new(),
                 mld: None,
             }),
         );
@@ -784,10 +683,6 @@ impl NodeTables {
             entry.dist = None;
             entry.mld = None;
             entry.pending_out.clear();
-            // The aborted connection takes its pending-spawn monitors along; dropping a
-            // suspended parent's waiter resumes it (dist.c:326
-            // dist_pend_spawn_exit_connection_down).
-            entry.pending_spawn_requests.clear();
         }
         Some(!was_connected)
     }
@@ -814,7 +709,6 @@ impl NodeTables {
         entry.connected = true;
         entry.dist = None;
         entry.pending_out.clear();
-        entry.pending_spawn_requests.clear();
         entry.mld = mld;
     }
 

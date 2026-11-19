@@ -52,7 +52,8 @@ pub(crate) struct ErlSpawnOpts {
 
 /// `monitor_tag` and `monitor_oflags` of `SPO_MONITOR`.
 pub(crate) struct SpawnMonitor {
-    pub tag: Option<arinsal_etf::OwnedTerm>,
+    /// The tag on the caller's heap; `erts_monitor_create` copies it.
+    pub tag: Option<Term>,
     pub alias: Option<AliasMode>,
     pub priority: bool,
 }
@@ -605,7 +606,7 @@ fn create_child(
                 ),
                 parent_pid.data(),
                 child_pid.data(),
-                crate::proc_create::MonitorInfo::new(monitor.tag.clone(), None),
+                crate::proc_create::MonitorInfo::new(monitor.tag, None),
                 crate::proc_create::OriginMonitor::Process(crate::proc_create::OriginHalf),
             );
             parent.monitors.insert(origin);

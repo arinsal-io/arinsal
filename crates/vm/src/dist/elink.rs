@@ -5,13 +5,13 @@
 //! (erts_proc_sig_send_dist_*, reply_dist_unlink_ack, erts_proc_sig_send_link_exit_noconnection),
 //! erl_process.c (erts_proc_exit_handle_link) and bif.c (link_opt, unlink_1), OTP-29.1.1.
 
-use super::{badarg, control, local_pid_owned};
+use super::{CtlHeap, badarg, local_pid_term};
 use crate::monitor_link::{ExternalPid, Link, node_type};
 use crate::node_tables;
 use crate::process::Message;
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::{Pid, Signal};
-use arinsal_term::{Term, global_atoms, to_owned};
+use arinsal_term::{Term, global_atoms};
 use std::sync::Arc;
 
 /// The proc half of an external link in transit as a [`Signal::DistLink`] (erts queues
@@ -65,9 +65,8 @@ pub(super) fn spawn_reply_link(
     runtime: &crate::process::Runtime,
     handle: u64,
     parent: Pid,
-    result: &OwnedTerm,
+    remote: ExternalPid,
 ) -> Result<DistLinkHalf, crate::VmError> {
-    let remote = external_pid(result).ok_or_else(badarg)?;
     let (_node, _connection_id, mld) = connection_of_handle(handle).ok_or_else(badarg)?;
     let (proc_half, dist_half) =
         Link::create_external(node_type::LINK_DIST_PROC, parent.data(), remote);
@@ -135,8 +134,8 @@ pub(super) fn send_on_connection(
     runtime: &crate::process::Runtime,
     nodename: u32,
     connection_id: u32,
-    control: OwnedTerm,
-    payload: Option<OwnedTerm>,
+    control: Term,
+    payload: Option<Term>,
 ) {
     let Some(node) = global_atoms().text(arinsal_term::Atom(nodename)) else {
         return;
@@ -145,7 +144,6 @@ pub(super) fn send_on_connection(
         return;
     };
     let handle = {
-        let (local_name, local_creation) = node_tables::this_node();
         let mut entry = dep.lock();
         if entry.connection_id != connection_id {
             return;
@@ -156,10 +154,11 @@ pub(super) fn send_on_connection(
                 None => return,
             },
             node_tables::ConnState::Pending => {
-                let control = node_tables::relabel_local_node(control, local_name, local_creation);
-                let payload =
-                    payload.map(|m| node_tables::relabel_local_node(m, local_name, local_creation));
-                entry.pending_out.push_back((control, payload));
+                if let Ok(signal) =
+                    node_tables::encode_pending(control, payload, super::dsig_from(None))
+                {
+                    entry.pending_out.push_back(signal);
+                }
                 return;
             }
             _ => return,
@@ -182,44 +181,62 @@ pub(super) fn exit_payload_flag(nodename: u32) -> bool {
 }
 
 /// `erts_dsig_send_exit_tt(ctx, from, to, reason)` on connection `connection_id`.
-fn send_exit(
+pub(super) fn send_exit(
     runtime: &crate::process::Runtime,
     nodename: u32,
     connection_id: u32,
     local: Pid,
     remote: ExternalPid,
-    reason: OwnedTerm,
+    reason: Term,
 ) {
-    let Some(remote) = external_pid_owned(remote) else {
-        return;
-    };
-    let (control, payload) = if exit_payload_flag(nodename) {
-        (
-            control(24, vec![local_pid_owned(local), remote]),
-            Some(reason),
-        )
-    } else {
-        (
-            control(3, vec![local_pid_owned(local), remote, reason]),
-            None,
-        )
-    };
-    send_on_connection(runtime, nodename, connection_id, control, payload);
+    send_exit_from(
+        runtime,
+        nodename,
+        connection_id,
+        local_pid_term(local),
+        remote,
+        reason,
+    );
 }
 
-/// Incoming `DOP_LINK`: create the external link, put its dist half into the connection and
-/// queue its proc half to the local process.
+/// [`send_exit`] from any `from` term: the `noproc` reply to a `DOP_LINK` names the link
+/// target as the remote sent it (an old incarnation of this node included).
+// Port of erts/emulator/beam/dist.c (erts_dsig_send_exit_tt), OTP-29.1.1.
+fn send_exit_from(
+    runtime: &crate::process::Runtime,
+    nodename: u32,
+    connection_id: u32,
+    from: Term,
+    remote: ExternalPid,
+    reason: Term,
+) {
+    let mut ctl = CtlHeap::new();
+    let Ok(remote) = ctl.external_pid(remote) else {
+        return;
+    };
+    let built = if exit_payload_flag(nodename) {
+        ctl.control(24, &[from, remote]).map(|c| (c, Some(reason)))
+    } else {
+        ctl.control(3, &[from, remote, reason]).map(|c| (c, None))
+    };
+    if let Ok((control, payload)) = built {
+        send_on_connection(runtime, nodename, connection_id, control, payload);
+    }
+}
+
+/// Incoming `DOP_LINK` from the external `remote` to `to`: create the external link, put its
+/// dist half into the connection and queue its proc half to the local process; an old
+/// incarnation of this node or a dead process gets a `noproc` exit back.
 // Port of erts/emulator/beam/dist.c (erts_net_message, DOP_LINK), OTP-29.1.1.
 pub(super) fn incoming_link(
     runtime: &crate::process::Runtime,
     handle: u64,
     proxy: Pid,
-    from: &OwnedTerm,
-    to: Option<Pid>,
+    remote: ExternalPid,
+    to: Term,
 ) -> Result<(), crate::VmError> {
-    let remote = external_pid(from).ok_or_else(badarg)?;
     let (_node, connection_id, mld) = connection_of_handle(handle).ok_or_else(badarg)?;
-    if let Some(to) = to {
+    if let Some(to) = to.as_pid_data().map(Pid::from_data) {
         let (proc_half, dist_half) =
             Link::create_external(node_type::LINK_DIST_PROC, to.data(), remote);
         let not_inserted = dist_half.dist_insert(&mld).err();
@@ -236,30 +253,16 @@ pub(super) fn incoming_link(
         // The dropped signal took the dist half out of the connection and released both.
         drop(not_inserted);
     }
-    // Old incarnation of this node or a dead process: reply noproc.
-    send_exit_reply(runtime, mld.nodename, connection_id, to, remote, "noproc");
-    Ok(())
-}
-
-fn send_exit_reply(
-    runtime: &crate::process::Runtime,
-    nodename: u32,
-    connection_id: u32,
-    to: Option<Pid>,
-    remote: ExternalPid,
-    reason: &str,
-) {
-    let Some(to) = to else {
-        return;
-    };
-    send_exit(
+    // Failed to send signal or old incarnation: reply noproc.
+    send_exit_from(
         runtime,
-        nodename,
+        mld.nodename,
         connection_id,
         to,
         remote,
-        OwnedTerm::Atom(reason.into()),
+        Term::atom(arinsal_term::atoms::NOPROC),
     );
+    Ok(())
 }
 
 /// Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_send_link_exit_noconnection),
@@ -310,12 +313,11 @@ pub(super) fn links_connection_down(
 pub(super) fn incoming_exit(
     runtime: &crate::process::Runtime,
     proxy: Pid,
-    from: &OwnedTerm,
+    from: ExternalPid,
     to: Pid,
     linked: bool,
     reason: Message,
 ) -> Result<(), crate::VmError> {
-    let from = external_pid(from).ok_or_else(badarg)?;
     // A dead process takes the signal along (dist.c: "Process not alive").
     let _ = runtime.scheduler()?.signal(
         proxy,
@@ -338,11 +340,10 @@ pub(super) fn incoming_unlink(
     handle: u64,
     proxy: Pid,
     id: u64,
-    from: &OwnedTerm,
+    remote: ExternalPid,
     to: Pid,
     ack: bool,
 ) -> Result<(), crate::VmError> {
-    let remote = external_pid(from).ok_or_else(badarg)?;
     let (_node, connection_id, mld) = connection_of_handle(handle).ok_or_else(badarg)?;
     let op = Box::new(arinsal_sched::DistUnlinkOp {
         nodename: mld.nodename,
@@ -371,18 +372,17 @@ pub(crate) fn reply_dist_unlink_ack(
     if op.id == 0 {
         return;
     }
-    let Some(remote) = external_pid_owned(op.remote) else {
+    // erts_dsig_send_unlink_ack: {DOP_UNLINK_ID_ACK, Id, Local, Remote}.
+    let mut ctl = CtlHeap::new();
+    let Ok(remote) = ctl.external_pid(op.remote) else {
         return;
     };
-    let control = control(
-        36,
-        vec![
-            OwnedTerm::Int(op.id as i64),
-            local_pid_owned(op.local),
-            remote,
-        ],
-    );
-    send_on_connection(runtime, op.nodename, op.connection_id, control, None);
+    let Ok(id) = ctl.owned(&OwnedTerm::Int(op.id as i64)) else {
+        return;
+    };
+    if let Ok(control) = ctl.control(36, &[id, local_pid_term(op.local), remote]) {
+        send_on_connection(runtime, op.nodename, op.connection_id, control, None);
+    }
 }
 
 /// The `ERTS_LNK_TYPE_DIST_PROC` case of erts_proc_exit_handle_link: the local process `local`
@@ -408,9 +408,6 @@ pub(crate) fn proc_exit_handle_link(
     }
     let (Some(runtime), Some(remote), Some((nodename, connection_id))) = (runtime, remote, dist)
     else {
-        return;
-    };
-    let Ok(reason) = to_owned(reason) else {
         return;
     };
     send_exit(runtime, nodename, connection_id, local, remote, reason);
@@ -509,14 +506,11 @@ pub(super) fn link_external(
                 // The connection went down after the prepare.
                 send_link_exit_noconnection(runtime, dist_half);
             }
-            super::queue_outgoing_on(
-                process,
-                ctx,
-                node,
-                connection_id,
-                control(1, vec![local_pid_owned(me), target]),
-                None,
-            )?;
+            // erts_dsig_send_link: {DOP_LINK, Local, Remote}.
+            let mut ctl = CtlHeap::new();
+            let target = ctl.owned(&target)?;
+            let control = ctl.control(1, &[local_pid_term(me), target])?;
+            super::queue_outgoing_on(process, ctx, node, connection_id, control, None)?;
         }
     }
     Ok(Term::atom(arinsal_term::atoms::TRUE))
@@ -581,20 +575,15 @@ pub(super) fn unlink_external(
     // Not connected, or connected over another connection than the one the link was set up
     // on: nothing is sent and the link waits, unlinking, for its `noconnection` exit.
     if current.is_some() && current == connection_id {
-        super::queue_outgoing(
-            process,
-            ctx,
-            node,
-            control(
-                35,
-                vec![
-                    OwnedTerm::Int(id as i64),
-                    local_pid_owned(ctx.pid()),
-                    target,
-                ],
-            ),
-            None,
-        )?;
+        // erts_dsig_send_unlink: {DOP_UNLINK_ID, Id, Local, Remote}.
+        let mut ctl = CtlHeap::new();
+        let fields = [
+            ctl.owned(&OwnedTerm::Int(id as i64))?,
+            local_pid_term(ctx.pid()),
+            ctl.owned(&target)?,
+        ];
+        let control = ctl.control(35, &fields)?;
+        super::queue_outgoing(process, ctx, node, control, None)?;
     }
     Ok(Term::atom(arinsal_term::atoms::TRUE))
 }

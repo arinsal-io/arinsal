@@ -69,19 +69,24 @@ impl Process {
                 garbage: None,
                 pend_spawn: false,
                 waiter: None,
+                pend_spawn_monitors: Default::default(),
             })
             .expect("exit continuation allocation"),
         ));
         let mut reds = isize::MAX;
         let mut garbage = None;
         self.exit_ets(ctx, &mut reds, &mut garbage);
-        self.exit_stage3(ctx, reason);
+        let mut pend_spawn_monitors = self.exit_stage3(ctx, reason);
         // This synchronous exit cannot suspend: pending-spawn monitors whose child is not
         // known yet are dropped (see `crate::dist::pend_spawn_exit`).
-        if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::DIST_SPAWN != 0
-            && let Some(runtime) = self.runtime
-        {
-            let _ = crate::dist::pend_spawn_exit(runtime, ctx.pid(), reason, None);
+        if let Some(runtime) = self.runtime {
+            let _ = crate::dist::pend_spawn_exit(
+                runtime,
+                ctx.pid(),
+                reason,
+                None,
+                &mut pend_spawn_monitors,
+            );
         }
     }
 
@@ -287,7 +292,14 @@ impl Process {
     }
 
     /// Process exit after its tables are released: pending signals, names, links and monitors.
-    fn exit_stage3(&mut self, ctx: &mut RunCtx<'_, crate::Process>, reason: Term) {
+    /// Returns the pending-spawn monitors the MONITORS phase moved aside
+    /// (`ErtsProcExitContext.pend_spawn_monitors`).
+    fn exit_stage3(
+        &mut self,
+        ctx: &mut RunCtx<'_, crate::Process>,
+        reason: Term,
+    ) -> crate::proc_create::MonitorTree {
+        let mut pend_spawn_monitors = crate::proc_create::MonitorTree::default();
         // Port of erts/emulator/beam/erl_process.c:14374-14392
         // (ERTS_CONTINUE_EXIT_CLEAN_SYS_TASKS), OTP-29.1.1. Keep the literal area alive
         // through system task replies while the reason or a dirty-running process can access it.
@@ -461,6 +473,18 @@ impl Process {
                 }) => {
                     crate::port::demonitor_port(self, ctx.pid(), *port_id, monitor);
                 }
+                // Port of erts/emulator/beam/erl_process.c:13931-13935
+                // (erts_proc_exit_handle_monitor, ERTS_ML_FLG_SPAWN_PENDING) with dist.c:665
+                // (erts_dist_pend_spawn_exit_parent_setup), OTP-29.1.1: a pending-spawn
+                // monitor moves aside; a reply that arrives from now on is saved for this
+                // process by the distribution code.
+                Some(crate::proc_create::OriginMonitor::Distributed)
+                    if monitor.view().spawn_pending() =>
+                {
+                    if crate::dist::pend_spawn_exit_parent_setup(&monitor) {
+                        pend_spawn_monitors.insert(monitor);
+                    }
+                }
                 // Port of erts/emulator/beam/erl_process.c (erts_proc_exit_handle_monitor,
                 // origin ERTS_MON_TYPE_DIST_PROC): erts_proc_exit_dist_demonitor.
                 Some(crate::proc_create::OriginMonitor::Distributed) => {
@@ -507,22 +531,21 @@ impl Process {
                 );
             }
         }
-        // Port of erts/emulator/beam/erl_process.c:13932-13935 (proc_exit_handle_monitors,
-        // ERTS_ML_FLG_SPAWN_PENDING) with dist.c:665 (erts_dist_pend_spawn_exit_parent_setup),
-        // OTP-29.1.1: the MONITORS phase moves the pending-spawn monitors aside. A reply that
-        // arrives from now on is saved for this process by the distribution code.
-        let dist_spawn = ctx.exit_flags().load(Ordering::Acquire) & proc_flags::DIST_SPAWN != 0;
-        if dist_spawn {
-            crate::dist::pend_spawn_exit_parent_setup(ctx.pid());
-        }
         // Port of erl_process.c:14589 (ERTS_CONTINUE_EXIT_HANDLE_PROC_SIG) for the spawn replies
         // fetched before the links phase (erl_proc_sig_queue.c:5927
         // handle_dist_spawn_reply_exiting): they answer with the actual exit reason.
         if let Some(runtime) = self.runtime {
             for shared in &spawn_replies {
-                crate::dist::handle_dist_spawn_reply_exiting(runtime, ctx.pid(), reason, shared);
+                crate::dist::handle_dist_spawn_reply_exiting(
+                    runtime,
+                    ctx.pid(),
+                    reason,
+                    shared,
+                    &mut pend_spawn_monitors,
+                );
             }
         }
+        pend_spawn_monitors
     }
 }
 
@@ -598,6 +621,7 @@ impl Process {
             garbage: None,
             pend_spawn: false,
             waiter: None,
+            pend_spawn_monitors: Default::default(),
         };
         // Port of erts/emulator/beam/erl_process.c:14229 (erts_do_exit_process:
         // `BUMP_REDS(p, 100)`), OTP-29.1.1: the rest of the exit runs on what is left, and the
@@ -662,19 +686,24 @@ impl Process {
                 &zero,
             );
             // erts keeps `c_p` after the ptab delete of ERTS_CONTINUE_EXIT_FREE; Arinsal
-            // retains the process here, while its pid still resolves.
-            if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::DIST_SPAWN != 0 {
+            // retains the process before its pid leaves the table, when a pending-spawn
+            // monitor may make it wait.
+            if self
+                .monitors
+                .iter()
+                .any(|omon| !omon.is_target() && omon.spawn_pending())
+            {
                 state.waiter = runtime
                     .scheduler()
                     .ok()
                     .and_then(|scheduler| scheduler.exit_waiter(ctx.pid()));
             }
-            self.exit_stage3(ctx, state.reason);
+            state.pend_spawn_monitors = self.exit_stage3(ctx, state.reason);
             state.pend_spawn = true;
         }
         // Port of erts/emulator/beam/erl_process.c:14674-14697
         // (ERTS_CONTINUE_EXIT_DIST_PEND_SPAWN_MONITORS), OTP-29.1.1.
-        if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::DIST_SPAWN != 0 {
+        if !state.pend_spawn_monitors.is_empty() {
             // Signals that still reach the exiting process are handled as erts does while it
             // is suspended (erl_proc_sig_queue.c:7426 erts_proc_exit_handle_signal), so they
             // do not keep re-queueing it.
@@ -685,6 +714,7 @@ impl Process {
                     ctx.pid(),
                     state.reason,
                     shared,
+                    &mut state.pend_spawn_monitors,
                 );
             }
             let wait = matches!(
@@ -693,6 +723,7 @@ impl Process {
                     ctx.pid(),
                     state.reason,
                     state.waiter.as_ref(),
+                    &mut state.pend_spawn_monitors,
                 ),
                 crate::dist::PendSpawnExit::Wait
             );

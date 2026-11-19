@@ -981,6 +981,41 @@ impl ProcDict {
 /// returned value.
 pub(crate) type NativeReturnEvents = crate::trace::NativeReturnEvent;
 
+/// The words stored terms are copied to with `size_object` + `copy_struct`: the `heap` of
+/// `ErtsMonitorDataExtended` (reference, name, `other.item`), of `ErtsMonitorDataTagHeap`
+/// (the DOWN tag), or the heap fragment of a signal that carries terms
+/// (`erts_proc_sig_send_dist_spawn_reply`). The terms point into it and live as long as it.
+// Port of erts/emulator/beam/erl_monitor_link.c (erts_monitor_create: size_object +
+// copy_struct into `mdep->heap` / `tdp->heap`), OTP-29.1.1.
+#[derive(Default)]
+pub(crate) struct HeapFrag(Option<arinsal_term::VecHeap>);
+
+impl HeapFrag {
+    /// Copy `terms` into one new heap; immediates stay as they are.
+    pub(crate) fn copy<const N: usize>(terms: [Term; N]) -> (Self, [Term; N]) {
+        let sizes = terms.map(arinsal_term::size_object);
+        let total: usize = sizes.iter().sum();
+        if total == 0 {
+            return (Self(None), terms);
+        }
+        // One chunk of exactly the summed size: the words never move.
+        let mut heap = arinsal_term::VecHeap::with_initial_chunk_words(total);
+        let mut copied = terms;
+        for (term, size) in copied.iter_mut().zip(sizes) {
+            // erts HAlloc into a heap sized by size_object never fails.
+            *term = arinsal_term::copy_struct(*term, &mut heap, size)
+                .expect("monitor heap sized by size_object");
+        }
+        (Self(Some(heap)), copied)
+    }
+}
+
+impl std::fmt::Debug for HeapFrag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("HeapFrag").field(&self.0.is_some()).finish()
+    }
+}
+
 /// What both halves of a monitor share and never change. The DOWN tag and the name are rare,
 /// so they live in a separate box, as erts keeps them only in `ErtsMonitorDataExtended` /
 /// `ErtsMonitorDataTagHeap` (erl_monitor_link.h) and a plain monitor stays small.
@@ -989,64 +1024,229 @@ pub struct MonitorInfo(Option<Box<MonitorExtension>>);
 
 #[derive(Debug)]
 struct MonitorExtension {
-    tag: Option<arinsal_etf::OwnedTerm>,
+    /// `ErtsMonitorDataTagHeap`: the DOWN tag, copied into `tag_heap`.
+    tag: Option<Term>,
+    _tag_heap: HeapFrag,
     name: Option<String>,
     dist_origin: Option<DistOrigin>,
     dist_target: Option<DistTarget>,
     port_name: Option<arinsal_term::Atom>,
 }
 
-/// The remote target of an `ERTS_MON_TYPE_DIST_PROC` monitor a local process holds, as
-/// `ErtsMonitorDataExtended` keeps it: the origin half's `other.item` (the external pid, or
-/// the node of a monitor by name, whose name is the monitor's `name`), the reference sent in
-/// `DOP_MONITOR_P` (`md.ref`), and the connection the target half was inserted in, or the
-/// dead-dist record of a monitor made while not connected (`dist`).
-#[derive(Debug)]
-pub(crate) struct DistTarget {
-    pub(crate) target: arinsal_etf::OwnedTerm,
-    pub(crate) reference: arinsal_etf::OwnedTerm,
-    pub(crate) dist: std::sync::Arc<crate::monitor_link::MonLnkDist>,
-}
-
-/// The external watcher of an `ERTS_MON_TYPE_DIST_PROC` monitor of a local process, as
-/// `ErtsMonitorDataExtended` keeps it: the watcher pid (`md.u.target.other.item`, copied
-/// into `heap`), the reference as the remote node made it (`md.ref`), and the connection
-/// the origin half was inserted in (`dist`).
-#[derive(Debug)]
-pub(crate) struct DistOrigin {
-    pub(crate) watcher: crate::monitor_link::ExternalPid,
-    pub(crate) reference: arinsal_etf::OwnedTerm,
-    pub(crate) dist: std::sync::Arc<crate::monitor_link::MonLnkDist>,
-}
-
-impl MonitorInfo {
-    /// `tag`: the DOWN tag, owned off-heap so a tuple tag such as `{'ON_LOAD_DOWN', Mod}`
-    /// survives GC, `None` for the default `DOWN`. `name`: the registered name of a monitor
-    /// created by name; its DOWN object is `{Name, Node}`.
-    pub(crate) fn new(tag: Option<arinsal_etf::OwnedTerm>, name: Option<String>) -> Self {
-        if tag.is_none() && name.is_none() {
-            return Self(None);
-        }
-        Self(Some(Box::new(MonitorExtension {
+impl MonitorExtension {
+    fn new(tag: Option<Term>) -> Box<Self> {
+        let (tag_heap, tag) = match tag {
+            Some(tag) => {
+                let (heap, [tag]) = HeapFrag::copy([tag]);
+                (heap, Some(tag))
+            }
+            None => (HeapFrag::default(), None),
+        };
+        Box::new(Self {
             tag,
-            name,
+            _tag_heap: tag_heap,
+            name: None,
             dist_origin: None,
             dist_target: None,
             port_name: None,
-        })))
+        })
+    }
+}
+
+/// The remote target of an `ERTS_MON_TYPE_DIST_PROC` monitor a local process holds, as
+/// `ErtsMonitorDataExtended` keeps it: the origin half's `other.item` (the external pid, or
+/// the node of a monitor by name, whose name is the monitor's `name`), the reference sent in
+/// `DOP_MONITOR_P` (`md.ref`), both copied into the monitor's `heap`, and the connection the
+/// target half was inserted in, or the dead-dist record of a monitor made while not
+/// connected (`dist`).
+#[derive(Debug)]
+pub(crate) struct DistTarget {
+    target: Term,
+    reference: Term,
+    _heap: HeapFrag,
+    pub(crate) dist: std::sync::Arc<crate::monitor_link::MonLnkDist>,
+    /// The parts of a pending-spawn monitor (`ERTS_ML_FLG_SPAWN_PENDING`), `None` for any
+    /// other monitor.
+    spawn: Option<Box<SpawnPending>>,
+}
+
+/// The parts of `ErtsMonitorDataExtended` a pending distributed spawn uses (dist.c
+/// erts_internal_dist_spawn_request_4, erts_monitor_create with `am_pending`): the reply tag
+/// erts keeps in `u.name` until the reply, the child pid or error atom that replaces
+/// `am_pending` in `origin.other.item` (copied into the words `erts_monitor_create` reserved),
+/// and the exiting parent waiting for it (`u.target.other.ptr`).
+struct SpawnPending {
+    /// `u.name`: the reply tag, in the monitor's heap.
+    reply_tag: Term,
+    /// `origin.other.item` once the reply arrived; written once, by the parent
+    /// (handle_dist_spawn_reply) or under `dist->mtx` (dist_pend_spawn_exit_save_child_result,
+    /// erts_dist_pend_spawn_exit_parent_setup).
+    item: std::sync::OnceLock<(HeapFrag, Term)>,
+    /// `u.target.other.ptr`: the suspended exiting parent; dropping it is `erts_resume`.
+    /// Written and taken under `dist->mtx`.
+    waiter: std::sync::Mutex<Option<arinsal_sched::ExitWaiter<crate::Process>>>,
+}
+
+impl std::fmt::Debug for SpawnPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnPending")
+            .field("resolved", &self.item.get().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for SpawnPending {
+    // erts_monitor_release never resumes the process `u.target.other.ptr` points to.
+    fn drop(&mut self) {
+        if let Some(waiter) = self
+            .waiter
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            waiter.cancel();
+        }
+    }
+}
+
+impl DistTarget {
+    /// Copy `target` and `reference` into the monitor's heap (erts_monitor_create).
+    pub(crate) fn new(
+        target: Term,
+        reference: Term,
+        dist: std::sync::Arc<crate::monitor_link::MonLnkDist>,
+    ) -> Self {
+        let (heap, [target, reference]) = HeapFrag::copy([target, reference]);
+        Self {
+            target,
+            reference,
+            _heap: heap,
+            dist,
+            spawn: None,
+        }
+    }
+
+    /// The target of a pending spawn request: `other.item` is `am_pending` and the reply tag
+    /// is copied into the monitor's heap with the reference (dist.c
+    /// erts_internal_dist_spawn_request_4: erts_monitor_create(.., am_pending, tag, ..)).
+    pub(crate) fn spawn_pending(
+        reference: Term,
+        reply_tag: Term,
+        dist: std::sync::Arc<crate::monitor_link::MonLnkDist>,
+    ) -> Self {
+        let (heap, [reference, reply_tag]) = HeapFrag::copy([reference, reply_tag]);
+        Self {
+            target: Term::atom(arinsal_term::atoms::PENDING),
+            reference,
+            _heap: heap,
+            dist,
+            spawn: Some(Box::new(SpawnPending {
+                reply_tag,
+                item: std::sync::OnceLock::new(),
+                waiter: std::sync::Mutex::new(None),
+            })),
+        }
+    }
+
+    /// `other.item`: the external pid, or the node of a monitor by name; for a spawn request
+    /// `am_pending` until the reply stored the child pid or the error atom.
+    pub(crate) fn target(&self) -> Term {
+        match self.spawn.as_ref().and_then(|spawn| spawn.item.get()) {
+            Some((_, item)) => *item,
+            None => self.target,
+        }
+    }
+
+    /// `md.ref`.
+    pub(crate) fn reference(&self) -> Term {
+        self.reference
+    }
+
+    /// The reply tag of a spawn request (`mdep->u.name` while pending).
+    pub(crate) fn reply_tag(&self) -> Option<Term> {
+        self.spawn.as_ref().map(|spawn| spawn.reply_tag)
+    }
+
+    /// Replace `am_pending` in `other.item` by the spawn result, copied into the monitor
+    /// (`omon->other.item = copy_struct(result, ..)`). A second result is ignored, as erts
+    /// ignores the extra responses of a misbehaving peer.
+    pub(crate) fn set_item(&self, result: Term) {
+        if let Some(spawn) = self.spawn.as_ref() {
+            let _ = spawn.item.get_or_init(|| {
+                let (heap, [item]) = HeapFrag::copy([result]);
+                (heap, item)
+            });
+        }
+    }
+
+    /// `mdp->u.target.other.ptr`: set (`Some`) or take (`None`) the waiting exiting parent.
+    pub(crate) fn swap_waiter(
+        &self,
+        waiter: Option<arinsal_sched::ExitWaiter<crate::Process>>,
+    ) -> Option<arinsal_sched::ExitWaiter<crate::Process>> {
+        let spawn = self.spawn.as_ref()?;
+        let mut slot = spawn
+            .waiter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match waiter {
+            Some(waiter) => slot.replace(waiter),
+            None => slot.take(),
+        }
+    }
+}
+
+/// The external watcher of an `ERTS_MON_TYPE_DIST_PROC` monitor of a local process, as
+/// `ErtsMonitorDataExtended` keeps it: the watcher pid (`md.u.target.other.item`), the
+/// reference as the remote node made it (`md.ref`, copied into the monitor's `heap`), and the
+/// connection the origin half was inserted in (`dist`).
+#[derive(Debug)]
+pub(crate) struct DistOrigin {
+    pub(crate) watcher: crate::monitor_link::ExternalPid,
+    reference: Term,
+    _heap: HeapFrag,
+    pub(crate) dist: std::sync::Arc<crate::monitor_link::MonLnkDist>,
+}
+
+impl DistOrigin {
+    /// Copy `reference` into the monitor's heap (erts_monitor_create).
+    pub(crate) fn new(
+        watcher: crate::monitor_link::ExternalPid,
+        reference: Term,
+        dist: std::sync::Arc<crate::monitor_link::MonLnkDist>,
+    ) -> Self {
+        let (heap, [reference]) = HeapFrag::copy([reference]);
+        Self {
+            watcher,
+            reference,
+            _heap: heap,
+            dist,
+        }
+    }
+
+    /// `md.ref`.
+    pub(crate) fn reference(&self) -> Term {
+        self.reference
+    }
+}
+
+impl MonitorInfo {
+    /// `tag`: the DOWN tag, copied into the monitor's tag heap so a tuple tag such as
+    /// `{'ON_LOAD_DOWN', Mod}` survives GC of the caller, `None` for the default `DOWN`.
+    /// `name`: the registered name of a monitor created by name; its DOWN object is
+    /// `{Name, Node}`.
+    pub(crate) fn new(tag: Option<Term>, name: Option<String>) -> Self {
+        if tag.is_none() && name.is_none() {
+            return Self(None);
+        }
+        let mut extension = MonitorExtension::new(tag);
+        extension.name = name;
+        Self(Some(extension))
     }
 
     /// This monitor info for a monitor of the remote `target`.
     pub(crate) fn with_dist_target(self, target: DistTarget) -> Self {
-        let mut extension = self.0.unwrap_or_else(|| {
-            Box::new(MonitorExtension {
-                tag: None,
-                name: None,
-                dist_origin: None,
-                dist_target: None,
-                port_name: None,
-            })
-        });
+        let mut extension = self.0.unwrap_or_else(|| MonitorExtension::new(None));
         extension.dist_target = Some(target);
         Self(Some(extension))
     }
@@ -1059,13 +1259,10 @@ impl MonitorInfo {
     /// The shared data of a monitor of a local process by the external `origin`, created by
     /// the name `name` when it has one.
     pub(crate) fn dist_origin(origin: DistOrigin, name: Option<String>) -> Self {
-        Self(Some(Box::new(MonitorExtension {
-            tag: None,
-            name,
-            dist_origin: Some(origin),
-            dist_target: None,
-            port_name: None,
-        })))
+        let mut extension = MonitorExtension::new(None);
+        extension.name = name;
+        extension.dist_origin = Some(origin);
+        Self(Some(extension))
     }
 
     /// The external watcher of a monitor of a local process.
@@ -1076,28 +1273,22 @@ impl MonitorInfo {
     /// The shared part of a port monitor: its DOWN tag (`None` for `'DOWN'`) and the registered
     /// name it was created with, as `erts_monitor_create(ERTS_MON_TYPE_PORT, .., name, tag)`
     /// keeps both in `ErtsMonitorDataExtended`.
-    pub(crate) fn with_port_name(
-        tag: Option<arinsal_etf::OwnedTerm>,
-        name: Option<arinsal_term::Atom>,
-    ) -> Self {
+    pub(crate) fn with_port_name(tag: Option<Term>, name: Option<arinsal_term::Atom>) -> Self {
         if tag.is_none() && name.is_none() {
             return Self::default();
         }
-        Self(Some(Box::new(MonitorExtension {
-            tag,
-            name: None,
-            dist_origin: None,
-            dist_target: None,
-            port_name: name,
-        })))
+        let mut extension = MonitorExtension::new(tag);
+        extension.port_name = name;
+        Self(Some(extension))
     }
 
     pub(crate) fn port_name(&self) -> Option<arinsal_term::Atom> {
         self.0.as_ref()?.port_name
     }
 
-    pub(crate) fn tag(&self) -> Option<&arinsal_etf::OwnedTerm> {
-        self.0.as_ref()?.tag.as_ref()
+    /// The DOWN tag in the monitor's tag heap; copy it to use it elsewhere.
+    pub(crate) fn tag(&self) -> Option<Term> {
+        self.0.as_ref()?.tag
     }
 
     pub(crate) fn name(&self) -> Option<&str> {
@@ -2395,6 +2586,9 @@ pub(crate) struct ExitCont {
     /// This process, retained before its pid left the process table, for the suspend of
     /// erts_dist_pend_spawn_exit_parent_wait (dist.c:758-790).
     pub(crate) waiter: Option<arinsal_sched::ExitWaiter<Process>>,
+    /// `pend_spawn_monitors` of `ErtsProcExitContext`: the pending-spawn origin monitors the
+    /// MONITORS phase moved aside (erl_process.c erts_proc_exit_handle_monitor).
+    pub(crate) pend_spawn_monitors: MonitorTree,
 }
 
 #[cfg(test)]

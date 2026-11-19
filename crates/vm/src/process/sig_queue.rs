@@ -151,6 +151,7 @@ impl Process {
         // middle queue there only when it stops, so `stretch_limit` looks at what precedes.
         let msgq_end = self.inbox.entries.last_field();
         let mut cnt = 0_i32;
+        let mut yield_ = false;
         let mut handled = false;
         let result = loop {
             // Messages up to the next non-message signal or receive marker (a lazy node, which
@@ -265,6 +266,14 @@ impl Process {
                 continue;
             }
             let Event { from, payload } = node.into_value();
+            if let Payload::Signal(Signal::Rpc(rpc)) = payload {
+                // ERTS_SIG_Q_OP_RPC: `cnt += handle_rpc(c_p, sig, cnt, limit, &yield)`.
+                match self.handle_rpc(ctx, from, *rpc, cnt, limit, &mut yield_) {
+                    Ok(cost) => cnt += cost + 1,
+                    Err(error) => break Err(error),
+                }
+                continue;
+            }
             match self.handle_signal(ctx, from, payload) {
                 Ok(cost) => cnt += cost + 1,
                 Err(error) => break Err(error),
@@ -274,6 +283,10 @@ impl Process {
         self.pass_markers_at_save();
         // Port of erl_proc_sig_queue.c:7160 (`*redsp = cnt/ERTS_SIG_REDS_CNT_FACTOR + 1`).
         *reds = cnt / SIG_REDS_CNT_FACTOR + 1;
+        if yield_ {
+            // The virtual reductions (`esdp->virtual_reds`) are not counted.
+            *reds = max_reds;
+        }
         ctx.set_sig_q(!self.sig_cont_empty());
         let done = result?;
         crate::natives::erts_debug::after_message_queue_change(self);
@@ -439,6 +452,16 @@ impl Process {
                     }
                     was_linked = true;
                 }
+                // erl_proc_sig_queue.c:4724-4736 (handle_exit_signal): an exit reason received
+                // from another node is decoded now; one that does not decode removes the signal.
+                if message.is_external()
+                    && !super::message::erts_proc_sig_decode_dist(self.runtime, &mut message, true)
+                {
+                    if prio_link_removed {
+                        self.prio_item_deleted(crate::receive::PrioItemType::Link);
+                    }
+                    return Ok(2);
+                }
                 let result: Result<i32, VmError> = 'exit: {
                     let seq_token = message.take_seq_token();
                     let reason = message.into_receiver(self)?;
@@ -558,7 +581,18 @@ impl Process {
                 // convert_to_down_message (erl_proc_sig_queue.c:4838-5056).
                 8
             }
-            arinsal_sched::Signal::MonitorDown { reference, reason } => {
+            arinsal_sched::Signal::MonitorDown {
+                reference,
+                mut reason,
+            } => {
+                // erl_proc_sig_queue.c:6381-6386 (ERTS_SIG_Q_TYPE_GEN_EXIT of a monitor-down):
+                // a reason received from another node is decoded before the monitor lookup; a
+                // failed decode just removes the signal.
+                if reason.is_external()
+                    && !super::message::erts_proc_sig_decode_dist(self.runtime, &mut reason, true)
+                {
+                    return Ok(8);
+                }
                 let reason = reason.into_receiver(self)?;
                 let queued = self.inbox.len();
                 self.deliver_monitor_down(from, reference, reason)?;
@@ -611,18 +645,8 @@ impl Process {
                 )?;
                 1
             }
-            arinsal_sched::Signal::Rpc(request) => {
-                // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_RPC,
-                // handle_rpc), OTP-29.1.1.
-                let arinsal_sched::RpcRequest { id, op } = *request;
-                let op = match op {
-                    arinsal_sched::RpcOp::SaveCalls(value) => {
-                        crate::signals::RemoteOp::SaveCalls { value }
-                    }
-                    arinsal_sched::RpcOp::Display => crate::signals::RemoteOp::Display,
-                };
-                crate::signals::reply_request(self, ctx, crate::signals::Pending { id, from, op })?;
-                1
+            arinsal_sched::Signal::Rpc(_) => {
+                unreachable!("rpc signals are handled with the loop's cnt and limit")
             }
             arinsal_sched::Signal::IsAlive(id) => {
                 // Port of erts/emulator/beam/erl_proc_sig_queue.c:6787 (ERTS_SIG_Q_OP_IS_ALIVE)
@@ -730,43 +754,40 @@ impl Process {
         ctx: &mut RunCtx<'_, crate::Process>,
         shared: &arinsal_sched::SharedPayload,
     ) -> Result<i32, VmError> {
-        if let Some(down) = shared
-            .0
-            .downcast_ref::<crate::dist::DistSpawnNoconnection>()
-        {
-            // The connection of a pending request went down (erl_proc_sig_queue.c:4864,
-            // a monitor-down signal of a spawn-pending monitor).
-            if let Some(message) = crate::dist::spawn_noconnection_message(self, down)? {
-                self.inbox.push_back(message);
-            }
-            return Ok(5);
-        }
+        use crate::monitor_link::node_flag;
         let data = shared
             .0
             .downcast_ref::<crate::dist::DistSpawnReplyData>()
             .expect("dist spawn reply signal carries its reply data");
         let mut cnt = 1;
-        let Some(mut request) = crate::dist::take_spawn_request(ctx.pid(), data.id()) else {
-            // Stale reply: the link was never inserted here, only the distribution half of
-            // the monitor is released.
-            crate::dist::spawn_reply_drop_monitor(data);
+        let id = data.id();
+        let omon = self
+            .monitors
+            .get(id)
+            .filter(|omon| !omon.is_target() && omon.spawn_pending());
+        let Some(omon) = omon else {
+            // Stale reply; the link that was set up is released with the reply data.
             return Ok(cnt + 1);
         };
+        let flags = omon.flags();
+        // The tag to patch into the resulting message (`mdep->u.name`).
+        let tag = crate::dist::spawn_reply_tag_of(omon.info());
+        let tag = crate::dist::spawn_reply_tag(self, tag)?;
         let mut convert_to_message = true;
-        let mut adjust_monitor = false;
+        let adjust_monitor;
         if !data.is_success() {
-            // Spawn error; the distribution code created no link.
-            if request.monitor_priority {
-                self.prio_item_deleted(crate::receive::PrioItemType::Monitor);
-                request.monitor_priority = false;
-            }
-            if request.abandoned || request.no_error_msg {
+            // Spawn error; the distribution code created no link. Delete the monitor.
+            adjust_monitor = false;
+            if flags & (node_flag::SPAWN_ABANDONED | node_flag::SPAWN_NO_EMSG) != 0 {
                 convert_to_message = false;
             }
-        } else if request.abandoned {
-            debug_assert!(!request.monitor_priority);
+            if flags & node_flag::PRIO_ML != 0 {
+                self.prio_item_deleted(crate::receive::PrioItemType::Monitor);
+            }
+        } else if flags & node_flag::SPAWN_ABANDONED != 0 {
+            debug_assert_eq!(flags & node_flag::PRIO_ML, 0);
             // Spawn operation has been abandoned and link option was passed: send exit
-            // signal with exit reason `abandoned` and drop the message.
+            // signal with exit reason `abandoned`, delete the monitor and drop the message.
             if let Some(link) = data.link() {
                 crate::dist::proc_exit_handle_link(
                     self.runtime,
@@ -775,20 +796,22 @@ impl Process {
                     Term::atom(arinsal_term::atoms::ABANDONED),
                 );
             }
+            adjust_monitor = false;
             convert_to_message = false;
         } else {
-            if request.no_success_msg {
+            if flags & node_flag::SPAWN_NO_SMSG != 0 {
                 convert_to_message = false;
             }
             if let Some(link) = data.link() {
                 cnt += 1;
+                let link_priority = flags & node_flag::SPAWN_LINK_PRIO != 0;
                 let mut link = link;
-                link.view_mut().set_priority(request.link_priority);
+                link.view_mut().set_priority(link_priority);
                 if let Err(duplicate) = self.links.lookup_insert(link) {
                     let deleted = duplicate.dist_delete_other();
                     duplicate.release_external(deleted);
                 } else {
-                    if request.link_priority {
+                    if link_priority {
                         self.prio_item_added(crate::receive::PrioItemType::Link);
                     }
                     if crate::trace::active() {
@@ -806,26 +829,29 @@ impl Process {
                     }
                 }
             }
-            adjust_monitor = request.monitor;
+            adjust_monitor = flags & node_flag::SPAWN_MONITOR != 0;
             if adjust_monitor {
-                crate::dist::spawn_reply_install_origin_monitor(
-                    self,
-                    data,
-                    request.monitor_priority,
-                );
+                // Insert the actual pid of the spawned process in the origin part of the
+                // monitor: it becomes an ordinary monitor of the child.
+                if let Some(mut omon) = self.monitors.get_mut(id) {
+                    if let Some(target) = omon.info().dist_target() {
+                        target.set_item(data.result());
+                    }
+                    omon.update_flags(0, node_flag::SPAWNS);
+                }
+                self.cold_mut().dist_monitors.insert(id);
                 cnt += 2;
             }
         }
         if !adjust_monitor {
             // Delete monitor; either spawn error or no monitor requested.
-            if request.monitor_priority {
-                self.prio_item_deleted(crate::receive::PrioItemType::Monitor);
+            if let Some(omon) = self.monitors.remove(id) {
+                crate::dist::release_origin(omon);
             }
-            crate::dist::spawn_reply_drop_monitor(data);
             cnt += 2;
         }
         if convert_to_message {
-            let message = crate::dist::spawn_reply_message(self, &request.tag, data)?;
+            let message = crate::dist::spawn_reply_message(self, tag, data)?;
             self.inbox.push_back(message);
         }
         Ok(cnt)
@@ -958,6 +984,14 @@ impl Process {
         reason: Message,
     ) -> Result<i32, VmError> {
         let mut message = reason;
+        // erl_proc_sig_queue.c:4724-4736 (handle_exit_signal): the reason of an exit received
+        // from another node is decoded once the link checks passed; a bad one removes the
+        // signal.
+        if message.is_external()
+            && !super::message::erts_proc_sig_decode_dist(self.runtime, &mut message, true)
+        {
+            return Ok(2);
+        }
         let seq_token = message.take_seq_token();
         let reason = message.into_receiver(self)?;
         if self.trap_exit() && (linked || reason != Term::atom(arinsal_term::atoms::KILL)) {
@@ -1130,5 +1164,128 @@ impl Process {
     /// Whether this process already exited while executing a dirty job.
     pub(crate) fn dirty_exiting(&self) -> bool {
         self.slice().is_some_and(|work| work.dirty_exited)
+    }
+}
+
+/// `func` of an `ErtsProcSigRPC`: runs in the receiving process `c_p` with `arg`. `redsp` is
+/// `NULL` for a direct call; on entry it holds the reductions left, on return the reductions
+/// used (negative to force a yield). A non-immediate result lives in `*bpp`, or on `c_p`'s heap
+/// for a direct call (`bpp == NULL`).
+// Port of erts/emulator/beam/erl_proc_sig_queue.c:213 (ErtsProcSigRPC.func), OTP-29.1.1.
+pub(crate) type RpcFunc = fn(
+    &mut Process,
+    &mut RunCtx<'_, crate::Process>,
+    Option<Box<dyn std::any::Any + Send>>,
+    Option<&mut i32>,
+    Option<&mut Option<arinsal_term::message::MessageHeapBlock>>,
+) -> Result<Term, VmError>;
+
+/// The `func` and `arg` of an `ErtsProcSigRPC`, carried by [`arinsal_sched::RpcRequest::call`].
+// Port of erts/emulator/beam/erl_proc_sig_queue.c:213 (ErtsProcSigRPC), OTP-29.1.1.
+pub(crate) struct ProcSigRpc {
+    func: RpcFunc,
+    arg: Mutex<Option<Box<dyn std::any::Any + Send>>>,
+}
+
+/// Send `func(arg)` to run in process `to`. With `reply` the result is the reference the caller
+/// receives `{Ref, Result}` on, else `ok`; `None` (`THE_NON_VALUE`) when `to` is gone.
+// Port of erts/emulator/beam/erl_proc_sig_queue.c:3368 (erts_proc_sig_send_rpc_request,
+// erts_proc_sig_send_rpc_request_prio with prio -1), OTP-29.1.1.
+pub(crate) fn erts_proc_sig_send_rpc_request(
+    c_p: &mut Process,
+    ctx: &mut RunCtx<'_, crate::Process>,
+    to: Pid,
+    reply: bool,
+    func: RpcFunc,
+    arg: Option<Box<dyn std::any::Any + Send>>,
+) -> Result<Option<Term>, VmError> {
+    let (id, res) = if reply {
+        let id = c_p.next_ref();
+        let res = crate::signals::reference(c_p, id)?;
+        crate::port::set_save_end(c_p, ctx);
+        (Some(id), res)
+    } else {
+        (None, Term::atom(arinsal_term::atoms::OK))
+    };
+    let call = arinsal_sched::SharedPayload(Arc::new(ProcSigRpc {
+        func,
+        arg: Mutex::new(arg),
+    }));
+    let signal = arinsal_sched::Signal::Rpc(Box::new(arinsal_sched::RpcRequest { id, call }));
+    match ctx.signal(to, signal) {
+        Ok(()) => {
+            // maybe_elevate_sig_handling_prio(c_p, -1, to)
+            crate::signals::elevate_for_signal_request(c_p, ctx, to)?;
+            Ok(Some(res))
+        }
+        Err(arinsal_sched::Error::NoProcess) => {
+            if reply {
+                c_p.msgq_set_save_first();
+            }
+            Ok(None)
+        }
+        Err(error) => Err(VmError::Unsupported(format!("rpc request: {error}"))),
+    }
+}
+
+impl Process {
+    /// Run an rpc request and answer `{Ref, Result}` to its requester; returns the signal's
+    /// `cnt`. `yield_` is set when `func` asks for a yield.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:3564 (handle_rpc), OTP-29.1.1.
+    pub(crate) fn handle_rpc(
+        &mut self,
+        ctx: &mut RunCtx<'_, crate::Process>,
+        requester: Pid,
+        rpc: arinsal_sched::RpcRequest,
+        cnt: i32,
+        limit: i32,
+        yield_: &mut bool,
+    ) -> Result<i32, VmError> {
+        let arinsal_sched::RpcRequest { id, call } = rpc;
+        let call = call
+            .0
+            .downcast_ref::<ProcSigRpc>()
+            .expect("rpc signal carries ProcSigRpc");
+        let arg = call.arg.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let mut reds = (limit - cnt) / SIG_REDS_CNT_FACTOR;
+        if reds <= 0 {
+            reds = 1;
+        }
+        let mut bp = None;
+        let res = (call.func)(self, ctx, arg, Some(&mut reds), Some(&mut bp))?;
+        if reds < 0 {
+            // Force yield...
+            *yield_ = true;
+            reds = -reds;
+        }
+        let out_cnt = reds * SIG_REDS_CNT_FACTOR;
+        // `rp = erts_proc_lookup(rpc->requester)`: the send below drops the reply of a gone
+        // requester, and `bp` with it.
+        if let Some(id) = id {
+            // hsz = 3 + sizeof(ErtsORefThing)/sizeof(Eterm), plus the result copied out of `bp`
+            // (Arinsal's message fragment holds one heap, erts chains `bp` as `hfrag.next`).
+            let res_words = if bp.is_some() { size_object(res) } else { 0 };
+            let mut heap = arinsal_term::message::MessageHeapBlock::with_words(3 + 3 + res_words);
+            let res = if bp.is_some() {
+                copy_term(res, &mut heap)
+                    .map_err(|error| VmError::Unsupported(format!("rpc reply: {error:?}")))?
+            } else {
+                res
+            };
+            drop(bp);
+            let reference =
+                Term::local_ref(&mut heap, arinsal_sched::unique::ordinary_ref_words(id))
+                    .map_err(|error| VmError::Unsupported(format!("rpc reply: {error:?}")))?;
+            let msg = TermBuilder::new(&mut heap)
+                .tuple(&[reference, res])
+                .map_err(|error| VmError::Unsupported(format!("rpc reply: {error:?}")))?;
+            match ctx.send(requester, Message::from_heap_block(msg, heap)) {
+                Ok(()) | Err(arinsal_sched::Error::NoProcess) => {}
+                Err(error) => {
+                    return Err(VmError::Unsupported(format!("rpc reply: {error}")));
+                }
+            }
+        }
+        Ok(out_cnt)
     }
 }

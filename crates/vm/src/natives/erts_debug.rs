@@ -585,20 +585,28 @@ fn notify_busy_port_one(
     }
 }
 
-/// Emit the event when a sender is suspended on a busy distribution port.
-// Port of erts/emulator/beam/erl_trace.c:1942-1948, OTP-29.1.1.
-pub(crate) fn notify_busy_dist_port(process: &Process, sender: arinsal_sched::Pid, port_id: u64) {
+/// The controller of a busy distribution entry, the `spec` of a `busy_dist_port` event: a port
+/// or, for a process controller, its pid (`dep->cid`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DistCid {
+    Port(u64),
+    Pid(arinsal_sched::Pid),
+}
+
+/// Emit the event when a sender is suspended on a busy distribution entry.
+// Port of erts/emulator/beam/erl_trace.c:1942-1948 (monitor_busy_dist_port), OTP-29.1.1.
+pub(crate) fn monitor_busy_dist_port(process: &Process, sender: arinsal_sched::Pid, spec: DistCid) {
     if let Some(runtime) = process.runtime {
         for state in monitor_states(runtime) {
-            notify_busy_dist_port_one(process, sender, port_id, &state);
+            monitor_busy_dist_port_one(process, sender, spec, &state);
         }
     }
 }
 
-fn notify_busy_dist_port_one(
+fn monitor_busy_dist_port_one(
     process: &Process,
     sender: arinsal_sched::Pid,
-    port_id: u64,
+    spec: DistCid,
     state: &SystemMonitorState,
 ) {
     let Some(runtime) = process.runtime.as_ref() else {
@@ -636,10 +644,18 @@ fn notify_busy_dist_port_one(
             creation: 0,
         },
         OwnedTerm::atom("busy_dist_port"),
-        OwnedTerm::Port {
-            node: "nonode@nohost".into(),
-            id: port_id,
-            creation: 0,
+        match spec {
+            DistCid::Port(port_id) => OwnedTerm::Port {
+                node: "nonode@nohost".into(),
+                id: port_id,
+                creation: 0,
+            },
+            DistCid::Pid(cid) => OwnedTerm::Pid {
+                node: "nonode@nohost".into(),
+                id: cid.number(),
+                serial: cid.serial(),
+                creation: 0,
+            },
         },
     ]);
     if let Ok(term) = from_owned(&event, &mut arinsal_bifs::ProcessHeapHandle(&mut heap))
@@ -2321,7 +2337,7 @@ fn internal_monitor_list_from(
 fn monitor_extra(data: &crate::proc_create::MonitorInfo) -> Option<OwnedTerm> {
     data.name()
         .map(|name| OwnedTerm::Atom(name.to_owned()))
-        .or_else(|| data.tag().cloned())
+        .or_else(|| data.tag().and_then(|tag| arinsal_term::to_owned(tag).ok()))
 }
 
 fn monitor_extra_term(process: &mut Process, extra: Option<&OwnedTerm>) -> Result<Term, VmError> {

@@ -276,6 +276,60 @@ fn token_term(process: &mut Process, token: Option<&Token>) -> Result<Term, VmEr
 }
 
 impl Token {
+    /// The token of a `*_TT` distribution operation: `[]` is no token, a five-tuple
+    /// `{Flags, Label, Serial, From, LastCnt}` is one; anything else is not a token (the
+    /// control message is invalid).
+    // Port of erts/emulator/beam/dist.c (erts_net_message, `token = tuple[N]` of the *_TT
+    // cases) and erl_process.h (SEQ_TRACE_T_FLAGS .. SEQ_TRACE_T_LASTCNT), OTP-29.1.1.
+    pub(crate) fn from_dist(term: &OwnedTerm) -> Result<Option<Box<Token>>, ()> {
+        match term {
+            OwnedTerm::Nil => Ok(None),
+            OwnedTerm::Tuple(fields) => match fields.as_slice() {
+                [
+                    OwnedTerm::Int(flags),
+                    label,
+                    OwnedTerm::Int(serial),
+                    sender,
+                    OwnedTerm::Int(lastcnt),
+                ] if *flags >= 0 && *serial >= 0 && *lastcnt >= 0 => Ok(Some(Box::new(Token {
+                    label: label.clone(),
+                    flags: *flags as u64,
+                    serial: *serial as u64,
+                    sender: sender.clone(),
+                    lastcnt: *lastcnt as u64,
+                    epoch: epoch().load(Ordering::Relaxed),
+                    heap_ref: Term::NIL,
+                }))),
+                _ => Err(()),
+            },
+            _ => Err(()),
+        }
+    }
+
+    /// The five-tuple a `*_TT` control message carries.
+    // Port of erts/emulator/beam/dist.c (erts_dsig_send_msg: `token` in the control tuple),
+    // OTP-29.1.1.
+    pub(crate) fn to_dist(&self) -> OwnedTerm {
+        OwnedTerm::tuple(vec![
+            OwnedTerm::Int(self.flags as i64),
+            self.label.clone(),
+            OwnedTerm::Int(self.serial as i64),
+            self.sender.clone(),
+            OwnedTerm::Int(self.lastcnt as i64),
+        ])
+    }
+
+    /// `can_send_seqtrace_token(ctx, token)`: a peer without `DFLAG_BIG_SEQTRACE_LABELS`
+    /// takes only labels that are small on a 32-bit emulator.
+    // Port of erts/emulator/beam/dist.c (can_send_seqtrace_token), OTP-29.1.1.
+    pub(crate) fn can_send_to(&self, big_labels: bool) -> bool {
+        const TAG_IMMED1_SIZE: u32 = 4;
+        big_labels
+            || matches!(self.label, OwnedTerm::Int(label)
+                if label <= i64::from(i32::MAX >> TAG_IMMED1_SIZE)
+                    && label >= i64::from(i32::MIN >> TAG_IMMED1_SIZE))
+    }
+
     /// Where the copy of this token that travels with a queued message lives.
     pub(crate) fn heap_ref(&self) -> Term {
         self.heap_ref

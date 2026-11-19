@@ -5112,6 +5112,25 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         self.install_refc_binary(binary, bit_len)
     }
 
+    /// `erts_wrap_refc_bitstring`: a binary term of `len` bytes at byte `offset` of the
+    /// Binary `owner` references; the term's BinRef takes over that reference.
+    // Port of erts/emulator/beam/erl_bits.c (erts_wrap_refc_bitstring), OTP-29.1.1.
+    pub fn wrap_refc_bitstring(
+        &mut self,
+        owner: arinsal_alloc::raw::OwnedBinaryRef,
+        offset: usize,
+        len: usize,
+    ) -> Result<Term, TermError> {
+        let capacity = owner.capacity().ok_or(TermError::BadArg)?;
+        if offset.checked_add(len).is_none_or(|end| end > capacity) {
+            return Err(TermError::BadArg);
+        }
+        let adjustment = owner.payload_ptr() as usize & 3;
+        // The overhead is the allocated size of the Binary (`bin->orig_size`).
+        let size_words = (capacity / 8) as u64;
+        self.install_refc_owner(owner, adjustment, size_words, offset * 8, len * 8)
+    }
+
     fn install_refc_binary(
         &mut self,
         binary: RefcBinary,

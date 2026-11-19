@@ -80,6 +80,14 @@ pub(crate) mod node_flag {
     pub(crate) const SPAWN_LINK_PRIO: u32 = 1 << (BASE + 14);
     /// The monitor key is a PID reference; its creator is the other pid in `MonitorData`.
     pub(crate) const PID_REF: u32 = 1 << (BASE + 15);
+    /// `ERTS_ML_FLGS_SPAWN` (erl_monitor_link.h): the flags of a pending distributed spawn.
+    pub(crate) const SPAWNS: u32 = SPAWN_PENDING
+        | SPAWN_MONITOR
+        | SPAWN_LINK
+        | SPAWN_ABANDONED
+        | SPAWN_NO_SMSG
+        | SPAWN_NO_EMSG
+        | SPAWN_LINK_PRIO;
     /// Flags a holder may not change: the container state and the half's identity.
     pub(crate) const RESERVED: u32 = TYPE_MASK | TARGET | IN_TABLE;
 }
@@ -337,7 +345,6 @@ impl<H: NodeHandle> Drop for MonLnkTree<H> {
 }
 
 impl<H: NodeHandle> MonLnkTree<H> {
-    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.root.is_none()
     }
@@ -1529,11 +1536,11 @@ impl<I, O, S> Monitor<I, O, S> {
         }
     }
 
-    /// Set `ERTS_ML_FLG_PRIO_ML` when a pending spawn monitor becomes an ordinary monitor.
-    pub(crate) fn set_priority(&mut self, priority: bool) {
-        let flags = node_flags(self.node) & !node_flag::PRIO_ML;
-        let priority = if priority { node_flag::PRIO_ML } else { 0 };
-        set_node_flags(self.node, flags | priority);
+    /// `mon->flags |= flags` on this half only, as `mdp->origin.flags |= monitor_oflags` of a
+    /// pending spawn request (dist.c erts_internal_dist_spawn_request_4).
+    pub(crate) fn add_flags(&mut self, flags: u32) {
+        debug_assert_eq!(flags & node_flag::RESERVED, 0);
+        set_node_flags(self.node, node_flags(self.node) | flags);
     }
 
     #[cfg(test)]
@@ -1641,6 +1648,11 @@ impl<'a, I, O, S> MonitorRef<'a, I, O, S> {
         node_flags(self.node) & node_flag::SPAWN_PENDING != 0
     }
 
+    /// `mon->flags`.
+    pub(crate) fn flags(self) -> u32 {
+        node_flags(self.node)
+    }
+
     /// `ERTS_ML_FLG_PRIO_ML`: a priority monitor, its DOWN is a priority message.
     pub(crate) fn prio_ml(self) -> bool {
         node_flags(self.node) & node_flag::PRIO_ML != 0
@@ -1678,6 +1690,18 @@ impl<'a, I, O, S> MonitorMut<'a, I, O, S> {
         // SAFETY: only the origin half reaches the origin state, and this view borrows that
         // half exclusively.
         Some(unsafe { &mut *data.origin_state.get() })
+    }
+
+    /// `mon->flags = (mon->flags | set) & ~clear` on this half (bif.c spawn_request_abandon_1,
+    /// erl_proc_sig_queue.c handle_dist_spawn_reply).
+    pub(crate) fn update_flags(&mut self, set: u32, clear: u32) {
+        debug_assert_eq!((set | clear) & node_flag::RESERVED, 0);
+        set_node_flags(self.node, (node_flags(self.node) | set) & !clear);
+    }
+
+    /// The shared monitor data of this half.
+    pub(crate) fn info(&self) -> &I {
+        &MonitorData::<I, O, S>::from_node(self.node).info
     }
 
     // Port of erts/emulator/beam/bif.c (unalias_1), OTP-29.1.1.
@@ -1816,6 +1840,9 @@ struct MonLnkDistState {
     monitors: Option<NodePtr>,
     /// `orig_name_monitors`: the origin halves of monitors by name, a tree keyed by reference.
     orig_name_monitors: Option<NodePtr>,
+    /// `dist_pend_spawn_exit`: target halves of the pending-spawn monitors of exiting parents,
+    /// and records of spawn results that reached no parent, a tree keyed by reference.
+    dist_pend_spawn_exit: Option<NodePtr>,
 }
 
 // SAFETY: the list nodes are dist halves of `ELink`s whose shared fields are atomic or
@@ -1848,6 +1875,7 @@ impl MonLnkDist {
                 links: None,
                 monitors: None,
                 orig_name_monitors: None,
+                dist_pend_spawn_exit: None,
             }),
         }
     }
@@ -1964,6 +1992,40 @@ impl MonLnkDist {
         let monitor = tree.remove(reference);
         state.orig_name_monitors = tree.root.take();
         monitor
+    }
+
+    /// Run `f` on `dist_pend_spawn_exit` under `mtx` when the connection is alive (`None`
+    /// otherwise): the tree operations of dist.c erts_dist_pend_spawn_exit_parent_setup,
+    /// erts_dist_pend_spawn_exit_parent_wait, erts_dist_pend_spawn_exit_delete and
+    /// dist_pend_spawn_exit_save_child_result.
+    pub(crate) fn with_pend_spawn_exit<I, O, S, R>(
+        &self,
+        f: impl FnOnce(&mut MonLnkTree<Monitor<I, O, S>>) -> R,
+    ) -> Option<R> {
+        let mut state = self.lock();
+        if !state.alive {
+            return None;
+        }
+        let mut tree = MonLnkTree::<Monitor<I, O, S>> {
+            root: state.dist_pend_spawn_exit.take(),
+            _handles: PhantomData,
+        };
+        let result = f(&mut tree);
+        state.dist_pend_spawn_exit = tree.root.take();
+        Some(result)
+    }
+
+    /// Port of erts/emulator/beam/dist.c (con_monitor_link_seq_cleanup, the
+    /// dist_pend_spawn_exit state), OTP-29.1.1: take the tree of a connection that went down
+    /// (`alive` is already false), in its foreach order.
+    pub(crate) fn take_pend_spawn_exit<I, O, S>(&self) -> Vec<Monitor<I, O, S>> {
+        let mut state = self.lock();
+        debug_assert!(!state.alive);
+        let mut tree = MonLnkTree::<Monitor<I, O, S>> {
+            root: state.dist_pend_spawn_exit.take(),
+            _handles: PhantomData,
+        };
+        tree.drain().collect()
     }
 
     /// Port of erts/emulator/beam/dist.c (con_monitor_link_seq_cleanup, the monitors and

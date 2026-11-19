@@ -2669,7 +2669,7 @@ fn notify_links_monitors(
             // The monitor's `{tag, Tag}` option replaces 'DOWN', as for process monitors
             // (erl_proc_sig_queue.c:2836-2900 builds the DOWN from the monitor data).
             let tag = match monitor.info().tag() {
-                Some(owned) => match from_owned(owned, &mut heap) {
+                Some(tag) => match copy_term(tag, &mut heap) {
                     Ok(tag) => tag,
                     Err(_) => continue,
                 },
