@@ -923,10 +923,10 @@ impl ModuleEnv for VmModuleEnv<'_> {
                 .ok_or_else(|| format!("dynamic literal index {index} is out of range"));
         }
         let index = index as usize;
-        if let Some(word) = self.literals.get(index as usize) {
+        if let Some(word) = self.literals.get(index) {
             return Ok(*word);
         }
-        let at = (index as usize).wrapping_sub(self.literals.len());
+        let at = index.wrapping_sub(self.literals.len());
         self.added_literals
             .borrow()
             .get(at)
