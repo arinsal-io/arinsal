@@ -41,17 +41,120 @@ impl Task for Process {
 
     // A process without a runtime exits at once in `run_task` and never reaches Erlang code.
     fn copy_in_registers(&mut self, data: &mut SchedulerData) {
-        let Some(runtime) = self.runtime else {
-            return;
-        };
-        let executor = data.executor.get_or_insert_with(|| new_executor(runtime));
-        crate::beam_common::copy_in_registers(self, &mut executor.native_registers);
+        if self.runtime.is_some() {
+            crate::beam_common::copy_in_registers(self, &mut data.registers);
+        }
     }
 
     fn copy_out_registers(&mut self, _data: &mut SchedulerData) {
         if self.runtime.is_some() {
             crate::beam_common::copy_out_registers(self);
         }
+    }
+
+    // Port of erts/emulator/beam/erl_process.c:10508-10546 (trace_schedule_in), OTP-29.1.1: an
+    // exiting process that resumes its exit (`p->u.terminate` set) reports `in_exiting`,
+    // any other `in`; a call-time traced process starts its schedule-in time break.
+    fn trace_schedule_in(&mut self, ctx: &mut RunCtx<'_, Message>, data: &mut SchedulerData) {
+        // `p->scheduler_data = esdp` precedes the trace (erl_process.c:10232).
+        self.scheduler_id = ctx.scheduler_id().map_or(0, |id| id as u32);
+        let exiting = self.has_exit_cont();
+        let Some(runtime) = self.runtime else {
+            return;
+        };
+        if self.dirty_exiting()
+            || (!exiting && ctx.exit_flags().load(Ordering::Acquire) & proc_flags::TRACE == 0)
+        {
+            return;
+        }
+        with_executor(data, runtime, |executor| {
+            let pid = ctx.pid();
+            if exiting {
+                let zero = [Term::small(0).expect("small zero")];
+                crate::trace::emit(
+                    Some(&mut executor.vm),
+                    self,
+                    ctx,
+                    pid,
+                    crate::trace::EXITING,
+                    "in_exiting",
+                    &zero,
+                );
+            } else {
+                // The `in` event resolves the current function against the active code
+                // index, so this scheduler's replica must be current first
+                // (erts_find_function_from_pc reads the active code index).
+                executor.vm.refresh_code();
+                // The MFA tuple is built on the process heap, where erts' HAlloc never fails.
+                let running = crate::trace::running_mfa(self, pid).unwrap_or(None);
+                let running_fields = [running.unwrap_or(Term::small(0).expect("small zero"))];
+                crate::trace::emit(
+                    Some(&mut executor.vm),
+                    self,
+                    ctx,
+                    pid,
+                    crate::trace::RUNNING,
+                    "in",
+                    &running_fields,
+                );
+            }
+            if crate::trace::flags(self, pid) & crate::trace::CALL != 0 {
+                crate::trace_bp::schedule_time_break(self, pid, false);
+            }
+        });
+    }
+
+    // Port of erts/emulator/beam/erl_process.c:10548-10570 (trace_schedule_out), OTP-29.1.1: a
+    // process that yields in its exit reports `out_exiting`, any other `out`. A process that
+    // finished its exit is freed (ERTS_PSFLG_FREE) and has reported `out_exited` itself.
+    fn trace_schedule_out(
+        &mut self,
+        ctx: &mut RunCtx<'_, Message>,
+        data: &mut SchedulerData,
+        outcome: &RunOutcome,
+    ) {
+        if matches!(outcome, RunOutcome::Exit(_)) {
+            return;
+        }
+        let exiting = self.has_exit_cont();
+        let Some(runtime) = self.runtime else {
+            return;
+        };
+        if !exiting && ctx.exit_flags().load(Ordering::Acquire) & proc_flags::TRACE == 0 {
+            return;
+        }
+        with_executor(data, runtime, |executor| {
+            let pid = ctx.pid();
+            if crate::trace::flags(self, pid) & crate::trace::CALL != 0 {
+                crate::trace_bp::schedule_time_break(self, pid, true);
+            }
+            if exiting {
+                let zero = [Term::small(0).expect("small zero")];
+                crate::trace::emit(
+                    Some(&mut executor.vm),
+                    self,
+                    ctx,
+                    pid,
+                    crate::trace::EXITING,
+                    "out_exiting",
+                    &zero,
+                );
+            } else {
+                // erl_trace.c:752-760 (trace_sched_session): no current function is reported
+                // as 0.
+                let running = crate::trace::running_mfa(self, pid).unwrap_or(None);
+                let running_fields = [running.unwrap_or(Term::small(0).expect("small zero"))];
+                crate::trace::emit(
+                    Some(&mut executor.vm),
+                    self,
+                    ctx,
+                    pid,
+                    crate::trace::RUNNING,
+                    "out",
+                    &running_fields,
+                );
+            }
+        });
     }
 
     fn gc_nanoseconds(&self) -> u64 {
@@ -364,9 +467,7 @@ impl Process {
         if self.runtime.is_none() {
             return RunOutcome::Exit(1);
         }
-        // erts stores the scheduler id on the process. Profiling allocates no side
-        // record unless runnable-proc profiling is actually on.
-        self.scheduler_id = ctx.scheduler_id().map_or(0, |id| id as u32);
+        // Profiling allocates no side record unless runnable-proc profiling is actually on.
         // Port of erts/emulator/beam/erl_process.c:6978-6992 (schedule_process_sys_task and
         // the enqueue paths test erts_system_profile_flags.runnable_procs before
         // profile_runnable_proc), OTP-29.1.1: without profiling this is one flag test.
@@ -382,10 +483,12 @@ impl Process {
             return RunOutcome::Exit(1);
         }
         if let Some(state) = self.take_exit_cont() {
-            // Port of erts/emulator/beam/erl_process.c:10528 (in_exiting), OTP-29.1.1: an
-            // exiting process only continues its exit when scheduled in.
+            // Port of erts/emulator/beam/erl_process.c:14819 (erts_continue_exit_process
+            // yield: `p->i = beam_continue_exit`) and jit/x86/instr_common.cpp:295
+            // (emit_continue_exit), OTP-29.1.1: the code an exiting process resumes at is its
+            // exit continuation.
             let runtime = self.runtime_handle();
-            return self.continue_exit(runtime, ctx, data, true, state.into_inner());
+            return self.erts_continue_exit_process(runtime, ctx, data, state.into_inner());
         }
         let result = self.run_executor(ctx, data);
         if self.dirty_exiting() {
@@ -409,14 +512,19 @@ impl Process {
         ctx: &mut RunCtx<'_, Message>,
         data: &mut SchedulerData,
     ) -> Result<RunState, VmError> {
-        let executor = match data.executor {
-            Some(ref mut executor) => executor,
+        let SchedulerData {
+            registers,
+            executor,
+            ..
+        } = data;
+        let executor = match executor {
+            Some(executor) => executor,
             None => {
                 let runtime = self.runtime_handle();
-                data.executor.insert(new_executor(runtime))
+                executor.insert(new_executor(runtime))
             }
         };
-        let mut result = executor.run(self, ctx);
+        let mut result = executor.run(self, ctx, registers);
         // BIF_TRAP context-switches to beam_bif_export_trap. The continuation is an export
         // call, so the caller's CP stays on the stack and the backtrace PC is that trap.
         if matches!(result, Ok(RunState::Yield))
@@ -465,7 +573,7 @@ impl Process {
                 .entry
                 .then(|| Box::new(Err(VmError::Unsupported("max_heap_size".into()))));
             let runtime = self.runtime_handle();
-            return self.exit_with(
+            return self.erts_do_exit_process(
                 runtime,
                 ctx,
                 data,
@@ -553,7 +661,7 @@ impl Process {
                     }))
                 });
                 let runtime = self.runtime_handle();
-                self.exit_with(
+                self.erts_do_exit_process(
                     runtime,
                     ctx,
                     data,
@@ -584,7 +692,7 @@ impl Process {
                 }
                 let entry_result = self.entry.then(|| Box::new(Err(error)));
                 let runtime = self.runtime_handle();
-                self.exit_with(runtime, ctx, data, reason, entry_result, 1)
+                self.erts_do_exit_process(runtime, ctx, data, reason, entry_result, 1)
             }
         }
     }

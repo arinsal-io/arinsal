@@ -1195,6 +1195,29 @@ pub trait Task: Send + 'static {
     /// Port of erts/emulator/beam/beam_common.c:306 (copy_out_registers, called by
     /// process_main before erts_schedule), OTP-29.1.1.
     fn copy_out_registers(&mut self, _data: &mut Self::SchedulerData) {}
+    /// `trace_schedule_in(p, state)`: the schedule-in trace events of a traced process,
+    /// emitted once the process is picked, before its slice runs.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:10508 (trace_schedule_in, called by
+    /// erts_schedule when ERTS_IS_P_TRACED(p)), OTP-29.1.1.
+    fn trace_schedule_in(
+        &mut self,
+        _ctx: &mut RunCtx<Self::Message>,
+        _data: &mut Self::SchedulerData,
+    ) {
+    }
+    /// `trace_schedule_out(p, state)`: the schedule-out trace events of a traced process
+    /// whose slice ended with `outcome`.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:10548 (trace_schedule_out, called by
+    /// erts_schedule when ERTS_IS_P_TRACED(p)), OTP-29.1.1.
+    fn trace_schedule_out(
+        &mut self,
+        _ctx: &mut RunCtx<Self::Message>,
+        _data: &mut Self::SchedulerData,
+        _outcome: &RunOutcome,
+    ) {
+    }
     /// Release task-owned runtime registrations after all workers have stopped.
     fn scheduler_shutdown(&mut self) {}
     /// Cumulative time spent collecting this task's heap.
@@ -9548,9 +9571,11 @@ fn run_slice<T: Task>(esdp: &mut ErtsSchedulerData<T>, process: ProcRef<T>) -> S
             // Port of erts/emulator/beam/beam_common.c:179-300 (erts_dirty_process_main:
             // copy_in_registers after erts_schedule, copy_out_registers before the next),
             // OTP-29.1.1.
+            task.trace_schedule_in(&mut ctx, data);
             task.copy_in_registers(data);
             let outcome = task.run(&mut ctx, data, budget);
             task.copy_out_registers(data);
+            task.trace_schedule_out(&mut ctx, data, &outcome);
             if let Some(thread_type) = thread_type {
                 SCHEDULER_TYPE.with(|current| current.set(thread_type));
             }
@@ -9628,9 +9653,11 @@ fn run_process<T: Task>(esdp: &mut ErtsSchedulerData<T>, process: ProcRef<T>) ->
         // Port of erts/emulator/beam/jit/x86/process_main.cpp:200,277 and beam_emu.c:395,496
         // (process_main: copy_in_registers after erts_schedule returns, copy_out_registers
         // when the slice switches out), OTP-29.1.1.
+        task.trace_schedule_in(&mut ctx, data);
         task.copy_in_registers(data);
         let outcome = task.run(&mut ctx, data, budget);
         task.copy_out_registers(data);
+        task.trace_schedule_out(&mut ctx, data, &outcome);
         if ctx.esdp.msacc_enabled {
             ctx.set_msacc_state(MsaccState::Other);
             ctx.account_gc_total(task.gc_nanoseconds());

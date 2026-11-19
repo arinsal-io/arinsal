@@ -12,6 +12,7 @@ impl Executor {
         &mut self,
         process: &mut Process,
         ctx: &mut RunCtx<'_, Message>,
+        reg: &mut SchedulerRegisters,
     ) -> Result<RunState, VmError> {
         let exec_key = ctx.scheduler_key();
         let cached = exec_key != 0 && process.exec_key == exec_key && process.self_pid.is_some();
@@ -34,32 +35,9 @@ impl Executor {
         }
         let schedule_started = crate::natives::erts_debug::long_schedule_monitored(process)
             .then(std::time::Instant::now);
-        // A process runs with the code index active when it is scheduled in. The `in` trace
-        // event resolves the current function against it, so this replica must be current
-        // first (erts_find_function_from_pc reads the active code index).
+        // A process runs with the code index active when it is scheduled in.
         // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-247, OTP-29.1.1.
         self.vm.refresh_code();
-        // Port of erts/emulator/beam/erl_process.c:10539-10543 (schedule-in tests
-        // ERTS_TRACE_FLAGS(p) before any trace work), OTP-29.1.1: the process flag word has
-        // `proc_flags::TRACE` while the trace table holds an entry for this process.
-        if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::TRACE != 0 {
-            let running = crate::trace::running_mfa(process, ctx.pid())?;
-            let running_fields = [running.unwrap_or(Term::small(0).expect("small zero"))];
-            crate::trace::emit(
-                Some(&mut self.vm),
-                process,
-                ctx,
-                ctx.pid(),
-                crate::trace::RUNNING,
-                "in",
-                &running_fields,
-            );
-            // Port of erts/emulator/beam/erl_process.c:10541-10543 (trace_schedule_in),
-            // OTP-29.1.1.
-            if crate::trace::flags(process, ctx.pid()) & crate::trace::CALL != 0 {
-                crate::trace_bp::schedule_time_break(process, ctx.pid(), false);
-            }
-        }
         // Port of erts/emulator/beam/erl_process.c:12616 (erl_create_process: `p->i =
         // beam_run_process`), OTP-29.1.1: a spawned process (`p->u.initial` set) enters at the
         // stub on its first run. It is installed here, not at spawn, because process_info and
@@ -72,7 +50,7 @@ impl Executor {
         // one X register array (copy_in_registers), which is the process's file for the slice.
         let saved_len = process.x.saved_arity();
         // `esdp->registers` of this scheduler: the VM paths the slice runs reach `reg` here.
-        self.vm.esdp_registers = std::ptr::from_mut(&mut self.native_registers) as usize;
+        self.vm.esdp_registers = std::ptr::from_mut(&mut *reg) as usize;
         if crate::xreg_poison_enabled() {
             process.x[saved_len..].fill(crate::XREG_POISON);
         }
@@ -90,7 +68,7 @@ impl Executor {
         let fast_result = if let Some(error) = signal_error {
             Some(Err(error))
         } else if Self::fast_entry_ok(process, ctx) {
-            self.fast_resume(process, ctx, &mut fast_ran)
+            self.fast_resume(process, ctx, reg, &mut fast_ran)
         } else {
             None
         };
@@ -166,7 +144,7 @@ impl Executor {
                             }
                             // g_proc_sched: a suspended process is not scheduled; a hibernating
                             // one stays waiting until a message arrives, then continues at apply/3.
-                            if let Some(wait) = self.sched_preempt(process, ctx)? {
+                            if let Some(wait) = self.sched_preempt(process, ctx, reg)? {
                                 break Ok(wait);
                             }
                         }
@@ -182,17 +160,17 @@ impl Executor {
                             process.take_dirty_bif_continuation()
                         {
                             let arity = usize::from(arity);
-                            self.native_registers.x_reg_array[arity] = Term::atom(
+                            reg.x_reg_array[arity] = Term::atom(
                                 arinsal_term::global_atoms().intern(module).map_err(|_| {
                                     VmError::Unsupported("dirty continuation module atom".into())
                                 })?,
                             );
-                            self.native_registers.x_reg_array[arity + 1] = Term::atom(
+                            reg.x_reg_array[arity + 1] = Term::atom(
                                 arinsal_term::global_atoms().intern(function).map_err(|_| {
                                     VmError::Unsupported("dirty continuation function atom".into())
                                 })?,
                             );
-                            self.native_registers.x_reg_array[..arity].copy_from_slice(&args);
+                            reg.x_reg_array[..arity].copy_from_slice(&args);
                             process.heap.abi.arity = arity as u8;
                             process.gc_live = arity;
                             let continuation = self.vm.apply_fixed(process, arity, Some(ctx));
@@ -251,11 +229,11 @@ impl Executor {
                             process.slice_mut().native_dirty_nif = None;
                             match crate::native_helpers::run_static_nif(
                                 process,
-                                &self.native_registers.x_reg_array,
+                                &reg.x_reg_array,
                                 identity,
                             ) {
                                 Ok(value) => {
-                                    self.native_registers.x_reg_array[0] = value;
+                                    reg.x_reg_array[0] = value;
                                     process.native_continuation_resume = true;
                                     process.set_native_resume_arity(1);
                                     process.set_native_pc(Some(resume_pc));
@@ -308,7 +286,7 @@ impl Executor {
                             process.set_native_pc(None);
                             let returned = crate::trace::return_through_trace_frame(
                                 process,
-                                self.native_registers.x_reg_array[0],
+                                reg.x_reg_array[0],
                                 kind,
                                 |p, words| {
                                     p.heap.release_stack(words);
@@ -325,7 +303,7 @@ impl Executor {
                                 as *const () as usize;
                             if resume_pc == bridge {
                                 if !resume_after_native_return(process) {
-                                    break Ok(RunState::Done(self.native_registers.x_reg_array[0]));
+                                    break Ok(RunState::Done(reg.x_reg_array[0]));
                                 }
                             } else {
                                 process.native_continuation_resume = true;
@@ -360,7 +338,7 @@ impl Executor {
                                 }) {
                                     eprintln!(
                                         "arinsal boot: decode_path input={:?}",
-                                        self.native_registers.x_reg_array.first()
+                                        reg.x_reg_array.first()
                                     );
                                 }
                             }
@@ -403,7 +381,7 @@ impl Executor {
                                     if crate::code_ix::take_code_barrier() {
                                         ctx.block_thread_progress(std::time::Duration::ZERO);
                                     }
-                                    self.native_registers.active_code_ix = self
+                                    reg.active_code_ix = self
                                         .vm
                                         .code_ix
                                         .process_code_ix(crate::trace::saves_calls(process))
@@ -411,7 +389,7 @@ impl Executor {
                                     let native = {
                                         // Port of erts `c_p->scheduler_data`: a BIF native code calls reaches this
                                         // scheduler's data through the process while the slice runs.
-                                        let registers = &mut self.native_registers;
+                                        let registers = &mut *reg;
                                         super::sched_data::NativeSlice::run(
                                             &mut self.vm,
                                             ctx,
@@ -462,10 +440,10 @@ impl Executor {
                             {
                                 eprintln!(
                                     "arinsal boot: decode_path exit={outcome:?} output={:?}",
-                                    self.native_registers.x_reg_array.first()
+                                    reg.x_reg_array.first()
                                 );
                             }
-                            match self.after_native(process, ctx, outcome, code_ptr) {
+                            match self.after_native(process, ctx, reg, outcome, code_ptr) {
                                 Ok(Flow::Continue) => continue,
                                 Ok(Flow::Break(result)) => break result,
                                 Err(error) => return Err(error),
@@ -503,7 +481,7 @@ impl Executor {
                                 }
                                 break Ok(RunState::Wait { timeout_pos: None });
                             }
-                            self.install_apply(process)?;
+                            self.install_apply(process, reg)?;
                             continue;
                         }
                         if matches!(&result, Ok(RunState::Yield))
@@ -523,7 +501,7 @@ impl Executor {
                                     && let Some((mfa, arity)) = frame.rsplit_once('/')
                                     && let Some((module, function)) = mfa.split_once(':')
                                     && let Ok(arity) = arity.parse::<usize>()
-                                    && arity <= self.native_registers.x_reg_array.len()
+                                    && arity <= reg.x_reg_array.len()
                                 {
                                     trap.top = Some(crate::stacktrace::TopFrame::Bif {
                                         module: arinsal_term::global_atoms()
@@ -537,7 +515,7 @@ impl Executor {
                                                 VmError::Unsupported("undef function atom".into())
                                             })?,
                                         args: crate::stacktrace::BifArgs::from_terms(
-                                            &self.native_registers.x_reg_array[..arity],
+                                            &reg.x_reg_array[..arity],
                                         )?,
                                         info: crate::stacktrace::BifErrorInfo::None,
                                     });
@@ -643,30 +621,6 @@ impl Executor {
         // Port of erts/emulator/beam/erl_process.c:10415 (erts_schedule), OTP-29.1.1: erts has no
         // collection at schedule-out. ERTS_IS_GC_DESIRED is tested once, when the process is
         // scheduled in (`collect_on_schedule_in`), so a yielded process is collected there.
-        // OTP emits regular `out` only when a process is scheduled out; normal exit uses the
-        // separate `out_exiting` event when that flag is enabled.
-        // Port of erts/emulator/beam/erl_process.c:10550-10567, OTP-29.1.1.
-        if (matches!(result, Ok(RunState::Yield | RunState::Wait { .. }))
-            || matches!(result, Err(VmError::Yield | VmError::Dirty(_))))
-            && ctx.exit_flags().load(Ordering::Acquire) & proc_flags::TRACE != 0
-        {
-            let running = crate::trace::running_mfa(process, ctx.pid())?;
-            // erl_trace.c:752-760 (trace_sched_session): no current function is reported as 0.
-            let running_fields = [running.unwrap_or(Term::small(0).expect("small zero"))];
-            // Port of erts/emulator/beam/erl_process.c:10556-10560 (trace_schedule_out).
-            if crate::trace::flags(process, ctx.pid()) & crate::trace::CALL != 0 {
-                crate::trace_bp::schedule_time_break(process, ctx.pid(), true);
-            }
-            crate::trace::emit(
-                Some(&mut self.vm),
-                process,
-                ctx,
-                ctx.pid(),
-                crate::trace::RUNNING,
-                "out",
-                &running_fields,
-            );
-        }
         if let Some(schedule_started) = schedule_started {
             crate::natives::erts_debug::after_schedule(
                 process,

@@ -87,12 +87,33 @@ static PF_MONITOR_DOWN: AtomicU64 = AtomicU64::new(0);
 /// Port of erts/emulator/beam/erl_process.h:687 (struct ErtsSchedulerData_: `registers`,
 /// `current_process`) and erl_process.c:5994 (init_scheduler_data), OTP-29.1.1: one per
 /// normal, dirty or simulated scheduler, handed down explicitly instead of looked up.
-#[derive(Default)]
 pub struct SchedulerData {
+    /// `esdp->registers`: the scheduler's X and F register file, which `copy_in_registers`
+    /// loads the scheduled process's live registers into.
+    pub(super) registers: Box<SchedulerRegisters>,
     pub(super) executor: Option<Box<Executor>>,
     /// `esdp->no` as the allocator numbers it: the allocator index of this scheduler's thread,
     /// read once on its first process turn and handed to the heap of each process it runs.
     pub(super) alloc_ix: Option<usize>,
+}
+
+impl Default for SchedulerData {
+    /// Port of erts/emulator/beam/erl_process.c:5994 (init_scheduler_data: `esdp->registers =
+    /// erts_alloc_permanent_cache_aligned(...)`), OTP-29.1.1: the register file is allocated
+    /// with the scheduler data, before the scheduler runs any process.
+    fn default() -> Self {
+        #[cfg_attr(not(target_arch = "aarch64"), allow(unused_mut))]
+        let mut registers = Box::<SchedulerRegisters>::default();
+        // The arm trace-return stub address is a per-scheduler constant (process_main sets it
+        // once).
+        #[cfg(target_arch = "aarch64")]
+        crate::beamasm_integration::set_trace_return_hook(&mut registers);
+        Self {
+            registers,
+            executor: None,
+            alloc_ix: None,
+        }
+    }
 }
 
 /// How the entry loop goes on after a native call's exit was dispatched.
@@ -109,8 +130,6 @@ pub(super) struct Executor {
     /// The scheduler thread's hub is bound to `current_process`.
     pub(super) hub_bound: bool,
     pub(super) vm: Vm,
-    /// Native register backing is scheduler-local, as required by x19.
-    pub(super) native_registers: SchedulerRegisters,
 }
 
 impl Executor {
@@ -183,6 +202,7 @@ impl Executor {
         &mut self,
         process: &mut Process,
         ctx: &mut RunCtx<'_, Message>,
+        reg: &mut SchedulerRegisters,
         ran: &mut bool,
     ) -> Option<Result<RunState, VmError>> {
         let mut first = true;
@@ -207,14 +227,14 @@ impl Executor {
             if crate::code_ix::take_code_barrier() {
                 ctx.block_thread_progress(std::time::Duration::ZERO);
             }
-            self.native_registers.active_code_ix =
+            reg.active_code_ix =
                 self.vm
                     .code_ix
                     .process_code_ix(crate::trace::saves_calls(process)) as u64;
             let native = {
                 // Port of erts `c_p->scheduler_data`: a BIF native code calls reaches this
                 // scheduler's data through the process while the slice runs.
-                let registers = &mut self.native_registers;
+                let registers = &mut *reg;
                 super::sched_data::NativeSlice::run(&mut self.vm, ctx, process, |process| {
                     crate::native_bridge::run_native_resume(process, registers, code_ptr)
                 })
@@ -246,12 +266,12 @@ impl Executor {
             if matches!(outcome, arinsal_beamasm::ExitReason::Returned) {
                 // The entry function returned: the process continues in its caller or is done.
                 if !resume_after_native_return(process) {
-                    return Some(Ok(RunState::Done(self.native_registers.x_reg_array[0])));
+                    return Some(Ok(RunState::Done(reg.x_reg_array[0])));
                 }
                 continue;
             }
             if !matches!(outcome, arinsal_beamasm::ExitReason::Yield) {
-                match self.after_native(process, ctx, outcome, code_ptr) {
+                match self.after_native(process, ctx, reg, outcome, code_ptr) {
                     Ok(Flow::Continue) => continue,
                     Ok(Flow::Break(result)) => return Some(result),
                     Err(error) => return Some(Err(error)),
@@ -292,7 +312,7 @@ impl Executor {
                     }
                     return Some(Ok(RunState::Yield));
                 }
-                _ => match self.after_native(process, ctx, outcome, code_ptr) {
+                _ => match self.after_native(process, ctx, reg, outcome, code_ptr) {
                     Ok(Flow::Continue) => continue,
                     Ok(Flow::Break(result)) => return Some(result),
                     Err(error) => return Some(Err(error)),
@@ -309,6 +329,7 @@ impl Executor {
         &mut self,
         process: &mut Process,
         ctx: &mut RunCtx<'_, Message>,
+        reg: &mut SchedulerRegisters,
     ) -> Result<Option<RunState>, VmError> {
         // Nothing to do at most scheduling points: no suspend and no hibernation. Checked
         // before the runtime handle is cloned.
@@ -343,14 +364,18 @@ impl Executor {
                 // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
                 process.set_hibernate_sched(false);
             } else {
-                self.install_apply(process)?;
+                self.install_apply(process, reg)?;
             }
         }
         Ok(None)
     }
 
     // g_proc_sched. Port of bif.c:1402 (`hibernate_3` resumes via apply/3), OTP-29.1.1.
-    pub(super) fn install_apply(&mut self, process: &mut Process) -> Result<(), VmError> {
+    pub(super) fn install_apply(
+        &mut self,
+        process: &mut Process,
+        reg: &mut SchedulerRegisters,
+    ) -> Result<(), VmError> {
         if process.runtime.is_none() {
             return Err(VmError::Unsupported("hibernate without a scheduler".into()));
         }
@@ -362,7 +387,7 @@ impl Executor {
         // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
         process.set_hibernate_sched(false);
         // hibernate/3 left `apply(M, F, A)` in X0..X2.
-        if self.native_registers.x_reg_array.len() < 3 {
+        if reg.x_reg_array.len() < 3 {
             return Err(VmError::Unsupported("hibernate registers".into()));
         }
         // Port of erts/emulator/beam/bif.c:1426-1427 (hibernate_3: erts_hibernate, then
@@ -487,10 +512,8 @@ pub(super) fn with_executor<R>(
     f(executor)
 }
 
-/// The executor a scheduler creates on its first process turn. Kept out of line: the
-/// register file is built once per scheduler, not in the frame of every turn.
-// Port of erts/emulator/beam/erl_process.c:5994 (init_scheduler_data allocates
-// `esdp->registers` once), OTP-29.1.1.
+/// The executor a scheduler creates on its first process turn. Kept out of line: the code
+/// replica is built once per scheduler, not in the frame of every turn.
 #[cold]
 #[inline(never)]
 pub(super) fn new_executor(runtime: &'static Runtime) -> Box<Executor> {
@@ -499,14 +522,5 @@ pub(super) fn new_executor(runtime: &'static Runtime) -> Box<Executor> {
         current_process: Default::default(),
         hub_bound: false,
         vm: Vm::shared_replica(&runtime.paths),
-        native_registers: {
-            #[cfg_attr(not(target_arch = "aarch64"), allow(unused_mut))]
-            let mut registers = SchedulerRegisters::default();
-            // The arm trace-return stub address is a per-scheduler constant (process_main sets
-            // it once).
-            #[cfg(target_arch = "aarch64")]
-            crate::beamasm_integration::set_trace_return_hook(&mut registers);
-            registers
-        },
     })
 }

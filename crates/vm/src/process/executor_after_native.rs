@@ -10,6 +10,7 @@ impl Executor {
         &mut self,
         process: &mut Process,
         ctx: &mut RunCtx<'_, Message>,
+        reg: &mut SchedulerRegisters,
         outcome: arinsal_beamasm::ExitReason,
         code_ptr: usize,
     ) -> Result<Flow, VmError> {
@@ -62,7 +63,7 @@ impl Executor {
                         .as_ref()
                         .and_then(|cold| cold.bif_trap.as_ref())
                         .map(|pending| (pending.callee.0, pending.callee.1, pending.arity)),
-                    self.native_registers.x_reg_array[0],
+                    reg.x_reg_array[0],
                 );
                 // The native call site names the caller only if the called BIF
                 // raises; any other continuation must not inherit it.
@@ -83,9 +84,7 @@ impl Executor {
                         arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize;
                     if resume_pc == bridge {
                         if !resume_after_native_return(process) {
-                            return Ok(Flow::Break(Ok(RunState::Done(
-                                self.native_registers.x_reg_array[0],
-                            ))));
+                            return Ok(Flow::Break(Ok(RunState::Done(reg.x_reg_array[0]))));
                         }
                     } else {
                         process.native_continuation_resume = true;
@@ -161,7 +160,7 @@ impl Executor {
                     // collect when the spilled registers and S_RESERVED do not fit.
                     process.ensure_objv(
                         live + 2 + arinsal_term::S_RESERVED,
-                        &mut self.native_registers.x_reg_array[..live],
+                        &mut reg.x_reg_array[..live],
                     )?;
                     if !process.heap.reserve_stack(1)
                         || !process
@@ -174,7 +173,7 @@ impl Executor {
                         ))));
                     }
                     for index in 0..live {
-                        let value = self.native_registers.x_reg_array[index];
+                        let value = reg.x_reg_array[index];
                         if !process.heap.stack_set(index, value) {
                             break;
                         }
@@ -206,14 +205,14 @@ impl Executor {
                     let handler_function = arinsal_term::global_atoms()
                         .intern("breakpoint")
                         .map_err(|_| VmError::Unsupported("atom table".into()))?;
-                    self.native_registers.x_reg_array[0] = Term::atom(module_atom);
-                    self.native_registers.x_reg_array[1] = Term::atom(function_atom);
-                    self.native_registers.x_reg_array[2] =
+                    reg.x_reg_array[0] = Term::atom(module_atom);
+                    reg.x_reg_array[1] = Term::atom(function_atom);
+                    reg.x_reg_array[2] =
                         Term::small(i64::from(function.arity)).expect("arity is a small integer");
-                    self.native_registers.x_reg_array[3] =
+                    reg.x_reg_array[3] =
                         Term::small(i64::from(line)).expect("line is a small integer");
-                    self.native_registers.x_reg_array[4] = Term::atom(handler_module);
-                    self.native_registers.x_reg_array[5] = Term::atom(handler_function);
+                    reg.x_reg_array[4] = Term::atom(handler_module);
+                    reg.x_reg_array[5] = Term::atom(handler_function);
                     process.gc_live = 4;
                     process.native_apply = true;
                     let result = self.vm.apply_fixed(process, 4, Some(ctx));
@@ -227,7 +226,7 @@ impl Executor {
                             return Ok(Flow::Break(Ok(RunState::Yield)));
                         }
                         crate::ImportOutcome::Returned(value) => {
-                            self.native_registers.x_reg_array[0] = value;
+                            reg.x_reg_array[0] = value;
                             if process.native_pc().is_none() {
                                 return Ok(Flow::Break(Ok(RunState::Done(value))));
                             }
@@ -253,8 +252,7 @@ impl Executor {
                     }
                     // The trace callbacks read every argument from the scheduler
                     // array, which is the process's X file.
-                    let arity =
-                        usize::from(function.arity).min(self.native_registers.x_reg_array.len());
+                    let arity = usize::from(function.arity).min(reg.x_reg_array.len());
                     let actions = crate::trace::executor_native_call_event(
                         &mut self.vm,
                         process,
@@ -266,7 +264,7 @@ impl Executor {
                         process,
                         resume_pc,
                         &actions,
-                        &mut self.native_registers.x_reg_array[..arity],
+                        &mut reg.x_reg_array[..arity],
                     )?;
                     if crate::trace_bp::debug_breakpoint_enabled(
                         process,
@@ -297,7 +295,7 @@ impl Executor {
                                 return Ok(Flow::Break(Ok(RunState::Yield)));
                             }
                             crate::ImportOutcome::Returned(value) => {
-                                self.native_registers.x_reg_array[0] = value;
+                                reg.x_reg_array[0] = value;
                                 if process.native_pc().is_none() {
                                     return Ok(Flow::Break(Ok(RunState::Done(value))));
                                 }
@@ -427,7 +425,7 @@ impl Executor {
                             return Ok(Flow::Break(Ok(RunState::Yield)));
                         }
                         crate::ImportOutcome::Returned(value) => {
-                            self.native_registers.x_reg_array[0] = value;
+                            reg.x_reg_array[0] = value;
                             if process.native_pc().is_none() {
                                 return Ok(Flow::Break(Ok(RunState::Done(value))));
                             }
@@ -463,7 +461,7 @@ impl Executor {
                     // matching below records what its flags select.
                     let saved_arguments: smallvec::SmallVec<[Term; 8]> =
                         smallvec::SmallVec::from_slice(
-                            &self.native_registers.x_reg_array[..usize::from(export.arity)],
+                            &reg.x_reg_array[..usize::from(export.arity)],
                         );
                     let collections_before = process.stats.gc.collections;
                     // erlang:make_fun/3 is implemented by the VM's call path (funs.rs), not
@@ -487,11 +485,8 @@ impl Executor {
                     {
                         Some(match export.function.as_str() {
                             "make_fun" => {
-                                let args = [
-                                    self.native_registers.x_reg_array[0],
-                                    self.native_registers.x_reg_array[1],
-                                    self.native_registers.x_reg_array[2],
-                                ];
+                                let args =
+                                    [reg.x_reg_array[0], reg.x_reg_array[1], reg.x_reg_array[2]];
                                 self.vm.make_export_fun(process, &args)
                             }
                             "fun_info" => self.vm.fun_info(process, export.arity == 2),
@@ -600,7 +595,7 @@ impl Executor {
                         Some(Err(VmError::Exception { reason, frame })) => {
                             Some(Err(VmError::Trap(legacy_exception_trap(
                                 process,
-                                &self.native_registers.x_reg_array,
+                                &reg.x_reg_array,
                                 &reason,
                                 &frame,
                             )?)))
@@ -629,8 +624,7 @@ impl Executor {
                                         // by any collection the call ran; the copies taken
                                         // before it are stale.
                                         args: crate::stacktrace::BifArgs::from_terms(
-                                            &self.native_registers.x_reg_array
-                                                [..saved_arguments.len()],
+                                            &reg.x_reg_array[..saved_arguments.len()],
                                         )?,
                                         info: crate::stacktrace::BifErrorInfo::Plain,
                                     });
@@ -667,11 +661,8 @@ impl Executor {
                                 // yielding BIF that allocated) moved the
                                 // registers; the copies taken before it are stale.
                                 if process.stats.gc.collections == collections_before {
-                                    for (register, value) in self
-                                        .native_registers
-                                        .x_reg_array
-                                        .iter_mut()
-                                        .zip(&saved_arguments)
+                                    for (register, value) in
+                                        reg.x_reg_array.iter_mut().zip(&saved_arguments)
                                     {
                                         *register = *value;
                                     }
@@ -687,11 +678,8 @@ impl Executor {
                                 // (erts_gc_after_bif_call_lhf) moved the registers; the
                                 // copies taken before it are stale.
                                 if process.stats.gc.collections == collections_before {
-                                    for (register, value) in self
-                                        .native_registers
-                                        .x_reg_array
-                                        .iter_mut()
-                                        .zip(&saved_arguments)
+                                    for (register, value) in
+                                        reg.x_reg_array.iter_mut().zip(&saved_arguments)
                                     {
                                         *register = *value;
                                     }
@@ -739,12 +727,12 @@ impl Executor {
                                         timeout_pos: None,
                                     })));
                                 }
-                                self.install_apply(process)?;
+                                self.install_apply(process, reg)?;
                                 return Ok(Flow::Continue);
                             }
                             Err(error) => return Err(error),
                         };
-                        self.native_registers.x_reg_array[0] = value;
+                        reg.x_reg_array[0] = value;
                         if !resume_after_native_return(process) {
                             return Ok(Flow::Break(Ok(RunState::Done(value))));
                         }
@@ -772,9 +760,7 @@ impl Executor {
                         } {
                             Ok(module_id) => module_id,
                             Err(_) => {
-                                let saved = self.native_registers.x_reg_array
-                                    [..usize::from(export.arity)]
-                                    .to_vec();
+                                let saved = reg.x_reg_array[..usize::from(export.arity)].to_vec();
                                 let outcome = match self.vm.call_undefined_function(
                                     process,
                                     &export.module,
@@ -806,7 +792,7 @@ impl Executor {
                                         return Ok(Flow::Break(Ok(RunState::Yield)));
                                     }
                                     crate::ImportOutcome::Returned(value) => {
-                                        self.native_registers.x_reg_array[0] = value;
+                                        reg.x_reg_array[0] = value;
                                         if process.native_pc().is_none() {
                                             return Ok(Flow::Break(Ok(RunState::Done(value))));
                                         }
@@ -854,7 +840,7 @@ impl Executor {
                             process,
                             function.start,
                             &actions,
-                            &mut self.native_registers.x_reg_array[..usize::from(function.arity)],
+                            &mut reg.x_reg_array[..usize::from(function.arity)],
                         )?;
                         process.gc_live = usize::from(export.arity);
                         process.set_native_pc(Some(function.start));
@@ -874,8 +860,7 @@ impl Executor {
                     // (emit_export_trampoline), OTP-29.1.1: the call's reduction is the
                     // callee's own `i_test_yield` at its native entry.
                 } else {
-                    let saved =
-                        self.native_registers.x_reg_array[..usize::from(export.arity)].to_vec();
+                    let saved = reg.x_reg_array[..usize::from(export.arity)].to_vec();
                     let outcome = match self.vm.call_undefined_function(
                         process,
                         &export.module,
@@ -901,7 +886,7 @@ impl Executor {
                             return Ok(Flow::Break(Ok(RunState::Yield)));
                         }
                         crate::ImportOutcome::Returned(value) => {
-                            self.native_registers.x_reg_array[0] = value;
+                            reg.x_reg_array[0] = value;
                             if process.native_pc().is_none() {
                                 return Ok(Flow::Break(Ok(RunState::Done(value))));
                             }
@@ -925,9 +910,7 @@ impl Executor {
             }
             arinsal_beamasm::ExitReason::Returned => {
                 if !resume_after_native_return(process) {
-                    return Ok(Flow::Break(Ok(RunState::Done(
-                        self.native_registers.x_reg_array[0],
-                    ))));
+                    return Ok(Flow::Break(Ok(RunState::Done(reg.x_reg_array[0]))));
                 }
                 return Ok(Flow::Continue);
             }
