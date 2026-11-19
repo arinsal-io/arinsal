@@ -1,6 +1,5 @@
 //! Local closures, export funs, and dynamic calls.
 
-use crate::process::Message;
 use crate::{EvalResult, ImportOutcome, Process, Vm, VmError, exceptions};
 use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle};
 use arinsal_loader::Module;
@@ -202,7 +201,7 @@ impl Vm {
         p: &mut Process,
         fun: Term,
         arity: usize,
-        ctx: Option<&mut RunCtx<'_, Message>>,
+        ctx: Option<&mut RunCtx<'_, crate::Process>>,
     ) -> Result<ImportOutcome, VmError> {
         if arity >= crate::proc_create::ATTACHED_X_REGS {
             return Err(VmError::Unsupported("fun arity exceeds X registers".into()));
@@ -299,7 +298,7 @@ impl Vm {
         module: arinsal_term::Atom,
         arity: usize,
         pending_purge: bool,
-        ctx: Option<&mut RunCtx<'_, Message>>,
+        ctx: Option<&mut RunCtx<'_, crate::Process>>,
     ) -> Result<ImportOutcome, VmError> {
         let (handler, function) = if pending_purge {
             let name = atom_name(Term::atom(module))
@@ -390,7 +389,7 @@ impl Vm {
         module: &str,
         function: &str,
         arity: usize,
-        ctx: Option<&mut RunCtx<'_, Message>>,
+        ctx: Option<&mut RunCtx<'_, crate::Process>>,
     ) -> Result<ImportOutcome, VmError> {
         self.call_named_resolved(p, None, module, function, arity, ctx)
     }
@@ -405,7 +404,7 @@ impl Vm {
         &mut self,
         p: &mut Process,
         trap: crate::ExportTrap,
-        ctx: Option<&mut RunCtx<'_, Message>>,
+        ctx: Option<&mut RunCtx<'_, crate::Process>>,
     ) -> Result<ImportOutcome, VmError> {
         let target = trap.target;
         let (module, function, arity) = (target.module, target.function, target.arity);
@@ -482,7 +481,7 @@ impl Vm {
         module: &str,
         function: &str,
         arity: usize,
-        ctx: Option<&mut RunCtx<'_, Message>>,
+        ctx: Option<&mut RunCtx<'_, crate::Process>>,
     ) -> Result<ImportOutcome, VmError> {
         self.call_named_resolved(
             p,
@@ -502,7 +501,7 @@ impl Vm {
         module: &str,
         function: &str,
         arity: usize,
-        mut ctx: Option<&mut RunCtx<'_, Message>>,
+        mut ctx: Option<&mut RunCtx<'_, crate::Process>>,
     ) -> Result<ImportOutcome, VmError> {
         // A BIF reached through apply is traced like a direct call.
         // Port of erts/emulator/beam/beam_bp.c:321-330 (erts_export_is_bif_traced), OTP-29.1.1.
@@ -601,7 +600,7 @@ impl Vm {
         module: &str,
         function: &str,
         arity: usize,
-        mut ctx: Option<&mut RunCtx<'_, Message>>,
+        mut ctx: Option<&mut RunCtx<'_, crate::Process>>,
     ) -> Result<ImportOutcome, VmError> {
         p.gc_live = arity;
         if arity > u8::MAX as usize {
@@ -996,7 +995,7 @@ impl Vm {
         module: &str,
         function: &str,
         arity: usize,
-        ctx: Option<&mut RunCtx<'_, Message>>,
+        ctx: Option<&mut RunCtx<'_, crate::Process>>,
     ) -> Result<ImportOutcome, VmError> {
         // Port of erts/emulator/beam/beam_common.c:1294-1345
         // (`call_error_handler`), OTP-29.1.1. Resolve the handler before changing X registers:
@@ -1041,7 +1040,7 @@ impl Vm {
         module: &str,
         function: &str,
         arity: usize,
-        ctx: Option<&mut RunCtx<'_, Message>>,
+        ctx: Option<&mut RunCtx<'_, crate::Process>>,
     ) -> Result<ImportOutcome, VmError> {
         // Port of erts/emulator/beam/beam_common.c:1294-1345
         // (`call_error_handler`), OTP-29.1.1. A breakpoint dispatches through the
@@ -1083,7 +1082,7 @@ impl Vm {
         &mut self,
         p: &mut Process,
         arity: usize,
-        ctx: Option<&mut RunCtx<'_, Message>>,
+        ctx: Option<&mut RunCtx<'_, crate::Process>>,
     ) -> Result<ImportOutcome, VmError> {
         if arity + 1 >= crate::proc_create::ATTACHED_X_REGS {
             return Err(self.exception(p, "system_limit"));
@@ -1152,7 +1151,7 @@ impl Vm {
         &mut self,
         p: &mut Process,
         arity: usize,
-        ctx: Option<&mut RunCtx<'_, Message>>,
+        ctx: Option<&mut RunCtx<'_, crate::Process>>,
     ) -> Result<ImportOutcome, VmError> {
         let original_position = p.position_marker();
         let original_gc_live = p.gc_live;

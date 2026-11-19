@@ -1,4 +1,3 @@
-use crate::process::Message;
 use crate::{Process, Vm, VmError, exceptions};
 use arinsal_bifs::{Ctx, ProcessHeapHandle};
 use arinsal_sched::RunCtx;
@@ -20,7 +19,7 @@ pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
 pub(crate) fn call(
     _vm: &mut Vm,
     process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: super::NativeArgs<'_>,

@@ -983,7 +983,7 @@ impl Process {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn remove_message(
         &mut self,
-        ctx: Option<&mut arinsal_sched::RunCtx<'_, crate::process::Message>>,
+        ctx: Option<&mut arinsal_sched::RunCtx<'_, crate::Process>>,
     ) -> Result<(), VmError> {
         self.remove_message_inner(None, ctx)
     }
@@ -991,7 +991,7 @@ impl Process {
     fn remove_message_inner(
         &mut self,
         vm: Option<&mut crate::Vm>,
-        ctx: Option<&mut arinsal_sched::RunCtx<'_, crate::process::Message>>,
+        ctx: Option<&mut arinsal_sched::RunCtx<'_, crate::Process>>,
     ) -> Result<(), VmError> {
         // Port of erts/emulator/beam/erl_message.c:975 (erts_save_message_in_proc,
         // erts_adjust_message_break), OTP-29.1.1: a message that was copied onto the heap is

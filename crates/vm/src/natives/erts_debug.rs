@@ -895,7 +895,7 @@ fn dirty_test_body(
 /// Run `dirty_test` on the current scheduler; on a dirty one as a dirty job.
 fn dirty_test(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     scheduler: &'static str,
     operation: Term,
     value: Term,
@@ -1098,7 +1098,7 @@ fn dirty_reschedule_step(scheduler: &'static str, operation: Term, value: Term) 
 /// Port of erts/emulator/beam/beam_debug.c:1190 (erts_debug_dirty_3), OTP-29.1.1.
 fn dirty(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     let scheduler = match arg_name(args[0]).as_deref() {
@@ -1419,7 +1419,7 @@ fn term_type(value: Term) -> Term {
 fn build(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
     module: &str,
     function: &str,
@@ -1499,7 +1499,7 @@ fn map_to_tuple_keys(process: &mut Process, value: Term) -> Result<Term, VmError
 /// Port of erts/emulator/beam/erl_bif_info.c:5678-5728, OTP-29.1.1.
 fn gather_allocator_info(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     arg: Term,
     carrier: bool,
 ) -> Result<Term, VmError> {
@@ -1574,7 +1574,7 @@ fn owned_signed(value: &OwnedTerm) -> Option<i64> {
 fn internal_state_tuple_get(
     _vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     selector: Term,
 ) -> Result<Option<Term>, VmError> {
     if let Some(fields) = term_sequence(selector)
@@ -2205,7 +2205,7 @@ impl Relations {
 /// until all are handled or it is exiting, then reads the relations. A running target holds
 /// the lock, so the BIF yields and retries where erts waits for it.
 fn remote_relations(
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     pid: arinsal_sched::Pid,
 ) -> Result<Option<Relations>, VmError> {
     let mut relations = None;
@@ -2241,7 +2241,7 @@ fn remote_relations(
 /// OTP-29.1.1: the debug introspection path drains pending signals even for the caller itself.
 fn current_relations(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
 ) -> Result<Option<Relations>, VmError> {
     let exiting = |target: &Process| target.dirty_exiting() || target.has_exit_cont();
     if !exiting(process) {
@@ -2322,7 +2322,7 @@ fn monitor_extra_term(process: &mut Process, extra: Option<&OwnedTerm>) -> Resul
 fn internal_state_get(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     selector: Term,
 ) -> Result<Term, VmError> {
     if !INTERNAL_STATE.load(Ordering::Relaxed) {
@@ -2682,7 +2682,7 @@ fn debug_wait_wake(
 /// Port of erts/emulator/beam/erl_bif_info.c:5036-5500, OTP-29.1.1.
 fn internal_state_set(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     selector: Term,
     value: Term,
 ) -> Result<Term, VmError> {
@@ -3462,7 +3462,7 @@ fn apply_monitor_option(
 /// Port of erts/emulator/beam/erl_bif_trace.c:3560-3715 (system_monitor), OTP-29.1.1.
 fn system_monitor_set(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     let runtime = process.runtime.ok_or_else(badarg)?;
@@ -3599,7 +3599,7 @@ fn system_monitor_set(
 pub(crate) fn call(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: super::NativeArgs<'_>,

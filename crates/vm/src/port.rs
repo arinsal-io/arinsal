@@ -128,7 +128,7 @@ fn child_setup_payload(
 // erts_port_output), OTP-29.1.1.
 pub(crate) fn process_send(
     process: &mut Process,
-    ctx: Option<&mut RunCtx<'_, Message>>,
+    ctx: Option<&mut RunCtx<'_, crate::Process>>,
     port: Term,
     message: Term,
     suspend: bool,
@@ -1448,7 +1448,7 @@ fn trace_port_send(
 fn start(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &RunCtx<'_, Message>,
+    ctx: &RunCtx<'_, crate::Process>,
     spec: Term,
     opts: Term,
 ) -> Result<Term, VmError> {
@@ -1686,7 +1686,7 @@ fn start(
 // and `prim_inet` maps that onto `{error, eprotonosupport}`.
 fn start_driver(
     process: &mut Process,
-    ctx: &RunCtx<'_, Message>,
+    ctx: &RunCtx<'_, crate::Process>,
     name: String,
     _binary: bool,
     io: DriverIoFlags,
@@ -1740,7 +1740,7 @@ const ERL_DRV_FLAG_USE_PORT_LOCKING: i32 = 1 << 0;
 /// driver, with the state flags erl_bif_port.c:1140 sets after `start`.
 fn start_dyn_driver(
     process: &mut Process,
-    ctx: &RunCtx<'_, Message>,
+    ctx: &RunCtx<'_, crate::Process>,
     handle_id: Option<u64>,
     driver: Arc<arinsal_drv::Driver>,
     name: String,
@@ -1805,7 +1805,7 @@ pub(crate) fn open_sys_driver_port(
 #[allow(clippy::too_many_arguments)]
 fn open_driver_port(
     process: &mut Process,
-    ctx: &RunCtx<'_, Message>,
+    ctx: &RunCtx<'_, crate::Process>,
     reservation: PortIdReservation<'_>,
     handle_id: Option<u64>,
     driver: Arc<arinsal_drv::Driver>,
@@ -2851,7 +2851,7 @@ fn make_driver_handle(
 fn start_fd(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &RunCtx<'_, Message>,
+    ctx: &RunCtx<'_, crate::Process>,
     input_fd: RawFd,
     output_fd: RawFd,
     opts: &PortOptions,
@@ -2920,7 +2920,7 @@ fn wake_suspended(scheduler: &Scheduler<Process>, pids: Vec<Pid>) {
 /// be queued before the save pointer moves. The receive that waits for the reply then starts at
 /// the end of the message queue.
 // Port of erts/emulator/beam/erl_proc_sig_queue.h:2397 (erts_msgq_set_save_end), OTP-29.1.1.
-pub(crate) fn set_save_end(process: &mut Process, ctx: &mut RunCtx<'_, Message>) {
+pub(crate) fn set_save_end(process: &mut Process, ctx: &mut RunCtx<'_, crate::Process>) {
     // erts_proc_sig_fetch(c_p). Fetching links queued messages and cannot fail: `push_message`
     // only appends, so the Result is an internal invariant.
     process
@@ -3201,7 +3201,7 @@ fn port_set_data(process: &Process, port: Term, data: Term) -> Result<Term, VmEr
 pub(crate) fn family(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: &[Term],
@@ -3251,7 +3251,7 @@ pub(crate) fn family(
 // Non-inet ports still return the atom `badarg`. `tcp_inet` returns a byte list.
 fn port_control(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     port: Term,
     op: Term,
     data: Term,
@@ -3370,7 +3370,7 @@ fn io_pieces(term: Term, out: &mut Vec<(Vec<u8>, bool)>) -> Option<()> {
 // io.c:4268 (erts_port_control) for a loaded driver.
 fn driver_control(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     caller: Pid,
     drv_port: &arinsal_drv::DriverPort,
     op: Term,
@@ -3413,7 +3413,7 @@ fn port_command_yield(process: &mut Process, args: &[Term]) -> VmError {
 
 fn port_command(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     port: Term,
     data: Term,
     args: &[Term],
@@ -3771,7 +3771,7 @@ fn close_inner(process: &Process, term: Term, trace_receive: bool) -> Result<Ter
 // Port of erts/emulator/beam/erl_bif_port.c:233 (erts_internal_port_close_1), OTP-29.1.1.
 fn port_close(
     process: &mut Process,
-    ctx: Option<&mut RunCtx<'_, Message>>,
+    ctx: Option<&mut RunCtx<'_, crate::Process>>,
     caller: Pid,
     port: Term,
 ) -> Result<Term, VmError> {
@@ -3802,7 +3802,7 @@ fn port_close(
 /// Close a runtime port selected by its internal id.
 pub(crate) fn close_by_id(
     process: &Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     id: u64,
 ) -> Result<bool, VmError> {
     let term = Term::port(id).ok_or_else(badarg)?;
@@ -4366,7 +4366,7 @@ pub(crate) fn send_from_process(
     port: Term,
     message: Term,
     nosuspend: bool,
-    mut ctx: Option<&mut RunCtx<'_, Message>>,
+    mut ctx: Option<&mut RunCtx<'_, crate::Process>>,
 ) -> Result<PortSend, VmError> {
     loop {
         match send_message_inner(process, port, message, nosuspend, ctx.as_deref_mut())? {
@@ -4397,7 +4397,7 @@ fn send_message_inner(
     port: Term,
     message: Term,
     nosuspend: bool,
-    mut ctx: Option<&mut RunCtx<'_, Message>>,
+    mut ctx: Option<&mut RunCtx<'_, crate::Process>>,
 ) -> Result<(PortSend, DrvTarget), VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;

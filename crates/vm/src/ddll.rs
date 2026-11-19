@@ -511,7 +511,7 @@ fn scheduler_of(process: &Process) -> Result<Arc<Scheduler<Process>>, VmError> {
 /// Port of erl_bif_ddll.c:178 (erl_ddll_try_load_3).
 pub(crate) fn try_load(
     process: &mut Process,
-    ctx: &RunCtx<'_, Message>,
+    ctx: &RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     // F_USING_DDLL (erl_process.c:14415): exit calls erts_ddll_proc_dead only when set.
@@ -762,7 +762,7 @@ fn try_load_locked(
 /// Port of erl_bif_ddll.c:489 (erl_ddll_try_unload_2).
 pub(crate) fn try_unload(
     process: &mut Process,
-    ctx: &RunCtx<'_, Message>,
+    ctx: &RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     arinsal_sched::proc_flags::publish(ctx.exit_flags(), arinsal_sched::proc_flags::DDLL);
@@ -1002,7 +1002,7 @@ fn pid_counts(process: &mut Process, items: &[(Pid, i64)]) -> Result<Term, VmErr
 /// and notify_when_unloaded (erl_bif_ddll.c:1219-1300).
 pub(crate) fn monitor(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     arinsal_sched::proc_flags::publish(ctx.exit_flags(), arinsal_sched::proc_flags::DDLL);
@@ -1066,7 +1066,10 @@ pub(crate) fn monitor(
 }
 
 /// Port of erl_bif_ddll.c:641 (erl_ddll_demonitor_1) and :924 (erts_ddll_remove_monitor).
-pub(crate) fn demonitor(ctx: &RunCtx<'_, Message>, reference: Term) -> Result<Term, VmError> {
+pub(crate) fn demonitor(
+    ctx: &RunCtx<'_, crate::Process>,
+    reference: Term,
+) -> Result<Term, VmError> {
     let id = crate::signals::ref_id(reference).ok_or_else(badarg)?;
     let pid = ctx.pid();
     let mut table = table().lock().unwrap();

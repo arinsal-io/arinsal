@@ -114,7 +114,7 @@ impl Process {
     // (erts_proc_sig_receive_helper), OTP-29.1.1.
     pub(crate) fn receive_helper(
         &mut self,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         fcalls: i32,
     ) -> Result<(i32, ReceiveHelper), VmError> {
         // `neg_o_reds` is nonzero only while saving calls (`save_calls`).
@@ -160,7 +160,7 @@ impl Process {
     // OTP-29.1.1.
     pub(super) fn alias_message_accepted(
         &mut self,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         alias: u64,
     ) -> Result<Option<(bool, bool)>, VmError> {
         if alias == 0 {
@@ -233,7 +233,7 @@ impl Process {
     /// Move a message signal into the message queue.
     pub(super) fn move_message(
         &mut self,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         mut node: MessageNode,
     ) -> Result<(), VmError> {
         let from = node.from;

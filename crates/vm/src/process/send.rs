@@ -100,7 +100,7 @@ impl Process {
     #[allow(clippy::too_many_arguments)] // erts passes the scheduler data as one more.
     fn try_send_on_receiver_heap(
         &self,
-        ctx: Option<&mut RunCtx<'_, Message>>,
+        ctx: Option<&mut RunCtx<'_, crate::Process>>,
         from: Pid,
         to: Pid,
         counted: CountedSend<'_>,
@@ -190,7 +190,7 @@ impl Process {
     fn trace_send(
         &mut self,
         vm: Option<&mut Vm>,
-        ctx: Option<&mut RunCtx<'_, Message>>,
+        ctx: Option<&mut RunCtx<'_, crate::Process>>,
         sender: Pid,
         event: &str,
         value: Term,
@@ -224,7 +224,7 @@ impl Process {
     pub(crate) fn send_message_prio(
         &mut self,
         vm: Option<&mut Vm>,
-        ctx: Option<&mut RunCtx<'_, Message>>,
+        ctx: Option<&mut RunCtx<'_, crate::Process>>,
         target: Term,
         value: Term,
         want_priority: bool,
@@ -236,7 +236,7 @@ impl Process {
     fn send_resolved(
         &mut self,
         mut vm: Option<&mut Vm>,
-        mut ctx: Option<&mut RunCtx<'_, Message>>,
+        mut ctx: Option<&mut RunCtx<'_, crate::Process>>,
         target: Term,
         value: Term,
         want_priority: bool,
@@ -464,7 +464,7 @@ impl Process {
 
     fn send_counted(
         &mut self,
-        mut ctx: Option<&mut RunCtx<'_, Message>>,
+        mut ctx: Option<&mut RunCtx<'_, crate::Process>>,
         sender: Pid,
         pid: Pid,
         value: Term,

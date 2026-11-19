@@ -28,7 +28,7 @@ use std::cmp::Ordering;
 /// The executor's scheduler data, when the executor calls the BIF by its MFA (an `apply` it
 /// resolves, a traced call). Native code passes `None` and the distributed arm reaches the
 /// data through the process.
-type Sched<'a, 'c> = Option<(&'a mut Vm, &'a mut RunCtx<'c, Message>)>;
+type Sched<'a, 'c> = Option<(&'a mut Vm, &'a mut RunCtx<'c, crate::Process>)>;
 
 pub(crate) fn badarg() -> VmError {
     VmError::Trap(crate::exceptions::Trap::error(Term::atom(atoms::BADARG)))
@@ -132,7 +132,7 @@ pub(crate) extern "C" fn demonitor_2(c_p: *mut ProcessHeader, reg: *mut u64, i: 
 pub(crate) fn monitor_executor(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     monitor(process, std::ptr::null_mut(), Some((vm, ctx)), args)
@@ -142,7 +142,7 @@ pub(crate) fn monitor_executor(
 pub(crate) fn demonitor_executor(
     _vm: &mut Vm,
     process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     demonitor(process, args)
@@ -1017,7 +1017,7 @@ fn send_options(list: Term) -> Option<SendOptions> {
 pub(crate) fn with_sched<R>(
     process: &mut Process,
     reg: *mut u64,
-    f: impl FnOnce(&mut Vm, &mut Process, &mut RunCtx<'_, Message>) -> R,
+    f: impl FnOnce(&mut Vm, &mut Process, &mut RunCtx<'_, crate::Process>) -> R,
 ) -> Result<R, VmError> {
     crate::native_hooks::note_call_site(process, reg);
     let result = crate::process::sched_data::with_sched_data(process, f)

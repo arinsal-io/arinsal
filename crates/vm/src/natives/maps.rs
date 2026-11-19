@@ -1,7 +1,6 @@
 //! Map iterator primitives used by the OTP maps module.
 
 use crate::exceptions::Trap;
-use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_sched::RunCtx;
 use arinsal_term::{HeapReservation, Term, TermBuilder, TermKind, Tuple3Chain, atoms};
@@ -599,7 +598,7 @@ pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
 }
 
 type Handler =
-    fn(&mut Vm, &mut Process, &mut RunCtx<'_, Message>, &[Term]) -> Result<Term, VmError>;
+    fn(&mut Vm, &mut Process, &mut RunCtx<'_, crate::Process>, &[Term]) -> Result<Term, VmError>;
 
 pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler> {
     match (module, function, arity) {
@@ -685,7 +684,7 @@ fn map_next_process_bif(
 fn call_map_next(
     _vm: &mut Vm,
     process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     map_next(process, args).map_err(VmError::Trap)

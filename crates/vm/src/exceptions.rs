@@ -503,7 +503,7 @@ pub(super) fn direct_bif_error(
 pub(super) fn resume(
     vm: &mut Vm,
     p: &mut Process,
-    mut ctx: Option<&mut arinsal_sched::RunCtx<'_, crate::process::Message>>,
+    mut ctx: Option<&mut arinsal_sched::RunCtx<'_, crate::Process>>,
     mut trap: Trap,
 ) -> Result<Option<VmError>, VmError> {
     // An exception leaves the active BEAM call site. Any trap record belongs

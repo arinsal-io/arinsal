@@ -1,6 +1,5 @@
 //! Raw storage of `c_p->scheduler_data` while the process's native slice runs.
 
-use super::Message;
 use crate::Vm;
 use arinsal_sched::RunCtx;
 
@@ -9,7 +8,7 @@ use arinsal_sched::RunCtx;
 #[derive(Clone, Copy)]
 pub(crate) struct Published {
     vm: *mut Vm,
-    ctx: *mut RunCtx<'static, Message>,
+    ctx: *mut RunCtx<'static, crate::Process>,
 }
 
 impl Published {
@@ -28,12 +27,12 @@ impl Default for Published {
 
 /// The pointers of `vm` and `ctx`, to store into the process.
 #[inline(always)]
-pub(super) fn publish(vm: &mut Vm, ctx: &mut RunCtx<'_, Message>) -> Published {
+pub(super) fn publish(vm: &mut Vm, ctx: &mut RunCtx<'_, crate::Process>) -> Published {
     Published {
         vm: std::ptr::from_mut(vm),
         // Only the lifetime parameter changes; `with_published` hands the context out again
         // under a lifetime bounded by the call.
-        ctx: std::ptr::from_mut(ctx).cast::<RunCtx<'static, Message>>(),
+        ctx: std::ptr::from_mut(ctx).cast::<RunCtx<'static, crate::Process>>(),
     }
 }
 
@@ -43,7 +42,7 @@ pub(super) fn publish(vm: &mut Vm, ctx: &mut RunCtx<'_, Message>) -> Published {
 #[inline]
 pub(super) fn with_published<R>(
     published: Published,
-    f: impl FnOnce(&mut Vm, &mut RunCtx<'_, Message>) -> R,
+    f: impl FnOnce(&mut Vm, &mut RunCtx<'_, crate::Process>) -> R,
 ) -> Option<R> {
     if published.vm.is_null() || published.ctx.is_null() {
         return None;

@@ -338,7 +338,7 @@ pub(crate) fn get_token_term(process: &mut Process, _pid: Pid) -> Result<Term, V
 pub(crate) fn on_send(
     vm: Option<&mut Vm>,
     process: &mut Process,
-    ctx: Option<&mut RunCtx<'_, Message>>,
+    ctx: Option<&mut RunCtx<'_, crate::Process>>,
     pid: Pid,
     receiver: Term,
     message: Term,
@@ -367,7 +367,7 @@ pub(crate) fn on_send(
 pub(crate) fn on_receive(
     vm: Option<&mut Vm>,
     process: &mut Process,
-    ctx: Option<&mut RunCtx<'_, Message>>,
+    ctx: Option<&mut RunCtx<'_, crate::Process>>,
     pid: Pid,
     state: SeqState,
     message: OwnedTerm,
@@ -417,7 +417,7 @@ pub(crate) fn on_receive(
 // (send_gen_exit_signal, do_seq_trace_output), OTP-29.1.1.
 pub(crate) fn on_exit_signal(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     to: Pid,
     reason: Term,
 ) -> Option<Box<Token>> {
@@ -476,7 +476,7 @@ pub(crate) fn spawn_prepare(
 pub(crate) fn spawn_events(
     vm: &mut Vm,
     parent: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     request: &Token,
     child: Pid,
     messages: (OwnedTerm, OwnedTerm),
@@ -556,7 +556,7 @@ fn term(process: &mut Process, owned: &OwnedTerm) -> Result<Term, VmError> {
 fn emit(
     vm: Option<&mut Vm>,
     process: &mut Process,
-    mut ctx: Option<&mut RunCtx<'_, Message>>,
+    mut ctx: Option<&mut RunCtx<'_, crate::Process>>,
     tracee: Pid,
     token: &Token,
     event: SeqEvent,
@@ -725,7 +725,7 @@ fn emit(
 pub(crate) fn call(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: crate::natives::NativeArgs<'_>,
@@ -953,7 +953,7 @@ fn info(process: &mut Process, _pid: Pid, component: Term) -> Result<Term, VmErr
 fn print(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     pid: Pid,
     label: Option<Term>,
     message: Term,

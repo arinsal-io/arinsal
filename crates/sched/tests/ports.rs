@@ -61,11 +61,12 @@ impl Task for Idle {
     type SchedulerData = ();
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
-        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        esdp: &arinsal_sched::ErtsSchedulerData<Self>,
+        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
-        esdp.with_ctx(c_p, |this, _, ctx| {
+        esdp.with_ctx(c_p, |this, ctx| {
             ctx.erts_proc_exit_free(this);
             RunOutcome::Yield
         })
@@ -80,11 +81,12 @@ impl Task for Busy {
     type SchedulerData = ();
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
-        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        esdp: &arinsal_sched::ErtsSchedulerData<Self>,
+        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         budget: u32,
         calls: &mut u32,
     ) -> RunOutcome {
-        esdp.with_ctx(c_p, |this, _, ctx| {
+        esdp.with_ctx(c_p, |this, ctx| {
             if this.0.load(Ordering::Relaxed) {
                 return {
                     ctx.erts_proc_exit_free(this);

@@ -1,7 +1,6 @@
 //! OTP native record BIFs.
 
 use super::NativeArgs;
-use crate::process::Message;
 use crate::{Process, Vm, VmError, exceptions};
 use arinsal_bifs::ProcessHeapHandle;
 use arinsal_sched::RunCtx;
@@ -270,7 +269,7 @@ fn is_exported(process: &mut Process, term: Term) -> Result<Term, VmError> {
 pub(crate) fn dispatch(
     vm: &mut Vm,
     process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     function: &str,
     args: &[Term],
 ) -> Option<Result<Term, VmError>> {
@@ -291,7 +290,7 @@ pub(crate) fn dispatch(
 pub(crate) fn call(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: NativeArgs<'_>,

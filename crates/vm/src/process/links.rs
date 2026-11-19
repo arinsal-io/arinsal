@@ -103,7 +103,7 @@ impl Process {
     #[must_use]
     pub(super) fn absorb_exit_signals(
         &mut self,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
     ) -> Vec<arinsal_sched::SharedPayload> {
         self.destroy_prio_q_info_terminating();
         let mut spawn_replies = Vec::new();

@@ -60,7 +60,7 @@ pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
 pub(crate) fn call(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: crate::natives::NativeArgs<'_>,
@@ -76,7 +76,7 @@ pub(crate) fn call(
 fn dispatch(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: &[Term],
@@ -221,7 +221,7 @@ fn parse_dhandle(term: Term) -> Result<(u32, u64), VmError> {
 
 fn create_channel(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/dist.c:5127 (erts_internal_create_dist_channel_3), OTP-29.1.1.
@@ -360,7 +360,7 @@ fn create_channel(
 
 fn notify_dist_ctrlr(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     ctrlr: Term,
     node: Term,
 ) -> Result<(), VmError> {
@@ -389,7 +389,7 @@ fn dhandle_term(process: &mut Process, conn_id: u32, entry_ref: u64) -> Result<T
 
 fn get_data(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     handle: Term,
 ) -> Result<Term, VmError> {
     let bytes = with_dhandle(handle, ctx.pid(), true, |state| {
@@ -419,7 +419,7 @@ fn get_data(
 fn put_data(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     handle: Term,
     data: Term,
 ) -> Result<Term, VmError> {
@@ -633,7 +633,7 @@ fn net_message_send(
 fn route_incoming(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     handle: u64,
     local: &str,
     mut terms: Vec<(OwnedTerm, usize)>,
@@ -841,7 +841,7 @@ fn publish_remote_signal(
 
 fn queue_remote_control(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     handle: u64,
     control: OwnedTerm,
 ) -> Result<(), VmError> {
@@ -922,7 +922,7 @@ fn remote_alias_pid(reference: &OwnedTerm) -> Option<Pid> {
 /// to `net_kernel` and buffers the signal until `create_dist_channel` succeeds.
 pub(crate) fn queue_outgoing(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     node: &str,
     control: OwnedTerm,
     message: Option<OwnedTerm>,
@@ -956,7 +956,7 @@ pub(crate) enum DsigPrepare {
 /// no longer `connection_id`, as `erts_dsig_send` does.
 pub(crate) fn dsig_prepare(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     node: &str,
 ) -> Result<DsigPrepare, VmError> {
     loop {
@@ -1003,7 +1003,7 @@ pub(crate) fn dsig_prepare(
 /// connection that is gone is dropped (dist.c erts_dsig_send: "Not the same connection").
 pub(crate) fn queue_outgoing_on(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     node: &str,
     connection_id: u32,
     control: OwnedTerm,
@@ -1039,7 +1039,7 @@ enum DistSendResult {
 #[allow(clippy::too_many_arguments)]
 fn queue_outgoing_with_options(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     node: &str,
     control: OwnedTerm,
     message: Option<OwnedTerm>,
@@ -1160,7 +1160,7 @@ fn queue_outgoing_with_options(
 /// schedule_con_monitor_link_seq_cleanup of its `mld`) and the result is `false`.
 fn notify_auto_connect(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     node: &str,
     conn_id: u32,
     entry_ref: u64,
@@ -1852,7 +1852,7 @@ fn internalize_local_node(mut term: OwnedTerm, local: &str, local_creation: u32)
 fn dist_spawn_request(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/dist.c:5827 (erts_internal_dist_spawn_request_4), OTP-29.1.1.
@@ -2086,7 +2086,7 @@ fn dist_spawn_request(
 fn fallback_dist_spawn(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     crate::natives::proc::call(
@@ -2679,7 +2679,7 @@ pub(crate) fn pend_spawn_exit(
 fn handle_spawn_request(
     _vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     handle: u64,
     parts: &[OwnedTerm],
     arguments: &OwnedTerm,
@@ -2991,7 +2991,7 @@ pub(crate) fn forward_link_exit_if_proxy(
 // (erts_dsig_send_link), OTP-29.1.1.
 pub(crate) fn link_remote(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     node: &str,
     target: Term,
     priority: bool,
@@ -3004,7 +3004,7 @@ pub(crate) fn link_remote(
 // (erts_dsig_send_unlink), OTP-29.1.1.
 pub(crate) fn unlink_remote(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     node: &str,
     target: Term,
 ) -> Result<Term, VmError> {
@@ -3017,7 +3017,7 @@ pub(crate) fn unlink_remote(
 // (erts_dsig_send_exit2), OTP-29.1.1.
 pub(crate) fn exit2_remote(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     node: &str,
     target: Term,
     reason: Term,
@@ -3042,7 +3042,7 @@ pub(crate) fn exit2_remote(
 // (erts_dsig_send_monitor), OTP-29.1.1.
 pub(crate) fn monitor_remote(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
     node: String,
 ) -> Result<Term, VmError> {
@@ -3194,7 +3194,7 @@ pub(crate) fn is_remote_target(target: Term) -> Result<bool, VmError> {
 
 pub(crate) fn try_remote_send(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     target: Term,
     message: Term,
 ) -> Result<bool, VmError> {
@@ -3217,7 +3217,7 @@ pub(crate) enum RemoteSendOutcome {
 #[allow(clippy::too_many_arguments)]
 fn queue_remote_send(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     node: &str,
     control: OwnedTerm,
     message: Option<OwnedTerm>,
@@ -3243,7 +3243,7 @@ fn queue_remote_send(
 // Port of erts/emulator/beam/bif.c:2381-2401 (`remote_send`), OTP-29.1.1.
 pub(crate) fn try_remote_send_with_options(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     target: Term,
     message: Term,
     connect: bool,
@@ -3796,7 +3796,10 @@ fn local_pid_matches(node: &str, creation: u32, local: &str, local_creation: u32
     node == local && creation == local_creation
 }
 
-fn get_data_notification(ctx: &mut RunCtx<'_, Message>, handle: Term) -> Result<Term, VmError> {
+fn get_data_notification(
+    ctx: &mut RunCtx<'_, crate::Process>,
+    handle: Term,
+) -> Result<Term, VmError> {
     let handler = with_dhandle(handle, ctx.pid(), true, |state| {
         if state.output.is_empty() {
             state.notify = true;
@@ -3816,7 +3819,7 @@ fn get_data_notification(ctx: &mut RunCtx<'_, Message>, handle: Term) -> Result<
 }
 
 fn input_handler(
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     handle: Term,
     handler: Term,
 ) -> Result<Term, VmError> {
@@ -3828,7 +3831,11 @@ fn input_handler(
     Ok(Term::atom(arinsal_term::atoms::OK))
 }
 
-fn get_opt(ctx: &mut RunCtx<'_, Message>, handle: Term, option: Term) -> Result<Term, VmError> {
+fn get_opt(
+    ctx: &mut RunCtx<'_, crate::Process>,
+    handle: Term,
+    option: Term,
+) -> Result<Term, VmError> {
     if atom_name(option).as_deref() != Some("get_size") {
         return Err(badarg());
     }
@@ -3837,7 +3844,7 @@ fn get_opt(ctx: &mut RunCtx<'_, Message>, handle: Term, option: Term) -> Result<
 }
 
 fn set_opt(
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     handle: Term,
     option: Term,
     value: Term,
@@ -3858,7 +3865,7 @@ fn set_opt(
 
 fn get_stat(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     handle: Term,
 ) -> Result<Term, VmError> {
     let (read, written, pending) = with_dhandle(handle, ctx.pid(), false, |state| {

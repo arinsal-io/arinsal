@@ -2197,7 +2197,7 @@ fn build_trace<H: HeapAlloc>(heap: &mut H, args: &[Term]) -> Option<Term> {
     TermBuilder::new(heap).tuple(&parts).ok()
 }
 
-fn deliver_trace(process: &mut Process, _ctx: &mut RunCtx<'_, Message>, args: &[Term]) {
+fn deliver_trace(process: &mut Process, _ctx: &mut RunCtx<'_, crate::Process>, args: &[Term]) {
     let message = {
         let mut heap = ProcessHeapHandle(&mut process.heap);
         build_trace(&mut heap, args)
@@ -2258,7 +2258,7 @@ fn tracer_trace(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 }
 
 #[inline(never)]
-pub(crate) fn refresh_hub(process: &Process, ctx: &RunCtx<'_, Message>) {
+pub(crate) fn refresh_hub(process: &Process, ctx: &RunCtx<'_, crate::Process>) {
     let pid = ctx.pid();
     let current = HUB.with(|hub| {
         hub.borrow()
@@ -2270,7 +2270,7 @@ pub(crate) fn refresh_hub(process: &Process, ctx: &RunCtx<'_, Message>) {
     }
 }
 
-fn install_hub(process: &Process, ctx: &RunCtx<'_, Message>) {
+fn install_hub(process: &Process, ctx: &RunCtx<'_, crate::Process>) {
     install_hub_for(process, ctx.pid());
 }
 
@@ -2612,7 +2612,7 @@ pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
 }
 
 type Handler =
-    fn(&mut Vm, &mut Process, &mut RunCtx<'_, Message>, &[Term]) -> Result<Term, VmError>;
+    fn(&mut Vm, &mut Process, &mut RunCtx<'_, crate::Process>, &[Term]) -> Result<Term, VmError>;
 
 pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler> {
     match (module, function, arity) {
@@ -2627,7 +2627,7 @@ pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler
 pub(crate) fn load_nif_2(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     install_hub(process, ctx);
@@ -2637,7 +2637,7 @@ pub(crate) fn load_nif_2(
 fn call_load_nif(
     vm: &mut Vm,
     process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     load_nif(vm, process, args)
@@ -2646,7 +2646,7 @@ fn call_load_nif(
 fn call_nif_error(
     _vm: &mut Vm,
     _process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     let reason = args
@@ -2660,7 +2660,7 @@ fn call_nif_error(
 pub(crate) fn call(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: super::NativeArgs<'_>,
@@ -2673,7 +2673,7 @@ pub(crate) fn call(
 fn call_values(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: &[Term],

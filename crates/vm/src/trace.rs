@@ -2035,7 +2035,7 @@ pub(crate) fn tracer_exited(process: &Process, pid: Pid) {
 pub(crate) fn call_event(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: &[Term],
@@ -2051,7 +2051,7 @@ pub(crate) fn call_event(
 pub(crate) fn bif_call_event(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: &[Term],
@@ -2078,7 +2078,7 @@ struct CallMatch {
 fn run_call_match(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     spec: Option<&std::sync::Arc<crate::trace_bp::MatchSpec>>,
     session: u64,
     (module, function): (&str, &str),
@@ -2167,7 +2167,7 @@ fn run_call_match(
 fn call_event_scope(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: &[Term],
@@ -2380,7 +2380,7 @@ fn call_event_scope(
 fn session_call_enabled(
     vm: &Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     session: u64,
     pid: Pid,
 ) -> bool {
@@ -2408,7 +2408,7 @@ fn session_call_enabled(
 fn module_call_enabled(
     vm: &Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     tracer: &Tracer,
     pid: Pid,
 ) -> Option<bool> {
@@ -2464,7 +2464,7 @@ pub(crate) fn is_initial_call(process: &Process, module: &str, function: &str, a
 fn emit_meta_call_event(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     meta: &crate::trace_bp::MetaTracer,
     module: &str,
     function: &str,
@@ -2481,7 +2481,7 @@ fn emit_meta_call_event(
 fn emit_meta(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     meta: &crate::trace_bp::MetaTracer,
     name: &str,
     fields: &[Term],
@@ -2700,7 +2700,7 @@ fn process_dump_for(
     specification: &OwnedTerm,
     vm: Option<&Vm>,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
 ) -> Option<Vec<u8>> {
     fn uses(term: &OwnedTerm) -> bool {
         match term {
@@ -2722,7 +2722,7 @@ fn process_dump_for(
 fn emit_call_event(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     event: CallEvent<'_>,
     session: Option<u64>,
 ) -> Result<(bool, bool), VmError> {
@@ -2903,7 +2903,7 @@ fn current_stacktraces(vm: &Vm, process: &mut Process) -> Result<Vec<(VecHeap, T
 pub(crate) fn executor_native_call_event(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     function: &crate::NativeFunction,
     local: bool,
 ) -> Result<Vec<NativeTraceAction>, VmError> {
@@ -2927,7 +2927,7 @@ pub(crate) fn executor_native_call_event(
 pub(crate) fn generic_breakpoint_actions(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: &[Term],
@@ -3129,7 +3129,7 @@ pub(crate) fn push_native_trace_frame(
 pub(crate) fn native_return_event(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     function_pc: usize,
     session: u64,
     value: Term,
@@ -3158,7 +3158,7 @@ fn consume_return_trace_frame(process: &mut Process) {
 fn native_return_event_inner(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     function_pc: usize,
     session: u64,
     value: Term,
@@ -3226,7 +3226,7 @@ fn native_return_event_inner(
 pub(crate) fn bif_return_events(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     actions: &[CallActions],
     module: &str,
     function: &str,
@@ -3332,7 +3332,7 @@ fn caller_mfa_name(
 pub(crate) fn unwound_return_to(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     sessions: &[u64],
     target: Option<(String, String, u8)>,
 ) -> Result<(), VmError> {
@@ -3358,7 +3358,7 @@ pub(crate) fn unwound_return_to(
 pub(crate) fn native_return_to_event(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     session: u64,
     target: Option<(String, String, u8)>,
 ) -> Result<(), VmError> {
@@ -3396,7 +3396,7 @@ fn return_to_target(process: &Process, start: usize) -> Option<(String, String, 
 fn emit_return_to(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     session: u64,
     target: Option<(String, String, u8)>,
 ) -> Result<(), VmError> {
@@ -3439,7 +3439,7 @@ fn emit_return_to(
 pub(crate) fn spawned(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     child: Pid,
     mfa: Term,
     linked: bool,
@@ -3627,7 +3627,7 @@ pub(crate) fn apply_linked_trace_change(process: &Process, pid: Pid, change: &Li
 pub(crate) fn emit(
     vm: Option<&mut Vm>,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     subject: Pid,
     class: u64,
     name: &str,
@@ -3639,7 +3639,7 @@ pub(crate) fn emit(
 pub(crate) fn receive_event(
     vm: Option<&mut Vm>,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     message: Term,
     from: Option<Pid>,
 ) {
@@ -3671,7 +3671,7 @@ pub(crate) fn receive_event(
 pub(crate) fn timeout_event(
     vm: Option<&mut Vm>,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
 ) {
     let node = Term::atom(arinsal_term::atoms::CLOCK_SERVICE);
     let undefined = Term::atom(arinsal_term::atoms::UNDEFINED);
@@ -4179,7 +4179,7 @@ pub(crate) fn running_mfa(process: &mut Process, subject: Pid) -> Result<Option<
 fn emit_filtered(
     mut vm: Option<&mut Vm>,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     subject: Pid,
     class: u64,
     name: &str,
@@ -4303,7 +4303,7 @@ fn emit_filtered(
 fn deliver(
     vm: Option<&mut Vm>,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     subject: Pid,
     subject_term: Term,
     entry: &Entry,
@@ -4415,7 +4415,7 @@ fn timestamp_term(process: &mut Process, flags: u64) -> Option<Term> {
 fn emit_module(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: Option<&mut RunCtx<'_, Message>>,
+    ctx: Option<&mut RunCtx<'_, crate::Process>>,
     module: &str,
     owned_state: &OwnedTerm,
     event: TraceEvent<'_>,

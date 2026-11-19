@@ -6,7 +6,7 @@ use super::*;
 pub(super) fn raise_undefined_call(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     arguments: &[Term],
     error: VmError,
 ) -> Result<Option<VmError>, VmError> {
@@ -137,7 +137,7 @@ impl Executor {
     pub(super) fn emit_native_return_event(
         &mut self,
         process: &mut Process,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         event: crate::trace::NativeReturnEvent,
     ) -> Result<(), VmError> {
         match event {
@@ -169,7 +169,7 @@ impl Executor {
     #[inline(always)]
     pub(super) fn fast_entry_ok(
         process: &Process,
-        ctx: &RunCtx<'_, Message>,
+        ctx: &RunCtx<'_, crate::Process>,
         sys_task_run: bool,
     ) -> bool {
         !ctx.has_pending_nmsg() && Self::fast_entry_ok_before_signals(process, ctx, sys_task_run)
@@ -180,7 +180,7 @@ impl Executor {
     #[inline(always)]
     pub(super) fn fast_entry_ok_before_signals(
         process: &Process,
-        ctx: &RunCtx<'_, Message>,
+        ctx: &RunCtx<'_, crate::Process>,
         sys_task_run: bool,
     ) -> bool {
         process.slice_is_plain()
@@ -207,7 +207,7 @@ impl Executor {
     pub(super) fn fast_resume(
         &mut self,
         process: &mut Process,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         reg: &mut SchedulerRegisters,
         ran: &mut bool,
         sys_task_run: bool,
@@ -343,7 +343,7 @@ impl Executor {
     pub(super) fn sched_preempt(
         &mut self,
         process: &mut Process,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         reg: &mut SchedulerRegisters,
     ) -> Result<Option<RunState>, VmError> {
         // Nothing to do at most scheduling points: no suspend and no hibernation. Checked

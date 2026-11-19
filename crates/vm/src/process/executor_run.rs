@@ -11,7 +11,7 @@ impl Executor {
     pub(super) fn run(
         &mut self,
         process: &mut Process,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         reg: &mut SchedulerRegisters,
     ) -> Result<RunState, VmError> {
         let exec_key = ctx.scheduler_key();
@@ -662,7 +662,7 @@ impl Executor {
 // OTP-29.1.1.
 fn schedule_in_signals(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     sys_task_run: bool,
 ) -> Result<(), VmError> {
     let reds = process.heap.abi.fcalls;

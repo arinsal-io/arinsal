@@ -648,7 +648,7 @@ fn process_info(
     src: InfoSource<'_>,
     process: &mut Process,
     pid: Pid,
-    drain: Option<&mut RunCtx<'_, Message>>,
+    drain: Option<&mut RunCtx<'_, crate::Process>>,
     args: &ProcessInfoArgs,
     status: Term,
     charge: bool,
@@ -2512,7 +2512,7 @@ fn charge_info_reductions(process: &mut Process, info_reds: i32) {
 fn process_info_call(
     vm: &Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     target: Term,
     item: Option<Term>,
 ) -> Result<Term, VmError> {
@@ -2602,7 +2602,7 @@ pub(crate) fn process_info_handler(
 fn process_info_resolved(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: super::NativeArgs<'_>,
 ) -> Option<Result<Term, VmError>> {
     args.with_values(process, |process, values| match values {
@@ -2669,7 +2669,7 @@ pub(crate) fn set_group_leader(process: &mut Process, leader: Pid) -> Result<(),
 /// before it.
 pub(crate) fn fulfill_collect(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     request_id: Message,
     major: bool,
 ) -> Result<Message, VmError> {
@@ -2698,7 +2698,7 @@ pub(crate) fn fulfill_collect(
 /// and the group-leader / RPC handlers beside it, OTP-29.1.1.
 pub(crate) fn fulfill_request(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     id: u64,
     op: crate::signals::RemoteOp,
 ) -> Result<Term, VmError> {
@@ -2876,7 +2876,7 @@ pub(crate) fn failure_reply(
 // `{Ref, Result}` when the target handles it.
 fn group_leader_3(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     leader: Term,
     target: Term,
     reference: Term,
@@ -2911,7 +2911,7 @@ fn group_leader_3(
 fn process_display_call(
     module: &str,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     target: Term,
     display: Term,
 ) -> Result<Term, VmError> {
@@ -2971,7 +2971,7 @@ fn process_display_call(
 pub(crate) fn call(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: super::NativeArgs<'_>,
@@ -2984,7 +2984,7 @@ pub(crate) fn call(
 fn call_values(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: &[Term],
@@ -3293,7 +3293,7 @@ fn hibernate_zero(vm: &Vm, process: &mut Process) -> Result<Term, VmError> {
 // (`erts_internal_suspend_process_2`), OTP-29.1.1.
 fn suspend_process(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     target: Term,
     options: Term,
 ) -> Result<Term, VmError> {
@@ -3516,7 +3516,7 @@ pub(crate) fn trace_session_id(process: &Process, session: Term) -> Option<u64> 
 fn dist_spawn_request(
     _vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     node: Term,
     mfa: Term,
     options: Term,
@@ -3820,7 +3820,7 @@ pub(crate) fn trace_flag_bit(name: &str) -> Option<u64> {
 fn trace(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     session: u64,
     spec: Term,
     how: Term,
@@ -4076,7 +4076,7 @@ fn trace(
 fn trace_session_create(
     vm: &Vm,
     process: &mut Process,
-    _ctx: &RunCtx<'_, Message>,
+    _ctx: &RunCtx<'_, crate::Process>,
     name: Term,
     tracer_term: Term,
     options: Term,
@@ -4219,7 +4219,7 @@ fn trace_session_refs_term(
 fn trace_session_info(
     vm: &Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     session: u64,
     spec: Term,
     item: Term,
@@ -4437,7 +4437,7 @@ fn trace_session_info(
 fn trace_info(
     vm: &Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     spec: Term,
     item: Term,
 ) -> Result<Term, VmError> {
@@ -4618,7 +4618,7 @@ fn meta_tracer_from_term(vm: &Vm, flag: Term) -> Result<crate::trace::Tracer, Vm
 fn trace_info_function(
     vm: &Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     session: u64,
     (module, function, arity): (String, String, u8),
     item: Term,
@@ -4999,8 +4999,8 @@ fn trace_info_on_load(process: &mut Process, session: u64, item: Term) -> Result
 fn with_code_mod_permission(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    body: impl FnOnce(&mut Vm, &mut Process, &mut RunCtx<'_, Message>) -> Result<Term, VmError>,
+    ctx: &mut RunCtx<'_, crate::Process>,
+    body: impl FnOnce(&mut Vm, &mut Process, &mut RunCtx<'_, crate::Process>) -> Result<Term, VmError>,
 ) -> Result<Term, VmError> {
     let pid = ctx.pid();
     let runtime = process.runtime;
@@ -5050,7 +5050,7 @@ fn with_code_mod_permission(
 // Port of erts/emulator/beam/code_ix.c:556 (erts_schedule_code_barrier) with the caller
 // suspended like erl_bif_trace.c:509-516 (trace_pattern) and resumed like :575-581
 // (smp_bp_finisher), OTP-29.1.1.
-fn suspend_for_code_barrier(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> bool {
+fn suspend_for_code_barrier(process: &mut Process, ctx: &mut RunCtx<'_, crate::Process>) -> bool {
     let Some(runtime) = process.runtime else {
         ctx.block_thread_progress(std::time::Duration::ZERO);
         return false;
@@ -5064,7 +5064,7 @@ fn suspend_for_code_barrier(process: &mut Process, ctx: &mut RunCtx<'_, Message>
 /// [`advance_trace_finish`] for an update that only waits for code barriers.
 fn wait_code_barriers(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     mut finish: crate::trace_bp::TraceFinish,
 ) -> Result<crate::trace_bp::TraceFinish, VmError> {
     debug_assert!(
@@ -5092,7 +5092,7 @@ fn wait_code_barriers(
 fn advance_trace_finish(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     mut finish: crate::trace_bp::TraceFinish,
     mut barrier_passed: bool,
 ) -> Result<crate::trace_bp::TraceFinish, VmError> {
@@ -5132,7 +5132,7 @@ fn dispatch_finish_stage(
 // Port of erts/emulator/beam/erl_bif_trace.c:2052-2100 (trace_info_finisher), OTP-29.1.1.
 fn advance_timem_trace_finish(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     mut finish: crate::trace_bp::TraceFinish,
 ) -> Result<crate::trace_bp::TraceFinish, VmError> {
     loop {
@@ -5224,7 +5224,7 @@ fn run_finish_stage(
 pub(crate) fn trace_finish_process_exit(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
 ) {
     let Some(mut finish) = process
         .cold
@@ -5256,7 +5256,7 @@ pub(crate) fn trace_finish_process_exit(
 fn trace_pattern(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     session: u64,
     spec: Term,
     pattern: Term,
@@ -5526,7 +5526,7 @@ fn live_pids(process: &Process) -> Result<Vec<Pid>, VmError> {
 // invalidate a scan that is already in progress.
 fn processes_next(
     process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     cursor: Term,
 ) -> Result<Term, VmError> {
     let index = u32::try_from(cursor.as_small().ok_or_else(badarg)?).map_err(|_| badarg())?;
@@ -5601,7 +5601,7 @@ fn fun_info_mfa(vm: &Vm, process: &mut Process, fun: Term) -> Result<Term, VmErr
 pub(crate) fn process_dump(
     vm: Option<&Vm>,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
 ) -> Result<Vec<u8>, VmError> {
     use arinsal_term::raw::{Cons, Tuple};
     use std::io::Write as _;

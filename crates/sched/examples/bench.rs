@@ -28,11 +28,12 @@ impl Task for Dummy {
     type SchedulerData = ();
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
-        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        esdp: &arinsal_sched::ErtsSchedulerData<Self>,
+        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         budget: u32,
         calls: &mut u32,
     ) -> RunOutcome {
-        esdp.with_ctx(c_p, |this, _, ctx| {
+        esdp.with_ctx(c_p, |this, ctx| {
             match &mut this.mode {
                 Mode::Forward(to) => {
                     while ctx.receive().is_some() {

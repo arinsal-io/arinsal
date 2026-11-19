@@ -328,7 +328,7 @@ impl PurgeState {
 /// Port of erts/emulator/beam/beam_bif_load.c:2028-2036 (finalize_purge_operation), OTP-29.1.1.
 fn resume_pending_lambda_callers(
     process: &Process,
-    _ctx: &mut RunCtx<'_, crate::process::Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     pids: Vec<Pid>,
 ) {
     let Some(runtime) = process.runtime else {
@@ -372,7 +372,7 @@ impl Prepared {
 pub(crate) fn has_prepared_code_on_load_1(
     _vm: &mut Vm,
     _process: &mut Process,
-    _ctx: &mut RunCtx<'_, crate::process::Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     has_prepared_code_on_load(args[0])
@@ -383,7 +383,7 @@ pub(crate) fn has_prepared_code_on_load_1(
 pub(crate) fn finish_loading_1(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::process::Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     let pid = ctx.pid();
@@ -880,7 +880,7 @@ fn release_code_load_permission(process: &Process, pid: Option<Pid>) {
 fn finish(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: Option<&mut RunCtx<'_, crate::process::Message>>,
+    ctx: Option<&mut RunCtx<'_, crate::Process>>,
     pid: Option<Pid>,
     args: &[Term],
 ) -> Result<Term, VmError> {
@@ -904,7 +904,7 @@ fn finish(
 fn finish_stage(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: Option<&mut RunCtx<'_, crate::process::Message>>,
+    ctx: Option<&mut RunCtx<'_, crate::Process>>,
     pid: Option<Pid>,
     args: &[Term],
     barrier: &mut bool,
@@ -1347,7 +1347,7 @@ fn module_id_referenced(
 fn purge(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::process::Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     name: &str,
     phase: &str,
 ) -> Result<Term, VmError> {
@@ -1540,7 +1540,7 @@ fn literal_collector(process: &Process, pid: Pid) -> bool {
 // Persistent-term and purged-module literal areas share the collector queue.
 fn release_area_switch(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::process::Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
 ) -> Result<Term, VmError> {
     let store = process.persistent_terms;
     if store.collector_area_complete() {
@@ -1599,7 +1599,7 @@ fn wait_release_area(
 // The collector owns the area selection; each request names its active area.
 fn send_copy_request(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::process::Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     if !literal_collector(process, ctx.pid()) {
@@ -1668,7 +1668,7 @@ fn dirty_signal_handler(process: &Process, pid: Pid) -> bool {
 pub(crate) fn call(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::process::Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: super::NativeArgs<'_>,
@@ -1689,7 +1689,7 @@ pub(crate) fn call(
 fn call_values(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::process::Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: &[Term],

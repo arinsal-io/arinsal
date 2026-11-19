@@ -39,7 +39,10 @@ impl Process {
 // g_proc_sched. Port of erl_gc.c:3730 (`has_reached_max_heap_size`) and
 // erl_gc.c:3741 (`reached_max_heap_size`), OTP-29.1.1.
 #[inline(always)]
-pub(super) fn heap_limit_kills(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> bool {
+pub(super) fn heap_limit_kills(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, crate::Process>,
+) -> bool {
     if process
         .cold
         .as_ref()
@@ -51,7 +54,7 @@ pub(super) fn heap_limit_kills(process: &mut Process, ctx: &mut RunCtx<'_, Messa
 }
 
 #[inline(never)]
-fn heap_limit_check(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> bool {
+fn heap_limit_check(process: &mut Process, ctx: &mut RunCtx<'_, crate::Process>) -> bool {
     let snapshot = {
         // Port of erts/emulator/beam/erl_process.h (`p->max_heap_size`), OTP-29.1.1: the limit
         // is a field of the process itself, so only the process reads or writes it.
@@ -166,7 +169,7 @@ pub(super) fn off_heap_binary_words(process: &Process, objv: &[Term]) -> usize {
 // OTP-29.1.1.
 fn report_max_heap(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     limit: MaxHeap,
     used: u64,
 ) {

@@ -53,7 +53,6 @@ pub(crate) fn listed(table: &[(&str, &str, u8)], module: &str, function: &str, a
         })
 }
 
-use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_sched::RunCtx;
 use arinsal_term::Term;
@@ -153,7 +152,7 @@ impl NativeArgs<'_> {
 pub(crate) type NativeFamily = fn(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: NativeArgs<'_>,
@@ -162,7 +161,7 @@ pub(crate) type NativeFamily = fn(
 fn port_call(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: NativeArgs<'_>,
@@ -300,7 +299,7 @@ fn port_recognizes(module: &str, function: &str, arity: u8) -> bool {
 pub(crate) type DirectNative = fn(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError>;
 
@@ -429,7 +428,7 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
 pub(crate) type ResolvedNative = fn(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: NativeArgs<'_>,
 ) -> Option<Result<Term, VmError>>;
 

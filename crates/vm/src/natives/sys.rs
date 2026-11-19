@@ -76,7 +76,7 @@ pub(crate) fn after_collection(process: &mut Process, collections: u64, words_re
 // Port of erts/emulator/beam/erl_proc_sig_queue.c:8128 (`handle_cla`), OTP-29.1.1.
 pub(crate) fn copy_literal_area(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     area_id: u64,
     request: Message,
     how: arinsal_sched::LiteralCopyHow,
@@ -217,7 +217,7 @@ fn literal_scan_words(process: &Process) -> usize {
 /// Complete a collector request for a process that has already started exiting.
 pub(crate) fn reply_exiting_literal_area(
     _process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     request: Message,
     requester: arinsal_sched::Pid,
 ) -> Result<(), VmError> {
@@ -227,7 +227,7 @@ pub(crate) fn reply_exiting_literal_area(
 /// Complete a request when the target exited before the scheduler accepted its signal.
 pub(crate) fn reply_failed_literal_area_request(
     _process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     area: Term,
     how: arinsal_sched::LiteralCopyHow,
     target: arinsal_sched::Pid,
@@ -240,7 +240,7 @@ pub(crate) fn reply_failed_literal_area_request(
 }
 
 fn reply_literal_area_copy(
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     request: Message,
     requester: arinsal_sched::Pid,
     result: Term,
@@ -288,7 +288,7 @@ pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
 }
 
 type Handler =
-    fn(&mut Vm, &mut Process, &mut RunCtx<'_, Message>, &[Term]) -> Result<Term, VmError>;
+    fn(&mut Vm, &mut Process, &mut RunCtx<'_, crate::Process>, &[Term]) -> Result<Term, VmError>;
 
 pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler> {
     match (module, function, arity) {
@@ -313,7 +313,7 @@ pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler
 fn call_no_aux_work_threads(
     _vm: &mut Vm,
     _process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     _args: &[Term],
 ) -> Result<Term, VmError> {
     non_neg(_process, ctx.scheduler_count().saturating_add(1) as u64)
@@ -322,7 +322,7 @@ fn call_no_aux_work_threads(
 fn call_nodes0(
     _vm: &mut Vm,
     _process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     _args: &[Term],
 ) -> Result<Term, VmError> {
     Ok(Term::NIL)
@@ -331,7 +331,7 @@ fn call_nodes0(
 fn call_display(
     _vm: &mut Vm,
     _process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     display(args[0])
@@ -340,7 +340,7 @@ fn call_display(
 fn call_display_string(
     _vm: &mut Vm,
     process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     display_string(args).map_err(|error| {
@@ -351,7 +351,7 @@ fn call_display_string(
 fn call_term_to_string(
     _vm: &mut Vm,
     process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     term_to_string(process, args)
@@ -426,7 +426,7 @@ fn current_reductions(process: &Process) -> u64 {
 fn call_statistics(
     _vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     statistics(process, Some(ctx), args[0])
@@ -435,7 +435,7 @@ fn call_statistics(
 fn call_bump_reductions(
     _vm: &mut Vm,
     process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/bif.c:5403 (bump_reductions_1), OTP-29.1.1.
@@ -453,7 +453,7 @@ fn call_bump_reductions(
 fn call_garbage_collect(
     _vm: &mut Vm,
     process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/bif.c:4077 (erts_internal_garbage_collect_1), OTP-29.1.1:
@@ -466,7 +466,7 @@ fn call_garbage_collect(
 fn call_system_flag(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     system_flag(vm, process, ctx, args)
@@ -475,7 +475,7 @@ fn call_system_flag(
 fn call_scheduler_wall_time(
     _vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/bif.c:5306 (erts_internal_scheduler_wall_time_1), OTP-29.1.1.
@@ -562,7 +562,7 @@ pub(crate) fn dt_restore_tag_light(
 fn call_dt_spread_tag(
     _vm: &mut Vm,
     _process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/bif.c:6032 (dt_spread_tag_1), OTP-29.1.1.
@@ -578,7 +578,7 @@ fn call_dt_spread_tag(
 fn call_dt_restore_tag(
     _vm: &mut Vm,
     _process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/bif.c:6066 (dt_restore_tag_1), OTP-29.1.1.
@@ -592,7 +592,7 @@ fn call_dt_restore_tag(
 pub(super) fn call(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: super::NativeArgs<'_>,
@@ -605,7 +605,7 @@ pub(super) fn call(
 fn call_values(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: &[Term],
@@ -700,7 +700,7 @@ fn call_values(
 pub(crate) fn bif_return_trap_2(
     _vm: &mut Vm,
     process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     if args[1] == crate::atom_cache::put("multi_scheduling") {
@@ -736,7 +736,7 @@ fn persistent_update_export(module: &str, function: &str, arity: u8) -> Option<&
 // (persistent_term_erase_1), :545-575 (erts_internal_erase_persistent_terms_0), OTP-29.1.1.
 fn persistent_update(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     bif: arinsal_pterm::StoreBif,
     (module, function, continuation): (&str, &str, &'static str),
     args: &[Term],
@@ -808,7 +808,7 @@ macro_rules! persistent_update_bif {
         pub(crate) fn $name(
             _vm: &mut Vm,
             process: &mut Process,
-            ctx: &mut RunCtx<'_, Message>,
+            ctx: &mut RunCtx<'_, crate::Process>,
             args: &[Term],
         ) -> Result<Term, VmError> {
             let bif = arinsal_pterm::lookup_in($module, $function, $arity)
@@ -842,7 +842,7 @@ persistent_update_bif!(
 pub(crate) fn persistent_term_get_0(
     _vm: &mut Vm,
     process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     _args: &[Term],
 ) -> Result<Term, VmError> {
     get_all_step(process)
@@ -871,7 +871,7 @@ impl PersistentTermUpdate {
 }
 
 // Port of erts/emulator/beam/beam_bif_load.c:1916 (wake area-switch wait), OTP-29.1.1.
-pub(crate) fn wake_literal_collector(process: &Process, ctx: &mut RunCtx<'_, Message>) {
+pub(crate) fn wake_literal_collector(process: &Process, ctx: &mut RunCtx<'_, crate::Process>) {
     let store = process.persistent_terms;
     if !store.has_retired() {
         return;
@@ -2916,7 +2916,7 @@ fn ets_structure_bytes(process: &Process) -> u64 {
 
 fn statistics(
     process: &mut Process,
-    ctx: Option<&mut RunCtx<'_, Message>>,
+    ctx: Option<&mut RunCtx<'_, crate::Process>>,
     key: Term,
 ) -> Result<Term, VmError> {
     let Some(name) = atom_name(key) else {
@@ -3003,7 +3003,7 @@ fn statistics(
 fn system_flag(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/bif.c:4972 (system_flag_2), OTP-29.1.1.
@@ -3842,7 +3842,11 @@ pub(crate) fn reader_groups_map(process: &mut Process, groups: i64) -> Result<Te
 
 // Port of erts/emulator/beam/bif.c (system_flag_2: `erts_send_warning_to_logger_str` with
 // the caller's group leader), OTP-29.1.1.
-fn send_deprecation_warning(process: &mut Process, ctx: &mut RunCtx<'_, Message>, text: &str) {
+fn send_deprecation_warning(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, crate::Process>,
+    text: &str,
+) {
     let Some(runtime) = process.runtime else {
         return;
     };
@@ -3853,7 +3857,7 @@ fn send_deprecation_warning(process: &mut Process, ctx: &mut RunCtx<'_, Message>
     crate::utils::send_warning_to_logger_str(runtime, ctx.pid(), group_leader, text);
 }
 
-fn warn_deprecated_scheduler_bind(process: &mut Process, ctx: &mut RunCtx<'_, Message>) {
+fn warn_deprecated_scheduler_bind(process: &mut Process, ctx: &mut RunCtx<'_, crate::Process>) {
     send_deprecation_warning(
         process,
         ctx,
@@ -3861,7 +3865,7 @@ fn warn_deprecated_scheduler_bind(process: &mut Process, ctx: &mut RunCtx<'_, Me
     );
 }
 
-fn warn_deprecated_cpu_topology(process: &mut Process, ctx: &mut RunCtx<'_, Message>) {
+fn warn_deprecated_cpu_topology(process: &mut Process, ctx: &mut RunCtx<'_, crate::Process>) {
     send_deprecation_warning(
         process,
         ctx,
@@ -3998,7 +4002,7 @@ pub(crate) fn set_system_logger(process: &Process, value: Term) -> Result<Term, 
 
 fn set_scheduler_wall_enabled(
     process: &Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     enable: bool,
 ) -> Result<Term, VmError> {
     let mut state = runtime_state(process)
@@ -4034,7 +4038,7 @@ fn set_scheduler_wall_enabled(
     }))
 }
 
-fn set_runtime_accounting(process: &Process, ctx: &mut RunCtx<'_, Message>) {
+fn set_runtime_accounting(process: &Process, ctx: &mut RunCtx<'_, crate::Process>) {
     let enabled = runtime_state(process)
         .sched_wall
         .lock()
@@ -4404,7 +4408,7 @@ fn parse_scheduler_pair(value: &str, cpus: usize) -> Option<(usize, usize)> {
 
 fn multi_scheduling(
     process: &mut Process,
-    ctx: &RunCtx<'_, Message>,
+    ctx: &RunCtx<'_, crate::Process>,
     value: Term,
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_process.c:8484 (erts_block_multi_scheduling), OTP-29.1.1.
@@ -4588,7 +4592,10 @@ fn outstanding_limit(process: &Process, value: Term) -> Result<Term, VmError> {
 }
 
 // Port of erts/emulator/beam/bif.c:5258-5271 (system_flag_2), OTP-29.1.1.
-fn scheduling_statistics(ctx: &mut RunCtx<'_, Message>, value: Term) -> Result<Term, VmError> {
+fn scheduling_statistics(
+    ctx: &mut RunCtx<'_, crate::Process>,
+    value: Term,
+) -> Result<Term, VmError> {
     let action = atom_name(value)
         .filter(|value| matches!(*value, "enable" | "disable" | "clear"))
         .ok_or_else(badarg)?;
@@ -4725,7 +4732,7 @@ fn max_heap_map(process: &mut Process, limit: crate::process::MaxHeap) -> Result
 // Port of erts/emulator/beam/erl_msacc.c:329 (microstate accounting actions), OTP-29.1.1.
 fn set_microstate(
     process: &Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     value: Term,
 ) -> Result<Term, VmError> {
     let previous = runtime_state(process).microstate.load(Ordering::Relaxed);
@@ -4788,7 +4795,7 @@ fn set_microstate_workers(process: &Process, enabled: bool) {
 }
 
 // Port of erts/emulator/beam/erl_msacc.c:425 (counter reset), OTP-29.1.1.
-fn reset_microstate_baseline(process: &Process, ctx: &RunCtx<'_, Message>) {
+fn reset_microstate_baseline(process: &Process, ctx: &RunCtx<'_, crate::Process>) {
     let stats = scheduler_stats(process, Some(ctx));
     let counters = stats.as_ref().map_or_else(Vec::new, all_msacc_ns);
     let poll_baseline = crate::check_io::msacc_snapshot();
@@ -5047,7 +5054,7 @@ fn push_children(term: Term, out: &mut Vec<Term>) {
 
 // Port of erts/emulator/beam/erl_bif_info.c (statistics(reductions):
 // erts_get_total_reductions plus erts_current_reductions of the caller), OTP-29.1.1.
-fn reduction_total(process: &Process, ctx: Option<&RunCtx<'_, Message>>) -> u64 {
+fn reduction_total(process: &Process, ctx: Option<&RunCtx<'_, crate::Process>>) -> u64 {
     ctx.map_or(0, |ctx| {
         ctx.total_reductions() + current_reductions(process)
     })
@@ -5086,7 +5093,7 @@ fn logical_processors() -> (usize, usize) {
 
 fn scheduler_stats(
     process: &Process,
-    ctx: Option<&RunCtx<'_, Message>>,
+    ctx: Option<&RunCtx<'_, crate::Process>>,
 ) -> Option<arinsal_sched::SchedulerStats> {
     if let Some(ctx) = ctx {
         return Some(
@@ -5171,7 +5178,7 @@ fn scheduler_state_owned(kind: &str, [total, online, active]: [u64; 3]) -> arins
 
 fn queue_counts(
     process: &Process,
-    ctx: Option<&RunCtx<'_, Message>>,
+    ctx: Option<&RunCtx<'_, crate::Process>>,
     active: bool,
     include_dirty_io: bool,
 ) -> Vec<u64> {
@@ -5211,7 +5218,7 @@ fn all_msacc_ns(stats: &arinsal_sched::SchedulerStats) -> Vec<[u64; 7]> {
 
 fn scheduler_wall(
     process: &mut Process,
-    ctx: Option<&RunCtx<'_, Message>>,
+    ctx: Option<&RunCtx<'_, crate::Process>>,
     include_dirty_io: bool,
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_process.c scheduler active/total time accounting, OTP-29.1.1.
@@ -5272,7 +5279,7 @@ fn scheduler_wall(
 
 fn microstate(
     process: &mut Process,
-    mut ctx: Option<&mut RunCtx<'_, Message>>,
+    mut ctx: Option<&mut RunCtx<'_, crate::Process>>,
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_msacc.c result layout, OTP-29.1.1.
     // erts keeps msacc counters from boot, so the list exists even if accounting was never on.

@@ -173,7 +173,7 @@ fn call_driver_output(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn output(
     process: &mut Process,
-    ctx: Option<&mut RunCtx<'_, Message>>,
+    ctx: Option<&mut RunCtx<'_, crate::Process>>,
     caller: Pid,
     handle: &Arc<PortHandle>,
     drv: &DriverPort,
@@ -454,7 +454,7 @@ fn imm_or_schedule(
 /// the reply term, or a reference the caller waits on.
 pub(crate) fn control(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     caller: Pid,
     drv: &DriverPort,
     op: u32,
@@ -667,7 +667,7 @@ fn trace_close_receive(runtime: &crate::process::Runtime, id: u64, from: Pid) {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exit(
     process: &mut Process,
-    ctx: Option<&mut RunCtx<'_, Message>>,
+    ctx: Option<&mut RunCtx<'_, crate::Process>>,
     caller: Pid,
     handle: &Arc<PortHandle>,
     drv: &DriverPort,

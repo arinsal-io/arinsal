@@ -259,7 +259,7 @@ fn break_loop(read_fd: RawFd) {
 /// interpreter records the owner immediately before those NIF bodies run.
 /// A remote call records it here as well. The poll thread delivers
 /// `{select, TTY, Ref, ready_input}` to that pid.
-pub(crate) fn note_caller(process: &Process, ctx: &RunCtx<'_, Message>) {
+pub(crate) fn note_caller(process: &Process, ctx: &RunCtx<'_, crate::Process>) {
     note_caller_pid(process, ctx.pid());
 }
 
@@ -459,7 +459,7 @@ pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
 pub(super) fn call(
     _vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: super::NativeArgs<'_>,
@@ -471,7 +471,7 @@ pub(super) fn call(
 
 fn call_values(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: &[Term],

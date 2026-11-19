@@ -6,7 +6,7 @@ impl Vm {
     pub(crate) fn dispatch_native(
         &mut self,
         p: &mut Process,
-        ctx: &mut arinsal_sched::RunCtx<'_, process::Message>,
+        ctx: &mut arinsal_sched::RunCtx<'_, crate::Process>,
         module: &str,
         function: &str,
         arity: usize,
@@ -75,7 +75,7 @@ impl Vm {
     pub(crate) fn dispatch_resolved_entry(
         &mut self,
         p: &mut Process,
-        ctx: &mut arinsal_sched::RunCtx<'_, process::Message>,
+        ctx: &mut arinsal_sched::RunCtx<'_, crate::Process>,
         args: natives::NativeArgs<'_>,
         entry: natives::NativeEntry,
     ) -> Option<Result<Term, VmError>> {
@@ -91,7 +91,7 @@ impl Vm {
     fn dispatch_native_source(
         &mut self,
         p: &mut Process,
-        ctx: &mut arinsal_sched::RunCtx<'_, process::Message>,
+        ctx: &mut arinsal_sched::RunCtx<'_, crate::Process>,
         module: &str,
         function: &str,
         resolved: (ImportClass, usize),

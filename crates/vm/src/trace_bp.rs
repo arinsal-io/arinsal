@@ -1183,7 +1183,7 @@ fn site_breakpoints(process: &Process, site: usize) -> Option<Arc<SiteBreakpoint
 pub(crate) fn generic_breakpoint(
     vm: &mut crate::Vm,
     process: &mut Process,
-    ctx: &mut arinsal_sched::RunCtx<'_, crate::process::Message>,
+    ctx: &mut arinsal_sched::RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     reg: &mut [arinsal_term::Term],

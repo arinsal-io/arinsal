@@ -1,6 +1,5 @@
 //! OTP debugger BIFs and debugger event delivery.
 
-use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_etf::OwnedTerm as O;
 use arinsal_sched::{Pid, RunCtx};
@@ -64,7 +63,7 @@ fn bool_term(value: bool) -> O {
 fn call_impl(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: &[Term],
@@ -117,7 +116,7 @@ fn call_impl(
 pub(crate) fn call(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: super::NativeArgs<'_>,
@@ -162,7 +161,7 @@ fn toggle_instrumentations(_process: &mut Process, toggles: Term) -> Result<Term
 // Port of erts/emulator/beam/erl_debugger.c:126-160, OTP-29.1.1.
 fn register(
     process: &mut Process,
-    _ctx: &RunCtx<'_, Message>,
+    _ctx: &RunCtx<'_, crate::Process>,
     term: Term,
 ) -> Result<Term, VmError> {
     let pid = Pid::from_term(term).ok_or_else(badarg)?;
@@ -736,7 +735,7 @@ fn limit_term(term: Term, max_size: usize) -> O {
 // Port of erts/emulator/beam/erl_debugger.c:418-444, OTP-29.1.1.
 fn notify_breakpoint_hit(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     mfa: Term,
     line: Term,
     resume: Term,

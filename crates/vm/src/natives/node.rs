@@ -27,7 +27,7 @@ pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
 }
 
 type Handler =
-    fn(&mut Vm, &mut Process, &mut RunCtx<'_, Message>, &[Term]) -> Result<Term, VmError>;
+    fn(&mut Vm, &mut Process, &mut RunCtx<'_, crate::Process>, &[Term]) -> Result<Term, VmError>;
 
 pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler> {
     match (module, function, arity) {
@@ -45,7 +45,7 @@ pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler
 fn call_halt2(
     _vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     halt(process, ctx, args[0], args[1])
@@ -54,7 +54,7 @@ fn call_halt2(
 fn call_nodes0(
     _vm: &mut Vm,
     process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     _args: &[Term],
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/dist.c:6279 (nodes/0 → visible), OTP-29.1.1.
@@ -83,7 +83,7 @@ pub(crate) fn nodes0_bif(
 fn call_nodes1(
     _vm: &mut Vm,
     process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     nodes(process, args[0], None)
@@ -92,7 +92,7 @@ fn call_nodes1(
 pub(crate) fn call_nodes2(
     _vm: &mut Vm,
     process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     nodes(process, args[0], Some(args[1]))
@@ -101,7 +101,7 @@ pub(crate) fn call_nodes2(
 fn call_setnode2(
     _vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/dist.c:4978 (setnode_2), OTP-29.1.1.
@@ -175,7 +175,7 @@ fn call_setnode2(
 fn call_monitor_node2(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     monitor_node(vm, process, ctx, args[0], args[1], None)
@@ -184,7 +184,7 @@ fn call_monitor_node2(
 fn call_monitor_node3(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     monitor_node(vm, process, ctx, args[0], args[1], Some(args[2]))
@@ -357,7 +357,7 @@ fn nodes(process: &mut Process, types: Term, options: Option<Term>) -> Result<Te
 fn monitor_node(
     _vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     node: Term,
     enabled: Term,
     options: Option<Term>,
@@ -443,7 +443,7 @@ fn error(reason: &str) -> VmError {
 
 fn halt(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     code: Term,
     options: Term,
 ) -> Result<Term, VmError> {

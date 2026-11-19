@@ -420,7 +420,7 @@ pub(crate) fn proc_exit_handle_link(
 // Port of erts/emulator/beam/bif.c:136-365 (link_opt: is_external_pid), OTP-29.1.1.
 pub(super) fn link_external(
     process: &mut crate::Process,
-    ctx: &mut arinsal_sched::RunCtx<'_, Message>,
+    ctx: &mut arinsal_sched::RunCtx<'_, crate::Process>,
     node: &str,
     target: OwnedTerm,
     priority: bool,
@@ -542,7 +542,7 @@ fn replace_proc_half(
 // Port of erts/emulator/beam/bif.c (unlink_1, ERTS_LNK_TYPE_DIST_PROC), OTP-29.1.1.
 pub(super) fn unlink_external(
     process: &mut crate::Process,
-    ctx: &mut arinsal_sched::RunCtx<'_, Message>,
+    ctx: &mut arinsal_sched::RunCtx<'_, crate::Process>,
     node: &str,
     target: OwnedTerm,
 ) -> Result<Term, crate::VmError> {

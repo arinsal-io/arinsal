@@ -947,11 +947,12 @@ mod tests {
 
         fn run(
             c_p: &mut crate::CP<'_, Self>,
-            esdp: &mut crate::ErtsSchedulerData<Self>,
+            esdp: &crate::ErtsSchedulerData<Self>,
+            _reg: &mut <Self as crate::Task>::SchedulerData,
             _budget: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
-            esdp.with_ctx(c_p, |_, _, _ctx| RunOutcome::Wait { timeout_ms: None })
+            esdp.with_ctx(c_p, |_, _ctx| RunOutcome::Wait { timeout_ms: None })
         }
     }
 

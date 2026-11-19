@@ -11,7 +11,7 @@ impl Process {
     /// Handle the signals left in the middle queue without fetching.
     pub(crate) fn handle_local_signals(
         &mut self,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
     ) -> Result<(), VmError> {
         loop {
             let mut reds = CONTEXT_REDS;
@@ -25,7 +25,7 @@ impl Process {
     /// in `CONTEXT_REDS` rounds until it is empty.
     // Port of erts/emulator/beam/erl_bif_info.c:4643-4652 (process_info on a process that
     // handles its signals until done), OTP-29.1.1.
-    pub(crate) fn drain(&mut self, ctx: &mut RunCtx<'_, Message>) -> Result<(), VmError> {
+    pub(crate) fn drain(&mut self, ctx: &mut RunCtx<'_, crate::Process>) -> Result<(), VmError> {
         let mut local_only = false;
         loop {
             let mut reds = CONTEXT_REDS;
@@ -41,7 +41,7 @@ impl Process {
     // receive tracing) and 8627 (trace_receive), OTP-29.1.1.
     pub(super) fn trace_converted_signal(
         &mut self,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         message: Term,
         from: Pid,
     ) {
@@ -53,7 +53,12 @@ impl Process {
     }
 
     /// Receive-trace the message, if any, that a conversion appended after `queued` entries.
-    fn trace_new_message(&mut self, ctx: &mut RunCtx<'_, Message>, queued: usize, from: Pid) {
+    fn trace_new_message(
+        &mut self,
+        ctx: &mut RunCtx<'_, crate::Process>,
+        queued: usize,
+        from: Pid,
+    ) {
         if self.inbox.len() > queued
             && let Some(message) = self.inbox.back().copied()
         {
@@ -66,7 +71,10 @@ impl Process {
     /// off, the messages go straight to the message queue; otherwise the batch is appended to
     /// the middle queue (`sig_cont`) for [`Self::handle_incoming`].
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:1332 (erts_proc_sig_fetch__), OTP-29.1.1.
-    pub(crate) fn fetch_signals(&mut self, ctx: &mut RunCtx<'_, Message>) -> Result<(), VmError> {
+    pub(crate) fn fetch_signals(
+        &mut self,
+        ctx: &mut RunCtx<'_, crate::Process>,
+    ) -> Result<(), VmError> {
         let cont = !self.sig_cont_empty();
         let start = self.sig_cont().len();
         let recv_traced = crate::trace::active()
@@ -120,7 +128,7 @@ impl Process {
     // (erts_proc_sig_handle_incoming), OTP-29.1.1.
     pub(crate) fn handle_incoming(
         &mut self,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         reds: &mut i32,
         max_reds: i32,
         local_only: bool,
@@ -278,7 +286,7 @@ impl Process {
     // (erts_proc_sig_handle_incoming), OTP-29.1.1.
     fn handle_signal(
         &mut self,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         from: Pid,
         payload: Payload<Message>,
     ) -> Result<i32, VmError> {
@@ -719,7 +727,7 @@ impl Process {
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:5690 (handle_dist_spawn_reply), OTP-29.1.1.
     fn handle_dist_spawn_reply(
         &mut self,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         shared: &arinsal_sched::SharedPayload,
     ) -> Result<i32, VmError> {
         if let Some(down) = shared
@@ -825,7 +833,7 @@ impl Process {
 
     fn handle_unlink_signal(
         &mut self,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         from: Pid,
         id: u64,
         operation: Option<crate::monitor_link::UnlinkOp>,
@@ -883,7 +891,7 @@ impl Process {
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (handle_exit_signal), OTP-29.1.1.
     fn handle_dist_exit_signal(
         &mut self,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         sender: Pid,
         exit: arinsal_sched::DistExitSignal<Message>,
     ) -> Result<i32, VmError> {
@@ -941,7 +949,7 @@ impl Process {
     #[allow(clippy::too_many_arguments)]
     fn convert_dist_exit_signal(
         &mut self,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         sender: Pid,
         from: crate::monitor_link::ExternalPid,
         linked: bool,
@@ -985,7 +993,7 @@ impl Process {
     /// `getting_linked` with an external linker.
     fn trace_getting_linked_external(
         &mut self,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         linker: crate::monitor_link::ExternalPid,
     ) {
         if crate::trace::active()
@@ -1006,7 +1014,7 @@ impl Process {
     /// `getting_unlinked` with an external unlinker.
     fn trace_getting_unlinked_external(
         &mut self,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         unlinker: crate::monitor_link::ExternalPid,
     ) {
         if crate::trace::active()
@@ -1025,7 +1033,7 @@ impl Process {
     }
 
     /// Port of erts/emulator/beam/erl_proc_sig_queue.c:8585 (getting_linked), OTP-29.1.1.
-    fn trace_getting_linked(&mut self, ctx: &mut RunCtx<'_, Message>, linker: Pid) {
+    fn trace_getting_linked(&mut self, ctx: &mut RunCtx<'_, crate::Process>, linker: Pid) {
         if let Some(linker) = linker.to_term() {
             crate::trace::emit(
                 None,
@@ -1040,7 +1048,7 @@ impl Process {
     }
 
     /// Port of erts/emulator/beam/erl_proc_sig_queue.c:8578 (getting_unlinked), OTP-29.1.1.
-    fn trace_getting_unlinked(&mut self, ctx: &mut RunCtx<'_, Message>, unlinker: Pid) {
+    fn trace_getting_unlinked(&mut self, ctx: &mut RunCtx<'_, crate::Process>, unlinker: Pid) {
         if let Some(unlinker) = unlinker.to_term() {
             crate::trace::emit(
                 None,
@@ -1069,7 +1077,7 @@ impl Process {
     pub(crate) fn handle_dirty_signals(
         &mut self,
         vm: &mut Vm,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         reds: i32,
     ) -> bool {
         if self.dirty_exiting() {

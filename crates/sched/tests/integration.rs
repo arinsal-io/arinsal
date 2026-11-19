@@ -12,11 +12,12 @@ impl Task for Collector {
     type SchedulerData = ();
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
-        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        esdp: &arinsal_sched::ErtsSchedulerData<Self>,
+        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
-        esdp.with_ctx(c_p, |this, _, ctx| {
+        esdp.with_ctx(c_p, |this, ctx| {
             while let Some(Event { from, payload }) = ctx.receive() {
                 let entry = match payload {
                     Payload::Message(n) => (ctx.pid(), from, n, false),
@@ -106,11 +107,12 @@ impl Task for CountTask {
     type SchedulerData = ();
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
-        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        esdp: &arinsal_sched::ErtsSchedulerData<Self>,
+        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
-        esdp.with_ctx(c_p, |this, _, ctx| {
+        esdp.with_ctx(c_p, |this, ctx| {
             while ctx.receive().is_some() {
                 this.0.fetch_add(1, Ordering::Relaxed);
             }
@@ -164,11 +166,12 @@ impl Task for SchedulingProbe {
     type SchedulerData = ();
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
-        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        esdp: &arinsal_sched::ErtsSchedulerData<Self>,
+        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _budget: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
-        esdp.with_ctx(c_p, |this, _, ctx| {
+        esdp.with_ctx(c_p, |this, ctx| {
             let active = this.active.fetch_add(1, Ordering::AcqRel) + 1;
             this.peak.fetch_max(active, Ordering::AcqRel);
             while !this.release.load(Ordering::Acquire) {
@@ -193,11 +196,12 @@ impl Task for PriorityCounter {
     type SchedulerData = ();
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
-        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        esdp: &arinsal_sched::ErtsSchedulerData<Self>,
+        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _budget: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
-        esdp.with_ctx(c_p, |this, _, ctx| {
+        esdp.with_ctx(c_p, |this, ctx| {
             if this.stop.load(Ordering::Acquire) {
                 return {
                     ctx.erts_proc_exit_free(this);
@@ -312,11 +316,12 @@ fn hot_mailbox_repeated_waits_do_not_lose_wakes() {
         type SchedulerData = ();
         fn run(
             c_p: &mut arinsal_sched::CP<'_, Self>,
-            esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+            esdp: &arinsal_sched::ErtsSchedulerData<Self>,
+            _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
             _: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
-            esdp.with_ctx(c_p, |this, _, ctx| {
+            esdp.with_ctx(c_p, |this, ctx| {
                 if ctx.receive().is_some() {
                     this.0.fetch_add(1, Ordering::Relaxed);
                 }
@@ -359,11 +364,12 @@ fn worker_blocks_preserve_sender_message_signal_order() {
         type SchedulerData = ();
         fn run(
             c_p: &mut arinsal_sched::CP<'_, Self>,
-            esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+            esdp: &arinsal_sched::ErtsSchedulerData<Self>,
+            _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
             _: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
-            esdp.with_ctx(c_p, |this, _, ctx| match this {
+            esdp.with_ctx(c_p, |this, ctx| match this {
                 Work::Producer(to) => {
                     for sequence in 0..1_000 {
                         if sequence % 2 == 0 {
@@ -429,11 +435,12 @@ fn ping_pong_gives_external_work_a_turn() {
         type SchedulerData = ();
         fn run(
             c_p: &mut arinsal_sched::CP<'_, Self>,
-            esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+            esdp: &arinsal_sched::ErtsSchedulerData<Self>,
+            _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
             _: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
-            esdp.with_ctx(c_p, |this, _, ctx| match this {
+            esdp.with_ctx(c_p, |this, ctx| match this {
                 Work::Ping(to, count) => {
                     if ctx.receive().is_some() {
                         let value = count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -493,11 +500,12 @@ fn pid_generation() {
         type SchedulerData = ();
         fn run(
             c_p: &mut arinsal_sched::CP<'_, Self>,
-            esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+            esdp: &arinsal_sched::ErtsSchedulerData<Self>,
+            _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
             _: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
-            esdp.with_ctx(c_p, |this, _, ctx| {
+            esdp.with_ctx(c_p, |this, ctx| {
                 ctx.erts_proc_exit_free(this);
                 RunOutcome::Yield
             })
@@ -572,11 +580,12 @@ impl Task for ProgressRacer {
     type SchedulerData = ();
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
-        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        esdp: &arinsal_sched::ErtsSchedulerData<Self>,
+        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
-        esdp.with_ctx(c_p, |this, _, ctx| {
+        esdp.with_ctx(c_p, |this, ctx| {
             if !this.bound {
                 this.bound = true;
                 ctx.bind_scheduler(if this.blocker { 1 } else { 2 });
@@ -651,11 +660,12 @@ impl Task for LaterWaiter {
     type SchedulerData = ();
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
-        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        esdp: &arinsal_sched::ErtsSchedulerData<Self>,
+        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
-        esdp.with_ctx(c_p, |this, _, ctx| {
+        esdp.with_ctx(c_p, |this, ctx| {
             if !this.bound {
                 this.bound = true;
                 ctx.bind_scheduler(if this.spinner { 1 } else { 2 });
@@ -731,11 +741,12 @@ impl Task for Idle {
     type SchedulerData = ();
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
-        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        esdp: &arinsal_sched::ErtsSchedulerData<Self>,
+        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
-        esdp.with_ctx(c_p, |_, _, ctx| {
+        esdp.with_ctx(c_p, |_, ctx| {
             while ctx.receive().is_some() {}
             RunOutcome::Wait { timeout_ms: None }
         })
@@ -794,11 +805,12 @@ fn wait_timer_keeps_its_position_across_reentry() {
         type SchedulerData = ();
         fn run(
             c_p: &mut arinsal_sched::CP<'_, Self>,
-            esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+            esdp: &arinsal_sched::ErtsSchedulerData<Self>,
+            _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
             _: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
-            esdp.with_ctx(c_p, |this, _, ctx| {
+            esdp.with_ctx(c_p, |this, ctx| {
                 while ctx.receive().is_some() {}
                 let pos = *this
                     .pos

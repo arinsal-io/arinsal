@@ -11,11 +11,12 @@ impl Task for Sink {
 
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
-        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        esdp: &arinsal_sched::ErtsSchedulerData<Self>,
+        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
-        esdp.with_ctx(c_p, |this, _, ctx| {
+        esdp.with_ctx(c_p, |this, ctx| {
             while let Some(event) = ctx.receive() {
                 match event.payload {
                     Payload::Timer { message, .. } => this.0.lock().unwrap().push(*message),
@@ -123,11 +124,12 @@ impl Task for ReentrantTimerTask {
 
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
-        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        esdp: &arinsal_sched::ErtsSchedulerData<Self>,
+        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
-        esdp.with_ctx(c_p, |this, _, ctx| {
+        esdp.with_ctx(c_p, |this, ctx| {
             let Some(scheduler) = this.scheduler.get().and_then(Weak::upgrade) else {
                 return {
                     ctx.erts_proc_exit_free(this);
@@ -190,11 +192,12 @@ impl Task for CrossCancelTask {
 
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
-        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        esdp: &arinsal_sched::ErtsSchedulerData<Self>,
+        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
-        esdp.with_ctx(c_p, |this, _, ctx| {
+        esdp.with_ctx(c_p, |this, ctx| {
             let Some(scheduler) = this.scheduler.get().and_then(Weak::upgrade) else {
                 return {
                     ctx.erts_proc_exit_free(this);
@@ -300,11 +303,12 @@ impl Task for Victim {
 
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
-        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        esdp: &arinsal_sched::ErtsSchedulerData<Self>,
+        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
-        esdp.with_ctx(c_p, |this, _, ctx| {
+        esdp.with_ctx(c_p, |this, ctx| {
             if !this.started {
                 this.started = true;
                 this.own.send(ctx.start_timer(60_000, 1).unwrap()).unwrap();

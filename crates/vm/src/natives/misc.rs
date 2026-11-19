@@ -76,7 +76,7 @@ pub(crate) fn decode_packet_light(
 pub(crate) fn call(
     _vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: super::NativeArgs<'_>,
@@ -322,7 +322,7 @@ pub(crate) fn profile_runnable_procs() -> bool {
 // Port of erts/emulator/beam/erl_trace.c:2357 (profile_runnable_proc), OTP-29.1.1.
 pub(crate) fn profile_process_event(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     active: bool,
 ) {
     let flags = PROFILE_FLAGS.load(Ordering::Relaxed);

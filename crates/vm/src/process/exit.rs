@@ -55,7 +55,12 @@ impl Process {
             .map_err(|error| VmError::Unsupported(format!("signal tuple: {error:?}")))
     }
 
-    pub(super) fn notify_exit(&mut self, vm: &mut Vm, ctx: &mut RunCtx<'_, Message>, reason: Term) {
+    pub(super) fn notify_exit(
+        &mut self,
+        vm: &mut Vm,
+        ctx: &mut RunCtx<'_, crate::Process>,
+        reason: Term,
+    ) {
         debug_assert!(reason.is_pointer() || (reason.is_immed() && !reason.is_non_value()));
         self.exit_stage1(vm, ctx, reason);
         self.set_exit_cont(Some(
@@ -85,7 +90,7 @@ impl Process {
     /// Port of erts/emulator/beam/erl_process.c:14290-14430 (`erts_continue_exit_process`),
     /// OTP-29.1.1: each global table is touched only when the process-local word says this
     /// process has that resource.
-    fn exit_stage1(&mut self, vm: &mut Vm, ctx: &mut RunCtx<'_, Message>, reason: Term) {
+    fn exit_stage1(&mut self, vm: &mut Vm, ctx: &mut RunCtx<'_, crate::Process>, reason: Term) {
         self.final_exit_reason = Some(reason);
         let resources = proc_flags::resources_to_clean(ctx.exit_flags());
         if resources & proc_flags::CODE_PERM != 0 {
@@ -156,7 +161,7 @@ impl Process {
     /// Port of erts/emulator/beam/erl_db.c:5031 (erts_db_process_exiting), OTP-29.1.1.
     fn exit_ets(
         &mut self,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         reds: &mut isize,
         interrupted: &mut Option<arinsal_ets::Garbage>,
     ) -> bool {
@@ -282,7 +287,7 @@ impl Process {
     }
 
     /// Process exit after its tables are released: pending signals, names, links and monitors.
-    fn exit_stage3(&mut self, ctx: &mut RunCtx<'_, Message>, reason: Term) {
+    fn exit_stage3(&mut self, ctx: &mut RunCtx<'_, crate::Process>, reason: Term) {
         // Port of erts/emulator/beam/erl_process.c:14374-14392
         // (ERTS_CONTINUE_EXIT_CLEAN_SYS_TASKS), OTP-29.1.1. Keep the literal area alive
         // through system task replies while the reason or a dirty-running process can access it.
@@ -524,7 +529,7 @@ impl Process {
 // Port of erts/emulator/beam/beam_common.c (terminate_proc, EXF_LOG branch), OTP-29.1.1.
 pub(super) fn report_process_error(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     reason: Term,
 ) {
     let Some(runtime) = process.runtime else {
@@ -575,7 +580,7 @@ impl Process {
     pub(crate) fn erts_do_exit_process(
         &mut self,
         vm: &mut Vm,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         reason: Term,
     ) {
         debug_assert!(reason.is_pointer() || (reason.is_immed() && !reason.is_non_value()));
@@ -608,7 +613,7 @@ impl Process {
     pub(crate) fn erts_continue_exit_process(
         &mut self,
         vm: &mut Vm,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
     ) {
         let state = self
             .take_exit_cont()
@@ -627,7 +632,7 @@ impl Process {
     fn continue_exit(
         &mut self,
         vm: &mut Vm,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         mut state: crate::proc_create::ExitCont,
     ) {
         let zero = [Term::small(0).expect("small zero")];

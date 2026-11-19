@@ -14,7 +14,6 @@ mod raw;
 
 pub(crate) use raw::Published as SchedulerDataPtr;
 
-use super::Message;
 use crate::{Process, Vm};
 use arinsal_sched::RunCtx;
 
@@ -28,7 +27,7 @@ impl NativeSlice {
     #[inline(always)]
     pub(crate) fn run<R>(
         vm: &mut Vm,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         process: &mut Process,
         body: impl FnOnce(&mut Process) -> R,
     ) -> R {
@@ -46,7 +45,7 @@ impl NativeSlice {
 #[inline]
 pub(crate) fn with_sched_data<R>(
     process: &mut Process,
-    f: impl FnOnce(&mut Vm, &mut Process, &mut RunCtx<'_, Message>) -> R,
+    f: impl FnOnce(&mut Vm, &mut Process, &mut RunCtx<'_, crate::Process>) -> R,
 ) -> Option<R> {
     let published = std::mem::take(&mut process.scheduler_data);
     let result = raw::with_published(published, |vm, ctx| {

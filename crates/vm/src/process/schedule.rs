@@ -8,7 +8,7 @@ use super::*;
 // ERTS_PSFLG_ACTIVE_SYS signal handling only), OTP-29.1.1.
 pub(super) fn park_suspended(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
 ) -> Result<RunState, VmError> {
     let pid = ctx.pid();
     process.cold_mut().sys_task_point = true;
@@ -40,28 +40,25 @@ impl Task for Process {
     }
 
     // A process without a runtime exits at once in `run_task` and never reaches Erlang code.
-    fn copy_in_registers(c_p: &mut CP<'_>, esdp: &mut ErtsSchedulerData) {
+    fn copy_in_registers(c_p: &mut CP<'_>, reg: &mut SchedulerData) {
         let process = c_p.task();
         if process.runtime.is_some() {
-            crate::beam_common::copy_in_registers(process, &mut esdp.registers().registers);
+            crate::beam_common::copy_in_registers(process, &mut reg.registers);
         }
     }
 
-    fn copy_out_registers(c_p: &mut CP<'_>, esdp: &mut ErtsSchedulerData) {
+    fn copy_out_registers(c_p: &mut CP<'_>, reg: &mut SchedulerData) {
         let process = c_p.task();
         if process.runtime.is_some() {
-            crate::beam_common::copy_out_registers(
-                process,
-                &esdp.registers().registers.x_reg_array,
-            );
+            crate::beam_common::copy_out_registers(process, &reg.registers.x_reg_array);
         }
     }
 
     // Port of erts/emulator/beam/erl_process.c:10508-10546 (trace_schedule_in), OTP-29.1.1: an
     // exiting process that resumes its exit (`p->u.terminate` set) reports `in_exiting`,
     // any other `in`; a call-time traced process starts its schedule-in time break.
-    fn trace_schedule_in(c_p: &mut CP<'_>, esdp: &mut ErtsSchedulerData) {
-        esdp.with_ctx(c_p, |process, data, ctx| {
+    fn trace_schedule_in(c_p: &mut CP<'_>, esdp: &ErtsSchedulerData, data: &mut SchedulerData) {
+        esdp.with_ctx(c_p, |process, ctx| {
             // `p->scheduler_data = esdp` precedes the trace (erl_process.c:10232).
             process.scheduler_id = ctx.scheduler_id().map_or(0, |id| id as u32);
             let exiting = process.has_exit_cont();
@@ -115,8 +112,13 @@ impl Task for Process {
     // process that yields in its exit reports `out_exiting`, any other `out`. A process that
     // finished its exit is freed (ERTS_PSFLG_FREE in `p->state`) and has reported `out_exited`
     // itself.
-    fn trace_schedule_out(c_p: &mut CP<'_>, esdp: &mut ErtsSchedulerData, _outcome: &RunOutcome) {
-        esdp.with_ctx(c_p, |process, data, ctx| {
+    fn trace_schedule_out(
+        c_p: &mut CP<'_>,
+        esdp: &ErtsSchedulerData,
+        data: &mut SchedulerData,
+        _outcome: &RunOutcome,
+    ) {
+        esdp.with_ctx(c_p, |process, ctx| {
             if ctx.proc_state().load(Ordering::Acquire) & arinsal_sched::psflg::FREE != 0 {
                 return;
             }
@@ -171,11 +173,12 @@ impl Task for Process {
     #[inline(always)]
     fn run(
         c_p: &mut CP<'_>,
-        esdp: &mut ErtsSchedulerData,
+        esdp: &ErtsSchedulerData,
+        data: &mut SchedulerData,
         budget: u32,
         calls: &mut u32,
     ) -> RunOutcome {
-        esdp.with_ctx(c_p, |process, data, ctx| {
+        esdp.with_ctx(c_p, |process, ctx| {
             // `c_p` (the native prefix at the start of this task) and the process state word are in
             // one process struct, the state word at `offsetof(Process, state)` from `c_p`.
             debug_assert_eq!(
@@ -442,7 +445,7 @@ impl Process {
     #[inline(always)]
     fn context_switch(
         &mut self,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         dirty_start: Option<std::time::Instant>,
     ) -> u32 {
         let virtual_reds = std::mem::take(&mut self.virtual_reds);
@@ -466,7 +469,11 @@ impl Process {
     }
 
     #[inline(always)]
-    fn run_task(&mut self, ctx: &mut RunCtx<'_, Message>, data: &mut SchedulerData) -> RunOutcome {
+    fn run_task(
+        &mut self,
+        ctx: &mut RunCtx<'_, crate::Process>,
+        data: &mut SchedulerData,
+    ) -> RunOutcome {
         if self.runtime.is_none() {
             // A process with no node runtime (the in-process test harness) has no code to
             // run; it ends at once.
@@ -529,7 +536,7 @@ impl Process {
     /// exit, then `erts_do_exit_process` runs on this scheduler's VM view.
     fn exit_with(
         &mut self,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         data: &mut SchedulerData,
         reason: Term,
         entry_result: Option<Box<Result<ScheduledResult, VmError>>>,
@@ -553,7 +560,7 @@ impl Process {
     #[inline(always)]
     fn run_executor(
         &mut self,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         data: &mut SchedulerData,
     ) -> Result<RunState, VmError> {
         let SchedulerData {
@@ -601,7 +608,7 @@ impl Process {
 
     fn finish_run(
         &mut self,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         data: &mut SchedulerData,
         result: Result<RunState, VmError>,
     ) -> RunOutcome {

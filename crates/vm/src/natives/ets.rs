@@ -2330,7 +2330,7 @@ impl arinsal_ets::flxctr::SnapshotHost for RecordedLater {
 // OTP-29.1.1.
 fn suspend_until_thr_prgr(
     process: &mut Process,
-    ctx: Option<&mut RunCtx<'_, Message>>,
+    ctx: Option<&mut RunCtx<'_, crate::Process>>,
     pid: Pid,
     host: RecordedLater,
 ) -> Result<(), VmError> {
@@ -2365,7 +2365,7 @@ fn make_integer(process: &mut Process, value: i128) -> Result<Term, VmError> {
 // (erts_flxctr_snapshot), OTP-29.1.1.
 fn info_counters(
     process: &mut Process,
-    ctx: Option<&mut RunCtx<'_, Message>>,
+    ctx: Option<&mut RunCtx<'_, crate::Process>>,
     caller_pid: Pid,
     args: &[Term],
 ) -> Result<Option<Term>, VmError> {
@@ -2505,7 +2505,7 @@ fn info_counters(
 /// other table operation runs from the caller pid alone, as erts runs them from BeamAsm.
 fn call_inner(
     process: &mut Process,
-    mut ctx: Option<&mut RunCtx<'_, Message>>,
+    mut ctx: Option<&mut RunCtx<'_, crate::Process>>,
     caller_pid: Pid,
     function: EtsBif,
     args: &[Term],

@@ -78,7 +78,7 @@ fn mirror_bit(runtime: &Runtime, pid: Pid, on: bool) {
 
 /// Whether the process running on `ctx` is suspended: one load of its own state word, as erts
 /// tests `ERTS_PSFLG_SUSPENDED` in `p->state` without a process table lookup.
-pub(crate) fn ctx_suspended(ctx: &arinsal_sched::RunCtx<'_, Message>) -> bool {
+pub(crate) fn ctx_suspended(ctx: &arinsal_sched::RunCtx<'_, crate::Process>) -> bool {
     ctx.proc_state().load(Ordering::Acquire) & psflg::SUSPENDED != 0
 }
 
@@ -234,7 +234,7 @@ pub(crate) fn send_sync_suspend(
 /// time it handles the request.
 pub(crate) fn sync_reply(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     requester: Pid,
     tag: Message,
     reply: u32,
@@ -288,7 +288,7 @@ pub(crate) fn resume_remote(process: &mut Process, me: Pid, target: Pid) -> Opti
 }
 
 /// Exit of a suspender (erl_process.c:13894): every suspend it holds is released at its target.
-pub(crate) fn release_on_exit(process: &mut Process, ctx: &mut RunCtx<'_, Message>) {
+pub(crate) fn release_on_exit(process: &mut Process, ctx: &mut RunCtx<'_, crate::Process>) {
     let Some(cold) = process.cold.as_mut() else {
         return;
     };
@@ -307,7 +307,7 @@ pub(crate) fn release_on_exit(process: &mut Process, ctx: &mut RunCtx<'_, Messag
 }
 
 /// Exit of a suspendee (erl_process.c:13809): every suspender drops its half of the monitor.
-pub(crate) fn down_on_exit(process: &mut Process, ctx: &mut RunCtx<'_, Message>) {
+pub(crate) fn down_on_exit(process: &mut Process, ctx: &mut RunCtx<'_, crate::Process>) {
     let Some(cold) = process.cold.as_mut() else {
         return;
     };

@@ -278,7 +278,7 @@ impl Vm {
     pub(crate) fn trace_native_call_named(
         &mut self,
         p: &mut Process,
-        ctx: &mut arinsal_sched::RunCtx<'_, process::Message>,
+        ctx: &mut arinsal_sched::RunCtx<'_, crate::Process>,
         module: &str,
         function: &str,
         arity: usize,
@@ -303,7 +303,7 @@ impl Vm {
     pub(crate) fn trace_native_return(
         &mut self,
         p: &mut Process,
-        ctx: &mut arinsal_sched::RunCtx<'_, process::Message>,
+        ctx: &mut arinsal_sched::RunCtx<'_, crate::Process>,
         module: &str,
         function: &str,
         args: &[Term],
@@ -332,7 +332,7 @@ impl Vm {
     pub(crate) fn trace_native_return_outcome(
         &mut self,
         p: &mut Process,
-        ctx: &mut arinsal_sched::RunCtx<'_, process::Message>,
+        ctx: &mut arinsal_sched::RunCtx<'_, crate::Process>,
         module: &str,
         function: &str,
         args: &[Term],

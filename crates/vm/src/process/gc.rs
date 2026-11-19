@@ -69,7 +69,7 @@ pub(super) fn hibernate_resumes_in_place(process: &Process) -> bool {
 // Port of erts/emulator/beam/beam_common.c:1584-1596 (erts_hibernate), OTP-29.1.1.
 pub(super) fn hibernate_fetch_collect(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
 ) -> Result<bool, VmError> {
     process.fetch_signals(ctx)?;
     if !process.inbox.is_empty() {

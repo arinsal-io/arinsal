@@ -485,7 +485,7 @@ pub(crate) fn ref_id(term: Term) -> Option<u64> {
 fn dirty_process_handle_signals(
     vm: &mut Vm,
     process: &Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     target: Term,
 ) -> Result<Term, VmError> {
     // erts compares BIF_P with the three dirty signal handler processes.
@@ -521,7 +521,7 @@ fn dirty_process_handle_signals(
 
 fn deliver(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     to: Pid,
     message: Term,
 ) -> Result<(), VmError> {
@@ -549,7 +549,7 @@ fn task_tuple(process: &mut Process, values: &[Term]) -> Result<Term, VmError> {
 fn request_system_task(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     let (requester, target, priority, operation) = if args.len() == 3 {
@@ -688,7 +688,7 @@ macro_rules! resolved_signal_handler {
         fn $name(
             vm: &mut Vm,
             process: &mut Process,
-            ctx: &mut RunCtx<'_, Message>,
+            ctx: &mut RunCtx<'_, crate::Process>,
             args: crate::natives::NativeArgs<'_>,
         ) -> Option<Result<Term, VmError>> {
             Some(args.with_values(process, |process, args| {
@@ -912,7 +912,7 @@ fn atom_id(name: &str) -> Option<Atom> {
 pub(crate) fn call(
     _vm: &mut Vm,
     _process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, crate::Process>,
     _module: &str,
     _function: &str,
     _args: &[Term],
@@ -1033,7 +1033,7 @@ fn named_on_this_node(target: Term, local_node: Option<Atom>) -> Option<Atom> {
 fn call_resolved(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     entry: SignalBif,
     args: &[Term],
 ) -> Result<Term, VmError> {
@@ -1258,7 +1258,7 @@ pub(crate) fn is_waiting(process: &Process, pid: Pid) -> bool {
 /// sent before; the target's own queues take it when the signal is handled.
 pub(crate) fn submit_sys_task(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     requester: Pid,
     target: Pid,
     op: RemoteOp,
@@ -1289,7 +1289,7 @@ pub(crate) fn submit_sys_task(
 /// executes dirty.
 fn elevate_sig_handling_prio(
     process: &Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     target: Pid,
 ) -> Result<(), VmError> {
     let min_prio = crate::natives::proc::user_priority(process);
@@ -1321,7 +1321,7 @@ fn elevate_sig_handling_prio(
 /// OTP-29.1.1.
 pub(crate) fn elevate_for_signal_request(
     process: &Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     target: Pid,
 ) -> Result<(), VmError> {
     elevate_sig_handling_prio(process, ctx, target)
@@ -1333,7 +1333,7 @@ pub(crate) fn elevate_for_signal_request(
 // process' system task queues when its ordered signal is consumed), OTP-29.1.1.
 pub(crate) fn handle_sys_task(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     payload: &arinsal_sched::SharedPayload,
 ) -> Result<(), VmError> {
     let signal = payload
@@ -1384,7 +1384,7 @@ pub(crate) fn handle_sys_task(
 /// a dirty scheduler first.
 fn run_request(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     index: usize,
     pending: Pending,
 ) -> Result<(), VmError> {
@@ -1426,7 +1426,7 @@ fn run_request(
 /// `c_p->dirty_sys_tasks` loop), OTP-29.1.1: answer the tasks saved for the dirty scheduler.
 pub(crate) fn execute_dirty_sys_tasks(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
 ) -> Result<(), VmError> {
     let tasks = process
         .cold
@@ -1455,7 +1455,7 @@ fn potentially_long_gc(process: &Process, major: bool) -> bool {
 /// system tasks queued for the process at its scheduling point.
 pub(crate) fn execute_sys_tasks(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
 ) -> Result<(), VmError> {
     process.slice_mut().sys_tasks_deferred = false;
     loop {
@@ -1471,7 +1471,7 @@ pub(crate) fn execute_sys_tasks(
     }
 }
 
-fn clear_sys_task_priority_if_idle(process: &Process, ctx: &RunCtx<'_, Message>) {
+fn clear_sys_task_priority_if_idle(process: &Process, ctx: &RunCtx<'_, crate::Process>) {
     if process
         .cold
         .as_ref()
@@ -1486,7 +1486,7 @@ fn clear_sys_task_priority_if_idle(process: &Process, ctx: &RunCtx<'_, Message>)
 #[inline(always)]
 pub(crate) fn reschedule_deferred_sys_tasks(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
 ) -> Result<(), VmError> {
     if process.slice().is_some_and(|work| work.sys_tasks_deferred) {
         return wake_for_deferred_sys_tasks(process, ctx);
@@ -1497,7 +1497,7 @@ pub(crate) fn reschedule_deferred_sys_tasks(
 #[inline(never)]
 fn wake_for_deferred_sys_tasks(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
 ) -> Result<(), VmError> {
     let Some(index) = process.cold.as_ref().and_then(|cold| {
         cold.sys_tasks
@@ -1523,7 +1523,7 @@ fn wake_for_deferred_sys_tasks(
 /// Run a queued request and send its reply.
 pub(crate) fn reply_request(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     pending: Pending,
 ) -> Result<(), VmError> {
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (handle_process_info), OTP-29.1.1: the
@@ -1573,7 +1573,7 @@ pub(crate) fn reply_request(
 /// `{Ref, undefined}` to the requester of a `process_info` signal the exiting target never ran.
 pub(crate) fn reply_request_failure(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     requester: Pid,
     id: u64,
 ) -> Result<(), VmError> {
@@ -1583,7 +1583,7 @@ pub(crate) fn reply_request_failure(
 /// The failure reply of request `op` to the requester of a signal the exiting target never ran.
 pub(crate) fn reply_failure(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     requester: Pid,
     id: u64,
     op: RemoteOp,
@@ -1599,7 +1599,7 @@ pub(crate) fn reply_failure(
 /// The failure reply of a system task signal that reached the exiting target.
 pub(crate) fn sys_task_signal_failed(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     payload: &arinsal_sched::SharedPayload,
 ) {
     let Some(signal) = payload.0.downcast_ref::<SysTaskSignal>() else {
@@ -1613,7 +1613,7 @@ pub(crate) fn sys_task_signal_failed(
 
 /// Port of erts/emulator/beam/erl_process.c:11039 (cleanup_sys_tasks), OTP-29.1.1: the failure
 /// reply of a system task the process will never run.
-fn fail_sys_task(process: &mut Process, ctx: &mut RunCtx<'_, Message>, task: Pending) {
+fn fail_sys_task(process: &mut Process, ctx: &mut RunCtx<'_, crate::Process>, task: Pending) {
     match task.op {
         RemoteOp::PrioSig => {}
         // ERTS_PSTT_CLA of an exiting process answers `ok`.
@@ -1634,7 +1634,7 @@ fn fail_sys_task(process: &mut Process, ctx: &mut RunCtx<'_, Message>, task: Pen
 }
 
 /// Reply `false` / `undefined` / `badarg` for requests this process will never run.
-pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Message>) {
+pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, crate::Process>) {
     crate::natives::sys::release_multi_scheduling_blocks(process, ctx.pid());
     // OTP destroys the trapped BIF state together with the exiting process.
     // Persistent get/0's snapshot retains a table generation and its literals.
@@ -1920,7 +1920,7 @@ pub(crate) fn port_monitor_object<H: arinsal_term::HeapAlloc + ?Sized>(
 // Port of erts/emulator/beam/erl_proc_sig_queue.c:3625 (is_alive_response), OTP-29.1.1.
 pub(crate) fn alive_response(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     requester: Pid,
     id: u64,
     alive: bool,
@@ -1947,7 +1947,7 @@ pub(crate) fn alive_response(
 // Port of erts/emulator/beam/erl_bif_info.c:4049 (erts_internal_is_process_alive_2), OTP-29.1.1.
 fn is_process_alive_2(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     pid: Term,
     reference: Term,
 ) -> Result<Term, VmError> {
@@ -2000,7 +2000,7 @@ fn is_process_executing_dirty(process: &Process, pid: Term) -> Result<Term, VmEr
 // number; the one that drops it to zero does `erts_send_sys_msg_proc`.
 fn trace_delivered(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, crate::Process>,
     target: Term,
 ) -> Result<Term, VmError> {
     if target != Term::atom(arinsal_term::atoms::ALL) && Pid::from_term(target).is_none() {
@@ -2034,7 +2034,7 @@ fn trace_delivered(
 // (erts_trace_cleaner_send_trace_clean_signal_1), OTP-29.1.1.
 fn trace_cleaner_send(
     process: &Process,
-    ctx: &RunCtx<'_, Message>,
+    ctx: &RunCtx<'_, crate::Process>,
     to: Term,
 ) -> Result<Term, VmError> {
     let is_cleaner = process.runtime.as_ref().is_some_and(|runtime| {

@@ -20,11 +20,12 @@ impl Task for Probe {
     type SchedulerData = ();
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
-        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        esdp: &arinsal_sched::ErtsSchedulerData<Self>,
+        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
-        esdp.with_ctx(c_p, |this, _, ctx| {
+        esdp.with_ctx(c_p, |this, ctx| {
             match this {
                 Probe::Block { running, release } => {
                     running.store(true, Ordering::Release);

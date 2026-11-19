@@ -9,7 +9,7 @@ impl Executor {
     pub(super) fn after_native(
         &mut self,
         process: &mut Process,
-        ctx: &mut RunCtx<'_, Message>,
+        ctx: &mut RunCtx<'_, crate::Process>,
         reg: &mut SchedulerRegisters,
         outcome: arinsal_beamasm::ExitReason,
         code_ptr: usize,
