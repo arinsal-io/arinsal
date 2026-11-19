@@ -13,6 +13,8 @@ workspace = true
 [dependencies]
 rustix = { version = "1.1.5", features = ["event", "fs", "process"] }
 
+libc = "0.2.189"
+
 [build-dependencies]
 cc = "1.2.38"
 
@@ -42,3 +44,15 @@ path = "src/bin/typer.rs"
 [[bin]]
 name = "arinsal_erl_call"
 path = "src/bin/erl_call.rs"
+
+[[bin]]
+name = "arinsal_heart"
+path = "src/bin/heart.rs"
+
+[[bin]]
+name = "arinsal_run_erl"
+path = "src/bin/run_erl.rs"
+
+[[bin]]
+name = "arinsal_to_erl"
+path = "src/bin/to_erl.rs"

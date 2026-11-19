@@ -488,6 +488,7 @@ name = "arinsal_erts_etc"
 version = "0.0.1"
 dependencies = [
  "cc",
+ "libc",
  "rustix",
  "similar-asserts",
 ]
