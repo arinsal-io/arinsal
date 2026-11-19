@@ -13,7 +13,7 @@ run() ->
             min_bin_vheap_size, fullsweep_after, max_heap_size,
             message_queue_data, scheduler_bind_type, multi_scheduling,
             time_warp_mode, time_correction, kernel_poll, emu_flavor, emu_type,
-            stack_size],
+            stack_size, system_architecture],
     lists:foreach(fun(Key) ->
         print(Key, value(fun() -> erlang:system_info(Key) end))
     end, Keys),

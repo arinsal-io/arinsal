@@ -19,13 +19,13 @@ fn main() {
 }
 
 /// Configure-time values read by `erlang:system_info/1` in erts are compiled into the runtime.
-// Port of erts/emulator/beam/erl_bif_info.c (system_info_1, c_compiler_used), OTP-29.1.1,
-// and erts/emulator/utils/make_version (ERLANG_ARCHITECTURE).
+// Port of erts/emulator/beam/erl_bif_info.c (system_architecture, system_info_1, c_compiler_used),
+// OTP-29.1.1, and erts/emulator/utils/make_version (ERLANG_ARCHITECTURE).
 fn system_info_build_constants() {
     println!("cargo:rerun-if-env-changed=CC");
-    let build_host = env::var("HOST").expect("Cargo provides the build host triple");
+    let target = env::var("TARGET").expect("Cargo provides the target triple");
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| "unknown".into());
-    let architecture = build_host_architecture(&build_host);
+    let architecture = build_target_architecture(&target);
     println!("cargo:rustc-env=ARINSAL_SYSTEM_ARCHITECTURE={architecture}");
     println!("cargo:rustc-env=ARINSAL_OTP_RELEASE=29");
     println!("cargo:rustc-env=ARINSAL_ERTS_VERSION=17.1");
@@ -49,12 +49,12 @@ fn system_info_build_constants() {
     println!("cargo:rustc-env=ARINSAL_C_COMPILER_VERSION={version}");
 }
 
-/// `ERLANG_ARCHITECTURE` comes from config.guess on the build host during erts configure.
-fn build_host_architecture(host: &str) -> String {
-    let mut parts = host.split('-');
-    let cpu = parts.next().expect("Cargo host triple has a CPU");
-    let vendor = parts.next().expect("Cargo host triple has a vendor");
-    let os = parts.next().expect("Cargo host triple has an OS");
+/// `ERLANG_ARCHITECTURE` describes the target passed to erts configure.
+fn build_target_architecture(target: &str) -> String {
+    let mut parts = target.split('-');
+    let cpu = parts.next().expect("Cargo target triple has a CPU");
+    let vendor = parts.next().expect("Cargo target triple has a vendor");
+    let os = parts.next().expect("Cargo target triple has an OS");
     match os {
         "darwin" => format!("{cpu}-apple-darwin{}", darwin_release()),
         "linux" => {
