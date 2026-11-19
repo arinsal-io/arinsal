@@ -44,7 +44,7 @@
 //!     type SchedulerData = ();
 //!     fn run(
 //!         c_p: &mut CP<'_, Self>,
-//!         esdp: &mut ErtsSchedulerData<Self>,
+//!         esdp: &ErtsSchedulerData<Self>,
 //!         _budget: u32,
 //!         _calls: &mut u32,
 //!     ) -> RunOutcome {
@@ -70,6 +70,7 @@ mod ports;
 mod proc_ref;
 mod ptab_slot;
 mod run_queue;
+mod sched_data_key;
 /// Global scheduling statistics corresponding to `erts_sched_stat`.
 pub mod sched_stat;
 mod sig_queue;
@@ -93,6 +94,7 @@ use arinsal_term::ptab::{PTAB_ID_DATA_MASK, PtabIdRing};
 use proc_ref::raw::{ProcLock, ProcLockGuard};
 pub use proc_ref::{CP, SignalProbe};
 use proc_ref::{ErasedProcRef, ProcRef, TaskCell};
+pub use sched_data_key::erts_get_scheduler_data;
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -5666,7 +5668,7 @@ pub struct ErtsSchedulerData<T: Task> {
     thr_progress_data: Option<thr_progress::ManagedThread>,
     /// `current_process` of a dirty scheduler: the job [`erts_schedule`] picked, kept until
     /// the next call schedules it out.
-    current_process: Option<ProcRef<T>>,
+    current_process: RefCell<Option<ProcRef<T>>>,
     /// `ssi`: the spin count `scheduler_wait` spins before it sleeps.
     ssi_spin_count: u32,
     /// `dirty_no`: pool and index of a dirty scheduler.
@@ -5767,16 +5769,16 @@ impl<T: Task> RunCtx<'_, T> {
     }
     /// Cancel pending BIF timers aimed at a terminating process.
     pub fn cancel_target_timers(&mut self, pid: Pid) {
-        erts_cancel_bif_timers(&self.esdp.run_queue, self.esdp.local.as_deref(), pid);
+        erts_cancel_bif_timers(&self.esdp.run_queue, Some(self.esdp), pid);
     }
     /// Schedule a child inserted with [`Scheduler::spawn_unscheduled`].
     /// A worker-local child runs before this worker parks.
     pub fn schedule_spawn(&mut self, pid: Pid) -> Result<(), Error> {
-        erts_schedule_process_pid(&self.esdp.run_queue, self.esdp.local.as_deref(), pid)
+        erts_schedule_process_pid(&self.esdp.run_queue, Some(self.esdp), pid)
     }
     /// Schedule a child returned by `Scheduler::spawn_unscheduled_handle` (no table lookup).
     pub fn schedule_spawned(&mut self, spawned: SpawnedProcess<T::Message>) -> Result<(), Error> {
-        erts_schedule_spawned(&self.esdp.run_queue, self.esdp.local.as_deref(), spawned)
+        erts_schedule_spawned(&self.esdp.run_queue, Some(self.esdp), spawned)
     }
     /// Number of scheduler workers available to this runtime.
     pub fn scheduler_count(&self) -> usize {
@@ -5816,7 +5818,7 @@ impl<T: Task> RunCtx<'_, T> {
     /// Publish messages and signals this turn has buffered so far. A long dirty job
     /// calls this so its sends do not wait for the job to return.
     pub fn flush_pending(&mut self) {
-        erts_proc_sig_send_pending(&self.esdp.run_queue, self.esdp.local.as_deref());
+        erts_proc_sig_send_pending(&self.esdp.run_queue, Some(self.esdp));
     }
     /// Whether events wait in this process's shared input queue.
     pub fn has_pending_input(&self) -> bool {
@@ -5923,7 +5925,7 @@ impl<T: Task> RunCtx<'_, T> {
     ) -> bool {
         erts_halt(
             &self.esdp.run_queue,
-            self.esdp.local.as_deref(),
+            Some(self.esdp),
             self.proc.pid,
             code,
             timeout,
@@ -5945,7 +5947,7 @@ impl<T: Task> RunCtx<'_, T> {
     ) -> Result<TimerRef, Error> {
         setup_bif_timer(
             &self.esdp.run_queue,
-            self.esdp.local.as_deref(),
+            Some(self.esdp),
             self.proc.pid,
             target,
             ms,
@@ -5963,7 +5965,7 @@ impl<T: Task> RunCtx<'_, T> {
     ) -> Result<TimerRef, Error> {
         setup_bif_timer_resolved(
             &self.esdp.run_queue,
-            self.esdp.local.as_deref(),
+            Some(self.esdp),
             self.proc.pid,
             ms,
             Arc::new(resolve),
@@ -5997,7 +5999,7 @@ impl<T: Task> RunCtx<'_, T> {
     }
     /// Scheduler-wide reductions committed before this process turn.
     pub fn total_reductions(&self) -> u64 {
-        erts_get_total_reductions(&self.esdp.run_queue, self.esdp.local.as_deref())
+        erts_get_total_reductions(&self.esdp.run_queue, Some(self.esdp))
     }
     /// Read exact reductions while all other managed schedulers are paused at a progress point.
     pub fn exact_total_reductions(&self) -> u64 {
@@ -6006,7 +6008,7 @@ impl<T: Task> RunCtx<'_, T> {
     /// Scheduler-owned task and timing snapshot including this turn's `current` reductions
     /// (`erts_current_reductions`: what the running slice has used so far, not yet reported).
     pub fn scheduler_stats(&self, current: u32) -> SchedulerStats {
-        let mut stats = erts_sched_stats(&self.esdp.run_queue, self.esdp.local.as_deref());
+        let mut stats = erts_sched_stats(&self.esdp.run_queue, Some(self.esdp));
         stats.reductions = stats.reductions.saturating_add(u64::from(current));
         stats
     }
@@ -6015,18 +6017,18 @@ impl<T: Task> RunCtx<'_, T> {
         if !self.esdp.msacc_enabled.get() {
             return;
         }
-        erts_msacc_set_state(self.esdp.local.as_deref(), state);
+        erts_msacc_set_state(self.esdp, state);
     }
     /// Change microstate accounting while this task is running.
     pub fn set_msacc_accounting_enabled(&mut self, enabled: bool) {
         if self.esdp.msacc_enabled.get() != enabled {
             self.esdp.msacc_enabled.set(enabled);
-            erts_msacc_request(self.esdp.local.as_deref(), enabled);
+            erts_msacc_request(self.esdp, enabled);
         }
     }
     /// Move measured heap collection time out of the enclosing emulator interval.
     pub fn reclassify_gc_ns(&mut self, nanoseconds: u64) {
-        erts_msacc_reclassify_gc(self.esdp.local.as_deref(), nanoseconds);
+        erts_msacc_reclassify_gc(self.esdp, nanoseconds);
     }
     /// Account newly completed collection time before a live microstate snapshot.
     // Port of erts/emulator/beam/erl_gc.c:800 (collector state interval), OTP-29.1.1.
@@ -6034,7 +6036,7 @@ impl<T: Task> RunCtx<'_, T> {
         if self.esdp.msacc_enabled.get() {
             let delta = total_nanoseconds.saturating_sub(self.esdp.gc_accounted_total.get());
             if delta != 0 {
-                erts_msacc_reclassify_gc(self.esdp.local.as_deref(), delta);
+                erts_msacc_reclassify_gc(self.esdp, delta);
             }
             self.esdp
                 .gc_accounted_total
@@ -6051,14 +6053,14 @@ impl<T: Task> RunCtx<'_, T> {
             return;
         }
         self.esdp.wall_enabled.set(enabled);
-        erts_sched_wall_time_change(&self.esdp.run_queue, self.esdp.local.as_deref(), enabled);
+        erts_sched_wall_time_change(&self.esdp.run_queue, Some(self.esdp), enabled);
     }
     /// Take the oldest signal from the outer signal queue, for a task without an inner
     /// queue of its own (and for an exiting process absorbing what is left).
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:7730-7790 (erts_proc_sig_receive_helper
     // fetches from the outer queue), OTP-29.1.1.
     pub fn receive(&mut self) -> Option<Event<T::Message>> {
-        erts_proc_sig_send_pending(&self.esdp.run_queue, self.esdp.local.as_deref());
+        erts_proc_sig_send_pending(&self.esdp.run_queue, Some(self.esdp));
         self.proc.input.fetch_first_if(|_| true)
     }
     /// Move every signal published to this process into `into`, after the signals it already
@@ -6070,7 +6072,7 @@ impl<T: Task> RunCtx<'_, T> {
     /// `recv_traced`: receive tracing is on, so fetched messages stay in `into` as well
     /// (`ERTS_MSG_RECV_TRACED` in erts_proc_sig_fetch__).
     pub fn fetch_signals(&mut self, into: &mut SignalQueue<Event<T::Message>>, recv_traced: bool) {
-        erts_proc_sig_send_pending(&self.esdp.run_queue, self.esdp.local.as_deref());
+        erts_proc_sig_send_pending(&self.esdp.run_queue, Some(self.esdp));
         self.proc.input.take_all(into, recv_traced);
     }
     /// Record whether this process's middle signal queue holds unhandled signals
@@ -6106,7 +6108,7 @@ impl<T: Task> RunCtx<'_, T> {
     pub fn send(&mut self, to: Pid, msg: T::Message) -> Result<(), Error> {
         proc_queue_payload(
             &self.esdp.run_queue,
-            self.esdp.local.as_deref(),
+            Some(self.esdp),
             self.proc.pid,
             to,
             Payload::Message(msg),
@@ -6118,7 +6120,7 @@ impl<T: Task> RunCtx<'_, T> {
         to: Pid,
         signal: OwnedSignal<Event<T::Message>>,
     ) -> Result<(), Error> {
-        proc_queue_signal(&self.esdp.run_queue, self.esdp.local.as_deref(), to, signal)
+        proc_queue_signal(&self.esdp.run_queue, Some(self.esdp), to, signal)
     }
     /// Send an opaque envelope to this process itself (see [`SignalProbe::send_self`]).
     pub fn send_self(&mut self, msg: T::Message) -> Result<(), Error> {
@@ -6179,7 +6181,7 @@ impl<T: Task> RunCtx<'_, T> {
     ) -> Result<(), Error> {
         proc_queue_sys_task_signal(
             &self.esdp.run_queue,
-            self.esdp.local.as_deref(),
+            Some(self.esdp),
             self.proc.pid,
             to,
             Payload::Signal(signal),
@@ -6190,7 +6192,7 @@ impl<T: Task> RunCtx<'_, T> {
     pub fn signal(&mut self, to: Pid, signal: Signal<T::Message>) -> Result<(), Error> {
         proc_queue_payload(
             &self.esdp.run_queue,
-            self.esdp.local.as_deref(),
+            Some(self.esdp),
             self.proc.pid,
             to,
             Payload::Signal(signal),
@@ -6198,10 +6200,10 @@ impl<T: Task> RunCtx<'_, T> {
     }
     /// Start an Erlang-style timer. The VM may wrap the received envelope as `{timeout, Ref, Msg}`.
     pub fn start_timer(&mut self, ms: u64, msg: T::Message) -> Result<TimerRef, Error> {
-        erts_proc_sig_send_pending(&self.esdp.run_queue, self.esdp.local.as_deref());
+        erts_proc_sig_send_pending(&self.esdp.run_queue, Some(self.esdp));
         setup_bif_timer(
             &self.esdp.run_queue,
-            self.esdp.local.as_deref(),
+            Some(self.esdp),
             self.proc.pid,
             self.proc.pid,
             ms,
@@ -6211,10 +6213,10 @@ impl<T: Task> RunCtx<'_, T> {
     }
     /// Schedule a plain message without a timer-reference wrapper.
     pub fn send_after(&mut self, ms: u64, msg: T::Message) -> Result<TimerRef, Error> {
-        erts_proc_sig_send_pending(&self.esdp.run_queue, self.esdp.local.as_deref());
+        erts_proc_sig_send_pending(&self.esdp.run_queue, Some(self.esdp));
         setup_bif_timer(
             &self.esdp.run_queue,
-            self.esdp.local.as_deref(),
+            Some(self.esdp),
             self.proc.pid,
             self.proc.pid,
             ms,
@@ -6229,10 +6231,10 @@ impl<T: Task> RunCtx<'_, T> {
         ms: u64,
         callback: TimerCallback<T::Message>,
     ) -> Result<TimerRef, Error> {
-        erts_proc_sig_send_pending(&self.esdp.run_queue, self.esdp.local.as_deref());
+        erts_proc_sig_send_pending(&self.esdp.run_queue, Some(self.esdp));
         erts_start_timer_callback(
             &self.esdp.run_queue,
-            self.esdp.local.as_deref(),
+            Some(self.esdp),
             self.proc.pid,
             ms,
             callback,
@@ -6246,15 +6248,8 @@ impl<T: Task> RunCtx<'_, T> {
         msg: T::Message,
         wrapped: bool,
     ) -> Result<TimerRef, Error> {
-        erts_proc_sig_send_pending(&self.esdp.run_queue, self.esdp.local.as_deref());
-        setup_bif_timer_self(
-            &self.esdp.run_queue,
-            self.esdp.local.as_deref(),
-            pid,
-            ms,
-            msg,
-            wrapped,
-        )
+        erts_proc_sig_send_pending(&self.esdp.run_queue, Some(self.esdp));
+        setup_bif_timer_self(&self.esdp.run_queue, Some(self.esdp), pid, ms, msg, wrapped)
     }
     /// Runs `op` once every managed scheduler thread passed a thread progress point: every
     /// slice running now, this one included, ended. Never blocks; `op` runs on a scheduler
@@ -6267,13 +6262,13 @@ impl<T: Task> RunCtx<'_, T> {
     /// Port of erts/emulator/beam/erl_bif_info.c:5079-5091, OTP-29.1.1.
     /// Pause other running tasks until the callback returns.
     pub fn block_thread_progress(&mut self, duration: Duration) {
-        erts_proc_sig_send_pending(&self.esdp.run_queue, self.esdp.local.as_deref());
+        erts_proc_sig_send_pending(&self.esdp.run_queue, Some(self.esdp));
         erts_thr_progress_block_for(&self.esdp.run_queue, duration);
     }
     /// Pause other scheduler threads while `op` changes state that must not race scheduling.
     // Port of erts/emulator/beam/erl_process.c (erts_sched_stat_modify), OTP-29.1.1.
     pub fn with_thread_progress_blocked(&mut self, op: impl FnOnce()) {
-        erts_proc_sig_send_pending(&self.esdp.run_queue, self.esdp.local.as_deref());
+        erts_proc_sig_send_pending(&self.esdp.run_queue, Some(self.esdp));
         let mut op = Some(op);
         erts_thr_progress_block_during(&self.esdp.run_queue, &mut || {
             op.take().expect("operation runs once")()
@@ -6356,10 +6351,11 @@ fn process_peak_rss_bytes() -> Option<u64> {
 
 pub(crate) fn bounce_pending_monitors<T: Task>(
     rq: &Inner<T>,
-    local: Option<&RefCell<Local<T>>>,
+    esdp: Option<&ErtsSchedulerData<T>>,
     dead: Pid,
     lost: Vec<(Pid, u64)>,
 ) {
+    let local = esdp.and_then(|esdp| esdp.local.as_deref());
     for (watcher, id) in lost {
         let _ = rq.deliver(
             dead,
@@ -6374,9 +6370,10 @@ pub(crate) fn bounce_pending_monitors<T: Task>(
 // child joins its parent's run queue.
 pub(crate) fn erts_schedule_process<T: Task>(
     rq: &Inner<T>,
-    local: Option<&RefCell<Local<T>>>,
+    esdp: Option<&ErtsSchedulerData<T>>,
     process: ProcRef<T>,
 ) -> Result<(), Error> {
+    let local = esdp.and_then(|esdp| esdp.local.as_deref());
     let prio = process.priority().index();
     let kind = process
         .run_state()
@@ -6402,9 +6399,10 @@ pub(crate) fn erts_schedule_process<T: Task>(
 
 pub(crate) fn erts_proc_lookup_raw<T: Task>(
     rq: &Inner<T>,
-    local: Option<&RefCell<Local<T>>>,
+    esdp: Option<&ErtsSchedulerData<T>>,
     pid: Pid,
 ) -> Option<ProcRef<T>> {
+    let local = esdp.and_then(|esdp| esdp.local.as_deref());
     if let Some(local) = local.map(RefCell::borrow_mut).as_deref_mut() {
         local.lookup(&rq.table, pid)
     } else {
@@ -6413,20 +6411,20 @@ pub(crate) fn erts_proc_lookup_raw<T: Task>(
 }
 
 /// Publish the held monitor of this scheduler, if any.
-pub(crate) fn send_pending_signal<T: Task>(rq: &Inner<T>, local: Option<&RefCell<Local<T>>>) {
+pub(crate) fn send_pending_signal<T: Task>(rq: &Inner<T>, esdp: Option<&ErtsSchedulerData<T>>) {
     if let Some(held) = PENDING_PROC_MONITOR.with(PendingSlot::take) {
-        send_held_monitor(rq, local, held);
+        send_held_monitor(rq, esdp, held);
     }
 }
 
 /// Publish the held monitor only when it is for `to`, so the signal to `to` goes after it.
 pub(crate) fn send_pending_signal_to<T: Task>(
     rq: &Inner<T>,
-    local: Option<&RefCell<Local<T>>>,
+    esdp: Option<&ErtsSchedulerData<T>>,
     to: Pid,
 ) {
     if let Some(held) = take_held_monitor_for(to) {
-        send_held_monitor(rq, local, held);
+        send_held_monitor(rq, esdp, held);
     }
 }
 
@@ -6434,12 +6432,12 @@ pub(crate) fn send_pending_signal_to<T: Task>(
 // Port of erts/emulator/beam/erl_proc_sig_queue.c:1102-1125 (esdp->pending_signal), OTP-29.1.1.
 pub(crate) fn hold_pending_signal<T: Task>(
     rq: &Inner<T>,
-    local: Option<&RefCell<Local<T>>>,
+    esdp: Option<&ErtsSchedulerData<T>>,
     held: PendingProcMonitor,
 ) {
     let previous = PENDING_PROC_MONITOR.with(|slot| slot.replace(held));
     if let Some(previous) = previous {
-        send_held_monitor(rq, local, previous);
+        send_held_monitor(rq, esdp, previous);
     }
 }
 
@@ -6447,15 +6445,16 @@ pub(crate) fn hold_pending_signal<T: Task>(
 /// target must bounce DOWN (erl_proc_sig_queue.c:1131-1135, `noproc`).
 pub(crate) fn send_held_monitor<T: Task>(
     rq: &Inner<T>,
-    local: Option<&RefCell<Local<T>>>,
+    esdp: Option<&ErtsSchedulerData<T>>,
     held: PendingProcMonitor,
 ) {
+    let local = esdp.and_then(|esdp| esdp.local.as_deref());
     let from = held.from;
     let to = held.to;
     let id = held.id;
     let node = restore_held_monitor::<T::Message>(held);
-    let Some(process) = erts_proc_lookup_raw(rq, local, to) else {
-        bounce_pending_monitors(rq, local, to, vec![(from, id)]);
+    let Some(process) = erts_proc_lookup_raw(rq, esdp, to) else {
+        bounce_pending_monitors(rq, esdp, to, vec![(from, id)]);
         return;
     };
     if rq
@@ -6468,7 +6467,7 @@ pub(crate) fn send_held_monitor<T: Task>(
         )
         .is_err()
     {
-        bounce_pending_monitors(rq, local, to, vec![(from, id)]);
+        bounce_pending_monitors(rq, esdp, to, vec![(from, id)]);
     }
 }
 
@@ -6586,25 +6585,26 @@ pub(crate) fn erts_pid2proc_main_locked<T: Task>(
 }
 pub(crate) fn proc_queue_sys_task_signal<T: Task>(
     rq: &Inner<T>,
-    local: Option<&RefCell<Local<T>>>,
+    esdp: Option<&ErtsSchedulerData<T>>,
     from: Pid,
     to: Pid,
     payload: Payload<T::Message>,
     priority: Priority,
 ) -> Result<(), Error> {
     // Keep signal order: a monitor deferred for `to` goes first.
-    send_pending_signal_to(rq, local, to);
+    send_pending_signal_to(rq, esdp, to);
     rq.deliver_sys_task(from, to, payload, priority)
 }
 pub(crate) fn setup_bif_timer_resolved<T: Task>(
     rq: &Inner<T>,
-    local: Option<&RefCell<Local<T>>>,
+    esdp: Option<&ErtsSchedulerData<T>>,
     owner: Pid,
     ms: u64,
     resolve: Arc<dyn Fn() -> Option<Pid> + Send + Sync>,
     msg: T::Message,
     wrapped: bool,
 ) -> Result<TimerRef, Error> {
+    let local = esdp.and_then(|esdp| esdp.local.as_deref());
     rq.start_resolved_timer(
         owner,
         ms,
@@ -6621,12 +6621,13 @@ pub(crate) fn erts_schedule_multi_misc_aux_work<T: Task>(rq: &Inner<T>, work: Sc
 
 pub(crate) fn erts_halt<T: Task>(
     rq: &Inner<T>,
-    local: Option<&RefCell<Local<T>>>,
+    esdp: Option<&ErtsSchedulerData<T>>,
     pid: Pid,
     code: i32,
     timeout: Option<(u64, TimerCallback<T::Message>)>,
     actions: HaltActions,
 ) -> bool {
+    let local = esdp.and_then(|esdp| esdp.local.as_deref());
     rq.begin_halt(
         pid,
         code,
@@ -6638,9 +6639,10 @@ pub(crate) fn erts_halt<T: Task>(
 
 pub(crate) fn erts_cancel_bif_timers<T: Task>(
     rq: &Inner<T>,
-    local: Option<&RefCell<Local<T>>>,
+    esdp: Option<&ErtsSchedulerData<T>>,
     pid: Pid,
 ) {
+    let local = esdp.and_then(|esdp| esdp.local.as_deref());
     // Port of erts/emulator/beam/erl_hl_timer.c:2455 (erts_cancel_bif_timers), OTP-29.1.1:
     // only the wheels holding the receiver's timers are visited; a canceled timer on
     // another scheduler is handed to it as aux work.
@@ -6685,36 +6687,37 @@ pub(crate) fn erts_cancel_bif_timers<T: Task>(
 
 pub(crate) fn erts_schedule_process_pid<T: Task>(
     rq: &Inner<T>,
-    local: Option<&RefCell<Local<T>>>,
+    esdp: Option<&ErtsSchedulerData<T>>,
     pid: Pid,
 ) -> Result<(), Error> {
-    let process = erts_proc_lookup_raw(rq, local, pid).ok_or(Error::NoProcess)?;
-    erts_schedule_process(rq, local, process)
+    let process = erts_proc_lookup_raw(rq, esdp, pid).ok_or(Error::NoProcess)?;
+    erts_schedule_process(rq, esdp, process)
 }
 pub(crate) fn erts_schedule_spawned<T: Task>(
     rq: &Inner<T>,
-    local: Option<&RefCell<Local<T>>>,
+    esdp: Option<&ErtsSchedulerData<T>>,
     spawned: SpawnedProcess<T::Message>,
 ) -> Result<(), Error> {
     let process = spawned.process.downcast::<T>().ok_or(Error::NoProcess)?;
-    erts_schedule_process(rq, local, process)
+    erts_schedule_process(rq, esdp, process)
 }
 /// Queue `payload` from `from` on `to` as one signal node.
 pub(crate) fn proc_queue_payload<T: Task>(
     rq: &Inner<T>,
-    local: Option<&RefCell<Local<T>>>,
+    esdp: Option<&ErtsSchedulerData<T>>,
     from: Pid,
     to: Pid,
     payload: Payload<T::Message>,
 ) -> Result<(), Error> {
-    proc_queue_signal(rq, local, to, event_node(from, payload))
+    proc_queue_signal(rq, esdp, to, event_node(from, payload))
 }
 pub(crate) fn proc_queue_signal<T: Task>(
     rq: &Inner<T>,
-    local: Option<&RefCell<Local<T>>>,
+    esdp: Option<&ErtsSchedulerData<T>>,
     to: Pid,
     signal: OwnedSignal<Event<T::Message>>,
 ) -> Result<(), Error> {
+    let local = esdp.and_then(|esdp| esdp.local.as_deref());
     let from = node_from(&signal);
     let lazy = signal.lazy_meta();
     let monitor = match lazy {
@@ -6736,7 +6739,7 @@ pub(crate) fn proc_queue_signal<T: Task>(
         };
         hold_pending_signal(
             rq,
-            local,
+            esdp,
             PendingProcMonitor {
                 from,
                 to,
@@ -6758,7 +6761,7 @@ pub(crate) fn proc_queue_signal<T: Task>(
         let id = *reference;
         hold_pending_signal(
             rq,
-            local,
+            esdp,
             PendingProcMonitor {
                 from,
                 to,
@@ -6841,7 +6844,7 @@ pub(crate) fn proc_queue_signal<T: Task>(
                     local.message_slabs.push(events);
                 }
                 if delivered.is_err() {
-                    bounce_pending_monitors(rq, local, to, lost);
+                    bounce_pending_monitors(rq, esdp, to, lost);
                     return Err(Error::NoProcess);
                 }
             } else {
@@ -6880,14 +6883,15 @@ pub(crate) fn proc_queue_signal<T: Task>(
 }
 pub(crate) fn erts_proc_sig_send_pending<T: Task>(
     rq: &Inner<T>,
-    local: Option<&RefCell<Local<T>>>,
+    esdp: Option<&ErtsSchedulerData<T>>,
 ) {
-    send_pending_signal(rq, local);
+    send_pending_signal(rq, esdp);
 }
 pub(crate) fn erts_get_total_reductions<T: Task>(
     rq: &Inner<T>,
-    local: Option<&RefCell<Local<T>>>,
+    esdp: Option<&ErtsSchedulerData<T>>,
 ) -> u64 {
+    let local = esdp.and_then(|esdp| esdp.local.as_deref());
     rq.scheduler_stats(local.map(RefCell::borrow).as_deref(), 0)
         .reductions
 }
@@ -6896,24 +6900,25 @@ pub(crate) fn erts_get_exact_total_reductions<T: Task>(rq: &Inner<T>) -> u64 {
 }
 pub(crate) fn erts_sched_stats<T: Task>(
     rq: &Inner<T>,
-    local: Option<&RefCell<Local<T>>>,
+    esdp: Option<&ErtsSchedulerData<T>>,
 ) -> SchedulerStats {
+    let local = esdp.and_then(|esdp| esdp.local.as_deref());
     rq.scheduler_stats(local.map(RefCell::borrow).as_deref(), 0)
 }
-pub(crate) fn erts_msacc_set_state<T: Task>(local: Option<&RefCell<Local<T>>>, state: MsaccState) {
+pub(crate) fn erts_msacc_set_state<T: Task>(esdp: &ErtsSchedulerData<T>, state: MsaccState) {
+    let local = esdp.local.as_deref();
     if let Some(local) = local.map(RefCell::borrow_mut).as_deref_mut() {
         local.set_msacc_state(state);
     }
 }
-pub(crate) fn erts_msacc_request<T: Task>(local: Option<&RefCell<Local<T>>>, enabled: bool) {
+pub(crate) fn erts_msacc_request<T: Task>(esdp: &ErtsSchedulerData<T>, enabled: bool) {
+    let local = esdp.local.as_deref();
     if let Some(local) = local.map(RefCell::borrow_mut).as_deref_mut() {
         local.set_msacc_enabled(enabled);
     }
 }
-pub(crate) fn erts_msacc_reclassify_gc<T: Task>(
-    local: Option<&RefCell<Local<T>>>,
-    nanoseconds: u64,
-) {
+pub(crate) fn erts_msacc_reclassify_gc<T: Task>(esdp: &ErtsSchedulerData<T>, nanoseconds: u64) {
+    let local = esdp.local.as_deref();
     if let Some(local) = local.map(RefCell::borrow_mut).as_deref_mut()
         && local.msacc_enabled
     {
@@ -6925,9 +6930,10 @@ pub(crate) fn erts_msacc_reclassify_gc<T: Task>(
 }
 pub(crate) fn erts_sched_wall_time_change<T: Task>(
     rq: &Inner<T>,
-    local: Option<&RefCell<Local<T>>>,
+    esdp: Option<&ErtsSchedulerData<T>>,
     enabled: bool,
 ) {
+    let local = esdp.and_then(|esdp| esdp.local.as_deref());
     if let Some(local) = local.map(RefCell::borrow_mut).as_deref_mut() {
         let _ = rq.take_wall_start(local.worker_id);
         local.set_wall_enabled(enabled);
@@ -6942,13 +6948,14 @@ pub(crate) fn erts_ptab_delete_element<T: Task>(rq: &Inner<T>, pid: Pid) {
 }
 pub(crate) fn setup_bif_timer<T: Task>(
     rq: &Inner<T>,
-    local: Option<&RefCell<Local<T>>>,
+    esdp: Option<&ErtsSchedulerData<T>>,
     owner: Pid,
     target: Pid,
     ms: u64,
     msg: T::Message,
     wrapped: bool,
 ) -> Result<TimerRef, Error> {
+    let local = esdp.and_then(|esdp| esdp.local.as_deref());
     // Message timers may belong to another worker; receive timeouts do not
     // use this path.
     rq.start_timer(
@@ -6961,11 +6968,12 @@ pub(crate) fn setup_bif_timer<T: Task>(
 }
 pub(crate) fn erts_start_timer_callback<T: Task>(
     rq: &Inner<T>,
-    local: Option<&RefCell<Local<T>>>,
+    esdp: Option<&ErtsSchedulerData<T>>,
     pid: Pid,
     ms: u64,
     callback: TimerCallback<T::Message>,
 ) -> Result<TimerRef, Error> {
+    let local = esdp.and_then(|esdp| esdp.local.as_deref());
     rq.start_timer(
         pid,
         ms,
@@ -6976,12 +6984,13 @@ pub(crate) fn erts_start_timer_callback<T: Task>(
 }
 pub(crate) fn setup_bif_timer_self<T: Task>(
     rq: &Inner<T>,
-    local: Option<&RefCell<Local<T>>>,
+    esdp: Option<&ErtsSchedulerData<T>>,
     pid: Pid,
     ms: u64,
     msg: T::Message,
     wrapped: bool,
 ) -> Result<TimerRef, Error> {
+    let local = esdp.and_then(|esdp| esdp.local.as_deref());
     rq.start_timer(
         pid,
         ms,
@@ -9562,7 +9571,7 @@ fn schedule_out<T: Task>(
 // Port of erts/emulator/beam/beam_common.c:179 (erts_dirty_process_main: one dirty job),
 // OTP-29.1.1.
 fn run_slice<T: Task>(
-    esdp: &mut ErtsSchedulerData<T>,
+    esdp: &ErtsSchedulerData<T>,
     registers: &mut T::SchedulerData,
     process: ProcRef<T>,
 ) -> SliceEnd<T> {
@@ -9621,7 +9630,7 @@ fn run_slice<T: Task>(
         });
         (outcome, calls, esdp.virtual_reds.get(), active_ns)
     };
-    erts_proc_sig_send_pending(&esdp.run_queue, esdp.local.as_deref());
+    erts_proc_sig_send_pending(&esdp.run_queue, Some(esdp));
     drop(cell);
     SliceEnd {
         process,
@@ -9638,7 +9647,7 @@ fn run_slice<T: Task>(
 // Port of erts/emulator/beam/erl_process.c (erts_schedule: schedule-in half) and
 // jit/arm/process_main.cpp (process_main), OTP-29.1.1.
 fn run_process<T: Task>(
-    esdp: &mut ErtsSchedulerData<T>,
+    esdp: &ErtsSchedulerData<T>,
     registers: &mut T::SchedulerData,
     process: ProcRef<T>,
 ) -> SliceEnd<T> {
@@ -9678,7 +9687,7 @@ fn run_process<T: Task>(
         });
         (outcome, calls, esdp.virtual_reds.get(), active_ns)
     };
-    erts_proc_sig_send_pending(&esdp.run_queue, esdp.local.as_deref());
+    erts_proc_sig_send_pending(&esdp.run_queue, Some(esdp));
     drop(cell);
     SliceEnd {
         process,
@@ -9854,13 +9863,19 @@ impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
         &self,
         spawned: SpawnedProcess<T::Message>,
     ) -> Result<Result<(), Error>, SpawnedProcess<T::Message>> {
-        let Some(local) = self.local.upgrade() else {
-            return Err(spawned);
-        };
-        if local.try_borrow_mut().is_err() {
-            return Err(spawned);
-        }
-        Ok(erts_schedule_spawned(&self.inner, Some(&local), spawned))
+        let mut spawned = Some(spawned);
+        erts_get_scheduler_data::<T, _>(|esdp| {
+            let busy = esdp
+                .local
+                .as_deref()
+                .is_none_or(|local| local.try_borrow_mut().is_err());
+            (!busy).then(|| {
+                let spawned = spawned.take().expect("taken once");
+                erts_schedule_spawned(&self.inner, Some(esdp), spawned)
+            })
+        })
+        .flatten()
+        .ok_or_else(|| spawned.take().expect("not taken"))
     }
 
     fn send_node(
@@ -10291,7 +10306,7 @@ impl Drop for AllocOwnerWaker {
 /// dirty pass found the runtime stopping.
 // Port of erts/emulator/beam/erl_process.c:9607 (erts_schedule), OTP-29.1.1.
 fn erts_schedule<T: Task>(
-    esdp: &mut ErtsSchedulerData<T>,
+    esdp: &ErtsSchedulerData<T>,
     previous: Option<SliceEnd<T>>,
 ) -> Option<ProcRef<T>> {
     if let Some((kind, index)) = esdp.dirty_no {
@@ -10318,7 +10333,7 @@ fn erts_schedule<T: Task>(
     // Every `None` below happens after it.
     if let Some(end) = previous {
         let own = schedule_out(inner, Some(&mut *local), end, Some(id), None);
-        esdp.current_process = None;
+        *esdp.current_process.borrow_mut() = None;
         // Port of erts/emulator/beam/erl_process.c:9744 (schedule: schedule_out_process
         // "returns with rq locked"), OTP-29.1.1: the lock covers the enqueue of the slice that
         // just ended up to the dequeue, so a thief (trylock EBUSY) cannot take the process
@@ -10646,7 +10661,7 @@ fn erts_schedule<T: Task>(
         }
         local.last_process = Some(process.pid);
         drop(local_guard);
-        esdp.current_process = Some(process.clone());
+        *esdp.current_process.borrow_mut() = Some(process.clone());
         return Some(process);
     }
     if ran_port {
@@ -10817,7 +10832,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         local: Rc::downgrade(&local_cell),
     }) as Rc<dyn NativeSend<T::Message>>);
     let ssi_spin_count = scheduler_spin_count(&inner.config.busy_wait_thresholds, 0, "medium");
-    let mut esdp = ErtsSchedulerData {
+    let esdp = ErtsSchedulerData {
         worker: Some(id),
         worker_count: inner.config.workers,
         sched_type: SchedulerType::Normal,
@@ -10827,7 +10842,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         gc_accounted_total: Cell::new(0),
         local: Some(local_cell),
         thr_progress_data: Some(managed_thread),
-        current_process: None,
+        current_process: RefCell::new(None),
         ssi_spin_count,
         dirty_no: None,
         run_queue: inner,
@@ -10836,7 +10851,8 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
     // erts seeds the scheduler-local random state from the `esdp` address.
     arinsal_term::initialize_scheduler_random(std::ptr::from_ref(&esdp).cast());
     let _ref_unique_binding = esdp.ref_unique.bind();
-    process_main(&mut esdp);
+    let _sched_data_key = sched_data_key::SchedDataKey::set(&esdp);
+    process_main(&esdp);
     native_sender::clear();
     // A stopped scheduler waits forever: it must not hold back blockers.
     thr_progress::scheduler_prepare_wait();
@@ -10850,7 +10866,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
 /// [`erts_schedule`] and runs the process it returns.
 // Port of erts/emulator/beam/beam_emu.c:375 (process_main: `c_p = erts_schedule(NULL, c_p,
 // reds_used)`, then the slice) and jit/x86/process_main.cpp (schedule_next), OTP-29.1.1.
-fn process_main<T: Task>(esdp: &mut ErtsSchedulerData<T>) {
+fn process_main<T: Task>(esdp: &ErtsSchedulerData<T>) {
     let id = esdp.worker.expect("a normal scheduler has its number");
     #[cfg(target_os = "linux")]
     let inherited_affinity = rustix::thread::sched_getaffinity(None).ok();
@@ -11085,7 +11101,7 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
         },
         "short",
     );
-    let mut esdp = ErtsSchedulerData {
+    let esdp = ErtsSchedulerData {
         worker: None,
         worker_count: inner.config.workers,
         sched_type: kind.into(),
@@ -11095,7 +11111,7 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
         gc_accounted_total: Cell::new(0),
         local: None,
         thr_progress_data: None,
-        current_process: None,
+        current_process: RefCell::new(None),
         ssi_spin_count,
         dirty_no: Some((kind, index)),
         run_queue: inner,
@@ -11107,13 +11123,14 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
     let thread = &pool.threads[index];
     let _ = thread.handle.set(thread::current());
     thread.stats.lock().unwrap().set_state(MsaccState::Other);
-    erts_dirty_process_main(&mut esdp);
+    let _sched_data_key = sched_data_key::SchedDataKey::set(&esdp);
+    erts_dirty_process_main(&esdp);
 }
 
 /// The scheduling loop of a dirty scheduler: each turn hands the job that just ended to
 /// [`erts_schedule`] and runs the process it returns.
 // Port of erts/emulator/beam/beam_common.c:179 (erts_dirty_process_main), OTP-29.1.1.
-fn erts_dirty_process_main<T: Task>(esdp: &mut ErtsSchedulerData<T>) {
+fn erts_dirty_process_main<T: Task>(esdp: &ErtsSchedulerData<T>) {
     // `ErtsSchedulerRegisters` of this thread, on the loop's frame as process_main keeps
     // them; `esdp->registers` points at them.
     let mut registers = T::SchedulerData::default();
@@ -11128,7 +11145,7 @@ fn erts_dirty_process_main<T: Task>(esdp: &mut ErtsSchedulerData<T>) {
 // Port of erts/emulator/beam/erl_process.c:9607 (erts_schedule, `!is_normal_sched`
 // branches) and :3404 (scheduler_wait on a dirty run queue), OTP-29.1.1.
 fn erts_schedule_dirty<T: Task>(
-    esdp: &mut ErtsSchedulerData<T>,
+    esdp: &ErtsSchedulerData<T>,
     kind: DirtyKind,
     index: usize,
     previous: Option<SliceEnd<T>>,
@@ -11142,7 +11159,7 @@ fn erts_schedule_dirty<T: Task>(
     if let Some(end) = previous {
         let process = end.process.clone();
         let _ = schedule_out(inner, None, end, None, Some(kind));
-        esdp.current_process = None;
+        *esdp.current_process.borrow_mut() = None;
         process
             .input
             .state()
@@ -11211,7 +11228,7 @@ fn erts_schedule_dirty<T: Task>(
         }
     };
     thread.stats.lock().unwrap().begin_active();
-    esdp.current_process = Some(item.process.clone());
+    *esdp.current_process.borrow_mut() = Some(item.process.clone());
     Some(item.process)
 }
 
