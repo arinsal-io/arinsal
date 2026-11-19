@@ -1,3 +1,4 @@
+use super::executor_run::process_main;
 use super::*;
 
 /// A suspended process that would run on is parked instead. Its queued signals are handled
@@ -40,24 +41,26 @@ impl Task for Process {
     }
 
     // A process without a runtime exits at once in `run_task` and never reaches Erlang code.
-    fn copy_in_registers(c_p: &mut CP<'_>, reg: &mut SchedulerData) {
+    fn copy_in_registers(c_p: &mut CP<'_>, reg: &SchedulerData) {
         let process = c_p.task();
         if process.runtime.is_some() {
-            crate::beam_common::copy_in_registers(process, &mut reg.registers);
+            reg.registers
+                .with(|reg| crate::beam_common::copy_in_registers(process, reg));
         }
     }
 
-    fn copy_out_registers(c_p: &mut CP<'_>, reg: &mut SchedulerData) {
+    fn copy_out_registers(c_p: &mut CP<'_>, reg: &SchedulerData) {
         let process = c_p.task();
         if process.runtime.is_some() {
-            crate::beam_common::copy_out_registers(process, &reg.registers.x_reg_array);
+            reg.registers
+                .with(|reg| crate::beam_common::copy_out_registers(process, &reg.x_reg_array));
         }
     }
 
     // Port of erts/emulator/beam/erl_process.c:10508-10546 (trace_schedule_in), OTP-29.1.1: an
     // exiting process that resumes its exit (`p->u.terminate` set) reports `in_exiting`,
     // any other `in`; a call-time traced process starts its schedule-in time break.
-    fn trace_schedule_in(c_p: &mut CP<'_>, esdp: &ErtsSchedulerData, data: &mut SchedulerData) {
+    fn trace_schedule_in(c_p: &mut CP<'_>, esdp: &ErtsSchedulerData) {
         esdp.with_ctx(c_p, |process, ctx| {
             // `p->scheduler_data = esdp` precedes the trace (erl_process.c:10232).
             process.scheduler_id = ctx.scheduler_id().map_or(0, |id| id as u32);
@@ -70,12 +73,13 @@ impl Task for Process {
             {
                 return;
             }
-            with_executor(data, runtime, |executor| {
+            init_scheduler_vm(esdp, runtime);
+            {
                 let pid = ctx.pid();
                 if exiting {
                     let zero = [Term::small(0).expect("small zero")];
                     crate::trace::emit(
-                        Some(&mut executor.vm),
+                        Some(&mut *lend_vm(esdp)),
                         process,
                         ctx,
                         pid,
@@ -87,12 +91,12 @@ impl Task for Process {
                     // The `in` event resolves the current function against the active code
                     // index, so this scheduler's replica must be current first
                     // (erts_find_function_from_pc reads the active code index).
-                    executor.vm.refresh_code();
+                    lend_vm(esdp).refresh_code();
                     // The MFA tuple is built on the process heap, where erts' HAlloc never fails.
                     let running = crate::trace::running_mfa(process, pid).unwrap_or(None);
                     let running_fields = [running.unwrap_or(Term::small(0).expect("small zero"))];
                     crate::trace::emit(
-                        Some(&mut executor.vm),
+                        Some(&mut *lend_vm(esdp)),
                         process,
                         ctx,
                         pid,
@@ -104,7 +108,7 @@ impl Task for Process {
                 if crate::trace::flags(process, pid) & crate::trace::CALL != 0 {
                     crate::trace_bp::schedule_time_break(process, pid, false);
                 }
-            });
+            }
         })
     }
 
@@ -112,12 +116,7 @@ impl Task for Process {
     // process that yields in its exit reports `out_exiting`, any other `out`. A process that
     // finished its exit is freed (ERTS_PSFLG_FREE in `p->state`) and has reported `out_exited`
     // itself.
-    fn trace_schedule_out(
-        c_p: &mut CP<'_>,
-        esdp: &ErtsSchedulerData,
-        data: &mut SchedulerData,
-        _outcome: &RunOutcome,
-    ) {
+    fn trace_schedule_out(c_p: &mut CP<'_>, esdp: &ErtsSchedulerData, _outcome: &RunOutcome) {
         esdp.with_ctx(c_p, |process, ctx| {
             if ctx.proc_state().load(Ordering::Acquire) & arinsal_sched::psflg::FREE != 0 {
                 return;
@@ -129,7 +128,8 @@ impl Task for Process {
             if !exiting && ctx.exit_flags().load(Ordering::Acquire) & proc_flags::TRACE == 0 {
                 return;
             }
-            with_executor(data, runtime, |executor| {
+            init_scheduler_vm(esdp, runtime);
+            {
                 let pid = ctx.pid();
                 if crate::trace::flags(process, pid) & crate::trace::CALL != 0 {
                     crate::trace_bp::schedule_time_break(process, pid, true);
@@ -137,7 +137,7 @@ impl Task for Process {
                 if exiting {
                     let zero = [Term::small(0).expect("small zero")];
                     crate::trace::emit(
-                        Some(&mut executor.vm),
+                        Some(&mut *lend_vm(esdp)),
                         process,
                         ctx,
                         pid,
@@ -151,7 +151,7 @@ impl Task for Process {
                     let running = crate::trace::running_mfa(process, pid).unwrap_or(None);
                     let running_fields = [running.unwrap_or(Term::small(0).expect("small zero"))];
                     crate::trace::emit(
-                        Some(&mut executor.vm),
+                        Some(&mut *lend_vm(esdp)),
                         process,
                         ctx,
                         pid,
@@ -160,7 +160,7 @@ impl Task for Process {
                         &running_fields,
                     );
                 }
-            });
+            }
         })
     }
 
@@ -171,13 +171,7 @@ impl Task for Process {
     // Inlined into the worker loop: see `Executor::run`. The dirty scheduler
     // path (`run_slice`) gets its own copy, which the normal schedulers never execute.
     #[inline(always)]
-    fn run(
-        c_p: &mut CP<'_>,
-        esdp: &ErtsSchedulerData,
-        data: &mut SchedulerData,
-        budget: u32,
-        calls: &mut u32,
-    ) -> RunOutcome {
+    fn run(c_p: &mut CP<'_>, esdp: &ErtsSchedulerData, budget: u32, calls: &mut u32) -> RunOutcome {
         esdp.with_ctx(c_p, |process, ctx| {
             // `c_p` (the native prefix at the start of this task) and the process state word are in
             // one process struct, the state word at `offsetof(Process, state)` from `c_p`.
@@ -221,9 +215,12 @@ impl Task for Process {
             // Port of erts/emulator/beam/erl_alloc.c (erts_alloc passes `esdp->no` to the
             // thread-specific allocators), OTP-29.1.1: the process heap allocates on this scheduler's
             // instance without looking the thread up, for the span of this run.
-            let alloc_ix = *data
-                .alloc_ix
-                .get_or_insert_with(arinsal_alloc::thread_alloc_ix);
+            let data = arinsal_sched::erts_sched_registers(esdp);
+            let alloc_ix = data.alloc_ix.get().unwrap_or_else(|| {
+                let ix = arinsal_alloc::thread_alloc_ix();
+                data.alloc_ix.set(Some(ix));
+                ix
+            });
             process.heap.set_alloc_ix(Some(alloc_ix));
             process.on_managed = !ctx.scheduler_type().is_dirty();
             if process.receive_timeout_pos.is_some() {
@@ -243,7 +240,7 @@ impl Task for Process {
                         .take_work(|w| w.dirty_pickup.take())
                         .unwrap_or_else(std::time::Instant::now)
                 });
-            let outcome = process.run_task(ctx, data);
+            let outcome = process.run_task(ctx);
             *calls = process.context_switch(ctx, dirty_start);
             process.heap.set_alloc_ix(None);
             process.native = None;
@@ -469,11 +466,7 @@ impl Process {
     }
 
     #[inline(always)]
-    fn run_task(
-        &mut self,
-        ctx: &mut RunCtx<'_, crate::Process>,
-        data: &mut SchedulerData,
-    ) -> RunOutcome {
+    fn run_task(&mut self, ctx: &mut RunCtx<'_, crate::Process>) -> RunOutcome {
         if self.runtime.is_none() {
             // A process with no node runtime (the in-process test harness) has no code to
             // run; it ends at once.
@@ -502,13 +495,12 @@ impl Process {
             // yield: `p->i = beam_continue_exit`) and beam_emu.c / jit/x86/instr_common.cpp:295
             // (continue_exit: `erts_continue_exit_process(c_p); goto do_schedule`),
             // OTP-29.1.1: an exiting process resumes at its exit continuation.
-            let runtime = self.runtime_handle();
-            with_executor(data, runtime, |executor| {
-                self.erts_continue_exit_process(&mut executor.vm, ctx)
-            });
+            let esdp = ctx.esdp();
+            init_scheduler_vm(esdp, self.runtime_handle());
+            self.erts_continue_exit_process(&mut lend_vm(esdp), ctx);
             return self.exit_outcome();
         }
-        let result = self.run_executor(ctx, data);
+        let result = self.run_executor(ctx);
         if self.dirty_exiting() {
             // Port of erts/emulator/beam/erl_process.c:10096 (need_forced_exit), OTP-29.1.1:
             // the process already terminated while the job ran; whatever the job returned,
@@ -516,7 +508,7 @@ impl Process {
             ctx.erts_proc_exit_free(self);
             return RunOutcome::Yield;
         }
-        self.finish_run(ctx, data, result)
+        self.finish_run(ctx, result)
     }
 
     /// What the slice that ran `erts_do_exit_process` / `erts_continue_exit_process` ends
@@ -537,17 +529,15 @@ impl Process {
     fn exit_with(
         &mut self,
         ctx: &mut RunCtx<'_, crate::Process>,
-        data: &mut SchedulerData,
         reason: Term,
         entry_result: Option<Box<Result<ScheduledResult, VmError>>>,
     ) -> RunOutcome {
         if entry_result.is_some() {
             self.cold_mut().entry_result = entry_result;
         }
-        let runtime = self.runtime_handle();
-        with_executor(data, runtime, |executor| {
-            self.erts_do_exit_process(&mut executor.vm, ctx, reason)
-        });
+        let esdp = ctx.esdp();
+        init_scheduler_vm(esdp, self.runtime_handle());
+        self.erts_do_exit_process(&mut lend_vm(esdp), ctx, reason);
         self.exit_outcome()
     }
 
@@ -558,24 +548,11 @@ impl Process {
     }
 
     #[inline(always)]
-    fn run_executor(
-        &mut self,
-        ctx: &mut RunCtx<'_, crate::Process>,
-        data: &mut SchedulerData,
-    ) -> Result<RunState, VmError> {
-        let SchedulerData {
-            registers,
-            executor,
-            ..
-        } = data;
-        let executor = match executor {
-            Some(executor) => executor,
-            None => {
-                let runtime = self.runtime_handle();
-                executor.insert(new_executor(runtime))
-            }
-        };
-        let mut result = executor.run(self, ctx, registers);
+    fn run_executor(&mut self, ctx: &mut RunCtx<'_, crate::Process>) -> Result<RunState, VmError> {
+        let esdp = ctx.esdp();
+        init_scheduler_vm(esdp, self.runtime_handle());
+        let data = arinsal_sched::erts_sched_registers(esdp);
+        let mut result = data.registers.with(|reg| process_main(self, ctx, reg));
         // BIF_TRAP context-switches to beam_bif_export_trap. The continuation is an export
         // call, so the caller's CP stays on the stack and the backtrace PC is that trap.
         if matches!(result, Ok(RunState::Yield))
@@ -609,7 +586,6 @@ impl Process {
     fn finish_run(
         &mut self,
         ctx: &mut RunCtx<'_, crate::Process>,
-        data: &mut SchedulerData,
         result: Result<RunState, VmError>,
     ) -> RunOutcome {
         if matches!(&result, Ok(RunState::Wait { .. } | RunState::Done(_)))
@@ -623,12 +599,7 @@ impl Process {
             let entry_result = self
                 .entry
                 .then(|| Box::new(Err(VmError::Unsupported("max_heap_size".into()))));
-            return self.exit_with(
-                ctx,
-                data,
-                Term::atom(arinsal_term::atoms::KILLED),
-                entry_result,
-            );
+            return self.exit_with(ctx, Term::atom(arinsal_term::atoms::KILLED), entry_result);
         }
         // Port of erts/emulator/beam/erl_process.c:6747-6763 (schedule_out_process), OTP-29.1.1:
         // with GC disabled the dirty collection is dropped; the next collection does it.
@@ -710,7 +681,6 @@ impl Process {
                 });
                 self.exit_with(
                     ctx,
-                    data,
                     // erts passes `am_normal` (beam_common.c, `erts_do_exit_process(c_p, am_normal)`).
                     Term::atom(arinsal_term::atoms::NORMAL),
                     entry_result,
@@ -736,7 +706,7 @@ impl Process {
                     eprintln!("arinsal boot: process {:?} exited: {error}", ctx.pid());
                 }
                 let entry_result = self.entry.then(|| Box::new(Err(error)));
-                self.exit_with(ctx, data, reason, entry_result)
+                self.exit_with(ctx, reason, entry_result)
             }
         }
     }

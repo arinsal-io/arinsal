@@ -13,7 +13,6 @@ impl Task for Collector {
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
-        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
@@ -108,7 +107,6 @@ impl Task for CountTask {
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
-        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
@@ -167,7 +165,6 @@ impl Task for SchedulingProbe {
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
-        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _budget: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
@@ -197,7 +194,6 @@ impl Task for PriorityCounter {
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
-        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _budget: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
@@ -317,7 +313,6 @@ fn hot_mailbox_repeated_waits_do_not_lose_wakes() {
         fn run(
             c_p: &mut arinsal_sched::CP<'_, Self>,
             esdp: &arinsal_sched::ErtsSchedulerData<Self>,
-            _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
             _: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
@@ -365,7 +360,6 @@ fn worker_blocks_preserve_sender_message_signal_order() {
         fn run(
             c_p: &mut arinsal_sched::CP<'_, Self>,
             esdp: &arinsal_sched::ErtsSchedulerData<Self>,
-            _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
             _: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
@@ -436,7 +430,6 @@ fn ping_pong_gives_external_work_a_turn() {
         fn run(
             c_p: &mut arinsal_sched::CP<'_, Self>,
             esdp: &arinsal_sched::ErtsSchedulerData<Self>,
-            _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
             _: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
@@ -501,7 +494,6 @@ fn pid_generation() {
         fn run(
             c_p: &mut arinsal_sched::CP<'_, Self>,
             esdp: &arinsal_sched::ErtsSchedulerData<Self>,
-            _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
             _: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
@@ -581,7 +573,6 @@ impl Task for ProgressRacer {
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
-        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
@@ -661,7 +652,6 @@ impl Task for LaterWaiter {
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
-        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
@@ -742,7 +732,6 @@ impl Task for Idle {
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
-        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
@@ -806,7 +795,6 @@ fn wait_timer_keeps_its_position_across_reentry() {
         fn run(
             c_p: &mut arinsal_sched::CP<'_, Self>,
             esdp: &arinsal_sched::ErtsSchedulerData<Self>,
-            _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
             _: u32,
             _calls: &mut u32,
         ) -> RunOutcome {

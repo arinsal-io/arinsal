@@ -35,6 +35,7 @@ mod max_heap;
 mod message;
 mod message_queue;
 mod receive;
+mod registers;
 mod runtime;
 pub(crate) mod sched_data;
 mod schedule;

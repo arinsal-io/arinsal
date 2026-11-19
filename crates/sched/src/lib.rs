@@ -1176,9 +1176,11 @@ impl PendingSlot {
 pub trait Task: Send + 'static {
     /// Opaque message envelope owned by the receiving process.
     type Message: SignalMessage;
-    /// Task-side part of one scheduler's data (`ErtsSchedulerData`): created once per normal
-    /// or dirty scheduler and lent to every [`Task::run`] on it.
-    type SchedulerData: Default + Send + 'static;
+    /// Task-side part of one scheduler's data: `esdp->registers`, created with the scheduler
+    /// data and reached through `esdp` ([`erts_sched_registers`]) by the slice and by the code
+    /// it calls. Shared access only: whatever the task mutates in it is a `Cell` or behind
+    /// its own raw module, so no exclusive borrow is held while the slice runs.
+    type SchedulerData: Default + 'static;
     /// Execute the process `c_p` cooperatively, consuming at most `budget` reductions
     /// (`p->fcalls = reds`), on the scheduler whose data is `esdp`, and store in `calls` the reductions the slice used
     /// (`REDS_IN - FCALLS` from `c_p->fcalls`, or the dirty scheduler's own count), which
@@ -1189,7 +1191,6 @@ pub trait Task: Send + 'static {
     fn run(
         c_p: &mut CP<'_, Self>,
         esdp: &ErtsSchedulerData<Self>,
-        reg: &mut Self::SchedulerData,
         budget: u32,
         calls: &mut u32,
     ) -> RunOutcome
@@ -1200,7 +1201,7 @@ pub trait Task: Send + 'static {
     ///
     /// Port of erts/emulator/beam/beam_common.c:336 (copy_in_registers, called by process_main
     /// after erts_schedule returns), OTP-29.1.1.
-    fn copy_in_registers(_c_p: &mut CP<'_, Self>, _reg: &mut Self::SchedulerData)
+    fn copy_in_registers(_c_p: &mut CP<'_, Self>, _reg: &Self::SchedulerData)
     where
         Self: Sized,
     {
@@ -1210,7 +1211,7 @@ pub trait Task: Send + 'static {
     ///
     /// Port of erts/emulator/beam/beam_common.c:306 (copy_out_registers, called by
     /// process_main before erts_schedule), OTP-29.1.1.
-    fn copy_out_registers(_c_p: &mut CP<'_, Self>, _reg: &mut Self::SchedulerData)
+    fn copy_out_registers(_c_p: &mut CP<'_, Self>, _reg: &Self::SchedulerData)
     where
         Self: Sized,
     {
@@ -1220,11 +1221,8 @@ pub trait Task: Send + 'static {
     ///
     /// Port of erts/emulator/beam/erl_process.c:10508 (trace_schedule_in, called by
     /// erts_schedule when ERTS_IS_P_TRACED(p)), OTP-29.1.1.
-    fn trace_schedule_in(
-        _c_p: &mut CP<'_, Self>,
-        _esdp: &ErtsSchedulerData<Self>,
-        _reg: &mut Self::SchedulerData,
-    ) where
+    fn trace_schedule_in(_c_p: &mut CP<'_, Self>, _esdp: &ErtsSchedulerData<Self>)
+    where
         Self: Sized,
     {
     }
@@ -1236,7 +1234,6 @@ pub trait Task: Send + 'static {
     fn trace_schedule_out(
         _c_p: &mut CP<'_, Self>,
         _esdp: &ErtsSchedulerData<Self>,
-        _reg: &mut Self::SchedulerData,
         _outcome: &RunOutcome,
     ) where
         Self: Sized,
@@ -5677,6 +5674,17 @@ pub struct ErtsSchedulerData<T: Task> {
     run_queue: Arc<Inner<T>>,
     /// `thr_id`, `unique`, `ref`.
     ref_unique: Rc<unique::SchedRefUnique>,
+    /// `registers`: the scheduler's register block, allocated with the scheduler data
+    /// (init_scheduler_data) and read by the slice through `esdp`.
+    registers: T::SchedulerData,
+}
+
+/// `esdp->registers`: the register block of the scheduler whose data is `esdp`.
+// Port of erts/emulator/beam/erl_process.h (ErtsSchedulerData_.registers) and erl_process.c
+// (init_scheduler_data: `esdp->registers = ...`), OTP-29.1.1.
+#[inline(always)]
+pub fn erts_sched_registers<T: Task>(esdp: &ErtsSchedulerData<T>) -> &T::SchedulerData {
+    &esdp.registers
 }
 
 /// Schedule-in of one slice: the accounting caches `process_main` refreshes at every
@@ -8487,7 +8495,6 @@ mod spawn_request_tests {
         fn run(
             c_p: &mut crate::CP<'_, Self>,
             esdp: &crate::ErtsSchedulerData<Self>,
-            _reg: &mut <Self as crate::Task>::SchedulerData,
             _: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
@@ -8546,7 +8553,6 @@ mod dirty_state_tests {
         fn run(
             c_p: &mut crate::CP<'_, Self>,
             esdp: &crate::ErtsSchedulerData<Self>,
-            _reg: &mut <Self as crate::Task>::SchedulerData,
             _: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
@@ -8805,7 +8811,6 @@ mod offline_scheduler_tests {
         fn run(
             c_p: &mut crate::CP<'_, Self>,
             esdp: &crate::ErtsSchedulerData<Self>,
-            _reg: &mut <Self as crate::Task>::SchedulerData,
             _budget: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
@@ -8855,7 +8860,6 @@ mod proxy_requeue_tests {
         fn run(
             c_p: &mut crate::CP<'_, Self>,
             esdp: &crate::ErtsSchedulerData<Self>,
-            _reg: &mut <Self as crate::Task>::SchedulerData,
             _budget: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
@@ -9117,7 +9121,6 @@ mod rq_double_enqueue_tests {
         fn run(
             c_p: &mut crate::CP<'_, Self>,
             esdp: &crate::ErtsSchedulerData<Self>,
-            _reg: &mut <Self as crate::Task>::SchedulerData,
             _budget: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
@@ -9544,11 +9547,7 @@ fn schedule_out<T: Task>(
 /// schedule-out half is left in the returned [`SliceEnd`] for the next [`erts_schedule`].
 // Port of erts/emulator/beam/beam_common.c:179 (erts_dirty_process_main: one dirty job),
 // OTP-29.1.1.
-fn run_slice<T: Task>(
-    esdp: &ErtsSchedulerData<T>,
-    registers: &mut T::SchedulerData,
-    process: ProcRef<T>,
-) -> SliceEnd<T> {
+fn run_slice<T: Task>(esdp: &ErtsSchedulerData<T>, process: ProcRef<T>) -> SliceEnd<T> {
     let kind = esdp
         .dirty_no
         .map(|(kind, _)| kind)
@@ -9583,12 +9582,12 @@ fn run_slice<T: Task>(
         // Port of erts/emulator/beam/beam_common.c:179-300 (erts_dirty_process_main:
         // copy_in_registers after erts_schedule, copy_out_registers before the next),
         // OTP-29.1.1.
-        T::trace_schedule_in(&mut c_p, esdp, registers);
-        T::copy_in_registers(&mut c_p, registers);
+        T::trace_schedule_in(&mut c_p, esdp);
+        T::copy_in_registers(&mut c_p, &esdp.registers);
         let mut calls = 0;
-        let outcome = T::run(&mut c_p, esdp, registers, budget, &mut calls);
-        T::copy_out_registers(&mut c_p, registers);
-        T::trace_schedule_out(&mut c_p, esdp, registers, &outcome);
+        let outcome = T::run(&mut c_p, esdp, budget, &mut calls);
+        T::copy_out_registers(&mut c_p, &esdp.registers);
+        T::trace_schedule_out(&mut c_p, esdp, &outcome);
         if let Some(thread_type) = thread_type {
             SCHEDULER_TYPE.with(|current| current.set(thread_type));
         }
@@ -9620,11 +9619,7 @@ fn run_slice<T: Task>(
 /// state, as erts' `schedule()` does after `process_main` returns.
 // Port of erts/emulator/beam/erl_process.c (erts_schedule: schedule-in half) and
 // jit/arm/process_main.cpp (process_main), OTP-29.1.1.
-fn run_process<T: Task>(
-    esdp: &ErtsSchedulerData<T>,
-    registers: &mut T::SchedulerData,
-    process: ProcRef<T>,
-) -> SliceEnd<T> {
+fn run_process<T: Task>(esdp: &ErtsSchedulerData<T>, process: ProcRef<T>) -> SliceEnd<T> {
     debug_assert!(
         esdp.local.is_some(),
         "a normal scheduler has its local state"
@@ -9643,12 +9638,12 @@ fn run_process<T: Task>(
         // Port of erts/emulator/beam/jit/x86/process_main.cpp:200,277 and beam_emu.c:395,496
         // (process_main: copy_in_registers after erts_schedule returns, copy_out_registers
         // when the slice switches out), OTP-29.1.1.
-        T::trace_schedule_in(&mut c_p, esdp, registers);
-        T::copy_in_registers(&mut c_p, registers);
+        T::trace_schedule_in(&mut c_p, esdp);
+        T::copy_in_registers(&mut c_p, &esdp.registers);
         let mut calls = 0;
-        let outcome = T::run(&mut c_p, esdp, registers, budget, &mut calls);
-        T::copy_out_registers(&mut c_p, registers);
-        T::trace_schedule_out(&mut c_p, esdp, registers, &outcome);
+        let outcome = T::run(&mut c_p, esdp, budget, &mut calls);
+        T::copy_out_registers(&mut c_p, &esdp.registers);
+        T::trace_schedule_out(&mut c_p, esdp, &outcome);
         if esdp.msacc_enabled.get() {
             let gc_ns = c_p.task().gc_nanoseconds();
             esdp.with_ctx(&mut c_p, |_, ctx| {
@@ -10821,6 +10816,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         dirty_no: None,
         run_queue: inner,
         ref_unique: Rc::new(unique::SchedRefUnique::new_normal(id as u32 + 1)),
+        registers: T::SchedulerData::default(),
     };
     // erts seeds the scheduler-local random state from the `esdp` address.
     arinsal_term::initialize_scheduler_random(std::ptr::from_ref(&esdp).cast());
@@ -10846,9 +10842,6 @@ fn process_main<T: Task>(esdp: &ErtsSchedulerData<T>) {
     let inherited_affinity = rustix::thread::sched_getaffinity(None).ok();
     #[cfg(target_os = "linux")]
     let mut applied_binding = None;
-    // `ErtsSchedulerRegisters` of this thread, on the loop's frame as process_main keeps
-    // them (jit/x86/process_main.cpp: `esdp->registers` points into its stack frame).
-    let mut registers = T::SchedulerData::default();
     let mut previous: Option<SliceEnd<T>> = None;
     while !esdp.run_queue.stopped.load(Ordering::Acquire) {
         #[cfg(target_os = "linux")]
@@ -10863,7 +10856,7 @@ fn process_main<T: Task>(esdp: &ErtsSchedulerData<T>) {
         };
         // A managed thread runs its later operations at its progress point
         // (`scheduler_progress`), so the unmanaged-runtime pass of `run_one` is not needed.
-        previous = Some(run_process(esdp, &mut registers, item));
+        previous = Some(run_process(esdp, item));
     }
     // A stop never drops a finished slice.
     if let Some(end) = previous.take() {
@@ -11090,6 +11083,7 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
         dirty_no: Some((kind, index)),
         run_queue: inner,
         ref_unique: Rc::new(unique::SchedRefUnique::new_dirty(thr_id)),
+        registers: T::SchedulerData::default(),
     };
     arinsal_term::initialize_scheduler_random(std::ptr::from_ref(&esdp).cast());
     let _ref_unique_binding = esdp.ref_unique.bind();
@@ -11105,12 +11099,9 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
 /// [`erts_schedule`] and runs the process it returns.
 // Port of erts/emulator/beam/beam_common.c:179 (erts_dirty_process_main), OTP-29.1.1.
 fn erts_dirty_process_main<T: Task>(esdp: &ErtsSchedulerData<T>) {
-    // `ErtsSchedulerRegisters` of this thread, on the loop's frame as process_main keeps
-    // them; `esdp->registers` points at them.
-    let mut registers = T::SchedulerData::default();
     let mut previous: Option<SliceEnd<T>> = None;
     while let Some(item) = erts_schedule(esdp, previous.take()) {
-        previous = Some(run_slice(esdp, &mut registers, item));
+        previous = Some(run_slice(esdp, item));
     }
 }
 
@@ -11255,7 +11246,6 @@ mod worker_drop_tests {
         fn run(
             c_p: &mut crate::CP<'_, Self>,
             esdp: &crate::ErtsSchedulerData<Self>,
-            _reg: &mut <Self as crate::Task>::SchedulerData,
             _budget: u32,
             _calls: &mut u32,
         ) -> RunOutcome {

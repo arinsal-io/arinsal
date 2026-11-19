@@ -1,3 +1,4 @@
+use super::executor_after_native::context_switch;
 use super::*;
 
 /// Raises the error of a native call to an undefined function that has no error handler
@@ -81,20 +82,29 @@ pub(super) fn trace_boot_enabled() -> bool {
 #[cfg(feature = "pf-mem-counters")]
 static PF_MONITOR_DOWN: AtomicU64 = AtomicU64::new(0);
 
-/// VM part of one scheduler's data (`ErtsSchedulerData`): the scheduler's code replica and
-/// register file, created on its first process turn and kept for the scheduler's lifetime.
+/// VM part of one scheduler's data: `esdp->registers` and the per-scheduler state erts keeps in
+/// `ErtsSchedulerData` (`current_process` as the NIF hub sees it, the allocator index), plus the
+/// scheduler's code view. It lives inline in [`arinsal_sched::ErtsSchedulerData`] and is
+/// reached through `esdp` ([`arinsal_sched::erts_sched_registers`]) by the slice and the code it
+/// calls, by shared reference only: no exclusive borrow of it is held across a call into
+/// generated code.
 ///
 /// Port of erts/emulator/beam/erl_process.h:687 (struct ErtsSchedulerData_: `registers`,
-/// `current_process`) and erl_process.c:5994 (init_scheduler_data), OTP-29.1.1: one per
-/// normal, dirty or simulated scheduler, handed down explicitly instead of looked up.
+/// `current_process`) and erl_process.c:5994 (init_scheduler_data), OTP-29.1.1.
 pub struct SchedulerData {
     /// `esdp->registers`: the scheduler's X and F register file, which `copy_in_registers`
     /// loads the scheduled process's live registers into.
-    pub(super) registers: Box<SchedulerRegisters>,
-    pub(super) executor: Option<Box<Executor>>,
+    pub(super) registers: super::registers::RegisterBlock,
+    /// The scheduler's code view, created on its first process turn. Lent out for each use
+    /// ([`lend_vm`]), so no borrow of it outlives the statement that needs it.
+    vm: std::cell::Cell<Option<Box<Vm>>>,
+    /// `esdp->current_process`, shared with this scheduler thread's NIF hub.
+    pub(super) current_process: crate::natives::nif::CurrentProcess,
+    /// The scheduler thread's hub is bound to `current_process`.
+    pub(super) hub_bound: std::cell::Cell<bool>,
     /// `esdp->no` as the allocator numbers it: the allocator index of this scheduler's thread,
     /// read once on its first process turn and handed to the heap of each process it runs.
-    pub(super) alloc_ix: Option<usize>,
+    pub(super) alloc_ix: std::cell::Cell<Option<usize>>,
 }
 
 impl Default for SchedulerData {
@@ -102,18 +112,72 @@ impl Default for SchedulerData {
     /// erts_alloc_permanent_cache_aligned(...)`), OTP-29.1.1: the register file is allocated
     /// with the scheduler data, before the scheduler runs any process.
     fn default() -> Self {
-        #[cfg_attr(not(target_arch = "aarch64"), allow(unused_mut))]
-        let mut registers = Box::<SchedulerRegisters>::default();
+        let registers = super::registers::RegisterBlock::default();
         // The arm trace-return stub address is a per-scheduler constant (process_main sets it
         // once).
         #[cfg(target_arch = "aarch64")]
-        crate::beamasm_integration::set_trace_return_hook(&mut registers);
+        registers.with(crate::beamasm_integration::set_trace_return_hook);
         Self {
             registers,
-            executor: None,
-            alloc_ix: None,
+            vm: std::cell::Cell::new(None),
+            current_process: Default::default(),
+            hub_bound: std::cell::Cell::new(false),
+            alloc_ix: std::cell::Cell::new(None),
         }
     }
+}
+
+/// The scheduler's code view lent for one use; it goes back into the scheduler data on drop.
+pub(crate) struct VmLease<'a> {
+    data: &'a SchedulerData,
+    vm: Option<Box<Vm>>,
+}
+
+impl std::ops::Deref for VmLease<'_> {
+    type Target = Vm;
+    fn deref(&self) -> &Vm {
+        self.vm.as_deref().expect("lent")
+    }
+}
+
+impl std::ops::DerefMut for VmLease<'_> {
+    fn deref_mut(&mut self) -> &mut Vm {
+        self.vm.as_deref_mut().expect("lent")
+    }
+}
+
+impl Drop for VmLease<'_> {
+    fn drop(&mut self) {
+        self.data.vm.set(self.vm.take());
+    }
+}
+
+/// The code view of the scheduler whose data is `esdp`, for one use. The scheduler's first
+/// process turn created it ([`init_scheduler_vm`]); a use while it is already lent is a bug
+/// in the caller, which held a lease across code that needs it again.
+#[inline(always)]
+pub(crate) fn lend_vm(esdp: &ErtsSchedulerData) -> VmLease<'_> {
+    let data = arinsal_sched::erts_sched_registers(esdp);
+    let vm = data.vm.take();
+    assert!(vm.is_some(), "the scheduler's code view is already lent");
+    VmLease { data, vm }
+}
+
+/// Creates the scheduler's code view for `runtime` on its first process turn. Kept out of
+/// line: the code replica is built once per scheduler, not in the frame of every turn.
+#[inline(always)]
+pub(super) fn init_scheduler_vm(esdp: &ErtsSchedulerData, runtime: &'static Runtime) {
+    let data = arinsal_sched::erts_sched_registers(esdp);
+    let vm = data.vm.take();
+    data.vm
+        .set(Some(vm.unwrap_or_else(|| new_scheduler_vm(runtime))));
+}
+
+#[cold]
+#[inline(never)]
+fn new_scheduler_vm(runtime: &'static Runtime) -> Box<Vm> {
+    arinsal_nif_zlib::set_scheduler_caller(crate::natives::nif::scheduler_caller);
+    Box::new(Vm::shared_replica(&runtime.paths))
 }
 
 /// How the entry loop goes on after a native call's exit was dispatched.
@@ -124,295 +188,283 @@ pub(super) enum Flow {
     Break(Result<RunState, VmError>),
 }
 
-pub(super) struct Executor {
-    /// `esdp->current_process`, shared with this scheduler thread's NIF hub.
-    pub(super) current_process: crate::natives::nif::CurrentProcess,
-    /// The scheduler thread's hub is bound to `current_process`.
-    pub(super) hub_bound: bool,
-    pub(super) vm: Vm,
+/// Emit the trace event a return through a trace frame left for the scheduler.
+pub(super) fn trace_native_return_event(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, crate::Process>,
+    event: crate::trace::NativeReturnEvent,
+) -> Result<(), VmError> {
+    let esdp = ctx.esdp();
+    match event {
+        crate::trace::NativeReturnEvent::Return {
+            function_pc,
+            session,
+            value,
+        } => crate::trace::native_return_event(
+            &mut lend_vm(esdp),
+            process,
+            ctx,
+            function_pc,
+            session,
+            value,
+            false,
+        ),
+        crate::trace::NativeReturnEvent::ReturnTo { session, target } => {
+            crate::trace::native_return_to_event(&mut lend_vm(esdp), process, ctx, session, target)
+        }
+    }
 }
 
-impl Executor {
-    /// Emit the trace event a return through a trace frame left for the scheduler.
-    pub(super) fn emit_native_return_event(
-        &mut self,
-        process: &mut Process,
-        ctx: &mut RunCtx<'_, crate::Process>,
-        event: crate::trace::NativeReturnEvent,
-    ) -> Result<(), VmError> {
-        match event {
-            crate::trace::NativeReturnEvent::Return {
-                function_pc,
-                session,
-                value,
-            } => crate::trace::native_return_event(
-                &mut self.vm,
-                process,
-                ctx,
-                function_pc,
-                session,
-                value,
-                false,
-            ),
-            crate::trace::NativeReturnEvent::ReturnTo { session, target } => {
-                crate::trace::native_return_to_event(&mut self.vm, process, ctx, session, target)
+/// Whether the slice can enter `fast_resume`: a native continuation with none of the rare
+/// per-slice work pending. Each test is a field the full path reads before it enters
+/// native code; when one holds, the full path does the work.
+// Port of erts/emulator/beam/erl_process.c (erts_schedule tests `p->state` and `p->flags`
+// once) and jit/arm/process_main.cpp (process_main: copy_in_registers, FCALLS, `br c_p->i`),
+// OTP-29.1.1.
+#[inline(always)]
+pub(super) fn fast_entry_ok(
+    process: &Process,
+    ctx: &RunCtx<'_, crate::Process>,
+    sys_task_run: bool,
+) -> bool {
+    !ctx.has_pending_nmsg() && fast_entry_ok_before_signals(process, ctx, sys_task_run)
+}
+
+/// [`fast_entry_ok`] before the schedule-in signal handling: everything but the
+/// queued non-message signals, which the scheduler handles first (erts_schedule).
+#[inline(always)]
+pub(super) fn fast_entry_ok_before_signals(
+    process: &Process,
+    ctx: &RunCtx<'_, crate::Process>,
+    sys_task_run: bool,
+) -> bool {
+    process.slice_is_plain()
+        && !process.hibernate_sched()
+        && !process.dirty_bif_completed()
+        && process.x.reds_in() > 0
+        && ctx.fast_slice_ok_before_signals(sys_task_run)
+        && !crate::suspend::ctx_suspended(ctx)
+        && !trace_boot_enabled()
+        && !process
+            .native_pc()
+            .is_some_and(|pc| crate::trace::TraceFrameKind::of(pc).is_some())
+}
+
+/// The native entry loop of the full path, for the common slices: enter native code at the
+/// continuation, and handle the two exits every receive-driven process takes (a yield and a
+/// wait) and the signal fetch of `loop_rec`. `None` hands the slice to the full loop with
+/// the process state untouched; every other exit goes through `after_native`, the same
+/// dispatch the full loop uses.
+// Port of erts/emulator/beam/jit/arm/process_main.cpp (process_main: the scheduler enters
+// `c_p->i` directly), OTP-29.1.1.
+// Inlined into the slice: see `Executor::run`.
+#[inline(always)]
+pub(super) fn process_main_dispatch(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, crate::Process>,
+    reg: &mut SchedulerRegisters,
+    ran: &mut bool,
+    sys_task_run: bool,
+) -> Option<Result<RunState, VmError>> {
+    let esdp = ctx.esdp();
+    let mut first = true;
+    loop {
+        let code_ptr = process.native_pc()?;
+        if !first && !fast_entry_ok(process, ctx, sys_task_run) {
+            return None;
+        }
+        if first {
+            first = false;
+            match collect_on_schedule_in(process) {
+                Ok(false) => {}
+                Ok(true) => return Some(Ok(RunState::Yield)),
+                Err(error) => return Some(Err(error)),
             }
         }
-    }
-
-    /// Whether the slice can enter `fast_resume`: a native continuation with none of the rare
-    /// per-slice work pending. Each test is a field the full path reads before it enters
-    /// native code; when one holds, the full path does the work.
-    // Port of erts/emulator/beam/erl_process.c (erts_schedule tests `p->state` and `p->flags`
-    // once) and jit/arm/process_main.cpp (process_main: copy_in_registers, FCALLS, `br c_p->i`),
-    // OTP-29.1.1.
-    #[inline(always)]
-    pub(super) fn fast_entry_ok(
-        process: &Process,
-        ctx: &RunCtx<'_, crate::Process>,
-        sys_task_run: bool,
-    ) -> bool {
-        !ctx.has_pending_nmsg() && Self::fast_entry_ok_before_signals(process, ctx, sys_task_run)
-    }
-
-    /// [`Self::fast_entry_ok`] before the schedule-in signal handling: everything but the
-    /// queued non-message signals, which the scheduler handles first (erts_schedule).
-    #[inline(always)]
-    pub(super) fn fast_entry_ok_before_signals(
-        process: &Process,
-        ctx: &RunCtx<'_, crate::Process>,
-        sys_task_run: bool,
-    ) -> bool {
-        process.slice_is_plain()
-            && !process.hibernate_sched()
-            && !process.dirty_bif_completed()
-            && process.x.reds_in() > 0
-            && ctx.fast_slice_ok_before_signals(sys_task_run)
-            && !crate::suspend::ctx_suspended(ctx)
-            && !trace_boot_enabled()
-            && !process
-                .native_pc()
-                .is_some_and(|pc| crate::trace::TraceFrameKind::of(pc).is_some())
-    }
-
-    /// The native entry loop of the full path, for the common slices: enter native code at the
-    /// continuation, and handle the two exits every receive-driven process takes (a yield and a
-    /// wait) and the signal fetch of `loop_rec`. `None` hands the slice to the full loop with
-    /// the process state untouched; every other exit goes through `after_native`, the same
-    /// dispatch the full loop uses.
-    // Port of erts/emulator/beam/jit/arm/process_main.cpp (process_main: the scheduler enters
-    // `c_p->i` directly), OTP-29.1.1.
-    // Inlined into the slice: see `Executor::run`.
-    #[inline(always)]
-    pub(super) fn fast_resume(
-        &mut self,
-        process: &mut Process,
-        ctx: &mut RunCtx<'_, crate::Process>,
-        reg: &mut SchedulerRegisters,
-        ran: &mut bool,
-        sys_task_run: bool,
-    ) -> Option<Result<RunState, VmError>> {
-        let mut first = true;
-        loop {
-            let code_ptr = process.native_pc()?;
-            if !first && !Self::fast_entry_ok(process, ctx, sys_task_run) {
-                return None;
-            }
-            if first {
-                first = false;
-                match collect_on_schedule_in(process) {
-                    Ok(false) => {}
-                    Ok(true) => return Some(Ok(RunState::Yield)),
+        #[cfg(target_arch = "aarch64")]
+        crate::beamasm_integration::count_native_call();
+        *ran = true;
+        process.native_transfer = false;
+        process.set_native_pc(None);
+        if crate::code_ix::take_code_barrier() {
+            ctx.block_thread_progress(std::time::Duration::ZERO);
+        }
+        reg.active_code_ix = lend_vm(esdp)
+            .code_ix
+            .process_code_ix(crate::trace::saves_calls(process))
+            as u64;
+        let native = {
+            // Port of erts `c_p->scheduler_data`: a BIF native code calls reaches this
+            // scheduler's data through the process while the slice runs.
+            let registers = &mut *reg;
+            super::sched_data::NativeSlice::run(&mut lend_vm(esdp), ctx, process, |process| {
+                crate::native_bridge::run_native_resume(process, registers, code_ptr)
+            })
+        };
+        // Native `timeout` has no scheduler context to send its trace event.
+        if process.native_exit_kind != crate::proc_create::NativeExit::None
+            && process.take_native_timeout_trace()
+        {
+            crate::trace::timeout_event(Some(&mut *lend_vm(esdp)), process, ctx);
+        }
+        let outcome = match native {
+            Ok(outcome) => outcome,
+            Err(VmError::Trap(trap)) => {
+                match crate::exceptions::resume(&mut lend_vm(esdp), process, Some(ctx), trap) {
                     Err(error) => return Some(Err(error)),
-                }
-            }
-            #[cfg(target_arch = "aarch64")]
-            crate::beamasm_integration::count_native_call();
-            *ran = true;
-            process.native_transfer = false;
-            process.set_native_pc(None);
-            if crate::code_ix::take_code_barrier() {
-                ctx.block_thread_progress(std::time::Duration::ZERO);
-            }
-            reg.active_code_ix =
-                self.vm
-                    .code_ix
-                    .process_code_ix(crate::trace::saves_calls(process)) as u64;
-            let native = {
-                // Port of erts `c_p->scheduler_data`: a BIF native code calls reaches this
-                // scheduler's data through the process while the slice runs.
-                let registers = &mut *reg;
-                super::sched_data::NativeSlice::run(&mut self.vm, ctx, process, |process| {
-                    crate::native_bridge::run_native_resume(process, registers, code_ptr)
-                })
-            };
-            // Native `timeout` has no scheduler context to send its trace event.
-            if process.native_exit_kind != crate::proc_create::NativeExit::None
-                && process.take_native_timeout_trace()
-            {
-                crate::trace::timeout_event(Some(&mut self.vm), process, ctx);
-            }
-            let outcome = match native {
-                Ok(outcome) => outcome,
-                Err(VmError::Trap(trap)) => {
-                    match crate::exceptions::resume(&mut self.vm, process, Some(ctx), trap) {
-                        Err(error) => return Some(Err(error)),
-                        Ok(Some(error)) => {
-                            return Some(Err(error));
-                        }
-                        Ok(None) => {
-                            process.heap.abi.exc.freason = 0;
-                            process.heap.abi.exc.fvalue = 0;
-                            process.heap.abi.exc.ftrace = 0;
-                            continue;
-                        }
-                    }
-                }
-                Err(error) => return Some(Err(error)),
-            };
-            if matches!(outcome, arinsal_beamasm::ExitReason::Returned) {
-                // The entry function returned: the process continues in its caller or is done.
-                if !resume_after_native_return(process) {
-                    return Some(Ok(RunState::Done(reg.x_reg_array[0])));
-                }
-                continue;
-            }
-            if !matches!(outcome, arinsal_beamasm::ExitReason::Yield) {
-                match self.after_native(process, ctx, reg, outcome, code_ptr) {
-                    Ok(Flow::Continue) => continue,
-                    Ok(Flow::Break(result)) => return Some(result),
-                    Err(error) => return Some(Err(error)),
-                }
-            }
-            match process.native_exit_kind {
-                crate::proc_create::NativeExit::None => {
-                    #[cfg(target_arch = "aarch64")]
-                    crate::beamasm_integration::count_native_yield();
-                    process.native_exit_kind = crate::proc_create::NativeExit::None;
-                    // Port of erts/emulator/beam/erl_process.c (erts_schedule: schedule-out of
-                    // a process whose ERTS_PSFLG_DIRTY_*_PROC flag static_schedule_dirty_nif
-                    // or enif_schedule_nif set), OTP-29.1.1.
-                    if !ctx.scheduler_type().is_dirty()
-                        && let Some(kind) = super::executor_run::dirty_proc_kind(ctx.proc_state())
-                    {
-                        return Some(Err(VmError::Dirty(kind)));
-                    }
-                    return Some(Ok(RunState::Yield));
-                }
-                crate::proc_create::NativeExit::Wait if process.native_wait.is_some() => {
-                    #[cfg(target_arch = "aarch64")]
-                    crate::beamasm_integration::count_native_yield();
-                    process.native_exit_kind = crate::proc_create::NativeExit::None;
-                    let timeout_pos = process.native_wait.take().expect("checked above");
-                    // A native receive found no matching message; see the full path.
-                    process.gc_live = 0;
-                    process.set_native_resume_arity(0);
-                    let self_wait = std::mem::take(&mut process.native_wait_self);
-                    if self_wait && let Err(error) = process.fetch_signals(ctx) {
+                    Ok(Some(error)) => {
                         return Some(Err(error));
                     }
-                    return Some(Ok(RunState::Wait { timeout_pos }));
-                }
-                crate::proc_create::NativeExit::Exiting => {
-                    #[cfg(target_arch = "aarch64")]
-                    crate::beamasm_integration::count_native_yield();
-                    process.native_exit_kind = crate::proc_create::NativeExit::None;
-                    // The native receive helper handled a signal that ends the process.
-                    if let Some(error) = process
-                        .cold
-                        .as_mut()
-                        .and_then(|cold| cold.native_exiting.take())
-                    {
-                        return Some(Err(*error));
+                    Ok(None) => {
+                        process.heap.abi.exc.freason = 0;
+                        process.heap.abi.exc.fvalue = 0;
+                        process.heap.abi.exc.ftrace = 0;
+                        continue;
                     }
-                    return Some(Ok(RunState::Yield));
                 }
-                _ => match self.after_native(process, ctx, reg, outcome, code_ptr) {
-                    Ok(Flow::Continue) => continue,
-                    Ok(Flow::Break(result)) => return Some(result),
-                    Err(error) => return Some(Err(error)),
-                },
             }
-        }
-    }
-
-    // g_proc_sched. A suspended process drains its mailbox and does not run.
-    // A hibernating process waits until the inbox is non-empty, then continues
-    // at `erlang:apply/3`. Port of beam_common.c:1568 (`erts_hibernate`) and
-    // erl_process.c:9304 (`erts_process_state2status`), OTP-29.1.1.
-    pub(super) fn sched_preempt(
-        &mut self,
-        process: &mut Process,
-        ctx: &mut RunCtx<'_, crate::Process>,
-        reg: &mut SchedulerRegisters,
-    ) -> Result<Option<RunState>, VmError> {
-        // Nothing to do at most scheduling points: no suspend and no hibernation. Checked
-        // before the runtime handle is cloned.
-        if process.runtime.is_some()
-            && !crate::suspend::ctx_suspended(ctx)
-            && !process.hibernate_sched()
-        {
-            return Ok(None);
-        }
-        let Some(runtime) = process.runtime else {
-            return Ok(None);
+            Err(error) => return Some(Err(error)),
         };
-        let pid = ctx.pid();
-        if runtime.suspend_total_of(pid) > 0 {
-            return match park_suspended(process, ctx)? {
-                RunState::Yield => Ok(None),
-                parked => Ok(Some(parked)),
-            };
-        }
-        if process.hibernate_sched() {
-            process.drain(ctx)?;
-            if process.inbox.is_empty() {
-                return Ok(Some(RunState::Wait { timeout_pos: None }));
+        if matches!(outcome, arinsal_beamasm::ExitReason::Returned) {
+            // The entry function returned: the process continues in its caller or is done.
+            if !resume_after_native_return(process) {
+                return Some(Ok(RunState::Done(reg.x_reg_array[0])));
             }
-            // elixir_loop1: unlike hibernate/3, hibernate/0 keeps its stack.
-            let resume_in_place = process
-                .cold
-                .as_ref()
-                .and_then(|cold| cold.hibernate.as_ref())
-                .is_some_and(|cont| cont.resume_in_place);
-            if resume_in_place {
-                // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
-                process.set_hibernate_sched(false);
-            } else {
-                self.install_apply(process, reg)?;
+            continue;
+        }
+        if !matches!(outcome, arinsal_beamasm::ExitReason::Yield) {
+            match context_switch(process, ctx, reg, outcome, code_ptr) {
+                Ok(Flow::Continue) => continue,
+                Ok(Flow::Break(result)) => return Some(result),
+                Err(error) => return Some(Err(error)),
             }
         }
-        Ok(None)
+        match process.native_exit_kind {
+            crate::proc_create::NativeExit::None => {
+                #[cfg(target_arch = "aarch64")]
+                crate::beamasm_integration::count_native_yield();
+                process.native_exit_kind = crate::proc_create::NativeExit::None;
+                // Port of erts/emulator/beam/erl_process.c (erts_schedule: schedule-out of
+                // a process whose ERTS_PSFLG_DIRTY_*_PROC flag static_schedule_dirty_nif
+                // or enif_schedule_nif set), OTP-29.1.1.
+                if !ctx.scheduler_type().is_dirty()
+                    && let Some(kind) = super::executor_run::dirty_proc_kind(ctx.proc_state())
+                {
+                    return Some(Err(VmError::Dirty(kind)));
+                }
+                return Some(Ok(RunState::Yield));
+            }
+            crate::proc_create::NativeExit::Wait if process.native_wait.is_some() => {
+                #[cfg(target_arch = "aarch64")]
+                crate::beamasm_integration::count_native_yield();
+                process.native_exit_kind = crate::proc_create::NativeExit::None;
+                let timeout_pos = process.native_wait.take().expect("checked above");
+                // A native receive found no matching message; see the full path.
+                process.gc_live = 0;
+                process.set_native_resume_arity(0);
+                let self_wait = std::mem::take(&mut process.native_wait_self);
+                if self_wait && let Err(error) = process.fetch_signals(ctx) {
+                    return Some(Err(error));
+                }
+                return Some(Ok(RunState::Wait { timeout_pos }));
+            }
+            crate::proc_create::NativeExit::Exiting => {
+                #[cfg(target_arch = "aarch64")]
+                crate::beamasm_integration::count_native_yield();
+                process.native_exit_kind = crate::proc_create::NativeExit::None;
+                // The native receive helper handled a signal that ends the process.
+                if let Some(error) = process
+                    .cold
+                    .as_mut()
+                    .and_then(|cold| cold.native_exiting.take())
+                {
+                    return Some(Err(*error));
+                }
+                return Some(Ok(RunState::Yield));
+            }
+            _ => match context_switch(process, ctx, reg, outcome, code_ptr) {
+                Ok(Flow::Continue) => continue,
+                Ok(Flow::Break(result)) => return Some(result),
+                Err(error) => return Some(Err(error)),
+            },
+        }
     }
+}
 
-    // g_proc_sched. Port of bif.c:1402 (`hibernate_3` resumes via apply/3), OTP-29.1.1.
-    pub(super) fn install_apply(
-        &mut self,
-        process: &mut Process,
-        reg: &mut SchedulerRegisters,
-    ) -> Result<(), VmError> {
-        if process.runtime.is_none() {
-            return Err(VmError::Unsupported("hibernate without a scheduler".into()));
-        }
-        process
-            .cold_mut()
-            .hibernate
-            .take()
-            .ok_or_else(|| VmError::Unsupported("hibernate continuation missing".into()))?;
-        // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
-        process.set_hibernate_sched(false);
-        // hibernate/3 left `apply(M, F, A)` in X0..X2.
-        if reg.x_reg_array.len() < 3 {
-            return Err(VmError::Unsupported("hibernate registers".into()));
-        }
-        // Port of erts/emulator/beam/bif.c:1426-1427 (hibernate_3: erts_hibernate, then
-        // BIF_TRAP_CODE_PTR(beam_run_process, 3)), OTP-29.1.1: the process wakes in the
-        // beam_run_process stub, which applies X0..X2.
-        process.set_run_process_entry()?;
-        process.msgq_set_save_first();
-        process.cancel_receive_timer();
-        Ok(())
+// g_proc_sched. A suspended process drains its mailbox and does not run.
+// A hibernating process waits until the inbox is non-empty, then continues
+// at `erlang:apply/3`. Port of beam_common.c:1568 (`erts_hibernate`) and
+// erl_process.c:9304 (`erts_process_state2status`), OTP-29.1.1.
+pub(super) fn schedule_suspend_hibernate(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, crate::Process>,
+    reg: &mut SchedulerRegisters,
+) -> Result<Option<RunState>, VmError> {
+    // Nothing to do at most scheduling points: no suspend and no hibernation. Checked
+    // before the runtime handle is cloned.
+    if process.runtime.is_some()
+        && !crate::suspend::ctx_suspended(ctx)
+        && !process.hibernate_sched()
+    {
+        return Ok(None);
     }
+    let Some(runtime) = process.runtime else {
+        return Ok(None);
+    };
+    let pid = ctx.pid();
+    if runtime.suspend_total_of(pid) > 0 {
+        return match park_suspended(process, ctx)? {
+            RunState::Yield => Ok(None),
+            parked => Ok(Some(parked)),
+        };
+    }
+    if process.hibernate_sched() {
+        process.drain(ctx)?;
+        if process.inbox.is_empty() {
+            return Ok(Some(RunState::Wait { timeout_pos: None }));
+        }
+        // elixir_loop1: unlike hibernate/3, hibernate/0 keeps its stack.
+        let resume_in_place = process
+            .cold
+            .as_ref()
+            .and_then(|cold| cold.hibernate.as_ref())
+            .is_some_and(|cont| cont.resume_in_place);
+        if resume_in_place {
+            // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
+            process.set_hibernate_sched(false);
+        } else {
+            hibernate_wakeup(process, reg)?;
+        }
+    }
+    Ok(None)
+}
+
+// g_proc_sched. Port of bif.c:1402 (`hibernate_3` resumes via apply/3), OTP-29.1.1.
+pub(super) fn hibernate_wakeup(
+    process: &mut Process,
+    reg: &mut SchedulerRegisters,
+) -> Result<(), VmError> {
+    if process.runtime.is_none() {
+        return Err(VmError::Unsupported("hibernate without a scheduler".into()));
+    }
+    process
+        .cold_mut()
+        .hibernate
+        .take()
+        .ok_or_else(|| VmError::Unsupported("hibernate continuation missing".into()))?;
+    // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
+    process.set_hibernate_sched(false);
+    // hibernate/3 left `apply(M, F, A)` in X0..X2.
+    if reg.x_reg_array.len() < 3 {
+        return Err(VmError::Unsupported("hibernate registers".into()));
+    }
+    // Port of erts/emulator/beam/bif.c:1426-1427 (hibernate_3: erts_hibernate, then
+    // BIF_TRAP_CODE_PTR(beam_run_process, 3)), OTP-29.1.1: the process wakes in the
+    // beam_run_process stub, which applies X0..X2.
+    process.set_run_process_entry()?;
+    process.msgq_set_save_first();
+    process.cancel_receive_timer();
+    Ok(())
 }
 
 /// Exact live X register count of a switched-out process, erts `c_p->arity`. Every
@@ -515,27 +567,4 @@ pub(crate) fn with_replica_vm<R>(runtime: &'static Runtime, f: impl FnOnce(&mut 
         slot.push((key, vm));
     });
     result
-}
-
-/// Run `f` on this scheduler's executor, creating it for `runtime` on first use.
-pub(super) fn with_executor<R>(
-    data: &mut SchedulerData,
-    runtime: &'static Runtime,
-    f: impl FnOnce(&mut Executor) -> R,
-) -> R {
-    let executor = data.executor.get_or_insert_with(|| new_executor(runtime));
-    f(executor)
-}
-
-/// The executor a scheduler creates on its first process turn. Kept out of line: the code
-/// replica is built once per scheduler, not in the frame of every turn.
-#[cold]
-#[inline(never)]
-pub(super) fn new_executor(runtime: &'static Runtime) -> Box<Executor> {
-    arinsal_nif_zlib::set_scheduler_caller(crate::natives::nif::scheduler_caller);
-    Box::new(Executor {
-        current_process: Default::default(),
-        hub_bound: false,
-        vm: Vm::shared_replica(&runtime.paths),
-    })
 }

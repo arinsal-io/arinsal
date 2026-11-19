@@ -12,7 +12,6 @@ impl Task for Sink {
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
-        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
@@ -125,7 +124,6 @@ impl Task for ReentrantTimerTask {
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
-        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
@@ -193,7 +191,6 @@ impl Task for CrossCancelTask {
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
-        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
@@ -304,7 +301,6 @@ impl Task for Victim {
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
-        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {

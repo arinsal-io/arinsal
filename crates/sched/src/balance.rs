@@ -948,7 +948,6 @@ mod tests {
         fn run(
             c_p: &mut crate::CP<'_, Self>,
             esdp: &crate::ErtsSchedulerData<Self>,
-            _reg: &mut <Self as crate::Task>::SchedulerData,
             _budget: u32,
             _calls: &mut u32,
         ) -> RunOutcome {

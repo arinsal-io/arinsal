@@ -29,7 +29,6 @@ impl Task for Dummy {
     fn run(
         c_p: &mut arinsal_sched::CP<'_, Self>,
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
-        _reg: &mut <Self as arinsal_sched::Task>::SchedulerData,
         budget: u32,
         calls: &mut u32,
     ) -> RunOutcome {
