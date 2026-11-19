@@ -23,7 +23,10 @@ impl Task for Idle {
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
-        esdp.with_ctx(c_p, |_, _, _| RunOutcome::Exit(0))
+        esdp.with_ctx(c_p, |this, _, ctx| {
+            ctx.erts_proc_exit_free(this);
+            RunOutcome::Yield
+        })
     }
 }
 

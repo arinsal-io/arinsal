@@ -62,8 +62,6 @@ impl Process {
             arinsal_alloc::typed::FixAllocBox::new(crate::proc_create::ExitCont {
                 reason,
                 garbage: None,
-                entry_result: None,
-                code: 0,
                 pend_spawn: false,
                 waiter: None,
             })
@@ -569,32 +567,30 @@ pub(super) fn report_process_error(
 
 impl Process {
     /// Terminate the process: everything up to the owned ETS tables now, the tables a slice of
-    /// reductions at a time, and the rest once they are released.
+    /// reductions at a time, and the rest once they are released. Ends with the process FREE
+    /// in `p->state`, or yielded with its continuation in `p->u.terminate`; the schedule-out
+    /// reads which from the process.
     ///
     /// Port of erts/emulator/beam/erl_process.c:14171 (erts_do_exit_process), OTP-29.1.1.
-    pub(super) fn erts_do_exit_process(
+    pub(crate) fn erts_do_exit_process(
         &mut self,
-        runtime: &'static Runtime,
+        vm: &mut Vm,
         ctx: &mut RunCtx<'_, Message>,
-        data: &mut SchedulerData,
         reason: Term,
-        entry_result: Option<Box<Result<ScheduledResult, VmError>>>,
-        code: u64,
-    ) -> RunOutcome {
+    ) {
         debug_assert!(reason.is_pointer() || (reason.is_immed() && !reason.is_non_value()));
+        // erl_process.c:14173: `p->arity = 0`, no live registers.
+        self.heap.abi.arity = 0;
         // erts finishes a parked fragmented send in ERTS_CONTINUE_EXIT_DIST_SEND, before the
         // distribution links and monitors are signalled; here that is before any exit work.
         crate::bif_traps::finish_parked_dsend(self, ctx.pid());
-        with_executor(data, runtime, |executor| {
-            self.exit_stage1(&mut executor.vm, ctx, reason)
-        });
-        // Port of erts/emulator/beam/erl_process.c (erts_continue_exit_process), OTP-29.1.1:
-        // the continuation state lives on the stack and is allocated only when the exit yields.
+        self.exit_stage1(vm, ctx, reason);
+        // erl_process.c:14227 (`p->u.terminate = NULL`): the continuation state starts on the
+        // stack and is allocated only when the exit yields.
+        self.set_exit_cont(None);
         let state = crate::proc_create::ExitCont {
             reason,
             garbage: None,
-            entry_result,
-            code,
             pend_spawn: false,
             waiter: None,
         };
@@ -602,23 +598,40 @@ impl Process {
         // `BUMP_REDS(p, 100)`), OTP-29.1.1: the rest of the exit runs on what is left, and the
         // schedulers' wakeup_other, check_balance and check_time counters see this cost.
         crate::process::bump_fcalls(self, 100);
-        self.erts_continue_exit_process(runtime, ctx, data, state)
+        self.continue_exit(vm, ctx, state)
     }
 
-    /// Run the interruptible part of process exit: yields, keeping the continuation in
-    /// `p->u.terminate`, when the reductions run out, and finishes with `out_exited`. The
-    /// `in_exiting` / `out_exiting` events of a resumed exit are the scheduler's
-    /// (`trace_schedule_in` / `trace_schedule_out`).
+    /// Resume a yielded exit from its continuation in `p->u.terminate`.
     ///
-    /// Port of erts/emulator/beam/erl_process.c:14270 (erts_continue_exit_process), OTP-29.1.1.
-    pub(super) fn erts_continue_exit_process(
+    /// Port of erts/emulator/beam/erl_process.c:14270 (erts_continue_exit_process: `trap_state
+    /// = p->u.terminate`), OTP-29.1.1.
+    pub(crate) fn erts_continue_exit_process(
         &mut self,
-        runtime: &'static Runtime,
+        vm: &mut Vm,
         ctx: &mut RunCtx<'_, Message>,
-        data: &mut SchedulerData,
+    ) {
+        let state = self
+            .take_exit_cont()
+            .expect("a continued exit has its p->u.terminate")
+            .into_inner();
+        self.continue_exit(vm, ctx, state)
+    }
+
+    /// The interruptible part of process exit: yields, keeping the continuation in
+    /// `p->u.terminate`, when the reductions run out, and finishes FREE (ptab delete, state
+    /// bit, delete_process). The `in_exiting` / `out_exiting` events of a resumed exit are
+    /// the scheduler's (`trace_schedule_in` / `trace_schedule_out`).
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:14270-14830 (erts_continue_exit_process),
+    /// OTP-29.1.1.
+    fn continue_exit(
+        &mut self,
+        vm: &mut Vm,
+        ctx: &mut RunCtx<'_, Message>,
         mut state: crate::proc_create::ExitCont,
-    ) -> RunOutcome {
+    ) {
         let zero = [Term::small(0).expect("small zero")];
+        let runtime = self.runtime.expect("an exiting process has a runtime");
         if !state.pend_spawn {
             // Port of erts/emulator/beam/erl_process.c (erts_continue_exit_process: `reds =
             // ERTS_BIF_REDS_LEFT(p)` ... `BUMP_REDS(p, reds_used)`), OTP-29.1.1.
@@ -627,23 +640,22 @@ impl Process {
             let done = self.exit_ets(ctx, &mut reds, &mut state.garbage);
             crate::process::bump_fcalls(self, (initial - reds).clamp(0, initial) as i32);
             if !done {
+                // erl_process.c:14800-14819 (yield: `p->u.terminate = trap_state`).
                 self.set_exit_cont(Some(
                     arinsal_alloc::typed::FixAllocBox::new(state)
                         .expect("exit continuation allocation"),
                 ));
-                return RunOutcome::Yield;
+                return;
             }
-            with_executor(data, runtime, |executor| {
-                crate::trace::emit(
-                    Some(&mut executor.vm),
-                    self,
-                    ctx,
-                    ctx.pid(),
-                    crate::trace::EXITING,
-                    "out_exited",
-                    &zero,
-                );
-            });
+            crate::trace::emit(
+                Some(vm),
+                self,
+                ctx,
+                ctx.pid(),
+                crate::trace::EXITING,
+                "out_exited",
+                &zero,
+            );
             // erts keeps `c_p` after the ptab delete of ERTS_CONTINUE_EXIT_FREE; Arinsal
             // retains the process here, while its pid still resolves.
             if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::DIST_SPAWN != 0 {
@@ -680,22 +692,27 @@ impl Process {
                 crate::dist::PendSpawnExit::Wait
             );
             if wait {
+                // dist.c:758-790 (erts_dist_pend_spawn_exit_parent_wait suspends the process
+                // and the exit yields at this phase).
                 self.set_exit_cont(Some(
                     arinsal_alloc::typed::FixAllocBox::new(state)
                         .expect("exit continuation allocation"),
                 ));
-                return RunOutcome::Wait { timeout_ms: None };
+                return;
             }
         }
-        let mut cont = state;
-        if let Some(waiter) = cont.waiter.take() {
+        if let Some(waiter) = state.waiter.take() {
             waiter.cancel();
         }
-        if self.entry
-            && let Some(result) = cont.entry_result
-        {
+        if let Some(result) = self.cold.as_mut().and_then(|cold| cold.entry_result.take()) {
             let _ = runtime.result.lock().unwrap().send(*result);
         }
-        RunOutcome::Exit(cont.code)
+        // erts finishes a suspended updater's table_updater even when the process is killed,
+        // which releases the permission; the update is already published here.
+        self.persistent_terms
+            .release_update_permission(crate::natives::sys::persistent_owner(ctx.pid()));
+        // ERTS_CONTINUE_EXIT_FREE / ERTS_CONTINUE_EXIT_DONE: FREE in `p->state`, then
+        // delete_process.
+        ctx.erts_proc_exit_free(self);
     }
 }

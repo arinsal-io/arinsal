@@ -64,7 +64,10 @@ impl Task for Dummy {
                             return RunOutcome::Yield;
                         }
                     }
-                    return RunOutcome::Exit(0);
+                    return {
+                        ctx.erts_proc_exit_free(this);
+                        RunOutcome::Yield
+                    };
                 }
                 Mode::Fanout {
                     receivers,
@@ -80,7 +83,10 @@ impl Task for Dummy {
                             return RunOutcome::Yield;
                         }
                     }
-                    return RunOutcome::Exit(0);
+                    return {
+                        ctx.erts_proc_exit_free(this);
+                        RunOutcome::Yield
+                    };
                 }
                 Mode::Idle(started) => {
                     started.fetch_add(1, Ordering::Relaxed);

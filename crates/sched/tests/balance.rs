@@ -21,9 +21,12 @@ impl Task for Busy {
         budget: u32,
         calls: &mut u32,
     ) -> RunOutcome {
-        esdp.with_ctx(c_p, |this, _, _ctx| {
+        esdp.with_ctx(c_p, |this, _, ctx| {
             if this.stop.load(Ordering::Relaxed) {
-                return RunOutcome::Exit(0);
+                return {
+                    ctx.erts_proc_exit_free(this);
+                    RunOutcome::Yield
+                };
             }
             this.runs.fetch_add(1, Ordering::Relaxed);
             *calls = budget;

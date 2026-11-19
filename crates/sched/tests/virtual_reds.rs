@@ -25,7 +25,10 @@ impl Task for Slice {
             *calls = this.consumed;
             ctx.add_virtual_reds(this.virtual_reds);
             let _ = this.done.send(());
-            RunOutcome::Exit(0)
+            {
+                ctx.erts_proc_exit_free(this);
+                RunOutcome::Yield
+            }
         })
     }
 }

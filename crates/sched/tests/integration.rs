@@ -168,7 +168,7 @@ impl Task for SchedulingProbe {
         _budget: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
-        esdp.with_ctx(c_p, |this, _, _ctx| {
+        esdp.with_ctx(c_p, |this, _, ctx| {
             let active = this.active.fetch_add(1, Ordering::AcqRel) + 1;
             this.peak.fetch_max(active, Ordering::AcqRel);
             while !this.release.load(Ordering::Acquire) {
@@ -176,7 +176,10 @@ impl Task for SchedulingProbe {
             }
             this.active.fetch_sub(1, Ordering::AcqRel);
             this.complete.fetch_add(1, Ordering::Release);
-            RunOutcome::Exit(0)
+            {
+                ctx.erts_proc_exit_free(this);
+                RunOutcome::Yield
+            }
         })
     }
 }
@@ -194,9 +197,12 @@ impl Task for PriorityCounter {
         _budget: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
-        esdp.with_ctx(c_p, |this, _, _ctx| {
+        esdp.with_ctx(c_p, |this, _, ctx| {
             if this.stop.load(Ordering::Acquire) {
-                return RunOutcome::Exit(0);
+                return {
+                    ctx.erts_proc_exit_free(this);
+                    RunOutcome::Yield
+                };
             }
             this.count.fetch_add(1, Ordering::Relaxed);
             RunOutcome::Yield
@@ -366,7 +372,10 @@ fn worker_blocks_preserve_sender_message_signal_order() {
                             ctx.signal(*to, Signal::Unlink(sequence as u64)).unwrap();
                         }
                     }
-                    RunOutcome::Exit(0)
+                    {
+                        ctx.erts_proc_exit_free(this);
+                        RunOutcome::Yield
+                    }
                 }
                 Work::Sink(output) => {
                     while let Some(event) = ctx.receive() {
@@ -436,7 +445,10 @@ fn ping_pong_gives_external_work_a_turn() {
                 }
                 Work::Observe(count, observed) => {
                     observed.store(count.load(Ordering::Relaxed), Ordering::Release);
-                    RunOutcome::Exit(0)
+                    {
+                        ctx.erts_proc_exit_free(this);
+                        RunOutcome::Yield
+                    }
                 }
             })
         }
@@ -485,7 +497,10 @@ fn pid_generation() {
             _: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
-            esdp.with_ctx(c_p, |_, _, _| RunOutcome::Exit(0))
+            esdp.with_ctx(c_p, |this, _, ctx| {
+                ctx.erts_proc_exit_free(this);
+                RunOutcome::Yield
+            })
         }
     }
     let sched = Scheduler::new(Config {
@@ -575,7 +590,10 @@ impl Task for ProgressRacer {
                 }
             }
             if this.rounds.fetch_add(1, Ordering::AcqRel) + 1 >= 400 {
-                RunOutcome::Exit(0)
+                {
+                    ctx.erts_proc_exit_free(this);
+                    RunOutcome::Yield
+                }
             } else {
                 RunOutcome::Yield
             }
@@ -648,7 +666,10 @@ impl Task for LaterWaiter {
                 while !this.release.load(Ordering::Acquire) {
                     std::thread::yield_now();
                 }
-                return RunOutcome::Exit(0);
+                return {
+                    ctx.erts_proc_exit_free(this);
+                    RunOutcome::Yield
+                };
             }
             if !this.spinning.load(Ordering::Acquire) {
                 return RunOutcome::Yield;
@@ -656,7 +677,10 @@ impl Task for LaterWaiter {
             let fired = Arc::clone(&this.fired);
             ctx.thread_progress_later(move || fired.store(true, Ordering::Release));
             this.scheduled.store(true, Ordering::Release);
-            RunOutcome::Exit(0)
+            {
+                ctx.erts_proc_exit_free(this);
+                RunOutcome::Yield
+            }
         })
     }
 }
@@ -781,7 +805,10 @@ fn wait_timer_keeps_its_position_across_reentry() {
                     .get_or_insert_with(|| arinsal_sched::receive_timeout_pos(200));
                 if arinsal_sched::monotonic_now_ms() >= pos {
                     *this.fired.lock().unwrap() = Some(Instant::now());
-                    return RunOutcome::Exit(0);
+                    return {
+                        ctx.erts_proc_exit_free(this);
+                        RunOutcome::Yield
+                    };
                 }
                 RunOutcome::WaitTimer { timeout_pos: pos }
             })

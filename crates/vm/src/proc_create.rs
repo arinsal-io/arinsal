@@ -1373,6 +1373,10 @@ impl SliceWork {
 
 #[derive(Default)]
 pub(crate) struct ProcessCold {
+    /// Result the runner's entry process reports when its exit completes (Arinsal's
+    /// embedding harness; erts has no entry process). Set where the process finishes,
+    /// before `erts_do_exit_process`, and sent at the end of `erts_continue_exit_process`.
+    pub(crate) entry_result: Option<Box<Result<crate::ScheduledResult, crate::VmError>>>,
     /// The outcome of a BIF called from native code that only the scheduler completes
     /// (ERTS_BIF_YIELD, dirty scheduling, a busy port, hibernation): the BIF returned
     /// THE_NON_VALUE with TRAP to its call, and the scheduler finishes the call with this
@@ -1822,6 +1826,11 @@ impl Process {
         let previous = std::mem::replace(&mut self.entry_started, started);
         self.set_slow(Self::SLOW_NOT_STARTED, !started);
         previous
+    }
+    /// Whether a yielded exit waits (ERTS_CONTINUE_EXIT_DIST_PEND_SPAWN_MONITORS suspends the
+    /// process) rather than yields with reductions used up: the phase in `p->u.terminate`.
+    pub(crate) fn exit_waits(&self) -> bool {
+        self.exit_cont.as_ref().is_some_and(|cont| cont.pend_spawn)
     }
     #[inline(always)]
     pub(crate) fn has_exit_cont(&self) -> bool {
@@ -2379,11 +2388,6 @@ pub(crate) struct ExitCont {
     pub(crate) reason: arinsal_term::Term,
     /// Storage of the owned table whose release was interrupted (`FREE_OWNED_TABLE`).
     pub(crate) garbage: Option<arinsal_ets::Garbage>,
-    /// Result the entry process reports once exit completes, and its exit code. Boxed: only
-    /// the runner's entry process has one, and the exit state stays the size of erts'
-    /// `continue_exit_state` for every other process.
-    pub(crate) entry_result: Option<Box<Result<crate::ScheduledResult, crate::VmError>>>,
-    pub(crate) code: u64,
     /// The phases up to ERTS_CONTINUE_EXIT_DIST_MONITORS are done; the exit continues at
     /// ERTS_CONTINUE_EXIT_DIST_PEND_SPAWN_MONITORS (erl_process.c:14674), OTP-29.1.1.
     pub(crate) pend_spawn: bool,

@@ -1016,8 +1016,6 @@ pub enum RunOutcome {
     /// Port of erts/emulator/beam/erl_hl_timer.c (erts_set_proc_timer_term computes the
     /// position once, while the process runs `i_wait_timeout`), OTP-29.1.1.
     WaitTimer { timeout_pos: u64 },
-    /// The task has terminated; reason interpretation belongs to the VM.
-    Exit(u64),
     /// The task must continue on a dirty scheduler of this kind. A task that
     /// returns [`RunOutcome::Yield`] or [`RunOutcome::Wait`] from a dirty
     /// scheduler moves back to the normal run queues.
@@ -5879,6 +5877,26 @@ impl<M: SignalMessage> RunCtx<'_, M> {
             self.inner.mark_exited(self.proc.pid);
         }
     }
+    /// The end of the running process's exit, from erts_continue_exit_process: the ptab delete
+    /// of ERTS_CONTINUE_EXIT_FREE (when `begin_exit` has not done it), FREE without ACTIVE in
+    /// `p->state` (the inactivation of ERTS_CONTINUE_EXIT_DONE), then `delete_process`, whose
+    /// signal queue cleanup closes the in-queue and reaps what it still holds. The schedule-out
+    /// reads FREE from the state word; nothing is returned to it.
+    // Port of erts/emulator/beam/erl_process.c:14406-14470 (ERTS_CONTINUE_EXIT_FREE:
+    // erts_ptab_delete_element, `p->state |= ERTS_PSFLG_FREE`), 14700-14760
+    // (ERTS_CONTINUE_EXIT_DONE: inactivate) and 14777 (delete_process), OTP-29.1.1.
+    pub fn erts_proc_exit_free<T: Task<Message = M>>(&mut self, task: &mut T) {
+        self.begin_exit();
+        self.proc.run_state().store(EXITED, Ordering::SeqCst);
+        // Close the in-queue under the msgq lock and reap what it still holds; a later
+        // enqueue fails and the sender sees the process gone.
+        let mut remaining = SignalQueue::default();
+        if self.proc.input.close_into(&mut remaining) > 0 {
+            let events = std::iter::from_fn(|| remaining.pop_front()).collect();
+            task.reap_signals(self.proc.pid, events);
+        }
+        task.delete_process();
+    }
     /// Cancel pending BIF timers aimed at a terminating process.
     pub fn cancel_target_timers(&mut self, pid: Pid) {
         self.inner.cancel_target_timers(pid);
@@ -8877,7 +8895,10 @@ mod proxy_requeue_tests {
                         return if runs.fetch_add(1, Ordering::AcqRel) == 0 {
                             RunOutcome::Yield
                         } else {
-                            RunOutcome::Exit(0)
+                            {
+                                ctx.erts_proc_exit_free(this);
+                                RunOutcome::Yield
+                            }
                         };
                     }
                     Probe::SelfWaker(runs) => {
@@ -8886,7 +8907,10 @@ mod proxy_requeue_tests {
                             ctx.send(me, ()).unwrap();
                         } else {
                             // The message is never consumed, so leave for good on the second run.
-                            return RunOutcome::Exit(0);
+                            return {
+                                ctx.erts_proc_exit_free(this);
+                                RunOutcome::Yield
+                            };
                         }
                     }
                 }
@@ -9256,28 +9280,6 @@ struct SliceEnd<T: Task> {
     active_ns: u64,
 }
 
-/// The part of a process exit that needs the process cell: close the in-queue, reap what it
-/// holds, delete the process.
-// Port of erts/emulator/beam/erl_process.c (erts_schedule: the exiting process is handed to
-// erts_continue_exit_process while it is still locked), OTP-29.1.1.
-fn exit_cleanup<T: Task>(inner: &Inner<T>, process: &Process<T>, cell: &mut TaskCell<T>) {
-    let ptab_deleted = process.ptab_deleted.swap(true, Ordering::SeqCst);
-    process.run_state().store(EXITED, Ordering::SeqCst);
-    // Close the in-queue under the msgq lock and reap what it still holds; a later
-    // enqueue fails and the sender sees the process gone.
-    let mut remaining = SignalQueue::default();
-    if process.input.close_into(&mut remaining) > 0 {
-        let events = std::iter::from_fn(|| remaining.pop_front()).collect();
-        cell.task_mut().reap_signals(process.pid, events);
-    }
-    cell.task_mut().delete_process();
-    // `begin_exit` deletes the element at ERTS_CONTINUE_EXIT_FREE. Keep the forced-exit
-    // fallback, but use the process state as erts' FREE bit instead of looking up the pid again.
-    if !ptab_deleted {
-        inner.table.remove(process.pid);
-    }
-}
-
 /// Schedule a finished slice out: reductions executed, the outcome's state transition and the
 /// enqueue decision. Shared by the normal scheduler loop (inside `erts_schedule`'s one borrow
 /// of the scheduler state) and by `run_slice` (dirty schedulers, no `Local`).
@@ -9359,7 +9361,24 @@ fn schedule_out<T: Task>(
             Ordering::AcqRel,
         );
     }
+    // Port of erts/emulator/beam/erl_process.c:9742-9780 (erts_schedule: schedule_out_process
+    // works from `state`, and `state & ERTS_PSFLG_FREE` marks a process that finished its
+    // exit), OTP-29.1.1: erts_continue_exit_process set FREE in `p->state` itself, so the
+    // process is not enqueued again whatever the slice ended with.
+    let freed = process.input.state().load(Ordering::Acquire) & psflg::FREE != 0;
     match outcome {
+        _ if freed => {
+            // Port of erts/emulator/beam/erl_process.c:14209 (erts_do_exit_process cancels
+            // the process timer), OTP-29.1.1.
+            inner.cancel_proc_timer(&process);
+            if dirty.is_some() {
+                // Already outside the normal run queue accounting.
+            } else if let Some(local) = local.as_deref_mut() {
+                local.record_waiting(&process);
+            } else {
+                inner.record_waiting(&process);
+            }
+        }
         RunOutcome::Dirty(kind) => {
             // Port of erts/emulator/beam/erl_process.c:9873 (schedule_out to a dirty run
             // queue), OTP-29.1.1.
@@ -9538,19 +9557,6 @@ fn schedule_out<T: Task>(
                 inner.place_runnable(next, local.as_deref_mut());
             }
         }
-        RunOutcome::Exit(_) => {
-            // Port of erts/emulator/beam/erl_process.c:14209 (erts_continue_exit_process
-            // cancels the process timer), OTP-29.1.1.
-            inner.cancel_proc_timer(&process);
-            if dirty.is_some() {
-                // Already outside the normal run queue accounting.
-            } else if let Some(local) = local.as_deref_mut() {
-                local.record_waiting(&process);
-            } else {
-                inner.record_waiting(&process);
-            }
-            // The in-queue was closed and reaped by `exit_cleanup` under the cell.
-        }
     }
     if let Some(local) = local {
         inner.flush_local_metrics(local);
@@ -9622,10 +9628,6 @@ fn run_slice<T: Task>(esdp: &mut ErtsSchedulerData<T>, process: ProcRef<T>) -> S
         (outcome, calls, esdp.core.virtual_reds, active_ns)
     };
     esdp.runner().flush();
-    let inner: &Inner<T> = &esdp.run_queue;
-    if matches!(outcome, RunOutcome::Exit(_)) {
-        exit_cleanup(inner, &process, &mut cell);
-    }
     drop(cell);
     SliceEnd {
         process,
@@ -9682,10 +9684,6 @@ fn run_process<T: Task>(esdp: &mut ErtsSchedulerData<T>, process: ProcRef<T>) ->
         (outcome, calls, esdp.core.virtual_reds, active_ns)
     };
     esdp.runner().flush();
-    let inner: &Inner<T> = &esdp.run_queue;
-    if matches!(outcome, RunOutcome::Exit(_)) {
-        exit_cleanup(inner, &process, &mut cell);
-    }
     drop(cell);
     SliceEnd {
         process,
@@ -11266,12 +11264,15 @@ mod worker_drop_tests {
             _budget: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
-            esdp.with_ctx(c_p, |this, _, _ctx| {
+            esdp.with_ctx(c_p, |this, _, ctx| {
                 // The last scheduler handle drops on this worker while its cell is locked.
                 match &this.slot {
                     Some(slot) => {
                         drop(slot.lock().unwrap().take());
-                        RunOutcome::Exit(0)
+                        {
+                            ctx.erts_proc_exit_free(this);
+                            RunOutcome::Yield
+                        }
                     }
                     None => RunOutcome::Wait { timeout_ms: None },
                 }

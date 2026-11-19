@@ -129,16 +129,25 @@ impl Task for ReentrantTimerTask {
     ) -> RunOutcome {
         esdp.with_ctx(c_p, |this, _, ctx| {
             let Some(scheduler) = this.scheduler.get().and_then(Weak::upgrade) else {
-                return RunOutcome::Exit(1);
+                return {
+                    ctx.erts_proc_exit_free(this);
+                    RunOutcome::Yield
+                };
             };
             let Ok(timer) = scheduler.start_timer(ctx.pid(), 60_000, 1) else {
-                return RunOutcome::Exit(2);
+                return {
+                    ctx.erts_proc_exit_free(this);
+                    RunOutcome::Yield
+                };
             };
             let remaining = scheduler.read_timer(timer);
             let canceled = scheduler.cancel_timer(timer);
             let after_cancel = scheduler.read_timer(timer);
             let _ = this.result.send((remaining, canceled, after_cancel));
-            RunOutcome::Exit(0)
+            {
+                ctx.erts_proc_exit_free(this);
+                RunOutcome::Yield
+            }
         })
     }
 }
@@ -187,10 +196,16 @@ impl Task for CrossCancelTask {
     ) -> RunOutcome {
         esdp.with_ctx(c_p, |this, _, ctx| {
             let Some(scheduler) = this.scheduler.get().and_then(Weak::upgrade) else {
-                return RunOutcome::Exit(1);
+                return {
+                    ctx.erts_proc_exit_free(this);
+                    RunOutcome::Yield
+                };
             };
             let Ok(timer) = scheduler.start_timer(ctx.pid(), 60_000, 1) else {
-                return RunOutcome::Exit(2);
+                return {
+                    ctx.erts_proc_exit_free(this);
+                    RunOutcome::Yield
+                };
             };
             this.slots.lock().unwrap()[this.me] = Some(timer);
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -199,7 +214,10 @@ impl Task for CrossCancelTask {
                     break other;
                 }
                 if Instant::now() > deadline {
-                    return RunOutcome::Exit(3);
+                    return {
+                        ctx.erts_proc_exit_free(this);
+                        RunOutcome::Yield
+                    };
                 }
                 thread::yield_now();
             };
@@ -208,7 +226,10 @@ impl Task for CrossCancelTask {
             let read = scheduler.read_timer(other);
             let canceled = scheduler.cancel_timer(other);
             let _ = this.result.send((this.me, read, canceled));
-            RunOutcome::Exit(0)
+            {
+                ctx.erts_proc_exit_free(this);
+                RunOutcome::Yield
+            }
         })
     }
 }
@@ -291,7 +312,10 @@ impl Task for Victim {
             if ctx.receive().is_some() {
                 ctx.cancel_target_timers(ctx.pid());
                 this.done.send(()).unwrap();
-                return RunOutcome::Exit(0);
+                return {
+                    ctx.erts_proc_exit_free(this);
+                    RunOutcome::Yield
+                };
             }
             RunOutcome::Wait { timeout_ms: None }
         })

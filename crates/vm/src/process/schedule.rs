@@ -113,10 +113,11 @@ impl Task for Process {
 
     // Port of erts/emulator/beam/erl_process.c:10548-10570 (trace_schedule_out), OTP-29.1.1: a
     // process that yields in its exit reports `out_exiting`, any other `out`. A process that
-    // finished its exit is freed (ERTS_PSFLG_FREE) and has reported `out_exited` itself.
-    fn trace_schedule_out(c_p: &mut CP<'_>, esdp: &mut ErtsSchedulerData, outcome: &RunOutcome) {
+    // finished its exit is freed (ERTS_PSFLG_FREE in `p->state`) and has reported `out_exited`
+    // itself.
+    fn trace_schedule_out(c_p: &mut CP<'_>, esdp: &mut ErtsSchedulerData, _outcome: &RunOutcome) {
         esdp.with_ctx(c_p, |process, data, ctx| {
-            if matches!(outcome, RunOutcome::Exit(_)) {
+            if ctx.proc_state().load(Ordering::Acquire) & arinsal_sched::psflg::FREE != 0 {
                 return;
             }
             let exiting = process.has_exit_cont();
@@ -243,13 +244,6 @@ impl Task for Process {
             *calls = process.context_switch(ctx, dirty_start);
             process.heap.set_alloc_ix(None);
             process.native = None;
-            if matches!(outcome, RunOutcome::Exit(_)) {
-                // erts finishes a suspended updater's table_updater even when the process is
-                // killed, which releases the permission; the update is already published here.
-                process
-                    .persistent_terms
-                    .release_update_permission(crate::natives::sys::persistent_owner(ctx.pid()));
-            }
             if trace_scheduling {
                 crate::trace::emit_process(
                     None,
@@ -474,7 +468,10 @@ impl Process {
     #[inline(always)]
     fn run_task(&mut self, ctx: &mut RunCtx<'_, Message>, data: &mut SchedulerData) -> RunOutcome {
         if self.runtime.is_none() {
-            return RunOutcome::Exit(1);
+            // A process with no node runtime (the in-process test harness) has no code to
+            // run; it ends at once.
+            ctx.erts_proc_exit_free(self);
+            return RunOutcome::Yield;
         }
         // Profiling allocates no side record unless runnable-proc profiling is actually on.
         // Port of erts/emulator/beam/erl_process.c:6978-6992 (schedule_process_sys_task and
@@ -488,25 +485,63 @@ impl Process {
             self.slice_mut().profile_active = true;
         }
         if self.dirty_exiting() {
-            // Exited by a dirty signal handler while queued for a dirty scheduler.
-            return RunOutcome::Exit(1);
+            // Exited by a dirty signal handler while queued for a dirty scheduler: the exit
+            // ran there, only the process structure remains to be released.
+            ctx.erts_proc_exit_free(self);
+            return RunOutcome::Yield;
         }
-        if let Some(state) = self.take_exit_cont() {
+        if self.has_exit_cont() {
             // Port of erts/emulator/beam/erl_process.c:14819 (erts_continue_exit_process
-            // yield: `p->i = beam_continue_exit`) and jit/x86/instr_common.cpp:295
-            // (emit_continue_exit), OTP-29.1.1: the code an exiting process resumes at is its
-            // exit continuation.
+            // yield: `p->i = beam_continue_exit`) and beam_emu.c / jit/x86/instr_common.cpp:295
+            // (continue_exit: `erts_continue_exit_process(c_p); goto do_schedule`),
+            // OTP-29.1.1: an exiting process resumes at its exit continuation.
             let runtime = self.runtime_handle();
-            return self.erts_continue_exit_process(runtime, ctx, data, state.into_inner());
+            with_executor(data, runtime, |executor| {
+                self.erts_continue_exit_process(&mut executor.vm, ctx)
+            });
+            return self.exit_outcome();
         }
         let result = self.run_executor(ctx, data);
         if self.dirty_exiting() {
             // Port of erts/emulator/beam/erl_process.c:10096 (need_forced_exit), OTP-29.1.1:
             // the process already terminated while the job ran; whatever the job returned,
             // only the process structure remains to be released.
-            return RunOutcome::Exit(1);
+            ctx.erts_proc_exit_free(self);
+            return RunOutcome::Yield;
         }
         self.finish_run(ctx, data, result)
+    }
+
+    /// What the slice that ran `erts_do_exit_process` / `erts_continue_exit_process` ends
+    /// with: both `goto do_schedule`, and erts_schedule reads FREE from `p->state`; an exit
+    /// that suspended at ERTS_CONTINUE_EXIT_DIST_PEND_SPAWN_MONITORS waits, any other yields.
+    // Port of erts/emulator/beam/beam_emu.c (normal_exit / continue_exit: `goto do_schedule`),
+    // OTP-29.1.1.
+    fn exit_outcome(&self) -> RunOutcome {
+        if self.exit_waits() {
+            RunOutcome::Wait { timeout_ms: None }
+        } else {
+            RunOutcome::Yield
+        }
+    }
+
+    /// The process ends with `reason`: the entry process's result is kept for the end of the
+    /// exit, then `erts_do_exit_process` runs on this scheduler's VM view.
+    fn exit_with(
+        &mut self,
+        ctx: &mut RunCtx<'_, Message>,
+        data: &mut SchedulerData,
+        reason: Term,
+        entry_result: Option<Box<Result<ScheduledResult, VmError>>>,
+    ) -> RunOutcome {
+        if entry_result.is_some() {
+            self.cold_mut().entry_result = entry_result;
+        }
+        let runtime = self.runtime_handle();
+        with_executor(data, runtime, |executor| {
+            self.erts_do_exit_process(&mut executor.vm, ctx, reason)
+        });
+        self.exit_outcome()
     }
 
     /// The node runtime this process belongs to. A slice only needs a counted reference on
@@ -581,14 +616,11 @@ impl Process {
             let entry_result = self
                 .entry
                 .then(|| Box::new(Err(VmError::Unsupported("max_heap_size".into()))));
-            let runtime = self.runtime_handle();
-            return self.erts_do_exit_process(
-                runtime,
+            return self.exit_with(
                 ctx,
                 data,
                 Term::atom(arinsal_term::atoms::KILLED),
                 entry_result,
-                1,
             );
         }
         // Port of erts/emulator/beam/erl_process.c:6747-6763 (schedule_out_process), OTP-29.1.1:
@@ -669,15 +701,12 @@ impl Process {
                         stats: self.stats.snapshot(),
                     }))
                 });
-                let runtime = self.runtime_handle();
-                self.erts_do_exit_process(
-                    runtime,
+                self.exit_with(
                     ctx,
                     data,
                     // erts passes `am_normal` (beam_common.c, `erts_do_exit_process(c_p, am_normal)`).
                     Term::atom(arinsal_term::atoms::NORMAL),
                     entry_result,
-                    0,
                 )
             }
             Err(error) => {
@@ -700,8 +729,7 @@ impl Process {
                     eprintln!("arinsal boot: process {:?} exited: {error}", ctx.pid());
                 }
                 let entry_result = self.entry.then(|| Box::new(Err(error)));
-                let runtime = self.runtime_handle();
-                self.erts_do_exit_process(runtime, ctx, data, reason, entry_result, 1)
+                self.exit_with(ctx, data, reason, entry_result)
             }
         }
     }

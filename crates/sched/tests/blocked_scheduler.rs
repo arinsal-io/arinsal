@@ -24,7 +24,7 @@ impl Task for Probe {
         _: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
-        esdp.with_ctx(c_p, |this, _, _ctx| {
+        esdp.with_ctx(c_p, |this, _, ctx| {
             match this {
                 Probe::Block { running, release } => {
                     running.store(true, Ordering::Release);
@@ -36,7 +36,10 @@ impl Task for Probe {
                     done.fetch_add(1, Ordering::AcqRel);
                 }
             }
-            RunOutcome::Exit(0)
+            {
+                ctx.erts_proc_exit_free(this);
+                RunOutcome::Yield
+            }
         })
     }
 }
