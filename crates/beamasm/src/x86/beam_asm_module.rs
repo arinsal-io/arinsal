@@ -133,6 +133,55 @@ impl super::beam_asm_global::BeamGlobalAssembler {
         a.aligned_call_label(generic_bp_local)?;
         a.emit(|e| e.ret())
     }
+
+    /// Builds the position independent replacement stub that `load_nif` copies into a
+    /// function body. `self` is the process-wide global assembler, whose executable fragments
+    /// stay alive for the lifetime of every stub.
+    // Port of erts/emulator/beam/jit/beam_jit_main.cpp:542-574 (beamasm_emit_call_nif),
+    // erts/emulator/beam/jit/x86/beam_asm_module.cpp:468-500, 207-231, and
+    // erts/emulator/beam/jit/x86/instr_bif.cpp:1059-1092, OTP-29.1.1.
+    pub fn beamasm_emit_call_nif(
+        &self,
+        info: &ErtsCodeInfo,
+        normal_fptr: usize,
+        lib: usize,
+        dirty_fptr: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, AsmError> {
+        let mut ba = BeamModuleAssembler::with_fragment_addresses(3, self.ptrs().to_vec());
+        ba.emit_aligned_label(
+            ArgVal::Label(1),
+            ArgVal::Word(core::mem::size_of::<usize>() as u64),
+        )?;
+        ba.emit_i_func_info(
+            ArgVal::Word(1),
+            ArgVal::Immediate(info.mfa.module),
+            ArgVal::Immediate(info.mfa.function),
+            ArgVal::Word(info.mfa.arity),
+        )?;
+        ba.emit_aligned_label(
+            ArgVal::Label(2),
+            ArgVal::Word(core::mem::size_of::<usize>() as u64),
+        )?;
+        ba.emit_i_breakpoint_trampoline()?;
+        ba.emit_call_nif(
+            ArgVal::Word(normal_fptr as u64),
+            ArgVal::Word(lib as u64),
+            ArgVal::Word(dirty_fptr as u64),
+        )?;
+
+        // Port of `BeamModuleAssembler::codegen(char *, size_t)`: flatten, resolve
+        // cross-section fixups, relocate to `buff`, then copy the complete image there.
+        let mut code = core::mem::take(&mut ba.asm.a).finish()?;
+        let size = code.code_size();
+        if size > buf.len() {
+            return Err(AsmError::Operand("NIF call stub buffer too small"));
+        }
+        code.relocate(buf.as_mut_ptr() as u64)?;
+        let image = code.image()?;
+        buf[..image.len()].copy_from_slice(&image);
+        Ok(size)
+    }
 }
 
 /// erts `class BeamModuleAssembler : public BeamAssembler, public BeamModuleAssemblerCommon`.
@@ -1140,6 +1189,13 @@ impl BeamModuleAssembler {
         let fragment = self.ga_get(GlobalLabels::IFuncInfoShared)?;
         let target = self.resolve_fragment(fragment);
         self.asm.a.call(target)?;
+        if self.code_header.is_none() {
+            // `beamasm_emit_call_nif` uses `codegen(buff, ...)` without an int_code_end
+            // dispatch table. asmjit leaves this metadata-only call's rel32 unresolved (zero);
+            // erl_nif.c copies the function body after it, so retain those same bytes while
+            // satisfying CodeBuffer's requirement that every label be bound.
+            self.asm.bind(target)?;
+        }
         self.asm.emit(|e| e.nop())?;
         self.asm.emit(|e| e.nop())?;
         self.asm.a.embed_u8(ERTS_ASM_BP_FLAG_NONE)?;
@@ -1634,5 +1690,53 @@ mod tests {
         memory.read(address - base, &mut bytes).unwrap();
         similar_asserts::assert_eq!(bytes, [0, 1, 2, 255]);
         assert_eq!(module.get_rodata("empty"), None);
+    }
+
+    #[test]
+    fn nif_stub_copies_the_three_loader_words_after_its_prologue() {
+        use arinsal_term::{ErtsCodeMfa, Term, atoms};
+
+        let info = ErtsCodeInfo {
+            metadata: [0; 8],
+            gen_bp: 0,
+            mfa: ErtsCodeMfa {
+                module: Term::atom(atoms::ERLANG).word(),
+                function: Term::atom(atoms::LOAD_NIF).word(),
+                arity: 2,
+            },
+        };
+        let mut ga =
+            BeamGlobalAssembler::new(crate::common::process_offsets::ProcessOffsets::ERTS_X86_64)
+                .unwrap();
+        let _global_code = ga.codegen().unwrap();
+        let (normal_fptr, lib, dirty_fptr) = (0x1111_2222, 0x3333_4444, 0x5555_6666);
+        // `ErtsNifBeamStub.code.call_nif` is 64 bytes; info precedes it in the C buffer.
+        let capacity = core::mem::size_of::<ErtsCodeInfo>() + 64;
+        let (mut first, mut second) = (vec![0; capacity], vec![0; capacity]);
+        let first_size = ga
+            .beamasm_emit_call_nif(&info, normal_fptr, lib, dirty_fptr, &mut first)
+            .unwrap();
+        let second_size = ga
+            .beamasm_emit_call_nif(&info, normal_fptr, lib, dirty_fptr, &mut second)
+            .unwrap();
+
+        similar_asserts::assert_eq!(&first[..first_size], &second[..second_size]);
+        assert!(first_size <= capacity);
+        similar_asserts::assert_eq!(&first[..5], &[0xe8, 0, 0, 0, 0]);
+        // erl_nif.c copies bytes beginning at the 8-byte function prologue. The three
+        // ErtsNativeFunc words begin at ErtsCodeInfo + BEAM_ASM_NFUNC_SIZE (16 on x86).
+        let words = core::mem::size_of::<ErtsCodeInfo>() + 16;
+        assert!(first_size >= words + 3 * core::mem::size_of::<usize>());
+        let read_word = |at: usize| {
+            u64::from_le_bytes(first[at..at + 8].try_into().expect("word fits in stub"))
+        };
+        similar_asserts::assert_eq!(
+            [
+                read_word(words),
+                read_word(words + 8),
+                read_word(words + 16)
+            ],
+            [normal_fptr as u64, lib as u64, dirty_fptr as u64]
+        );
     }
 }
