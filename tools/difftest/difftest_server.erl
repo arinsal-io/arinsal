@@ -15,26 +15,9 @@ main() ->
         end
     end,
     Port = open_port({fd, 0, 1}, [{packet, 4}, binary, eof]),
-    start_parent_watchdog(),
     loop(#state{port = Port, max = Max}),
     %% Started with -s, so returning would leave the node running forever.
     erlang:halt(0).
-
-%% Halt when the Rust test process that started us is gone, even if it was
-%% killed before it could close our stdin (e.g. SIGKILL or a crashed runner).
-start_parent_watchdog() ->
-    case os:getenv("DIFFTEST_PARENT_PID") of
-        false -> ok;
-        Pid ->
-            spawn(fun() -> watch_parent(Pid) end)
-    end.
-
-watch_parent(Pid) ->
-    timer:sleep(1000),
-    case string:trim(os:cmd("kill -0 " ++ Pid ++ " 2>/dev/null && echo alive")) of
-        "alive" -> watch_parent(Pid);
-        _ -> erlang:halt(0)
-    end.
 
 loop(State = #state{port = Port, active = Active}) ->
     receive

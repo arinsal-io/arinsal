@@ -11,7 +11,9 @@ use arinsal_etf::OwnedTerm;
 use num_bigint::BigInt;
 use num_traits::FromPrimitive;
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
@@ -119,25 +121,7 @@ impl RefErl {
         let source = server_source();
         let ebin = source.parent().unwrap().join("ebin");
         std::fs::create_dir_all(&ebin)?;
-        let beam = ebin.join("difftest_server.beam");
-        let stale = beam
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .zip(source.metadata().and_then(|m| m.modified()).ok())
-            .is_none_or(|(built, src)| built < src);
-        if stale {
-            let output = Command::new("erlc")
-                .arg("-o")
-                .arg(&ebin)
-                .arg(&source)
-                .output()?;
-            if !output.status.success() {
-                return Err(Error::Protocol(
-                    String::from_utf8_lossy(&output.stderr).into(),
-                ));
-            }
-        }
+        ensure_server_beam(&source, &ebin)?;
         Ok(Self {
             process: Mutex::new(spawn(&ebin, &erl_args)?),
             next_id: AtomicU64::new(1),
@@ -329,6 +313,78 @@ fn server_source() -> std::path::PathBuf {
 fn server_ebin() -> std::path::PathBuf {
     server_source().parent().unwrap().join("ebin")
 }
+fn ensure_server_beam(source: &Path, ebin: &Path) -> Result<(), Error> {
+    let build_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(ebin.join(".difftest_server.lock"))?;
+    build_lock.lock()?;
+
+    let beam = ebin.join("difftest_server.beam");
+    let stale = beam
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .zip(source.metadata().and_then(|m| m.modified()).ok())
+        .is_none_or(|(built, src)| built < src);
+    if !stale {
+        return Ok(());
+    }
+
+    // Each compiler writes a private result; rename publishes only a complete BEAM.
+    let build_dir = BuildDir::create(ebin)?;
+    let output = Command::new("erlc")
+        .arg("-o")
+        .arg(&build_dir.0)
+        .arg(source)
+        .output()?;
+    if !output.status.success() {
+        return Err(Error::Protocol(
+            String::from_utf8_lossy(&output.stderr).into(),
+        ));
+    }
+
+    let compiled_beam = build_dir.0.join("difftest_server.beam");
+    let compiled = std::fs::read(&compiled_beam)?;
+    match std::fs::read(&beam) {
+        Ok(existing) if existing == compiled => {}
+        Ok(_) => std::fs::rename(compiled_beam, beam)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::rename(compiled_beam, beam)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+struct BuildDir(std::path::PathBuf);
+
+impl BuildDir {
+    fn create(parent: &Path) -> Result<Self, Error> {
+        static NEXT_BUILD_ID: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let id = NEXT_BUILD_ID.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(
+                ".difftest-server-build-{}-{id}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
+impl Drop for BuildDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn spawn(ebin: &std::path::Path, erl_args: &[String]) -> Result<Process, Error> {
     let mut child = Command::new("erl")
         .args(erl_args)
@@ -342,7 +398,6 @@ fn spawn(ebin: &std::path::Path, erl_args: &[String]) -> Result<Process, Error> 
             "difftest_server",
             "main",
         ])
-        .env("DIFFTEST_PARENT_PID", std::process::id().to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
