@@ -14,9 +14,12 @@ pub extern "C" fn erts_do_exit_process(c_p: *mut ProcessHeader, reason: u64) {
     let process = crate::native_hooks::process_from_header(c_p)
         .expect("erts_do_exit_process: c_p is the running process");
     let reason = crate::native_hooks::from_raw(reason);
-    crate::process::sched_data::with_sched_data(process, |vm, process, ctx| {
-        process.erts_do_exit_process(vm, ctx, reason)
+    arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
+        arinsal_sched::RunCtx::with_current(esdp, |ctx| {
+            process.erts_do_exit_process(&mut crate::Vm {}, ctx, reason)
+        })
     })
+    .flatten()
     .expect("erts_do_exit_process: called from the process's native slice");
 }
 
@@ -27,8 +30,11 @@ pub extern "C" fn erts_do_exit_process(c_p: *mut ProcessHeader, reason: u64) {
 pub extern "C" fn erts_continue_exit_process(c_p: *mut ProcessHeader) {
     let process = crate::native_hooks::process_from_header(c_p)
         .expect("erts_continue_exit_process: c_p is the running process");
-    crate::process::sched_data::with_sched_data(process, |vm, process, ctx| {
-        process.erts_continue_exit_process(vm, ctx)
+    arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
+        arinsal_sched::RunCtx::with_current(esdp, |ctx| {
+            process.erts_continue_exit_process(&mut crate::Vm {}, ctx)
+        })
     })
+    .flatten()
     .expect("erts_continue_exit_process: called from the process's native slice");
 }

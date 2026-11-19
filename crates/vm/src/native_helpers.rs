@@ -65,7 +65,7 @@ pub extern "C" fn arinsal_beamasm_raise_class(
     let raw_class = crate::stacktrace::raw_class(process, trace);
     let class = empty_class.or(raw_class).or(process.exc_class).or_else(|| {
         // x3 of `reg` holds the class atom a catch put there (found_catch).
-        let reg = crate::process::sched_data::sched_registers(process)?;
+        let reg = (crate::Vm {}).x_regs().ok()?;
         crate::exceptions::parse_class(reg[3])
     });
     // Port of erts/emulator/beam/beam_common.c (erts_sanitize_freason), OTP-29.1.1: a valid
@@ -1230,8 +1230,7 @@ pub(crate) fn bif_return(
             return bif_trap_export(process, export, trap, identity as usize);
         }
         Err(crate::VmError::Exception { reason, frame }) => {
-            let reg: &[Term] =
-                crate::process::sched_data::sched_registers(process).map_or(&[], |reg| &*reg);
+            let reg: &[Term] = (crate::Vm {}).x_regs().ok().map_or(&[], |reg| &*reg);
             match crate::process::legacy_exception_trap(process, reg, &reason, &frame) {
                 Ok(trap) => Err(trap),
                 Err(error) => {
@@ -1310,9 +1309,12 @@ pub(crate) extern "C" fn sched_bif_light<B: SchedBif>(
     process.gc_live = B::ARITY;
     // The call site a raising or suspending BIF names (`c_p->i` at the call).
     process.native_call_pc = registers.tmp_mem[6] as usize;
-    let result = crate::process::sched_data::with_sched_data(process, |vm, process, ctx| {
-        (B::BODY)(vm, process, ctx, &args[..B::ARITY])
+    let result = arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
+        arinsal_sched::RunCtx::with_current(esdp, |ctx| {
+            (B::BODY)(&mut crate::Vm {}, process, ctx, &args[..B::ARITY])
+        })
     })
+    .flatten()
     .expect("native code runs inside an executor slice, which publishes its scheduler data");
     process.native_call_pc = 0;
     bif_return(process, export, identity, light_call, result)
@@ -1347,7 +1349,7 @@ fn process_bif_error(
         if let (Some(m), Some(f)) = (atoms.text(*module), atoms.text(*function))
             && let Some(bif) = crate::beamasm_integration::bif_mfa_export(m, f, terms.len() as u8)
         {
-            if let Some(reg) = crate::process::sched_data::sched_registers(process) {
+            if let Ok(reg) = (crate::Vm {}).x_regs() {
                 reg[..terms.len()].copy_from_slice(terms);
             }
             export = bif;
@@ -1585,7 +1587,7 @@ fn set_native_bif_context(process: &mut crate::Process, bif_mfa: usize, args: &[
     if bif_mfa != 0 {
         process.heap.abi.current = bif_mfa as *const std::ffi::c_void;
     }
-    if let Some(reg) = crate::process::sched_data::sched_registers(process) {
+    if let Ok(reg) = (crate::Vm {}).x_regs() {
         let count = args.len().min(reg.len());
         reg[..count].copy_from_slice(&args[..count]);
     }

@@ -25,9 +25,8 @@ impl Vm {
         let has_bif_spec = arity <= u8::MAX as usize
             && arinsal_spec::bif_lookup(module, function, arity as u8).is_some();
         if has_bif_spec || class == ImportClass::Native {
-            let table_result = crate::process::sched_data::NativeSlice::run(self, ctx, p, |p| {
-                crate::bif_table::call_from_executor(p, reg, module, function, arity)
-            });
+            let table_result =
+                crate::bif_table::call_from_executor(p, reg, module, function, arity);
             if table_result.is_some() {
                 return table_result;
             }

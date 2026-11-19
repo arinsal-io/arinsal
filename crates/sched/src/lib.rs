@@ -94,7 +94,7 @@ use arinsal_term::ptab::{PTAB_ID_DATA_MASK, PtabIdRing};
 use proc_ref::raw::{ProcLock, ProcLockGuard};
 pub use proc_ref::{CP, SignalProbe};
 use proc_ref::{ErasedProcRef, ProcRef, TaskCell};
-pub use sched_data_key::erts_get_scheduler_data;
+pub use sched_data_key::{ProcSchedData, erts_get_scheduler_data, erts_proc_sched_data};
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -1238,6 +1238,15 @@ pub trait Task: Send + 'static {
     ) where
         Self: Sized,
     {
+    }
+    /// `p->scheduler_data` (erl_process.h: `ErtsSchedulerData *scheduler_data` in Process),
+    /// which [`erts_schedule`] sets when a normal scheduler selects the process and clears at
+    /// its schedule-out; `None` for a task without the field.
+    fn scheduler_data(&self) -> Option<&ProcSchedData<Self>>
+    where
+        Self: Sized,
+    {
+        None
     }
     /// Release task-owned runtime registrations after all workers have stopped.
     fn scheduler_shutdown(&mut self) {}
@@ -5731,6 +5740,24 @@ impl<'a, T: Task> RunCtx<'a, T> {
 }
 
 impl<T: Task> RunCtx<'_, T> {
+    /// Run `f` on the [`RunCtx`] of `esdp->current_process` and `esdp`, for callers that
+    /// reach the scheduler through `erts_proc_sched_data(c_p)` and are not yet converted to
+    /// `(c_p, esdp)`; `None` when the scheduler runs no process.
+    pub fn with_current<R>(
+        esdp: &ErtsSchedulerData<T>,
+        f: impl FnOnce(&mut RunCtx<'_, T>) -> R,
+    ) -> Option<R> {
+        let current = esdp.current_process.borrow();
+        let process = current.as_ref()?;
+        let mut ctx = RunCtx {
+            proc: &process.shared,
+            esdp,
+        };
+        Some(f(&mut ctx))
+    }
+}
+
+impl<T: Task> RunCtx<'_, T> {
     fn consumed_event(&self) {}
     /// Pid of the running task.
     pub fn pid(&self) -> Pid {
@@ -9638,12 +9665,22 @@ fn run_process<T: Task>(esdp: &ErtsSchedulerData<T>, process: ProcRef<T>) -> Sli
         // Port of erts/emulator/beam/jit/x86/process_main.cpp:200,277 and beam_emu.c:395,496
         // (process_main: copy_in_registers after erts_schedule returns, copy_out_registers
         // when the slice switches out), OTP-29.1.1.
+        // Port of erts/emulator/beam/erl_process.c:10232 (erts_schedule: `p->scheduler_data =
+        // esdp` for a normal scheduler, before trace_schedule_in), OTP-29.1.1.
+        if let Some(slot) = c_p.task().scheduler_data() {
+            slot.set_scheduler(Some(esdp));
+        }
         T::trace_schedule_in(&mut c_p, esdp);
         T::copy_in_registers(&mut c_p, &esdp.registers);
         let mut calls = 0;
         let outcome = T::run(&mut c_p, esdp, budget, &mut calls);
         T::copy_out_registers(&mut c_p, &esdp.registers);
         T::trace_schedule_out(&mut c_p, esdp, &outcome);
+        // Port of erts/emulator/beam/erl_process.c:9756 (erts_schedule: `p->scheduler_data =
+        // NULL` at the schedule-out of a normal scheduler), OTP-29.1.1.
+        if let Some(slot) = c_p.task().scheduler_data() {
+            slot.set_scheduler(None);
+        }
         if esdp.msacc_enabled.get() {
             let gc_ns = c_p.task().gc_nanoseconds();
             esdp.with_ctx(&mut c_p, |_, ctx| {

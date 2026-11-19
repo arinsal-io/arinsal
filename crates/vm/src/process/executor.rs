@@ -238,14 +238,7 @@ pub(super) fn process_main_dispatch(
         }
         reg.active_code_ix =
             crate::code_ix::global().process_code_ix(crate::trace::saves_calls(process)) as u64;
-        let native = {
-            // Port of erts `c_p->scheduler_data`: a BIF native code calls reaches this
-            // scheduler's data through the process while the slice runs.
-            let registers = &mut *reg;
-            super::sched_data::NativeSlice::run(&mut Vm {}, ctx, process, |process| {
-                crate::native_bridge::run_native_resume(process, registers, code_ptr)
-            })
-        };
+        let native = crate::native_bridge::run_native_resume(process, &mut *reg, code_ptr);
         // Native `timeout` has no scheduler context to send its trace event.
         if process.native_exit_kind != crate::proc_create::NativeExit::None
             && process.take_native_timeout_trace()

@@ -345,9 +345,12 @@ fn monitor_remote_native(
 ) -> Result<Term, VmError> {
     // The call site a suspending BIF names (`c_p->i` at the call).
     crate::native_hooks::note_call_site(process, reg);
-    let result = crate::process::sched_data::with_sched_data(process, |_vm, process, ctx| {
-        crate::dist::monitor_remote(process, ctx, args, node)
+    let result = arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
+        arinsal_sched::RunCtx::with_current(esdp, |ctx| {
+            crate::dist::monitor_remote(process, ctx, args, node)
+        })
     })
+    .flatten()
     .ok_or_else(|| VmError::Unsupported("monitor: no scheduler data".into()))?;
     process.native_call_pc = 0;
     result
@@ -1018,8 +1021,11 @@ pub(crate) fn with_sched<R>(
     f: impl FnOnce(&mut Vm, &mut Process, &mut RunCtx<'_, crate::Process>) -> R,
 ) -> Result<R, VmError> {
     crate::native_hooks::note_call_site(process, reg);
-    let result = crate::process::sched_data::with_sched_data(process, f)
-        .ok_or_else(|| VmError::Unsupported("BIF: no scheduler data".into()));
+    let result = arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
+        arinsal_sched::RunCtx::with_current(esdp, |ctx| f(&mut Vm {}, process, ctx))
+    })
+    .flatten()
+    .ok_or_else(|| VmError::Unsupported("BIF: no scheduler data".into()));
     process.native_call_pc = 0;
     result
 }

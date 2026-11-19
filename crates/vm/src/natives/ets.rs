@@ -826,9 +826,12 @@ pub(crate) fn ets_call(
     args: &[Term],
 ) -> Result<Term, VmError> {
     let pid = process.self_pid.ok_or_else(badarg)?;
-    crate::process::sched_data::with_sched_data(process, |_vm, process, ctx| {
-        call_inner(process, Some(ctx), pid, function, args)
+    arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
+        arinsal_sched::RunCtx::with_current(esdp, |ctx| {
+            call_inner(process, Some(ctx), pid, function, args)
+        })
     })
+    .flatten()
     .expect("native code runs inside an executor slice, which publishes its scheduler data")
 }
 

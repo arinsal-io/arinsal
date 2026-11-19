@@ -969,8 +969,8 @@ fn current_proc<'a>() -> Option<&'a mut Process> {
 /// `erts_atomic32_read_bset_nob(&proc->state, DIRTY_CPU_PROC | DIRTY_IO_PROC, flag)` on the
 /// state word of the process running on this normal scheduler.
 fn bset_running_dirty_psflg(c_p: &mut Process, flag: u32) {
-    crate::process::sched_data::with_sched_data(c_p, |_, _, ctx| {
-        bset_dirty_bits(ctx.proc_state(), flag)
+    arinsal_sched::erts_proc_sched_data(c_p, |_, esdp| {
+        arinsal_sched::RunCtx::with_current(esdp, |ctx| bset_dirty_bits(ctx.proc_state(), flag))
     });
 }
 

@@ -432,9 +432,10 @@ pub struct Process {
     /// One-based id of the scheduler running this process (0 outside a run), refreshed each slice
     /// like erts' `c_p->scheduler_data`.
     pub(crate) scheduler_id: u32,
-    /// `c_p->scheduler_data` while the process's native code runs: the VM view and slice
-    /// context a BIF called from that code reaches (`erts_proc_sched_data`).
-    pub(crate) scheduler_data: crate::process::sched_data::SchedulerDataPtr,
+    /// `p->scheduler_data` (erl_process.h): the data of the normal scheduler running the
+    /// process, set and cleared by `erts_schedule`; read through
+    /// [`arinsal_sched::erts_proc_sched_data`].
+    pub(crate) scheduler_data: arinsal_sched::ProcSchedData<Process>,
     /// `RunCtx::scheduler_key` the scheduler-derived state of `Process::run` was set up for.
     pub(crate) run_key: u64,
     /// The same for `Executor::run`'s scheduler-derived PID words.
@@ -2128,7 +2129,7 @@ impl Process {
             on_managed: false,
             native: None,
             scheduler_id: 0,
-            scheduler_data: crate::process::sched_data::SchedulerDataPtr::NONE,
+            scheduler_data: arinsal_sched::ProcSchedData::default(),
             run_key: 0,
             exec_key: 0,
             signal_probe: None,

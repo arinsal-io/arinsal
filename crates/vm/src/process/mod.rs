@@ -37,7 +37,6 @@ mod message_queue;
 mod receive;
 mod registers;
 mod runtime;
-pub(crate) mod sched_data;
 mod schedule;
 mod send;
 mod sig_queue;

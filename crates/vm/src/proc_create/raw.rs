@@ -68,7 +68,7 @@ pub(crate) fn initialize_spawned(
         std::ptr::addr_of_mut!((*process).native).write(None);
         std::ptr::addr_of_mut!((*process).scheduler_id).write(0);
         std::ptr::addr_of_mut!((*process).scheduler_data)
-            .write(crate::process::sched_data::SchedulerDataPtr::NONE);
+            .write(arinsal_sched::ProcSchedData::default());
         std::ptr::addr_of_mut!((*process).run_key).write(0);
         std::ptr::addr_of_mut!((*process).exec_key).write(0);
         std::ptr::addr_of_mut!((*process).signal_probe).write(None);

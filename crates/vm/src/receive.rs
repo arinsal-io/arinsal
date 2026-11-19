@@ -1152,12 +1152,15 @@ pub extern "C" fn erts_msgq_recv_marker_insert(header: *mut arinsal_beamasm::Pro
     let Some(process) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
-    let fetched = crate::process::sched_data::with_sched_data(process, |_vm, process, ctx| {
-        if process.signal_probe().is_none() {
-            process.set_signal_probe(ctx.signal_probe());
-        }
-        process.fetch_signals(ctx)
+    let fetched = arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
+        arinsal_sched::RunCtx::with_current(esdp, |ctx| {
+            if process.signal_probe().is_none() {
+                process.set_signal_probe(ctx.signal_probe());
+            }
+            process.fetch_signals(ctx)
+        })
     })
+    .flatten()
     .expect("native code runs inside an executor slice, which publishes its scheduler data");
     match fetched.and_then(|()| process.reserve_receive_marker()) {
         Ok(marker) => crate::native_hooks::raw(marker),
@@ -1222,12 +1225,15 @@ pub extern "C" fn erts_proc_sig_receive_helper(
     let Some(process) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
-    let result = crate::process::sched_data::with_sched_data(process, |_vm, process, ctx| {
-        if process.signal_probe().is_none() {
-            process.set_signal_probe(ctx.signal_probe());
-        }
-        process.receive_helper(ctx, fcalls - neg_o_reds)
+    let result = arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
+        arinsal_sched::RunCtx::with_current(esdp, |ctx| {
+            if process.signal_probe().is_none() {
+                process.set_signal_probe(ctx.signal_probe());
+            }
+            process.receive_helper(ctx, fcalls - neg_o_reds)
+        })
     })
+    .flatten()
     .expect("native code runs inside an executor slice, which publishes its scheduler data");
     let (consumed, message, get_out) = match result {
         Ok((consumed, crate::process::ReceiveHelper::Message)) => (

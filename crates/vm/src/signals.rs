@@ -1052,16 +1052,14 @@ fn call_resolved(
             // Port of erts/emulator/beam/erl_init.c (erts_internal_spawn_system_process_3:
             // erl_spawn_system_process with default options), OTP-29.1.1.
             let mut so = crate::natives::erl_process::ErlSpawnOpts::new(process.runtime);
-            let pid = crate::process::sched_data::NativeSlice::run(vm, ctx, process, |process| {
-                crate::natives::erl_process::erl_create_process(
-                    process,
-                    std::ptr::null_mut(),
-                    *module,
-                    *function,
-                    *args,
-                    &mut so,
-                )
-            })
+            let pid = crate::natives::erl_process::erl_create_process(
+                process,
+                std::ptr::null_mut(),
+                *module,
+                *function,
+                *args,
+                &mut so,
+            )
             .map_err(crate::natives::erl_process::CreateError::into_bif_error)?;
             if let (Some(pid), Some(runtime)) = (Pid::from_term(pid), process.runtime.as_ref()) {
                 runtime.system_processes.lock().unwrap().insert(pid);

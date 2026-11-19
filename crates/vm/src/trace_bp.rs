@@ -1234,22 +1234,25 @@ pub extern "C" fn erts_generic_breakpoint(
     };
     let (module, function) = (name(mfa.module), name(mfa.function));
     let arity = (mfa.arity as usize).min(registers.x_reg_array.len());
-    let debug = crate::process::sched_data::with_sched_data(process, |vm, process, ctx| {
-        let debug = generic_breakpoint(
-            vm,
-            process,
-            ctx,
-            module,
-            function,
-            &mut registers.x_reg_array[..arity],
-            local,
-            function_pc,
-        );
-        debug.unwrap_or_else(|_| {
-            crate::native_hooks::set_error(process, "system_limit");
-            false
+    let debug = arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
+        arinsal_sched::RunCtx::with_current(esdp, |ctx| {
+            let debug = generic_breakpoint(
+                &mut crate::Vm {},
+                process,
+                ctx,
+                module,
+                function,
+                &mut registers.x_reg_array[..arity],
+                local,
+                function_pc,
+            );
+            debug.unwrap_or_else(|_| {
+                crate::native_hooks::set_error(process, "system_limit");
+                false
+            })
         })
     })
+    .flatten()
     .expect("native code runs inside an executor slice, which publishes its scheduler data");
     if debug {
         arinsal_term::OP_I_DEBUG_BREAKPOINT

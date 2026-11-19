@@ -2,7 +2,6 @@
 //! generated code and the BIF return path call by symbol.
 
 use crate::Process;
-use crate::process::sched_data::with_sched_data;
 use arinsal_beamasm::ProcessHeader;
 use arinsal_term::{THE_NON_VALUE, Term, exc};
 
@@ -73,7 +72,10 @@ pub extern "C" fn erts_garbage_collect_nobump(
         return 0;
     };
     if process.gc_must_fetch_signals() {
-        let fetched = with_sched_data(process, |_, process, ctx| process.fetch_signals(ctx));
+        let fetched = arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
+            arinsal_sched::RunCtx::with_current(esdp, |ctx| process.fetch_signals(ctx))
+        })
+        .flatten();
         if !matches!(fetched, Some(Ok(()))) {
             set_system_limit(process);
             return 0;
