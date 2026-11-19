@@ -33,6 +33,7 @@ members = [
     "crates/pterm",
     "crates/cli",
     "crates/args",
+    "crates/erts_etc",
     "tools/gap_report",
 ]
 

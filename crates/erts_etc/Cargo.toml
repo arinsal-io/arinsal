@@ -1,0 +1,40 @@
+[package]
+name = "arinsal_erts_etc"
+description = "Rust ports of the standalone erts/etc programs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+rustix = { version = "1.1.5", features = ["fs"] }
+
+[build-dependencies]
+cc = "1.2.38"
+
+[dev-dependencies]
+similar-asserts = "2"
+
+[[bin]]
+name = "arinsal_erlc"
+path = "src/bin/erlc.rs"
+
+[[bin]]
+name = "arinsal_escript"
+path = "src/bin/escript.rs"
+
+[[bin]]
+name = "arinsal_ct_run"
+path = "src/bin/ct_run.rs"
+
+[[bin]]
+name = "arinsal_dialyzer"
+path = "src/bin/dialyzer.rs"
+
+[[bin]]
+name = "arinsal_typer"
+path = "src/bin/typer.rs"
