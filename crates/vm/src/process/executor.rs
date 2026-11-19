@@ -83,8 +83,8 @@ pub(super) fn trace_boot_enabled() -> bool {
 static PF_MONITOR_DOWN: AtomicU64 = AtomicU64::new(0);
 
 /// VM part of one scheduler's data: `esdp->registers` and the per-scheduler state erts keeps in
-/// `ErtsSchedulerData` (`current_process` as the NIF hub sees it, the allocator index), plus the
-/// scheduler's code view. It lives inline in [`arinsal_sched::ErtsSchedulerData`] and is
+/// `ErtsSchedulerData` (`current_process` as the NIF hub sees it, the allocator index). It
+/// lives inline in [`arinsal_sched::ErtsSchedulerData`] and is
 /// reached through `esdp` ([`arinsal_sched::erts_sched_registers`]) by the slice and the code it
 /// calls, by shared reference only: no exclusive borrow of it is held across a call into
 /// generated code.
@@ -100,9 +100,6 @@ pub struct SchedulerData {
     /// slice runs. An address derived from the slice's own borrow, as erts' `reg` is the
     /// pointer process_main hands down.
     pub(crate) registers_addr: std::cell::Cell<usize>,
-    /// The scheduler's code view, created on its first process turn. Lent out for each use
-    /// ([`lend_vm`]), so no borrow of it outlives the statement that needs it.
-    vm: std::cell::Cell<Option<Box<Vm>>>,
     /// `esdp->current_process`, shared with this scheduler thread's NIF hub.
     pub(super) current_process: crate::natives::nif::CurrentProcess,
     /// The scheduler thread's hub is bound to `current_process`.
@@ -125,65 +122,11 @@ impl Default for SchedulerData {
         Self {
             registers,
             registers_addr: std::cell::Cell::new(0),
-            vm: std::cell::Cell::new(None),
             current_process: Default::default(),
             hub_bound: std::cell::Cell::new(false),
             alloc_ix: std::cell::Cell::new(None),
         }
     }
-}
-
-/// The scheduler's code view lent for one use; it goes back into the scheduler data on drop.
-pub(crate) struct VmLease<'a> {
-    data: &'a SchedulerData,
-    vm: Option<Box<Vm>>,
-}
-
-impl std::ops::Deref for VmLease<'_> {
-    type Target = Vm;
-    fn deref(&self) -> &Vm {
-        self.vm.as_deref().expect("lent")
-    }
-}
-
-impl std::ops::DerefMut for VmLease<'_> {
-    fn deref_mut(&mut self) -> &mut Vm {
-        self.vm.as_deref_mut().expect("lent")
-    }
-}
-
-impl Drop for VmLease<'_> {
-    fn drop(&mut self) {
-        self.data.vm.set(self.vm.take());
-    }
-}
-
-/// The code view of the scheduler whose data is `esdp`, for one use. The scheduler's first
-/// process turn created it ([`init_scheduler_vm`]); a use while it is already lent is a bug
-/// in the caller, which held a lease across code that needs it again.
-#[inline(always)]
-pub(crate) fn lend_vm(esdp: &ErtsSchedulerData) -> VmLease<'_> {
-    let data = arinsal_sched::erts_sched_registers(esdp);
-    let vm = data.vm.take();
-    assert!(vm.is_some(), "the scheduler's code view is already lent");
-    VmLease { data, vm }
-}
-
-/// Creates the scheduler's code view for `runtime` on its first process turn. Kept out of
-/// line: the code replica is built once per scheduler, not in the frame of every turn.
-#[inline(always)]
-pub(super) fn init_scheduler_vm(esdp: &ErtsSchedulerData, runtime: &'static Runtime) {
-    let data = arinsal_sched::erts_sched_registers(esdp);
-    let vm = data.vm.take();
-    data.vm
-        .set(Some(vm.unwrap_or_else(|| new_scheduler_vm(runtime))));
-}
-
-#[cold]
-#[inline(never)]
-fn new_scheduler_vm(_runtime: &'static Runtime) -> Box<Vm> {
-    arinsal_nif_zlib::set_scheduler_caller(crate::natives::nif::scheduler_caller);
-    Box::new(Vm::shared_replica())
 }
 
 /// How the entry loop goes on after a native call's exit was dispatched.
@@ -200,14 +143,13 @@ pub(super) fn trace_native_return_event(
     ctx: &mut RunCtx<'_, crate::Process>,
     event: crate::trace::NativeReturnEvent,
 ) -> Result<(), VmError> {
-    let esdp = ctx.esdp();
     match event {
         crate::trace::NativeReturnEvent::Return {
             function_pc,
             session,
             value,
         } => crate::trace::native_return_event(
-            &mut lend_vm(esdp),
+            &mut Vm {},
             process,
             ctx,
             function_pc,
@@ -216,7 +158,7 @@ pub(super) fn trace_native_return_event(
             false,
         ),
         crate::trace::NativeReturnEvent::ReturnTo { session, target } => {
-            crate::trace::native_return_to_event(&mut lend_vm(esdp), process, ctx, session, target)
+            crate::trace::native_return_to_event(&mut Vm {}, process, ctx, session, target)
         }
     }
 }
@@ -272,7 +214,6 @@ pub(super) fn process_main_dispatch(
     ran: &mut bool,
     sys_task_run: bool,
 ) -> Option<Result<RunState, VmError>> {
-    let esdp = ctx.esdp();
     let mut first = true;
     loop {
         let code_ptr = process.native_pc()?;
@@ -301,7 +242,7 @@ pub(super) fn process_main_dispatch(
             // Port of erts `c_p->scheduler_data`: a BIF native code calls reaches this
             // scheduler's data through the process while the slice runs.
             let registers = &mut *reg;
-            super::sched_data::NativeSlice::run(&mut lend_vm(esdp), ctx, process, |process| {
+            super::sched_data::NativeSlice::run(&mut Vm {}, ctx, process, |process| {
                 crate::native_bridge::run_native_resume(process, registers, code_ptr)
             })
         };
@@ -309,12 +250,12 @@ pub(super) fn process_main_dispatch(
         if process.native_exit_kind != crate::proc_create::NativeExit::None
             && process.take_native_timeout_trace()
         {
-            crate::trace::timeout_event(Some(&mut *lend_vm(esdp)), process, ctx);
+            crate::trace::timeout_event(Some(&mut Vm {}), process, ctx);
         }
         let outcome = match native {
             Ok(outcome) => outcome,
             Err(VmError::Trap(trap)) => {
-                match crate::exceptions::resume(&mut lend_vm(esdp), process, Some(ctx), trap) {
+                match crate::exceptions::resume(&mut Vm {}, process, Some(ctx), trap) {
                     Err(error) => return Some(Err(error)),
                     Ok(Some(error)) => {
                         return Some(Err(error));

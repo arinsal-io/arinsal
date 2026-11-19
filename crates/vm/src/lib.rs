@@ -156,7 +156,7 @@ mod boot_loop1_shared_tests {
                 &[],
             )
             .unwrap();
-        let mut vm = Vm::shared_replica();
+        let mut vm = Vm {};
         let id = vm.load_bytes(&beam).unwrap();
         let code = crate::code_ix::code_tables(crate::code_ix::erts_active_code_ix());
         assert_eq!(code.modules[id].name, "boot_loop1_shared");

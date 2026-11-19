@@ -12,8 +12,6 @@ pub(super) fn context_switch(
     outcome: arinsal_beamasm::ExitReason,
     code_ptr: usize,
 ) -> Result<Flow, VmError> {
-    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
-    let esdp = ctx.esdp();
     match outcome {
         arinsal_beamasm::ExitReason::Yield => {
             #[cfg(target_arch = "aarch64")]
@@ -135,14 +133,12 @@ pub(super) fn context_switch(
                     process.heap.release_stack(1);
                 }
                 let live = usize::from(live);
-                let mut vm = lend_vm(esdp);
-                let handler = vm.load_named("erts_internal").is_ok_and(|id| {
+                let handler = (Vm {}).load_named("erts_internal").is_ok_and(|id| {
                     crate::code_ix::code_tables(crate::code_ix::erts_active_code_ix()).modules[id]
                         .functions
                         .iter()
                         .any(|(_, name, arity)| *name == "breakpoint" && *arity == 4)
                 });
-                drop(vm);
                 // The handler's own breakpoints are not reported.
                 let cycle = function.module == "erts_internal"
                     && function.function == "breakpoint"
@@ -216,7 +212,7 @@ pub(super) fn context_switch(
                 reg.x_reg_array[5] = Term::atom(handler_function);
                 process.gc_live = 4;
                 process.native_apply = true;
-                let result = lend_vm(esdp).apply_fixed(process, 4, Some(ctx));
+                let result = (Vm {}).apply_fixed(process, 4, Some(ctx));
                 process.native_apply = false;
                 match result? {
                     crate::ImportOutcome::Dispatch => {}
@@ -255,7 +251,7 @@ pub(super) fn context_switch(
                 // array, which is the process's X file.
                 let arity = usize::from(function.arity).min(reg.x_reg_array.len());
                 let actions = crate::trace::executor_native_call_event(
-                    &mut lend_vm(esdp),
+                    &mut Vm {},
                     process,
                     ctx,
                     &function,
@@ -279,7 +275,7 @@ pub(super) fn context_switch(
                     // tail-call the process-configured breakpoint handler.
                     process.gc_live = arity;
                     super::executor::bump_fcalls(process, 1);
-                    let called = lend_vm(esdp).call_debug_breakpoint_handler(
+                    let called = (Vm {}).call_debug_breakpoint_handler(
                         process,
                         function.module,
                         function.function,
@@ -364,7 +360,7 @@ pub(super) fn context_switch(
                     ))));
                 };
                 process.native_apply = true;
-                let outcome = lend_vm(esdp).trap_to_export(process, trap, Some(ctx));
+                let outcome = (Vm {}).trap_to_export(process, trap, Some(ctx));
                 process.native_apply = false;
                 // The trap export is the same BIF and failed after its trap:
                 // ERTS_BIF_ERROR_TRAPPED raises it in the process, as below.
@@ -382,7 +378,7 @@ pub(super) fn context_switch(
                     };
                     if let Some(traced) = traced {
                         let args = vec![Term::NIL; *arity];
-                        lend_vm(esdp).trace_native_return_outcome(
+                        (Vm {}).trace_native_return_outcome(
                             process, ctx, module, function, &args, traced,
                         );
                     }
@@ -398,7 +394,7 @@ pub(super) fn context_switch(
                             process.heap.release_stack(1);
                         }
                         if let Some(error) =
-                            crate::exceptions::resume(&mut lend_vm(esdp), process, Some(ctx), trap)?
+                            crate::exceptions::resume(&mut Vm {}, process, Some(ctx), trap)?
                         {
                             return Ok(Flow::Break(Err(error)));
                         }
@@ -479,10 +475,10 @@ pub(super) fn context_switch(
                     Some(match export.function.as_str() {
                         "make_fun" => {
                             let args = [reg.x_reg_array[0], reg.x_reg_array[1], reg.x_reg_array[2]];
-                            lend_vm(esdp).make_export_fun(process, &args)
+                            (Vm {}).make_export_fun(process, &args)
                         }
-                        "fun_info" => lend_vm(esdp).fun_info(process, export.arity == 2),
-                        _ => lend_vm(esdp).fun_info_mfa(process),
+                        "fun_info" => (Vm {}).fun_info(process, export.arity == 2),
+                        _ => (Vm {}).fun_info_mfa(process),
                     })
                 } else {
                     // Port of erts/emulator/beam/jit/arm/process_main.cpp
@@ -505,7 +501,7 @@ pub(super) fn context_switch(
                     let position_before = process.position_marker();
                     process.native_call_pc = call_site_pc;
                     let traced = if export.is_bif_traced() {
-                        lend_vm(esdp).trace_native_call_named(
+                        (Vm {}).trace_native_call_named(
                             process,
                             ctx,
                             &export.module,
@@ -534,7 +530,7 @@ pub(super) fn context_switch(
                                 .is_some_and(|word| word.tagged_word() as usize == resume_pc),
                     );
                     process.heap.set_bif_hidden_words(hidden);
-                    let result = lend_vm(esdp).dispatch_native(
+                    let result = (Vm {}).dispatch_native(
                         process,
                         ctx,
                         &export.module,
@@ -563,8 +559,7 @@ pub(super) fn context_switch(
                         other => other,
                     };
                     if let (Some((module, function, args)), Some(result)) = (&traced, &result) {
-                        lend_vm(esdp)
-                            .trace_native_return(process, ctx, module, function, args, result);
+                        (Vm {}).trace_native_return(process, ctx, module, function, args, result);
                     }
                     // Port of erts/emulator/beam/beam_bif_load.c:793
                     // (call_on_load_function_1), OTP-29.1.1: the BIF traps
@@ -626,12 +621,9 @@ pub(super) fn context_switch(
                             {
                                 process.heap.release_stack(1);
                             }
-                            if let Some(error) = crate::exceptions::resume(
-                                &mut lend_vm(esdp),
-                                process,
-                                Some(ctx),
-                                trap,
-                            )? {
+                            if let Some(error) =
+                                crate::exceptions::resume(&mut Vm {}, process, Some(ctx), trap)?
+                            {
                                 return Ok(Flow::Break(Err(error)));
                             }
                             process.heap.abi.exc.freason = 0;
@@ -738,7 +730,7 @@ pub(super) fn context_switch(
                     // Port of beam_common.c (call_error_handler): with the code
                     // server up, the error handler loads the module.
                     let loaded = {
-                        let mut vm = lend_vm(esdp);
+                        let mut vm = Vm {};
                         if vm.unloaded_on_load(process, &export.module)
                             || vm.should_autoload(process, &export.module)
                         {
@@ -751,7 +743,7 @@ pub(super) fn context_switch(
                         Ok(module_id) => module_id,
                         Err(_) => {
                             let saved = reg.x_reg_array[..usize::from(export.arity)].to_vec();
-                            let called = lend_vm(esdp).call_undefined_function(
+                            let called = (Vm {}).call_undefined_function(
                                 process,
                                 &export.module,
                                 &export.function,
@@ -761,7 +753,7 @@ pub(super) fn context_switch(
                                 Ok(outcome) => outcome,
                                 Err(error) => {
                                     if let Some(error) = raise_undefined_call(
-                                        &mut lend_vm(esdp),
+                                        &mut Vm {},
                                         process,
                                         ctx,
                                         &saved,
@@ -817,7 +809,7 @@ pub(super) fn context_switch(
                     });
                 if let Some(function) = function {
                     let actions = crate::trace::executor_native_call_event(
-                        &mut lend_vm(esdp),
+                        &mut Vm {},
                         process,
                         ctx,
                         &function,
@@ -843,13 +835,13 @@ pub(super) fn context_switch(
                 .map(arinsal_loader::ExportSlot::target);
             if let Some(target_ip) = target_ip {
                 process.gc_live = usize::from(export.arity);
-                lend_vm(esdp).set_position(process, module_id, target_ip)?;
+                (Vm {}).set_position(process, module_id, target_ip)?;
                 // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp
                 // (emit_export_trampoline), OTP-29.1.1: the call's reduction is the
                 // callee's own `i_test_yield` at its native entry.
             } else {
                 let saved = reg.x_reg_array[..usize::from(export.arity)].to_vec();
-                let called = lend_vm(esdp).call_undefined_function(
+                let called = (Vm {}).call_undefined_function(
                     process,
                     &export.module,
                     &export.function,
@@ -859,7 +851,7 @@ pub(super) fn context_switch(
                     Ok(outcome) => outcome,
                     Err(error) => {
                         if let Some(error) =
-                            raise_undefined_call(&mut lend_vm(esdp), process, ctx, &saved, error)?
+                            raise_undefined_call(&mut Vm {}, process, ctx, &saved, error)?
                         {
                             return Ok(Flow::Break(Err(error)));
                         }

@@ -65,21 +65,20 @@ impl Task for Process {
             // `p->scheduler_data = esdp` precedes the trace (erl_process.c:10232).
             process.scheduler_id = ctx.scheduler_id().map_or(0, |id| id as u32);
             let exiting = process.has_exit_cont();
-            let Some(runtime) = process.runtime else {
+            if process.runtime.is_none() {
                 return;
-            };
+            }
             if process.dirty_exiting()
                 || (!exiting && ctx.exit_flags().load(Ordering::Acquire) & proc_flags::TRACE == 0)
             {
                 return;
             }
-            init_scheduler_vm(esdp, runtime);
             {
                 let pid = ctx.pid();
                 if exiting {
                     let zero = [Term::small(0).expect("small zero")];
                     crate::trace::emit(
-                        Some(&mut *lend_vm(esdp)),
+                        Some(&mut Vm {}),
                         process,
                         ctx,
                         pid,
@@ -92,7 +91,7 @@ impl Task for Process {
                     let running = crate::trace::running_mfa(process, pid).unwrap_or(None);
                     let running_fields = [running.unwrap_or(Term::small(0).expect("small zero"))];
                     crate::trace::emit(
-                        Some(&mut *lend_vm(esdp)),
+                        Some(&mut Vm {}),
                         process,
                         ctx,
                         pid,
@@ -118,13 +117,12 @@ impl Task for Process {
                 return;
             }
             let exiting = process.has_exit_cont();
-            let Some(runtime) = process.runtime else {
+            if process.runtime.is_none() {
                 return;
-            };
+            }
             if !exiting && ctx.exit_flags().load(Ordering::Acquire) & proc_flags::TRACE == 0 {
                 return;
             }
-            init_scheduler_vm(esdp, runtime);
             {
                 let pid = ctx.pid();
                 if crate::trace::flags(process, pid) & crate::trace::CALL != 0 {
@@ -133,7 +131,7 @@ impl Task for Process {
                 if exiting {
                     let zero = [Term::small(0).expect("small zero")];
                     crate::trace::emit(
-                        Some(&mut *lend_vm(esdp)),
+                        Some(&mut Vm {}),
                         process,
                         ctx,
                         pid,
@@ -147,7 +145,7 @@ impl Task for Process {
                     let running = crate::trace::running_mfa(process, pid).unwrap_or(None);
                     let running_fields = [running.unwrap_or(Term::small(0).expect("small zero"))];
                     crate::trace::emit(
-                        Some(&mut *lend_vm(esdp)),
+                        Some(&mut Vm {}),
                         process,
                         ctx,
                         pid,
@@ -489,9 +487,7 @@ impl Process {
             // yield: `p->i = beam_continue_exit`) and beam_emu.c / jit/x86/instr_common.cpp:295
             // (continue_exit: `erts_continue_exit_process(c_p); goto do_schedule`),
             // OTP-29.1.1: an exiting process resumes at its exit continuation.
-            let esdp = ctx.esdp();
-            init_scheduler_vm(esdp, self.runtime_handle());
-            self.erts_continue_exit_process(&mut lend_vm(esdp), ctx);
+            self.erts_continue_exit_process(&mut Vm {}, ctx);
             return self.exit_outcome();
         }
         let result = self.run_executor(ctx);
@@ -529,22 +525,13 @@ impl Process {
         if entry_result.is_some() {
             self.cold_mut().entry_result = entry_result;
         }
-        let esdp = ctx.esdp();
-        init_scheduler_vm(esdp, self.runtime_handle());
-        self.erts_do_exit_process(&mut lend_vm(esdp), ctx, reason);
+        self.erts_do_exit_process(&mut Vm {}, ctx, reason);
         self.exit_outcome()
-    }
-
-    /// The node runtime this process belongs to. A slice only needs a counted reference on
-    /// the exit paths, so the scheduler takes it there, not on every turn.
-    fn runtime_handle(&self) -> &'static Runtime {
-        self.runtime.expect("a scheduled process has a runtime")
     }
 
     #[inline(always)]
     fn run_executor(&mut self, ctx: &mut RunCtx<'_, crate::Process>) -> Result<RunState, VmError> {
         let esdp = ctx.esdp();
-        init_scheduler_vm(esdp, self.runtime_handle());
         let data = arinsal_sched::erts_sched_registers(esdp);
         let mut result = data.registers.with(|reg| process_main(self, ctx, reg));
         // BIF_TRAP context-switches to beam_bif_export_trap. The continuation is an export

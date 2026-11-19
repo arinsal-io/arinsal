@@ -194,16 +194,13 @@ pub(super) fn process_main(
                         reg.x_reg_array[..arity].copy_from_slice(&args);
                         process.heap.abi.arity = arity as u8;
                         process.gc_live = arity;
-                        let continuation = lend_vm(esdp).apply_fixed(process, arity, Some(ctx));
+                        let continuation = (Vm {}).apply_fixed(process, arity, Some(ctx));
                         let continuation = match continuation {
                             Ok(outcome) => outcome,
                             Err(VmError::Trap(trap)) => {
-                                if let Some(error) = crate::exceptions::resume(
-                                    &mut lend_vm(esdp),
-                                    process,
-                                    Some(ctx),
-                                    trap,
-                                )? {
+                                if let Some(error) =
+                                    crate::exceptions::resume(&mut Vm {}, process, Some(ctx), trap)?
+                                {
                                     process.heap.abi.exc.freason = 0;
                                     process.heap.abi.exc.fvalue = 0;
                                     break Err(error);
@@ -276,12 +273,9 @@ pub(super) fn process_main(
                                 break Err(error);
                             }
                             Err(VmError::Trap(trap)) => {
-                                if let Some(error) = crate::exceptions::resume(
-                                    &mut lend_vm(esdp),
-                                    process,
-                                    Some(ctx),
-                                    trap,
-                                )? {
+                                if let Some(error) =
+                                    crate::exceptions::resume(&mut Vm {}, process, Some(ctx), trap)?
+                                {
                                     break Err(error);
                                 }
                                 process.heap.abi.exc.freason = 0;
@@ -404,7 +398,7 @@ pub(super) fn process_main(
                                     // scheduler's data through the process while the slice runs.
                                     let registers = &mut *reg;
                                     super::sched_data::NativeSlice::run(
-                                        &mut lend_vm(esdp),
+                                        &mut Vm {},
                                         ctx,
                                         process,
                                         |process| {
@@ -418,11 +412,7 @@ pub(super) fn process_main(
                                 if process.native_exit_kind != crate::proc_create::NativeExit::None
                                     && process.take_native_timeout_trace()
                                 {
-                                    crate::trace::timeout_event(
-                                        Some(&mut *lend_vm(esdp)),
-                                        process,
-                                        ctx,
-                                    );
+                                    crate::trace::timeout_event(Some(&mut Vm {}), process, ctx);
                                 }
                                 native
                             };
@@ -430,7 +420,7 @@ pub(super) fn process_main(
                                 Ok(outcome) => outcome,
                                 Err(VmError::Trap(trap)) => {
                                     if let Some(error) = crate::exceptions::resume(
-                                        &mut lend_vm(esdp),
+                                        &mut Vm {},
                                         process,
                                         Some(ctx),
                                         trap,
@@ -472,7 +462,7 @@ pub(super) fn process_main(
                         }
                         // Only a BIF run for a native exit keeps a redzone.
                         process.heap.clear_native_redzone();
-                        lend_vm(esdp).enter_native_position(process)
+                        (Vm {}).enter_native_position(process)
                     });
                     if sched_out {
                         break Ok(RunState::Yield);
@@ -558,14 +548,13 @@ pub(super) fn process_main(
                         eprintln!(
                             "arinsal boot: process {:?} trap in {} at pc {:?}: {:?} reason {:?}",
                             ctx.pid(),
-                            lend_vm(esdp).frame_name(process),
+                            (Vm {}).frame_name(process),
                             process.native_pc(),
                             trap.class,
                             arinsal_term::to_owned(trap.reason)
                         );
                     }
-                    let resumed =
-                        crate::exceptions::resume(&mut lend_vm(esdp), process, Some(ctx), trap)?;
+                    let resumed = crate::exceptions::resume(&mut Vm {}, process, Some(ctx), trap)?;
                     if let Some(error) = resumed {
                         break Err(error);
                     }

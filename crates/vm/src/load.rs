@@ -847,12 +847,7 @@ impl Vm {
         crate::code_ix::global();
         crate::natives::sys::initialize_statistics_origins();
         crate::erl_init::erts_set_boot_args(paths, otp_root);
-        Self {}
-    }
-
-    /// A scheduler's handle on the node's code: the code tables and the boot arguments are
-    /// erts globals, so it holds nothing.
-    pub(crate) fn shared_replica() -> Self {
+        arinsal_nif_zlib::set_scheduler_caller(crate::natives::nif::scheduler_caller);
         Self {}
     }
 
