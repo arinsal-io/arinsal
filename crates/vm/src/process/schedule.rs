@@ -115,7 +115,7 @@ impl Task for Process {
     // process that yields in its exit reports `out_exiting`, any other `out`. A process that
     // finished its exit is freed (ERTS_PSFLG_FREE in `p->state`) and has reported `out_exited`
     // itself.
-    fn trace_schedule_out(c_p: &mut CP<'_>, esdp: &ErtsSchedulerData, _outcome: &RunOutcome) {
+    fn trace_schedule_out(c_p: &mut CP<'_>, esdp: &ErtsSchedulerData) {
         esdp.with_ctx(c_p, |process, ctx| {
             if ctx.proc_state().load(Ordering::Acquire) & arinsal_sched::psflg::FREE != 0 {
                 return;
@@ -169,7 +169,7 @@ impl Task for Process {
     // Inlined into the worker loop: see `Executor::run`. The dirty scheduler
     // path (`run_slice`) gets its own copy, which the normal schedulers never execute.
     #[inline(always)]
-    fn run(c_p: &mut CP<'_>, esdp: &ErtsSchedulerData, budget: u32, calls: &mut u32) -> RunOutcome {
+    fn run(c_p: &mut CP<'_>, esdp: &ErtsSchedulerData, budget: u32, calls: &mut u32) {
         esdp.with_ctx(c_p, |process, ctx| {
             // `c_p` (the native prefix at the start of this task) and the process state word are in
             // one process struct, the state word at `offsetof(Process, state)` from `c_p`.
@@ -237,7 +237,7 @@ impl Task for Process {
                         .take_work(|w| w.dirty_pickup.take())
                         .unwrap_or_else(std::time::Instant::now)
                 });
-            let outcome = process.run_task(ctx);
+            process.run_task(ctx);
             *calls = process.context_switch(ctx, dirty_start);
             process.heap.set_alloc_ix(None);
             process.native = None;
@@ -250,7 +250,6 @@ impl Task for Process {
                     &[],
                 );
             }
-            outcome
         })
     }
 
@@ -462,12 +461,12 @@ impl Process {
     }
 
     #[inline(always)]
-    fn run_task(&mut self, ctx: &mut RunCtx<'_, crate::Process>) -> RunOutcome {
+    fn run_task(&mut self, ctx: &mut RunCtx<'_, crate::Process>) {
         if self.runtime.is_none() {
             // A process with no node runtime (the in-process test harness) has no code to
             // run; it ends at once.
             ctx.erts_proc_exit_free(self);
-            return RunOutcome::Yield;
+            return;
         }
         // Profiling allocates no side record unless runnable-proc profiling is actually on.
         // Port of erts/emulator/beam/erl_process.c:6978-6992 (schedule_process_sys_task and
@@ -484,7 +483,7 @@ impl Process {
             // Exited by a dirty signal handler while queued for a dirty scheduler: the exit
             // ran there, only the process structure remains to be released.
             ctx.erts_proc_exit_free(self);
-            return RunOutcome::Yield;
+            return;
         }
         if self.has_exit_cont() {
             // Port of erts/emulator/beam/erl_process.c:14819 (erts_continue_exit_process
@@ -492,7 +491,7 @@ impl Process {
             // (continue_exit: `erts_continue_exit_process(c_p); goto do_schedule`),
             // OTP-29.1.1: an exiting process resumes at its exit continuation.
             self.erts_continue_exit_process(&mut Vm {}, ctx);
-            return self.exit_outcome();
+            return self.exit_outcome(ctx);
         }
         let result = self.run_executor(ctx);
         if self.dirty_exiting() {
@@ -500,22 +499,53 @@ impl Process {
             // the process already terminated while the job ran; whatever the job returned,
             // only the process structure remains to be released.
             ctx.erts_proc_exit_free(self);
-            return RunOutcome::Yield;
+            return;
         }
         self.finish_run(ctx, result)
     }
 
-    /// What the slice that ran `erts_do_exit_process` / `erts_continue_exit_process` ends
-    /// with: both `goto do_schedule`, and erts_schedule reads FREE from `p->state`; an exit
-    /// that suspended at ERTS_CONTINUE_EXIT_DIST_PEND_SPAWN_MONITORS waits, any other yields.
+    /// How the slice that ran `erts_do_exit_process` / `erts_continue_exit_process` ends:
+    /// both `goto do_schedule`, and erts_schedule reads FREE from `p->state`; an exit that
+    /// suspended at ERTS_CONTINUE_EXIT_DIST_PEND_SPAWN_MONITORS waits (ACTIVE cleared), any
+    /// other stays active.
     // Port of erts/emulator/beam/beam_emu.c (normal_exit / continue_exit: `goto do_schedule`),
     // OTP-29.1.1.
-    fn exit_outcome(&self) -> RunOutcome {
+    fn exit_outcome(&self, ctx: &RunCtx<'_, crate::Process>) {
         if self.exit_waits() {
-            RunOutcome::Wait { timeout_ms: None }
-        } else {
-            RunOutcome::Yield
+            self.wait_locked(ctx, None);
         }
+    }
+
+    /// The slice ends waiting for a message: the receive timer at `timeout_pos` is set while
+    /// the process still runs (beam_jit_wait_timeout -> erts_set_proc_timer_term), a wait
+    /// without one leaves no timer behind, then `ERTS_PSFLG_ACTIVE` is cleared in `p->state`
+    /// for schedule_out_process.
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1180-1206 (beam_jit_wait_locked:
+    // `erts_atomic32_read_band_relb(&c_p->state, ~ERTS_PSFLG_ACTIVE)`), OTP-29.1.1.
+    fn wait_locked(&self, ctx: &RunCtx<'_, crate::Process>, timeout_pos: Option<u64>) {
+        match timeout_pos {
+            Some(pos) => arinsal_sched::erts_set_proc_timer_term(ctx.esdp(), pos),
+            None => {
+                if let Some(probe) = self.signal_probe() {
+                    probe.receive_timer().cancel();
+                }
+            }
+        }
+        ctx.proc_state()
+            .fetch_and(!arinsal_sched::psflg::ACTIVE, Ordering::Release);
+    }
+
+    /// The slice ends with dirty work: `ERTS_PSFLG_DIRTY_CPU_PROC` / `ERTS_PSFLG_DIRTY_IO_PROC`
+    /// in `p->state`, which schedule_out_process reads to pick the dirty run queue.
+    // Port of erts/emulator/beam/bif.c:5683-5703 (erts_schedule_bif:
+    // `erts_atomic32_read_bset_nob(&c_p->state, mask, set)`) and erl_nif.c:3466
+    // (schedule_dirty_nif), OTP-29.1.1.
+    fn schedule_dirty(ctx: &RunCtx<'_, crate::Process>, kind: arinsal_sched::DirtyKind) {
+        let set = match kind {
+            arinsal_sched::DirtyKind::Cpu => arinsal_sched::psflg::DIRTY_CPU_PROC,
+            arinsal_sched::DirtyKind::Io => arinsal_sched::psflg::DIRTY_IO_PROC,
+        };
+        ctx.proc_state().fetch_or(set, Ordering::AcqRel);
     }
 
     /// The process ends with `reason`: the entry process's result is kept for the end of the
@@ -525,12 +555,12 @@ impl Process {
         ctx: &mut RunCtx<'_, crate::Process>,
         reason: Term,
         entry_result: Option<Box<Result<ScheduledResult, VmError>>>,
-    ) -> RunOutcome {
+    ) {
         if entry_result.is_some() {
             self.cold_mut().entry_result = entry_result;
         }
         self.erts_do_exit_process(&mut Vm {}, ctx, reason);
-        self.exit_outcome()
+        self.exit_outcome(ctx)
     }
 
     #[inline(always)]
@@ -572,7 +602,7 @@ impl Process {
         &mut self,
         ctx: &mut RunCtx<'_, crate::Process>,
         result: Result<RunState, VmError>,
-    ) -> RunOutcome {
+    ) {
         if matches!(&result, Ok(RunState::Wait { .. } | RunState::Done(_)))
             && self.slice().is_some_and(|work| work.profile_active)
         {
@@ -606,13 +636,12 @@ impl Process {
                 if !ctx.scheduler_type().is_dirty()
                     && self.slice().is_some_and(|work| work.dirty_sys_gc) =>
             {
+                // ERTS_PSFLG_DIRTY_ACTIVE_SYS sends it to the dirty CPU run queue.
                 ctx.set_active(true);
                 ctx.set_dirty_active_sys();
-                RunOutcome::Dirty(arinsal_sched::DirtyKind::Cpu)
             }
             Ok(RunState::Yield) => {
                 ctx.set_active(true);
-                RunOutcome::Yield
             }
             Ok(RunState::Wait { timeout_pos }) => {
                 // Port of erts/emulator/beam/erl_process.c:9304 (erts_process_state2status),
@@ -622,10 +651,7 @@ impl Process {
                     .take_work(|work| std::mem::take(&mut work.suspend_parked).then_some(()))
                     .is_some();
                 ctx.set_active(parked);
-                match timeout_pos {
-                    Some(timeout_pos) => RunOutcome::WaitTimer { timeout_pos },
-                    None => RunOutcome::Wait { timeout_ms: None },
-                }
+                self.wait_locked(ctx, timeout_pos);
             }
             Ok(RunState::Done(term)) => {
                 if trace_boot_enabled() {
@@ -673,13 +699,14 @@ impl Process {
             }
             Err(error) => {
                 if matches!(error, VmError::Yield) {
-                    return RunOutcome::Yield;
+                    return;
                 }
                 if let VmError::Dirty(kind) = error {
                     if self.slice().is_some_and(|work| work.dirty_sys_gc) {
                         ctx.set_dirty_active_sys();
                     }
-                    return RunOutcome::Dirty(kind);
+                    Self::schedule_dirty(ctx, kind);
+                    return;
                 }
                 let reason = exit_reason_from(self, &error);
                 if matches!(&error, VmError::Raised(raised) if raised.class == arinsal_bifs::Class::Error)

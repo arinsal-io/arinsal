@@ -272,13 +272,12 @@ fn idle_process_layout_stays_compact() {
                 + arinsal_term::ProcessHeap::OWNERS_SIZE
     );
     eprintln!(
-        "Process={} ProcessHeap={} MessageHeap={} PreviousMessageHeap={} VecDeque={} RunOutcome={}",
+        "Process={} ProcessHeap={} MessageHeap={} PreviousMessageHeap={} VecDeque={}",
         std::mem::size_of::<crate::Process>(),
         std::mem::size_of::<arinsal_term::ProcessHeap>(),
         std::mem::size_of::<arinsal_term::message::MessageHeap>(),
         std::mem::size_of::<arinsal_term::ProcessHeap>(),
-        std::mem::size_of::<std::collections::VecDeque<arinsal_term::Term>>(),
-        std::mem::size_of::<arinsal_sched::RunOutcome>()
+        std::mem::size_of::<std::collections::VecDeque<arinsal_term::Term>>()
     );
 }
 

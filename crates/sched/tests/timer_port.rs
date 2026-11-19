@@ -1,4 +1,4 @@
-use arinsal_sched::{Config, Payload, RunOutcome, Scheduler, Task};
+use arinsal_sched::{Config, Payload, Scheduler, Task};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,7 +14,7 @@ impl Task for Sink {
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
         _: u32,
         _calls: &mut u32,
-    ) -> RunOutcome {
+    ) {
         esdp.with_ctx(c_p, |this, ctx| {
             while let Some(event) = ctx.receive() {
                 match event.payload {
@@ -23,7 +23,12 @@ impl Task for Sink {
                     _ => unreachable!(),
                 }
             }
-            RunOutcome::Wait { timeout_ms: None }
+            {
+                ctx.proc_state().fetch_and(
+                    !arinsal_sched::psflg::ACTIVE,
+                    std::sync::atomic::Ordering::Release,
+                );
+            }
         })
     }
 }
@@ -126,18 +131,16 @@ impl Task for ReentrantTimerTask {
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
         _: u32,
         _calls: &mut u32,
-    ) -> RunOutcome {
+    ) {
         esdp.with_ctx(c_p, |this, ctx| {
             let Some(scheduler) = this.scheduler.get().and_then(Weak::upgrade) else {
                 return {
                     ctx.erts_proc_exit_free(this);
-                    RunOutcome::Yield
                 };
             };
             let Ok(timer) = scheduler.start_timer(ctx.pid(), 60_000, 1) else {
                 return {
                     ctx.erts_proc_exit_free(this);
-                    RunOutcome::Yield
                 };
             };
             let remaining = scheduler.read_timer(timer);
@@ -146,7 +149,6 @@ impl Task for ReentrantTimerTask {
             let _ = this.result.send((remaining, canceled, after_cancel));
             {
                 ctx.erts_proc_exit_free(this);
-                RunOutcome::Yield
             }
         })
     }
@@ -193,18 +195,16 @@ impl Task for CrossCancelTask {
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
         _: u32,
         _calls: &mut u32,
-    ) -> RunOutcome {
+    ) {
         esdp.with_ctx(c_p, |this, ctx| {
             let Some(scheduler) = this.scheduler.get().and_then(Weak::upgrade) else {
                 return {
                     ctx.erts_proc_exit_free(this);
-                    RunOutcome::Yield
                 };
             };
             let Ok(timer) = scheduler.start_timer(ctx.pid(), 60_000, 1) else {
                 return {
                     ctx.erts_proc_exit_free(this);
-                    RunOutcome::Yield
                 };
             };
             this.slots.lock().unwrap()[this.me] = Some(timer);
@@ -216,7 +216,6 @@ impl Task for CrossCancelTask {
                 if Instant::now() > deadline {
                     return {
                         ctx.erts_proc_exit_free(this);
-                        RunOutcome::Yield
                     };
                 }
                 thread::yield_now();
@@ -228,7 +227,6 @@ impl Task for CrossCancelTask {
             let _ = this.result.send((this.me, read, canceled));
             {
                 ctx.erts_proc_exit_free(this);
-                RunOutcome::Yield
             }
         })
     }
@@ -303,7 +301,7 @@ impl Task for Victim {
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
         _: u32,
         _calls: &mut u32,
-    ) -> RunOutcome {
+    ) {
         esdp.with_ctx(c_p, |this, ctx| {
             if !this.started {
                 this.started = true;
@@ -314,10 +312,14 @@ impl Task for Victim {
                 this.done.send(()).unwrap();
                 return {
                     ctx.erts_proc_exit_free(this);
-                    RunOutcome::Yield
                 };
             }
-            RunOutcome::Wait { timeout_ms: None }
+            {
+                ctx.proc_state().fetch_and(
+                    !arinsal_sched::psflg::ACTIVE,
+                    std::sync::atomic::Ordering::Release,
+                );
+            }
         })
     }
 }

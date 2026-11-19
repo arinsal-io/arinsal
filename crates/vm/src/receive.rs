@@ -1090,7 +1090,7 @@ impl Process {
 
     /// `i_wait_timeout`: sets the receive timer once per receive. `Some(0)` takes the
     /// timeout now, `Some(pos)` waits with the timer at wheel position `pos` (see
-    /// [`arinsal_sched::RunOutcome::WaitTimer`]), `None` waits without a timer.
+    /// [`arinsal_sched::erts_set_proc_timer_term`]), `None` waits without a timer.
     pub(crate) fn wait_timeout(&mut self, value: Term) -> Result<Option<u64>, VmError> {
         // Port of erts/emulator/beam/emu/msg_instrs.tab:231 (F_DELAY_GC cleared), OTP-29.1.1.
         self.set_delay_gc(false);

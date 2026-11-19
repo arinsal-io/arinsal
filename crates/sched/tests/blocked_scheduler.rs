@@ -3,7 +3,7 @@
 //! (`+sfwi`, erl_process.c `runq_supervisor`), which is off by default: then the work waits
 //! until the call returns. With the supervisor on, an idle scheduler takes the work over
 //! (`wake_scheduler_on_empty_runq`, `try_steal_task`).
-use arinsal_sched::{Config, Priority, RunOutcome, Scheduler, Task};
+use arinsal_sched::{Config, Priority, Scheduler, Task};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -23,7 +23,7 @@ impl Task for Probe {
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
         _: u32,
         _calls: &mut u32,
-    ) -> RunOutcome {
+    ) {
         esdp.with_ctx(c_p, |this, ctx| {
             match this {
                 Probe::Block { running, release } => {
@@ -38,7 +38,6 @@ impl Task for Probe {
             }
             {
                 ctx.erts_proc_exit_free(this);
-                RunOutcome::Yield
             }
         })
     }

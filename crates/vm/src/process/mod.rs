@@ -3,9 +3,7 @@
 use crate::{Process, RunState, Vm, VmError};
 use arinsal_beamasm::SchedulerRegisters;
 use arinsal_pterm::RetiredArea;
-use arinsal_sched::{
-    Config, Event, Payload, Pid, RunCtx, RunOutcome, Scheduler, Signal, Task, proc_flags,
-};
+use arinsal_sched::{Config, Event, Payload, Pid, RunCtx, Scheduler, Signal, Task, proc_flags};
 
 /// erts' `Process *c_p`: the running VM process, with whole-struct provenance.
 // Port of erts/emulator/beam/erl_process.h (`Process *c_p`), OTP-29.1.1.

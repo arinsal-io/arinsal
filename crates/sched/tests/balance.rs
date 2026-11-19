@@ -1,7 +1,7 @@
 //! Run queue balancing and low priority scheduling, compared with the erts behaviour that
 //! scheduler_SUITE (equal, many_low, few_low) checks.
 
-use arinsal_sched::{Config, Priority, RunOutcome, Scheduler, Task};
+use arinsal_sched::{Config, Priority, Scheduler, Task};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -20,17 +20,15 @@ impl Task for Busy {
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
         budget: u32,
         calls: &mut u32,
-    ) -> RunOutcome {
+    ) {
         esdp.with_ctx(c_p, |this, ctx| {
             if this.stop.load(Ordering::Relaxed) {
                 return {
                     ctx.erts_proc_exit_free(this);
-                    RunOutcome::Yield
                 };
             }
             this.runs.fetch_add(1, Ordering::Relaxed);
             *calls = budget;
-            RunOutcome::Yield
         })
     }
 }

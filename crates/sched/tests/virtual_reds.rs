@@ -2,7 +2,7 @@
 // Port of erts/emulator/beam/erl_process.c:9678 (`reds = actual_reds = calls -
 // esdp->virtual_reds`) and erl_process.h:529 (ERTS_PROC_REDUCTIONS_EXECUTED), OTP-29.1.1.
 
-use arinsal_sched::{Config, RunOutcome, Scheduler, Task};
+use arinsal_sched::{Config, Scheduler, Task};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -20,14 +20,13 @@ impl Task for Slice {
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
         _: u32,
         calls: &mut u32,
-    ) -> RunOutcome {
+    ) {
         esdp.with_ctx(c_p, |this, ctx| {
             *calls = this.consumed;
             ctx.add_virtual_reds(this.virtual_reds);
             let _ = this.done.send(());
             {
                 ctx.erts_proc_exit_free(this);
-                RunOutcome::Yield
             }
         })
     }

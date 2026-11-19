@@ -3,8 +3,7 @@
 //! (erl_port_task.c erts_port_task_execute, erl_process.c schedule/try_steal_task).
 
 use arinsal_sched::{
-    Config, PortExecution, PortRunQueue, RunOutcome, RunPort, Scheduler, Task,
-    current_normal_scheduler,
+    Config, PortExecution, PortRunQueue, RunPort, Scheduler, Task, current_normal_scheduler,
 };
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -64,10 +63,9 @@ impl Task for Idle {
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
         _: u32,
         _calls: &mut u32,
-    ) -> RunOutcome {
+    ) {
         esdp.with_ctx(c_p, |this, ctx| {
             ctx.erts_proc_exit_free(this);
-            RunOutcome::Yield
         })
     }
 }
@@ -83,18 +81,16 @@ impl Task for Busy {
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
         budget: u32,
         calls: &mut u32,
-    ) -> RunOutcome {
+    ) {
         esdp.with_ctx(c_p, |this, ctx| {
             if this.0.load(Ordering::Relaxed) {
                 return {
                     ctx.erts_proc_exit_free(this);
-                    RunOutcome::Yield
                 };
             }
             this.1
                 .store(ctx.scheduler_id().unwrap_or(usize::MAX), Ordering::Relaxed);
             *calls = budget;
-            RunOutcome::Yield
         })
     }
 }

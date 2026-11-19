@@ -1,6 +1,6 @@
 //! Release-mode dummy-task benchmarks: `cargo run -r -p arinsal-sched --example bench -- all`.
 
-use arinsal_sched::{Config, Pid, RunOutcome, Scheduler, Task};
+use arinsal_sched::{Config, Pid, Scheduler, Task};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -31,7 +31,7 @@ impl Task for Dummy {
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
         budget: u32,
         calls: &mut u32,
-    ) -> RunOutcome {
+    ) {
         esdp.with_ctx(c_p, |this, ctx| {
             match &mut this.mode {
                 Mode::Forward(to) => {
@@ -42,7 +42,7 @@ impl Task for Dummy {
                         }
                         *calls += 4;
                         if *calls >= budget {
-                            return RunOutcome::Yield;
+                            return;
                         }
                     }
                 }
@@ -51,7 +51,7 @@ impl Task for Dummy {
                         this.count.fetch_add(1, Ordering::Relaxed);
                         *calls += 1;
                         if *calls >= budget {
-                            return RunOutcome::Yield;
+                            return;
                         }
                     }
                 }
@@ -61,12 +61,11 @@ impl Task for Dummy {
                         *count -= 1;
                         *calls += 4;
                         if *calls >= budget {
-                            return RunOutcome::Yield;
+                            return;
                         }
                     }
                     return {
                         ctx.erts_proc_exit_free(this);
-                        RunOutcome::Yield
                     };
                 }
                 Mode::Fanout {
@@ -80,19 +79,23 @@ impl Task for Dummy {
                         *next = (*next + 1) % receivers.len();
                         *calls += 4;
                         if *calls >= budget {
-                            return RunOutcome::Yield;
+                            return;
                         }
                     }
                     return {
                         ctx.erts_proc_exit_free(this);
-                        RunOutcome::Yield
                     };
                 }
                 Mode::Idle(started) => {
                     started.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            RunOutcome::Wait { timeout_ms: None }
+            {
+                ctx.proc_state().fetch_and(
+                    !arinsal_sched::psflg::ACTIVE,
+                    std::sync::atomic::Ordering::Release,
+                );
+            }
         })
     }
 }

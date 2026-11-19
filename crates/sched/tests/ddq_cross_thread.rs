@@ -8,7 +8,7 @@
 //! `DDQ_STRESS_SECS=20 cargo test -p arinsal-sched --test ddq_cross_thread -- --ignored`.
 
 use arinsal_alloc::typed::{AllocBlock, ErtsAlcType};
-use arinsal_sched::{Config, RunOutcome, Scheduler, Task};
+use arinsal_sched::{Config, Scheduler, Task};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -22,10 +22,9 @@ impl Task for Idle {
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
         _: u32,
         _calls: &mut u32,
-    ) -> RunOutcome {
+    ) {
         esdp.with_ctx(c_p, |this, ctx| {
             ctx.erts_proc_exit_free(this);
-            RunOutcome::Yield
         })
     }
 }

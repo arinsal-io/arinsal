@@ -936,7 +936,6 @@ mod tests {
             Arc::from([]),
         ))
     }
-    use crate::RunOutcome;
 
     /// A task type for the run queues the balance tests create.
     struct IdleTask;
@@ -947,11 +946,14 @@ mod tests {
 
         fn run(
             c_p: &mut crate::CP<'_, Self>,
-            esdp: &crate::ErtsSchedulerData<Self>,
+            _esdp: &crate::ErtsSchedulerData<Self>,
             _budget: u32,
             _calls: &mut u32,
-        ) -> RunOutcome {
-            esdp.with_ctx(c_p, |_, _ctx| RunOutcome::Wait { timeout_ms: None })
+        ) {
+            {
+                c_p.state()
+                    .fetch_and(!crate::psflg::ACTIVE, std::sync::atomic::Ordering::Release);
+            }
         }
     }
 

@@ -1,4 +1,4 @@
-use arinsal_sched::{Config, Event, Payload, Pid, RunOutcome, Scheduler, Signal, Task};
+use arinsal_sched::{Config, Event, Payload, Pid, Scheduler, Signal, Task};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,7 +15,7 @@ impl Task for Collector {
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
         _: u32,
         _calls: &mut u32,
-    ) -> RunOutcome {
+    ) {
         esdp.with_ctx(c_p, |this, ctx| {
             while let Some(Event { from, payload }) = ctx.receive() {
                 let entry = match payload {
@@ -25,7 +25,12 @@ impl Task for Collector {
                 };
                 this.output.lock().unwrap().push(entry);
             }
-            RunOutcome::Wait { timeout_ms: None }
+            {
+                ctx.proc_state().fetch_and(
+                    !arinsal_sched::psflg::ACTIVE,
+                    std::sync::atomic::Ordering::Release,
+                );
+            }
         })
     }
 }
@@ -109,12 +114,17 @@ impl Task for CountTask {
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
         _: u32,
         _calls: &mut u32,
-    ) -> RunOutcome {
+    ) {
         esdp.with_ctx(c_p, |this, ctx| {
             while ctx.receive().is_some() {
                 this.0.fetch_add(1, Ordering::Relaxed);
             }
-            RunOutcome::Wait { timeout_ms: None }
+            {
+                ctx.proc_state().fetch_and(
+                    !arinsal_sched::psflg::ACTIVE,
+                    std::sync::atomic::Ordering::Release,
+                );
+            }
         })
     }
 }
@@ -167,7 +177,7 @@ impl Task for SchedulingProbe {
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
         _budget: u32,
         _calls: &mut u32,
-    ) -> RunOutcome {
+    ) {
         esdp.with_ctx(c_p, |this, ctx| {
             let active = this.active.fetch_add(1, Ordering::AcqRel) + 1;
             this.peak.fetch_max(active, Ordering::AcqRel);
@@ -178,7 +188,6 @@ impl Task for SchedulingProbe {
             this.complete.fetch_add(1, Ordering::Release);
             {
                 ctx.erts_proc_exit_free(this);
-                RunOutcome::Yield
             }
         })
     }
@@ -196,16 +205,14 @@ impl Task for PriorityCounter {
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
         _budget: u32,
         _calls: &mut u32,
-    ) -> RunOutcome {
+    ) {
         esdp.with_ctx(c_p, |this, ctx| {
             if this.stop.load(Ordering::Acquire) {
                 return {
                     ctx.erts_proc_exit_free(this);
-                    RunOutcome::Yield
                 };
             }
             this.count.fetch_add(1, Ordering::Relaxed);
-            RunOutcome::Yield
         })
     }
 }
@@ -315,12 +322,17 @@ fn hot_mailbox_repeated_waits_do_not_lose_wakes() {
             esdp: &arinsal_sched::ErtsSchedulerData<Self>,
             _: u32,
             _calls: &mut u32,
-        ) -> RunOutcome {
+        ) {
             esdp.with_ctx(c_p, |this, ctx| {
                 if ctx.receive().is_some() {
                     this.0.fetch_add(1, Ordering::Relaxed);
                 }
-                RunOutcome::Wait { timeout_ms: None }
+                {
+                    ctx.proc_state().fetch_and(
+                        !arinsal_sched::psflg::ACTIVE,
+                        std::sync::atomic::Ordering::Release,
+                    );
+                }
             })
         }
     }
@@ -362,7 +374,7 @@ fn worker_blocks_preserve_sender_message_signal_order() {
             esdp: &arinsal_sched::ErtsSchedulerData<Self>,
             _: u32,
             _calls: &mut u32,
-        ) -> RunOutcome {
+        ) {
             esdp.with_ctx(c_p, |this, ctx| match this {
                 Work::Producer(to) => {
                     for sequence in 0..1_000 {
@@ -374,7 +386,6 @@ fn worker_blocks_preserve_sender_message_signal_order() {
                     }
                     {
                         ctx.erts_proc_exit_free(this);
-                        RunOutcome::Yield
                     }
                 }
                 Work::Sink(output) => {
@@ -386,7 +397,12 @@ fn worker_blocks_preserve_sender_message_signal_order() {
                         };
                         output.lock().unwrap().push((event.from, sequence));
                     }
-                    RunOutcome::Wait { timeout_ms: None }
+                    {
+                        ctx.proc_state().fetch_and(
+                            !arinsal_sched::psflg::ACTIVE,
+                            std::sync::atomic::Ordering::Release,
+                        );
+                    }
                 }
             })
         }
@@ -432,7 +448,7 @@ fn ping_pong_gives_external_work_a_turn() {
             esdp: &arinsal_sched::ErtsSchedulerData<Self>,
             _: u32,
             _calls: &mut u32,
-        ) -> RunOutcome {
+        ) {
             esdp.with_ctx(c_p, |this, ctx| match this {
                 Work::Ping(to, count) => {
                     if ctx.receive().is_some() {
@@ -441,13 +457,17 @@ fn ping_pong_gives_external_work_a_turn() {
                             ctx.send(*to, ()).unwrap();
                         }
                     }
-                    RunOutcome::Wait { timeout_ms: None }
+                    {
+                        ctx.proc_state().fetch_and(
+                            !arinsal_sched::psflg::ACTIVE,
+                            std::sync::atomic::Ordering::Release,
+                        );
+                    }
                 }
                 Work::Observe(count, observed) => {
                     observed.store(count.load(Ordering::Relaxed), Ordering::Release);
                     {
                         ctx.erts_proc_exit_free(this);
-                        RunOutcome::Yield
                     }
                 }
             })
@@ -496,10 +516,9 @@ fn pid_generation() {
             esdp: &arinsal_sched::ErtsSchedulerData<Self>,
             _: u32,
             _calls: &mut u32,
-        ) -> RunOutcome {
+        ) {
             esdp.with_ctx(c_p, |this, ctx| {
                 ctx.erts_proc_exit_free(this);
-                RunOutcome::Yield
             })
         }
     }
@@ -575,12 +594,12 @@ impl Task for ProgressRacer {
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
         _: u32,
         _calls: &mut u32,
-    ) -> RunOutcome {
+    ) {
         esdp.with_ctx(c_p, |this, ctx| {
             if !this.bound {
                 this.bound = true;
                 ctx.bind_scheduler(if this.blocker { 1 } else { 2 });
-                return RunOutcome::Yield;
+                return;
             }
             for _ in 0..50 {
                 if this.blocker {
@@ -590,12 +609,7 @@ impl Task for ProgressRacer {
                 }
             }
             if this.rounds.fetch_add(1, Ordering::AcqRel) + 1 >= 400 {
-                {
-                    ctx.erts_proc_exit_free(this);
-                    RunOutcome::Yield
-                }
-            } else {
-                RunOutcome::Yield
+                ctx.erts_proc_exit_free(this);
             }
         })
     }
@@ -654,12 +668,12 @@ impl Task for LaterWaiter {
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
         _: u32,
         _calls: &mut u32,
-    ) -> RunOutcome {
+    ) {
         esdp.with_ctx(c_p, |this, ctx| {
             if !this.bound {
                 this.bound = true;
                 ctx.bind_scheduler(if this.spinner { 1 } else { 2 });
-                return RunOutcome::Yield;
+                return;
             }
             if this.spinner {
                 this.spinning.store(true, Ordering::Release);
@@ -668,18 +682,16 @@ impl Task for LaterWaiter {
                 }
                 return {
                     ctx.erts_proc_exit_free(this);
-                    RunOutcome::Yield
                 };
             }
             if !this.spinning.load(Ordering::Acquire) {
-                return RunOutcome::Yield;
+                return;
             }
             let fired = Arc::clone(&this.fired);
             ctx.thread_progress_later(move || fired.store(true, Ordering::Release));
             this.scheduled.store(true, Ordering::Release);
             {
                 ctx.erts_proc_exit_free(this);
-                RunOutcome::Yield
             }
         })
     }
@@ -734,10 +746,15 @@ impl Task for Idle {
         esdp: &arinsal_sched::ErtsSchedulerData<Self>,
         _: u32,
         _calls: &mut u32,
-    ) -> RunOutcome {
+    ) {
         esdp.with_ctx(c_p, |_, ctx| {
             while ctx.receive().is_some() {}
-            RunOutcome::Wait { timeout_ms: None }
+            {
+                ctx.proc_state().fetch_and(
+                    !arinsal_sched::psflg::ACTIVE,
+                    std::sync::atomic::Ordering::Release,
+                );
+            }
         })
     }
 }
@@ -797,7 +814,7 @@ fn wait_timer_keeps_its_position_across_reentry() {
             esdp: &arinsal_sched::ErtsSchedulerData<Self>,
             _: u32,
             _calls: &mut u32,
-        ) -> RunOutcome {
+        ) {
             esdp.with_ctx(c_p, |this, ctx| {
                 while ctx.receive().is_some() {}
                 let pos = *this
@@ -807,10 +824,15 @@ fn wait_timer_keeps_its_position_across_reentry() {
                     *this.fired.lock().unwrap() = Some(Instant::now());
                     return {
                         ctx.erts_proc_exit_free(this);
-                        RunOutcome::Yield
                     };
                 }
-                RunOutcome::WaitTimer { timeout_pos: pos }
+                {
+                    arinsal_sched::erts_set_proc_timer_term(ctx.esdp(), pos);
+                    ctx.proc_state().fetch_and(
+                        !arinsal_sched::psflg::ACTIVE,
+                        std::sync::atomic::Ordering::Release,
+                    );
+                }
             })
         }
     }
