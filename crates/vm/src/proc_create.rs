@@ -217,6 +217,22 @@ impl ArgRegs {
         self.f_attached = 0;
     }
 
+    /// `REDS_IN` (`c_p->def_arg_reg[5]`): FCALLS at the start of the running slice. The slot
+    /// is free while the X file is attached, since `copy_in_registers` moved the saved
+    /// registers out; `copy_out_registers` overwrites it when the arity reaches six.
+    // Port of erts/emulator/beam/jit/x86/process_main.cpp and jit/arm/process_main.cpp
+    // (`def_arg_reg[5] = REDS_IN = FCALLS` after copy_in_registers), OTP-29.1.1.
+    #[inline]
+    pub fn reds_in(&self) -> i32 {
+        self.inline[5].tagged_word() as i32
+    }
+
+    /// Store `REDS_IN` in `c_p->def_arg_reg[5]` at schedule-in.
+    #[inline]
+    pub fn set_reds_in(&mut self, reds: i32) {
+        self.inline[5] = raw::reds_in_word(reds);
+    }
+
     /// The scheduler register file the X array belongs to while attached, null otherwise.
     /// Port of `esdp->registers` (erts reaches it through `esdp`, not `c_p`).
     #[inline]
@@ -388,9 +404,6 @@ pub struct Process {
     pub(crate) gc_live: usize,
     /// Largest total heap size seen at a collection entry since the last `max_heap_size` check.
     pub(crate) max_heap_peak: usize,
-    /// `REDS_IN`: FCALLS at the start of the current native slice.
-    /// `erts_current_reductions` is this minus the live `c_p->fcalls`.
-    pub(crate) reds_in: i32,
     /// `esdp->virtual_reds`: reductions the slice gave up through `ERTS_VBUMP_ALL_REDS` since
     /// the scheduler last folded them. They end the slice but are not the process's own work.
     pub(crate) virtual_reds: u32,
@@ -2074,7 +2087,6 @@ impl Process {
             entry_started: false,
             gc_live: 0,
             max_heap_peak: 0,
-            reds_in: 4000,
             virtual_reds: 0,
             reductions_used: 0,
             gc_deferred: false,
@@ -2735,7 +2747,6 @@ mod layout_report {
             "  Process.reductions {}",
             size_of_val(&process.heap.abi.fcalls)
         );
-        eprintln!("  Process.reds_in {}", size_of_val(&process.reds_in));
         eprintln!(
             "  Process.virtual_reds {}",
             size_of_val(&process.virtual_reds)

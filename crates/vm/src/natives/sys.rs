@@ -413,7 +413,8 @@ pub(crate) fn statistics_light(
 fn current_reductions(process: &Process) -> u64 {
     u64::try_from(
         process
-            .reds_in
+            .x
+            .reds_in()
             .saturating_sub(process.heap.abi.fcalls)
             .saturating_sub(i32::try_from(process.virtual_reds).unwrap_or(i32::MAX)),
     )

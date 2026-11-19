@@ -924,7 +924,7 @@ fn process_info_aux(
             let inflight = if matches!(src, InfoSource::Caller) {
                 // `- virtual_reds`: what ERTS_VBUMP_REDS took is not the process's own work.
                 u64::try_from(
-                    rp.reds_in
+                    rp.x.reds_in()
                         .saturating_sub(rp.heap.abi.fcalls)
                         .saturating_sub(i32::try_from(rp.virtual_reds).unwrap_or(i32::MAX)),
                 )

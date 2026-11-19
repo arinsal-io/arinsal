@@ -226,7 +226,7 @@ impl Task for Process {
         // slice's one counter starts at the budget.
         let reds_in = budget.min(i32::MAX as u32) as i32;
         self.heap.abi.fcalls = reds_in;
-        self.reds_in = reds_in;
+        self.x.set_reds_in(reds_in);
         // Port of erts/emulator/beam/beam_common.c (erts_dirty_process_main: `start_time`),
         // OTP-29.1.1: a dirty CPU scheduler charges the time from picking the process up.
         let dirty_start =
@@ -446,7 +446,7 @@ impl Process {
         let virtual_reds = std::mem::take(&mut self.virtual_reds);
         let reds_used = match ctx.scheduler_type() {
             arinsal_sched::SchedulerType::Normal => {
-                u32::try_from(self.reds_in.saturating_sub(self.heap.abi.fcalls)).unwrap_or(0)
+                u32::try_from(self.x.reds_in().saturating_sub(self.heap.abi.fcalls)).unwrap_or(0)
             }
             arinsal_sched::SchedulerType::DirtyIo => virtual_reds.saturating_add(1),
             arinsal_sched::SchedulerType::DirtyCpu => {

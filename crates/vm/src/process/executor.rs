@@ -186,7 +186,7 @@ impl Executor {
         process.slice_is_plain()
             && !process.hibernate_sched()
             && !process.dirty_bif_completed()
-            && process.reds_in > 0
+            && process.x.reds_in() > 0
             && ctx.fast_slice_ok_before_signals(sys_task_run)
             && !crate::suspend::ctx_suspended(ctx)
             && !trace_boot_enabled()

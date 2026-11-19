@@ -56,7 +56,6 @@ pub(crate) fn initialize_spawned(
         std::ptr::addr_of_mut!((*process).entry_started).write(false);
         std::ptr::addr_of_mut!((*process).gc_live).write(x_registers);
         std::ptr::addr_of_mut!((*process).max_heap_peak).write(0);
-        std::ptr::addr_of_mut!((*process).reds_in).write(4000);
         std::ptr::addr_of_mut!((*process).virtual_reds).write(0);
         std::ptr::addr_of_mut!((*process).reductions_used).write(0);
         std::ptr::addr_of_mut!((*process).gc_deferred).write(false);
@@ -136,7 +135,6 @@ fn process_fields_are_initialized(process: Process) {
         entry_started,
         gc_live,
         max_heap_peak,
-        reds_in,
         virtual_reds,
         reductions_used,
         gc_deferred,
@@ -200,7 +198,6 @@ fn process_fields_are_initialized(process: Process) {
         entry_started,
         gc_live,
         max_heap_peak,
-        reds_in,
         virtual_reds,
         reductions_used,
         gc_deferred,
@@ -248,4 +245,14 @@ fn process_fields_are_initialized(process: Process) {
         native_error_pc,
         native_exit_kind,
     ));
+}
+
+/// The word `REDS_IN` leaves in `def_arg_reg[5]`, typed as the slot's `Term`.
+// Port of erts/emulator/beam/jit/x86/process_main.cpp (`def_arg_reg[5] = REDS_IN`), OTP-29.1.1:
+// erts stores the raw reduction count in the register slot.
+pub(super) fn reds_in_word(reds: i32) -> Term {
+    // SAFETY: the slot holds REDS_IN only while the X file is attached or past the saved arity;
+    // no reader takes a term from it then (Deref, GC roots and copies see `len` registers),
+    // and `detach_save` / `grow_owned` overwrite it before it becomes a register again.
+    unsafe { Term::from_raw_bits(u64::from(reds as u32)) }
 }
