@@ -146,6 +146,7 @@ fn receive_fragments() -> Option<&'static arinsal_beamasm::receive_frag::Receive
         .get_or_init(|| {
             arinsal_beamasm::receive_frag::ReceiveFragments::new(
                 crate::receive::erts_proc_sig_receive_helper,
+                crate::beam_jit_common::beam_jit_decode_dist,
                 crate::beam_jit_common::beam_jit_wait_unlocked,
                 crate::beam_jit_common::beam_jit_wait_locked,
                 yield_fragments()?.context_switch(),

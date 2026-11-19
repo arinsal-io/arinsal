@@ -169,6 +169,7 @@ impl MessageQueue {
                 heap: None,
                 seq_token: Some(token),
                 timer_id: None,
+                dist_ext: None,
             }))),
             false,
         ));
@@ -494,6 +495,34 @@ impl MessageQueue {
         match failure {
             Some(error) => Err(error),
             None => Ok(copied),
+        }
+    }
+
+    /// The decode step of `erts_proc_sig_prep_msgq_for_inspection`: every external message is
+    /// decoded (`erts_proc_sig_decode_dist`), and one that does not decode is removed from the
+    /// queue (`remove_innerq_m_sig`) and freed (`erts_cleanup_messages`).
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_prep_msgq_for_inspection),
+    // OTP-29.1.1.
+    pub(crate) fn prep_msgq_for_inspection(&mut self, runtime: Option<&Runtime>) {
+        let mut field = self.entries.first_field();
+        loop {
+            let bad = match self.entries.at_mut(field) {
+                None => break,
+                Some(None) => false,
+                Some(Some(event)) => {
+                    let message = queued_mut(event);
+                    message.is_external()
+                        && !super::message::erts_proc_sig_decode_dist(runtime, message, true)
+                }
+            };
+            if bad {
+                drop(self.entries.unlink_field(field));
+                continue;
+            }
+            match self.entries.next_of(field) {
+                Some(next) => field = next,
+                None => break,
+            }
         }
     }
 

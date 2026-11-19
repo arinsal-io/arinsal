@@ -507,6 +507,46 @@ fn dist_mixed_otp_to_arinsal_pid_name_alias_and_rich_payload() {
     assert!(output.contains("DIST_MIXED_OK"), "{output}");
 }
 
+/// Messages from an OTP node wait undecoded in the receiver's queue (erts_queue_dist_message):
+/// `process_info(messages)` decodes them (erts_proc_sig_prep_msgq_for_inspection), atoms that
+/// arrive only through the atom cache are translated (ATOM_CACHE_REF), the receive decodes the
+/// rest (beam_jit_decode_dist), and a send to a name nobody has is dropped without taking the
+/// connection down (dist.c, DOP_REG_SEND).
+#[test]
+fn dist_mixed_otp_messages_decoded_on_receive() {
+    let _serial = serial_test();
+    let id = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
+    let cookie = format!("dm_cookie_{}_{id:04x}", std::process::id() % 100_000);
+    let host = short_hostname();
+    let (_arinsal, node) = start_arinsal_server(&cookie, &host);
+    let n = node_literal(&node);
+    let expression = format!(
+        concat!(
+            "N={n}, pong=net_adm:ping(N), ok=net_kernel:monitor_nodes(true), ",
+            "Me=self(), ",
+            "SpawnRef=erlang:spawn_request(N,fun() -> receive go -> ok end, ",
+            "Got=[receive M -> M after 5000 -> timeout end || _ <- [1,2,3]], Me ! {{got,self(),Got}} end,[]), ",
+            "Pid=receive {{spawn_reply,SpawnRef,ok,P}} -> P after 10000 -> exit(no_spawn_reply) end, ",
+            "New=list_to_atom(\"dist_deferred_\" ++ integer_to_list(erlang:unique_integer([positive]))), ",
+            "Msgs=[{{one,New,Me}}, #{{New => [1 bsl 70, <<\"bin\">>]}}, {{three,make_ref(),[New,New]}}], ",
+            "[Pid ! M || M <- Msgs], ",
+            "{{nobody_registered_here,N}} ! dropped, ",
+            "Wait=fun Again(0, Last) -> exit({{no_messages, Last, Msgs}}); Again(C, _) -> ",
+            "case erpc:call(N,erlang,process_info,[Pid,messages]) of {{messages,Msgs}} -> ok; ",
+            "Other -> timer:sleep(50), Again(C-1, Other) end end, ",
+            "ok=Wait(100, none), ",
+            "Pid ! go, ",
+            "receive {{got,Pid,Msgs}} -> ok after 10000 -> exit(no_got) end, ",
+            "receive {{nodedown,N}} -> exit(nodedown) after 200 -> ok end, ",
+            "true=lists:member(N,nodes()), ",
+            "io:format(\"DIST_MIXED_OK deferred_decode~n\")"
+        ),
+        n = n
+    );
+    let output = otp_eval(&cookie, &expression);
+    assert!(output.contains("DIST_MIXED_OK"), "{output}");
+}
+
 #[test]
 fn dist_mixed_erpc_rpc_both_directions() {
     let _serial = serial_test();

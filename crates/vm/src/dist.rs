@@ -7,7 +7,7 @@ use crate::node_tables::{self, DistState};
 use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_etf::{DistributionHeader, OwnedTerm};
-use arinsal_sched::{Event, Payload, Pid, RunCtx, Signal};
+use arinsal_sched::{Pid, RunCtx, Signal};
 use arinsal_term::{Term, TermBuilder, from_owned, global_atoms, to_owned};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -435,32 +435,199 @@ fn put_data(
         _ => return Err(badarg()),
     };
     let local_name = node_tables::this_node().0.to_owned();
-    let (handle_id, decoded) = with_dhandle_input(handle, ctx.pid(), |state| {
-        state.read = state.read.saturating_add(1);
-        let packet = arinsal_etf::decode_dist_packet_indexed(
-            &bytes,
-            &mut state.incoming_cache,
-            |name| {
-                arinsal_term::global_atoms()
-                    .intern(name)
-                    .ok()
-                    .map(|atom| atom.0)
-            },
-            |index| {
-                arinsal_term::global_atoms()
-                    .text(arinsal_term::Atom(index))
-                    .map(str::to_owned)
-            },
-        )
-        .map_err(|_| badarg())?;
-        let DistributionHeader::Start { .. } = packet.header else {
-            return Ok((state.handle, Vec::new()));
-        };
-        let decoded = arinsal_etf::decode_dist_payload_with_sizes(&packet).map_err(|_| badarg())?;
-        Ok((state.handle, decoded))
-    })?;
+    let (handle_id, sysname, connection_id, packet) =
+        with_dhandle_input(handle, ctx.pid(), |state, sysname, connection_id| {
+            state.read = state.read.saturating_add(1);
+            let packet = arinsal_etf::decode_dist_packet_indexed(
+                &bytes,
+                &mut state.incoming_cache,
+                |name| {
+                    arinsal_term::global_atoms()
+                        .intern(name)
+                        .ok()
+                        .map(|atom| atom.0)
+                },
+                |index| {
+                    arinsal_term::global_atoms()
+                        .text(arinsal_term::Atom(index))
+                        .map(str::to_owned)
+                },
+            )
+            .map_err(|_| badarg())?;
+            let DistributionHeader::Start { .. } = packet.header else {
+                return Ok((state.handle, String::new(), connection_id, None));
+            };
+            Ok((
+                state.handle,
+                sysname.to_owned(),
+                connection_id,
+                Some(packet),
+            ))
+        })?;
+    let Some(packet) = packet else {
+        return Ok(Term::atom(arinsal_term::atoms::OK));
+    };
+    let runtime = process.runtime.ok_or_else(badarg)?;
+    let (control, extp) = arinsal_etf::decode_dist_control(&packet).map_err(|_| badarg())?;
+    if is_send_op(&control) {
+        let edep = dist_ext(packet, extp, &sysname, connection_id);
+        net_message_send(runtime, handle_id, &local_name, &control, edep)?;
+        return Ok(Term::atom(arinsal_term::atoms::OK));
+    }
+    let decoded = arinsal_etf::decode_dist_payload_with_sizes(&packet).map_err(|_| badarg())?;
     route_incoming(vm, process, ctx, handle_id, &local_name, decoded)?;
     Ok(Term::atom(arinsal_term::atoms::OK))
+}
+
+/// Whether `control` is a `DOP_*SEND*` operation whose message `erts_net_message` queues
+/// undecoded (`erts_queue_dist_message` / `erts_proc_sig_send_dist_altact_msg`): every send,
+/// and a `DOP_ALTACT_SIG_SEND` that is not an exit.
+// Port of erts/emulator/beam/dist.c (erts_net_message, the DOP_REG_SEND .. DOP_ALTACT_SIG_SEND
+// cases), OTP-29.1.1.
+fn is_send_op(control: &OwnedTerm) -> bool {
+    const FLG_EXIT: u64 = 1 << 4;
+    let OwnedTerm::Tuple(parts) = control else {
+        return false;
+    };
+    match (parts.first(), parts.len()) {
+        (Some(OwnedTerm::Int(2 | 22 | 33)), 3) => true,
+        (Some(OwnedTerm::Int(12 | 23 | 34)), 4) => true,
+        (Some(OwnedTerm::Int(6)), 4) | (Some(OwnedTerm::Int(16)), 5) => true,
+        (Some(OwnedTerm::Int(37)), len) if len >= 4 => {
+            as_u64(&parts[1]).is_some_and(|flags| flags & FLG_EXIT == 0)
+        }
+        _ => false,
+    }
+}
+
+/// The `ErtsDistExternal` of the message after the control message: the payload from `extp`
+/// on, the atom translation table of the distribution header, the connection it came in on.
+// Port of erts/emulator/beam/external.c (erts_prepare_dist_ext) and dist.c (erts_net_message,
+// `edep` after the control message is decoded), OTP-29.1.1.
+fn dist_ext(
+    packet: arinsal_etf::DistributionPacket,
+    extp: usize,
+    sysname: &str,
+    connection_id: u32,
+) -> Box<crate::natives::external_dist::ErtsDistExternal> {
+    use crate::natives::external_dist::{
+        ERTS_DIST_EXT_ATOM_TRANS_TAB, ERTS_DIST_EXT_DFLAG_HDR, ErtsDistExternal,
+        ErtsDistExternalData,
+    };
+    let attab = match &packet.header {
+        DistributionHeader::Start { translations, .. } => translations
+            .atom_indices()
+            .iter()
+            .map(|index| arinsal_term::Atom(*index))
+            .collect(),
+        DistributionHeader::Continuation { .. } => Box::default(),
+    };
+    let binp = packet.payload.into_boxed_slice();
+    Box::new(ErtsDistExternal {
+        data: ErtsDistExternalData {
+            extp,
+            ext_endp: binp.len(),
+            binp,
+        },
+        flags: ERTS_DIST_EXT_DFLAG_HDR | ERTS_DIST_EXT_ATOM_TRANS_TAB,
+        connection_id,
+        heap_size: -1,
+        dep: global_atoms()
+            .intern(sysname)
+            .unwrap_or(arinsal_term::atoms::NONAME),
+        attab,
+        size_state: Default::default(),
+    })
+}
+
+/// The `DOP_*SEND*` cases of `erts_net_message`: the message is queued on the receiver with
+/// its payload still encoded; a send to a name or alias nobody has is dropped.
+// Port of erts/emulator/beam/dist.c (erts_net_message: DOP_REG_SEND, DOP_REG_SEND_TT,
+// DOP_SEND, DOP_SEND_TT, DOP_SEND_SENDER, DOP_SEND_SENDER_TT, DOP_ALIAS_SEND,
+// DOP_ALIAS_SEND_TT, DOP_ALTACT_SIG_SEND), OTP-29.1.1.
+fn net_message_send(
+    runtime: &'static crate::process::Runtime,
+    handle: u64,
+    local: &str,
+    control: &OwnedTerm,
+    edep: Box<crate::natives::external_dist::ErtsDistExternal>,
+) -> Result<(), VmError> {
+    let OwnedTerm::Tuple(parts) = control else {
+        return Err(badarg());
+    };
+    let Some(OwnedTerm::Int(op)) = parts.first() else {
+        return Err(badarg());
+    };
+    let sched = runtime.scheduler()?;
+    let altact = |from: Pid, target: Pid, message: Message| {
+        sched
+            .send(from, target, message)
+            .map_err(|error| VmError::Unsupported(format!("dist altact send: {error}")))
+    };
+    match *op {
+        2 | 22 | 12 | 23 => {
+            let target = local_pid(&parts[2], local).ok_or_else(badarg)?;
+            let from = if matches!(*op, 22 | 23) {
+                remote_proxy(handle, &parts[1])?
+            } else {
+                target
+            };
+            crate::process::erts_queue_dist_message(sched, target, edep, from)
+        }
+        6 | 16 => {
+            let OwnedTerm::Atom(name) = &parts[3] else {
+                return Err(badarg());
+            };
+            match runtime.reg.whereis_proc_str(name) {
+                Some(target) => {
+                    crate::process::erts_queue_dist_message(sched, target, edep, target)
+                }
+                None => Ok(()),
+            }
+        }
+        33 | 34 => {
+            let OwnedTerm::Ref { .. } = &parts[2] else {
+                return Err(badarg());
+            };
+            let reference = remote_ref_id(&parts[2]).ok_or_else(badarg)?;
+            match remote_alias_pid(&parts[2]) {
+                Some(target) => altact(
+                    target,
+                    target,
+                    Message::dist_external(edep).with_alias(reference),
+                ),
+                None => Ok(()),
+            }
+        }
+        37 => {
+            // `{37, Flags, SenderPid, To}` — alias bit delivers like DOP_ALIAS_SEND.
+            const FLG_PRIO: u64 = 1 << 0;
+            const FLG_ALIAS: u64 = 1 << 2;
+            const FLG_NAME: u64 = 1 << 3;
+            let flags = as_u64(&parts[1]).ok_or_else(badarg)?;
+            let from = remote_proxy(handle, &parts[2])?;
+            let mut message = Message::dist_external(edep);
+            let target = if flags & FLG_ALIAS != 0 {
+                message = message.with_alias(remote_ref_id(&parts[3]).ok_or_else(badarg)?);
+                remote_alias_pid(&parts[3])
+            } else if flags & FLG_NAME != 0 {
+                let OwnedTerm::Atom(name) = &parts[3] else {
+                    return Err(badarg());
+                };
+                runtime.reg.whereis_proc_str(name)
+            } else {
+                local_pid(&parts[3], local)
+            };
+            if flags & FLG_PRIO != 0 {
+                message = message.with_priority();
+            }
+            match target {
+                Some(target) => altact(from, target, message),
+                None => Ok(()),
+            }
+        }
+        _ => Err(badarg()),
+    }
 }
 
 fn route_incoming(
@@ -492,60 +659,6 @@ fn route_incoming(
         return Err(badarg());
     };
     match *op {
-        // Port of dist.c:2519 (DOP_SEND), OTP-29.1.1.
-        // Port of erts/emulator/beam/dist.c:2509-2539, OTP-29.1.1.
-        2 | 22 if parts.len() == 3 => {
-            let target = local_pid(&parts[2], local).ok_or_else(badarg)?;
-            let from = if *op == 22 {
-                remote_proxy(handle, &parts[1])?
-            } else {
-                target
-            };
-            for (term, _) in terms {
-                let message = from_owned(&term, &mut process.heap).map_err(|_| badarg())?;
-                ctx.send_node(
-                    target,
-                    arinsal_sched::OwnedSignal::new(Event {
-                        from,
-                        payload: Payload::Message(Message::copy_from(message)?),
-                    }),
-                )
-                .map_err(|error| VmError::Unsupported(format!("dist send: {error}")))?;
-            }
-        }
-        12 | 23 if parts.len() == 4 => {
-            let target = local_pid(&parts[2], local).ok_or_else(badarg)?;
-            let from = if *op == 23 {
-                remote_proxy(handle, &parts[1])?
-            } else {
-                target
-            };
-            for (term, _) in terms {
-                let message = from_owned(&term, &mut process.heap).map_err(|_| badarg())?;
-                ctx.send_node(
-                    target,
-                    arinsal_sched::OwnedSignal::new(Event {
-                        from,
-                        payload: Payload::Message(Message::copy_from(message)?),
-                    }),
-                )
-                .map_err(|error| VmError::Unsupported(format!("dist send: {error}")))?;
-            }
-        }
-        // Port of dist.c:2468 (DOP_REG_SEND), OTP-29.1.1.
-        6 if parts.len() == 4 => {
-            let sender = &parts[1];
-            let OwnedTerm::Atom(name) = &parts[3] else {
-                return Err(badarg());
-            };
-            let _ = sender;
-            let target = registered_pid(process, name).ok_or_else(badarg)?;
-            for (term, _) in terms {
-                let message = from_owned(&term, &mut process.heap).map_err(|_| badarg())?;
-                ctx.send(target, Message::copy_from(message)?)
-                    .map_err(|error| VmError::Unsupported(format!("dist send: {error}")))?;
-            }
-        }
         // Port of erts/emulator/beam/dist.c (DOP_LINK), OTP-29.1.1.
         1 if parts.len() == 3 => {
             let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
@@ -638,21 +751,6 @@ fn route_incoming(
                     reason: Box::new(Message::copy_from(reason)?),
                 },
             )?;
-        }
-        33 | 34 if (parts.len() == 3 && *op == 33) || (parts.len() == 4 && *op == 34) => {
-            let OwnedTerm::Ref { .. } = &parts[2] else {
-                return Err(badarg());
-            };
-            let reference = remote_ref_id(&parts[2]).ok_or_else(badarg)?;
-            if let Some(target) = remote_alias_pid(&parts[2]) {
-                for (term, _) in terms {
-                    let message = from_owned(&term, &mut process.heap).map_err(|_| badarg())?;
-                    ctx.send(target, Message::copy_from(message)?.with_alias(reference))
-                        .map_err(|error| {
-                            VmError::Unsupported(format!("dist alias send: {error}"))
-                        })?;
-                }
-            }
         }
         29 if parts.len() == 6 && terms.len() == 1 => {
             handle_spawn_request(vm, process, ctx, handle, parts, &terms[0].0)?;
@@ -815,11 +913,6 @@ fn remote_alias_pid(reference: &OwnedTerm) -> Option<Pid> {
     Some(Pid::from_data(Term::local_pid_ref_data_from_words(
         ids[3], ids[4],
     )?))
-}
-
-fn registered_pid(process: &Process, name: &str) -> Option<Pid> {
-    let runtime = process.runtime.as_ref()?;
-    runtime.reg.whereis_proc_str(name)
 }
 
 /// Queue one remote signal packet using the destination's negotiated atom cache.
@@ -1194,8 +1287,9 @@ pub(crate) fn ingest_port_data(
     }
     let (local_name, _) = node_tables::this_node();
     // The port's own `ERTS_PRTSD_DIST_ENTRY` reference: only the entry lock is taken.
-    let (handle, decoded) = {
+    let (handle, connection_id, packet) = {
         let mut entry = dep.lock();
+        let connection_id = entry.connection_id;
         let state = entry
             .dist
             .as_mut()
@@ -1221,9 +1315,14 @@ pub(crate) fn ingest_port_data(
         let Some(packet) = reassemble_port_fragment(state, packet)? else {
             return Ok(());
         };
-        let decoded = arinsal_etf::decode_dist_payload_with_sizes(&packet).map_err(|_| badarg())?;
-        (state.handle, decoded)
+        (state.handle, connection_id, packet)
     };
+    let (control, extp) = arinsal_etf::decode_dist_control(&packet).map_err(|_| badarg())?;
+    if is_send_op(&control) {
+        let edep = dist_ext(packet, extp, &dep.sysname, connection_id);
+        return net_message_send(runtime, handle, local_name, &control, edep);
+    }
+    let decoded = arinsal_etf::decode_dist_payload_with_sizes(&packet).map_err(|_| badarg())?;
     route_incoming_port(runtime, handle, local_name, decoded)
 }
 
@@ -1526,47 +1625,6 @@ fn route_incoming_port(
     };
     let sched = runtime.scheduler()?;
     match *op {
-        // Port of erts/emulator/beam/dist.c:2509-2539, OTP-29.1.1.
-        2 | 22 if parts.len() == 3 => {
-            let target = local_pid(&parts[2], local).ok_or_else(badarg)?;
-            let from = if *op == 22 {
-                remote_proxy(handle, &parts[1])?
-            } else {
-                target
-            };
-            for (term, heap_words) in terms {
-                let message = owned_to_message_with_heap_size(&term, heap_words)?;
-                sched
-                    .send(from, target, message)
-                    .map_err(|error| VmError::Unsupported(format!("dist send: {error}")))?;
-            }
-        }
-        12 | 23 if parts.len() == 4 => {
-            let target = local_pid(&parts[2], local).ok_or_else(badarg)?;
-            let from = if *op == 23 {
-                remote_proxy(handle, &parts[1])?
-            } else {
-                target
-            };
-            for (term, heap_words) in terms {
-                let message = owned_to_message_with_heap_size(&term, heap_words)?;
-                sched
-                    .send(from, target, message)
-                    .map_err(|error| VmError::Unsupported(format!("dist send: {error}")))?;
-            }
-        }
-        6 if parts.len() == 4 => {
-            let OwnedTerm::Atom(name) = &parts[3] else {
-                return Err(badarg());
-            };
-            let target = runtime.reg.whereis_proc_str(name).ok_or_else(badarg)?;
-            for (term, heap_words) in terms {
-                let message = owned_to_message_with_heap_size(&term, heap_words)?;
-                sched
-                    .send(target, target, message)
-                    .map_err(|error| VmError::Unsupported(format!("dist send: {error}")))?;
-            }
-        }
         // Port of erts/emulator/beam/dist.c (DOP_LINK), OTP-29.1.1.
         1 if parts.len() == 3 => {
             let from = remote_proxy(handle, &parts[1])?;
@@ -1664,94 +1722,42 @@ fn route_incoming_port(
                 )
                 .map_err(|error| VmError::Unsupported(format!("incoming dist signal: {error}")))?;
         }
-        // Port of dist.c (DOP_ALIAS_SEND / DOP_ALIAS_SEND_TT).
-        33 | 34 if (parts.len() == 3 && *op == 33) || (parts.len() == 4 && *op == 34) => {
-            let OwnedTerm::Ref { .. } = &parts[2] else {
-                return Err(badarg());
-            };
-            let reference = remote_ref_id(&parts[2]).ok_or_else(badarg)?;
-            if let Some(target) = remote_alias_pid(&parts[2]) {
-                for (term, heap_words) in terms {
-                    let message =
-                        owned_to_message_with_heap_size(&term, heap_words)?.with_alias(reference);
-                    sched.send(target, target, message).map_err(|error| {
-                        VmError::Unsupported(format!("dist alias send: {error}"))
-                    })?;
-                }
-            }
-        }
-        // Port of dist.c:2580 (DOP_ALTACT_SIG_SEND), OTP-29.1.1.
+        // Port of dist.c:2580 (DOP_ALTACT_SIG_SEND), OTP-29.1.1: the exit variant (a message
+        // is queued undecoded by `net_message_send`).
         // `{37, Flags, SenderPid, To}` — alias bit delivers like DOP_ALIAS_SEND.
         37 if parts.len() >= 4 => {
             let flags = as_u64(&parts[1]).ok_or_else(badarg)?;
             const FLG_PRIO: u64 = 1 << 0;
             const FLG_ALIAS: u64 = 1 << 2;
             const FLG_NAME: u64 = 1 << 3;
-            const FLG_EXIT: u64 = 1 << 4;
             let from = remote_proxy(handle, &parts[2])?;
-            if flags & FLG_ALIAS != 0 {
-                let reference = remote_ref_id(&parts[3]).ok_or_else(badarg)?;
-                if let Some(target) = remote_alias_pid(&parts[3]) {
-                    for (term, heap_words) in terms {
-                        let message = owned_to_message_with_heap_size(&term, heap_words)?
-                            .with_alias(reference);
-                        let message = if flags & FLG_PRIO != 0 {
-                            message.with_priority()
-                        } else {
-                            message
-                        };
-                        let result = if flags & FLG_EXIT != 0 {
-                            sched.signal(from, target, Signal::Exit(Box::new(message)))
-                        } else {
-                            sched.send(from, target, message)
-                        };
-                        result.map_err(|error| {
-                            VmError::Unsupported(format!("dist altact alias: {error}"))
-                        })?;
-                    }
-                }
+            let (target, alias) = if flags & FLG_ALIAS != 0 {
+                (
+                    remote_alias_pid(&parts[3]),
+                    Some(remote_ref_id(&parts[3]).ok_or_else(badarg)?),
+                )
             } else if flags & FLG_NAME != 0 {
                 let OwnedTerm::Atom(name) = &parts[3] else {
                     return Err(badarg());
                 };
-                let target = runtime.reg.whereis_proc_str(name);
-                if let Some(target) = target {
-                    for (term, heap_words) in terms {
-                        let message = owned_to_message_with_heap_size(&term, heap_words)?;
-                        let message = if flags & FLG_PRIO != 0 {
-                            message.with_priority()
-                        } else {
-                            message
-                        };
-                        let result = if flags & FLG_EXIT != 0 {
-                            sched.signal(from, target, Signal::Exit(Box::new(message)))
-                        } else {
-                            sched.send(from, target, message)
-                        };
-                        result.map_err(|error| {
-                            VmError::Unsupported(format!("dist altact name: {error}"))
-                        })?;
-                    }
-                }
+                (runtime.reg.whereis_proc_str(name), None)
             } else {
-                let target = local_pid(&parts[3], local);
-                if let Some(target) = target {
-                    for (term, heap_words) in terms {
-                        let message = owned_to_message_with_heap_size(&term, heap_words)?;
-                        let message = if flags & FLG_PRIO != 0 {
-                            message.with_priority()
-                        } else {
-                            message
-                        };
-                        let result = if flags & FLG_EXIT != 0 {
-                            sched.signal(from, target, Signal::Exit(Box::new(message)))
-                        } else {
-                            sched.send(from, target, message)
-                        };
-                        result.map_err(|error| {
-                            VmError::Unsupported(format!("dist altact pid: {error}"))
-                        })?;
+                (local_pid(&parts[3], local), None)
+            };
+            if let Some(target) = target {
+                for (term, heap_words) in terms {
+                    let mut message = owned_to_message_with_heap_size(&term, heap_words)?;
+                    if let Some(reference) = alias {
+                        message = message.with_alias(reference);
                     }
+                    if flags & FLG_PRIO != 0 {
+                        message = message.with_priority();
+                    }
+                    sched
+                        .signal(from, target, Signal::Exit(Box::new(message)))
+                        .map_err(|error| {
+                            VmError::Unsupported(format!("dist altact exit: {error}"))
+                        })?;
                 }
             }
         }
@@ -3890,7 +3896,7 @@ fn with_dhandle<R>(
 fn with_dhandle_input<R>(
     handle: Term,
     caller: Pid,
-    f: impl FnOnce(&mut DistState) -> Result<R, VmError>,
+    f: impl FnOnce(&mut DistState, &str, u32) -> Result<R, VmError>,
 ) -> Result<R, VmError> {
     let (conn_id, entry_ref) = parse_dhandle(handle)?;
     let dep = node_tables::lock()
@@ -3901,7 +3907,7 @@ fn with_dhandle_input<R>(
     if state.input_handler != caller {
         return Err(badarg());
     }
-    f(state)
+    f(state, &dep.sysname, conn_id)
 }
 
 fn owned(term: Term) -> Result<OwnedTerm, VmError> {

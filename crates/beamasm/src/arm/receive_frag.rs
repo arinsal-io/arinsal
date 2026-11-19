@@ -10,7 +10,7 @@ use crate::{
     Update,
     arm::beam_asm::tmp_mem_ref,
     emit_enter_runtime, emit_leave_runtime,
-    receive::{ReceiveHelperHook, WaitHook},
+    receive::{DecodeDistHook, ReceiveHelperHook, WaitHook},
 };
 
 const SCHEDULER_REGS: Gpr = Gpr::x(19);
@@ -64,12 +64,14 @@ fn clear_delay_gc(code: &mut CodeBuffer, flags: u32) -> Result<(), BufferError> 
 
 impl ReceiveFragments {
     /// Emits the shared receive fragments once for the VM. `receive_helper` is
-    /// `erts_proc_sig_receive_helper`; `context_switch` is the entry of the shared
+    /// `erts_proc_sig_receive_helper`, `decode_dist` is `beam_jit_decode_dist`;
+    /// `context_switch` is the entry of the shared
     /// `context_switch_simplified` fragment the schedule-out paths branch to.
     // Port of erts/emulator/beam/jit/arm/instr_msg.cpp (emit_i_loop_rec_shared,
     // emit_wait_unlocked, emit_wait_locked), OTP-29.1.1.
     pub fn new(
         receive_helper: ReceiveHelperHook,
+        decode_dist: DecodeDistHook,
         wait_unlocked: WaitHook,
         wait_locked: WaitHook,
         context_switch: usize,
@@ -81,6 +83,8 @@ impl ReceiveFragments {
         let wait_unlocked_label = code.new_label();
         let wait_locked_label = code.new_label();
         let schedule_out = code.new_label();
+        let restart = code.new_label();
+        let check_is_distributed = code.new_label();
         let done = code.new_label();
 
         // Port of erts/emulator/beam/jit/arm/instr_msg.cpp (emit_i_loop_rec_shared),
@@ -97,10 +101,11 @@ impl ReceiveFragments {
             )?;
             e.str_uoff(Gpr::w(8), C_P, PROCESS_FLAGS)?;
             e.str_uoff(ARG1, C_P, PROCESS_I)?;
-            e.mov_reg(XREG2, ARG2)?;
-            e.cmp_imm(FCALLS, 0, false)
+            e.mov_reg(XREG2, ARG2)
         })
         .map_err(fail)?;
+        code.bind(restart).map_err(fail)?;
+        code.emit(|e| e.cmp_imm(FCALLS, 0, false)).map_err(fail)?;
         code.b_cond(Cond::Le, schedule_out).map_err(fail)?;
 
         // "Peek next message".
@@ -109,7 +114,7 @@ impl ReceiveFragments {
             e.ldr_uoff(ARG1, TMP1, 0)
         })
         .map_err(fail)?;
-        code.cbnz(ARG1, done).map_err(fail)?;
+        code.cbnz(ARG1, check_is_distributed).map_err(fail)?;
         // Inner queue empty, fetch more from the outer and middle queues.
         emit_enter_runtime(&mut code, 0, Update::REDUCTIONS.union(Update::HEAP_ALLOC))
             .map_err(fail)?;
@@ -132,7 +137,7 @@ impl ReceiveFragments {
             e.ldr_uoff(ARG1, SCHEDULER_REGS, MESSAGE_PTR)
         })
         .map_err(fail)?;
-        code.cbnz(ARG1, done).map_err(fail)?;
+        code.cbnz(ARG1, check_is_distributed).map_err(fail)?;
         // Did we receive a signal or run out of reductions?
         code.emit(|e| e.ldr_uoff(Gpr::w(8), SCHEDULER_REGS, GET_OUT))
             .map_err(fail)?;
@@ -153,7 +158,27 @@ impl ReceiveFragments {
         })
         .map_err(fail)?;
 
-        // ARG1 holds the message node.
+        // ARG1 holds the message node. "Check if message is distributed": its tag (`m[0]`) is
+        // THE_NON_VALUE (0) until `beam_jit_decode_dist` decodes it; a corrupt one was removed
+        // and the loop restarts.
+        code.bind(check_is_distributed).map_err(fail)?;
+        code.emit(|e| e.ldr_uoff(TMP1, ARG1, offsets.message_term))
+            .map_err(fail)?;
+        code.cbnz(TMP1, done).map_err(fail)?;
+        code.emit(|e| e.sub_imm(FCALLS, FCALLS, 10, false))
+            .map_err(fail)?;
+        emit_enter_runtime(&mut code, 0, Update::NONE).map_err(fail)?;
+        code.emit(|e| {
+            e.mov_reg(ARG2, ARG1)?;
+            e.mov_reg(ARG1, C_P)?;
+            e.mov_const(SUPER_TMP, decode_dist as *const () as u64)?;
+            e.blr(SUPER_TMP)
+        })
+        .map_err(fail)?;
+        emit_leave_runtime(&mut code, 0, Update::NONE).map_err(fail)?;
+        code.cbz(ARG1, restart).map_err(fail)?;
+        // !! FALL THROUGH !!
+
         code.bind(done).map_err(fail)?;
         code.emit(|e| {
             e.ldr_uoff(XREG0, ARG1, offsets.message_term)?;

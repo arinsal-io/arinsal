@@ -253,6 +253,20 @@ impl Process {
                     priority = false;
                 }
                 let sender = from;
+                let traced = !receive_traced
+                    && crate::trace::flags(self, ctx.pid()) & crate::trace::RECEIVE != 0;
+                // erl_proc_sig_queue.c:6191-6196 (a priority message) and 9464-9474 (receive
+                // tracing): the payload is decoded before the message is inserted or traced;
+                // a bad dist message is dropped.
+                if message.is_external()
+                    && (priority || traced)
+                    && !erts_proc_sig_decode_dist(self.runtime, message, true)
+                {
+                    if prio_alias_deactivated {
+                        self.prio_item_deleted(crate::receive::PrioItemType::Alias);
+                    }
+                    return Ok(());
+                }
                 let before = self.message_words_before();
                 // ERTS_SIG_Q_OP_ALTACT_MSG with a priority: insert_prepared_prio_msg.
                 let term = if priority {
@@ -265,9 +279,7 @@ impl Process {
                     self.uncount_message_words(before);
                     term
                 };
-                if !receive_traced
-                    && crate::trace::flags(self, ctx.pid()) & crate::trace::RECEIVE != 0
-                {
+                if traced {
                     crate::trace::receive_event(None, self, ctx, term, Some(sender));
                 }
                 // erl_proc_sig_queue.c:6209-6217: after the message is inserted, so the prio

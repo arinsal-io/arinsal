@@ -284,9 +284,18 @@ impl AtomCache {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AtomTranslationTable {
     atoms: Vec<String>,
+    /// The runtime atom index of each entry (`ErtsAtomTranslationTable.atom`), filled by
+    /// [`decode_dist_packet_indexed`] only.
+    indices: Vec<u32>,
 }
 
 impl AtomTranslationTable {
+    /// `attab.atom[0..attab.size]`: the runtime atom indices, empty unless the packet was
+    /// decoded by [`decode_dist_packet_indexed`].
+    pub fn atom_indices(&self) -> &[u32] {
+        &self.indices
+    }
+
     /// Return an atom by its message-local reference index.
     pub fn get(&self, index: usize) -> Option<&str> {
         self.atoms.get(index).map(String::as_str)
@@ -2217,6 +2226,7 @@ fn decode_dist_packet_impl(
                     let index = intern(&atom)
                         .ok_or_else(|| invalid(r.at - len, "could not intern distribution atom"))?;
                     cache.set_indexed(slot, index);
+                    table.indices.push(index);
                 } else {
                     cache.entries[slot] = Some(CacheAtom::Text(atom.clone()));
                 }
@@ -2225,6 +2235,7 @@ fn decode_dist_packet_impl(
                 let index = cache
                     .get_indexed(slot)
                     .ok_or_else(|| invalid(flags_at, "reference to empty atom cache slot"))?;
+                table.indices.push(index);
                 atom_name(index).ok_or_else(|| invalid(flags_at, "cached atom index is invalid"))?
             } else {
                 cache
@@ -2243,6 +2254,20 @@ fn decode_dist_packet_impl(
         },
         payload: bytes[r.at..].to_vec(),
     })
+}
+
+/// Decode only the control message of a start packet: the term and the payload offset after
+/// it, where the message of a `DOP_*SEND*` operation begins (`edep->data->extp` after
+/// `erts_decode_dist_ext` of the control message in dist.c, erts_net_message).
+pub fn decode_dist_control(packet: &DistributionPacket) -> Result<(OwnedTerm, usize), DecodeError> {
+    let DistributionHeader::Start { translations, .. } = &packet.header else {
+        return Err(invalid(1, "continuation fragment has no translation table"));
+    };
+    let (term, used) = parse(&packet.payload, Some(translations))?;
+    if used == 0 {
+        return Err(invalid(0, "empty distribution term"));
+    }
+    Ok((term, used))
 }
 
 /// Decode all ETF terms after a start distribution header.

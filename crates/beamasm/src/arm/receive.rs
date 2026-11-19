@@ -23,6 +23,10 @@ pub type RecvMarkerUseHook = extern "C" fn(*mut ProcessHeader, u64);
 /// (`reg`): the helper leaves the message node in TMP_MEM2q (`*msgpp`) and `get_out` in
 /// TMP_MEM3q, the slots erts passes the addresses of. Returns the reductions consumed.
 pub type ReceiveHelperHook = extern "C" fn(*mut ProcessHeader, i32, i32, *mut u64, *mut i32) -> i32;
+/// `beam_jit_decode_dist(c_p, msgp)`: decodes the external message `loop_rec` found, `NULL`
+/// when it was corrupt and removed.
+pub type DecodeDistHook =
+    extern "C" fn(*mut ProcessHeader, *mut crate::ErtsMessage) -> *mut crate::ErtsMessage;
 /// Runtime callback which removes the current message and returns reductions left.
 pub type RemoveMessageHook = extern "C" fn(*mut ProcessHeader, i32, *mut u64, *mut u64, u32) -> i32;
 /// Runtime callback which advances the saved mailbox pointer.

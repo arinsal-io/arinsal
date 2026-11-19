@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arinsal_a64::enc::Gpr;
 use arinsal_beamasm::{
-    ExitReason, ProcessHeader, SchedulerRegisters, enter_native,
+    ErtsMessage, ExitReason, ProcessHeader, SchedulerRegisters, enter_native,
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
     receive::ReceiveHooks,
     receive_frag::{MsgOffsets, ReceiveFragments},
@@ -21,6 +21,7 @@ fn fragments() -> &'static ReceiveFragments {
             let yields = YieldFragments::new().unwrap();
             let receive = ReceiveFragments::new(
                 receive_helper,
+                decode_dist,
                 wait,
                 wait,
                 yields.context_switch(),
@@ -145,6 +146,32 @@ extern "C" fn receive_helper(
     0
 }
 
+/// The term `decode_dist` gives an external message (term THE_NON_VALUE, 0).
+const DECODED: u64 = 0x404;
+
+thread_local! {
+    /// External messages `decode_dist` still treats as corrupt.
+    static CORRUPT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// `beam_jit_decode_dist`: writes [`DECODED`] as the term, or unlinks a corrupt message (the
+/// save pointer moves to the next node) and returns NULL.
+extern "C" fn decode_dist(_: *mut ProcessHeader, msgp: *mut ErtsMessage) -> *mut ErtsMessage {
+    let node = node_ref(msgp.cast::<[AtomicU64; 2]>());
+    assert_eq!(
+        node[1].load(Ordering::Relaxed),
+        0,
+        "only external messages are decoded"
+    );
+    if CORRUPT.with(|corrupt| corrupt.replace(corrupt.get().saturating_sub(1))) > 0 {
+        let next = node[0].load(Ordering::Relaxed);
+        SAVE_FIELD.with(|field| field.store(next, Ordering::Relaxed));
+        return std::ptr::null_mut();
+    }
+    node[1].store(DECODED, Ordering::Relaxed);
+    msgp
+}
+
 /// Records the term of the message it removes in `fvalue`.
 extern "C" fn remove(
     process: *mut ProcessHeader,
@@ -217,6 +244,51 @@ fn native_first_message() {
     let mut process = queue(&[0x101]);
     assert_eq!(run(&module, 1, &mut process), ExitReason::Returned);
     assert_eq!(process.header.exc.fvalue, 0x101);
+}
+
+fn first_message_module() -> FinalizedModule {
+    let mut asm = BeamModuleAssembler::new();
+    asm.emit_i_func_label(1).unwrap();
+    asm.emit_enter_frame().unwrap();
+    asm.emit_i_loop_rec(2, hooks()).unwrap();
+    asm.emit_remove_message(hooks()).unwrap();
+    asm.emit_leave_frame().unwrap();
+    asm.emit_raw(|e| {
+        e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+        e.ret(Gpr::x(30))
+    })
+    .unwrap();
+    asm.emit_i_func_label(2).unwrap();
+    asm.finalize().unwrap()
+}
+
+/// An external message (term THE_NON_VALUE) is decoded by `beam_jit_decode_dist` before the
+/// receive sees it, for ten reductions.
+// Port of erts/emulator/beam/jit/arm/instr_msg.cpp (emit_i_loop_rec_shared,
+// check_is_distributed), OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn native_decodes_external_message() {
+    let module = first_message_module();
+    let mut process = queue(&[0]);
+    assert_eq!(run(&module, 1, &mut process), ExitReason::Returned);
+    assert_eq!(process.header.exc.fvalue, DECODED);
+    // 10 for the decode, 1 for the removal.
+    assert_eq!(process.header.fcalls, 10 - 10 - 1);
+}
+
+/// A corrupt external message is removed by `beam_jit_decode_dist` and the loop restarts at the
+/// next message.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn native_restarts_after_corrupt_external_message() {
+    let module = first_message_module();
+    let mut process = queue(&[0, 0x505]);
+    process.header.fcalls = 20;
+    CORRUPT.with(|corrupt| corrupt.set(1));
+    assert_eq!(run(&module, 1, &mut process), ExitReason::Returned);
+    assert_eq!(process.header.exc.fvalue, 0x505);
+    assert_eq!(process.header.fcalls, 20 - 10 - 1);
 }
 
 #[cfg(target_arch = "aarch64")]

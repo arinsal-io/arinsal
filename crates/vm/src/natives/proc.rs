@@ -1164,6 +1164,7 @@ fn process_info_item_messages(process: &mut Process) -> Result<Term, VmError> {
         let messages = if sensitive {
             Vec::new()
         } else {
+            process.inbox.prep_msgq_for_inspection(process.runtime);
             process.inbox.copied_terms(&mut process.heap)?
         };
         make_list(process, messages)?

@@ -643,3 +643,45 @@ pub extern "C" fn beam_jit_load_nif(
         }
     }
 }
+
+/// `beam_jit_decode_dist(c_p, msgp)`: decode the external message `loop_rec` found at the save
+/// pointer; a corrupt one is unlinked and freed and `NULL` is returned, so the receive loop
+/// restarts at the next message.
+// Port of erts/emulator/beam/jit/beam_jit_common.cpp:1059-1075 (beam_jit_decode_dist),
+// OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn beam_jit_decode_dist(
+    c_p: *mut ProcessHeader,
+    msgp: *mut arinsal_beamasm::ErtsMessage,
+) -> *mut arinsal_beamasm::ErtsMessage {
+    let Some(process) = crate::native_hooks::enter_runtime(c_p) else {
+        return std::ptr::null_mut();
+    };
+    debug_assert_eq!(
+        process
+            .inbox
+            .entries
+            .peek_node()
+            .map(|node| node.as_ptr() as usize),
+        Some(msgp as usize),
+        "loop_rec decodes the message at the save pointer"
+    );
+    let runtime = process.runtime;
+    let decoded = process
+        .inbox
+        .entries
+        .peek_mut()
+        .is_some_and(|event| match &mut event.payload {
+            arinsal_sched::Payload::Message(message) => {
+                crate::process::erts_proc_sig_decode_dist(runtime, message, false)
+            }
+            _ => false,
+        });
+    if !decoded {
+        // A corrupt distribution message that we weren't able to decode; remove it...
+        // (erts_msgq_unlink_msg, then erts_cleanup_messages).
+        drop(process.inbox.entries.unlink_at_save());
+        return std::ptr::null_mut();
+    }
+    msgp
+}

@@ -27,6 +27,13 @@ pub use x86::*;
 /// Native fields live at their fixed erts offsets in the process heap.
 pub type ProcessHeader = arinsal_term::NativeAbi;
 
+/// `ErtsMessage` as native code sees it: a message-queue node whose term (`m[0]`) is at the
+/// offset the VM provides. Opaque here; the VM owns the node type.
+#[repr(C)]
+pub struct ErtsMessage {
+    _opaque: [u8; 0],
+}
+
 const _: () = assert!(std::mem::offset_of!(ProcessHeader, fcalls) == 0x20);
 const _: () = assert!(std::mem::offset_of!(ProcessHeader, exc) == 0x28);
 const _: () = assert!(std::mem::offset_of!(ProcessHeader, catches) == 0x40);

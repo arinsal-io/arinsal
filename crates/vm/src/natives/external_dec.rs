@@ -495,6 +495,7 @@ impl<'a> B2tContext<'a> {
             safe: self.safe,
             internal_nc: self.internal_nc,
             this_node: self.local_node.unwrap_or((arinsal_term::atoms::NONAME, 0)),
+            attab: None,
         };
         let ep = self.dc.ep;
         let result = dec_term(

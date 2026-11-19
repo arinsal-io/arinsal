@@ -39,6 +39,9 @@ pub(super) struct MessageFragment {
     /// The VM timer id a timer-sent message carries until delivery, so expiry and cancellation
     /// release its message; kept here, not in `Message`, so the common message stays small.
     pub(super) timer_id: Option<u64>,
+    /// The `ErtsDistExternal` of a distribution message not yet decoded (the term is
+    /// `THE_NON_VALUE`); erts keeps it in `data.heap_frag` behind the token.
+    pub(super) dist_ext: Option<Box<crate::natives::external_dist::ErtsDistExternal>>,
 }
 
 /// A message's fragment: an ordinary box, or for a timer message a `BIF_TIMER` fixed-size
@@ -171,6 +174,7 @@ impl Message {
                     heap: None,
                     seq_token: None,
                     timer_id: Some(timer_id),
+                    dist_ext: None,
                 },
                 alloc_ix,
             ));
@@ -204,6 +208,7 @@ impl Message {
                         heap: None,
                         seq_token: None,
                         timer_id: Some(timer_id),
+                        dist_ext: None,
                     },
                     alloc_ix,
                 ));
@@ -234,6 +239,7 @@ impl Message {
                             heap: Some(arinsal_term::message::MessageHeap::Heap(fragment)),
                             seq_token: None,
                             timer_id: Some(timer_id),
+                            dist_ext: None,
                         },
                         alloc_ix,
                     )
@@ -242,6 +248,7 @@ impl Message {
                         heap: Some(arinsal_term::message::MessageHeap::Heap(fragment)),
                         seq_token: None,
                         timer_id: None,
+                        dist_ext: None,
                     })
                 },
             )),
@@ -385,6 +392,7 @@ impl Message {
                 heap: Some(arinsal_term::message::MessageHeap::Heap(heap)),
                 seq_token: None,
                 timer_id: None,
+                dist_ext: None,
             }))),
             priority: false,
             receive_traced: false,
@@ -463,6 +471,7 @@ impl Message {
                 heap: None,
                 seq_token: Some(token),
                 timer_id: None,
+                dist_ext: None,
             }));
         }
     }
@@ -658,4 +667,96 @@ impl Message {
     pub(crate) fn term(&self) -> Term {
         self.term
     }
+}
+
+impl Message {
+    /// A distribution message whose payload is still encoded: `ERL_MESSAGE_TERM(mp) =
+    /// THE_NON_VALUE` with the `ErtsDistExternal` attached.
+    // Port of erts/emulator/beam/erl_message.c (erts_queue_dist_message, the message it
+    // builds), OTP-29.1.1.
+    pub(crate) fn dist_external(
+        dist_ext: Box<crate::natives::external_dist::ErtsDistExternal>,
+    ) -> Self {
+        let mut message = Self::immediate(Term::NON_VALUE);
+        message.set_fragment(system_fragment(MessageFragment {
+            heap: None,
+            seq_token: None,
+            timer_id: None,
+            dist_ext: Some(dist_ext),
+        }));
+        message
+    }
+
+    /// `ERTS_SIG_IS_EXTERNAL_MSG`: the term is `THE_NON_VALUE` until the payload is decoded.
+    pub(crate) fn is_external(&self) -> bool {
+        self.term.is_non_value()
+    }
+}
+
+/// `erts_queue_dist_message(rcvr, rcvr_locks, dist_ext, hfrag, token, from)`: queue a
+/// distribution message on `rcvr` without decoding it; the receiver decodes it when it takes
+/// the message (`erts_proc_sig_decode_dist`).
+// Port of erts/emulator/beam/erl_message.c (erts_queue_dist_message), OTP-29.1.1.
+pub(crate) fn erts_queue_dist_message(
+    sched: &arinsal_sched::Scheduler<Process>,
+    rcvr: Pid,
+    dist_ext: Box<crate::natives::external_dist::ErtsDistExternal>,
+    from: Pid,
+) -> Result<(), VmError> {
+    sched
+        .send_node(
+            rcvr,
+            arinsal_sched::OwnedSignal::new(Event {
+                from,
+                payload: Payload::Message(Message::dist_external(dist_ext)),
+            }),
+        )
+        .map_err(|error| VmError::Unsupported(format!("dist send: {error}")))
+}
+
+/// `erts_proc_sig_decode_dist(proc, proc_locks, msgp, force_off_heap)`: decode the payload of
+/// an external message into a new message buffer attached to the message, replacing
+/// `THE_NON_VALUE` with the term. `false` for a payload that does not decode (the connection
+/// is killed and the caller removes the message).
+// Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_decode_dist), OTP-29.1.1.
+pub(crate) fn erts_proc_sig_decode_dist(
+    runtime: Option<&Runtime>,
+    msgp: &mut Message,
+    _force_off_heap: bool,
+) -> bool {
+    use crate::natives::external_dist::{erts_decode_dist_ext, erts_decode_dist_ext_size};
+    let Some(fragment) = msgp.fragment_mut() else {
+        return false;
+    };
+    let Some(edep) = fragment.dist_ext.as_mut() else {
+        return false;
+    };
+    let need = if edep.heap_size >= 0 {
+        edep.heap_size
+    } else {
+        let need = erts_decode_dist_ext_size(runtime, edep, true);
+        if need < 0 {
+            // bad signal; remove it...
+            return false;
+        }
+        edep.heap_size = need;
+        need
+    } as usize;
+    let mut hfrag = arinsal_term::message::NodeFragment::new_message_buffer(need);
+    let msg = {
+        let mut target = hfrag.fragment_mut();
+        let Ok(mut factory) = arinsal_term::HeapReservation::new(&mut target, need) else {
+            return false;
+        };
+        erts_decode_dist_ext(runtime, &mut factory, edep, true)
+    };
+    // erts_factory_undo: the buffer is freed with `hfrag`.
+    let Some(msg) = msg else {
+        return false;
+    };
+    // erts_free_dist_ext_copy, then the buffer becomes the message's data.
+    fragment.dist_ext = None;
+    fragment.heap = Some(arinsal_term::message::MessageHeap::Node(hfrag));
+    msgp.term = msg;
+    true
 }

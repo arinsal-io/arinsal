@@ -12,12 +12,15 @@ use arinsal_bifs::BifError;
 use arinsal_term::raw::{HeapSlotPtr, copy_to_binary_payload, term_from_bits};
 use arinsal_term::{
     Atom, AtomEncoding, FunEntry, HeapAlloc, HeapFactory, HeapReservation, HxNode, Node,
-    ProcessHeap, RefcBinary, Term, TermBuilder, TermKind, global_atoms,
-    hashmap_from_unsorted_array, hashmap_key_hash,
+    RefcBinary, Term, TermBuilder, TermKind, global_atoms, hashmap_from_unsorted_array,
+    hashmap_key_hash,
 };
 use num_bigint::{BigInt, Sign};
 use smallvec::SmallVec;
 use std::sync::Arc;
+
+/// `ATOM_CACHE_REF` (external.h).
+const ATOM_CACHE_REF: u8 = 82;
 
 #[derive(Clone, Copy)]
 pub(super) struct Reader<'a> {
@@ -110,6 +113,22 @@ impl Reader<'_> {
 }
 
 impl<'a> Reader<'a> {
+    /// `dec_atom(edep, ep, objp)`: an atom tag, or `ATOM_CACHE_REF` looked up in
+    /// `edep->attab` (an error without a translation table or past its size).
+    // Port of erts/emulator/beam/external.c (dec_atom), OTP-29.1.1.
+    pub(super) fn dec_atom(&mut self, flags: &DecFlags<'_>) -> Result<Term, BifError> {
+        if self.cur_peek() == ATOM_CACHE_REF {
+            self.cur_skip(1);
+            let n = self.u8()? as usize;
+            let attab = flags.attab.ok_or(BifError::BADARG)?;
+            return attab
+                .get(n)
+                .map(|atom| Term::atom(*atom))
+                .ok_or(BifError::BADARG);
+        }
+        Ok(self.atom(flags.safe, true)?.0)
+    }
+
     pub(super) fn new(validated: ValidatedBytes<'a>, at: usize) -> Self {
         Self {
             validated,
@@ -146,11 +165,13 @@ pub(crate) struct B2tDecodeContext {
 }
 
 /// `flags` of `dec_term`: `ERTS_DIST_EXT_BTT_SAFE`, `ERTS_DIST_EXT_INTERNAL_NC`, and this node
-/// for `dec_is_this_node`.
-pub(crate) struct DecFlags {
+/// for `dec_is_this_node`; `attab` is `edep->attab` when `edep` has
+/// `ERTS_DIST_EXT_ATOM_TRANS_TAB` (a distribution payload), `None` for `edep == NULL`.
+pub(crate) struct DecFlags<'e> {
     pub(crate) safe: bool,
     pub(crate) internal_nc: bool,
     pub(crate) this_node: (Atom, u32),
+    pub(crate) attab: Option<&'e [Atom]>,
 }
 
 /// The parts of `B2TContext` that `dec_term` uses when it is resumable.
@@ -183,8 +204,8 @@ fn link(next: Option<HeapSlotPtr>) -> u64 {
 
 /// `hp += words` on the factory (`erts_produce_heap` once the block is used up).
 #[inline(always)]
-fn produce(
-    fac: &mut HeapReservation<'_, ProcessHeap>,
+fn produce<H: HeapAlloc + ?Sized>(
+    fac: &mut HeapReservation<'_, H>,
     words: usize,
 ) -> Result<HeapSlotPtr, BifError> {
     fac.alloc(words)
@@ -194,33 +215,29 @@ fn produce(
 
 /// `dec_sysname`: a node name atom, or `NIL_EXT` for this node under `LOCAL_EXT`.
 // Port of erts/emulator/beam/external.c (dec_sysname), OTP-29.1.1.
-fn dec_sysname(r: &mut Reader<'_>, flags: &DecFlags) -> Result<(Atom, bool), BifError> {
+fn dec_sysname(r: &mut Reader<'_>, flags: &DecFlags<'_>) -> Result<(Atom, bool), BifError> {
     if flags.internal_nc && r.at() < r.validated.as_slice().len() && r.cur_peek() == 106 {
         r.cur_skip(1);
         return Ok((flags.this_node.0, true));
     }
-    let node = r
-        .atom(flags.safe, true)?
-        .0
-        .as_atom()
-        .ok_or(BifError::BADARG)?;
+    let node = r.dec_atom(flags)?.as_atom().ok_or(BifError::BADARG)?;
     Ok((node, false))
 }
 
 /// `dec_is_this_node`.
 // Port of erts/emulator/beam/external.c (dec_is_this_node), OTP-29.1.1.
 #[inline]
-fn dec_is_this_node(flags: &DecFlags, sysname: (Atom, bool), creation: u32) -> bool {
+fn dec_is_this_node(flags: &DecFlags<'_>, sysname: (Atom, bool), creation: u32) -> bool {
     sysname.1 || (sysname.0 == flags.this_node.0 && creation == flags.this_node.1)
 }
 
 /// `dec_pid`.
 // Port of erts/emulator/beam/external.c (dec_pid), OTP-29.1.1.
-fn dec_pid(
+fn dec_pid<H: HeapAlloc + ?Sized>(
     r: &mut Reader<'_>,
-    fac: &mut HeapReservation<'_, ProcessHeap>,
+    fac: &mut HeapReservation<'_, H>,
     tag: u8,
-    flags: &DecFlags,
+    flags: &DecFlags<'_>,
 ) -> Result<Term, BifError> {
     let sysname = dec_sysname(r, flags)?;
     let num = r.u32()?;
@@ -247,13 +264,13 @@ fn dec_pid(
 /// `ctx`). `Ok(Some(ep))` when done, `Ok(None)` when `ctx` yielded (`ctx->reds = 0`); on an
 /// error the caller undoes the factory (`erts_factory_undo`).
 // Port of erts/emulator/beam/external.c (dec_term), OTP-29.1.1.
-pub(crate) fn dec_term(
-    fac: &mut HeapReservation<'_, ProcessHeap>,
+pub(crate) fn dec_term<H: HeapAlloc + ?Sized>(
+    fac: &mut HeapReservation<'_, H>,
     validated: ValidatedBytes<'_>,
     ep: usize,
     objp: Option<HeapSlotPtr>,
     ctx: Option<DecCtx<'_>>,
-    flags: &mut DecFlags,
+    flags: &mut DecFlags<'_>,
 ) -> Result<Option<usize>, BifError> {
     match ctx {
         Some(mut ctx) => {
@@ -273,11 +290,11 @@ pub(crate) fn dec_term(
 /// in registers: the cursor and `next` go in by value and come back.
 // Port of erts/emulator/beam/external.c (dec_term, the cases off the hot path), OTP-29.1.1.
 #[inline(never)]
-fn dec_rare(
+fn dec_rare<H: HeapAlloc + ?Sized>(
     tag: u8,
     mut r: Reader<'_>,
-    fac: &mut HeapReservation<'_, ProcessHeap>,
-    flags: &mut DecFlags,
+    fac: &mut HeapReservation<'_, H>,
+    flags: &mut DecFlags<'_>,
     objp: HeapSlotPtr,
     mut next: Option<HeapSlotPtr>,
 ) -> Result<(usize, Option<HeapSlotPtr>), BifError> {
@@ -344,16 +361,8 @@ fn dec_rare(
             objp.store(dec_port_or_ref(&mut r, fac, tag, flags)?.word());
         }
         113 => {
-            let module = r
-                .atom(flags.safe, true)?
-                .0
-                .as_atom()
-                .ok_or(BifError::BADARG)?;
-            let name = r
-                .atom(flags.safe, true)?
-                .0
-                .as_atom()
-                .ok_or(BifError::BADARG)?;
+            let module = r.dec_atom(flags)?.as_atom().ok_or(BifError::BADARG)?;
+            let name = r.dec_atom(flags)?.as_atom().ok_or(BifError::BADARG)?;
             let temp = dec_sub_term(fac, &mut r, flags)?;
             let arity = temp.as_small().ok_or(BifError::BADARG)?;
             if arity < 0 {
@@ -380,11 +389,7 @@ fn dec_rare(
             let index = r.u32()?;
             let num_free = r.u32()? as usize;
             let funp = produce(fac, ERL_FUN_SIZE + num_free)?;
-            let module = r
-                .atom(flags.safe, true)?
-                .0
-                .as_atom()
-                .ok_or(BifError::BADARG)?;
+            let module = r.dec_atom(flags)?.as_atom().ok_or(BifError::BADARG)?;
             let old_index = dec_sub_term(fac, &mut r, flags)?
                 .as_small()
                 .and_then(|n| u32::try_from(n).ok())
@@ -410,10 +415,9 @@ fn dec_rare(
                 dispatch: Default::default(),
                 dispatch_epoch: Default::default(),
             });
-            let fun = TermBuilder::<HeapReservation<'_, ProcessHeap>>::init_decoded_fun(
-                funp, entry, num_free,
-            )
-            .map_err(map_term_build_error)?;
+            let fun =
+                TermBuilder::<HeapReservation<'_, H>>::init_decoded_fun(funp, entry, num_free)
+                    .map_err(map_term_build_error)?;
             objp.store(fun.word());
             for i in (0..num_free).rev() {
                 let env = funp.offset(ERL_FUN_SIZE + i);
@@ -442,24 +446,11 @@ fn dec_rare(
                 // The other bits in this byte are reserved and must be zero.
                 _ => return Err(BifError::BADARG),
             };
-            let module = r
-                .atom(flags.safe, true)?
-                .0
-                .as_atom()
-                .ok_or(BifError::BADARG)?;
-            let name = r
-                .atom(flags.safe, true)?
-                .0
-                .as_atom()
-                .ok_or(BifError::BADARG)?;
+            let module = r.dec_atom(flags)?.as_atom().ok_or(BifError::BADARG)?;
+            let name = r.dec_atom(flags)?.as_atom().ok_or(BifError::BADARG)?;
             let mut keys = SmallVec::<[Atom; 8]>::new();
             for _ in 0..num_fields {
-                keys.push(
-                    r.atom(flags.safe, true)?
-                        .0
-                        .as_atom()
-                        .ok_or(BifError::BADARG)?,
-                );
+                keys.push(r.dec_atom(flags)?.as_atom().ok_or(BifError::BADARG)?);
             }
             let (instance, values) = TermBuilder::new(&mut *fac)
                 .decoded_native_record(module, name, exported, &keys)
@@ -476,13 +467,13 @@ fn dec_rare(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dec_term_body(
-    fac: &mut HeapReservation<'_, ProcessHeap>,
+fn dec_term_body<H: HeapAlloc + ?Sized>(
+    fac: &mut HeapReservation<'_, H>,
     validated: ValidatedBytes<'_>,
     ep: usize,
     objp: Option<HeapSlotPtr>,
     mut ctx: Option<&mut DecCtx<'_>>,
-    flags: &mut DecFlags,
+    flags: &mut DecFlags<'_>,
     reds: &mut i64,
 ) -> Result<Option<usize>, BifError> {
     // `reds` lives in a local so it stays in a register; it is stored back where `dec_term`
@@ -580,9 +571,9 @@ fn dec_term_body(
             match tag {
                 98 => objp.store(Term::small(i64::from(r.u32()? as i32)).unwrap().word()),
                 97 => objp.store(Term::small(i64::from(r.u8()?)).unwrap().word()),
-                100 | 115 | 118 | 119 => {
+                100 | 115 | 118 | 119 | ATOM_CACHE_REF => {
                     r.cur_back(1);
-                    objp.store(r.atom(flags.safe, true)?.0.word());
+                    objp.store(r.dec_atom(flags)?.word());
                 }
                 104 | 105 => {
                     let mut n = if tag == 104 {
@@ -838,10 +829,10 @@ fn dec_term_body(
 }
 
 /// `dec_term(edep, factory, ep, &temp, NULL, flags)`: a nested decode into a local word.
-fn dec_sub_term(
-    fac: &mut HeapReservation<'_, ProcessHeap>,
+fn dec_sub_term<H: HeapAlloc + ?Sized>(
+    fac: &mut HeapReservation<'_, H>,
     r: &mut Reader<'_>,
-    flags: &mut DecFlags,
+    flags: &mut DecFlags<'_>,
 ) -> Result<Term, BifError> {
     let mut temp: u64 = 0;
     let slot = HeapSlotPtr::from_ptr(&mut temp).ok_or(BifError::BADARG)?;
@@ -869,11 +860,11 @@ const ERL_FUN_SIZE: usize = 2;
 /// `NEWER_REFERENCE_EXT` of `dec_term`.
 // Port of erts/emulator/beam/external.c (dec_term, PORT_EXT .. NEWER_REFERENCE_EXT),
 // OTP-29.1.1.
-fn dec_port_or_ref(
+fn dec_port_or_ref<H: HeapAlloc + ?Sized>(
     r: &mut Reader<'_>,
-    fac: &mut HeapReservation<'_, ProcessHeap>,
+    fac: &mut HeapReservation<'_, H>,
     tag: u8,
-    flags: &DecFlags,
+    flags: &DecFlags<'_>,
 ) -> Result<Term, BifError> {
     if matches!(tag, 102 | 89 | 120) {
         let sysname = dec_sysname(r, flags)?;

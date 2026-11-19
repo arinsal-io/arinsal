@@ -439,6 +439,19 @@ impl<T> MessageQueueList<T> {
         Some(OwnedSignal::value_of(node))
     }
 
+    /// [`Self::at`], mutably.
+    pub fn at_mut(&mut self, field: NextField<T>) -> Option<Option<&mut T>> {
+        // SAFETY: as in `at`; `&mut self` keeps the node exclusive while the reference lives.
+        let node = unsafe { *field.0 }?;
+        Some(OwnedSignal::value_mut_of(node))
+    }
+
+    /// `remove_innerq_m_sig`: unlink the message `field` names; `save` and `last` follow.
+    pub fn unlink_field(&mut self, field: NextField<T>) -> Option<OwnedSignal<T>> {
+        // SAFETY: a `NextField` of this list names `first` or the `next` of one of its nodes.
+        unsafe { (*field.0).is_some().then(|| self.unlink_at(field.0)) }
+    }
+
     /// The address of the marker `field` names, when it names a marker node: its block finds
     /// the marker by it.
     pub fn marker_at(&self, field: NextField<T>) -> Option<usize> {
