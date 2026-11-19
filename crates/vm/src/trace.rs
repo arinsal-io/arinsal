@@ -1110,6 +1110,17 @@ pub(crate) fn port_flags(process: &Process, session: u64, port: u64) -> u64 {
     live_port_entry(process, session, port).map_or(0, |entry| entry.flags)
 }
 
+/// Whether `port` has a live trace session for `class`.
+// Port of erts/emulator/beam/io.c:674 (`ERTS_IS_P_TRACED_FL(port, F_TRACE_PORTS)`), OTP-29.1.1.
+pub(crate) fn port_trace_enabled(runtime: &crate::process::Runtime, port: u64, class: u64) -> bool {
+    let owner = scope_runtime(runtime);
+    port_table()
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|((scope, _, id), entry)| *scope == owner && *id == port && entry.flags & class != 0)
+}
+
 pub(crate) fn port_tracer(process: &Process, session: u64, port: u64) -> Option<Tracer> {
     live_port_entry(process, session, port).map(|entry| entry.tracer)
 }

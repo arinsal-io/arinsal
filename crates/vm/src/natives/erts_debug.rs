@@ -1579,6 +1579,29 @@ fn internal_state_tuple_get(
 ) -> Result<Option<Term>, VmError> {
     if let Some(fields) = term_sequence(selector)
         && let [name, value] = fields.as_slice()
+        && name.as_atom().and_then(|name| global_atoms().text(name)) == Some("atom")
+    {
+        // Port of erts/emulator/beam/erl_bif_info.c:4842-4855
+        // (erts_debug_get_internal_state_1, {atom, Ix}), OTP-29.1.1.
+        let Some(index) = crate::natives::raw::integer(*value).and_then(|value| value.to_usize())
+        else {
+            return Err(badarg());
+        };
+        let table = global_atoms();
+        while index >= table.len() {
+            let size = table.len();
+            let name = format!("am{size:x}");
+            table.intern(&name).map_err(|_| {
+                VmError::Trap(exceptions::Trap::error(Term::atom(
+                    arinsal_term::atoms::SYSTEM_LIMIT,
+                )))
+            })?;
+        }
+        let index = u32::try_from(index).map_err(|_| badarg())?;
+        return Ok(Some(Term::atom(arinsal_term::Atom(index))));
+    }
+    if let Some(fields) = term_sequence(selector)
+        && let [name, value] = fields.as_slice()
         && name.as_atom().and_then(|name| global_atoms().text(name)) == Some("internal_hash")
     {
         // Port of erts/emulator/beam/erl_bif_info.c:4834-4835, OTP-29.1.1.

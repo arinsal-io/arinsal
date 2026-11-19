@@ -1853,6 +1853,24 @@ fn open_driver_port(
     runtime.ports.insert(port_id, Arc::clone(&handle));
     crate::trace::port_opened(runtime, port_id);
     reservation.commit();
+    // Port of erts/emulator/beam/io.c:673-680 (erts_open_driver): the open trace and its
+    // driver-name atom put happen after port creation and before the driver's start callback.
+    if crate::trace::port_trace_enabled(runtime, port_id, crate::trace::PORTS)
+        && let Some(caller) = ctx.pid().to_term()
+    {
+        crate::trace::emit_port_event(
+            runtime,
+            port_id,
+            crate::trace::PORTS,
+            "open",
+            &[
+                caller,
+                global_atoms()
+                    .put(name.as_bytes(), arinsal_term::AtomEncoding::Latin1, true)
+                    .map_or(Term::NIL, Term::atom),
+            ],
+        );
+    }
     let caller = packed_pid(ctx.pid());
     if let Err(error) = drv_port.start(&name, caller) {
         remove_port(runtime, port_id);
@@ -1870,21 +1888,11 @@ fn open_driver_port(
     }
     link_opener(process, port_id);
     drv_port.set_io_flags(io.binary, io.eof, io.line);
-    if let Some(caller) = ctx.pid().to_term() {
-        crate::trace::emit_port_event(
-            runtime,
-            port_id,
-            crate::trace::PORTS,
-            "open",
-            // Port of io.c:673 (erts_open_driver): `erts_atom_put(port->name, ..., LATIN1, 1)`,
-            // truncated to the longest atom; a spawn command may be longer.
-            &[
-                caller,
-                global_atoms()
-                    .put(name.as_bytes(), arinsal_term::AtomEncoding::Latin1, true)
-                    .map_or(Term::NIL, Term::atom),
-            ],
-        );
+    // Port of erts/emulator/beam/erl_bif_port.c:1123-1124: open_port emits getting_linked
+    // after erts_open_driver succeeds.
+    if crate::trace::port_trace_enabled(runtime, port_id, crate::trace::PORTS)
+        && let Some(caller) = ctx.pid().to_term()
+    {
         crate::trace::emit_port_event(
             runtime,
             port_id,
