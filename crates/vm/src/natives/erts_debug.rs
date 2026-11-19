@@ -1765,7 +1765,7 @@ fn internal_state_tuple_get(
         ) if node == "nonode@nohost" => {
             let pid = arinsal_sched::Pid::new(*id, *serial);
             if pid != ctx.pid() {
-                return match remote_relations(process, ctx, pid)? {
+                return match remote_relations(ctx, pid)? {
                     Some(relations) => internal_link_list_from(process, &relations.links).map(Some),
                     None => Ok(Some(Term::atom(arinsal_term::atoms::UNDEFINED))),
                 };
@@ -1786,7 +1786,7 @@ fn internal_state_tuple_get(
         ) if node == "nonode@nohost" => {
             let pid = arinsal_sched::Pid::new(*id, *serial);
             if pid != ctx.pid() {
-                return match remote_relations(process, ctx, pid)? {
+                return match remote_relations(ctx, pid)? {
                     Some(relations) => internal_monitor_list_from(
                         process,
                         &relations.monitors,
@@ -2205,15 +2205,12 @@ impl Relations {
 /// until all are handled or it is exiting, then reads the relations. A running target holds
 /// the lock, so the BIF yields and retries where erts waits for it.
 fn remote_relations(
-    process: &Process,
     ctx: &mut RunCtx<'_, Message>,
     pid: arinsal_sched::Pid,
 ) -> Result<Option<Relations>, VmError> {
     let mut relations = None;
     let mut signal_error = None;
-    // The caller's reductions left bound the target's signal handling.
-    let reds = u32::try_from(process.heap.abi.fcalls.max(1)).unwrap_or(1);
-    let locked = ctx.with_locked_target(pid, reds, &mut |task, target_ctx| {
+    let locked = ctx.with_locked_target(pid, &mut |task, target_ctx| {
         let Some(target) = task.downcast_mut::<Process>() else {
             return;
         };

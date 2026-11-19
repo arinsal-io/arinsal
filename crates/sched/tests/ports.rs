@@ -59,7 +59,7 @@ struct Idle;
 impl Task for Idle {
     type Message = ();
     type SchedulerData = ();
-    fn run(&mut self, _: &mut RunCtx<()>, _: &mut (), _: u32) -> RunOutcome {
+    fn run(&mut self, _: &mut RunCtx<()>, _: &mut (), _: u32, _calls: &mut u32) -> RunOutcome {
         RunOutcome::Exit(0)
     }
 }
@@ -70,13 +70,19 @@ struct Busy(Arc<AtomicBool>, Arc<AtomicUsize>);
 impl Task for Busy {
     type Message = ();
     type SchedulerData = ();
-    fn run(&mut self, ctx: &mut RunCtx<()>, _: &mut (), _: u32) -> RunOutcome {
+    fn run(
+        &mut self,
+        ctx: &mut RunCtx<()>,
+        _: &mut (),
+        budget: u32,
+        calls: &mut u32,
+    ) -> RunOutcome {
         if self.0.load(Ordering::Relaxed) {
             return RunOutcome::Exit(0);
         }
         self.1
             .store(ctx.scheduler_id().unwrap_or(usize::MAX), Ordering::Relaxed);
-        while ctx.consume(100) {}
+        *calls = budget;
         RunOutcome::Yield
     }
 }

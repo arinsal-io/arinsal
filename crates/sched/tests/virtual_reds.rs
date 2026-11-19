@@ -15,8 +15,8 @@ struct Slice {
 impl Task for Slice {
     type Message = ();
     type SchedulerData = ();
-    fn run(&mut self, ctx: &mut RunCtx<()>, _: &mut (), _: u32) -> RunOutcome {
-        ctx.consume(self.consumed);
+    fn run(&mut self, ctx: &mut RunCtx<()>, _: &mut (), _: u32, calls: &mut u32) -> RunOutcome {
+        *calls = self.consumed;
         ctx.add_virtual_reds(self.virtual_reds);
         let _ = self.done.send(());
         RunOutcome::Exit(0)

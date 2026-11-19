@@ -504,10 +504,10 @@ fn dirty_process_handle_signals(
         return Ok(Term::atom(arinsal_term::atoms::FALSE));
     };
     // `ERTS_BIF_REDS_LEFT(BIF_P)`: the caller's reductions bound the target's signal handling.
-    let reds = u32::try_from(process.heap.abi.fcalls.max(1)).unwrap_or(1);
-    let result = ctx.handle_dirty_signals(pid, reds, &mut |task, target_ctx| {
+    let reds = process.heap.abi.fcalls.max(1);
+    let result = ctx.handle_dirty_signals(pid, &mut |task, target_ctx| {
         task.downcast_mut::<Process>()
-            .is_none_or(|target| target.handle_dirty_signals(vm, target_ctx))
+            .is_none_or(|target| target.handle_dirty_signals(vm, target_ctx, reds))
     });
     Ok(Term::atom(match result {
         arinsal_sched::DirtySignals::NoProc => arinsal_term::atoms::NOPROC,
@@ -1548,6 +1548,7 @@ pub(crate) fn reply_request(
             request,
             how,
             pending.from,
+            process.heap.abi.fcalls,
         );
     }
     let message = if let RemoteOp::Collect { request_id, major } = pending.op {

@@ -18,7 +18,7 @@ enum Probe {
 impl Task for Probe {
     type Message = ();
     type SchedulerData = ();
-    fn run(&mut self, _ctx: &mut RunCtx<()>, _: &mut (), _: u32) -> RunOutcome {
+    fn run(&mut self, _ctx: &mut RunCtx<()>, _: &mut (), _: u32, _calls: &mut u32) -> RunOutcome {
         match self {
             Probe::Block { running, release } => {
                 running.store(true, Ordering::Release);

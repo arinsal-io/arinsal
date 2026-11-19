@@ -26,7 +26,13 @@ struct Dummy {
 impl Task for Dummy {
     type Message = ();
     type SchedulerData = ();
-    fn run(&mut self, ctx: &mut RunCtx<()>, _: &mut (), _: u32) -> RunOutcome {
+    fn run(
+        &mut self,
+        ctx: &mut RunCtx<()>,
+        _: &mut (),
+        budget: u32,
+        calls: &mut u32,
+    ) -> RunOutcome {
         match &mut self.mode {
             Mode::Forward(to) => {
                 while ctx.receive().is_some() {
@@ -34,7 +40,8 @@ impl Task for Dummy {
                     if n < self.limit {
                         ctx.send(*to, ()).unwrap();
                     }
-                    if !ctx.consume(4) {
+                    *calls += 4;
+                    if *calls >= budget {
                         return RunOutcome::Yield;
                     }
                 }
@@ -42,7 +49,8 @@ impl Task for Dummy {
             Mode::Sink => {
                 while ctx.receive().is_some() {
                     self.count.fetch_add(1, Ordering::Relaxed);
-                    if !ctx.consume(1) {
+                    *calls += 1;
+                    if *calls >= budget {
                         return RunOutcome::Yield;
                     }
                 }
@@ -51,7 +59,8 @@ impl Task for Dummy {
                 while *count > 0 {
                     ctx.send(*to, ()).unwrap();
                     *count -= 1;
-                    if !ctx.consume(4) {
+                    *calls += 4;
+                    if *calls >= budget {
                         return RunOutcome::Yield;
                     }
                 }
@@ -66,7 +75,8 @@ impl Task for Dummy {
                     ctx.send(receivers[*next], ()).unwrap();
                     *remaining -= 1;
                     *next = (*next + 1) % receivers.len();
-                    if !ctx.consume(4) {
+                    *calls += 4;
+                    if *calls >= budget {
                         return RunOutcome::Yield;
                     }
                 }

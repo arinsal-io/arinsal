@@ -15,12 +15,18 @@ struct Busy {
 impl Task for Busy {
     type Message = ();
     type SchedulerData = ();
-    fn run(&mut self, ctx: &mut RunCtx<()>, _: &mut (), _: u32) -> RunOutcome {
+    fn run(
+        &mut self,
+        _ctx: &mut RunCtx<()>,
+        _: &mut (),
+        budget: u32,
+        calls: &mut u32,
+    ) -> RunOutcome {
         if self.stop.load(Ordering::Relaxed) {
             return RunOutcome::Exit(0);
         }
         self.runs.fetch_add(1, Ordering::Relaxed);
-        while ctx.consume(100) {}
+        *calls = budget;
         RunOutcome::Yield
     }
 }

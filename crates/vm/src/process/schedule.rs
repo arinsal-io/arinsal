@@ -169,6 +169,7 @@ impl Task for Process {
         ctx: &mut RunCtx<'_, Message>,
         data: &mut SchedulerData,
         budget: u32,
+        calls: &mut u32,
     ) -> RunOutcome {
         // `c_p` (the native prefix at the start of this task) and the process state word are in
         // one process struct, the state word at `offsetof(Process, state)` from `c_p`.
@@ -234,7 +235,7 @@ impl Task for Process {
                     .unwrap_or_else(std::time::Instant::now)
             });
         let outcome = self.run_task(ctx, data);
-        self.context_switch(ctx, dirty_start);
+        *calls = self.context_switch(ctx, dirty_start);
         self.heap.set_alloc_ix(None);
         self.native = None;
         if matches!(outcome, RunOutcome::Exit(_)) {
@@ -431,7 +432,7 @@ impl Task for Process {
 impl Process {
     /// The context switch's reduction count, taken once per slice: `reds_used` is what the
     /// slice took from FCALLS, `p->reds` gains it less what `ERTS_VBUMP_REDS` gave up, and
-    /// the scheduler counts it. A dirty scheduler charges by its own rule instead.
+    /// it is returned as the `calls` the scheduler passes to `erts_schedule`. A dirty scheduler charges by its own rule instead.
     // Port of erts/emulator/beam/jit/arm/process_main.cpp (context_switch: `reds_used =
     // REDS_IN - FCALLS`), beam_common.c (erts_dirty_process_main: `reds_used`) and
     // erl_process.c:9678-9700 (erts_schedule: `actual_reds = calls - esdp->virtual_reds`,
@@ -441,7 +442,7 @@ impl Process {
         &mut self,
         ctx: &mut RunCtx<'_, Message>,
         dirty_start: Option<std::time::Instant>,
-    ) {
+    ) -> u32 {
         let virtual_reds = std::mem::take(&mut self.virtual_reds);
         let reds_used = match ctx.scheduler_type() {
             arinsal_sched::SchedulerType::Normal => {
@@ -456,10 +457,10 @@ impl Process {
             }
         };
         ctx.add_virtual_reds(virtual_reds);
-        let _ = ctx.consume(reds_used);
         self.reductions_used = self
             .reductions_used
             .saturating_add(u64::from(reds_used.saturating_sub(virtual_reds)));
+        reds_used
     }
 
     #[inline(always)]

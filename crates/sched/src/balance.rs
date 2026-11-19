@@ -945,7 +945,13 @@ mod tests {
         type Message = ();
         type SchedulerData = ();
 
-        fn run(&mut self, _ctx: &mut RunCtx<'_, ()>, _: &mut (), _budget: u32) -> RunOutcome {
+        fn run(
+            &mut self,
+            _ctx: &mut RunCtx<'_, ()>,
+            _: &mut (),
+            _budget: u32,
+            _calls: &mut u32,
+        ) -> RunOutcome {
             RunOutcome::Wait { timeout_ms: None }
         }
     }

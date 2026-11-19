@@ -257,7 +257,7 @@ impl Process {
                 continue;
             }
             let Event { from, payload } = node.into_value();
-            match self.handle_signal(ctx, from, payload) {
+            match self.handle_signal(ctx, from, payload, limit / SIG_REDS_CNT_FACTOR) {
                 Ok(cost) => cnt += cost + 1,
                 Err(error) => break Err(error),
             }
@@ -281,6 +281,7 @@ impl Process {
         ctx: &mut RunCtx<'_, Message>,
         from: Pid,
         payload: Payload<Message>,
+        limit: i32,
     ) -> Result<i32, VmError> {
         let Payload::Signal(signal) = payload else {
             unreachable!("message signals are moved to the message queue before this");
@@ -706,7 +707,7 @@ impl Process {
                     requester,
                 } = *copy;
                 crate::natives::sys::copy_literal_area(
-                    self, ctx, area_id, request, how, requester,
+                    self, ctx, area_id, request, how, requester, limit,
                 )?;
                 0
             }
@@ -1070,13 +1071,15 @@ impl Process {
         &mut self,
         vm: &mut Vm,
         ctx: &mut RunCtx<'_, Message>,
+        reds: i32,
     ) -> bool {
         if self.dirty_exiting() {
             return true;
         }
         let gc = self.set_gc_enabled(false);
-        // `reds = ERTS_BIF_REDS_LEFT(BIF_P)` and one `erts_proc_sig_handle_incoming`.
-        let mut reds = i32::try_from(ctx.remaining()).unwrap_or(i32::MAX).max(1);
+        // `reds = ERTS_BIF_REDS_LEFT(BIF_P)` (the caller's) and one
+        // `erts_proc_sig_handle_incoming`.
+        let mut reds = reds.max(1);
         let max_reds = reds;
         let result = self.handle_incoming(ctx, &mut reds, max_reds, false);
         self.set_gc_enabled(gc);

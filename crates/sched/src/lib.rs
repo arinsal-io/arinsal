@@ -42,7 +42,7 @@
 //! impl Task for Echo {
 //!     type Message = u64; // Replace with a VM heap-fragment envelope.
 //!     type SchedulerData = ();
-//!     fn run(&mut self, ctx: &mut RunCtx<Self::Message>, _: &mut (), _budget: u32) -> RunOutcome {
+//!     fn run(&mut self, ctx: &mut RunCtx<Self::Message>, _: &mut (), _budget: u32, _calls: &mut u32) -> RunOutcome {
 //!         if let Some(event) = ctx.receive() {
 //!             if let arinsal_sched::Payload::Message(value) = event.payload {
 //!                 let _ = ctx.send(event.from, value);
@@ -1172,8 +1172,10 @@ pub trait Task: Send + 'static {
     /// Task-side part of one scheduler's data (`ErtsSchedulerData`): created once per normal
     /// or dirty scheduler and lent to every [`Task::run`] on it.
     type SchedulerData: Default + Send + 'static;
-    /// Execute cooperatively, consuming at most `budget` reductions, on the scheduler whose
-    /// data is `data`.
+    /// Execute cooperatively, consuming at most `budget` reductions (`p->fcalls = reds`), on
+    /// the scheduler whose data is `data`, and store in `calls` the reductions the slice used
+    /// (`REDS_IN - FCALLS` from `c_p->fcalls`, or the dirty scheduler's own count), which
+    /// the scheduler passes on to `erts_schedule(esdp, p, calls)`.
     ///
     /// Port of erts/emulator/beam/erl_process.c:9607 (erts_schedule returns the process to
     /// run to process_main, which keeps `esdp` at hand), OTP-29.1.1.
@@ -1182,6 +1184,7 @@ pub trait Task: Send + 'static {
         ctx: &mut RunCtx<Self::Message>,
         data: &mut Self::SchedulerData,
         budget: u32,
+        calls: &mut u32,
     ) -> RunOutcome;
     /// `copy_in_registers(c_p, reg)`: load the saved argument registers into this scheduler's
     /// register array before the slice runs.
@@ -1763,11 +1766,6 @@ struct ProcShared<M: SignalMessage> {
     /// priority queues of the dirty run queues the process has an entry in.
     /// Port of erts/emulator/beam/erl_process.h:1390-1425, OTP-29.1.1.
     xstate: AtomicU32,
-    /// `REDS_IN` (`c_p->def_arg_reg[5]`): the reductions the slice was scheduled in with.
-    reds_in: AtomicU32,
-    /// `c_p->fcalls`: reductions left in the slice; [`RunCtx::consume`] spends them. The slice
-    /// reports `REDS_IN - FCALLS` to `erts_schedule` as `calls`.
-    fcalls: AtomicI32,
 }
 
 #[repr(C)]
@@ -1778,23 +1776,6 @@ struct Process<T: Task> {
     /// at a fixed offset from `c_p` (erts reads `c_p->state` at `offsetof(Process, state)`).
     cell: ProcLock<TaskCell<T>>,
     shared: ProcShared<T::Message>,
-}
-
-impl<M: SignalMessage> ProcShared<M> {
-    /// Schedule-in of a slice of `reds` reductions: `REDS_IN = FCALLS = reds`.
-    // Port of erts/emulator/beam/erl_process.c (erts_schedule: `p->fcalls = reds`), OTP-29.1.1.
-    fn set_reds(&self, reds: u32) {
-        self.reds_in.store(reds, Ordering::Relaxed);
-        self.fcalls
-            .store(i32::try_from(reds).unwrap_or(i32::MAX), Ordering::Relaxed);
-    }
-
-    /// `REDS_IN - FCALLS`: what the slice reports to `erts_schedule` as `calls`.
-    fn consumed(&self) -> u32 {
-        let used = i64::from(self.reds_in.load(Ordering::Relaxed))
-            - i64::from(self.fcalls.load(Ordering::Relaxed));
-        used.clamp(0, i64::from(u32::MAX)) as u32
-    }
 }
 
 impl<T: Task> Process<T> {
@@ -2392,8 +2373,6 @@ impl<T: Task> ProcessTable<T> {
                     rtimer: ReceiveTimer::default(),
                     input: Incoming::with_state(psflg::initial(priority.index() as u32)),
                     xstate: AtomicU32::new(0),
-                    reds_in: AtomicU32::new(0),
-                    fcalls: AtomicI32::new(0),
                 },
                 cell: ProcLock::new(TaskCell::uninit()),
             },
@@ -5791,14 +5770,12 @@ trait ContextOps<M: SignalMessage> {
         &mut self,
         esdp: &mut EsdpCore,
         pid: Pid,
-        reds: u32,
         handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, M>) -> bool,
     ) -> DirtySignals;
     fn with_locked_target(
         &mut self,
         esdp: &mut EsdpCore,
         pid: Pid,
-        reds: u32,
         handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, M>),
     ) -> Result<(), SignalFreeError>;
 }
@@ -5850,17 +5827,6 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     pub fn schedule_spawned(&mut self, spawned: SpawnedProcess<M>) -> Result<(), Error> {
         self.inner.schedule_spawned(spawned)
     }
-    /// Report `count` more reductions used by the slice; returns false when the quantum is
-    /// exhausted. A task whose code keeps its own counter (FCALLS) reports once, at the
-    /// context switch.
-    // Port of erts/emulator/beam/jit/arm/process_main.cpp (context_switch: `reds_used`
-    // passed to erts_schedule), OTP-29.1.1.
-    pub fn consume(&mut self, count: u32) -> bool {
-        let left = self.proc.fcalls.load(Ordering::Relaxed);
-        let left = left.saturating_sub(i32::try_from(count).unwrap_or(i32::MAX));
-        self.proc.fcalls.store(left, Ordering::Relaxed);
-        left > 0
-    }
     /// Number of scheduler workers available to this runtime.
     pub fn scheduler_count(&self) -> usize {
         self.esdp.worker_count
@@ -5882,15 +5848,15 @@ impl<M: SignalMessage> RunCtx<'_, M> {
         self.esdp.worker.map_or(0, |worker| worker as u64 + 1)
     }
     /// Whether the slice may skip the scheduling-in work a signal, a system task or a dirty
-    /// scheduler would add: a plain slice on a normal scheduler with reductions left. Queued
-    /// non-message signals are not part of this test: the scheduler handles them first and
+    /// scheduler would add: a plain slice on a normal scheduler (the `reds` test reads the
+    /// task's own `c_p->fcalls`). Queued non-message signals are not part of this test: the scheduler handles them first and
     /// the slice is plain after that.
     // Port of erts/emulator/beam/erl_process.c (erts_schedule: `state & ERTS_PSFLG_RUNNING_SYS`,
     // the scheduler type and `reds` tests), OTP-29.1.1.
     #[inline(always)]
     pub fn fast_slice_ok_before_signals(&self, sys_task_run: bool) -> bool {
         // A normal scheduler never runs a dirty-running or dirty-queued process.
-        self.scheduler_key() != 0 && self.proc.fcalls.load(Ordering::Relaxed) > 0 && !sys_task_run
+        self.scheduler_key() != 0 && !sys_task_run
     }
     /// Type of the scheduler executing this process turn.
     pub fn scheduler_type(&self) -> SchedulerType {
@@ -5955,11 +5921,9 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     pub fn handle_dirty_signals(
         &mut self,
         pid: Pid,
-        reds: u32,
         handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, M>) -> bool,
     ) -> DirtySignals {
-        self.inner
-            .handle_dirty_signals(self.esdp, pid, reds, handle)
+        self.inner.handle_dirty_signals(self.esdp, pid, handle)
     }
     /// Run `body` with `pid`'s main lock held and a context acting as that process, as
     /// `erts_pid2proc(.., ERTS_PROC_LOCK_MAIN, ..)` lets the caller handle another process's
@@ -5970,10 +5934,9 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     pub fn with_locked_target(
         &mut self,
         pid: Pid,
-        reds: u32,
         body: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, M>),
     ) -> Result<(), SignalFreeError> {
-        self.inner.with_locked_target(self.esdp, pid, reds, body)
+        self.inner.with_locked_target(self.esdp, pid, body)
     }
     /// Run one copy of `work` on every scheduler at its next scheduling point.
     pub fn request_aux_work_all(&mut self, work: impl Fn(usize) + Send + Sync + 'static) {
@@ -6059,15 +6022,6 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     #[inline]
     pub fn add_virtual_reds(&mut self, reds: u32) {
         self.esdp.virtual_reds = self.esdp.virtual_reds.saturating_add(reds);
-    }
-    /// Reductions of the quantum not yet reported through [`RunCtx::consume`]. A context
-    /// acting as another process (a dirty signal handler) has the caller's reductions left.
-    pub fn remaining(&self) -> u32 {
-        self.proc.fcalls.load(Ordering::Relaxed).max(0) as u32
-    }
-    /// Reductions reported through [`RunCtx::consume`] in this process turn so far.
-    pub fn consumed(&self) -> u32 {
-        self.proc.consumed()
     }
     /// Scheduler-wide reductions committed before this process turn.
     pub fn total_reductions(&self) -> u64 {
@@ -6494,15 +6448,12 @@ impl<T: Task> Runner<'_, T> {
         process: &Process<T>,
         cell: &mut TaskCell<T>,
         pid: Pid,
-        reds: u32,
         handle: &mut TargetHandler<'_, T::Message>,
     ) -> bool {
         debug_assert_eq!(pid, process.pid);
         // The handling scheduler's own esdp, as erts' erts_internal_dirty_process_handle_signals_1
         // runs the target's signals with `c_p` the target and `esdp` the caller's scheduler.
         let task = cell.task_mut();
-        // The handler runs with the target's own `fcalls`, as erts' handler passes its `reds`.
-        process.shared.set_reds(reds);
         let mut ctx = RunCtx {
             inner: self,
             proc: &process.shared,
@@ -6544,7 +6495,6 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         &mut self,
         esdp: &mut EsdpCore,
         pid: Pid,
-        reds: u32,
         handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, T::Message>) -> bool,
     ) -> DirtySignals {
         let inner = self.inner;
@@ -6576,7 +6526,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         if let Some(result) = state(&process) {
             return result;
         }
-        let handled = self.run_as_target(esdp, &process, &mut cell, pid, reds, handle);
+        let handled = self.run_as_target(esdp, &process, &mut cell, pid, handle);
         if handled {
             DirtySignals::Handled
         } else {
@@ -6587,7 +6537,6 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         &mut self,
         esdp: &mut EsdpCore,
         pid: Pid,
-        reds: u32,
         handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, T::Message>),
     ) -> Result<(), SignalFreeError> {
         let process = self
@@ -6606,7 +6555,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         check(&process)?;
         let mut cell = process.cell.try_lock().ok_or(SignalFreeError::Busy)?;
         check(&process)?;
-        self.run_as_target(esdp, &process, &mut cell, pid, reds, &mut |task, ctx| {
+        self.run_as_target(esdp, &process, &mut cell, pid, &mut |task, ctx| {
             handle(task, ctx);
             true
         });
@@ -8481,7 +8430,13 @@ mod spawn_request_tests {
         type Message = ();
         type SchedulerData = ();
 
-        fn run(&mut self, ctx: &mut RunCtx<'_, ()>, _: &mut (), _: u32) -> RunOutcome {
+        fn run(
+            &mut self,
+            ctx: &mut RunCtx<'_, ()>,
+            _: &mut (),
+            _: u32,
+            _calls: &mut u32,
+        ) -> RunOutcome {
             while let Some(event) = ctx.receive() {
                 if matches!(event.payload, Payload::Signal(Signal::Link)) {
                     self.0.fetch_add(1, Ordering::Relaxed);
@@ -8532,7 +8487,13 @@ mod dirty_state_tests {
         type Message = ();
         type SchedulerData = ();
 
-        fn run(&mut self, _ctx: &mut RunCtx<'_, ()>, _: &mut (), _: u32) -> RunOutcome {
+        fn run(
+            &mut self,
+            _ctx: &mut RunCtx<'_, ()>,
+            _: &mut (),
+            _: u32,
+            _calls: &mut u32,
+        ) -> RunOutcome {
             RunOutcome::Wait { timeout_ms: None }
         }
     }
@@ -8785,7 +8746,13 @@ mod offline_scheduler_tests {
         type Message = ();
         type SchedulerData = ();
 
-        fn run(&mut self, _ctx: &mut RunCtx<'_, ()>, _: &mut (), _budget: u32) -> RunOutcome {
+        fn run(
+            &mut self,
+            _ctx: &mut RunCtx<'_, ()>,
+            _: &mut (),
+            _budget: u32,
+            _calls: &mut u32,
+        ) -> RunOutcome {
             RunOutcome::Yield
         }
     }
@@ -8829,7 +8796,13 @@ mod proxy_requeue_tests {
         type Message = ();
         type SchedulerData = ();
 
-        fn run(&mut self, ctx: &mut RunCtx<'_, ()>, _: &mut (), _budget: u32) -> RunOutcome {
+        fn run(
+            &mut self,
+            ctx: &mut RunCtx<'_, ()>,
+            _: &mut (),
+            _budget: u32,
+            _calls: &mut u32,
+        ) -> RunOutcome {
             match self {
                 Probe::Blocker(release) => {
                     while !release.load(Ordering::Acquire) {
@@ -9077,7 +9050,13 @@ mod rq_double_enqueue_tests {
         type Message = ();
         type SchedulerData = ();
 
-        fn run(&mut self, _ctx: &mut RunCtx<'_, ()>, _: &mut (), _budget: u32) -> RunOutcome {
+        fn run(
+            &mut self,
+            _ctx: &mut RunCtx<'_, ()>,
+            _: &mut (),
+            _budget: u32,
+            _calls: &mut u32,
+        ) -> RunOutcome {
             RunOutcome::Yield
         }
     }
@@ -9557,7 +9536,6 @@ fn run_slice<T: Task>(esdp: &mut ErtsSchedulerData<T>, process: ProcRef<T>) -> S
         let result = {
             let task = cell.task_mut();
             esdp.schedule_in(accounting_flags, || task.gc_nanoseconds());
-            process.shared.set_reds(budget);
             let mut ctx = RunCtx {
                 inner: &mut runner,
                 proc: &process.shared,
@@ -9575,7 +9553,8 @@ fn run_slice<T: Task>(esdp: &mut ErtsSchedulerData<T>, process: ProcRef<T>) -> S
             // OTP-29.1.1.
             task.trace_schedule_in(&mut ctx, data);
             task.copy_in_registers(data);
-            let outcome = task.run(&mut ctx, data, budget);
+            let mut calls = 0;
+            let outcome = task.run(&mut ctx, data, budget, &mut calls);
             task.copy_out_registers(data);
             task.trace_schedule_out(&mut ctx, data, &outcome);
             if let Some(thread_type) = thread_type {
@@ -9588,12 +9567,7 @@ fn run_slice<T: Task>(esdp: &mut ErtsSchedulerData<T>, process: ProcRef<T>) -> S
             let active_ns = accounting_started.map_or(0, |started| {
                 started.elapsed().as_nanos().min(u64::MAX as u128) as u64
             });
-            (
-                outcome,
-                process.shared.consumed(),
-                ctx.esdp.virtual_reds,
-                active_ns,
-            )
+            (outcome, calls, ctx.esdp.virtual_reds, active_ns)
         };
         runner.flush();
         result
@@ -9643,7 +9617,6 @@ fn run_process<T: Task>(esdp: &mut ErtsSchedulerData<T>, process: ProcRef<T>) ->
     let (outcome, reds_used, virtual_reds, active_ns) = {
         let task = cell.task_mut();
         esdp.schedule_in(accounting_flags, || task.gc_nanoseconds());
-        process.shared.set_reds(budget);
         let mut ctx = RunCtx {
             inner: &mut runner,
             proc: &process.shared,
@@ -9657,7 +9630,8 @@ fn run_process<T: Task>(esdp: &mut ErtsSchedulerData<T>, process: ProcRef<T>) ->
         // when the slice switches out), OTP-29.1.1.
         task.trace_schedule_in(&mut ctx, data);
         task.copy_in_registers(data);
-        let outcome = task.run(&mut ctx, data, budget);
+        let mut calls = 0;
+        let outcome = task.run(&mut ctx, data, budget, &mut calls);
         task.copy_out_registers(data);
         task.trace_schedule_out(&mut ctx, data, &outcome);
         if ctx.esdp.msacc_enabled {
@@ -9667,12 +9641,7 @@ fn run_process<T: Task>(esdp: &mut ErtsSchedulerData<T>, process: ProcRef<T>) ->
         let active_ns = accounting_started.map_or(0, |started| {
             started.elapsed().as_nanos().min(u64::MAX as u128) as u64
         });
-        (
-            outcome,
-            process.shared.consumed(),
-            ctx.esdp.virtual_reds,
-            active_ns,
-        )
+        (outcome, calls, ctx.esdp.virtual_reds, active_ns)
     };
     runner.flush();
     if matches!(outcome, RunOutcome::Exit(_)) {
@@ -11252,7 +11221,13 @@ mod worker_drop_tests {
         type Message = ();
         type SchedulerData = ();
 
-        fn run(&mut self, _ctx: &mut RunCtx<'_, ()>, _: &mut (), _budget: u32) -> RunOutcome {
+        fn run(
+            &mut self,
+            _ctx: &mut RunCtx<'_, ()>,
+            _: &mut (),
+            _budget: u32,
+            _calls: &mut u32,
+        ) -> RunOutcome {
             // The last scheduler handle drops on this worker while its cell is locked.
             match &self.slot {
                 Some(slot) => {

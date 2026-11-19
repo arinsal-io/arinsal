@@ -11,7 +11,7 @@ struct Idle;
 impl Task for Idle {
     type Message = ();
     type SchedulerData = ();
-    fn run(&mut self, _: &mut RunCtx<()>, _: &mut (), _: u32) -> RunOutcome {
+    fn run(&mut self, _: &mut RunCtx<()>, _: &mut (), _: u32, _calls: &mut u32) -> RunOutcome {
         RunOutcome::Exit(0)
     }
 }
