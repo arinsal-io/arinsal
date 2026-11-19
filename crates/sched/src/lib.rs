@@ -5657,6 +5657,10 @@ pub struct ErtsSchedulerData<T: Task> {
     /// `registers`: the scheduler's register block, allocated with the scheduler data
     /// (init_scheduler_data) and read by the slice through `esdp`.
     registers: T::SchedulerData,
+    /// `cpu_id`: the CPU binding erts_sched_check_cpu_bind applied (`Some(None)` unbound),
+    /// `None` before the first check.
+    #[cfg(target_os = "linux")]
+    cpu_id: Cell<Option<Option<usize>>>,
 }
 
 /// `esdp->registers`: the register block of the scheduler whose data is `esdp`.
@@ -9259,7 +9263,7 @@ impl<T: Task> Scheduler<T> {
 fn schedule_out<T: Task>(
     esdp: &ErtsSchedulerData<T>,
     mut local: Option<&mut Local<T>>,
-    process: ProcRef<T>,
+    process: &ProcRef<T>,
     reds_used: u32,
     worker: Option<usize>,
     dirty: Option<DirtyKind>,
@@ -9342,13 +9346,13 @@ fn schedule_out<T: Task>(
         _ if state & psflg::FREE != 0 => {
             // Port of erts/emulator/beam/erl_process.c:14209 (erts_do_exit_process cancels
             // the process timer), OTP-29.1.1.
-            inner.cancel_proc_timer(&process);
+            inner.cancel_proc_timer(process);
             if dirty.is_some() {
                 // Already outside the normal run queue accounting.
             } else if let Some(local) = local.as_deref_mut() {
-                local.record_waiting(&process);
+                local.record_waiting(process);
             } else {
-                inner.record_waiting(&process);
+                inner.record_waiting(process);
             }
         }
         Some(kind) => {
@@ -9356,9 +9360,9 @@ fn schedule_out<T: Task>(
             // queue), OTP-29.1.1.
             if dirty.is_none() {
                 if let Some(local) = local.as_deref_mut() {
-                    local.record_waiting(&process);
+                    local.record_waiting(process);
                 } else {
-                    inner.record_waiting(&process);
+                    inner.record_waiting(process);
                 }
             }
             let prio = process.priority().index();
@@ -9373,7 +9377,7 @@ fn schedule_out<T: Task>(
             // scheduled dirty), OTP-29.1.1.
             let state = process.input.state().load(Ordering::Acquire);
             if Inner::<T>::need_dirty_sig_handling(state) {
-                inner.notify_dirty_signal_handler(&process, Some(process.priority()));
+                inner.notify_dirty_signal_handler(process, Some(process.priority()));
             }
         }
         None if state & psflg::ACTIVE != 0 && dirty.is_some() => {
@@ -9427,16 +9431,16 @@ fn schedule_out<T: Task>(
             // before the process publishes WAITING: once it waits, another scheduler may run it.
             // A wheel timer id the receiver cancelled leaves its wheel here
             // (erl_hl_timer.c continue_cancel_ptimer).
-            inner.cancel_proc_timer_wheel(&process);
+            inner.cancel_proc_timer_wheel(process);
             let left_running = process
                 .run_state()
                 .store_from_running(WAITING, Ordering::SeqCst);
             if dirty.is_some() {
                 // Already outside the normal run queue accounting.
             } else if let Some(local) = local.as_deref_mut() {
-                local.record_waiting(&process);
+                local.record_waiting(process);
             } else {
-                inner.record_waiting(&process);
+                inner.record_waiting(process);
             }
             let prio = process.priority().index();
             // A signal that arrived while the process ran found it active and did not wake it.
@@ -9633,33 +9637,47 @@ fn schedule_in<T: Task>(esdp: &ErtsSchedulerData<T>, process: &ProcRef<T>) -> He
     cell.keep_locked()
 }
 
-/// The schedule-out half of a normal `erts_schedule` for the process `p` that just ran,
-/// whose main lock `held` the slice kept: the schedule-out trace events, `p->scheduler_data
-/// = NULL`, the accounting, the pending signal, and the main lock released. The state
-/// transition (`schedule_out`) follows.
-// Port of erts/emulator/beam/erl_process.c:9660-9760 (erts_schedule: erts_proc_sig_send_pending,
-// trace_schedule_out, `p->scheduler_data = NULL`, `erts_proc_unlock(p, ERTS_PROC_LOCK_MAIN)`),
-// OTP-29.1.1.
-fn schedule_out_locked<T: Task>(
+/// The first part of a normal `erts_schedule`'s schedule-out of the process `p` that just
+/// ran, whose main lock `held` the slice kept: the pending signal, the schedule-out trace
+/// events and the accounting. Returns the main lock still held for the state transition
+/// (`schedule_out`) and [`schedule_out_unlock`].
+// Port of erts/emulator/beam/erl_process.c:9660-9720 (erts_schedule: erts_proc_sig_send_pending,
+// trace_schedule_out), OTP-29.1.1.
+fn schedule_out_trace<'p, T: Task>(
     esdp: &ErtsSchedulerData<T>,
-    process: &ProcRef<T>,
+    process: &'p ProcRef<T>,
     held: HeldMainLock,
-) {
+) -> ProcLockGuard<'p, TaskCell<T>> {
     let mut cell = process.cell.resume_locked(held);
     {
         let mut c_p = CP::new(process, &mut cell);
         T::trace_schedule_out(&mut c_p, esdp);
-        // Port of erts/emulator/beam/erl_process.c:9756 (erts_schedule: `p->scheduler_data =
-        // NULL` at the schedule-out of a normal scheduler), OTP-29.1.1.
-        if let Some(slot) = c_p.task().scheduler_data() {
-            slot.set_scheduler(None);
-        }
         if esdp.msacc_enabled.get() {
             let gc_ns = c_p.task().gc_nanoseconds();
             esdp.with_ctx(&mut c_p, |_, ctx| {
                 ctx.set_msacc_state(MsaccState::Other);
                 ctx.account_gc_total(gc_ns);
             });
+        }
+    }
+    cell
+}
+
+/// The end of a normal `erts_schedule`'s schedule-out, after the state transition:
+/// `esdp->current_process = NULL`, `p->scheduler_data = NULL` and the main lock released.
+// Port of erts/emulator/beam/erl_process.c:9750-9760 (erts_schedule: `esdp->current_process =
+// NULL; p->scheduler_data = NULL; erts_proc_unlock(p, ERTS_PROC_LOCK_MAIN | ...)`),
+// OTP-29.1.1.
+fn schedule_out_unlock<T: Task>(
+    esdp: &ErtsSchedulerData<T>,
+    process: &ProcRef<T>,
+    mut cell: ProcLockGuard<'_, TaskCell<T>>,
+) {
+    *esdp.current_process.borrow_mut() = None;
+    {
+        let mut c_p = CP::new(process, &mut cell);
+        if let Some(slot) = c_p.task().scheduler_data() {
+            slot.set_scheduler(None);
         }
     }
     erts_proc_sig_send_pending(esdp);
@@ -10300,13 +10318,54 @@ impl Drop for AllocOwnerWaker {
     }
 }
 
-/// One pass of `erts_schedule`: the schedule-out of `previous` (erts' `p` and `calls`), then on
-/// a normal scheduler the progress point, aux work, timers, balance, ports and the dequeue, and
-/// on a dirty scheduler the dequeue from its dirty run queue. `Some` is the process to run;
-/// `None` means a normal pass ran a port, slept, stole nothing, or must be repeated, and a
-/// dirty pass found the runtime stopping.
-// Port of erts/emulator/beam/erl_process.c:9607 (erts_schedule), OTP-29.1.1.
+/// `erts_schedule(esdp, p, calls)` of a normal scheduler: schedules out `p` (the process
+/// that ran last, its main lock held, `calls` its reductions), then repeats
+/// `check_activities_to_run` (CPU binding, aux work, timers, balance, ports, the dequeue) until
+/// a process is selected, and returns it with its main lock held. It returns `None` only when
+/// the scheduler is stopped (see the stop protocol in the report: erts schedulers never stop).
+// Port of erts/emulator/beam/erl_process.c:9607 (erts_schedule) and :9853-9866
+// (continue_check_activities_to_run: ERTS_RUNQ_FLG_CHK_CPU_BIND -> erts_sched_check_cpu_bind;
+// every path without a process to run goes back to check_activities_to_run), OTP-29.1.1.
 fn erts_schedule<T: Task>(
+    esdp: &ErtsSchedulerData<T>,
+    mut p: Option<(ProcRef<T>, HeldMainLock)>,
+    mut calls: u32,
+) -> Option<(ProcRef<T>, HeldMainLock)> {
+    loop {
+        if esdp.run_queue.stopped.load(Ordering::Acquire) {
+            // A stop never drops a finished slice.
+            if let Some((p, held)) = p.take() {
+                let id = esdp.worker.expect("a normal scheduler has its number");
+                let cell = schedule_out_trace(esdp, &p, held);
+                let local_cell = esdp
+                    .local
+                    .as_ref()
+                    .expect("a normal scheduler has its local state");
+                let mut local = local_cell.borrow_mut();
+                if let Some(next) = schedule_out(esdp, Some(&mut *local), &p, calls, Some(id), None)
+                {
+                    esdp.run_queue.run_queues[id].push(next);
+                }
+                drop(local);
+                schedule_out_unlock(esdp, &p, cell);
+            }
+            return None;
+        }
+        #[cfg(target_os = "linux")]
+        erts_sched_check_cpu_bind(esdp);
+        if let Some(next) = check_activities_to_run(esdp, p.take(), calls) {
+            return Some(next);
+        }
+        calls = 0;
+    }
+}
+
+/// One pass of `erts_schedule`: the schedule-out of `p` when there is one, then on a normal
+/// scheduler the progress point, aux work, timers, balance, ports and the dequeue. `Some` is
+/// the process to run; `None` means the pass ran a port, slept, stole nothing, or must be
+/// repeated (`goto check_activities_to_run`).
+// Port of erts/emulator/beam/erl_process.c:9607-10230 (erts_schedule), OTP-29.1.1.
+fn check_activities_to_run<T: Task>(
     esdp: &ErtsSchedulerData<T>,
     p: Option<(ProcRef<T>, HeldMainLock)>,
     calls: u32,
@@ -10315,12 +10374,16 @@ fn erts_schedule<T: Task>(
         esdp.dirty_no.is_none(),
         "erts_schedule_dirty serves dirty schedulers"
     );
-    // The schedule-out half runs before this pass borrows the scheduler's local state: the
-    // trace and signal work it does may reach that state itself.
-    let p = p.map(|(p, held)| {
-        schedule_out_locked(esdp, &p, held);
-        p
-    });
+    // The traced half of the schedule-out runs before this pass borrows the scheduler's local
+    // state: the trace and signal work it does may reach that state itself.
+    let (p, held) = match p {
+        Some((p, held)) => (Some(p), Some(held)),
+        None => (None, None),
+    };
+    let p = p
+        .as_ref()
+        .zip(held)
+        .map(|(p, held)| (p, schedule_out_trace(esdp, p, held)));
     let inner = &esdp.run_queue;
     let id = esdp.worker.expect("a normal scheduler has its number");
     let local_cell = esdp
@@ -10340,9 +10403,11 @@ fn erts_schedule<T: Task>(
     // The schedule-out half of the slice that just ran comes first and shares this borrow
     // (erts_schedule: schedule_out_process, then check_activities_to_run and the dequeue).
     // Every `None` below happens after it.
-    if let Some(p) = p {
+    if let Some((p, cell)) = p {
+        // Port of erts/emulator/beam/erl_process.c:9740-9760 (erts_schedule:
+        // schedule_out_process with the main lock held, then `esdp->current_process = NULL`,
+        // `p->scheduler_data = NULL`, erts_proc_unlock), OTP-29.1.1.
         let own = schedule_out(esdp, Some(&mut *local), p, calls, Some(id), None);
-        *esdp.current_process.borrow_mut() = None;
         // Port of erts/emulator/beam/erl_process.c:9744 (schedule: schedule_out_process
         // "returns with rq locked"), OTP-29.1.1: the lock covers the enqueue of the slice that
         // just ended up to the dequeue, so a thief (trylock EBUSY) cannot take the process
@@ -10351,6 +10416,7 @@ fn erts_schedule<T: Task>(
         if let Some(next) = own {
             rq.locked().push(next);
         }
+        schedule_out_unlock(esdp, p, cell);
     } else {
         // erts_schedule(NULL, ...) and scheduler_wait both continue with rq locked.
         rq.lock();
@@ -10857,7 +10923,12 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         run_queue: inner,
         ref_unique: Rc::new(unique::SchedRefUnique::new_normal(id as u32 + 1)),
         registers: T::SchedulerData::default(),
+        #[cfg(target_os = "linux")]
+        cpu_id: Cell::new(None),
     };
+    // Read the start affinity before this scheduler binds itself (erts_cpu_info_update).
+    #[cfg(target_os = "linux")]
+    CPUINFO_AFFINITY.get_or_init(|| rustix::thread::sched_getaffinity(None).ok());
     // erts seeds the scheduler-local random state from the `esdp` address.
     arinsal_term::initialize_scheduler_random(std::ptr::from_ref(&esdp).cast());
     let _ref_unique_binding = esdp.ref_unique.bind();
@@ -10877,54 +10948,32 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
 // Port of erts/emulator/beam/beam_emu.c:375 (process_main: `c_p = erts_schedule(NULL, c_p,
 // reds_used)`, then the slice) and jit/x86/process_main.cpp (schedule_next), OTP-29.1.1.
 fn process_main<T: Task>(esdp: &ErtsSchedulerData<T>) {
-    let id = esdp.worker.expect("a normal scheduler has its number");
-    #[cfg(target_os = "linux")]
-    let inherited_affinity = rustix::thread::sched_getaffinity(None).ok();
-    #[cfg(target_os = "linux")]
-    let mut applied_binding = None;
     // `c_p` and `reds_used` of process_main: the process that ran last and its reductions.
     let mut c_p: Option<(ProcRef<T>, HeldMainLock)> = None;
     let mut reds_used = 0;
-    while !esdp.run_queue.stopped.load(Ordering::Acquire) {
-        #[cfg(target_os = "linux")]
-        apply_scheduler_cpu_binding(
-            &esdp.run_queue,
-            id,
-            &mut applied_binding,
-            inherited_affinity.as_ref(),
-        );
-        let Some((item, held)) = erts_schedule(esdp, c_p.take(), reds_used) else {
-            continue;
-        };
+    while let Some((item, held)) = erts_schedule(esdp, c_p.take(), reds_used) {
         // A managed thread runs its later operations at its progress point
         // (`scheduler_progress`), so the unmanaged-runtime pass of `run_one` is not needed.
         let (held, calls) = run_process(esdp, &item, held);
         reds_used = calls;
         c_p = Some((item, held));
     }
-    // A stop never drops a finished slice.
-    if let Some((p, held)) = c_p.take() {
-        schedule_out_locked(esdp, &p, held);
-        let inner = &esdp.run_queue;
-        let local_cell = esdp
-            .local
-            .as_ref()
-            .expect("a normal scheduler has its local state");
-        let mut local = local_cell.borrow_mut();
-        if let Some(next) = schedule_out(esdp, Some(&mut *local), p, reds_used, Some(id), None) {
-            inner.run_queues[id].push(next);
-        }
-    }
 }
 
+/// `cpuinfo->affinity`: the CPU set the runtime was started with, read before any scheduler
+/// binds itself; unbinding a scheduler restores it.
+// Port of erts/emulator/beam/erl_cpu_topology.c (`static erts_cpu_info_t *cpuinfo`,
+// erts_cpu_info_update), OTP-29.1.1.
+#[cfg(target_os = "linux")]
+static CPUINFO_AFFINITY: OnceLock<Option<rustix::thread::CpuSet>> = OnceLock::new();
+
+/// `erts_sched_check_cpu_bind(esdp)`: binds the scheduler thread to the CPU its run queue's
+/// bind target names (or unbinds it), `esdp->cpu_id` recording the binding applied.
 // Port of erts/emulator/beam/erl_cpu_topology.c (erts_sched_check_cpu_bind), OTP-29.1.1.
 #[cfg(target_os = "linux")]
-fn apply_scheduler_cpu_binding<T: Task>(
-    inner: &Inner<T>,
-    id: usize,
-    applied: &mut Option<Option<usize>>,
-    inherited: Option<&rustix::thread::CpuSet>,
-) {
+fn erts_sched_check_cpu_bind<T: Task>(esdp: &ErtsSchedulerData<T>) {
+    let inner = &*esdp.run_queue;
+    let id = esdp.worker.expect("a normal scheduler has its number");
     let requested = inner
         .cpu_bind_targets
         .read()
@@ -10934,10 +10983,13 @@ fn apply_scheduler_cpu_binding<T: Task>(
     } else {
         None
     };
-    if *applied == Some(target) {
+    if esdp.cpu_id.get() == Some(target) {
         return;
     }
-    let Some(inherited) = inherited else {
+    let Some(inherited) = CPUINFO_AFFINITY
+        .get_or_init(|| rustix::thread::sched_getaffinity(None).ok())
+        .as_ref()
+    else {
         return;
     };
     let mut mask = rustix::thread::CpuSet::new();
@@ -10951,13 +11003,13 @@ fn apply_scheduler_cpu_binding<T: Task>(
             .cpu_bind_actual
             .write()
             .unwrap_or_else(|error| error.into_inner())[id] = target;
-        *applied = Some(target);
+        esdp.cpu_id.set(Some(target));
     } else if target.is_some() && rustix::thread::sched_setaffinity(None, inherited).is_ok() {
         inner
             .cpu_bind_actual
             .write()
             .unwrap_or_else(|error| error.into_inner())[id] = None;
-        *applied = Some(None);
+        esdp.cpu_id.set(Some(None));
     }
 }
 
@@ -11129,6 +11181,8 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
         run_queue: inner,
         ref_unique: Rc::new(unique::SchedRefUnique::new_dirty(thr_id)),
         registers: T::SchedulerData::default(),
+        #[cfg(target_os = "linux")]
+        cpu_id: Cell::new(None),
     };
     arinsal_term::initialize_scheduler_random(std::ptr::from_ref(&esdp).cast());
     let _ref_unique_binding = esdp.ref_unique.bind();
@@ -11171,7 +11225,7 @@ fn erts_schedule_dirty<T: Task>(
     // Port of erts/emulator/beam/erl_process.c:9744-9760 (erts_schedule: schedule_out_process,
     // then `esdp->current_process = NULL`), OTP-29.1.1.
     if let Some(process) = p {
-        let _ = schedule_out(esdp, None, process.clone(), calls, None, Some(kind));
+        let _ = schedule_out(esdp, None, &process, calls, None, Some(kind));
         *esdp.current_process.borrow_mut() = None;
         process
             .input
