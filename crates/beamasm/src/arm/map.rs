@@ -105,12 +105,11 @@ pub struct MapRuntime {
 /// immediate key; other literal keys are hashed by the runtime lookup.
 // Port of erts/emulator/beam/generators.tab (gen.get_map_element) and erl_map.h:216
 // (hashmap_make_hash), OTP-29.1.1.
-pub fn literal_key_hash(key: ArgVal) -> u64 {
-    match key {
-        ArgVal::Immediate(word) | ArgVal::Literal(word) if word & 3 == 3 => {
-            arinsal_term::immediate_internal_hash(word)
-        }
-        _ => 0,
+pub fn literal_key_hash(word: u64) -> u64 {
+    if word & 3 == 3 {
+        arinsal_term::immediate_internal_hash(word)
+    } else {
+        0
     }
 }
 
@@ -461,7 +460,7 @@ impl BeamModuleAssembler {
     ) -> Result<(), ModuleError> {
         // erts' `maybe_one_of<BeamTypeId::MaybeImmediate>(Key)`: only a boxed literal is
         // known not to be an immediate. Any other key goes through the shared fragment.
-        let key_is_immediate = !matches!(key, ArgVal::Literal(word) if word & 3 != 3);
+        let key_is_immediate = self.constant_word(key).is_none_or(|word| word & 3 == 3);
         let map = self.source_reg(src)?;
         self.code.emit(|e| e.mov_reg(Gpr::x(0), map))?;
         let key = self.source_reg_into(key, Gpr::x(17))?;
@@ -501,20 +500,20 @@ impl BeamModuleAssembler {
         let fail = self.label(fail);
         // erts calls the shared fragment only for an immediate key (`Key.isImmed()`); any
         // other constant goes straight to the runtime lookup.
-        if matches!(key, ArgVal::Immediate(word) | ArgVal::Literal(word) if word & 3 == 3) {
+        if self.constant_word(key).is_some_and(|word| word & 3 == 3) {
             for (arg, value) in [(Gpr::x(0), src), (Gpr::x(1), key)] {
                 let reg = self.source_reg(value)?;
                 self.code.emit(|e| e.mov_reg(arg, reg))?;
             }
-            match hash {
-                ArgVal::Immediate(value) | ArgVal::Literal(value) => {
+            match self.constant_word(hash) {
+                Some(value) => {
                     // ArgWord constants wider than 32 bits are embedded in OTP's module
                     // literal area and loaded with LDR literal.
                     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1528-1554,
                     // OTP-29.1.1.
                     self.code.ldr_literal(Gpr::x(2), value)?;
                 }
-                _ => {
+                None => {
                     let reg = self.source_reg(hash)?;
                     self.code.emit(|e| e.mov_reg(Gpr::x(2), reg))?;
                 }
@@ -646,14 +645,12 @@ impl BeamModuleAssembler {
             .0
             .iter()
             .map(|triple| {
-                let key = match triple[0] {
-                    ArgVal::Immediate(word) | ArgVal::Literal(word) => word,
-                    _ => return Err(ModuleError::InvalidOperand("map lookup key is not static")),
-                };
-                let hash = match triple[2] {
-                    ArgVal::Immediate(word) | ArgVal::Literal(word) => word,
-                    _ => return Err(ModuleError::InvalidOperand("map lookup hash is not static")),
-                };
+                let key = self
+                    .constant_word(triple[0])
+                    .ok_or(ModuleError::InvalidOperand("map lookup key is not static"))?;
+                let hash = self
+                    .constant_word(triple[2])
+                    .ok_or(ModuleError::InvalidOperand("map lookup hash is not static"))?;
                 let destination = match triple[1] {
                     ArgVal::X(index) => MapLookupDestination::X(index),
                     ArgVal::Y(index) => MapLookupDestination::Y(index),
@@ -676,9 +673,10 @@ impl BeamModuleAssembler {
         let map = self.source_reg(src)?;
         // Port of erts/emulator/beam/jit/arm/instr_map.cpp:391-490, OTP-29.1.1.
         let can_inline = args.len() < 24
-            && args.iter().step_by(3).all(
-                |arg| matches!(arg, ArgVal::Immediate(word) | ArgVal::Literal(word) if word & 3 == 3),
-            );
+            && args
+                .iter()
+                .step_by(3)
+                .all(|&arg| self.constant_word(arg).is_some_and(|word| word & 3 == 3));
         let generic = self.code.new_label();
         let done = self.code.new_label();
         self.code.emit(|e| e.mov_reg(Gpr::x(1), map))?;

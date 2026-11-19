@@ -423,22 +423,22 @@ pub(crate) fn bsm_init(commands: &[BsmCommand]) -> Vec<Segment> {
 }
 
 /// `BSF_LITTLE`, `BSF_SIGNED` (erl_bits.h).
-#[cfg(target_arch = "x86_64")]
 const BSF_LITTLE: u64 = 2;
-#[cfg(target_arch = "x86_64")]
 const BSF_SIGNED: u64 = 4;
 
 /// `bs_get_flags(beam, val)`: the flags of a `bs_match` segment, NIL, a flag list literal
 /// or a word (from `bs_get_integer2`).
 // Port of erts/emulator/beam/jit/beam_jit_bs.cpp:255-285 (bs_get_flags), OTP-29.1.1.
-#[cfg(target_arch = "x86_64")]
-fn bs_get_flags(val: ArgVal) -> Result<u64, &'static str> {
+pub(crate) fn beam_jit_bs_get_flags(
+    val: ArgVal,
+    beamfile_get_literal: &impl Fn(i64) -> u64,
+) -> Result<u64, &'static str> {
     use arinsal_term::raw::Cons;
     if val.is_nil() {
         Ok(0)
-    } else if let ArgVal::Literal(word) = val {
-        // `beamfile_get_literal(beam, idx)`: the loader resolved the literal to its term in
-        // the module's literal area (see `ArgVal::Literal`).
+    } else if let ArgVal::Literal(index) = val {
+        // Port of erts/emulator/beam/jit/beam_jit_bs.cpp:255-285 (bs_get_flags), OTP-29.1.1.
+        let word = beamfile_get_literal(index);
         let mut term = arinsal_term::raw::term_from_bits(word);
         let mut flags = 0;
         while let Ok(cell) = Cons::try_from(term) {
@@ -476,7 +476,10 @@ fn bsm_live(val: ArgVal) -> Result<Option<u32>, &'static str> {
 /// loader hands it to the emitter (`{atom, operands...}` flattened).
 // Port of erts/emulator/beam/jit/beam_jit_bs.cpp:287-364 (beam_jit_bsm_init), OTP-29.1.1.
 #[cfg(target_arch = "x86_64")]
-pub(crate) fn beam_jit_bsm_init(list: &[ArgVal]) -> Result<Vec<Segment>, &'static str> {
+pub(crate) fn beam_jit_bsm_init(
+    list: &[ArgVal],
+    beamfile_get_literal: impl Fn(i64) -> u64,
+) -> Result<Vec<Segment>, &'static str> {
     use arinsal_term::{Term, atoms};
     let atom = |a| Term::atom(a).word();
     let word = |val: ArgVal| val.word().ok_or("bs_match word operand");
@@ -515,7 +518,7 @@ pub(crate) fn beam_jit_bsm_init(list: &[ArgVal]) -> Result<Vec<Segment>, &'stati
                 live: bsm_live(arg(current)?)?,
                 size: size * unit,
                 unit,
-                flags: bs_get_flags(arg(current + 1)?)?,
+                flags: beam_jit_bs_get_flags(arg(current + 1)?, &beamfile_get_literal)?,
                 dst: Some(dst),
                 ..Segment::new(action)
             };

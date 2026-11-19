@@ -21,26 +21,43 @@ const SMALL_MASK: u64 = 0x0f;
 const SMALL_SHIFT: u8 = 4;
 
 impl BeamModuleAssembler {
-    fn emit_compare(&mut self, reg: Gpr, value: ArgVal) -> Result<(), ModuleError> {
+    fn constant_value(&self, value: ArgVal) -> Option<u64> {
         match value {
-            ArgVal::Immediate(value) | ArgVal::Literal(value) => {
-                if value <= 4095 {
-                    self.code.emit(|e| e.cmp_imm(reg, value as u16, false))?;
-                } else if value.wrapping_neg() <= 4095 {
-                    // Rebased values below the base wrap around; `cmn` keeps the unsigned
-                    // `hs`/`lo` meaning of `cmp`.
-                    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp (cmp_arg/cmp), OTP-29.1.1.
-                    self.code
-                        .emit(|e| e.cmn_imm(reg, value.wrapping_neg() as u16, false))?;
-                } else {
-                    self.code.emit(|e| e.mov_const(TMP3, value))?;
-                    self.code.emit(|e| e.cmp_reg(reg, TMP3, Shift::Lsl, 0))?;
-                }
+            ArgVal::Immediate(word) => Some(word),
+            ArgVal::Literal(index) => Some(self.beamfile_get_literal(index)),
+            _ => None,
+        }
+    }
+
+    fn is_nil(&self, value: ArgVal) -> bool {
+        self.constant_value(value)
+            .is_some_and(|word| matches!(word, 0 | 0x3b))
+    }
+
+    fn select_values(&self, values: &[ArgVal]) -> Vec<u64> {
+        values
+            .iter()
+            .map(|&value| self.constant_value(value).unwrap_or(0))
+            .collect()
+    }
+
+    fn emit_compare(&mut self, reg: Gpr, value: ArgVal) -> Result<(), ModuleError> {
+        if let Some(value) = self.constant_value(value) {
+            if value <= 4095 {
+                self.code.emit(|e| e.cmp_imm(reg, value as u16, false))?;
+            } else if value.wrapping_neg() <= 4095 {
+                // Rebased values below the base wrap around; `cmn` keeps the unsigned
+                // `hs`/`lo` meaning of `cmp`.
+                // Port of erts/emulator/beam/jit/arm/beam_asm.hpp (cmp_arg/cmp), OTP-29.1.1.
+                self.code
+                    .emit(|e| e.cmn_imm(reg, value.wrapping_neg() as u16, false))?;
+            } else {
+                self.code.emit(|e| e.mov_const(TMP3, value))?;
+                self.code.emit(|e| e.cmp_reg(reg, TMP3, Shift::Lsl, 0))?;
             }
-            _ => {
-                let rhs = self.source_reg(value)?;
-                self.code.emit(|e| e.cmp_reg(reg, rhs, Shift::Lsl, 0))?;
-            }
+        } else {
+            let rhs = self.source_reg(value)?;
+            self.code.emit(|e| e.cmp_reg(reg, rhs, Shift::Lsl, 0))?;
         }
         Ok(())
     }
@@ -57,11 +74,14 @@ impl BeamModuleAssembler {
                 let target = self.label(id);
                 self.code.b(target)?;
             }
-            ArgVal::Immediate(0 | 0x3b) | ArgVal::Literal(0 | 0x3b) => self.code.b(fallthrough)?,
             _ => {
-                return Err(ModuleError::InvalidOperand(
-                    "select fail must be label or nil",
-                ));
+                if self.is_nil(fail) {
+                    self.code.b(fallthrough)?;
+                } else {
+                    return Err(ModuleError::InvalidOperand(
+                        "select fail must be label or nil",
+                    ));
+                }
             }
         }
         Ok(())
@@ -106,7 +126,7 @@ impl BeamModuleAssembler {
             }
         };
         let reg = self.source_reg_into(src.val, ARG1)?;
-        let (base, shift) = plan_untag(&select_values(&args[..count]));
+        let (base, shift) = plan_untag(&self.select_values(&args[..count]));
         if base == 0 && shift == 0 {
             self.emit_linear_search(reg, fail_label, args)?;
         } else {
@@ -121,7 +141,7 @@ impl BeamModuleAssembler {
     }
 
     fn branch_fail_check(&self, fail: ArgVal) -> Result<(), ModuleError> {
-        if is_nil(fail) {
+        if self.is_nil(fail) {
             Ok(())
         } else {
             Err(ModuleError::InvalidOperand(
@@ -145,7 +165,7 @@ impl BeamModuleAssembler {
         shift: u32,
     ) -> Result<Vec<ArgVal>, ModuleError> {
         let count = values.len();
-        let first = select_values(values)[0];
+        let first = self.select_values(values)[0];
         let (mask, tag) = if first & 0xf == 0xf {
             (0xfu64, 0xfu16)
         } else {
@@ -170,7 +190,7 @@ impl BeamModuleAssembler {
             base >>= shift;
             comparand = ARG1;
         }
-        let raw = select_values(values);
+        let raw = self.select_values(values);
         let mut entries: Vec<(u64, ArgVal)> = (0..count)
             .map(|i| ((raw[i] >> shift).wrapping_sub(base), args[i + count]))
             .collect();
@@ -229,13 +249,11 @@ impl BeamModuleAssembler {
             }
             let mut run = 1;
             while i + run < end {
-                let previous = match args[i + run - 1] {
-                    ArgVal::Immediate(v) | ArgVal::Literal(v) => v,
-                    _ => break,
+                let Some(previous) = self.constant_value(args[i + run - 1]) else {
+                    break;
                 };
-                let current = match args[i + run] {
-                    ArgVal::Immediate(v) | ArgVal::Literal(v) => v,
-                    _ => break,
+                let Some(current) = self.constant_value(args[i + run]) else {
+                    break;
                 };
                 if previous.checked_add(1) != Some(current) {
                     break;
@@ -243,14 +261,11 @@ impl BeamModuleAssembler {
                 run += 1;
             }
             if run > 2 {
-                let first = match value {
-                    ArgVal::Immediate(v) | ArgVal::Literal(v) => v,
-                    _ => {
-                        return Err(ModuleError::InvalidOperand(
-                            "contiguous select values must be words",
-                        ));
-                    }
-                };
+                let first = self
+                    .constant_value(value)
+                    .ok_or(ModuleError::InvalidOperand(
+                        "contiguous select values must be words",
+                    ))?;
                 if first == 0 {
                     self.code.emit(|e| e.cmp_imm(reg, run as u16, false))?;
                 } else {
@@ -288,22 +303,16 @@ impl BeamModuleAssembler {
         target: u32,
     ) -> Result<(), ModuleError> {
         // Port of erts/emulator/beam/jit/arm/instr_select.cpp:533-582, OTP-29.1.1
-        let x = match first {
-            ArgVal::Immediate(v) | ArgVal::Literal(v) => v,
-            _ => {
-                return Err(ModuleError::InvalidOperand(
-                    "two-value select needs constants",
-                ));
-            }
-        };
-        let y = match second {
-            ArgVal::Immediate(v) | ArgVal::Literal(v) => v,
-            _ => {
-                return Err(ModuleError::InvalidOperand(
-                    "two-value select needs constants",
-                ));
-            }
-        };
+        let x = self
+            .constant_value(first)
+            .ok_or(ModuleError::InvalidOperand(
+                "two-value select needs constants",
+            ))?;
+        let y = self
+            .constant_value(second)
+            .ok_or(ModuleError::InvalidOperand(
+                "two-value select needs constants",
+            ))?;
         let diff = x ^ y;
         if x.checked_add(1) == Some(y) {
             if x == 0 {
@@ -388,9 +397,9 @@ impl BeamModuleAssembler {
         }
         let reg = self.source_reg_into(src.val, ARG1)?;
         let fail_label = self.fail_label(fail)?;
-        let sorted = sorted_select_pairs(count, args)?;
+        let sorted = sorted_select_pairs(self, count, args)?;
         let (base, shift) = if untag {
-            plan_untag(&select_values(&sorted[..count]))
+            plan_untag(&self.select_values(&sorted[..count]))
         } else {
             (0, 0)
         };
@@ -408,7 +417,7 @@ impl BeamModuleAssembler {
             )?;
             self.binsearch(ARG1, 0, count, &untagged, fail_label)?;
         }
-        if is_nil(fail) {
+        if self.is_nil(fail) {
             self.code.bind(fail_label)?;
         }
         Ok(())
@@ -417,7 +426,7 @@ impl BeamModuleAssembler {
     fn fail_label(&mut self, fail: ArgVal) -> Result<Label, ModuleError> {
         match fail {
             ArgVal::Label(id) => Ok(self.label(id)),
-            ArgVal::Immediate(0 | 0x3b) | ArgVal::Literal(0 | 0x3b) => Ok(self.code.new_label()),
+            _ if self.is_nil(fail) => Ok(self.code.new_label()),
             _ => Err(ModuleError::InvalidOperand(
                 "select fail must be label or nil",
             )),
@@ -531,7 +540,7 @@ impl BeamModuleAssembler {
     ) -> Result<(), ModuleError> {
         // Port of erts/emulator/beam/jit/arm/instr_select.cpp:258-281, OTP-29.1.1
         let count = Self::validate_pairs(size, args)?;
-        let fallthrough = is_nil(fail);
+        let fallthrough = self.is_nil(fail);
         let fail = self.fail_label(fail)?;
         let reg = self.source_reg(src)?;
         self.code.emit(|e| e.and_imm(TMP0, reg, 3))?;
@@ -600,7 +609,7 @@ impl BeamModuleAssembler {
             ));
         }
         let reg = self.source_reg(src)?;
-        let fallthrough = is_nil(fail);
+        let fallthrough = self.is_nil(fail);
         let fail = self.fail_label(fail)?;
         self.code.emit(|e| e.and_imm(TMP0, reg, SMALL_MASK))?;
         self.code
@@ -673,17 +682,6 @@ impl BeamModuleAssembler {
     }
 }
 
-/// Raw words of a value vector; non-word operands map to a value that disables untagging.
-fn select_values(values: &[ArgVal]) -> Vec<u64> {
-    values
-        .iter()
-        .map(|value| match value {
-            ArgVal::Immediate(v) | ArgVal::Literal(v) => *v,
-            _ => 0,
-        })
-        .collect()
-}
-
 /// `isInt13`: fits the 12-bit immediate of `cmp` or, negated, of `cmn`.
 fn is_int13(value: u64) -> bool {
     value < 4096 || (value as i64).wrapping_neg() as u64 <= 4095
@@ -747,18 +745,19 @@ fn plan_untag(values: &[u64]) -> (u64, u32) {
     (values[best_left + distance / 2], shift)
 }
 
-fn sorted_select_pairs(count: usize, args: &[ArgVal]) -> Result<Vec<ArgVal>, ModuleError> {
+fn sorted_select_pairs(
+    module: &BeamModuleAssembler,
+    count: usize,
+    args: &[ArgVal],
+) -> Result<Vec<ArgVal>, ModuleError> {
     let mut pairs = (0..count)
         .map(|index| {
-            let raw = match args[index] {
-                ArgVal::Immediate(value) | ArgVal::Literal(value) => value,
-                _ => {
-                    return Err(ModuleError::InvalidOperand(
-                        "binary select values must be constants",
-                    ));
-                }
-            };
-            Ok((raw, args[index], args[index + count]))
+            let raw = module
+                .constant_value(args[index])
+                .ok_or(ModuleError::InvalidOperand(
+                    "binary select values must be constants",
+                ))?;
+            Ok::<_, ModuleError>((raw, args[index], args[index + count]))
         })
         .collect::<Result<Vec<_>, _>>()?;
     // Port of erts/emulator/beam/beam_transform_helpers.c:135-155
@@ -768,13 +767,6 @@ fn sorted_select_pairs(count: usize, args: &[ArgVal]) -> Result<Vec<ArgVal>, Mod
     sorted.extend(pairs.iter().map(|(_, value, _)| *value));
     sorted.extend(pairs.iter().map(|(_, _, target)| *target));
     Ok(sorted)
-}
-
-fn is_nil(value: ArgVal) -> bool {
-    matches!(
-        value,
-        ArgVal::Immediate(0 | 0x3b) | ArgVal::Literal(0 | 0x3b)
-    )
 }
 
 #[cfg(test)]
@@ -789,17 +781,20 @@ mod tests {
         let aaa = Term::atom(atoms.intern("aax2a_select_crash").unwrap()).tagged_word();
         assert!(zzz < aaa, "fixture must reverse atom literal order");
 
+        let mut assembler = BeamModuleAssembler::new();
+        assembler.set_beam_literal(1, aaa);
+        assembler.set_beam_literal(2, zzz);
         let args = [
-            ArgVal::Literal(aaa),
-            ArgVal::Literal(zzz),
+            ArgVal::Literal(1),
+            ArgVal::Literal(2),
             ArgVal::Label(10),
             ArgVal::Label(20),
         ];
         assert_eq!(
-            sorted_select_pairs(2, &args).unwrap(),
+            sorted_select_pairs(&assembler, 2, &args).unwrap(),
             [
-                ArgVal::Literal(zzz),
-                ArgVal::Literal(aaa),
+                ArgVal::Literal(2),
+                ArgVal::Literal(1),
                 ArgVal::Label(20),
                 ArgVal::Label(10),
             ]

@@ -10,6 +10,7 @@ use arinsal_beamasm::{
     rt,
 };
 use arinsal_term::{Atom, ProcessHeap, Term, TermBuilder, global_atoms};
+use similar_asserts::assert_eq;
 
 static FIXTURE: OnceLock<Mutex<(ProcessHeap, Term, Term)>> = OnceLock::new();
 
@@ -134,7 +135,18 @@ fn run_native(
     emit: impl FnOnce(&mut BeamModuleAssembler) -> Result<(), arinsal_beamasm::module::ModuleError>,
     setup: impl FnOnce(&mut [u64; 128], &mut ProcessHeader, &mut SchedulerRegisters),
 ) -> (ExitReason, ProcessHeader, [u64; 1024], [u64; 128]) {
+    run_native_with_literals(&[], emit, setup)
+}
+
+fn run_native_with_literals(
+    literals: &[(i64, u64)],
+    emit: impl FnOnce(&mut BeamModuleAssembler) -> Result<(), arinsal_beamasm::module::ModuleError>,
+    setup: impl FnOnce(&mut [u64; 128], &mut ProcessHeader, &mut SchedulerRegisters),
+) -> (ExitReason, ProcessHeader, [u64; 1024], [u64; 128]) {
     let mut asm = BeamModuleAssembler::new();
+    for &(index, word) in literals {
+        asm.set_beam_literal(index, word);
+    }
     asm.emit_i_func_label(1).unwrap();
     asm.emit_enter_frame().unwrap();
     emit(&mut asm).unwrap();
@@ -144,7 +156,10 @@ fn run_native(
         e.ret(Gpr::x(30))
     })
     .unwrap();
-    let module: FinalizedModule = asm.finalize().unwrap();
+    let mut module: FinalizedModule = asm.finalize().unwrap();
+    for &(index, word) in literals {
+        module.patch_literal(index, word).unwrap();
+    }
     let mut heap = [0_u64; 128];
     let base = heap.as_mut_ptr();
     let mut header = ProcessHeader {
@@ -177,10 +192,11 @@ fn tagged_small(value: i64) -> u64 {
 #[test]
 fn native_create_and_get() {
     let (record, _) = fixture();
-    let (exit, _, regs, _) = run_native(
+    let (exit, _, regs, _) = run_native_with_literals(
+        &[(0, record)],
         |asm| {
             asm.emit_i_create_local_native_record(
-                ArgVal::Literal(record),
+                ArgVal::Literal(0),
                 ArgVal::X(0),
                 1,
                 &[ArgVal::Immediate(tagged_small(42))],

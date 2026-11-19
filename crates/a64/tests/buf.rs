@@ -1,5 +1,8 @@
 use arinsal_a64::buf::CodeBuffer;
-use arinsal_a64::enc::{Cond, Gpr, Shift};
+#[cfg(target_arch = "aarch64")]
+use arinsal_a64::enc::Shift;
+use arinsal_a64::enc::{Cond, Gpr};
+#[cfg(target_arch = "aarch64")]
 use arinsal_a64::exec::CodeMemory;
 use similar_asserts::assert_eq;
 

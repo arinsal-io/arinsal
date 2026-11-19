@@ -658,7 +658,7 @@ pub(crate) fn owns_native_address(address: usize) -> bool {
 
 struct VmModuleEnv<'a> {
     literal_heap: std::cell::RefCell<&'a mut VecHeap>,
-    dynamic_integer_literals: std::cell::RefCell<HashMap<BigInt, u64>>,
+    dynamic_integer_literals: std::cell::RefCell<Vec<u64>>,
     literals: Vec<u64>,
     /// The literals the load added after those of the file, by literal index.
     /// The words of the added literals, by literal index minus `literals.len()`.
@@ -725,7 +725,7 @@ impl<'a> VmModuleEnv<'a> {
         }
         Ok(Self {
             literal_heap: std::cell::RefCell::new(literal_heap),
-            dynamic_integer_literals: std::cell::RefCell::new(HashMap::new()),
+            dynamic_integer_literals: std::cell::RefCell::new(Vec::new()),
             literals,
             added_literals: std::cell::RefCell::new(Vec::new()),
             zero_capture_funs,
@@ -775,18 +775,19 @@ impl<'a> VmModuleEnv<'a> {
 
 impl VmModuleEnv<'_> {
     // Port of erts/emulator/beam/beam_file.c (beamfile_add_literal), OTP-29.1.1.
-    fn intern_dynamic_integer_literal(&self, value: BigInt) -> Result<u64, String> {
-        if let Some(word) = self.dynamic_integer_literals.borrow().get(&value).copied() {
-            return Ok(word);
-        }
+    fn make_integer_literal(&self, value: BigInt) -> Result<u64, String> {
         let mut heap = self.literal_heap.borrow_mut();
-        let word = from_owned(&arinsal_etf::OwnedTerm::BigInt(value.clone()), &mut **heap)
+        from_owned(&arinsal_etf::OwnedTerm::BigInt(value), &mut **heap)
             .map(raw_word)
-            .map_err(|error| format!("integer literal: {error:?}"))?;
-        self.dynamic_integer_literals
-            .borrow_mut()
-            .insert(value, word);
-        Ok(word)
+            .map_err(|error| format!("integer literal: {error:?}"))
+    }
+
+    fn add_dynamic_integer_literal(&self, value: BigInt) -> Result<i64, String> {
+        let word = self.make_integer_literal(value)?;
+        let mut literals = self.dynamic_integer_literals.borrow_mut();
+        let index = i64::try_from(literals.len()).map_err(|_| "dynamic literal index overflow")?;
+        literals.push(word);
+        Ok(!index)
     }
 }
 
@@ -841,8 +842,8 @@ impl ModuleEnv for VmModuleEnv<'_> {
         })
     }
 
-    fn integer_literal(&self, value: i64) -> Result<u64, String> {
-        self.intern_dynamic_integer_literal(BigInt::from(value))
+    fn integer_literal(&self, value: i64) -> Result<i64, String> {
+        self.add_dynamic_integer_literal(BigInt::from(value))
     }
 
     fn match_string(&self, bytes: &[u8]) -> Result<u64, String> {
@@ -853,7 +854,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
         let value = decimal
             .parse::<num_bigint::BigInt>()
             .map_err(|error| format!("bignum literal: {error}"))?;
-        self.intern_dynamic_integer_literal(value)
+        self.make_integer_literal(value)
     }
 
     fn tuple_literal(&self, elements: &[u64]) -> Result<u64, String> {
@@ -878,12 +879,15 @@ impl ModuleEnv for VmModuleEnv<'_> {
         Ok(order)
     }
 
-    fn map_key_hash(&self, key: arinsal_beamasm::module::ArgVal) -> u64 {
+    fn map_key_hash(&self, beam: &BeamFile, key: arinsal_beamasm::module::ArgVal) -> u64 {
         match key {
-            arinsal_beamasm::module::ArgVal::Immediate(word)
-            | arinsal_beamasm::module::ArgVal::Literal(word) => {
+            arinsal_beamasm::module::ArgVal::Immediate(word) => {
                 arinsal_term::internal_hash(crate::native_hooks::from_raw(word))
             }
+            arinsal_beamasm::module::ArgVal::Literal(index) => self
+                .literal(beam, index)
+                .map(|word| arinsal_term::internal_hash(crate::native_hooks::from_raw(word)))
+                .unwrap_or(0),
             _ => 0,
         }
     }
@@ -909,7 +913,16 @@ impl ModuleEnv for VmModuleEnv<'_> {
         Ok(())
     }
 
-    fn literal(&self, _beam: &BeamFile, index: u32) -> Result<u64, String> {
+    fn literal(&self, _beam: &BeamFile, index: i64) -> Result<u64, String> {
+        if index < 0 {
+            return self
+                .dynamic_integer_literals
+                .borrow()
+                .get((!index) as usize)
+                .copied()
+                .ok_or_else(|| format!("dynamic literal index {index} is out of range"));
+        }
+        let index = index as usize;
         if let Some(word) = self.literals.get(index as usize) {
             return Ok(*word);
         }
@@ -920,6 +933,14 @@ impl ModuleEnv for VmModuleEnv<'_> {
             .copied()
             .flatten()
             .ok_or_else(|| format!("literal index {index} is out of range"))
+    }
+
+    fn literal_count(&self, _beam: &BeamFile) -> usize {
+        self.literals.len() + self.added_literals.borrow().len()
+    }
+
+    fn dynamic_literal_count(&self) -> usize {
+        self.dynamic_integer_literals.borrow().len()
     }
 
     fn zero_capture_fun(&self, _beam: &BeamFile, lambda: u32) -> Result<u64, String> {
@@ -1092,12 +1113,6 @@ impl ModuleEnv for VmModuleEnv<'_> {
         // The general path of `=:=` / `=/=` calls `eq` directly, with or without fragments.
         shared.eq = crate::utils::eq as *const () as usize;
         shared
-    }
-    fn atom_word_by_name(&self, name: &str) -> Option<u64> {
-        global_atoms()
-            .intern(name)
-            .ok()
-            .map(|atom| raw_word(Term::atom(atom)))
     }
     fn guard_helper3(&self) -> GuardHelper3 {
         crate::arinsal_beamasm_guard3

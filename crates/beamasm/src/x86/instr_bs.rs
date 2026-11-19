@@ -1333,7 +1333,8 @@ impl BeamModuleAssembler {
         let fail = arg_label(fail)?;
         let need = arg_word(need)?;
         let live = arg_word(live)?;
-        let segments = beam_jit_bsm_init(list).map_err(AsmError::Operand)?;
+        let segments = beam_jit_bsm_init(list, |index| self.beamfile_get_literal(index))
+            .map_err(AsmError::Operand)?;
         let segments = opt_bsm_segments(&segments, need, live as u32);
 
         // bin_position must be RCX: only CL can be a variable shift count without BMI2's SHLX.
@@ -4450,7 +4451,11 @@ zero_large() -> <<0:1024>>.
             commands.push(command);
         }
         // Need: the test_heap total minus what the commands themselves need.
-        let planned = opt_bsm_segments(&beam_jit_bsm_init(&commands.concat()).ok()?, 0, 0);
+        let planned = opt_bsm_segments(
+            &beam_jit_bsm_init(&commands.concat(), |_| unreachable!()).ok()?,
+            0,
+            0,
+        );
         let own: u64 = planned
             .iter()
             .filter(|s| s.action == Action::TestHeap)

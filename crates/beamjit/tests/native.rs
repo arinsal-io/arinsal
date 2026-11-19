@@ -7,6 +7,7 @@ use arinsal_beamasm::{
     ExitReason, ProcessHeader, SchedulerRegisters, module::BeamModuleAssembler, rt::read_heap_word,
 };
 use arinsal_beamjit::{ModuleEnv, compile_module_with_env};
+use similar_asserts::assert_eq;
 use std::{
     fs,
     process::Command,
@@ -61,11 +62,14 @@ impl ModuleEnv for TestEnv {
         Ok(())
     }
 
-    fn literal(&self, beam: &BeamFile, index: u32) -> Result<u64, String> {
-        if index as usize >= beam.literals.len() {
+    fn literal(&self, beam: &BeamFile, index: i64) -> Result<u64, String> {
+        let Ok(index) = usize::try_from(index) else {
+            return Ok(0);
+        };
+        if index >= beam.literals.len() {
             return Ok(0);
         }
-        beam.literal(index)
+        beam.literal(index as u32)
             .map(|_| 0)
             .map_err(|error| error.to_string())
     }

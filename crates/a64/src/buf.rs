@@ -247,13 +247,16 @@ pub struct CodeBuffer {
     /// The newest unresolved branch to each label; the older ones follow through `Fixup::next`.
     waiting: Vec<u32>,
     literals: Vec<Literal>,
+    /// Pending payloads patched after code allocation, kept separate from constants just like
+    /// BeamModuleAssembler keeps embedded labels separate from constants.
+    literal_relocations_pending: Vec<Literal>,
     literal_relocations: Vec<Option<usize>>,
     /// Index into `literals` of the pending literal with a value.
     pending_literals: HashMap<u64, usize, BuildHasherDefault<LabelHasher>>,
     /// The offset of the last pool entry emitted for a value: the entries only move forward, so
     /// when it is out of reach of a load, so are the older ones.
     literal_sites: HashMap<u64, usize, BuildHasherDefault<LabelHasher>>,
-    unreachable: bool,
+    last_unreachable_offset: usize,
     last_check: usize,
     binds: u64,
     /// Lower bound of `site + reach` over the pending control branches without a veneer.
@@ -523,7 +526,7 @@ impl CodeBuffer {
         let id = self.literal_relocations.len();
         self.literal_relocations.push(None);
         self.min_literal_site = Some(self.min_literal_site.map_or(site, |m| m.min(site)));
-        self.literals.push(Literal {
+        self.literal_relocations_pending.push(Literal {
             first: (site, reg),
             more: Vec::new(),
             value: 0,
@@ -537,18 +540,13 @@ impl CodeBuffer {
     where
         F: FnOnce(&mut Emitter) -> Result<(), EncodeError>,
     {
-        let old_len = self.emitter.len();
         encode(&mut self.emitter)?;
-        if self.emitter.len() > old_len {
-            self.unreachable = false;
-        }
         Ok(())
     }
 
     /// Emits a raw word.
     pub fn word(&mut self, word: u32) {
         self.emitter.word(word);
-        self.unreachable = false;
     }
 
     /// Embeds a 64-bit data word without changing control-flow state.
@@ -562,15 +560,22 @@ impl CodeBuffer {
     }
 
     /// Marks the current instruction as a control transfer before embedded data.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:869-875 (mark_unreachable), OTP-29.1.1.
     pub fn mark_unreachable(&mut self) {
-        self.unreachable = true;
+        self.last_unreachable_offset = self.offset();
+    }
+
+    /// Returns whether no instruction has been emitted since the last unreachable mark.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:882-883 (is_unreachable), OTP-29.1.1.
+    fn is_unreachable(&self) -> bool {
+        self.offset() == self.last_unreachable_offset
     }
 
     /// Emits all stubs approaching their architecture reach limits.
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:796-814, OTP-29.1.1
     pub fn check_pending_stubs(&mut self) -> Result<(), BufferError> {
         if self.offset().saturating_sub(self.last_check) < STUB_CHECK_INTERVAL {
-            if self.unreachable {
+            if self.is_unreachable() {
                 self.flush_label_relocations_unreachable()?;
             }
             return Ok(());
@@ -591,12 +596,10 @@ impl CodeBuffer {
     }
 
     /// Emits pending relocated literals while control flow is unreachable.
-    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp (flush_pending_labels), OTP-29.1.1.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:888-900 (flush_pending_labels),
+    // OTP-29.1.1.
     fn flush_label_relocations_unreachable(&mut self) -> Result<(), BufferError> {
-        let labels: Vec<Literal> = self
-            .literals
-            .extract_if(.., |literal| literal.relocation.is_some())
-            .collect();
+        let labels = std::mem::take(&mut self.literal_relocations_pending);
         for literal in labels {
             self.align8();
             let offset = self.offset();
@@ -608,6 +611,14 @@ impl CodeBuffer {
         }
         self.recompute_stub_bounds();
         Ok(())
+    }
+
+    /// Reindexes the pending-constant lookup after emitted constants leave the pool.
+    fn rebuild_pending_literals(&mut self) {
+        self.pending_literals.clear();
+        for (index, literal) in self.literals.iter().enumerate() {
+            self.pending_literals.insert(literal.value, index);
+        }
     }
 
     /// Flushes veneers and constants whose remaining reach is within `range` bytes.
@@ -629,10 +640,7 @@ impl CodeBuffer {
                 .saturating_sub(range)
                 <= now
         });
-        let labels_pending = self
-            .literals
-            .iter()
-            .any(|literal| literal.relocation.is_some());
+        let labels_pending = !self.literal_relocations_pending.is_empty();
         if !stub_due && !veneer_due && !literal_due && !labels_pending {
             return Ok(());
         }
@@ -687,13 +695,10 @@ impl CodeBuffer {
 
         let jump_site = self.offset();
         let after = self.new_label();
-        if !self.unreachable {
+        if !self.is_unreachable() {
             self.emit_branch(after, BranchKind::B)?;
         }
-        let due_labels: Vec<Literal> = self
-            .literals
-            .extract_if(.., |literal| literal.relocation.is_some())
-            .collect();
+        let due_labels = std::mem::take(&mut self.literal_relocations_pending);
         for literal in due_labels {
             self.align8();
             let offset = self.offset();
@@ -728,12 +733,7 @@ impl CodeBuffer {
                     })
             })
             .collect();
-        self.pending_literals.clear();
-        for (index, literal) in self.literals.iter().enumerate() {
-            if literal.relocation.is_none() {
-                self.pending_literals.insert(literal.value, index);
-            }
-        }
+        self.rebuild_pending_literals();
         for literal in due {
             self.align8();
             let offset = self.offset();
@@ -750,7 +750,6 @@ impl CodeBuffer {
         self.recompute_stub_bounds();
         self.bind(after)?;
         let _ = jump_site;
-        self.unreachable = false;
         Ok(())
     }
 
@@ -771,6 +770,7 @@ impl CodeBuffer {
         self.min_literal_site = self
             .literals
             .iter()
+            .chain(&self.literal_relocations_pending)
             .flat_map(|l| l.sites().map(|(site, _)| site))
             .min();
     }
@@ -895,10 +895,11 @@ impl Default for CodeBuffer {
             fixups: Vec::new(),
             waiting: Vec::new(),
             literals: Vec::new(),
+            literal_relocations_pending: Vec::new(),
             literal_relocations: Vec::new(),
             pending_literals: HashMap::default(),
             literal_sites: HashMap::default(),
-            unreachable: false,
+            last_unreachable_offset: 0,
             last_check: 0,
             binds: 0,
             min_stub_deadline: None,
@@ -932,6 +933,38 @@ fn branch_fits(kind: BranchKind, site: usize, target: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreachable_relocated_literal_flush_keeps_pending_constant_indices_valid() {
+        let mut buffer = CodeBuffer::new();
+        buffer.ldr_literal(Gpr::x(0), 0x1111).unwrap();
+        buffer.ldr_literal_reloc(Gpr::x(1)).unwrap();
+        buffer.ldr_literal(Gpr::x(2), 0x2222).unwrap();
+
+        buffer.flush_label_relocations_unreachable().unwrap();
+        buffer.ldr_literal(Gpr::x(3), 0x2222).unwrap();
+
+        similar_asserts::assert_eq!(buffer.pending_literals.get(&0x2222), Some(&1));
+        similar_asserts::assert_eq!(buffer.literals.len(), 2);
+        similar_asserts::assert_eq!(buffer.literal_relocations_pending.len(), 0);
+        similar_asserts::assert_eq!(buffer.literals[1].more.len(), 1);
+    }
+
+    #[test]
+    fn emitted_relocated_load_ends_the_unreachable_region() {
+        let mut buffer = CodeBuffer::new();
+        let target = buffer.new_label();
+        buffer.b(target).unwrap();
+        buffer.mark_unreachable();
+        buffer.bind(target).unwrap();
+
+        let relocation = buffer.ldr_literal_reloc(Gpr::x(26)).unwrap();
+        buffer.flush_pending_stubs(0).unwrap();
+        let (words, _, literal_relocations) = buffer.finish_with_labels_and_relocations().unwrap();
+
+        similar_asserts::assert_eq!(literal_relocations[relocation], 16);
+        similar_asserts::assert_eq!(words[2], 0x1400_0004);
+    }
 
     #[test]
     fn long_veneer_preserves_beam_x4_and_x5_registers() {

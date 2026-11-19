@@ -16,6 +16,7 @@ use arinsal_beamasm::{
     records::RecordRuntime,
     rt,
 };
+use similar_asserts::assert_eq;
 
 const VALUE: u64 = 0x4f;
 const REG_OUTPUT: u64 = 0x8f;
@@ -174,8 +175,20 @@ fn run(
     initial: [u64; 6],
     target_frame: TargetFrame,
 ) -> (Seen, [u64; 6], ProcessHeader) {
+    run_with_literals(&[], emit, initial, target_frame)
+}
+
+fn run_with_literals(
+    literals: &[(i64, u64)],
+    emit: impl FnOnce(&mut BeamModuleAssembler) -> Result<(), ModuleError>,
+    initial: [u64; 6],
+    target_frame: TargetFrame,
+) -> (Seen, [u64; 6], ProcessHeader) {
     *SEEN.lock().unwrap() = None;
     let mut asm = BeamModuleAssembler::new();
+    for &(index, word) in literals {
+        asm.set_beam_literal(index, word);
+    }
     // Fragment calls clobber LR, so keep the return address in scratch memory (the stack
     // pointer is asserted) unless the case builds its own frame.
     let own_cp = target_frame == TargetFrame::None;
@@ -215,7 +228,10 @@ fn run(
         e.ret(Gpr::x(30))
     })
     .unwrap();
-    let module: FinalizedModule = asm.finalize().unwrap();
+    let mut module: FinalizedModule = asm.finalize().unwrap();
+    for &(index, word) in literals {
+        module.patch_literal(index, word).unwrap();
+    }
     let mut heap = [0_u64; 64];
     let base = heap.as_mut_ptr();
     let mut header = ProcessHeader {
@@ -330,8 +346,9 @@ fn runtime_calls_in_fun_map_and_records_keep_register_state() {
     assert_seen(seen, initial, &header);
     assert_xregs(after, expected);
 
-    let map_args = [ArgVal::Literal(0x100), ArgVal::X(0), ArgVal::Immediate(0)];
-    let (seen, after, header) = run(
+    let map_args = [ArgVal::Literal(0), ArgVal::X(0), ArgVal::Immediate(0)];
+    let (seen, after, header) = run_with_literals(
+        &[(0, VALUE)],
         |asm| asm.emit_i_get_map_elements(90, ArgVal::X(5), &map_args, map_runtime()),
         initial,
         TargetFrame::None,

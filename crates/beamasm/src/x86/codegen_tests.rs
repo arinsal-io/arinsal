@@ -15,6 +15,7 @@ use std::process::Command;
 
 use arinsal_beamops::{NewLiteral, OpSink, SpecificOperand, TransformArena};
 use arinsal_term::Term;
+use similar_asserts::assert_eq;
 
 use super::beam_asm_global::{BeamGlobalAssembler, GLOBAL_LABELS};
 use super::beam_asm_module::{BeamCodeHeader, BeamModuleAssembler};
@@ -299,7 +300,7 @@ fn massage(sign: &str, operands: &[SpecificOperand]) -> Result<Vec<ArgVal>, Stri
             ('L', SpecificOperand::Unsigned(label)) => ArgVal::Label(*label as u32),
             ('i', SpecificOperand::Unsigned(value)) => ArgVal::Immediate(*value),
             ('c' | 'q' | 's', SpecificOperand::Literal(index)) => {
-                ArgVal::Literal(u64::from(*index))
+                ArgVal::Literal(i64::from(*index))
             }
             ('e', SpecificOperand::Unsigned(value)) => ArgVal::Export(*value as u32),
             // The BIF function pointer of an import: only `module_info`'s substituted
@@ -1061,11 +1062,14 @@ fn patches_reach_the_running_code() {
     m.emit_on_load().unwrap();
     m.emit_i_breakpoint_trampoline().unwrap();
     m.emit_i_test_yield().unwrap();
+    m.set_beam_literal(0, 0xaaa);
+    m.set_beam_literal(1, 0xaaa);
     for (x, arg) in [
         ArgVal::Export(3),
-        ArgVal::Literal(0xaaa),
+        ArgVal::Literal(0),
         ArgVal::BytePtr(5),
         ArgVal::FunEntry(0),
+        ArgVal::Literal(1),
     ]
     .into_iter()
     .enumerate()
@@ -1080,7 +1084,8 @@ fn patches_reach_the_running_code() {
 
     let (mut memory, code_hdr) = m.codegen(&BeamCodeHeader::default()).unwrap();
     m.patch_import(&mut memory, 3, 0x1000).unwrap();
-    m.patch_literal(&mut memory, 0xaaa, 0x2002).unwrap();
+    m.patch_literal(&mut memory, 0, 0x2002).unwrap();
+    m.patch_literal(&mut memory, 1, 0x2222).unwrap();
     m.patch_strings(&mut memory, 0x3000).unwrap();
     m.patch_lambda(&mut memory, 0, 0x4000).unwrap();
 
@@ -1096,7 +1101,10 @@ fn patches_reach_the_running_code() {
     let mut p = Process::new();
     p.call(entry, &[]);
     let x = |i: usize| p.regs.x_reg_array[i].tagged_word();
-    assert_eq!([x(0), x(1), x(2), x(3)], [0x1000, 0x2002, 0x3005, 0x4000]);
+    assert_eq!(
+        [x(0), x(1), x(2), x(3), x(4)],
+        [0x1000, 0x2002, 0x3005, 0x4000, 0x2222]
+    );
 }
 
 /// erts' dump lines of `block` as GNU `as` input: the rel32 of every call and jump to a
@@ -1272,7 +1280,7 @@ fn int_code_end_matches_erts_dump() {
     // `mov rdi, imm64` (the message is a static C string), then `REX call rel32`.
     assert_eq!(&rest[..2], &[0x48, 0xbf]);
     let msg = u64::from_le_bytes(rest[2..10].try_into().unwrap());
-    assert_ne!(msg, 0);
+    assert_eq!(msg != 0, true);
     assert_eq!(&rest[10..12], &[0x40, 0xe8]);
     assert_eq!(rest.len(), 16);
 }

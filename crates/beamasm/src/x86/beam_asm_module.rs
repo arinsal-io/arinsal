@@ -177,9 +177,12 @@ pub struct BeamModuleAssembler {
     pub imports: HashMap<u32, Vec<Patch>>,
     /// `lambdas[index].patches` and `lambdas[index].trampoline`.
     pub lambdas: HashMap<u32, LambdaPatch>,
-    /// `literals[index].patches`. Arinsal's [`ArgVal::Literal`] carries the literal's term,
-    /// so the patches are keyed by that term, the value they are filled with.
-    pub literals: HashMap<u64, Vec<Patch>>,
+    /// `literals[index].patches`.
+    pub literals: HashMap<i64, Vec<Patch>>,
+    /// The module's static literal table, including literals added by the loader.
+    beam_literals: Vec<u64>,
+    /// The module's dynamic literal table, indexed by the complement of a negative index.
+    dynamic_literals: Vec<u64>,
     /// `strings`: every string patch.
     pub strings: Vec<Patch>,
     /// `CodeHolder::label_by_name`: addresses of named read-only data embedded in this module.
@@ -226,6 +229,10 @@ pub struct BeamModuleAssembler {
 impl BeamModuleAssemblerCommon for BeamModuleAssembler {
     fn beam_types(&self) -> &[ArgType] {
         &self.beam_types
+    }
+
+    fn beamfile_get_literal(&self, index: i64) -> u64 {
+        BeamModuleAssembler::beamfile_get_literal(self, index)
     }
 }
 
@@ -396,6 +403,8 @@ impl BeamModuleAssembler {
             imports: HashMap::new(),
             lambdas: HashMap::new(),
             literals: HashMap::new(),
+            beam_literals: Vec::new(),
+            dynamic_literals: Vec::new(),
             strings: Vec::new(),
             rodata_labels: HashMap::new(),
             reg_cache: RegisterCache::with_temporaries(
@@ -481,6 +490,33 @@ impl BeamModuleAssembler {
         m.asm
             .embed_zeros(core::mem::size_of::<BeamCodeHeader>() + 8 * num_functions)?;
         Ok(m)
+    }
+
+    /// Stores a term in the module's `BeamFile` literal table.
+    // Port of erts/emulator/beam/beam_file.c:1977-1990 (beamfile_get_literal table layout),
+    // OTP-29.1.1.
+    pub fn set_beam_literal(&mut self, index: i64, literal: u64) {
+        if index >= 0 {
+            let index = index as usize;
+            self.beam_literals
+                .resize(self.beam_literals.len().max(index + 1), 0);
+            self.beam_literals[index] = literal;
+        } else {
+            let index = (!index) as usize;
+            self.dynamic_literals
+                .resize(self.dynamic_literals.len().max(index + 1), 0);
+            self.dynamic_literals[index] = literal;
+        }
+    }
+
+    /// `beamfile_get_literal(beam, index)`.
+    // Port of erts/emulator/beam/beam_file.c:1977-1990 (beamfile_get_literal), OTP-29.1.1.
+    pub fn beamfile_get_literal(&self, index: i64) -> u64 {
+        if index >= 0 {
+            self.beam_literals[index as usize]
+        } else {
+            self.dynamic_literals[(!index) as usize]
+        }
     }
 
     /// `lambdas[index].trampoline` used by `emit_i_lambda_trampoline` and `emit_i_call_fun2`.
@@ -764,10 +800,10 @@ impl BeamModuleAssembler {
                                 | LOADER_Y_REG,
                         )?;
                     }
-                    ArgVal::Literal(term) => {
-                        let mut patches = self.literals.remove(&term).unwrap_or_default();
+                    ArgVal::Literal(index) => {
+                        let mut patches = self.literals.remove(&index).unwrap_or_default();
                         let result = Self::make_word_patch(&mut self.asm, &mut patches);
-                        self.literals.insert(term, patches);
+                        self.literals.insert(index, patches);
                         result?;
                     }
                     ArgVal::Label(beam_label) => {
@@ -850,10 +886,10 @@ impl BeamModuleAssembler {
                     .ok_or(AsmError::Operand("lambda index"))?;
                 Self::make_move_patch(&mut m.asm, to, &mut lambda.patches, 0)
             }),
-            ArgVal::Literal(term) => self.preserve_cache(&[to], &[], |m| {
-                let mut patches = m.literals.remove(&term).unwrap_or_default();
+            ArgVal::Literal(index) => self.preserve_cache(&[to], &[], |m| {
+                let mut patches = m.literals.remove(&index).unwrap_or_default();
                 let result = Self::make_move_patch(&mut m.asm, to, &mut patches, 0);
-                m.literals.insert(term, patches);
+                m.literals.insert(index, patches);
                 result
             }),
             ArgVal::X(_) | ArgVal::Y(_) => {
@@ -1463,17 +1499,15 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
-    /// `patchLiteral(rw_base, index, lit)`: the moved literal `lit` into every use of the
-    /// literal keyed `key` (Arinsal keys literal patches by the term the loader resolved, see
-    /// [`Self::literals`]).
+    /// `patchLiteral(rw_base, index, lit)`: the moved literal `lit` into every use of index.
     // Port of erts/emulator/beam/jit/beam_jit_common.cpp:557-567 (patchLiteral), OTP-29.1.1.
     pub fn patch_literal(
         &self,
         rw: &mut arinsal_x64::exec::CodeMemory,
-        key: u64,
+        index: i64,
         lit: u64,
     ) -> Result<(), AsmError> {
-        for patch in self.literals.get(&key).into_iter().flatten() {
+        for patch in self.literals.get(&index).into_iter().flatten() {
             self.write_patch(rw, patch, lit + patch.val_offs as u64)?;
         }
         Ok(())

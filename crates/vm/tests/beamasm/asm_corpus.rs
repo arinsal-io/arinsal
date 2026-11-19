@@ -132,8 +132,9 @@ extern "C" fn raw_raise_for_compile(
 }
 
 impl ModuleEnv for CorpusEnv {
-    fn integer_literal(&self, _value: i64) -> Result<u64, String> {
-        Ok(Term::NIL.tagged_word())
+    fn integer_literal(&self, _value: i64) -> Result<i64, String> {
+        // Dynamic literals are complemented indices; the corpus only compiles, so every one maps to NIL below.
+        Ok(!0)
     }
 
     fn match_string(&self, _bytes: &[u8]) -> Result<u64, String> {
@@ -182,13 +183,15 @@ impl ModuleEnv for CorpusEnv {
             .map_err(|error| format!("zero-capture fun {lambda}: {error:?}"))
     }
 
-    fn literal(&self, beam: &BeamFile, index: u32) -> Result<u64, String> {
+    fn literal(&self, beam: &BeamFile, index: i64) -> Result<u64, String> {
         let mut heap = self.literal_heap.borrow_mut();
-        if index as usize >= beam.literals.len() {
+        if index < 0 || index as usize >= beam.literals.len() {
             // A literal the load added (a record definition, a key tuple, a bignum).
             return Ok(Term::NIL.tagged_word());
         }
-        let value = beam.literal(index).map_err(|error| error.to_string())?;
+        let value = beam
+            .literal(index as u32)
+            .map_err(|error| error.to_string())?;
         from_owned(&value, &mut *heap)
             .map(Term::tagged_word)
             .map_err(|error| format!("literal {index}: {error:?}"))

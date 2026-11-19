@@ -1257,7 +1257,7 @@ impl BeamModuleAssembler {
                     self.code.b_cond(Cond::Ne, generic)?;
                 }
             } else {
-                let mut value = l.word();
+                let mut value = self.constant_word(l.val).unwrap_or(0);
                 if (value as i64) < 0 {
                     value ^= !15u64;
                 }

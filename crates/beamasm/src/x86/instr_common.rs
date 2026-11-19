@@ -4306,8 +4306,8 @@ impl BeamModuleAssembler {
         let fail = self
             .resolve_beam_label(arg_label(fail)?)
             .ok_or(AsmError::Operand("exact compare to an unknown label"))?;
-        if let ArgVal::Literal(bits) = y {
-            let literal = term_from_bits(bits);
+        if let ArgVal::Literal(index) = y {
+            let literal = term_from_bits(self.beamfile_get_literal(index));
             if let Some((len, head)) = literal_is_list_of_immediates(literal) {
                 if len == 1 {
                     let head = head.word() as i64;
@@ -4425,8 +4425,8 @@ impl BeamModuleAssembler {
         let fail = self
             .resolve_beam_label(arg_label(fail)?)
             .ok_or(AsmError::Operand("exact compare to an unknown label"))?;
-        if let ArgVal::Literal(bits) = y {
-            let literal = term_from_bits(bits);
+        if let ArgVal::Literal(index) = y {
+            let literal = term_from_bits(self.beamfile_get_literal(index));
             if let Some((len, head)) = literal_is_list_of_immediates(literal) {
                 if len == 1 {
                     let next = self.asm.new_label();

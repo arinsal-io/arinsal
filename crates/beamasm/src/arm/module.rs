@@ -128,6 +128,8 @@ pub struct FinalizedModule {
     /// For each line-breakpoint site, ascending: the return-address offset after the `bl`
     /// and the branch site offset used to recover the instrumented function's source line.
     pub line_breakpoint_returns: Vec<(usize, usize)>,
+    /// Literal patch sites in `literals[index].patches` order.
+    literal_patches: std::collections::HashMap<i64, Vec<usize>>,
 }
 
 /// BEAM label ids below this are dense (the labels of the file); the compiler's own labels
@@ -213,6 +215,17 @@ impl FinalizedModule {
             })
     }
 
+    /// `patchLiteral(rw_base, index, lit)`.
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:557-567, OTP-29.1.1.
+    pub fn patch_literal(&mut self, index: i64, literal: u64) -> Result<(), ModuleError> {
+        for &offset in self.literal_patches.get(&index).into_iter().flatten() {
+            self.memory.write(offset, 8, |bytes| {
+                bytes.copy_from_slice(&literal.to_le_bytes());
+            })?;
+        }
+        Ok(())
+    }
+
     /// Returns a native entry handle that keeps this module's executable mapping alive.
     pub fn entry(&self, label: u32) -> Option<crate::NativeEntry<'_>> {
         self.entry_offsets
@@ -234,6 +247,11 @@ pub struct BeamModuleAssembler {
     pub(super) rodata_label_patches: Vec<(usize, Label)>,
     /// Literal relocations to read-only words: (literal id, word index).
     pub(super) rodata_pointer_patches: Vec<(usize, usize)>,
+    /// `literals[index].patches`: literal table index to literal-pool relocation IDs.
+    pub(super) literals: std::collections::HashMap<i64, Vec<usize>>,
+    /// `beam->static_literals` and `beam->dynamic_literals` term words.
+    beam_literals: Vec<u64>,
+    dynamic_literals: Vec<u64>,
     /// Inline text-data relocations to module code labels.
     pub(super) code_label_patches: Vec<(usize, Label)>,
     pub(super) reg_cache: crate::regcache::RegCache,
@@ -389,6 +407,52 @@ impl Default for BeamModuleAssembler {
 }
 
 impl BeamModuleAssembler {
+    /// Stores a term in the module's `BeamFile` literal table.
+    // Port of erts/emulator/beam/beam_file.c:1977-1990 (beamfile_get_literal table layout),
+    // OTP-29.1.1.
+    pub fn set_beam_literal(&mut self, index: i64, literal: u64) {
+        if index >= 0 {
+            let index = index as usize;
+            self.beam_literals
+                .resize(self.beam_literals.len().max(index + 1), 0);
+            self.beam_literals[index] = literal;
+        } else {
+            let index = (!index) as usize;
+            self.dynamic_literals
+                .resize(self.dynamic_literals.len().max(index + 1), 0);
+            self.dynamic_literals[index] = literal;
+        }
+    }
+
+    /// `beamfile_get_literal(beam, index)`.
+    // Port of erts/emulator/beam/beam_file.c:1977-1990 (beamfile_get_literal), OTP-29.1.1.
+    pub fn beamfile_get_literal(&self, index: i64) -> u64 {
+        if index >= 0 {
+            self.beam_literals[index as usize]
+        } else {
+            self.dynamic_literals[(!index) as usize]
+        }
+    }
+
+    /// Resolves a constant operand as the erts emitter does before inspecting its term word.
+    pub(super) fn constant_word(&self, value: ArgVal) -> Option<u64> {
+        match value {
+            ArgVal::Immediate(word) => Some(word),
+            ArgVal::Literal(index) => Some(self.beamfile_get_literal(index)),
+            _ => None,
+        }
+    }
+
+    /// Loads a literal through a patch slot owned by its literal index.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:118-132, OTP-29.1.1.
+    fn load_literal(&mut self, dst: Gpr, index: i64) -> Result<(), ModuleError> {
+        self.preserve_cache(&[dst], |this| {
+            let relocation = this.code.ldr_literal_reloc(dst)?;
+            this.literals.entry(index).or_default().push(relocation);
+            Ok(())
+        })
+    }
+
     /// Loads `erts_this_node->sysname`; `this_node` is the address of `erts_this_node`.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:701-705, OTP-29.1.1.
     pub fn emit_node(&mut self, dst: ArgVal, this_node: usize) -> Result<(), ModuleError> {
@@ -421,6 +485,9 @@ impl BeamModuleAssembler {
             rodata_words: Vec::new(),
             rodata_label_patches: Vec::new(),
             rodata_pointer_patches: Vec::new(),
+            literals: std::collections::HashMap::new(),
+            beam_literals: Vec::new(),
+            dynamic_literals: Vec::new(),
             code_label_patches: Vec::new(),
             reg_cache: crate::regcache::RegCache::new(SCHEDULER_REGS, E),
             map_lookups: Vec::new(),
@@ -1610,7 +1677,7 @@ impl BeamModuleAssembler {
             }
             while slots >= 2 {
                 if !x_initialized {
-                    self.mov_value(nil, false, 0x3b)?;
+                    self.mov_value(nil, 0x3b)?;
                     x_initialized = true;
                 }
                 let offset = first_y_offset(first_y)?;
@@ -1630,7 +1697,7 @@ impl BeamModuleAssembler {
                     self.code.emit(|e| e.str_d_uoff(vector, E, offset))?;
                 } else {
                     if !x_initialized {
-                        self.mov_value(nil, false, 0x3b)?;
+                        self.mov_value(nil, 0x3b)?;
                         x_initialized = true;
                     }
                     self.code.emit(|e| e.str_uoff(nil, E, offset))?;
@@ -1878,19 +1945,14 @@ impl BeamModuleAssembler {
         self.source_reg_into(src, tmp)
     }
 
-    /// Loads an immediate or literal term the way `load_source` does: a value that fits 32 bits
-    /// (signed or unsigned) is a `mov`, anything else, and every boxed or list literal, is an
-    /// `ldr` from the literal pool. The register cache survives except for `dst`.
+    /// Loads an immediate term the way `load_source` does: a value that fits 32 bits (signed or
+    /// unsigned) is a `mov`, anything else is an `ldr` from the literal pool. The register cache
+    /// survives except for `dst`.
     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1498-1553 (load_source for literals,
     // immediates and words), OTP-29.1.1.
-    pub(super) fn mov_value(
-        &mut self,
-        dst: Gpr,
-        literal: bool,
-        value: u64,
-    ) -> Result<(), ModuleError> {
+    pub(super) fn mov_value(&mut self, dst: Gpr, value: u64) -> Result<(), ModuleError> {
         let fits = i32::try_from(value as i64).is_ok() || u32::try_from(value).is_ok();
-        if literal || !fits {
+        if !fits {
             self.preserve_cache(&[dst], |this| Ok(this.code.ldr_literal(dst, value)?))
         } else {
             self.preserve_cache(&[dst], |this| {
@@ -1998,8 +2060,12 @@ impl BeamModuleAssembler {
                 self.ldr_cached(scratch, crate::regcache::Slot { base: E, offset })?;
                 Ok(scratch)
             }
-            ArgVal::Immediate(v) | ArgVal::Literal(v) => {
-                self.mov_value(scratch, src_is_literal(src), v)?;
+            ArgVal::Immediate(v) => {
+                self.mov_value(scratch, v)?;
+                Ok(scratch)
+            }
+            ArgVal::Literal(index) => {
+                self.load_literal(scratch, index)?;
                 Ok(scratch)
             }
             ArgVal::Export(v) => {
@@ -2813,6 +2879,19 @@ impl BeamModuleAssembler {
                 handler: memory.ptr_at(offset + handler),
             })
             .collect();
+        let literal_patches = self
+            .literals
+            .into_iter()
+            .map(|(index, relocations)| {
+                (
+                    index,
+                    relocations
+                        .into_iter()
+                        .map(|relocation| offset + literal_relocations[relocation])
+                        .collect(),
+                )
+            })
+            .collect();
         Ok(FinalizedModule {
             memory,
             map_lookups: self.map_lookups.into_boxed_slice(),
@@ -2831,6 +2910,7 @@ impl BeamModuleAssembler {
             trace_breakpoints,
             line_breakpoints,
             line_breakpoint_returns: self.line_breakpoint_returns,
+            literal_patches,
         })
     }
 }
@@ -2924,11 +3004,4 @@ fn first_y_offset(index: u32) -> Result<u32, ModuleError> {
     index
         .checked_mul(8)
         .ok_or(ModuleError::InvalidOperand("Y register offset overflow"))
-}
-
-/// Whether a source operand is a beam literal that lives in the literal area (a list or boxed
-/// term) and so is loaded from the literal pool; an immediate-valued literal is a plain
-/// immediate.
-fn src_is_literal(src: ArgVal) -> bool {
-    matches!(src, ArgVal::Literal(term) if matches!(term & 3, 1 | 2))
 }

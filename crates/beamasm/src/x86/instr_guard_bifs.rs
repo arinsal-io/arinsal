@@ -450,8 +450,9 @@ impl BeamModuleAssembler {
         let const_position = position.is_some_and(|n| n > 0 && n <= MAX_ARITYVAL);
 
         if self.exact_type(pos, type_id::INTEGER)
-            && let ArgVal::Literal(term) = tuple
-            && let Ok(literal_tuple) = arinsal_term::raw::Tuple::try_from(term_from_bits(term))
+            && let ArgVal::Literal(index) = tuple
+            && let Ok(literal_tuple) =
+                arinsal_term::raw::Tuple::try_from(term_from_bits(self.beamfile_get_literal(index)))
         {
             let size = literal_tuple.arity() as i64;
             let (min, max) = self.get_clamped_range(pos);

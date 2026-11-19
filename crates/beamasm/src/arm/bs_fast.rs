@@ -99,20 +99,20 @@ pub(crate) fn emit_fast_bs_create_bin(
     segments: &[BsSegment],
     helpers: BsCreateBinHelpers,
 ) -> Result<bool, ModuleError> {
-    if let Some(plan) = private_plan(segments) {
+    if let Some(plan) = private_plan(asm, segments) {
         emit_private(asm, fail, alloc, live, dst, segments, helpers, &plan)?;
         return Ok(true);
     }
     // The slow path rebuilds from the source register, so a collection inside the helper
     // must have updated it: only a source among the live roots takes this path.
     if APPEND_CHECKED.load(Ordering::Relaxed) != 0
-        && let Some(plan) = append_plan(segments)
+        && let Some(plan) = append_plan(asm, segments)
         && x_index(plan.bin).is_some_and(|index| index < live)
     {
         emit_append(asm, fail, alloc, live, dst, segments, helpers, &plan)?;
         return Ok(true);
     }
-    if let Some(plan) = fixed_plan(segments, alloc) {
+    if let Some(plan) = fixed_plan(asm, segments, alloc) {
         emit_fixed(asm, fail, alloc, live, dst, segments, helpers, &plan)?;
         return Ok(true);
     }
@@ -129,7 +129,7 @@ pub(crate) fn emit_fast_bs_create_bin(
     Ok(false)
 }
 
-fn private_plan(segments: &[BsSegment]) -> Option<PrivatePlan> {
+fn private_plan(asm: &BeamModuleAssembler, segments: &[BsSegment]) -> Option<PrivatePlan> {
     let (first, rest) = segments.split_first()?;
     if first.kind != BsSegmentKind::PrivateAppend || first.unit == 0 || first.unit % 8 != 0 {
         return None;
@@ -137,7 +137,7 @@ fn private_plan(segments: &[BsSegment]) -> Option<PrivatePlan> {
     if !is_all(first) {
         return None;
     }
-    let (extra_bits, segments) = integer_group(rest)?;
+    let (extra_bits, segments) = integer_group(asm, rest)?;
     Some(PrivatePlan {
         bin: first.src,
         extra_bits,
@@ -146,7 +146,7 @@ fn private_plan(segments: &[BsSegment]) -> Option<PrivatePlan> {
 }
 
 // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1810-1845 (`am_append`), OTP-29.1.1.
-fn append_plan(segments: &[BsSegment]) -> Option<AppendPlan> {
+fn append_plan(asm: &BeamModuleAssembler, segments: &[BsSegment]) -> Option<AppendPlan> {
     let (first, rest) = segments.split_first()?;
     if first.kind != BsSegmentKind::Append
         || first.unit == 0
@@ -156,7 +156,7 @@ fn append_plan(segments: &[BsSegment]) -> Option<AppendPlan> {
     {
         return None;
     }
-    let (extra_bits, segments) = integer_group(rest)?;
+    let (extra_bits, segments) = integer_group(asm, rest)?;
     Some(AppendPlan {
         bin: first.src,
         unit: u64::from(first.unit),
@@ -165,8 +165,8 @@ fn append_plan(segments: &[BsSegment]) -> Option<AppendPlan> {
     })
 }
 
-fn fixed_plan(segments: &[BsSegment], alloc: u32) -> Option<FixedPlan> {
-    let (bits, combined) = integer_group(segments)?;
+fn fixed_plan(asm: &BeamModuleAssembler, segments: &[BsSegment], alloc: u32) -> Option<FixedPlan> {
+    let (bits, combined) = integer_group(asm, segments)?;
     if bits > ONHEAP_BITS {
         return None;
     }
@@ -207,7 +207,10 @@ fn append_binary_plan(segments: &[BsSegment]) -> Option<(u32, u32)> {
     }
 }
 
-fn integer_group(segments: &[BsSegment]) -> Option<(u64, Vec<BscSegment>)> {
+fn integer_group(
+    asm: &BeamModuleAssembler,
+    segments: &[BsSegment],
+) -> Option<(u64, Vec<BscSegment>)> {
     if segments.is_empty() {
         return None;
     }
@@ -217,7 +220,7 @@ fn integer_group(segments: &[BsSegment]) -> Option<(u64, Vec<BscSegment>)> {
         if seg.kind != BsSegmentKind::Integer || seg.flags & BSF_LITTLE_OR_NATIVE != 0 {
             return None;
         }
-        let width = integer_bits(seg)?;
+        let width = integer_bits(asm, seg)?;
         bits = bits.checked_add(width)?;
         segs.push(BscSegment {
             type_: ArgVal::Immediate(Term::atom(atoms::INTEGER).word()),
@@ -237,13 +240,14 @@ fn integer_group(segments: &[BsSegment]) -> Option<(u64, Vec<BscSegment>)> {
     Some((bits, beam_jit_bsc_combine_segments(&segs)))
 }
 
-fn integer_bits(seg: &BsSegment) -> Option<u64> {
-    let units = match seg.size {
-        ArgVal::Immediate(word) | ArgVal::Literal(word) if seg.size_is_units => word,
-        ArgVal::Immediate(word) | ArgVal::Literal(word) if word & 0xf == 0xf => {
-            u64::try_from((word as i64) >> 4).ok()?
-        }
-        _ => return None,
+fn integer_bits(asm: &BeamModuleAssembler, seg: &BsSegment) -> Option<u64> {
+    let word = asm.constant_word(seg.size)?;
+    let units = if seg.size_is_units {
+        word
+    } else if word & 0xf == 0xf {
+        u64::try_from((word as i64) >> 4).ok()?
+    } else {
+        return None;
     };
     let bits = units.checked_mul(u64::from(seg.unit))?;
     (bits > 0 && bits <= 64 && bits % 8 == 0).then_some(bits)
@@ -977,21 +981,20 @@ fn emit_is_small(
     src: ArgVal,
     not_small: arinsal_a64::buf::Label,
 ) -> Result<(), ModuleError> {
-    match src {
-        ArgVal::Immediate(word) | ArgVal::Literal(word) if word & 0xf == 0xf => Ok(()),
-        ArgVal::Immediate(_) | ArgVal::Literal(_) => {
-            asm.code.b(not_small)?;
-            Ok(())
+    if let Some(word) = asm.constant_word(src) {
+        if word & 0xf == 0xf {
+            return Ok(());
         }
-        _ => {
-            let reg = asm.source_reg(src)?;
-            asm.code.emit(|e| {
-                e.and_imm(TMP, reg, 0xf)?;
-                e.cmp_imm(TMP, 0xf, false)
-            })?;
-            asm.code.b_cond(Cond::Ne, not_small)?;
-            Ok(())
-        }
+        asm.code.b(not_small)?;
+        Ok(())
+    } else {
+        let reg = asm.source_reg(src)?;
+        asm.code.emit(|e| {
+            e.and_imm(TMP, reg, 0xf)?;
+            e.cmp_imm(TMP, 0xf, false)
+        })?;
+        asm.code.b_cond(Cond::Ne, not_small)?;
+        Ok(())
     }
 }
 

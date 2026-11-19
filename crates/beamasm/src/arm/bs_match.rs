@@ -26,6 +26,13 @@ const TMP: Gpr = Gpr::x(9);
 const FIELD_BITS: Gpr = Gpr::x(12);
 
 impl BeamModuleAssembler {
+    /// Resolves a `bs_match` flags operand through the module's literal table.
+    // Port of erts/emulator/beam/jit/beam_jit_bs.cpp:255-285 (bs_get_flags), OTP-29.1.1.
+    pub fn bs_get_flags(&self, value: ArgVal) -> Result<u64, ModuleError> {
+        crate::common::bs::beam_jit_bs_get_flags(value, &|index| self.beamfile_get_literal(index))
+            .map_err(ModuleError::InvalidOperand)
+    }
+
     /// Runs one field-decoding `bs_match` command through the runtime.
     ///
     /// `staged` holds the match context and the command's operands as terms; the collector
@@ -143,10 +150,7 @@ impl BeamModuleAssembler {
         let ctx = self.source_reg(ctx)?;
         self.code.emit(|e| e.mov_reg(Gpr::x(2), ctx))?;
         let live = if op == 0 {
-            match size {
-                ArgVal::Immediate(value) | ArgVal::Literal(value) => value as usize,
-                _ => 0,
-            }
+            self.constant_word(size).map_or(0, |value| value as usize)
         } else {
             6
         };
@@ -493,49 +497,46 @@ impl BeamModuleAssembler {
         fail: arinsal_a64::buf::Label,
     ) -> Result<bool, ModuleError> {
         const MAX_SMALL: i64 = (1 << 59) - 1;
-        match size {
-            ArgVal::Immediate(word) | ArgVal::Literal(word) => {
-                let value = (word & 0xf == 0xf).then_some(word as i64 >> 4);
-                match value {
-                    Some(value)
-                        if value >= 0 && (unit == 0 || value <= MAX_SMALL / i64::from(unit)) =>
-                    {
-                        let bits = value as u64 * u64::from(unit);
-                        self.code.emit(|e| e.mov_const(FIELD_BITS, bits))?;
-                        Ok(true)
-                    }
-                    _ => {
-                        self.code.b(fail)?;
-                        Ok(false)
-                    }
+        if let Some(word) = self.constant_word(size) {
+            let value = (word & 0xf == 0xf).then_some(word as i64 >> 4);
+            match value {
+                Some(value)
+                    if value >= 0 && (unit == 0 || value <= MAX_SMALL / i64::from(unit)) =>
+                {
+                    let bits = value as u64 * u64::from(unit);
+                    self.code.emit(|e| e.mov_const(FIELD_BITS, bits))?;
+                    Ok(true)
+                }
+                _ => {
+                    self.code.b(fail)?;
+                    Ok(false)
                 }
             }
-            _ => {
-                let source = self.source_reg(size)?;
-                self.code.emit(|e| {
-                    // Negating the tag bits guards against non-smalls, negative sizes and
-                    // overflow with one test.
-                    e.eor_imm(FIELD_BITS, source, 0xf)?;
-                    e.tst_imm(FIELD_BITS, 0xfff0_0000_0000_000f)?;
-                    if unit == 0 {
-                        e.mov_const(FIELD_BITS, 0)?;
-                    } else if unit.is_power_of_two() {
-                        let trailing = unit.trailing_zeros() as u8;
-                        if trailing < 4 {
-                            e.lsr_imm(FIELD_BITS, FIELD_BITS, 4 - trailing)?;
-                        } else if trailing > 4 {
-                            e.lsl_imm(FIELD_BITS, FIELD_BITS, trailing - 4)?;
-                        }
-                    } else {
-                        e.lsr_imm(FIELD_BITS, FIELD_BITS, 4)?;
-                        e.mov_const(Gpr::x(10), u64::from(unit))?;
-                        e.mul(FIELD_BITS, FIELD_BITS, Gpr::x(10))?;
+        } else {
+            let source = self.source_reg(size)?;
+            self.code.emit(|e| {
+                // Negating the tag bits guards against non-smalls, negative sizes and
+                // overflow with one test.
+                e.eor_imm(FIELD_BITS, source, 0xf)?;
+                e.tst_imm(FIELD_BITS, 0xfff0_0000_0000_000f)?;
+                if unit == 0 {
+                    e.mov_const(FIELD_BITS, 0)?;
+                } else if unit.is_power_of_two() {
+                    let trailing = unit.trailing_zeros() as u8;
+                    if trailing < 4 {
+                        e.lsr_imm(FIELD_BITS, FIELD_BITS, 4 - trailing)?;
+                    } else if trailing > 4 {
+                        e.lsl_imm(FIELD_BITS, FIELD_BITS, trailing - 4)?;
                     }
-                    Ok(())
-                })?;
-                self.code.b_cond(Cond::Ne, fail)?;
-                Ok(true)
-            }
+                } else {
+                    e.lsr_imm(FIELD_BITS, FIELD_BITS, 4)?;
+                    e.mov_const(Gpr::x(10), u64::from(unit))?;
+                    e.mul(FIELD_BITS, FIELD_BITS, Gpr::x(10))?;
+                }
+                Ok(())
+            })?;
+            self.code.b_cond(Cond::Ne, fail)?;
+            Ok(true)
         }
     }
 

@@ -166,7 +166,11 @@ impl BeamModuleAssembler {
         // With a failure label the helper only reports failure; without one it raises.
         let raise = u64::from(fail == 0);
         self.code.emit(|e| e.mov_const(Gpr::x(4), raise))?;
-        let helper = if is_immediate_id(id) {
+        let helper = if match id {
+            ArgVal::Immediate(_) => true,
+            ArgVal::Literal(index) => !matches!(self.beamfile_get_literal(index) & 7, 1 | 2),
+            _ => false,
+        } {
             runtime.get_local_field
         } else {
             runtime.get_field
@@ -431,12 +435,4 @@ fn emit_record_runtime(
     asm.code.emit(|e| e.ldr_uoff(Gpr::x(9), C_P, 40))?;
     asm.error_if_nonzero(Gpr::x(9))?;
     Ok(())
-}
-
-fn is_immediate_id(id: ArgVal) -> bool {
-    match id {
-        ArgVal::Immediate(_) => true,
-        ArgVal::Literal(term) => !matches!(term & 7, 1 | 2),
-        _ => false,
-    }
 }

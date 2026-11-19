@@ -1013,7 +1013,7 @@ mod tests {
             .emit_i_new_small_map_lit(
                 ArgVal::X(1),
                 ArgVal::Word(2),
-                ArgVal::Literal(u64::MAX),
+                ArgVal::Literal(i64::MAX),
                 ArgVal::Word(2),
                 &[ArgVal::X(1), ArgVal::Immediate(15371)],
             )

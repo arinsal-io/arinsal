@@ -99,25 +99,12 @@ pub struct TypedArg {
     pub val: ArgVal,
     /// Its type; only meaningful for registers and literals.
     pub ty: ArgType,
-    /// Arity of the literal tuple behind a `Literal` operand (erts reads it with
-    /// `beamfile_get_literal`); `None` for any other operand.
-    pub literal_tuple_arity: Option<u64>,
 }
 
 impl TypedArg {
     /// Pairs an operand with its type.
     pub fn new(val: ArgVal, ty: ArgType) -> Self {
-        Self {
-            val,
-            ty,
-            literal_tuple_arity: None,
-        }
-    }
-
-    /// Records the arity of a literal tuple operand.
-    pub fn with_literal_tuple_arity(mut self, arity: Option<u64>) -> Self {
-        self.literal_tuple_arity = arity;
-        self
+        Self { val, ty }
     }
 
     /// `ArgSource::isSmall`: an immediate small integer.
@@ -125,10 +112,10 @@ impl TypedArg {
         matches!(self.val, ArgVal::Immediate(word) if word & 15 == 15)
     }
 
-    /// The operand's machine word (`ArgSmall::get` for a small: the tagged value).
+    /// The operand's immediate machine word (`ArgSmall::get` for a small: the tagged value).
     pub fn word(&self) -> u64 {
         match self.val {
-            ArgVal::Immediate(word) | ArgVal::Literal(word) => word,
+            ArgVal::Immediate(word) => word,
             _ => 0,
         }
     }
@@ -266,6 +253,18 @@ pub trait BeamModuleAssemblerCommon {
     /// `beam->types.entries`.
     fn beam_types(&self) -> &[ArgType];
 
+    /// `beamfile_get_literal(beam, index)`.
+    fn beamfile_get_literal(&self, index: i64) -> u64;
+
+    /// A constant term word as read by `getTypeUnion`.
+    fn constant_word(&self, arg: ArgVal) -> Option<u64> {
+        match arg {
+            ArgVal::Immediate(word) => Some(word),
+            ArgVal::Literal(index) => Some(self.beamfile_get_literal(index)),
+            _ => None,
+        }
+    }
+
     /// `getTypeEntry`: entry 0 for a constant.
     fn get_type_entry(&self, arg: ArgVal) -> ArgType {
         let type_index = if arg.is_register() {
@@ -282,8 +281,9 @@ pub trait BeamModuleAssemblerCommon {
         match arg {
             // `beamfile_get_literal`: the loader resolved the literal to its term in the
             // module's literal area, live for as long as the module.
-            ArgVal::Immediate(term) | ArgVal::Literal(term) => {
-                constant_type_union(term_from_bits(term))
+            ArgVal::Immediate(term) => constant_type_union(term_from_bits(term)),
+            ArgVal::Literal(index) => {
+                constant_type_union(term_from_bits(self.beamfile_get_literal(index)))
             }
             _ => self.get_type_entry(arg).union_bits,
         }
@@ -471,6 +471,10 @@ mod tests {
     impl BeamModuleAssemblerCommon for Types {
         fn beam_types(&self) -> &[ArgType] {
             &self.0
+        }
+
+        fn beamfile_get_literal(&self, _index: i64) -> u64 {
+            unreachable!("type tests do not read literal operands")
         }
     }
 

@@ -14,7 +14,7 @@ use arinsal_beamasm::{
     arith::ArithHelper,
     construct::GcHook,
     fun::FunCallTag,
-    guard::{CompareShared, EqLiteral, GuardHelper, GuardHelper3},
+    guard::{CompareShared, GuardHelper, GuardHelper3},
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
     types::{ArgType, TypedArg},
 };
@@ -27,15 +27,20 @@ use std::{
     path::Path,
 };
 
-mod eq_literal;
-use eq_literal::classify_eq_literal;
-
 /// Runtime values and helper entry points needed while compiling a module.
 pub trait ModuleEnv {
     /// Resolve a global atom index to an OTP tagged atom word.
     fn atom(&self, beam: &BeamFile, index: u32) -> Result<u64, String>;
-    /// Resolve a zero-based literal index to an OTP tagged term word.
-    fn literal(&self, beam: &BeamFile, index: u32) -> Result<u64, String>;
+    /// `beamfile_get_literal(beam, index)` for a static, load-added or dynamic index.
+    fn literal(&self, beam: &BeamFile, index: i64) -> Result<u64, String>;
+    /// The number of entries in `beam->static_literals` known to the loader.
+    fn literal_count(&self, beam: &BeamFile) -> usize {
+        beam.literals.len()
+    }
+    /// The number of entries in `beam->dynamic_literals` known to the loader.
+    fn dynamic_literal_count(&self) -> usize {
+        0
+    }
     /// Register the word of the literal at `index`, one that the load added after the literals
     /// of the file (`beamfile_add_literal`); `literal` then resolves it.
     fn add_literal(&self, _index: u32, _word: u64) -> Result<(), String> {
@@ -48,7 +53,7 @@ pub trait ModuleEnv {
         Err("module environment has no external dispatch slots".into())
     }
     /// Build a bignum literal for an integer outside the small range.
-    fn integer_literal(&self, _value: i64) -> Result<u64, String> {
+    fn integer_literal(&self, _value: i64) -> Result<i64, String> {
         Err("module environment cannot build integer literals".into())
     }
     /// The fun of the lambda at `lambda` in the lambda table when it has no free variables
@@ -79,8 +84,15 @@ pub trait ModuleEnv {
     }
     /// Hash a literal map key while compiling its lookup triplet.
     // Port of erts/emulator/beam/beam_transform_helpers.c:54-110, OTP-29.1.1.
-    fn map_key_hash(&self, key: ArgVal) -> u64 {
-        arinsal_beamasm::map::literal_key_hash(key)
+    fn map_key_hash(&self, beam: &BeamFile, key: ArgVal) -> u64 {
+        match key {
+            ArgVal::Immediate(word) => arinsal_beamasm::map::literal_key_hash(word),
+            ArgVal::Literal(index) => self
+                .literal(beam, index)
+                .map(arinsal_beamasm::map::literal_key_hash)
+                .unwrap_or(0),
+            _ => 0,
+        }
     }
     /// Return the retained `FunEntry` pointer for a lambda-table index.
     fn lambda_fun_entry(&self, _beam: &BeamFile, index: u32) -> Result<(usize, u8), String> {
@@ -179,18 +191,6 @@ pub trait ModuleEnv {
     /// Process-wide comparison fragments. The default is unset; the VM installs the real ones.
     fn compare_shared(&self) -> CompareShared {
         CompareShared::default()
-    }
-    /// Resolves an atom name to its VM term word, or `None` when the VM has no such atom.
-    fn atom_word_by_name(&self, _name: &str) -> Option<u64> {
-        None
-    }
-    /// Classifies a literal compared with `=:=` / `=/=`. The owned literal is decoded from the
-    /// module's literal table; the default treats every literal as `Generic`-decidable.
-    fn eq_literal(&self, beam: &BeamFile, index: u32) -> Result<EqLiteral, String> {
-        let term = beam.literal(index).map_err(|error| error.to_string())?;
-        Ok(classify_eq_literal(&term, &|name| {
-            self.atom_word_by_name(name)
-        }))
     }
     /// Guard slow path for checks that compare a tuple tag as well as its arity.
     fn guard_helper3(&self) -> GuardHelper3;
@@ -301,13 +301,19 @@ impl<E: ModuleEnv + ?Sized> crate::beam_asm::LoaderEnv for E {
     fn atom(&self, beam: &BeamFile, index: u32) -> Result<u64, String> {
         ModuleEnv::atom(self, beam, index)
     }
-    fn literal(&self, beam: &BeamFile, index: u32) -> Result<u64, String> {
+    fn literal(&self, beam: &BeamFile, index: i64) -> Result<u64, String> {
         ModuleEnv::literal(self, beam, index)
+    }
+    fn literal_count(&self, beam: &BeamFile) -> usize {
+        ModuleEnv::literal_count(self, beam)
+    }
+    fn dynamic_literal_count(&self) -> usize {
+        ModuleEnv::dynamic_literal_count(self)
     }
     fn add_literal(&self, index: u32, word: u64) -> Result<(), String> {
         ModuleEnv::add_literal(self, index, word)
     }
-    fn integer_literal(&self, value: i64) -> Result<u64, String> {
+    fn integer_literal(&self, value: i64) -> Result<i64, String> {
         ModuleEnv::integer_literal(self, value)
     }
     fn bigint_literal(&self, decimal: &str) -> Result<u64, String> {
@@ -1708,7 +1714,10 @@ impl<E: ModuleEnv> ModuleCompiler<'_, E> {
 
 impl<E: ModuleEnv> OpSink for ModuleCompiler<'_, E> {
     fn new_literal(&mut self, index: u32, literal: &NewLiteral) -> Result<(), String> {
-        resolve_new_literal(self.beam, self.env, index, literal)
+        resolve_new_literal(self.beam, self.env, index, literal)?;
+        let word = self.env.literal(self.beam, i64::from(index))?;
+        self.assembler.set_beam_literal(i64::from(index), word);
+        Ok(())
     }
 
     fn emit(&mut self, op: u16, specific: u16, operands: &[SpecificOperand]) -> Result<(), String> {
@@ -1751,6 +1760,7 @@ impl<E: ModuleEnv> OpSink for ModuleCompiler<'_, E> {
             Some(function) => (function.name, function.arity, function.native_body),
             None => ("<module>", 0, None),
         };
+        let dynamic_literals_before = env.dynamic_literal_count();
         let dump_enabled = assembler.dump_enabled();
         let start = if dump_enabled {
             assembler.code_offset()
@@ -1772,6 +1782,11 @@ impl<E: ModuleEnv> OpSink for ModuleCompiler<'_, E> {
         } else {
             dispatch_specific_op(specific, assembler, &view, beam, *env, name, arity)
                 .map_err(|error| describe(&view, &error))?;
+        }
+        for dynamic_index in dynamic_literals_before..env.dynamic_literal_count() {
+            let index = !(dynamic_index as i64);
+            let word = env.literal(beam, index)?;
+            assembler.set_beam_literal(index, word);
         }
         if dump_enabled {
             let end = assembler.code_offset();
@@ -1800,6 +1815,11 @@ fn compile_parsed_module_with_options_in_arena(
 ) -> Result<CompiledModule, CompileError> {
     let fail = |error: String| CompileError::Assemble(format!("{}: {error}", beam.module));
     let mut assembler = BeamModuleAssembler::new();
+    for index in 0..env.literal_count(beam) {
+        let index = index as i64;
+        let word = env.literal(beam, index).map_err(&fail)?;
+        assembler.set_beam_literal(index, word);
+    }
     assembler.set_exception_resolver(env.exception_resolver() as usize);
     if let Some((dispatch_return, test_yield, context_switch)) = env.yield_fragments() {
         assembler.set_yield_fragments(dispatch_return, test_yield, context_switch);
@@ -1863,9 +1883,23 @@ fn compile_parsed_module_with_options_in_arena(
     assembler
         .emit_missing_lambda_trampolines()
         .map_err(|error| fail(format!("{error:?}")))?;
-    let native = assembler
+    let mut native = assembler
         .finalize()
         .map_err(|error| fail(format!("{error:?}")))?;
+    for index in 0..env.literal_count(beam) {
+        let index = index as i64;
+        let word = env.literal(beam, index).map_err(&fail)?;
+        native
+            .patch_literal(index, word)
+            .map_err(|error| fail(format!("literal {index}: {error:?}")))?;
+    }
+    for dynamic_index in 0..env.dynamic_literal_count() {
+        let index = !(dynamic_index as i64);
+        let word = env.literal(beam, index).map_err(&fail)?;
+        native
+            .patch_literal(index, word)
+            .map_err(|error| fail(format!("literal {index}: {error:?}")))?;
+    }
     for (&index, &target) in &native.lambda_entries {
         env.publish_lambda_target(beam, index, target as usize)
             .map_err(&fail)?;
@@ -2120,7 +2154,7 @@ fn arg(
         SpecificOperand::Label(index) => Ok(ArgVal::Label(*index)),
         SpecificOperand::Atom(index) => env.atom(beam, *index).map(ArgVal::Immediate),
         SpecificOperand::Export(index) => env.import(beam, *index).map(ArgVal::Export),
-        SpecificOperand::Literal(index) => env.literal(beam, *index).map(ArgVal::Literal),
+        SpecificOperand::Literal(index) => Ok(ArgVal::Literal(i64::from(*index))),
         // Integers outside the 60-bit small range are bignum literals (OTP's loader moves them
         // into the literal table).
         SpecificOperand::SmallInt(value) if (-(1_i64 << 59)..(1_i64 << 59)).contains(value) => {
@@ -2135,47 +2169,15 @@ fn arg(
     }
 }
 
-/// The compile-time shape of an `=:=` / `=/=` right operand that is a literal; any other operand
-/// is `Generic`.
-fn eq_literal_operand(
-    value: Option<&SpecificOperand>,
-    beam: &BeamFile,
-    env: &impl ModuleEnv,
-) -> Result<EqLiteral, String> {
-    match value {
-        // A literal the load added (a bignum) compares like any boxed term.
-        Some(SpecificOperand::Literal(index)) if (*index as usize) < beam.literals.len() => {
-            env.eq_literal(beam, *index)
-        }
-        _ => Ok(EqLiteral::Generic),
-    }
-}
-
 fn typed_arg(
     value: Option<&SpecificOperand>,
     beam: &BeamFile,
     env: &impl ModuleEnv,
 ) -> Result<arinsal_beamasm::types::TypedArg, String> {
-    Ok(
-        arinsal_beamasm::types::TypedArg::new(arg(value, beam, env)?, operand_type(value, beam))
-            .with_literal_tuple_arity(literal_tuple_arity(value, beam)),
-    )
-}
-
-/// The arity of a literal tuple operand, read from the literal's external term format.
-// erts reads it from the loaded literal (beamfile_get_literal + arityval).
-fn literal_tuple_arity(value: Option<&SpecificOperand>, beam: &BeamFile) -> Option<u64> {
-    let Some(SpecificOperand::Literal(index)) = value else {
-        return None;
-    };
-    let etf = &beam.literals.get(*index as usize)?.0;
-    match etf.get(1)? {
-        104 => etf.get(2).map(|arity| u64::from(*arity)),
-        105 => etf
-            .get(2..6)
-            .map(|bytes| u64::from(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))),
-        _ => None,
-    }
+    Ok(arinsal_beamasm::types::TypedArg::new(
+        arg(value, beam, env)?,
+        operand_type(value, beam),
+    ))
 }
 
 /// The compiler type of an operand: its `Type` chunk entry for a typed register, the type of a
@@ -2290,35 +2292,18 @@ fn tagged_small_number(
     }
 }
 
-/// Decode a `bs_match` flags operand (a literal list of atoms, or nil) to `BSF_*` bits, tagged.
-fn bs_flags(value: Option<&SpecificOperand>, beam: &BeamFile) -> Result<u64, EmitError> {
-    let mut bits = 0u64;
-    if let Some(SpecificOperand::Unsigned(flags)) = value {
-        bits = *flags;
+/// Preserves a flags value as an operand for the module assembler's `bs_get_flags`.
+fn bs_flags_arg(
+    value: Option<&SpecificOperand>,
+    beam: &BeamFile,
+    env: &impl ModuleEnv,
+) -> Result<ArgVal, EmitError> {
+    match value {
+        Some(SpecificOperand::Literal(index)) => Ok(ArgVal::Literal(i64::from(*index))),
+        Some(SpecificOperand::Unsigned(flags)) => Ok(ArgVal::Word(*flags)),
+        Some(SpecificOperand::SmallInt(flags)) => Ok(ArgVal::Word(*flags as u64)),
+        other => arg(other, beam, env).map_err(EmitError::Operand),
     }
-    if let Some(SpecificOperand::SmallInt(flags)) = value {
-        bits = *flags as u64;
-    }
-    if let Some(SpecificOperand::Literal(index)) = value {
-        let term = beam
-            .literal(*index)
-            .map_err(|error| EmitError::Operand(error.to_string()))?;
-        let mut current = &term;
-        while let arinsal_etf::OwnedTerm::List { elems, tail } = current {
-            for elem in elems {
-                if let arinsal_etf::OwnedTerm::Atom(name) = elem {
-                    match name.as_str() {
-                        "little" => bits |= 2,
-                        "signed" => bits |= 4,
-                        "native" => bits |= 16,
-                        _ => {}
-                    }
-                }
-            }
-            current = tail;
-        }
-    }
-    Ok((bits << 4) | 0xf)
 }
 
 fn count_at_least(args: &[SpecificOperand], minimum: usize, name: &str) -> Result<(), EmitError> {
@@ -3002,14 +2987,12 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                                 typed_arg(args.get(1), beam, env)?,
                                 typed_arg(args.get(2), beam, env)?,
                                 fail,
-                                &eq_literal_operand(args.get(2), beam, env)?,
                                 env.compare_shared().eq,
                             )?,
                             erts_tables::GENOP_IS_NE_EXACT_3 => assembler.emit_is_ne_exact(
                                 typed_arg(args.get(1), beam, env)?,
                                 typed_arg(args.get(2), beam, env)?,
                                 fail,
-                                &eq_literal_operand(args.get(2), beam, env)?,
                                 env.compare_shared().eq,
                             )?,
                             erts_tables::GENOP_IS_EQ_3 => assembler.emit_is_eq(
@@ -4291,7 +4274,8 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 erts_tables::GENOP_BS_GET_INTEGER2_7 => {
                     // Fail Ms Live Sz Unit Flags Dst
                     count(7)?;
-                    let flags = bs_flags(args.get(5), beam)?;
+                    let flags =
+                        (assembler.bs_get_flags(bs_flags_arg(args.get(5), beam, env)?)? << 4) | 0xf;
                     let size = small_or_arg(args.get(3), beam, env)?;
                     let unit = small_or_arg(args.get(4), beam, env)?;
                     assembler.emit_bs_match_command(
@@ -4335,12 +4319,9 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                     };
                     // `bs_get_flags`: native endianness is little on this target.
                     let raw_flags = |index: usize| -> Result<u64, EmitError> {
-                        let flags = bs_flags(args.get(index), beam)? >> 4;
-                        Ok(if flags & 16 != 0 {
-                            (flags & !16) | 2
-                        } else {
-                            flags
-                        })
+                        assembler
+                            .bs_get_flags(bs_flags_arg(args.get(index), beam, env)?)
+                            .map_err(|error| EmitError::Assembler(format!("{error:?}")))
                     };
                     let mut commands = Vec::new();
                     while at < args.len() {

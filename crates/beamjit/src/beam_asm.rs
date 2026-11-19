@@ -48,13 +48,21 @@ pub enum CompileError {
 pub trait LoaderEnv {
     /// The tagged atom word of the global atom `index`.
     fn atom(&self, beam: &BeamFile, index: u32) -> Result<u64, String>;
-    /// The term word of the literal at `index`: one of the file, or one the load added.
-    fn literal(&self, beam: &BeamFile, index: u32) -> Result<u64, String>;
+    /// `beamfile_get_literal(beam, index)` for a static, load-added or dynamic index.
+    fn literal(&self, beam: &BeamFile, index: i64) -> Result<u64, String>;
+    /// The number of entries in `beam->static_literals` known to the loader.
+    fn literal_count(&self, beam: &BeamFile) -> usize {
+        beam.literals.len()
+    }
+    /// The number of entries in `beam->dynamic_literals` known to the loader.
+    fn dynamic_literal_count(&self) -> usize {
+        0
+    }
     /// Registers `word` as the literal at `index`, one the load added after the literals of
     /// the file (`beamfile_add_literal`).
     fn add_literal(&self, index: u32, word: u64) -> Result<(), String>;
-    /// A bignum literal for an integer operand outside the small range.
-    fn integer_literal(&self, value: i64) -> Result<u64, String>;
+    /// Adds a bignum to `beam->dynamic_literals` and returns its negative literal index.
+    fn integer_literal(&self, value: i64) -> Result<i64, String>;
     /// A bignum literal from decimal text (integers outside `i64`).
     fn bigint_literal(&self, decimal: &str) -> Result<u64, String>;
     /// The fun of the lambda at `lambda` when it has no free variables (`erts_fun_entry_put`
@@ -97,7 +105,7 @@ pub(crate) fn resolve_new_literal(
                 LiteralElement::Atom(atom) => env.atom(beam, *atom),
                 LiteralElement::Small(value) => Ok(make_small(*value)),
                 LiteralElement::Nil => Ok(NIL),
-                LiteralElement::Literal(literal) => env.literal(beam, *literal),
+                LiteralElement::Literal(literal) => env.literal(beam, i64::from(*literal)),
             })
             .collect::<Result<Vec<_>, _>>()
             .and_then(|words| env.tuple_literal(&words)),
@@ -207,7 +215,7 @@ pub fn beam_load_emit_op(
             ('c' | 's', SpecificOperand::SmallInt(value)) => tagged_integer(env, *value)?,
             ('c' | 's', SpecificOperand::Nil) => ArgVal::Immediate(NIL),
             ('c' | 's' | 'q', SpecificOperand::Literal(index)) => {
-                ArgVal::Literal(env.literal(beam, *index)?)
+                ArgVal::Literal(i64::from(*index))
             }
             ('t' | 'I' | 'W', operand) => ArgVal::Word(word(operand, letter)?),
             ('A', operand) => ArgVal::Word(make_arityval(word(operand, letter)?)),
@@ -259,7 +267,7 @@ pub fn beam_load_emit_op(
             | SpecificOperand::TypedX { .. }
             | SpecificOperand::Y(_)
             | SpecificOperand::TypedY { .. } => register(beam, curr)?,
-            SpecificOperand::Literal(index) => ArgVal::Literal(env.literal(beam, *index)?),
+            SpecificOperand::Literal(index) => ArgVal::Literal(i64::from(*index)),
             other => return Err(format!("unsupported primitive type {other:?}")),
         };
         args.push(arg);

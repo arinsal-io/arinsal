@@ -5,7 +5,6 @@ use std::{cell::RefCell, cmp::Ordering, collections::HashMap, process::Command, 
 use arinsal_a64::enc::Gpr;
 use arinsal_beamasm::{
     ExitReason, ProcessHeader, SchedulerRegisters, enter_native,
-    guard::EqLiteral,
     module::{ArgVal, BeamModuleAssembler, ModuleError},
     rt,
     types::{ArgType, TypedArg, type_id},
@@ -306,7 +305,17 @@ fn list_length(value: Term) -> Option<i64> {
 fn module(
     emit: impl FnOnce(&mut BeamModuleAssembler) -> Result<(), ModuleError>,
 ) -> arinsal_beamasm::module::FinalizedModule {
+    module_with_literals(&[], emit)
+}
+
+fn module_with_literals(
+    literals: &[(i64, u64)],
+    emit: impl FnOnce(&mut BeamModuleAssembler) -> Result<(), ModuleError>,
+) -> arinsal_beamasm::module::FinalizedModule {
     let mut asm = BeamModuleAssembler::new();
+    for &(index, word) in literals {
+        asm.set_beam_literal(index, word);
+    }
     asm.emit_i_func_label(1).unwrap();
     emit(&mut asm).unwrap();
     asm.emit_raw(|e| {
@@ -314,7 +323,11 @@ fn module(
         e.ret(Gpr::x(30))
     })
     .unwrap();
-    asm.finalize().unwrap()
+    let mut module = asm.finalize().unwrap();
+    for &(index, word) in literals {
+        module.patch_literal(index, word).unwrap();
+    }
+    module
 }
 
 fn run(
@@ -400,8 +413,28 @@ fn native_guard(
     second: Term,
     expected: bool,
 ) {
+    native_guard_with_literals(&[], emit, first, second, expected);
+}
+
+fn native_guard_literal(
+    emit: impl FnOnce(&mut BeamModuleAssembler) -> Result<(), ModuleError>,
+    literal: Term,
+    first: Term,
+    second: Term,
+    expected: bool,
+) {
+    native_guard_with_literals(&[(0, bits(literal))], emit, first, second, expected);
+}
+
+fn native_guard_with_literals(
+    literals: &[(i64, u64)],
+    emit: impl FnOnce(&mut BeamModuleAssembler) -> Result<(), ModuleError>,
+    first: Term,
+    second: Term,
+    expected: bool,
+) {
     let _fixture = terms();
-    let finalized = module(|asm| {
+    let finalized = module_with_literals(literals, |asm| {
         emit(asm)?;
         asm.move_(ArgVal::Immediate(1), ArgVal::X(1))?;
         asm.emit_raw(|e| {
@@ -730,7 +763,6 @@ fn native_is_eq_exact() {
                 ArgVal::X(0),
                 ArgVal::X(1),
                 2,
-                &EqLiteral::Generic,
                 (eq_helper as extern "C" fn(u64, u64) -> i32) as usize,
             )
         },
@@ -764,7 +796,6 @@ fn typed_atom_exact_compare_does_not_call_the_runtime() {
                 typed,
                 ArgVal::X(1),
                 2,
-                &EqLiteral::Generic,
                 (exploding_eq as extern "C" fn(u64, u64) -> i32) as usize,
             )
         },
@@ -778,7 +809,6 @@ fn typed_atom_exact_compare_does_not_call_the_runtime() {
                 typed,
                 ArgVal::X(1),
                 2,
-                &EqLiteral::Generic,
                 (exploding_eq as extern "C" fn(u64, u64) -> i32) as usize,
             )
         },
@@ -810,7 +840,6 @@ fn exact_comparisons_against_small_and_atom_immediates_are_inline() {
                 ArgVal::X(0),
                 ArgVal::Immediate(bits(fixture.one)),
                 2,
-                &EqLiteral::Generic,
                 (eq_helper as extern "C" fn(u64, u64) -> i32) as usize,
             )
         },
@@ -824,7 +853,6 @@ fn exact_comparisons_against_small_and_atom_immediates_are_inline() {
                 ArgVal::X(0),
                 ArgVal::Immediate(bits(fixture.one)),
                 2,
-                &EqLiteral::Generic,
                 (eq_helper as extern "C" fn(u64, u64) -> i32) as usize,
             )
         },
@@ -839,7 +867,6 @@ fn exact_comparisons_against_small_and_atom_immediates_are_inline() {
                 ArgVal::X(0),
                 ArgVal::Immediate(bits(atom)),
                 2,
-                &EqLiteral::Generic,
                 (eq_helper as extern "C" fn(u64, u64) -> i32) as usize,
             )
         },
@@ -857,7 +884,6 @@ fn native_is_ne_exact() {
                 ArgVal::X(0),
                 ArgVal::X(1),
                 2,
-                &EqLiteral::Generic,
                 (eq_helper as extern "C" fn(u64, u64) -> i32) as usize,
             )
         },
@@ -894,7 +920,6 @@ fn unequal_immediates_skip_the_compare_helper() {
                 ArgVal::X(0),
                 ArgVal::X(1),
                 2,
-                &EqLiteral::Generic,
                 (exploding_eq as extern "C" fn(u64, u64) -> i32) as usize,
             )
         },
@@ -908,7 +933,6 @@ fn unequal_immediates_skip_the_compare_helper() {
                 ArgVal::X(0),
                 ArgVal::X(1),
                 2,
-                &EqLiteral::Generic,
                 (exploding_eq as extern "C" fn(u64, u64) -> i32) as usize,
             )
         },
@@ -1598,32 +1622,32 @@ fn shape_fixture() -> ShapeFixture {
 }
 
 /// Checks `=:=` and `=/=` against a literal shape for each `(value, equal)` case.
-fn check_shape(shape: &EqLiteral, literal: Term, cases: &[(Term, bool)]) {
+fn check_shape(literal: Term, cases: &[(Term, bool)]) {
     for &(value, equal) in cases {
-        native_guard(
+        native_guard_literal(
             |a| {
                 a.emit_is_eq_exact(
                     ArgVal::X(0),
-                    ArgVal::Literal(bits(literal)),
+                    ArgVal::Literal(0),
                     2,
-                    shape,
                     (eq_helper as extern "C" fn(u64, u64) -> i32) as usize,
                 )
             },
+            literal,
             value,
             literal,
             equal,
         );
-        native_guard(
+        native_guard_literal(
             |a| {
                 a.emit_is_ne_exact(
                     ArgVal::X(0),
-                    ArgVal::Literal(bits(literal)),
+                    ArgVal::Literal(0),
                     2,
-                    shape,
                     (eq_helper as extern "C" fn(u64, u64) -> i32) as usize,
                 )
             },
+            literal,
             value,
             literal,
             !equal,
@@ -1634,12 +1658,7 @@ fn check_shape(shape: &EqLiteral, literal: Term, cases: &[(Term, bool)]) {
 #[test]
 fn shallow_tuple_literal_matches_inline() {
     let f = shape_fixture();
-    let shape = EqLiteral::ShallowTuple {
-        header: 2 << 6,
-        elements: vec![bits(f.c), bits(f.three)],
-    };
     check_shape(
-        &shape,
         f.pair_c3,
         &[
             (f.pair_c3, true),
@@ -1663,7 +1682,6 @@ fn shallow_tuple_literal_matches_inline() {
 fn list_of_immediates_literal_matches_inline() {
     let f = shape_fixture();
     check_shape(
-        &EqLiteral::ListOfImmediates(vec![bits(f.one)]),
         f.list1,
         &[
             (f.list1, true),
@@ -1677,7 +1695,6 @@ fn list_of_immediates_literal_matches_inline() {
         ],
     );
     check_shape(
-        &EqLiteral::ListOfImmediates(vec![bits(f.one), bits(f.one)]),
         f.list_11,
         &[(f.list_11, true), (f.list1, false), (f.list_c, false)],
     );
@@ -1687,7 +1704,6 @@ fn list_of_immediates_literal_matches_inline() {
 fn empty_binary_literal_matches_inline() {
     let f = shape_fixture();
     check_shape(
-        &EqLiteral::EmptyBinary,
         f.bin_empty,
         &[
             (f.bin_empty, true),
@@ -1702,7 +1718,6 @@ fn empty_binary_literal_matches_inline() {
 fn empty_map_literal_matches_inline() {
     let f = shape_fixture();
     check_shape(
-        &EqLiteral::EmptyMap,
         f.map_empty,
         &[
             (f.map_empty, true),
@@ -1717,30 +1732,30 @@ fn empty_map_literal_matches_inline() {
 fn generic_literal_takes_the_eq_call() {
     let f = shape_fixture();
     // `1 =:= 1.0` is false: the float is boxed and only the general path can tell.
-    native_guard(
+    native_guard_literal(
         |a| {
             a.emit_is_eq_exact(
                 ArgVal::X(0),
-                ArgVal::Literal(bits(f.one_float)),
+                ArgVal::Literal(0),
                 2,
-                &EqLiteral::Generic,
                 (eq_helper as extern "C" fn(u64, u64) -> i32) as usize,
             )
         },
+        f.one_float,
         f.one,
         f.one_float,
         false,
     );
-    native_guard(
+    native_guard_literal(
         |a| {
             a.emit_is_eq_exact(
                 ArgVal::X(0),
-                ArgVal::Literal(bits(f.one_float)),
+                ArgVal::Literal(0),
                 2,
-                &EqLiteral::Generic,
                 (eq_helper as extern "C" fn(u64, u64) -> i32) as usize,
             )
         },
+        f.one_float,
         f.one_float,
         f.one_float,
         true,
@@ -1765,7 +1780,7 @@ fn exact_comparison_runtime_call_keeps_x4_and_x5() {
     let clobber = clobber.finalize().unwrap();
     let eq = clobber.memory.ptr_at(0) as usize;
     let finalized = module(|asm| {
-        asm.emit_is_eq_exact(ArgVal::X(0), ArgVal::X(1), 2, &EqLiteral::Generic, eq)?;
+        asm.emit_is_eq_exact(ArgVal::X(0), ArgVal::X(1), 2, eq)?;
         asm.emit_raw(|e| {
             e.mov_reg(Gpr::x(0), Gpr::xzr())?;
             e.ret(Gpr::x(30))

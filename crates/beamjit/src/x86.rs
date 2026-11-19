@@ -280,16 +280,15 @@ pub fn beamasm_patch_import(
     ba.patch_import(rw, index, import)
 }
 
-/// `beamasm_patch_literal(instance, rw_base, index, lit)`; Arinsal keys literal patches by
-/// the term the loader resolved.
+/// `beamasm_patch_literal(instance, rw_base, index, lit)`.
 // Port of erts/emulator/beam/jit/beam_jit_main.cpp:678-684 (beamasm_patch_literal), OTP-29.1.1.
 pub fn beamasm_patch_literal(
     ba: &BeamModuleAssembler,
     rw: &mut CodeMemory,
-    key: u64,
+    index: i64,
     lit: u64,
 ) -> Result<(), AsmError> {
-    ba.patch_literal(rw, key, lit)
+    ba.patch_literal(rw, index, lit)
 }
 
 /// `beamasm_patch_lambda(instance, rw_base, index, fe)`.
@@ -429,7 +428,13 @@ pub fn beam_load_prepare_emit<'a, E: LoaderEnv + ?Sized>(
     erts_coverage_mode: CoverageMode,
     erts_debugger_flags: u64,
 ) -> Result<LoaderState<'a, E>, AsmError> {
-    let ba = beamasm_new_assembler(jit, beam)?;
+    let mut ba = beamasm_new_assembler(jit, beam)?;
+    for index in 0..env.literal_count(beam) {
+        let literal = env
+            .literal(beam, index as i64)
+            .map_err(|_| AsmError::Operand("module literal index"))?;
+        ba.set_beam_literal(index as i64, literal);
+    }
     let num_functions = u64::from(beam.code.function_count);
     let flags = beam.lines.as_ref().map_or(0, |lines| lines.flags);
     let instruction_count = beam
@@ -734,7 +739,10 @@ impl<E: LoaderEnv + ?Sized> LoaderState<'_, E> {
 
 impl<E: LoaderEnv + ?Sized> OpSink for LoaderState<'_, E> {
     fn new_literal(&mut self, index: u32, literal: &NewLiteral) -> Result<(), String> {
-        resolve_new_literal(self.beam, self.env, index, literal)
+        resolve_new_literal(self.beam, self.env, index, literal)?;
+        let word = self.env.literal(self.beam, i64::from(index))?;
+        self.ba.set_beam_literal(i64::from(index), word);
+        Ok(())
     }
 
     // Port of erts/emulator/beam/jit/asm_load.c:357-772 (beam_load_emit_op), OTP-29.1.1.
@@ -743,6 +751,12 @@ impl<E: LoaderEnv + ?Sized> OpSink for LoaderState<'_, E> {
             .ok_or_else(|| format!("no specific instruction {specific}"))?;
         beam_load_emit_op(self.beam, self.env, info.sign, operands, &mut self.args)
             .map_err(|error| format!("{}: {error}", info.name))?;
+        for arg in &self.args {
+            if let ArgVal::Literal(index @ ..=-1) = arg {
+                let word = self.env.literal(self.beam, *index)?;
+                self.ba.set_beam_literal(*index, word);
+            }
+        }
         self.emit_specific(specific, operands)
             .map_err(|error| format!("{} ({}): {error}", info.name, beamops::generic_op_name(op)))
     }

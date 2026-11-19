@@ -18,8 +18,8 @@ pub enum ArgVal {
     /// An untagged machine word (erts `ArgWord`, `TAG_u`): the `t`/`I`/`W`/`A`/`P`/`b`
     /// operands of the loader and the untagged elements of variable argument lists.
     Word(u64),
-    /// A literal machine word.
-    Literal(u64),
+    /// A literal index in the module's static or dynamic literal table.
+    Literal(i64),
     /// A module label number.
     Label(u32),
     /// An export table index (external call emission is currently unported).

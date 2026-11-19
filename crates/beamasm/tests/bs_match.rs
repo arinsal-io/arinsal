@@ -9,6 +9,7 @@ use arinsal_beamasm::{
     rt,
 };
 use arinsal_term::{ProcessHeap, Term, TermBuilder};
+use similar_asserts::assert_eq;
 use std::{cell::RefCell, collections::VecDeque};
 
 thread_local! {
@@ -66,6 +67,16 @@ fn run_native_offset(
     bit_offset: usize,
     bytes: &[u8],
 ) -> (u64, u64) {
+    run_native_offset_with_literals(&[], emit, bit_offset, bytes)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn run_native_offset_with_literals(
+    literals: &[(i64, u64)],
+    emit: impl FnOnce(&mut BeamModuleAssembler) -> Result<(), arinsal_beamasm::module::ModuleError>,
+    bit_offset: usize,
+    bytes: &[u8],
+) -> (u64, u64) {
     let mut heap = ProcessHeap::with_words(4096);
     let mut builder = TermBuilder::new(&mut heap);
     let binary = builder.binary(bytes).unwrap();
@@ -75,6 +86,9 @@ fn run_native_offset(
     let context = builder.match_context(sliced).unwrap();
 
     let mut asm = BeamModuleAssembler::new();
+    for &(index, word) in literals {
+        asm.set_beam_literal(index, word);
+    }
     asm.emit_i_func_label(1).unwrap();
     asm.emit_enter_frame().unwrap();
     emit(&mut asm).unwrap();
@@ -92,7 +106,10 @@ fn run_native_offset(
         e.ret(Gpr::x(30))
     })
     .unwrap();
-    let module = asm.finalize().unwrap();
+    let mut module = asm.finalize().unwrap();
+    for &(index, word) in literals {
+        module.patch_literal(index, word).unwrap();
+    }
     let mut registers = SchedulerRegisters::default();
     registers.x_reg_array[0] = context;
     registers.x_reg_array[1] = Term::small(1).unwrap();
@@ -242,15 +259,22 @@ fn native_i_bs_get_binary_all2() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn native_i_bs_match_string() {
-    run_native(|a| {
-        a.emit_i_bs_match_string(
-            ArgVal::X(0),
-            99,
-            ArgVal::Immediate((8 << 4) | 0xf),
-            ArgVal::Literal(0),
-            match_helper,
-        )
-    });
+    let mut literal_heap = ProcessHeap::with_words(8);
+    let literal = TermBuilder::new(&mut literal_heap).binary(&[0x5a]).unwrap();
+    run_native_offset_with_literals(
+        &[(0, rt::term_bits(literal))],
+        |a| {
+            a.emit_i_bs_match_string(
+                ArgVal::X(0),
+                99,
+                ArgVal::Immediate((8 << 4) | 0xf),
+                ArgVal::Literal(0),
+                match_helper,
+            )
+        },
+        0,
+        &[0x5a; 1000],
+    );
 }
 
 #[cfg(target_arch = "aarch64")]

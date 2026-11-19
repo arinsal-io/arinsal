@@ -33,7 +33,7 @@ fn raw_word(term: Term) -> u64 {
 // beam.dynamic_literals, bif_imports), OTP-29.1.1.
 struct X86LoaderEnv<'a> {
     literal_heap: RefCell<&'a mut VecHeap>,
-    dynamic_integer_literals: RefCell<HashMap<BigInt, u64>>,
+    dynamic_integer_literals: RefCell<Vec<u64>>,
     literals: Vec<u64>,
     added_literals: RefCell<Vec<Option<u64>>>,
     zero_capture_funs: HashMap<u32, u64>,
@@ -73,7 +73,7 @@ impl<'a> X86LoaderEnv<'a> {
         }
         Ok(Self {
             literal_heap: RefCell::new(literal_heap),
-            dynamic_integer_literals: RefCell::new(HashMap::new()),
+            dynamic_integer_literals: RefCell::new(Vec::new()),
             literals,
             added_literals: RefCell::new(Vec::new()),
             zero_capture_funs,
@@ -82,26 +82,23 @@ impl<'a> X86LoaderEnv<'a> {
     }
 
     // Port of erts/emulator/beam/beam_file.c (beamfile_add_literal), OTP-29.1.1.
-    fn intern_integer(&self, value: BigInt) -> Result<u64, String> {
-        if let Some(word) = self.dynamic_integer_literals.borrow().get(&value).copied() {
-            return Ok(word);
-        }
+    fn make_integer(&self, value: BigInt) -> Result<u64, String> {
         let mut heap = self.literal_heap.borrow_mut();
-        let word = from_owned(&arinsal_etf::OwnedTerm::BigInt(value.clone()), &mut **heap)
+        from_owned(&arinsal_etf::OwnedTerm::BigInt(value), &mut **heap)
             .map(raw_word)
-            .map_err(|error| format!("integer literal: {error:?}"))?;
-        self.dynamic_integer_literals
-            .borrow_mut()
-            .insert(value, word);
-        Ok(word)
+            .map_err(|error| format!("integer literal: {error:?}"))
     }
 
-    /// Every literal word an instruction may refer to: those of the file, then the added ones.
-    fn literal_words(&self) -> Vec<u64> {
-        let mut words = self.literals.clone();
-        words.extend(self.added_literals.borrow().iter().flatten().copied());
-        words.extend(self.dynamic_integer_literals.borrow().values().copied());
-        words
+    fn add_dynamic_integer(&self, value: BigInt) -> Result<i64, String> {
+        let word = self.make_integer(value)?;
+        let mut literals = self.dynamic_integer_literals.borrow_mut();
+        let index = i64::try_from(literals.len()).map_err(|_| "dynamic literal index overflow")?;
+        literals.push(word);
+        Ok(!index)
+    }
+
+    fn literal_count(&self, _beam: &BeamFile) -> usize {
+        self.literals.len() + self.added_literals.borrow().len()
     }
 }
 
@@ -115,7 +112,16 @@ impl LoaderEnv for X86LoaderEnv<'_> {
         Ok(raw_word(Term::atom(atom)))
     }
 
-    fn literal(&self, _beam: &BeamFile, index: u32) -> Result<u64, String> {
+    fn literal(&self, _beam: &BeamFile, index: i64) -> Result<u64, String> {
+        if index < 0 {
+            return self
+                .dynamic_integer_literals
+                .borrow()
+                .get((!index) as usize)
+                .copied()
+                .ok_or_else(|| format!("dynamic literal index {index} is out of range"));
+        }
+        let index = index as usize;
         if let Some(word) = self.literals.get(index as usize) {
             return Ok(*word);
         }
@@ -140,15 +146,23 @@ impl LoaderEnv for X86LoaderEnv<'_> {
         Ok(())
     }
 
-    fn integer_literal(&self, value: i64) -> Result<u64, String> {
-        self.intern_integer(BigInt::from(value))
+    fn literal_count(&self, _beam: &BeamFile) -> usize {
+        X86LoaderEnv::literal_count(self, _beam)
+    }
+
+    fn dynamic_literal_count(&self) -> usize {
+        self.dynamic_integer_literals.borrow().len()
+    }
+
+    fn integer_literal(&self, value: i64) -> Result<i64, String> {
+        self.add_dynamic_integer(BigInt::from(value))
     }
 
     fn bigint_literal(&self, decimal: &str) -> Result<u64, String> {
         let value = decimal
             .parse::<BigInt>()
             .map_err(|error| format!("bignum literal: {error}"))?;
-        self.intern_integer(value)
+        self.make_integer(value)
     }
 
     fn zero_capture_fun(&self, _beam: &BeamFile, lambda: u32) -> Result<u64, String> {
@@ -736,15 +750,16 @@ pub(crate) fn compile(
             return None;
         }
     }
-    // Literals: Arinsal's loader built them in the literal area already, so every literal
-    // patch writes the word the emitter recorded. erts patches each literal index once
-    // (beam_load.c, `beamasm_patch_literal` per index); the patches here are keyed by the
-    // word, so each distinct word is one key, patched once.
-    let mut words = env.literal_words();
-    words.sort_unstable();
-    words.dedup();
-    for word in words {
-        arinsal_beamjit::beamasm_patch_literal(&ba, &mut memory, word, word).ok()?;
+    // `beam_load_finalize_code`: patch each static and dynamic literal index once.
+    for index in 0..env.literal_count(beam) {
+        let index = index as i64;
+        let literal = env.literal(beam, index).ok()?;
+        arinsal_beamjit::beamasm_patch_literal(&ba, &mut memory, index, literal).ok()?;
+    }
+    for dynamic_index in 0..env.dynamic_literal_count() {
+        let index = !(dynamic_index as i64);
+        let literal = env.literal(beam, index).ok()?;
+        arinsal_beamjit::beamasm_patch_literal(&ba, &mut memory, index, literal).ok()?;
     }
     if !beam.strings.is_empty() {
         let string_table = ba.get_rodata("str")?;

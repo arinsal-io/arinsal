@@ -4,6 +4,10 @@ use arinsal_a64::{
     buf::Label,
     enc::{Cond, Gpr, Shifted},
 };
+use arinsal_term::{
+    Term, TermKind,
+    raw::{Cons, Tuple, bitstring_extent, term_from_bits},
+};
 
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
 use crate::types::{ArgType, TypedArg, type_id};
@@ -44,10 +48,9 @@ pub struct CompareShared {
     pub eq: usize,
 }
 
-/// Compile-time shape of a literal operand of `=:=` / `=/=`, classified by the VM from the owned
-/// literal. Shapes other than `Generic` are matched inline; `Generic` takes the `eq` call.
+/// Compile-time shape erts reads from the module's literal word for exact comparisons.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum EqLiteral {
+enum EqLiteral {
     /// No inline shape: the general path decides, as erts does for literals it cannot inline.
     Generic,
     /// A proper list of immediates. `words[i]` is the head of cell `i`; the tail is nil.
@@ -58,6 +61,58 @@ pub enum EqLiteral {
     EmptyBinary,
     /// `#{}`.
     EmptyMap,
+}
+
+/// Classifies the loaded term exactly where erts uses `beamfile_get_literal`.
+// Port of erts/emulator/beam/jit/beam_jit_common.cpp:1366-1392 (beam_jit_is_list_of_immediates,
+// beam_jit_is_shallow_boxed), OTP-29.1.1.
+fn classify_eq_literal(term: Term) -> EqLiteral {
+    let mut current = term;
+    let mut words = Vec::new();
+    while current != Term::NIL {
+        let Ok(cell) = Cons::try_from(current) else {
+            words.clear();
+            break;
+        };
+        let head = cell.head();
+        if !head.is_immed() {
+            words.clear();
+            break;
+        }
+        words.push(head.word());
+        current = cell.tail();
+    }
+    if current == Term::NIL && !words.is_empty() {
+        return EqLiteral::ListOfImmediates(words);
+    }
+
+    if let Ok(tuple) = Tuple::try_from(term)
+        && tuple.arity() <= 4000
+    {
+        let elements = tuple.elements().collect::<Vec<_>>();
+        if elements.iter().all(|value| value.is_immed()) {
+            return EqLiteral::ShallowTuple {
+                header: (tuple.arity() as u64) << 6,
+                elements: elements.into_iter().map(Term::word).collect(),
+            };
+        }
+    }
+
+    if bitstring_extent(term).is_some_and(|(_, bits)| bits == 0) {
+        return EqLiteral::EmptyBinary;
+    }
+
+    if term.classify() == TermKind::Map
+        && term.is_flatmap()
+        && term
+            .flatmap_keys_tuple()
+            .and_then(|keys| Tuple::try_from(keys).ok())
+            .is_some_and(|keys| keys.arity() == 0)
+    {
+        return EqLiteral::EmptyMap;
+    }
+
+    EqLiteral::Generic
 }
 
 /// Heap bitstring header tags (crates/term/src/lib.rs:120-121, erts `_TAG_HEADER_HEAP_BITS` and
@@ -1426,8 +1481,7 @@ impl BeamModuleAssembler {
         }
     }
 
-    /// Emits an exact equality guard. `literal` classifies the rhs when it is a literal and
-    /// `eq` is the C `eq` helper (`CompareShared::eq`).
+    /// Emits an exact equality guard; `eq` is the C `eq` helper (`CompareShared::eq`).
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1751-1898 (emit_is_eq_exact),
     // OTP-29.1.1.
     pub fn emit_is_eq_exact(
@@ -1435,10 +1489,9 @@ impl BeamModuleAssembler {
         lhs: impl Into<TypedArg>,
         rhs: impl Into<TypedArg>,
         fail: u32,
-        literal: &EqLiteral,
         eq: usize,
     ) -> Result<(), ModuleError> {
-        self.emit_exact_eq(lhs.into(), rhs.into(), fail, literal, eq, false)
+        self.emit_exact_eq(lhs.into(), rhs.into(), fail, eq, false)
     }
 
     /// Emits an exact inequality guard; see [`Self::emit_is_eq_exact`].
@@ -1449,10 +1502,9 @@ impl BeamModuleAssembler {
         lhs: impl Into<TypedArg>,
         rhs: impl Into<TypedArg>,
         fail: u32,
-        literal: &EqLiteral,
         eq: usize,
     ) -> Result<(), ModuleError> {
-        self.emit_exact_eq(lhs.into(), rhs.into(), fail, literal, eq, true)
+        self.emit_exact_eq(lhs.into(), rhs.into(), fail, eq, true)
     }
 
     /// Shared body of `=:=` (`fail_on_equal == false`) and `=/=`.
@@ -1461,7 +1513,6 @@ impl BeamModuleAssembler {
         lhs: TypedArg,
         rhs: TypedArg,
         fail: u32,
-        literal: &EqLiteral,
         eq: usize,
         fail_on_equal: bool,
     ) -> Result<(), ModuleError> {
@@ -1470,7 +1521,7 @@ impl BeamModuleAssembler {
         if lhs.always_immediate() || rhs.always_immediate() {
             return self.emit_exact_immediate_guard(lhs, rhs, fail, fail_on_equal);
         }
-        if let Some((term, value)) = exact_immediate_operand(lhs.val, rhs.val) {
+        if let Some((term, value)) = self.exact_immediate_operand(lhs.val, rhs.val) {
             let word = TypedArg {
                 val: ArgVal::Immediate(value),
                 ..rhs
@@ -1478,13 +1529,11 @@ impl BeamModuleAssembler {
             let term = TypedArg { val: term, ..lhs };
             return self.emit_exact_immediate_guard(term, word, fail, fail_on_equal);
         }
-        if *literal != EqLiteral::Generic {
-            if !matches!(rhs.val, ArgVal::Literal(_)) {
-                return Err(ModuleError::InvalidOperand(
-                    "an inline literal shape needs a literal right operand",
-                ));
+        if let ArgVal::Literal(index) = rhs.val {
+            let literal = classify_eq_literal(term_from_bits(self.beamfile_get_literal(index)));
+            if literal != EqLiteral::Generic {
+                return self.emit_literal_exact_eq(lhs.val, rhs.val, &literal, fail, fail_on_equal);
             }
-            return self.emit_literal_exact_eq(lhs.val, rhs.val, literal, fail, fail_on_equal);
         }
         // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1857-1897 (general path of
         // emit_is_eq_exact), OTP-29.1.1: compare the words, then call `eq` for the rest.
@@ -1725,7 +1774,7 @@ impl BeamModuleAssembler {
         } else if (-4095..0).contains(&value) {
             self.code.emit(|e| e.cmn_imm(reg, (-value) as u16, false))?;
         } else {
-            self.mov_value(Gpr::x(17), false, value as u64)?;
+            self.mov_value(Gpr::x(17), value as u64)?;
             self.code
                 .emit(|e| e.cmp_reg(reg, Gpr::x(17), arinsal_a64::enc::Shift::Lsl, 0))?;
         }
@@ -2936,21 +2985,17 @@ impl BeamModuleAssembler {
     }
 }
 
-fn exact_immediate(value: ArgVal) -> Option<u64> {
-    match value {
-        ArgVal::Immediate(word) | ArgVal::Literal(word)
-            if word & 15 == 15 || word & 63 == 11 || word == 0x3b =>
-        {
-            Some(word)
-        }
-        _ => None,
+impl BeamModuleAssembler {
+    fn exact_immediate(&self, value: ArgVal) -> Option<u64> {
+        let word = self.constant_word(value)?;
+        (word & 15 == 15 || word & 63 == 11 || word == 0x3b).then_some(word)
     }
-}
 
-fn exact_immediate_operand(lhs: ArgVal, rhs: ArgVal) -> Option<(ArgVal, u64)> {
-    exact_immediate(rhs)
-        .map(|word| (lhs, word))
-        .or_else(|| exact_immediate(lhs).map(|word| (rhs, word)))
+    fn exact_immediate_operand(&self, lhs: ArgVal, rhs: ArgVal) -> Option<(ArgVal, u64)> {
+        self.exact_immediate(rhs)
+            .map(|word| (lhs, word))
+            .or_else(|| self.exact_immediate(lhs).map(|word| (rhs, word)))
+    }
 }
 
 fn small_comparison_immediate(lhs: ArgVal, rhs: ArgVal) -> Option<(ArgVal, u64, bool)> {

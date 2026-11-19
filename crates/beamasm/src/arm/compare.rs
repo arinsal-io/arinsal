@@ -9,6 +9,7 @@ use arinsal_a64::{
 
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
 use crate::types::{TypedArg, type_id};
+use arinsal_term::raw::{Tuple, term_from_bits};
 
 const ARG1: Gpr = Gpr::x(0);
 const ARG2: Gpr = Gpr::x(1);
@@ -431,7 +432,7 @@ impl BeamModuleAssembler {
             self.code
                 .emit(|e| e.add_imm(dst, src, (-value) as u16, false))?;
         } else {
-            self.mov_value(SUPER_TMP, false, value as u64)?;
+            self.mov_value(SUPER_TMP, value as u64)?;
             self.code
                 .emit(|e| e.sub_reg(dst, src, SUPER_TMP, Shift::Lsl, 0))?;
         }
@@ -503,14 +504,16 @@ impl BeamModuleAssembler {
         // Port of instr_guard_bifs.cpp:585-640: a lookup table in a literal tuple indexed by an
         // integer needs neither a tuple test nor, for a known range, a bounds test.
         if pos.exact_type(type_id::INTEGER)
-            && let (ArgVal::Literal(_), Some(size)) = (tuple.val, tuple.literal_tuple_arity)
+            && let ArgVal::Literal(index) = tuple.val
+            && let Ok(literal_tuple) =
+                Tuple::try_from(term_from_bits(self.beamfile_get_literal(index)))
         {
             let (p, t) = self.load_two_sources(pos.val, ARG1, tuple.val, ARG2)?;
             let output = self.guard_destination(destination)?;
             let fail_label = self.code.new_label();
             let next = self.code.new_label();
             let (min, max) = pos.clamped_range();
-            let size = size as i64;
+            let size = literal_tuple.arity() as i64;
             let can_fail = min < 1 || size < max;
             if !pos.always_small() {
                 self.emit_is_not_boxed(fail_label, p)?;

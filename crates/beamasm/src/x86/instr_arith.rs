@@ -76,9 +76,10 @@ fn tagged_small(value: i64) -> i64 {
     (value << TAG_IMMED1_SIZE) | TAG_IMMED1_SMALL
 }
 
-fn arg_term(arg: ArgVal) -> u64 {
+fn arg_term(module: &BeamModuleAssembler, arg: ArgVal) -> u64 {
     match arg {
-        ArgVal::Immediate(term) | ArgVal::Literal(term) => term,
+        ArgVal::Immediate(term) => term,
+        ArgVal::Literal(index) => module.beamfile_get_literal(index),
         _ => 0,
     }
 }
@@ -507,6 +508,7 @@ impl BeamModuleAssembler {
         dst: ArgVal,
     ) -> Result<(), AsmError> {
         let small_result = self.is_sum_small_if_args_are_small(lhs, rhs);
+        let rhs_term = arg_term(self, rhs);
         let rhs_untagged = arg_small_value(rhs) << TAG_IMMED1_SIZE;
         let rhs_is_literal = rhs.is_small() && fits_i32(rhs_untagged);
 
@@ -516,8 +518,7 @@ impl BeamModuleAssembler {
                 self.preserve_cache(&[RET], &[], |m| m.asm.emit(|e| e.add_ri(RET, rhs_untagged)))?;
             } else if rhs.is_small() {
                 self.preserve_cache(&[RET, ARG2], &[], |m| {
-                    m.asm
-                        .mov_imm(ARG2, arg_term(rhs) & !(TAG_IMMED1_MASK as u64))?;
+                    m.asm.mov_imm(ARG2, rhs_term & !(TAG_IMMED1_MASK as u64))?;
                     m.asm.emit(|e| e.add_rr(RET, ARG2))
                 })?;
             } else {
@@ -585,7 +586,7 @@ impl BeamModuleAssembler {
                 self.preserve_cache(&[RET], &[], |m| m.asm.emit(|e| e.sub_ri(RET, rhs_untagged)))?;
             } else if rhs.is_small() {
                 self.asm
-                    .mov_imm(ARG2, arg_term(rhs) & !(TAG_IMMED1_MASK as u64))?;
+                    .mov_imm(ARG2, arg_term(self, rhs) & !(TAG_IMMED1_MASK as u64))?;
                 self.asm.emit(|e| e.sub_rr(RET, ARG2))?;
             } else {
                 self.mov_arg_to_reg(ARG2, rhs)?;
@@ -1122,7 +1123,7 @@ impl BeamModuleAssembler {
             && product_small
             && sum_small
         {
-            let mut increment = arg_term(src4) as i64;
+            let mut increment = arg_term(self, src4) as i64;
             increment = increment.wrapping_sub(factor.wrapping_mul(TAG_IMMED1_SMALL));
             let lea = match factor {
                 2 | 3 | 5 | 9 => Some(Mem::base_index(
@@ -1270,8 +1271,8 @@ impl BeamModuleAssembler {
     ) -> Result<(), AsmError> {
         if self.always_small(lhs) && self.always_small(rhs) {
             self.mov_arg_to_reg(RET, lhs)?;
-            let raw = arg_term(rhs) as i64;
-            if rhs.is_small() && arg_term(rhs) <= i32::MAX as u64 {
+            let raw = arg_term(self, rhs) as i64;
+            if rhs.is_small() && arg_term(self, rhs) <= i32::MAX as u64 {
                 self.preserve_cache(&[RET], &[], |m| m.asm.emit(|e| e.and_ri(RETD, raw)))?;
             } else if rhs.is_small() && fits_i32(raw) {
                 self.preserve_cache(&[RET], &[], |m| m.asm.emit(|e| e.and_ri(RET, raw)))?;
@@ -1313,7 +1314,7 @@ impl BeamModuleAssembler {
     ) -> Result<(), AsmError> {
         if self.always_small(lhs) && self.always_small(rhs) {
             self.mov_arg_to_reg(RET, lhs)?;
-            let raw = arg_term(rhs) as i64;
+            let raw = arg_term(self, rhs) as i64;
             if rhs.is_immed() && fits_i32(raw) {
                 self.asm.emit(|e| e.or_ri(RET, raw))?;
             } else {
@@ -1352,7 +1353,7 @@ impl BeamModuleAssembler {
     ) -> Result<(), AsmError> {
         if self.always_small(lhs) && self.always_small(rhs) {
             self.mov_arg_to_reg(RET, lhs)?;
-            let raw = arg_term(rhs) as i64;
+            let raw = arg_term(self, rhs) as i64;
             if rhs.is_immed() && fits_i32(raw) {
                 self.preserve_cache(&[RET], &[], |m| {
                     m.asm.emit(|e| e.xor_ri(RET, raw & !TAG_IMMED1_SMALL))
@@ -1524,7 +1525,7 @@ impl BeamModuleAssembler {
                 }
                 ARG3
             } else {
-                let mut value = arg_term(lhs);
+                let mut value = arg_term(self, lhs);
                 if (value as i64) < 0 {
                     value ^= !(TAG_IMMED1_MASK as u64);
                 }
