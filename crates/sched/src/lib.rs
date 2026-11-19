@@ -5888,12 +5888,9 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     // Port of erts/emulator/beam/erl_process.c (erts_schedule: `state & ERTS_PSFLG_RUNNING_SYS`,
     // the scheduler type and `reds` tests), OTP-29.1.1.
     #[inline(always)]
-    pub fn fast_slice_ok_before_signals(&self) -> bool {
-        self.scheduler_key() != 0
-            && self.proc.fcalls.load(Ordering::Relaxed) > 0
-            && !self.sys_task_run()
-            && !self.dirty_running()
-            && !self.dirty_queued()
+    pub fn fast_slice_ok_before_signals(&self, sys_task_run: bool) -> bool {
+        // A normal scheduler never runs a dirty-running or dirty-queued process.
+        self.scheduler_key() != 0 && self.proc.fcalls.load(Ordering::Relaxed) > 0 && !sys_task_run
     }
     /// Type of the scheduler executing this process turn.
     pub fn scheduler_type(&self) -> SchedulerType {

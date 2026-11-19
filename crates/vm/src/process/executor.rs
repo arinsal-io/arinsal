@@ -167,8 +167,12 @@ impl Executor {
     // once) and jit/arm/process_main.cpp (process_main: copy_in_registers, FCALLS, `br c_p->i`),
     // OTP-29.1.1.
     #[inline(always)]
-    pub(super) fn fast_entry_ok(process: &Process, ctx: &RunCtx<'_, Message>) -> bool {
-        !ctx.has_pending_nmsg() && Self::fast_entry_ok_before_signals(process, ctx)
+    pub(super) fn fast_entry_ok(
+        process: &Process,
+        ctx: &RunCtx<'_, Message>,
+        sys_task_run: bool,
+    ) -> bool {
+        !ctx.has_pending_nmsg() && Self::fast_entry_ok_before_signals(process, ctx, sys_task_run)
     }
 
     /// [`Self::fast_entry_ok`] before the schedule-in signal handling: everything but the
@@ -177,11 +181,12 @@ impl Executor {
     pub(super) fn fast_entry_ok_before_signals(
         process: &Process,
         ctx: &RunCtx<'_, Message>,
+        sys_task_run: bool,
     ) -> bool {
         process.slice_is_plain()
             && !process.hibernate_sched()
             && !process.dirty_bif_completed()
-            && ctx.fast_slice_ok_before_signals()
+            && ctx.fast_slice_ok_before_signals(sys_task_run)
             && !crate::suspend::ctx_suspended(ctx)
             && !trace_boot_enabled()
             && !process
@@ -204,11 +209,12 @@ impl Executor {
         ctx: &mut RunCtx<'_, Message>,
         reg: &mut SchedulerRegisters,
         ran: &mut bool,
+        sys_task_run: bool,
     ) -> Option<Result<RunState, VmError>> {
         let mut first = true;
         loop {
             let code_ptr = process.native_pc()?;
-            if !first && !Self::fast_entry_ok(process, ctx) {
+            if !first && !Self::fast_entry_ok(process, ctx, sys_task_run) {
                 return None;
             }
             if first {

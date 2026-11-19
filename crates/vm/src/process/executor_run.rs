@@ -59,16 +59,19 @@ impl Executor {
         // a process scheduled with non-message signals queued (a monitor, an alias message)
         // handles them in the scheduler and then enters its code like any other; the signals
         // are not a reason for a different entry path.
+        // erts_schedule's `state & ERTS_PSFLG_SYS_TASKS` of this schedule-in, a local.
+        let sys_task_run = ctx.sys_task_run();
         let mut signals_handled = false;
         let mut signal_error = None;
-        if ctx.has_pending_nmsg() && Self::fast_entry_ok_before_signals(process, ctx) {
+        if ctx.has_pending_nmsg() && Self::fast_entry_ok_before_signals(process, ctx, sys_task_run)
+        {
             signals_handled = true;
-            signal_error = schedule_in_signals(process, ctx).err();
+            signal_error = schedule_in_signals(process, ctx, sys_task_run).err();
         }
         let fast_result = if let Some(error) = signal_error {
             Some(Err(error))
-        } else if Self::fast_entry_ok(process, ctx) {
-            self.fast_resume(process, ctx, reg, &mut fast_ran)
+        } else if Self::fast_entry_ok(process, ctx, sys_task_run) {
+            self.fast_resume(process, ctx, reg, &mut fast_ran, sys_task_run)
         } else {
             None
         };
@@ -102,11 +105,9 @@ impl Executor {
                     // Signals already handled at this schedule-in (before the fast entry) are
                     // not handled again: erts_schedule handles them once per schedule-in.
                     if !signals_handled
-                        && (ctx.sys_task_run()
-                            || !process.sig_cont_empty()
-                            || ctx.has_pending_nmsg())
+                        && (sys_task_run || !process.sig_cont_empty() || ctx.has_pending_nmsg())
                     {
-                        schedule_in_signals(process, ctx)?;
+                        schedule_in_signals(process, ctx, sys_task_run)?;
                     }
 
                     // erts collects a process that is being scheduled in once signals have
@@ -640,6 +641,7 @@ impl Executor {
 fn schedule_in_signals(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
+    sys_task_run: bool,
 ) -> Result<(), VmError> {
     let reds = process.heap.abi.fcalls;
     let mut sig_reds = if process.slice().is_some_and(|work| work.dirty_sys_gc) {
@@ -647,7 +649,7 @@ fn schedule_in_signals(
     } else {
         SIG_HANDLE_REDS_MAX_PREFERED
     };
-    if ctx.sys_task_run() {
+    if sys_task_run {
         process.cold_mut().sys_task_point = true;
     }
     let max_reds = sig_reds;
@@ -657,13 +659,13 @@ fn schedule_in_signals(
     // used), OTP-29.1.1: the signal handling is the process's own work.
     super::executor::bump_fcalls(process, sig_reds);
     let executed = handled.and_then(|_| {
-        if ctx.sys_task_run() {
+        if sys_task_run {
             crate::signals::execute_sys_tasks(process, ctx)
         } else {
             Ok(())
         }
     });
-    if ctx.sys_task_run() {
+    if sys_task_run {
         process.cold_mut().sys_task_point = false;
     }
     executed?;
