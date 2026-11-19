@@ -128,9 +128,6 @@ pub struct FinalizedModule {
     /// For each line-breakpoint site, ascending: the return-address offset after the `bl`
     /// and the branch site offset used to recover the instrumented function's source line.
     pub line_breakpoint_returns: Vec<(usize, usize)>,
-    /// NIF load patch sites: function label to the word that skips the call-NIF body
-    /// until `load_nif` replaces it with a NOP.
-    pub nif_patches: IdMap<usize>,
 }
 
 /// BEAM label ids below this are dense (the labels of the file); the compiler's own labels
@@ -288,6 +285,9 @@ pub struct BeamModuleAssembler {
     /// Process-wide yield fragments: `dispatch_return`, `i_test_yield_shared` and
     /// `context_switch_simplified`. Unset in assemblers that run without a VM.
     yield_fragments: Option<(usize, usize, usize)>,
+    /// Address of the process-wide `call_nif_yield_helper` fragment that `call_nif` jumps to
+    /// (0: not installed).
+    call_nif_yield_helper: usize,
     /// Process-wide exception fragments: `raise_shared` and `raise_exception`. Unset in
     /// assemblers that run without a VM.
     pub(super) raise_fragments: Option<(usize, usize)>,
@@ -314,7 +314,6 @@ pub struct BeamModuleAssembler {
     pending_debug_line: Option<(u32, u16)>,
     line_breakpoints: Vec<(u32, usize, Label)>,
     line_breakpoint_returns: Vec<(usize, usize)>,
-    nif_patches: IdMap<usize>,
     current_function_label: Option<u32>,
     next_fresh_label: u32,
     dump_module: Option<String>,
@@ -322,9 +321,59 @@ pub struct BeamModuleAssembler {
     dump_recording_function: bool,
 }
 
-/// Size of the `i_func_info` slot that precedes every function's call entry: the `ErtsCodeInfo`
-/// of erts (a `bl`, the breakpoint flag, the generic breakpoint word and the 24-byte MFA).
-pub const FUNC_INFO_BYTES: usize = 40;
+use crate::common::beam_asm_h::{
+    BEAM_ASM_NFUNC_SIZE, BEAM_NATIVE_MIN_FUNC_SZ, FUNC_INFO_BYTES, NIF_STUB_CODE_BYTES,
+};
+
+/// Builds the `ErtsCodeInfo` and `call_nif` code of a NIF stub into `buf`
+/// (`ErtsNifBeamStub.info` followed by `.code`): `i_func_info` for the MFA, a breakpoint
+/// trampoline that only reserves its space, and `call_nif normal_fptr lib dirty_fptr`.
+// Port of erts/emulator/beam/jit/beam_jit_main.cpp:542-575 (beamasm_emit_call_nif),
+// OTP-29.1.1.
+pub fn beamasm_emit_call_nif(
+    (module, function, arity): (u64, u64, u8),
+    normal_fptr: u64,
+    lib: u64,
+    dirty_fptr: u64,
+    call_nif_yield_helper: usize,
+    buf: &mut [u8; FUNC_INFO_BYTES + NIF_STUB_CODE_BYTES],
+) -> Result<(), ModuleError> {
+    let mut ba = BeamModuleAssembler::new();
+    ba.set_call_nif_yield_helper(call_nif_yield_helper);
+    ba.emit_i_func_label(1)?;
+    // The stub starts at the aligned label; a fresh assembler pads before it.
+    let start = ba.code.offset();
+    ba.emit_i_func_info(1, module, function, arity)?;
+    ba.emit_i_entry_label(2)?;
+    ba.emit_i_breakpoint_trampoline(0)?;
+    ba.emit_call_nif(normal_fptr, lib, dirty_fptr)?;
+    // ERTS_CT_ASSERT(sizeof(stub->code) <= BEAM_NATIVE_MIN_FUNC_SZ * sizeof(Eterm)).
+    let size = ba.code.offset() - start;
+    if size > buf.len() {
+        return Err(ModuleError::InvalidOperand(
+            "call_nif stub exceeds ErtsNifBeamStub",
+        ));
+    }
+    // codegen: the stub's `i_func_info` is data only (its `bl` never runs), so the shared
+    // function_clause target lies past the copied bytes.
+    if let Some(stub) = ba.func_clause_stub.take() {
+        ba.code.bind(stub)?;
+        ba.code.emit(|e| {
+            e.udf(0xB1F);
+            Ok(())
+        })?;
+    }
+    let words = ba.code.finish()?;
+    let bytes = words
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .skip(start)
+        .take(size)
+        .collect::<Vec<_>>();
+    buf.fill(0);
+    buf[..size].copy_from_slice(&bytes);
+    Ok(())
+}
 
 type BsColdEmit = Box<dyn FnOnce(&mut BeamModuleAssembler) -> Result<(), ModuleError>>;
 /// `tmp_mem[6]`: the native pc an exception is attributed to.
@@ -396,6 +445,7 @@ impl BeamModuleAssembler {
             gc_fragments: Vec::new(),
             yield_stubs: Vec::new(),
             yield_fragments: None,
+            call_nif_yield_helper: 0,
             arith_compare_shared: 0,
             eq_exact_list_shared: 0,
             element_guard_shared: 0,
@@ -415,7 +465,6 @@ impl BeamModuleAssembler {
             pending_debug_line: None,
             line_breakpoints: Vec::new(),
             line_breakpoint_returns: Vec::new(),
-            nif_patches: IdMap::default(),
             current_function_label: None,
             next_fresh_label: 0x7000_0000,
             dump_module: None,
@@ -739,9 +788,23 @@ impl BeamModuleAssembler {
             ));
         };
         let patch = self.code.offset();
+        // erts_asm_bp_set_flag finds the branch one word past the entry (beam_asm.h:234-238).
+        debug_assert!(
+            crate::arm::beam_asm::native_cursor_validation_enabled()
+                || self.entry_offset.map(|entry| entry + 4) == Some(patch)
+        );
         let next = self.code.new_label();
         self.code.b(next)?;
-        self.fragment_call(fragment)?;
+        if fragment != 0 {
+            self.fragment_call(fragment)?;
+        } else {
+            // A NIF stub (no code header): the trampoline is never used as-is, but its space
+            // is reserved.
+            self.code.emit(|e| {
+                e.udf(0xB1F);
+                Ok(())
+            })?;
+        }
         self.code.bind(next)?;
         if self
             .trace_breakpoints
@@ -795,30 +858,76 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
-    /// Emits the call-NIF body of a function that `load_nif` may replace, behind a branch
-    /// that skips it until the NIF is loaded.
-    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:231-250 and erl_nif.c:5124-5196
-    // (load_nif_1st_finisher copies the call_nif sequence behind the function prologue),
-    // OTP-29.1.1: here the sequence is emitted up front and enabled by patching the branch.
-    pub fn emit_nif_patch_site(
-        &mut self,
-        identity: usize,
-        helper: usize,
-        arity: usize,
-    ) -> Result<(), ModuleError> {
-        let Some(function) = self.current_function_label else {
+    /// Pads the function that ends here to `BEAM_NATIVE_MIN_FUNC_SZ` words from its entry, so
+    /// a later `load_nif` can copy its `call_nif` stub over the body.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:163-173 (emit_i_nif_padding),
+    // OTP-29.1.1.
+    pub fn emit_i_nif_padding(&mut self) -> Result<(), ModuleError> {
+        let minimum_size = std::mem::size_of::<u64>() * BEAM_NATIVE_MIN_FUNC_SZ;
+        let Some(prev_func_start) = self.entry_offset else {
             return Err(ModuleError::InvalidOperand(
-                "NIF patch site has no owning function",
+                "i_nif_padding has no owning function",
             ));
         };
-        let patch = self.code.offset();
-        let body = self.code.new_label();
-        self.code.b(body)?;
-        self.emit_call_nif_body(identity, helper, arity)?;
-        self.code.bind(body)?;
-        if self.nif_patches.insert(function, patch).is_some() {
-            return Err(ModuleError::DuplicateLabel(function));
+        let diff = self.code.offset() - prev_func_start;
+        if diff < minimum_size {
+            self.code.emit(|e| {
+                for _ in 0..(minimum_size - diff) / 4 {
+                    e.embed_uint32(0);
+                }
+                Ok(())
+            })?;
         }
+        Ok(())
+    }
+
+    /// Installs the process-wide `call_nif_yield_helper` fragment that `call_nif` jumps to.
+    pub fn set_call_nif_yield_helper(&mut self, fragment: usize) {
+        self.call_nif_yield_helper = fragment;
+    }
+
+    /// Emits `call_nif Func NifMod DirtyFunc`: a branch over the three words of an
+    /// `ErtsNativeFunc` (`func`, `m`, `dfunc`), then the jump to `call_nif_yield_helper` with
+    /// the function's entry in ARG3. The sequence is copied over function bodies by
+    /// `load_nif_1st_finisher`, so it is position-independent.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:956-992 (emit_call_nif), OTP-29.1.1.
+    pub fn emit_call_nif(
+        &mut self,
+        func: u64,
+        nif_mod: u64,
+        dirty_func: u64,
+    ) -> Result<(), ModuleError> {
+        let (Some(current), Some(entry)) = (self.entry_label, self.entry_offset) else {
+            return Err(ModuleError::InvalidOperand(
+                "call_nif has no function entry",
+            ));
+        };
+        if self.call_nif_yield_helper == 0 {
+            return Err(ModuleError::InvalidOperand(
+                "call_nif without the call_nif_yield_helper fragment",
+            ));
+        }
+        let dispatch = self.code.new_label();
+        self.code.b(dispatch)?;
+        // Everything before this, including the breakpoint trampoline, is the
+        // `call_bif_nif` field of ErtsNativeFunc.
+        debug_assert!(self.code.offset().is_multiple_of(8));
+        self.code.emit(|e| {
+            e.embed_uint64(func);
+            e.embed_uint64(nif_mod);
+            e.embed_uint64(dirty_func);
+            Ok(())
+        })?;
+        // `call_nif_yield_helper` computes the address of `dispatch` from this.
+        debug_assert_eq!(self.code.offset() - entry, BEAM_ASM_NFUNC_SIZE + 24);
+        self.code.bind(dispatch)?;
+        self.code.adr(Gpr::x(2), current)?;
+        // pic_jmp (beam_asm.hpp): an absolute jump, the copy runs from another address.
+        let helper = self.call_nif_yield_helper as u64;
+        self.code.emit(|e| {
+            e.mov_const(Gpr::x(17), helper)?;
+            e.br(Gpr::x(17))
+        })?;
         Ok(())
     }
 
@@ -2726,7 +2835,6 @@ impl BeamModuleAssembler {
             trace_breakpoints,
             line_breakpoints,
             line_breakpoint_returns: self.line_breakpoint_returns,
-            nif_patches: self.nif_patches,
         })
     }
 }

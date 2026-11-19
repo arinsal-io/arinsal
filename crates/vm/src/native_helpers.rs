@@ -127,40 +127,6 @@ pub(crate) fn register_static_nif(
     identity
 }
 
-/// Identity in `native_dirty_nif` of a call-NIF body bound by `load_nif`: the process's
-/// `nif_pending` carries the library and function. Static NIF identities start at 1.
-pub(crate) const BOUND_NIF: usize = 0;
-
-/// The call-NIF body of a function of native code that `load_nif` may replace. The body is
-/// compiled with the address of its site and calls [`arinsal_beamasm_call_nif`] with it.
-// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:956-992 (emit_call_nif embeds Func, NifMod
-// and DirtyFunc in the function's code) and erl_nif.c:5149-5160 (load_nif_1st_finisher
-// copies them there), OTP-29.1.1: the site of the function holds the operands itself.
-pub(crate) struct NativeNifSite {
-    arity: u8,
-    /// `ErtsCodeMFA` of the function: `beam_jit_call_nif` stores it in `c_p->current`.
-    mfa: usize,
-    /// The `call_nif` operands, written once by `load_nif` before the body is enabled.
-    call: std::sync::OnceLock<crate::natives::nif::NativeFn>,
-}
-
-impl NativeNifSite {
-    pub(crate) fn new(module: String, function: String, arity: u8) -> Box<Self> {
-        let mfa = crate::beamasm_integration::bif_mfa_export(&module, &function, arity)
-            .map_or(0, |export| std::ptr::from_ref(export.mfa()) as usize);
-        Box::new(Self {
-            arity,
-            mfa,
-            call: std::sync::OnceLock::new(),
-        })
-    }
-
-    /// Writes the operands; a site is bound once, like the code of one module instance.
-    pub(crate) fn bind(&self, native: crate::natives::nif::NativeFn) -> bool {
-        self.call.set(native).is_ok()
-    }
-}
-
 /// The static NIF `identity` with the arguments in `process.x` as a dirty job; the
 /// executor's [`run_static_nif`] takes its result.
 ///
@@ -193,16 +159,12 @@ pub(crate) fn static_nif_job(
 }
 
 /// Runs a static NIF with the arguments in `reg`, for a dirty NIF call the executor
-/// performs on a dirty scheduler, or takes the result of its dirty job. [`BOUND_NIF`]
-/// resumes the call of a NIF bound by `load_nif` that the process carries.
+/// performs on a dirty scheduler, or takes the result of its dirty job.
 pub(crate) fn run_static_nif(
     process: &mut crate::Process,
     reg: &[Term],
     identity: usize,
 ) -> Result<Term, crate::VmError> {
-    if identity == BOUND_NIF {
-        return run_bound_nif(process, reg);
-    }
     let nif = static_nifs().lock().ok().and_then(|nifs| {
         let nif = nifs.get(&identity)?;
         Some((
@@ -222,44 +184,14 @@ pub(crate) fn run_static_nif(
         crate::natives::tty::note_caller_native(process);
     }
     let args = reg[..usize::from(arity)].to_vec();
-    let pending = process
-        .cold
-        .as_mut()
-        .and_then(|cold| cold.nif_pending.take().map(|boxed| *boxed));
     let done = process
         .cold
         .as_mut()
         .and_then(|cold| cold.static_nif_done.take());
     let result = match done {
         Some(result) => result,
-        None => match pending {
-            Some(pending) => crate::natives::nif::resume_pending(&mut process.heap, pending),
-            None => crate::calls::call_bif(&mut process.heap, entry, &args),
-        },
+        None => crate::calls::call_bif(&mut process.heap, entry, &args),
     };
-    result.map_err(|error| crate::exceptions::bif_error(process, &module, &function, &args, error))
-}
-
-/// Resumes the dirty call or continuation of a NIF bound by `load_nif` that native code
-/// handed to the executor.
-// Port of erts/emulator/beam/erl_nif.c:426-520 (erts_call_dirty_nif), OTP-29.1.1.
-fn run_bound_nif(process: &mut crate::Process, reg: &[Term]) -> Result<Term, crate::VmError> {
-    let Some(pending) = process
-        .cold
-        .as_mut()
-        .and_then(|cold| cold.nif_pending.take().map(|boxed| *boxed))
-    else {
-        return Err(crate::VmError::Trap(crate::exceptions::Trap::error(
-            Term::atom(arinsal_term::atoms::UNDEF),
-        )));
-    };
-    let (module, function, arity) = {
-        let (module, function, arity) = pending.trace_mfa();
-        (module.to_owned(), function.to_owned(), usize::from(arity))
-    };
-    crate::natives::nif::refresh_hub_native(process);
-    let args = reg.get(..arity).unwrap_or_default().to_vec();
-    let result = crate::natives::nif::resume_pending(&mut process.heap, pending);
     result.map_err(|error| crate::exceptions::bif_error(process, &module, &function, &args, error))
 }
 
@@ -276,15 +208,6 @@ fn leave_native_nif(
         Ok(value) => {
             reg[0] = value;
             crate::native_hooks::raw(value)
-        }
-        Err(arinsal_bifs::BifError::Dirty(class)) => {
-            // Port of erts/emulator/beam/erl_nif.c:3460 (static_schedule_dirty_nif) and
-            // erl_nif.c:3540 (enif_schedule_nif), OTP-29.1.1: the call traps to a
-            // continuation the executor runs on a scheduler of `class`.
-            if let Some(pending) = crate::natives::nif::take_rescheduled() {
-                process.cold_mut().nif_pending = Some(Box::new(pending));
-            }
-            trap_to_dirty_nif(process, identity, class, arity)
         }
         Err(error) => {
             let args = reg[..usize::from(arity)].to_vec();
@@ -342,36 +265,6 @@ pub extern "C" fn arinsal_beamasm_static_nif(
     let result =
         crate::calls::call_bif(&mut process.heap, nif.entry, &reg[..usize::from(nif.arity)]);
     leave_native_nif(process, reg, result, (identity as usize, nif.arity))
-}
-
-/// Calls the NIF that `load_nif` bound to a native call-NIF body.
-// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:863-900 (call_nif_shared loads Func and
-// NifMod from the function's code) and erts/emulator/beam/jit/beam_jit_common.cpp:623-677
-// (beam_jit_call_nif), OTP-29.1.1.
-#[cfg(target_arch = "aarch64")]
-pub extern "C" fn arinsal_beamasm_call_nif(
-    header: *mut ProcessHeader,
-    site: u64,
-    reg: *mut u64,
-) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
-        return 0;
-    };
-    // `reg`: the NIF's arguments, as beam_jit_call_nif passes them.
-    let reg = &mut registers.x_reg_array;
-    let site = crate::raw::jit_ffi::native_nif_site(site as usize);
-    let Some(native) = site.call.get() else {
-        crate::native_hooks::set_error(process, "undef");
-        return 0;
-    };
-    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:635 (beam_jit_call_nif).
-    process.heap.abi.current = site.mfa as *const std::ffi::c_void;
-    let result = crate::natives::nif::call_native(
-        &mut process.heap,
-        native,
-        &reg[..usize::from(site.arity)],
-    );
-    leave_native_nif(process, reg, result, (BOUND_NIF, site.arity))
 }
 
 /// The dirty scheduler class static NIF `module:function/arity` is flagged with in its library's
@@ -2059,7 +1952,7 @@ fn apply_bif_error_adjustment(
     registers: &mut arinsal_beamasm::SchedulerRegisters,
     mfa: (arinsal_term::Atom, arinsal_term::Atom, u8),
     return_ip: u64,
-    stack_offset: u32,
+    stack_offset: u64,
 ) -> bool {
     let needs_error_cp = matches!(
         mfa,
@@ -2098,23 +1991,63 @@ fn apply_bif_error_adjustment(
     stored
 }
 
-/// Resolves `apply Arity` to a BIF export (called through its dispatch address with the
-/// Export* in ARG1), a native entry, or the fragment that lets the interpreter apply.
-// Port of erts/emulator/beam/jit/arm/instr_call.cpp:263-320 (emit_fixed_apply) and
-// erts/emulator/beam/beam_common.c (fixed_apply), OTP-29.1.1.
-#[cfg(target_arch = "aarch64")]
-pub extern "C" fn arinsal_beamasm_apply_resolver(
-    header: *mut ProcessHeader,
-    arity: u32,
+#[derive(Clone, Copy)]
+pub(crate) struct ApplyTarget {
+    pub export: *const arinsal_term::ExportEntry,
+    pub target: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ApplyFailure {
+    Raise,
+    Adjustment,
+}
+
+fn apply_error(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    module: Term,
+    function: Term,
+    args: Term,
+    reason: arinsal_bifs::BifError,
+) -> Result<ApplyTarget, ApplyFailure> {
+    set_light_bif_error(process, &reason);
+    registers.x_reg_array[0] = module;
+    registers.x_reg_array[1] = function;
+    registers.x_reg_array[2] = args;
+    Err(ApplyFailure::Raise)
+}
+
+fn lookup_apply_export(
+    process: &crate::Process,
+    mfa: (arinsal_term::Atom, arinsal_term::Atom, u8),
+    code_ix: usize,
+) -> Option<ApplyTarget> {
+    process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.export_entry(mfa, code_ix))
+        .map(|export| ApplyTarget {
+            export: std::ptr::from_ref(export),
+            target: export.address(code_ix),
+        })
+        .or_else(|| {
+            crate::export::export_entry_or_stub(mfa).map(|export| ApplyTarget {
+                export: std::ptr::from_ref(&**export),
+                target: export.address(code_ix),
+            })
+        })
+}
+
+/// Resolves OTP's `fixed_apply` operation for both the x86 C ABI and arm BeamAsm.
+// Port of erts/emulator/beam/beam_common.c:1529-1566 (`fixed_apply`), OTP-29.1.1.
+pub(crate) fn resolve_fixed_apply(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    arity: usize,
     return_ip: u64,
-    stack_offset: u32,
-    reg: *mut u64,
-) -> arinsal_beamasm::misc::ApplyResolution {
-    use arinsal_beamasm::misc::ApplyResolution;
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
-        return ApplyResolution::default();
-    };
-    let arity = arity as usize;
+    stack_offset: u64,
+) -> Result<ApplyTarget, ApplyFailure> {
     if arity + 1 >= registers.x_reg_array.len() {
         return apply_error(
             process,
@@ -2128,7 +2061,7 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(
     let module = registers.x_reg_array[arity];
     let function = registers.x_reg_array[arity + 1];
     let (Some(module_atom), Some(function_atom)) = (module.as_atom(), function.as_atom()) else {
-        // Port of erts/emulator/beam/beam_common.c:1540-1552 (fixed_apply, `error`), OTP-29.1.1.
+        // Port of erts/emulator/beam/beam_common.c:1540-1552 (`fixed_apply` error path).
         if process
             .ensure_objv(arity * 2, &mut registers.x_reg_array[..arity + 2])
             .is_err()
@@ -2170,24 +2103,15 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(
             arinsal_bifs::BifError::Badarg { cause: None },
         );
     };
-    // Port of erts/emulator/beam/beam_common.c:1554-1557 (fixed_apply), OTP-29.1.1: an
-    // apply of erlang:apply/3 is a plain apply/3 of its arguments.
     if arity == 3
         && module_atom == arinsal_term::atoms::ERLANG
         && function_atom == arinsal_term::atoms::APPLY
     {
-        return apply3(process, registers, return_ip, stack_offset);
+        return resolve_apply(process, registers, return_ip, stack_offset);
     }
-    let code_ix = registers.active_code_ix as usize;
-    // Port of erts/emulator/beam/beam_common.c:1559-1566 (fixed_apply:
-    // erts_export_get_or_make_stub, apply_bif_error_adjustment), OTP-29.1.1: the JIT calls
-    // the export's `addresses[code_ix]` with the Export* in ARG1.
     let mfa = (module_atom, function_atom, arity as u8);
-    let Some(export) = process.runtime.as_ref().and_then(|runtime| {
-        runtime
-            .export_entry(mfa, code_ix)
-            .or_else(|| crate::export::export_entry_or_stub(mfa).map(|export| &**export))
-    }) else {
+    let code_ix = registers.active_code_ix as usize;
+    let Some(target) = lookup_apply_export(process, mfa, code_ix) else {
         return apply_error(
             process,
             registers,
@@ -2198,75 +2122,25 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(
         );
     };
     if !apply_bif_error_adjustment(process, registers, mfa, return_ip, stack_offset) {
-        return ApplyResolution::default();
+        return Err(ApplyFailure::Adjustment);
     }
-    ApplyResolution {
-        export: std::ptr::from_ref(export) as u64,
-        target: export.address(code_ix) as u64,
-    }
+    Ok(target)
 }
 
-/// An apply that raises: the reason, X0..X2 set to its module, function and arguments, and
-/// `current` erlang:apply/3, which the JIT raises with (`emit_raise_exception(&apply3_mfa)`).
-// Port of erts/emulator/beam/beam_common.c:1450-1460 (apply: error, error2) and
-// jit/arm/instr_call.cpp:205-244 (emit_variable_apply), OTP-29.1.1.
-#[cfg(target_arch = "aarch64")]
-fn apply_error(
-    process: &mut crate::Process,
-    registers: &mut arinsal_beamasm::SchedulerRegisters,
-    module: Term,
-    function: Term,
-    args: Term,
-    reason: arinsal_bifs::BifError,
-) -> arinsal_beamasm::misc::ApplyResolution {
-    set_light_bif_error(process, &reason);
-    registers.x_reg_array[0] = module;
-    registers.x_reg_array[1] = function;
-    registers.x_reg_array[2] = args;
-    // Port of erts/emulator/beam/jit/arm/instr_call.cpp:211 (`static ErtsCodeMFA apply3_mfa`).
-    #[cfg(target_arch = "aarch64")]
-    static APPLY3_MFA: std::sync::OnceLock<arinsal_term::ErtsCodeMfa> = std::sync::OnceLock::new();
-    let mfa = APPLY3_MFA.get_or_init(|| arinsal_term::ErtsCodeMfa {
-        module: Term::atom(arinsal_term::atoms::ERLANG).word(),
-        function: Term::atom(arinsal_term::atoms::APPLY).word(),
-        arity: 3,
-    });
-    process.heap.abi.current = std::ptr::from_ref(mfa).cast();
-    arinsal_beamasm::misc::ApplyResolution::default()
-}
-
-/// Resolves `apply/3` to a native entry with the arguments moved into the X registers, or to
-/// the fragment that lets the interpreter apply (and raise) with X0..X2 untouched.
-// Port of erts/emulator/beam/jit/arm/instr_call.cpp:205-244 (emit_variable_apply) and
-// erts/emulator/beam/beam_common.c:1434-1530 (apply), OTP-29.1.1.
-#[cfg(target_arch = "aarch64")]
-pub extern "C" fn arinsal_beamasm_apply3_resolver(
-    header: *mut ProcessHeader,
-    return_ip: u64,
-    stack_offset: u32,
-    reg: *mut u64,
-) -> arinsal_beamasm::misc::ApplyResolution {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
-        return arinsal_beamasm::misc::ApplyResolution::default();
-    };
-    apply3(process, registers, return_ip, stack_offset)
-}
-
-// Port of erts/emulator/beam/beam_common.c:1434-1530 (apply), OTP-29.1.1.
-#[cfg(target_arch = "aarch64")]
-fn apply3(
+/// Resolves OTP's variable `apply` operation and copies its proper-list arguments to X registers.
+// Port of erts/emulator/beam/beam_common.c:1434-1527 (`apply`), OTP-29.1.1.
+pub(crate) fn resolve_apply(
     process: &mut crate::Process,
     registers: &mut arinsal_beamasm::SchedulerRegisters,
     return_ip: u64,
-    stack_offset: u32,
-) -> arinsal_beamasm::misc::ApplyResolution {
-    use arinsal_beamasm::misc::ApplyResolution;
+    stack_offset: u64,
+) -> Result<ApplyTarget, ApplyFailure> {
     let (mut module, mut function, mut args) = (
         registers.x_reg_array[0],
         registers.x_reg_array[1],
         registers.x_reg_array[2],
     );
-    // Port of erts/emulator/beam/beam_common.c:1462-1495 (nested apply loop), OTP-29.1.1.
+    // Port of erts/emulator/beam/beam_common.c:1462-1495 (nested apply loop).
     while module.as_atom() == Some(arinsal_term::atoms::ERLANG)
         && function.as_atom() == Some(arinsal_term::atoms::APPLY)
     {
@@ -2296,9 +2170,8 @@ fn apply3(
     };
     let mut arity = 0_usize;
     let mut list = args;
-    while let Some((_, tail)) = crate::lists::split(list) {
-        arity += 1;
-        if arity >= registers.x_reg_array.len() - 1 {
+    while let Some((head, tail)) = crate::lists::split(list) {
+        if arity == registers.x_reg_array.len() - 1 {
             return apply_error(
                 process,
                 registers,
@@ -2308,6 +2181,8 @@ fn apply3(
                 arinsal_bifs::BifError::SystemLimit,
             );
         }
+        registers.x_reg_array[arity] = head;
+        arity += 1;
         list = tail;
     }
     if list != Term::NIL {
@@ -2330,52 +2205,90 @@ fn apply3(
             arinsal_bifs::BifError::SystemLimit,
         );
     };
-    let (module, function) = (module_atom, function_atom);
-    // Port of erts/emulator/beam/beam_common.c:1497-1530 (apply: the export of the MFA, whose
-    // `addresses[code_ix]` the JIT calls with the Export* in ARG1; a stub's address is the
-    // export trampoline, a process saving calls enters `beam_save_calls_export`), OTP-29.1.1.
+    let mfa = (module_atom, function_atom, arity);
     let code_ix = registers.active_code_ix as usize;
-    // Port of erts/emulator/beam/beam_common.c:1518-1520, OTP-29.1.1: a function not found
-    // gets a stub entry, which calls the error handler.
-    let Some(export) = process.runtime.as_ref().and_then(|runtime| {
-        runtime
-            .export_entry((module, function, arity), code_ix)
-            .or_else(|| {
-                crate::export::export_entry_or_stub((module, function, arity))
-                    .map(|export| &**export)
-            })
-    }) else {
+    let Some(target) = lookup_apply_export(process, mfa, code_ix) else {
         return apply_error(
             process,
             registers,
-            Term::atom(module),
-            Term::atom(function),
+            Term::atom(module_atom),
+            Term::atom(function_atom),
             args,
             arinsal_bifs::BifError::Badarg { cause: None },
         );
     };
-    let target = export.address(code_ix);
-    let mut list = args;
-    for slot in registers.x_reg_array.iter_mut() {
-        let Some((head, tail)) = crate::lists::split(list) else {
-            break;
-        };
-        *slot = head;
-        list = tail;
+    if !apply_bif_error_adjustment(process, registers, mfa, return_ip, stack_offset) {
+        return Err(ApplyFailure::Adjustment);
     }
-    if !apply_bif_error_adjustment(
+    Ok(target)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn apply3_mfa() -> &'static arinsal_term::ErtsCodeMfa {
+    // Port of erts/emulator/beam/jit/arm/instr_call.cpp:211 (`apply3_mfa`).
+    static APPLY3_MFA: std::sync::OnceLock<arinsal_term::ErtsCodeMfa> = std::sync::OnceLock::new();
+    APPLY3_MFA.get_or_init(|| arinsal_term::ErtsCodeMfa {
+        module: Term::atom(arinsal_term::atoms::ERLANG).word(),
+        function: Term::atom(arinsal_term::atoms::APPLY).word(),
+        arity: 3,
+    })
+}
+
+#[cfg(target_arch = "aarch64")]
+fn arm_apply_resolution(
+    process: &mut crate::Process,
+    resolution: Result<ApplyTarget, ApplyFailure>,
+) -> arinsal_beamasm::misc::ApplyResolution {
+    match resolution {
+        Ok(target) => arinsal_beamasm::misc::ApplyResolution {
+            export: target.export as u64,
+            target: target.target as u64,
+        },
+        Err(ApplyFailure::Raise) => {
+            process.heap.abi.current = std::ptr::from_ref(apply3_mfa()).cast();
+            arinsal_beamasm::misc::ApplyResolution::default()
+        }
+        Err(ApplyFailure::Adjustment) => arinsal_beamasm::misc::ApplyResolution::default(),
+    }
+}
+
+/// ARM's fixed-apply entry maps the shared erts export resolution to its branch pair.
+// Port of erts/emulator/beam/beam_common.c:1529-1566 (`fixed_apply`), OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
+pub extern "C" fn arinsal_beamasm_apply_resolver(
+    header: *mut ProcessHeader,
+    arity: u32,
+    return_ip: u64,
+    stack_offset: u32,
+    reg: *mut u64,
+) -> arinsal_beamasm::misc::ApplyResolution {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
+        return arinsal_beamasm::misc::ApplyResolution::default();
+    };
+    let resolution = resolve_fixed_apply(
         process,
         registers,
-        (module, function, arity),
+        arity as usize,
         return_ip,
-        stack_offset,
-    ) {
-        return ApplyResolution::default();
-    }
-    ApplyResolution {
-        export: std::ptr::from_ref(export) as u64,
-        target: target as u64,
-    }
+        u64::from(stack_offset),
+    );
+    arm_apply_resolution(process, resolution)
+}
+
+/// ARM's variable-apply entry maps the shared erts export resolution to its branch pair.
+// Port of erts/emulator/beam/beam_common.c:1434-1527 (`apply`), OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
+pub extern "C" fn arinsal_beamasm_apply3_resolver(
+    header: *mut ProcessHeader,
+    return_ip: u64,
+    stack_offset: u32,
+    reg: *mut u64,
+) -> arinsal_beamasm::misc::ApplyResolution {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
+        return arinsal_beamasm::misc::ApplyResolution::default();
+    };
+    let resolution = resolve_apply(process, registers, return_ip, u64::from(stack_offset));
+    arm_apply_resolution(process, resolution)
 }
 
 /// Builds a map from the staged key/value vector.
@@ -2920,22 +2833,16 @@ pub(crate) fn bs_append_checked(
     }
 }
 
-/// Runs the checked private append and charges its writable-binary overhead on the process.
+/// Runs erts' checked private append and charges its writable-binary overhead on the process.
 // Port of erts/emulator/beam/erl_bits.c:1928-2017 (`erts_bs_private_append_checked`), OTP-29.1.1.
-pub extern "C" fn arinsal_beamasm_bs_private_append_checked(
-    ebs: *mut u64,
-    process_header: *mut ProcessHeader,
+pub(crate) fn bs_private_append_checked(
+    process: &mut crate::Process,
+    ebs: &mut [u64; 2],
     bin: u64,
     extra_bits: u64,
 ) -> u64 {
-    // BeamAsm already committed native cursors before the direct C-style helper call.
-    // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1865-1880 and erl_bits.c:1928-1983,
-    // OTP-29.1.1.
-    let Some(process) = crate::native_hooks::enter_runtime(process_header) else {
-        return 0;
-    };
     let update = arinsal_term::erts_bs_private_append_checked_with_heap(
-        ebs,
+        ebs.as_mut_ptr(),
         bin,
         extra_bits,
         &mut process.heap,

@@ -402,6 +402,9 @@ pub struct Process {
     entry_started: bool,
     // Last BEAM live operand or call arity for allocation instructions without one.
     pub(crate) gc_live: usize,
+    /// `p->return_trace_frames`: live return and exception trace frames on the stack.
+    // Port of erts/emulator/beam/erl_process.h:1099, OTP-29.1.1.
+    pub(crate) return_trace_frames: isize,
     /// Largest total heap size seen at a collection entry since the last `max_heap_size` check.
     pub(crate) max_heap_peak: usize,
     /// `esdp->virtual_reds`: reductions the slice gave up through `ERTS_VBUMP_ALL_REDS` since
@@ -584,7 +587,7 @@ impl ProcDict {
     // Port of MAKE_HASH (erl_process_dict.c:58), OTP-29.1.1.
     // `unsigned_val` is a logical shift of the tagged word, not a sign-extended cast.
     #[inline]
-    fn hash(key: Term) -> u64 {
+    pub(crate) fn hash(key: Term) -> u64 {
         let word = key.tagged_word();
         if word & 15 == 15 {
             word >> 4
@@ -598,7 +601,12 @@ impl ProcDict {
     // Port of pd_hash_value_to_ix (erl_process_dict.c:1008), OTP-29.1.1.
     #[inline]
     fn bucket_index(&self, key: Term) -> usize {
-        let hash = Self::hash(key);
+        self.bucket_index_for_hash(Self::hash(key))
+    }
+
+    // Port of pd_hash_value_to_ix (erl_process_dict.c:1008), OTP-29.1.1.
+    #[inline]
+    fn bucket_index_for_hash(&self, hash: u64) -> usize {
         let high = hash & self.size_mask as u64;
         if high >= self.used_slots as u64 {
             (hash & (self.size_mask >> 1) as u64) as usize
@@ -757,10 +765,17 @@ impl ProcDict {
     // Port of erts/emulator/beam/erl_process_dict.c:463-501 (pd_hash_get), OTP-29.1.1.
     #[inline]
     pub(crate) fn get(&self, key: Term) -> Option<Term> {
+        self.get_with_hash(key, Self::hash(key))
+    }
+
+    /// Look up a key using the hash already supplied by the native instruction.
+    // Port of erts/emulator/beam/erl_process_dict.c:451-461 (erts_pd_hash_get_with_hx), OTP-29.1.1.
+    #[inline]
+    pub(crate) fn get_with_hash(&self, key: Term, hash: u64) -> Option<Term> {
         if self.used_slots == 0 {
             return None;
         }
-        let mut cur = self.heads[self.bucket_index(key)];
+        let mut cur = self.heads[self.bucket_index_for_hash(hash)];
         while cur != NIL_NODE {
             let node = &self.nodes[cur as usize];
             if arinsal_term::exact_eq(node.key, key) {
@@ -1425,8 +1440,9 @@ pub(crate) struct ProcessCold {
     /// Operand registers of `apply` calls in progress. A callee may collect before it
     /// yields back to re-execute the apply, so these stay GC roots until it returns.
     pub(crate) apply_roots: Vec<Term>,
-    /// A NIF call rescheduled to another scheduler class; its arguments are GC roots.
-    pub(crate) nif_pending: Option<Box<crate::natives::nif::PendingNif>>,
+    /// `ERTS_PSD_NFUNC_TRAP_WRAPPER`: the `ErtsNativeFunc` of a native call that scheduled
+    /// itself; its saved arguments are GC roots while it is in use.
+    pub(crate) psd_nfunc_trap_wrapper: Option<crate::erl_nfunc_sched::NativeFuncBox>,
     /// Set while the process handles its signals before executing code (erts
     /// `ERTS_PSFLG_RUNNING_SYS`): the only place system tasks execute (erl_process.c
     /// execute_sys_tasks), as no Erlang, native or BIF code is half-way done; a potentially
@@ -2086,6 +2102,7 @@ impl Process {
             slow: Self::SLOW_NOT_STARTED | Self::SLOW_NO_NATIVE_PC | Self::SLOW_NO_PROBE,
             entry_started: false,
             gc_live: 0,
+            return_trace_frames: 0,
             max_heap_peak: 0,
             virtual_reds: 0,
             reductions_used: 0,

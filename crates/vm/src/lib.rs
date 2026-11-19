@@ -26,6 +26,7 @@ mod erl_arith;
 mod erl_bits;
 mod erl_gc;
 mod erl_map;
+mod erl_nfunc_sched;
 mod erl_osenv;
 mod erl_poll;
 mod erl_trace;

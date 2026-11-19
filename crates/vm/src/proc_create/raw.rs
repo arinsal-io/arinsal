@@ -181,6 +181,7 @@ fn process_fields_are_initialized(process: Process) {
         native_arity_set,
         native_error_pc,
         native_exit_kind,
+        return_trace_frames,
     } = process;
     drop((
         heap,
@@ -244,6 +245,7 @@ fn process_fields_are_initialized(process: Process) {
         native_arity_set,
         native_error_pc,
         native_exit_kind,
+        return_trace_frames,
     ));
 }
 

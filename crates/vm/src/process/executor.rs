@@ -289,6 +289,14 @@ impl Executor {
                     #[cfg(target_arch = "aarch64")]
                     crate::beamasm_integration::count_native_yield();
                     process.native_exit_kind = crate::proc_create::NativeExit::None;
+                    // Port of erts/emulator/beam/erl_process.c (erts_schedule: schedule-out of
+                    // a process whose ERTS_PSFLG_DIRTY_*_PROC flag static_schedule_dirty_nif
+                    // or enif_schedule_nif set), OTP-29.1.1.
+                    if !ctx.scheduler_type().is_dirty()
+                        && let Some(kind) = super::executor_run::dirty_proc_kind(ctx.proc_state())
+                    {
+                        return Some(Err(VmError::Dirty(kind)));
+                    }
                     return Some(Ok(RunState::Yield));
                 }
                 crate::proc_create::NativeExit::Wait if process.native_wait.is_some() => {

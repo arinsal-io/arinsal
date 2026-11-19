@@ -1,5 +1,5 @@
-use arinsal_bifs::Ctx;
-use arinsal_bifs::ProcessHeapHandle;
+mod support;
+
 use arinsal_etf::OwnedTerm;
 use arinsal_nif::{LoadInfo, load_nif};
 use arinsal_term::{ProcessHeap, Term, TermBuilder, VecHeap, global_atoms, to_owned};
@@ -73,13 +73,11 @@ fn otp_crypto_callbacks_match_erl() {
         ("strong_rand_bytes_nif", vec![Term::small(32).unwrap()]),
         ("ng_crypto_one_time_nif", vec![aes, key, iv, abc, yes]),
     ] {
-        let mut state = arinsal_bifs::BifState::default();
-        let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut output_heap), &mut state);
         let t = nif
             .lookup(name, args.len())
             .unwrap()
-            .call(&mut ctx, &args)
-            .unwrap();
+            .call(&mut output_heap, &args);
+        assert!(!t.is_non_value(), "{name} raised");
         let value = to_owned(t).unwrap();
         actual.push(if name == "strong_rand_bytes_nif" {
             match &value {

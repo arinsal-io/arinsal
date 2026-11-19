@@ -3264,18 +3264,7 @@ fn hibernate(
     reg[0] = module;
     reg[1] = function;
     reg[2] = args;
-    process.gc_live = 3;
-    process.heap.abi.arity = 3;
-    process.msgq_set_save_first();
-    // Port of erts/emulator/beam/beam_common.c:1568 (erts_hibernate), OTP-29.1.1: the parked
-    // continuation is process state.
-    process.cold_mut().hibernate = Some(crate::process::HibernateCont {
-        stop: true,
-        resume_in_place: false, // elixir_loop1
-        current_mfa: None,
-    });
-    // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
-    process.set_hibernate_sched(true);
+    crate::process::begin_hibernate(process, &reg[..3], false, None);
     Err(VmError::Unsupported("hibernate".into()))
 }
 
@@ -3298,13 +3287,7 @@ fn hibernate_zero(vm: &Vm, process: &mut Process) -> Result<Term, VmError> {
     // `i_hibernate/0` retains the current MFA. Capture it before the scheduler hands the process
     // off, since the interpreter IP may then describe the process entry trampoline.
     let current_mfa = resolve_mfa(Some(vm), process)?;
-    process.cold_mut().hibernate = Some(crate::process::HibernateCont {
-        stop: true,
-        resume_in_place: true,
-        current_mfa: Some(current_mfa),
-    });
-    // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
-    process.set_hibernate_sched(true);
+    crate::process::begin_hibernate(process, &[], true, Some(current_mfa));
     Err(VmError::Unsupported("hibernate".into()))
 }
 

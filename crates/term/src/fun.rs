@@ -339,6 +339,12 @@ pub const OP_I_GENERIC_BREAKPOINT: usize = 115;
 /// `op_call_bif_W`: a BIF (or a native the runtime implements) the trampoline calls.
 #[cfg(not(target_arch = "x86_64"))]
 pub const OP_CALL_BIF_W: usize = 32;
+/// `op_call_nif_WWW`: the op an `ErtsNativeFunc` trampoline of a scheduled NIF holds.
+#[cfg(target_arch = "x86_64")]
+pub const OP_CALL_NIF_WWW: usize = 33;
+/// `op_call_nif_WWW`: the op an `ErtsNativeFunc` trampoline of a scheduled NIF holds.
+#[cfg(not(target_arch = "x86_64"))]
+pub const OP_CALL_NIF_WWW: usize = 36;
 /// Byte offset of `trampoline.common.op` for generated loads.
 pub const EXPORT_TRAMPOLINE_OP_OFFSET: u32 = (core::mem::offset_of!(ExportEntry, trampoline)
     + core::mem::offset_of!(ExportTrampoline, op))

@@ -129,6 +129,15 @@ impl Executor {
                             .map(|(_, _, class)| class);
                         let dirty_here = pending_dirty
                             .is_some_and(|class| class == scheduler_class(ctx.scheduler_type()));
+                        // Port of erts/emulator/beam/erl_process.c (schedule: a process with
+                        // ERTS_PSFLG_DIRTY_CPU_PROC / ERTS_PSFLG_DIRTY_IO_PROC set by
+                        // static_schedule_dirty_nif or enif_schedule_nif goes to that dirty run
+                        // queue), OTP-29.1.1.
+                        if !ctx.scheduler_type().is_dirty()
+                            && let Some(kind) = dirty_proc_kind(ctx.proc_state())
+                        {
+                            break Err(VmError::Dirty(kind));
+                        }
                         match pending_dirty {
                             Some(arinsal_bifs::SchedulerClass::DirtyCpu) if !dirty_here => {
                                 break Err(VmError::Dirty(arinsal_sched::DirtyKind::Cpu));
@@ -137,6 +146,19 @@ impl Executor {
                                 break Err(VmError::Dirty(arinsal_sched::DirtyKind::Io));
                             }
                             _ => {}
+                        }
+                        // Port of erts/emulator/beam/beam_common.c (erts_dirty_process_main)
+                        // and erl_nif.c (erts_call_dirty_nif), OTP-29.1.1: the dirty call ran
+                        // as this slice's dirty job and scheduled `dirty_nif_finalizer`,
+                        // `dirty_nif_exception` or a new call; a call for a dirty scheduler
+                        // goes back to a dirty run queue, any other runs on a normal one.
+                        if ctx.scheduler_type().is_dirty()
+                            && crate::erl_nfunc_sched::i_is_call_nif(process)
+                        {
+                            break match dirty_proc_kind(ctx.proc_state()) {
+                                Some(kind) => Err(VmError::Dirty(kind)),
+                                None => Ok(RunState::Yield),
+                            };
                         }
                         if !dirty_here {
                             // A caught exception re-enters this loop without replenishing its process slice.
@@ -670,4 +692,20 @@ fn schedule_in_signals(
     }
     executed?;
     Ok(())
+}
+
+/// The dirty run queue `ERTS_PSFLG_DIRTY_CPU_PROC` / `ERTS_PSFLG_DIRTY_IO_PROC` in the process
+/// state asks for.
+pub(super) fn dirty_proc_kind(
+    state: &std::sync::atomic::AtomicU32,
+) -> Option<arinsal_sched::DirtyKind> {
+    use arinsal_sched::psflg;
+    let state = state.load(std::sync::atomic::Ordering::Acquire);
+    if state & psflg::DIRTY_CPU_PROC != 0 {
+        Some(arinsal_sched::DirtyKind::Cpu)
+    } else if state & psflg::DIRTY_IO_PROC != 0 {
+        Some(arinsal_sched::DirtyKind::Io)
+    } else {
+        None
+    }
 }

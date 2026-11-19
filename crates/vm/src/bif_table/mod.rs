@@ -109,7 +109,7 @@ pub(crate) fn call_from_executor(
         registers.tmp_mem[6] = process.native_call_pc as u64;
     }
     let c_p = std::ptr::from_mut(process).cast::<ProcessHeader>();
-    let raw = func(c_p, reg_ptr, 0);
+    let raw = crate::beam_jit_common::beam_jit_call_bif(c_p, reg_ptr, 0, func, arity);
     if raw != arinsal_term::THE_NON_VALUE {
         return Some(Ok(crate::native_hooks::from_raw(raw)));
     }

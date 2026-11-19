@@ -52,6 +52,24 @@ run() ->
      atom_ne(1, ok), atom_ne(ok, ok),
      guard_atom(ok, ok), guard_atom(ok, error), guard_atom(1, 1)}.
 "#;
+#[cfg(target_arch = "x86_64")]
+const BIT_GETTER_MODULE: &str = "native_bit_getters";
+#[cfg(target_arch = "x86_64")]
+const BIT_GETTER_SOURCE: &str = r#"-module(native_bit_getters).
+-export([run/0]).
+run() ->
+    <<Integer:80/little-signed-integer, Tail/binary>> =
+        <<-12345678901234567890:80/little-signed-integer, 1, 2, 3>>,
+    <<Pair:2/binary, Rest/binary>> = Tail,
+    <<Float:32/little-float>> = <<3.25:32/little-float>>,
+    ZeroFloat = zero_float(0),
+    <<Utf8/utf8>> = <<16#1F642/utf8>>,
+    <<Utf16/utf16-little>> = <<16#1F680/utf16-little>>,
+    {Integer, Pair, Rest, Float, ZeroFloat, Utf8, Utf16}.
+zero_float(Size) ->
+    <<Value:Size/float>> = <<>>,
+    Value.
+"#;
 const LIST_FIELDS_SOURCE: &str = r#"-module(native_list_fields).
 -export([run/0]).
 
@@ -416,7 +434,7 @@ fn native_regressions_match_otp() {
 }
 
 #[test]
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn native_comparison_bifs_match_otp() {
     if run_child_case() {
         return;
@@ -425,6 +443,20 @@ fn native_comparison_bifs_match_otp() {
         "native_comparison_bifs_match_otp",
         COMPARE_MODULE,
         COMPARE_SOURCE,
+        &[],
+    );
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn x86_bit_getters_match_otp() {
+    if run_child_case() {
+        return;
+    }
+    assert_native_matches(
+        "x86_bit_getters_match_otp",
+        BIT_GETTER_MODULE,
+        BIT_GETTER_SOURCE,
         &[],
     );
 }

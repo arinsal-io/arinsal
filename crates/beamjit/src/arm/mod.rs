@@ -168,10 +168,6 @@ pub trait ModuleEnv {
     fn native_body(&self, _name: &str, _arity: u8) -> Option<(usize, usize)> {
         None
     }
-    /// Reserve the call-NIF body of a function that a later `load_nif` may replace.
-    fn dynamic_nif_body(&self, _name: &str, _arity: u8) -> Option<(usize, usize)> {
-        None
-    }
     /// Runtime helper that reads the process dictionary with exact key equality.
     fn process_dictionary_get_helper(&self) -> usize {
         0
@@ -1645,8 +1641,6 @@ struct CurrentFunction {
     /// Its body is a native stub: the rest of its operations are not emitted.
     skip: bool,
     native_body: Option<(usize, usize)>,
-    /// A `load_nif` can replace it (`may_load_nif` and `are_nifs` of erts).
-    nif_candidate: bool,
 }
 
 /// The module assembler as the receiver of `load_code`: the functions are emitted one after
@@ -1658,10 +1652,6 @@ struct ModuleCompiler<'a, E: ModuleEnv> {
     current: Option<CurrentFunction>,
     compiled: Vec<CompiledFunction>,
     on_load: Option<usize>,
-    /// For each function, whether it begins with `nif_start`; only for a module that may
-    /// call `load_nif`, whose functions are padded at their start here (see `begin_function`).
-    nif_stubs: Option<Vec<bool>>,
-    has_nif_start: bool,
 }
 
 impl<E: ModuleEnv> ModuleCompiler<'_, E> {
@@ -1682,7 +1672,6 @@ impl<E: ModuleEnv> ModuleCompiler<'_, E> {
             arity: 0,
             skip: false,
             native_body: None,
-            nif_candidate: false,
         });
     }
 
@@ -1707,18 +1696,11 @@ impl<E: ModuleEnv> ModuleCompiler<'_, E> {
         function.atom = *atom;
         self.assembler.name_dump_function(name, arity);
         let native_body = self.env.native_body(name, arity);
-        // Port of erts/emulator/beam/jit/arm/generators.tab:403-412 and asm_load.c:185-190
-        // (may_load_nif, are_nifs), OTP-29.1.1: functions a load_nif can replace.
-        let nif_candidate = native_body.is_none()
-            && self.nif_stubs.as_ref().is_some_and(|stubs| {
-                !self.has_nif_start || stubs.get(index).copied().unwrap_or(false)
-            });
         self.current = Some(CurrentFunction {
             name,
             arity,
             skip: false,
             native_body,
-            nif_candidate,
         });
         Ok(())
     }
@@ -1764,15 +1746,10 @@ impl<E: ModuleEnv> OpSink for ModuleCompiler<'_, E> {
             env,
             ..
         } = self;
-        let (name, arity, native_body, nif_candidate) = match current.as_ref() {
+        let (name, arity, native_body) = match current.as_ref() {
             Some(function) if function.skip && !flush => return Ok(()),
-            Some(function) => (
-                function.name,
-                function.arity,
-                function.native_body,
-                function.nif_candidate,
-            ),
-            None => ("<module>", 0, None, false),
+            Some(function) => (function.name, function.arity, function.native_body),
+            None => ("<module>", 0, None),
         };
         let dump_enabled = assembler.dump_enabled();
         let start = if dump_enabled {
@@ -1795,14 +1772,6 @@ impl<E: ModuleEnv> OpSink for ModuleCompiler<'_, E> {
         } else {
             dispatch_specific_op(specific, assembler, &view, beam, *env, name, arity)
                 .map_err(|error| describe(&view, &error))?;
-            if nif_candidate
-                && id == erts_tables::GENOP_I_BREAKPOINT_TRAMPOLINE_0
-                && let Some((identity, helper)) = env.dynamic_nif_body(name, arity)
-            {
-                assembler
-                    .emit_nif_patch_site(identity, helper, usize::from(arity))
-                    .map_err(|error| format!("{name}/{arity}: i_nif_padding: {error:?}"))?;
-            }
         }
         if dump_enabled {
             let end = assembler.code_offset();
@@ -1853,22 +1822,6 @@ fn compile_parsed_module_with_options_in_arena(
     }
     assembler.enable_dump(&beam.module);
     assembler.set_default_line_file(format!("{}.erl", beam.module));
-    let may_load_nif = beam.imports.iter().any(|import| {
-        import.arity == 2
-            && beam.atom(import.module_atom) == Some("erlang")
-            && beam.atom(import.function_atom) == Some("load_nif")
-    });
-    // The skim only for a module that may call `load_nif`: its padding is decided at the start
-    // of a function here, where erts decides it at the end (`are_nifs`).
-    let nif_stubs = if may_load_nif {
-        Some(
-            beam::scan(&beam.code.bytes, beam.code.max_opcode)
-                .map_err(|error| fail(error.to_string()))?
-                .nif_stubs,
-        )
-    } else {
-        None
-    };
     let mut compiler = ModuleCompiler {
         beam,
         env,
@@ -1876,10 +1829,6 @@ fn compile_parsed_module_with_options_in_arena(
         current: None,
         compiled: Vec::new(),
         on_load: None,
-        has_nif_start: nif_stubs
-            .as_ref()
-            .is_some_and(|stubs| stubs.contains(&true)),
-        nif_stubs,
     };
 
     // The lambdas of functions that are emitted get their table entries first, so the
@@ -2478,11 +2427,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
             }
             erts_tables::GENOP_I_NIF_PADDING_0 => {
                 count(0)?;
-                // erts pads the end of a function that a later `load_nif` can replace
-                // (beam_asm_module.cpp:163, emit_i_nif_padding). This assembler reserves the
-                // call-NIF patch site after the function's breakpoint trampoline instead (see
-                // `emit_nif_patch_site` in the function loop), so there is nothing to pad.
-                Ok(())
+                assembler.emit_i_nif_padding()
             }
             erts_tables::GENOP_I_FUNC_LABEL_1 => {
                 count(1)?;

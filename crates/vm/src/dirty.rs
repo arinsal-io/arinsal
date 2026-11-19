@@ -12,7 +12,6 @@ use arinsal_sched::{DirtyJob, DirtyKind};
 use arinsal_term::{ProcessHeap, Term};
 
 use crate::Process;
-use crate::natives::nif::PendingNif;
 
 pub(crate) type DirtyBifMfa = (&'static str, &'static str, u8);
 pub(crate) type DirtyBifCall = (DirtyBifMfa, Vec<Term>);
@@ -57,7 +56,7 @@ pub(crate) enum DirtyBif {
 
 /// What a dirty job hands back to its process.
 enum DirtyDone {
-    Nif(PendingNif, ProcessHeap),
+    Nif(crate::natives::nif::DirtyNifResult, ProcessHeap),
     Static(Result<Term, arinsal_bifs::BifError>, ProcessHeap),
     Bif(DirtyBifOutcome, ProcessHeap),
 }
@@ -190,13 +189,9 @@ impl Process {
     /// `erts_call_dirty_nif`).
     // Port of erts/emulator/beam/erl_nif.c (erts_call_dirty_nif), OTP-29.1.1.
     pub(crate) fn dirty_nif_done(&self) -> bool {
-        self.cold.as_ref().is_some_and(|cold| {
-            cold.static_nif_done.is_some()
-                || cold
-                    .nif_pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.is_done())
-        })
+        self.cold
+            .as_ref()
+            .is_some_and(|cold| cold.static_nif_done.is_some())
     }
 
     pub(crate) fn dirty_bif_scheduled(&self) -> bool {
@@ -372,6 +367,52 @@ impl Process {
             return None;
         }
         self.verify_dirty_gc_roots(crate::process::switched_out_live(self), "dirty job entry");
+        // Port of erts/emulator/beam/beam_common.c (erts_dirty_process_main:
+        // `BeamIsOpCode(*c_p->i, op_call_nif_WWW)` -> erts_call_dirty_nif), OTP-29.1.1.
+        if crate::erl_nfunc_sched::i_is_call_nif(self) {
+            let job = crate::natives::nif::DirtyNifJob::new(self)?;
+            let runtime = self.runtime;
+            let pid = self.self_pid;
+            let mfa = crate::erl_nfunc_sched::trampoline_mfa(self);
+            return Some(Box::new(move || {
+                let mut heap = shadow_heap();
+                if let (Some(runtime), Some(pid), Some((module, function, arity))) =
+                    (&runtime, pid, mfa)
+                {
+                    let _ = crate::natives::nif::with_dirty_trace_emission(|| {
+                        crate::trace::emit_dirty_running(
+                            runtime, pid, "in", module, function, arity,
+                        );
+                    });
+                }
+                let result = job.run(&mut heap);
+                if let (Some(runtime), Some(pid)) = (&runtime, pid) {
+                    let finalizer = match &result {
+                        crate::natives::nif::DirtyNifResult::Value(_) => {
+                            Some("dirty_nif_finalizer")
+                        }
+                        crate::natives::nif::DirtyNifResult::Exception(_)
+                        | crate::natives::nif::DirtyNifResult::BadReturn => {
+                            Some("dirty_nif_exception")
+                        }
+                        crate::natives::nif::DirtyNifResult::Rescheduled { .. } => None,
+                    };
+                    if let Some(function) = finalizer {
+                        let _ = crate::natives::nif::with_dirty_trace_emission(|| {
+                            crate::trace::emit_dirty_running(
+                                runtime,
+                                pid,
+                                "out",
+                                "erts_internal",
+                                function,
+                                1,
+                            );
+                        });
+                    }
+                }
+                Box::new(DirtyDone::Nif(result, heap)) as Box<dyn Any>
+            }));
+        }
         let cold = self.cold.as_mut()?;
         if matches!(&cold.dirty_bif, Some(DirtyBif::Job(wanted, _, _)) if *wanted == kind) {
             let Some(DirtyBif::Job(_, args, body)) = cold.dirty_bif.take() else {
@@ -386,45 +427,9 @@ impl Process {
                 Box::new(DirtyDone::Bif(result, heap)) as Box<dyn Any>
             }));
         }
-        if cold
-            .nif_pending
-            .as_ref()
-            .is_some_and(|pending| !pending.is_done() && pending.class() == scheduler_class(kind))
-        {
-            let mut pending = *cold.nif_pending.take()?;
-            // The job runs on this thread; NIF services find the process through the hub.
-            crate::natives::nif::refresh_hub_native(self);
-            let runtime = self.runtime;
-            let pid = self.self_pid;
-            let (module, function, arity) = pending.trace_mfa();
-            let module = module.to_owned();
-            let function = function.to_owned();
-            return Some(Box::new(move || {
-                let mut heap = shadow_heap();
-                if let (Some(runtime), Some(pid)) = (&runtime, pid) {
-                    let _ = crate::natives::nif::with_dirty_trace_emission(|| {
-                        crate::trace::emit_dirty_running(
-                            runtime, pid, "in", &module, &function, arity,
-                        );
-                    });
-                }
-                pending.run_dirty(&mut heap);
-                if let (Some(runtime), Some(pid)) = (&runtime, pid) {
-                    let (module, function, arity) =
-                        pending.finalizer_mfa().expect("dirty callback completes");
-                    let _ = crate::natives::nif::with_dirty_trace_emission(|| {
-                        crate::trace::emit_dirty_running(
-                            runtime, pid, "out", module, function, arity,
-                        );
-                    });
-                }
-                Box::new(DirtyDone::Nif(pending, heap)) as Box<dyn Any>
-            }));
-        }
         if let Some((identity, _, class)) = cold.native_dirty_nif
             && class == scheduler_class(kind)
             && cold.static_nif_done.is_none()
-            && cold.nif_pending.is_none()
         {
             return crate::native_helpers::static_nif_job(self, identity);
         }
@@ -440,9 +445,10 @@ impl Process {
         let Ok(done) = result.downcast::<DirtyDone>() else {
             return;
         };
+        let mut nif = None;
         let (heap, mut slot) = match *done {
-            DirtyDone::Nif(pending, heap) => {
-                self.cold_mut().nif_pending = Some(Box::new(pending));
+            DirtyDone::Nif(result, heap) => {
+                nif = Some(result);
                 (heap, None)
             }
             DirtyDone::Static(result, heap) => {
@@ -464,10 +470,17 @@ impl Process {
                 ) => roots.extend(args.iter_mut()),
                 _ => {}
             }
-            if let Some(cold) = self.cold.as_deref_mut() {
-                if let Some(pending) = cold.nif_pending.as_mut() {
-                    roots.extend(pending.done_slots());
+            match nif.as_mut() {
+                Some(
+                    crate::natives::nif::DirtyNifResult::Value(term)
+                    | crate::natives::nif::DirtyNifResult::Exception(term),
+                ) => roots.push(term),
+                Some(crate::natives::nif::DirtyNifResult::Rescheduled { reg, .. }) => {
+                    roots.extend(reg.iter_mut())
                 }
+                _ => {}
+            }
+            if let Some(cold) = self.cold.as_deref_mut() {
                 roots.extend(dirty_result_slots(None, cold.static_nif_done.as_mut()));
             }
             self.heap.flush_dirty_shadow(heap, &mut roots)
@@ -475,6 +488,9 @@ impl Process {
         if flushed.is_err() {
             // A shadow heap never has a stack or an old generation.
             unreachable!("dirty job shadow heap is standalone");
+        }
+        if let Some(result) = nif {
+            crate::natives::nif::erts_call_dirty_nif_finish(self, result);
         }
         if let Some(result) = slot {
             let continuation = match &result {

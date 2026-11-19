@@ -108,6 +108,23 @@ pub(crate) fn handle_error_core(
     registers: &mut [Term],
     bif_info: u64,
 ) -> usize {
+    let (mut pc, mut bif_info) = (pc, bif_info);
+    // Port of erts/emulator/beam/beam_common.c:470-472 (handle_error: EXF_RESTORE_NFUNC ->
+    // erts_nfunc_restore_error), OTP-29.1.1. Arinsal's native `raise/2` still reuses this bit
+    // for a re-raise (`catch::RERAISE`), which never happens while a wrapper is in use; the
+    // bit is cleared here so the exit path does not read the NIF exception as that re-raise.
+    if process.heap.abi.exc.freason & arinsal_term::exc::EXF_RESTORE_NFUNC != 0
+        && crate::erl_nfunc_sched::get_nfunc_trap_wrapper(process)
+            .is_some_and(|nep| nep.get().argc >= 0)
+    {
+        crate::erl_nfunc_sched::erts_nfunc_restore_error(
+            process,
+            &mut pc,
+            registers,
+            &mut bif_info,
+        );
+        process.heap.abi.exc.freason &= !arinsal_term::exc::EXF_RESTORE_NFUNC;
+    }
     process.heap.abi.i = pc as *const core::ffi::c_void;
     let freason = process.heap.abi.exc.freason;
     let error_arglist = crate::native_helpers::is_error_arglist(process, bif_info, freason);

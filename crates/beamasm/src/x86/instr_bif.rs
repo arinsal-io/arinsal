@@ -16,12 +16,14 @@ use super::beam_asm::{
     AsmError, ERTS_SAVE_CALLS_CODE_IX, Update, get_arg_ref, get_x_ref, process, process_ref,
     tmp_mem_q,
 };
-use super::beam_asm_global::{BEAM_ASM_FUNC_PROLOGUE_SIZE, BeamGlobalAssembler, GlobalLabels};
-use super::beam_asm_module::{BeamModuleAssembler, ErtsCodeInfo, arg_label};
+use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
+use super::beam_asm_module::{BeamModuleAssembler, arg_label};
 use super::rt::{
     beam_jit_call_bif, beam_jit_call_nif, beam_jit_load_nif, erts_gc_after_bif_call_lhf,
     erts_printable_return_address, erts_trapping_length_1, get_on_load_address, ubif2mfa,
 };
+use crate::common::beam_asm_h::ErtsCodeInfo;
+use crate::common::beam_asm_h::{BEAM_ASM_FUNC_PROLOGUE_SIZE, BEAM_ASM_NFUNC_SIZE};
 use arinsal_term::{EXPORT_MFA_OFFSET, ExportEntry};
 
 /// `offsetof(Export, is_bif_traced)`.
@@ -49,7 +51,6 @@ const F_FORCE_OR_DISABLE_GC: i64 =
 const F_HIBERNATE_SCHED: i64 = 1;
 const RET_NIF_SUCCESS: i64 = 0;
 const RET_NIF_YIELD: i64 = 2;
-const BEAM_ASM_NFUNC_SIZE: i64 = 16;
 
 const fn mfa(function: arinsal_term::Atom, arity: u64) -> ErtsCodeMfa {
     ErtsCodeMfa {
@@ -331,7 +332,7 @@ impl BeamGlobalAssembler {
     pub(crate) fn emit_call_nif_early(&mut self) -> Result<(), AsmError> {
         let call_nif = self.label(GlobalLabels::CallNifShared);
         let a = &mut self.asm;
-        let info_size = core::mem::size_of::<super::beam_asm_module::ErtsCodeInfo>() as i64;
+        let info_size = core::mem::size_of::<crate::common::beam_asm_h::ErtsCodeInfo>() as i64;
         a.emit(|e| e.mov_rm(ARG2, qword_ptr(enc::RSP, 0)))?;
         a.emit(|e| e.sub_ri(ARG2, 8 + info_size))?;
         a.emit_enter_runtime(Update::NONE)?;
@@ -425,14 +426,14 @@ impl BeamGlobalAssembler {
         a.short_jcc(CondCode::L, yield_label)?;
         a.jmp(call_nif)?;
         a.bind(yield_label)?;
-        let mfa_offset = -(core::mem::size_of::<super::beam_asm_module::ErtsCodeInfo>() as i32)
-            + core::mem::offset_of!(super::beam_asm_module::ErtsCodeInfo, mfa) as i32;
+        let mfa_offset = -(core::mem::size_of::<crate::common::beam_asm_h::ErtsCodeInfo>() as i32)
+            + core::mem::offset_of!(crate::common::beam_asm_h::ErtsCodeInfo, mfa) as i32;
         let arity_offset = mfa_offset + core::mem::size_of::<u64>() as i32 * 2;
         a.emit(|e| e.movzx_rm(ARG1D, byte_ptr(ARG3, arity_offset)))?;
         a.emit(|e| e.mov_mr(process_ref(process::ARITY, 1), ARG1.r8()))?;
         a.emit(|e| e.lea(ARG1, qword_ptr(ARG3, mfa_offset)))?;
         a.emit(|e| e.mov_mr(process_ref(process::CURRENT, 8), ARG1))?;
-        a.emit(|e| e.add_ri(ARG3, BEAM_ASM_NFUNC_SIZE + 24))?;
+        a.emit(|e| e.add_ri(ARG3, BEAM_ASM_NFUNC_SIZE as i64 + 24))?;
         a.jmp(context_switch)
     }
 

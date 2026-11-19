@@ -238,13 +238,15 @@ fn order_bits(order: Ordering) -> i32 {
 
 /// Atom order. The shared fragment only calls this when both operands are atoms.
 // Port of erts/emulator/beam/erl_utils.h:193 (erts_cmp_atoms), OTP-29.1.1.
-pub extern "C" fn arinsal_cmp_atoms(a: u64, b: u64) -> i32 {
+#[unsafe(no_mangle)]
+pub extern "C" fn erts_cmp_atoms(a: u64, b: u64) -> i32 {
     order_bits(cmp(from_raw(a), from_raw(b)))
 }
 
 /// Arithmetic term order (`exact == 0`) or exact term order. `eq_only` does not change the sign.
 // Port of erts/emulator/beam/utils.c:1658 (erts_cmp_compound), OTP-29.1.1.
-pub extern "C" fn arinsal_cmp_compound(a: u64, b: u64, exact: i32, _eq_only: i32) -> i64 {
+#[unsafe(no_mangle)]
+pub extern "C" fn erts_cmp_compound(a: u64, b: u64, exact: i32, _eq_only: i32) -> isize {
     let left = from_raw(a);
     let right = from_raw(b);
     let order = if exact == 0 {
@@ -252,7 +254,28 @@ pub extern "C" fn arinsal_cmp_compound(a: u64, b: u64, exact: i32, _eq_only: i32
     } else {
         cmp_exact(left, right)
     };
-    i64::from(order_bits(order))
+    order_bits(order) as isize
+}
+
+/// Resolves a `bif.tab` utility BIF function to its stable export MFA.
+// Port of erts/emulator/beam/beam_common.c:357-366 (ubif2mfa), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn ubif2mfa(function: *const core::ffi::c_void) -> *const arinsal_term::ErtsCodeMfa {
+    let address = function as usize;
+    for spec in arinsal_spec::BIFS
+        .iter()
+        .filter(|spec| spec.kind == arinsal_spec::BifKind::Ubif)
+    {
+        if crate::bif_table::function(i32::from(spec.index)) != address {
+            continue;
+        }
+        if let Some(export) =
+            crate::beamasm_integration::bif_mfa_export(spec.module, spec.name, spec.arity)
+        {
+            return std::ptr::from_ref(export.mfa());
+        }
+    }
+    std::process::abort()
 }
 
 /// Fun view for native ABI terms already recovered via [`from_raw`].

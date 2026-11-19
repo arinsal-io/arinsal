@@ -111,26 +111,45 @@ comparison!(
 /// `erlang:is_function/2`.
 // Port of erts/emulator/beam/erl_bif_op.c (is_function_2, erl_is_function), OTP-29.1.1.
 pub(crate) extern "C" fn is_function_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let [function, arity] = bif_args::<2>(reg);
+    match function_arity_matches(function, arity) {
+        Some(value) => boolean(value),
+        None => bif_badarg(c_p),
+    }
+}
+
+fn function_arity_matches(function: Term, arity: Term) -> Option<bool> {
     use num_bigint::Sign;
 
-    let [function, arity] = bif_args::<2>(reg);
     let arity = if let Some(arity) = arity.as_small() {
         if arity < 0 {
-            return bif_badarg(c_p);
+            return None;
         }
         Some(u8::try_from(arity).ok())
-    } else if let Some(arity) = crate::natives::raw::integer(arity) {
-        if arity.sign() == Sign::Minus {
-            return bif_badarg(c_p);
-        }
-        return boolean(false);
     } else {
-        return bif_badarg(c_p);
+        let arity = crate::natives::raw::integer(arity)?;
+        if arity.sign() == Sign::Minus {
+            return None;
+        }
+        return Some(false);
     };
-    let result = arity
-        .flatten()
-        .is_some_and(|arity| crate::natives::raw::fun_arity(function) == Some(arity));
-    boolean(result)
+    Some(
+        arity
+            .flatten()
+            .is_some_and(|arity| crate::natives::raw::fun_arity(function) == Some(arity)),
+    )
+}
+
+/// Dynamic function-arity type check used by x86 BeamAsm.
+// Port of erts/emulator/beam/erl_bif_op.c:237-265 (erl_is_function), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn erl_is_function(c_p: *mut ProcessHeader, function: u64, arity: u64) -> u64 {
+    let function = crate::native_hooks::from_raw(function);
+    let arity = crate::native_hooks::from_raw(arity);
+    match function_arity_matches(function, arity) {
+        Some(value) => boolean(value),
+        None => bif_badarg(c_p),
+    }
 }
 comparison!(
     /// `erlang:'/='/2`. Port of erl_bif_op.c (sneqeq_2).

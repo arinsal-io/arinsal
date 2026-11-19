@@ -14,11 +14,14 @@ use super::beam_asm::register::{
     ARG1, ARG2, ARG3, ARG4, ARG5, ARG6, E, REGISTERS, RET, TMP1, TMP2,
 };
 use super::beam_asm::{AsmError, BeamAssembler, Distance, Update, get_arg_ref};
-use super::beam_asm_global::{
-    BEAM_ASM_FUNC_PROLOGUE_SIZE, BeamGlobalAssembler, GLOBAL_LABELS, GlobalLabels,
-};
+use super::beam_asm_global::{BeamGlobalAssembler, GLOBAL_LABELS, GlobalLabels};
 pub use super::rt::{beam_catches_cons, i_emit_nyi};
 use crate::common::args::{ArgVal, REG_MASK};
+use crate::common::beam_asm_h::{
+    BEAM_ASM_FUNC_PROLOGUE_SIZE, BEAM_NATIVE_MIN_FUNC_SZ, ERTS_ASM_BP_FLAG_BP,
+    ERTS_ASM_BP_FLAG_BP_NIF_CALL_NIF_EARLY, ERTS_ASM_BP_FLAG_CALL_NIF_EARLY, ERTS_ASM_BP_FLAG_NONE,
+    ErtsCodeInfo,
+};
 use crate::common::register_cache::{CacheMem, RegisterCache};
 use crate::common::types::{ArgType, BeamModuleAssemblerCommon};
 
@@ -45,18 +48,6 @@ pub struct LambdaPatch {
     /// The direct body label for a zero-environment lambda or its environment-unpacking
     /// trampoline for a local closure.
     pub trampoline: Label,
-}
-
-/// `ErtsCodeInfo` with `BEAMASM`: the `i_func_info` block in front of every function.
-// Port of erts/emulator/beam/code_ix.h:104-125 (ErtsCodeInfo), OTP-29.1.1.
-#[repr(C)]
-pub struct ErtsCodeInfo {
-    /// `u.metadata`: `raise_function_clause[7]` and `breakpoint_flag`.
-    pub metadata: [u8; 8],
-    /// `gen_bp`: the trace breakpoint.
-    pub gen_bp: usize,
-    /// `mfa`.
-    pub mfa: arinsal_term::ErtsCodeMfa,
 }
 
 impl super::beam_asm_global::BeamGlobalAssembler {
@@ -86,17 +77,6 @@ impl super::beam_asm_global::BeamGlobalAssembler {
     }
 }
 
-/// `enum erts_asm_bp_flag`: what the breakpoint trampoline of a function does.
-// Port of erts/emulator/beam/jit/beam_asm.h:172-178, OTP-29.1.1.
-pub mod bp_flag {
-    /// `ERTS_ASM_BP_FLAG_CALL_NIF_EARLY`.
-    pub const CALL_NIF_EARLY: i64 = 1 << 0;
-    /// `ERTS_ASM_BP_FLAG_BP`.
-    pub const BP: i64 = 1 << 1;
-    /// `ERTS_ASM_BP_FLAG_BP_NIF_CALL_NIF_EARLY`.
-    pub const BP_NIF_CALL_NIF_EARLY: i64 = CALL_NIF_EARLY | BP;
-}
-
 impl super::beam_asm_global::BeamGlobalAssembler {
     /// Dispatches an enabled function prologue on the breakpoint flag of its `ErtsCodeInfo`,
     /// found from the return address of the prologue's call.
@@ -104,7 +84,7 @@ impl super::beam_asm_global::BeamGlobalAssembler {
     // (emit_i_breakpoint_trampoline_shared), OTP-29.1.1.
     pub(crate) fn emit_i_breakpoint_trampoline_shared(&mut self) -> Result<(), AsmError> {
         use super::beam_asm::register::RETD;
-        use super::beam_asm_global::{BEAM_ASM_FUNC_PROLOGUE_SIZE, GlobalLabels};
+        use super::beam_asm_global::GlobalLabels;
         use arinsal_x64::enc::{CondCode, byte_ptr, qword_ptr};
         // `offsetof(ErtsCodeInfo, u.metadata.breakpoint_flag)` is the last byte of `u`.
         let flag_offset =
@@ -115,11 +95,11 @@ impl super::beam_asm_global::BeamGlobalAssembler {
         let (bp_and_nif, bp_only, nif_only) = (a.new_label(), a.new_label(), a.new_label());
         a.emit(|e| e.mov_rm(RET, qword_ptr(arinsal_x64::enc::RSP, 0)))?;
         a.emit(|e| e.movzx_rm(RETD, byte_ptr(RET, -flag_offset)))?;
-        a.emit(|e| e.cmp_ri(RETD, bp_flag::BP_NIF_CALL_NIF_EARLY))?;
+        a.emit(|e| e.cmp_ri(RETD, i64::from(ERTS_ASM_BP_FLAG_BP_NIF_CALL_NIF_EARLY)))?;
         a.short_jcc(CondCode::E, bp_and_nif)?;
-        a.emit(|e| e.cmp_ri(RETD, bp_flag::CALL_NIF_EARLY))?;
+        a.emit(|e| e.cmp_ri(RETD, i64::from(ERTS_ASM_BP_FLAG_CALL_NIF_EARLY)))?;
         a.short_jcc(CondCode::E, nif_only)?;
-        a.emit(|e| e.cmp_ri(RETD, bp_flag::BP))?;
+        a.emit(|e| e.cmp_ri(RETD, i64::from(ERTS_ASM_BP_FLAG_BP)))?;
         a.short_jcc(CondCode::E, bp_only)?;
         a.emit(|e| e.ret())?;
 
@@ -352,15 +332,6 @@ impl BeamCodeHeader {
 }
 
 const _: () = assert!(core::mem::offset_of!(BeamCodeHeader, functions) == 19 * 8);
-
-/// `BEAM_NATIVE_MIN_FUNC_SZ` with `BEAMASM`: the minimum size of a function a NIF can
-/// replace, in words.
-// Port of erts/emulator/beam/beam_code.h:43-48, OTP-29.1.1.
-pub const BEAM_NATIVE_MIN_FUNC_SZ: usize = 30;
-
-/// `ERTS_ASM_BP_FLAG_NONE`.
-// Port of erts/emulator/beam/jit/beam_asm.h:172-178, OTP-29.1.1.
-const ERTS_ASM_BP_FLAG_NONE: u8 = 0;
 
 /// `BEAM_CATCHES_NIL`.
 // Port of erts/emulator/beam/beam_catches.h:33, OTP-29.1.1.
@@ -1143,7 +1114,7 @@ impl BeamModuleAssembler {
         debug_assert!(self.offset().is_multiple_of(8));
         self.asm.bind(next)?;
         debug_assert_eq!(
-            Some(self.offset() - BEAM_ASM_FUNC_PROLOGUE_SIZE as usize),
+            Some(self.offset() - BEAM_ASM_FUNC_PROLOGUE_SIZE),
             self.current_label_offset()
         );
         Ok(())
@@ -1697,8 +1668,8 @@ mod tests {
         use arinsal_term::{ErtsCodeMfa, Term, atoms};
 
         let info = ErtsCodeInfo {
-            metadata: [0; 8],
-            gen_bp: 0,
+            u: core::sync::atomic::AtomicUsize::new(0),
+            gen_bp: core::sync::atomic::AtomicUsize::new(0),
             mfa: ErtsCodeMfa {
                 module: Term::atom(atoms::ERLANG).word(),
                 function: Term::atom(atoms::LOAD_NIF).word(),

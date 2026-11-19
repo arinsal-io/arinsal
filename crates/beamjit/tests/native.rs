@@ -415,8 +415,8 @@ fn erlc_add_function_runs_through_native_bridge() {
     let mut registers = SchedulerRegisters::default();
     registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(tagged_small(19));
     registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(tagged_small(23));
-    let target =
-        module.native.entries[&function.label] as usize + arinsal_beamasm::module::FUNC_INFO_BYTES;
+    let target = module.native.entries[&function.label] as usize
+        + arinsal_beamasm::common::beam_asm_h::FUNC_INFO_BYTES;
     let caller = caller_module(target, 0xffff_fffe);
     let caller_entry = caller.entry(0xffff_fffe).unwrap();
     let result = arinsal_beamasm::enter_native(&mut header, &mut registers, &caller_entry);
@@ -480,7 +480,7 @@ fn erlc_list_tuple_guards_run_natively() {
     registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(tagged_small(0));
     registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(heap.as_mut_ptr() as u64 + 1);
     let list_target = module.native.entries[&first_integer.label] as usize
-        + arinsal_beamasm::module::FUNC_INFO_BYTES;
+        + arinsal_beamasm::common::beam_asm_h::FUNC_INFO_BYTES;
     let list_caller = caller_module(list_target, 0xffff_fffe);
     let list_entry = list_caller.entry(0xffff_fffe).unwrap();
     let result = arinsal_beamasm::enter_native(&mut header, &mut registers, &list_entry);
@@ -497,7 +497,7 @@ fn erlc_list_tuple_guards_run_natively() {
     registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(tagged_small(0));
     registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(heap.as_mut_ptr() as u64 + 2);
     let tuple_target = module.native.entries[&tuple_list.label] as usize
-        + arinsal_beamasm::module::FUNC_INFO_BYTES;
+        + arinsal_beamasm::common::beam_asm_h::FUNC_INFO_BYTES;
     let tuple_caller = caller_module(tuple_target, 0xffff_fffe);
     let tuple_entry = tuple_caller.entry(0xffff_fffe).unwrap();
     let result = arinsal_beamasm::enter_native(&mut header, &mut registers, &tuple_entry);
@@ -584,8 +584,8 @@ fn recursive_sum_and_fib_run_natively() {
     let mut registers = SchedulerRegisters::default();
     registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(tagged_small(10_000_000));
     registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(tagged_small(0));
-    let target =
-        module.native.entries[&sum.label] as usize + arinsal_beamasm::module::FUNC_INFO_BYTES;
+    let target = module.native.entries[&sum.label] as usize
+        + arinsal_beamasm::common::beam_asm_h::FUNC_INFO_BYTES;
     let caller = caller_module(target, 0xffff_fffe);
     let entry = caller.entry(0xffff_fffe).unwrap();
     let started = Instant::now();
@@ -611,8 +611,8 @@ fn recursive_sum_and_fib_run_natively() {
 
     registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(tagged_small(25));
     registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(0);
-    let target =
-        module.native.entries[&fib.label] as usize + arinsal_beamasm::module::FUNC_INFO_BYTES;
+    let target = module.native.entries[&fib.label] as usize
+        + arinsal_beamasm::common::beam_asm_h::FUNC_INFO_BYTES;
     let caller = caller_module(target, 0xffff_fffd);
     let entry = caller.entry(0xffff_fffd).unwrap();
     let started = Instant::now();

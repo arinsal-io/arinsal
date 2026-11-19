@@ -1,4 +1,5 @@
-use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle};
+mod support;
+
 use arinsal_nif::{LoadInfo, load_nif, take_test_messages};
 use arinsal_term::{ProcessHeap, Term, to_owned};
 use std::path::PathBuf;
@@ -98,18 +99,18 @@ fn c_api_groups_match_otp() {
         ("send_probe", vec![]),
         ("exception_probe", vec![]),
     ] {
-        let mut state = arinsal_bifs::BifState::default();
-        let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut heap), &mut state);
         let callback = nif.lookup(name, args.len()).unwrap();
         let result = if name == "send_probe" {
-            callback.call_with_pid(&mut ctx, &args, Term::pid(1, 0))
+            callback.call_with_pid(&mut heap, &args, Term::pid(1, 0))
         } else {
-            callback.call(&mut ctx, &args)
+            callback.call(&mut heap, &args)
         };
-        let term = match result {
-            Ok(value) => value,
-            Err(BifError::Error(reason)) => reason,
-            Err(other) => panic!("{name}: {other:?}"),
+        // An exception is THE_NON_VALUE with the reason in the process' `fvalue`.
+        let term = if result.is_non_value() {
+            assert_eq!(heap.abi.exc.freason, arinsal_term::exc::EXC_ERROR, "{name}");
+            arinsal_term::raw::term_from_bits(heap.abi.exc.fvalue)
+        } else {
+            result
         };
         actual.push(to_owned(term).unwrap());
     }
@@ -126,12 +127,9 @@ fn c_api_groups_match_otp() {
     );
     drop(heap);
     let mut check_heap = ProcessHeap::with_words(1024);
-    let mut state = arinsal_bifs::BifState::default();
-    let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut check_heap), &mut state);
     let destroyed = nif
         .lookup("dtor_count", 0)
         .unwrap()
-        .call(&mut ctx, &[])
-        .unwrap();
+        .call(&mut check_heap, &[]);
     assert!(destroyed.as_small().unwrap() >= 2);
 }

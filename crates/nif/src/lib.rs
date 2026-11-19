@@ -11,6 +11,10 @@ mod raw;
 mod res_monitor;
 mod resources;
 mod terms;
+pub use terms::{
+    enif_has_pending_exception, enif_is_exception, enif_make_atom, enif_make_badarg,
+    enif_raise_exception,
+};
 
 pub use extras::{
     SelectMessage, SelectRequest, SendHook, SentMessage, VmHooks, set_vm_hooks, take_test_messages,
@@ -82,8 +86,11 @@ pub const C_SHIM_EXPORTS: &[&str] = &[
 ];
 
 use crate::raw::{cstr, deref, deref_mut};
-use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle, SchedulerClass};
-use arinsal_term::{ExternalBinary, HeapAlloc, MagicBin, Node, Term, VecHeap, WritableBinary};
+use arinsal_bifs::SchedulerClass;
+use arinsal_term::exc::ExcFields;
+use arinsal_term::{
+    ExternalBinary, HeapAlloc, MagicBin, Node, ProcessHeap, Term, VecHeap, WritableBinary,
+};
 pub(crate) use libloading::os::unix::Library;
 use std::ffi::{c_char, c_int, c_uint, c_void};
 use std::path::Path;
@@ -207,62 +214,190 @@ layout_check!(ErlNifResourceTypeInit, SIZE_ErlNifResourceTypeInit,
     dyncall => OFF_ErlNifResourceTypeInit_dyncall);
 const _: () = assert!(size_of::<Term>() == layout::SIZE_ERL_NIF_TERM);
 
-enum EnvHeap {
-    Owned(Box<VecHeap>),
-    Bound(*mut ProcessHeapHandle<'static>),
+/// `MIN_HEAP_FRAG_SZ` (erl_nif.c): the extra words of a heap fragment `alloc_heap_heavy` adds.
+const MIN_HEAP_FRAG_SZ: usize = 200;
+
+/// The process heap part of `struct enif_environment_t`: `proc`, `hp`, `hp_end` and
+/// `heap_frag` (`heap_frag` as the `mem` of the fragment `hp` points into, or null).
+///
+/// Port of erts/emulator/beam/global.h:57-72 (struct enif_environment_t), OTP-29.1.1.
+pub(crate) struct ProcEnv {
+    proc: *mut ProcessHeap,
+    hp: *mut u64,
+    hp_end: *mut u64,
+    heap_frag: *mut u64,
+}
+impl ProcEnv {
+    pub(crate) fn proc_mut(&mut self) -> &mut ProcessHeap {
+        // SAFETY: `erts_pre_nif` ties `proc` to the running process for the whole callback.
+        deref_mut(self.proc)
+    }
+    fn proc_ref(&self) -> &ProcessHeap {
+        // SAFETY: `erts_pre_nif` ties `proc` to the running process for the whole callback.
+        deref(self.proc)
+    }
+    /// Port of erts/emulator/beam/erl_nif.c:207-215 (alloc_heap), OTP-29.1.1.
+    #[inline(always)]
+    fn alloc_heap(&mut self, need: usize) -> *mut u64 {
+        let hp = self.hp;
+        let end = hp.wrapping_add(need);
+        if end <= self.hp_end {
+            self.hp = end;
+            return hp;
+        }
+        self.alloc_heap_heavy(need, hp)
+    }
+    /// Port of erts/emulator/beam/erl_nif.c:217-237 (alloc_heap_heavy), OTP-29.1.1.
+    #[cold]
+    fn alloc_heap_heavy(&mut self, need: usize, hp: *mut u64) -> *mut u64 {
+        self.hp = hp;
+        if self.heap_frag.is_null() {
+            debug_assert_eq!(self.proc_ref().heap_limit(), self.hp_end);
+            let top = self.hp;
+            self.proc_mut().abi.htop = top;
+        } else {
+            let usz = (self.hp as usize - self.heap_frag as usize) / 8;
+            self.proc_mut().set_mbuf_head_used(usz);
+        }
+        let hp = self
+            .proc_mut()
+            .heap_fragment_with_extra(need, MIN_HEAP_FRAG_SZ);
+        let (mem, _, alloc_size) = self.proc_ref().mbuf_head().expect("erts_heap_alloc MBUF");
+        self.heap_frag = mem;
+        self.hp = hp.wrapping_add(need);
+        self.hp_end = mem.wrapping_add(alloc_size);
+        hp
+    }
+    /// Port of erts/emulator/beam/erl_nif.c:571-590 (flush_env), OTP-29.1.1: write the cached
+    /// heap pointers back so an ordinary `HAlloc` can run.
+    pub(crate) fn flush_env(&mut self) {
+        if self.heap_frag.is_null() {
+            debug_assert_eq!(self.hp_end, self.proc_ref().heap_limit());
+            debug_assert!(self.hp >= self.proc_ref().abi.htop);
+            let top = self.hp;
+            self.proc_mut().abi.htop = top;
+        } else {
+            debug_assert_eq!(
+                self.proc_ref().mbuf_head().map(|h| h.0),
+                Some(self.heap_frag)
+            );
+            let usz = (self.hp as usize - self.heap_frag as usize) / 8;
+            self.proc_mut().set_mbuf_head_used(usz);
+        }
+    }
+    /// Port of erts/emulator/beam/erl_nif.c:592-607 (cache_env), OTP-29.1.1: reload the
+    /// heap pointers after an ordinary `HAlloc`.
+    pub(crate) fn cache_env(&mut self) {
+        match self.proc_ref().mbuf_head() {
+            None => {
+                self.heap_frag = ptr::null_mut();
+                self.hp = self.proc_ref().abi.htop;
+                self.hp_end = self.proc_ref().heap_limit();
+            }
+            Some((mem, used, alloc_size)) => {
+                self.heap_frag = mem;
+                self.hp = mem.wrapping_add(used);
+                self.hp_end = mem.wrapping_add(alloc_size);
+            }
+        }
+    }
+}
+
+/// Where the terms of an environment live: a process (`env->proc`) or the heap of a
+/// process-independent environment with the `freason`/`fvalue` words of its phony process.
+pub(crate) enum EnvHeap {
+    Owned(Box<VecHeap>, ExcFields),
+    Proc(ProcEnv),
+}
+macro_rules! env_heap_forward {
+    ($self:ident, $h:ident => $e:expr) => {
+        match $self {
+            EnvHeap::Owned($h, _) => $e,
+            EnvHeap::Proc(p) => {
+                let $h = p.proc_mut();
+                $e
+            }
+        }
+    };
+}
+macro_rules! env_heap_forward_ref {
+    ($self:ident, $h:ident => $e:expr) => {
+        match $self {
+            EnvHeap::Owned($h, _) => $e,
+            EnvHeap::Proc(p) => {
+                let $h = p.proc_ref();
+                $e
+            }
+        }
+    };
 }
 impl EnvHeap {
-    fn bound_mut(heap: *mut ProcessHeapHandle<'static>) -> &'static mut ProcessHeapHandle<'static> {
-        // SAFETY: `ErlNifEnv::bound` ties this pointer to the synchronous callback lifetime.
-        deref_mut(heap)
+    /// `env->proc->freason` / `fvalue` (`phony_proc` for an independent environment).
+    pub(crate) fn exc_mut(&mut self) -> &mut ExcFields {
+        match self {
+            EnvHeap::Owned(_, exc) => exc,
+            EnvHeap::Proc(p) => &mut p.proc_mut().abi.exc,
+        }
     }
-    fn bound_ref(heap: *mut ProcessHeapHandle<'static>) -> &'static ProcessHeapHandle<'static> {
-        // SAFETY: `ErlNifEnv::bound` ties this pointer to the synchronous callback lifetime.
-        deref(heap)
+    pub(crate) fn exc(&self) -> &ExcFields {
+        match self {
+            EnvHeap::Owned(_, exc) => exc,
+            EnvHeap::Proc(p) => &p.proc_ref().abi.exc,
+        }
+    }
+    /// `env->proc` when the environment is bound to a process.
+    pub(crate) fn proc_env(&mut self) -> Option<&mut ProcEnv> {
+        match self {
+            EnvHeap::Owned(..) => None,
+            EnvHeap::Proc(p) => Some(p),
+        }
     }
 }
 impl HeapAlloc for EnvHeap {
+    #[inline(always)]
     fn alloc(&mut self, n: usize) -> Option<*mut u64> {
         match self {
-            Self::Owned(h) => h.alloc(n),
-            Self::Bound(h) => Self::bound_mut(*h).alloc(n),
-        }
-    }
-    fn alloc_with_extra(&mut self, n: usize, extra: usize) -> Option<*mut u64> {
-        match self {
-            Self::Owned(h) => h.alloc_with_extra(n, extra),
-            Self::Bound(h) => Self::bound_mut(*h).alloc_with_extra(n, extra),
+            Self::Owned(h, _) => h.alloc(n),
+            Self::Proc(p) => Some(p.alloc_heap(n)),
         }
     }
     fn alloc_fragment_only(&mut self, n: usize) -> Option<*mut u64> {
         match self {
-            Self::Owned(h) => h.alloc_fragment_only(n),
-            Self::Bound(h) => Self::bound_mut(*h).alloc_fragment_only(n),
+            Self::Owned(h, _) => h.alloc_fragment_only(n),
+            // Port of erts/emulator/beam/erl_nif.c (flush_env; HAlloc; cache_env), OTP-29.1.1.
+            Self::Proc(p) => {
+                p.flush_env();
+                let hp = p.proc_mut().alloc_fragment_only(n);
+                p.cache_env();
+                hp
+            }
         }
     }
     fn words_left(&self) -> Option<usize> {
         match self {
-            Self::Owned(h) => h.words_left(),
-            Self::Bound(h) => Self::bound_ref(*h).words_left(),
+            Self::Owned(h, _) => h.words_left(),
+            Self::Proc(p) => Some((p.hp_end as usize).saturating_sub(p.hp as usize) / 8),
         }
     }
     fn release(&mut self, end: *mut u64, start: *mut u64) {
         match self {
-            Self::Owned(h) => h.release(end, start),
-            Self::Bound(h) => Self::bound_mut(*h).release(end, start),
+            Self::Owned(h, _) => h.release(end, start),
+            // HRelease on the cached window: only the newest words move back.
+            Self::Proc(p) => {
+                if end == p.hp && start <= end {
+                    p.hp = start;
+                }
+            }
         }
     }
     fn release_needs_filler(&self, end: *mut u64, start: *mut u64) -> bool {
         match self {
-            Self::Owned(h) => h.release_needs_filler(end, start),
-            Self::Bound(h) => Self::bound_ref(*h).release_needs_filler(end, start),
+            Self::Owned(h, _) => h.release_needs_filler(end, start),
+            Self::Proc(p) => start != end && end != p.hp,
         }
     }
     fn retain_binary(&mut self, x: Arc<arinsal_term::RefcBinary>) {
-        match self {
-            Self::Owned(h) => h.retain_binary(x),
-            Self::Bound(h) => Self::bound_mut(*h).retain_binary(x),
-        }
+        env_heap_forward!(self, h => h.retain_binary(x))
     }
     fn link_bin_ref(
         &mut self,
@@ -271,34 +406,23 @@ impl HeapAlloc for EnvHeap {
         overhead_words: u64,
         owner: Option<arinsal_term::OwnedBinaryRef>,
     ) -> Result<(), arinsal_term::TermError> {
-        match self {
-            Self::Owned(h) => h.link_bin_ref(bin_ref, writable, overhead_words, owner),
-            Self::Bound(h) => {
-                // SAFETY: The bound heap remains live and exclusive for this callback.
-                unsafe { (&mut **h).link_bin_ref(bin_ref, writable, overhead_words, owner) }
-            }
-        }
+        env_heap_forward!(self, h => h.link_bin_ref(bin_ref, writable, overhead_words, owner))
+    }
+    fn add_bin_vheap(&mut self, words: u64) {
+        env_heap_forward!(self, h => h.add_bin_vheap(words))
     }
     fn retain_writable_binary(
         &mut self,
         x: Arc<WritableBinary>,
     ) -> Result<(), arinsal_term::TermError> {
-        match self {
-            Self::Owned(h) => h.retain_writable_binary(x),
-            Self::Bound(h) => Self::bound_mut(*h).retain_writable_binary(x),
-        }
+        env_heap_forward!(self, h => h.retain_writable_binary(x))
     }
     fn retain_writable_binary_with_apparent_size(
         &mut self,
         x: Arc<WritableBinary>,
         apparent_size_bits: usize,
     ) -> Result<(), arinsal_term::TermError> {
-        match self {
-            Self::Owned(h) => h.retain_writable_binary_with_apparent_size(x, apparent_size_bits),
-            Self::Bound(h) => {
-                Self::bound_mut(*h).retain_writable_binary_with_apparent_size(x, apparent_size_bits)
-            }
-        }
+        env_heap_forward!(self, h => h.retain_writable_binary_with_apparent_size(x, apparent_size_bits))
     }
     fn update_writable_binary_overhead(
         &mut self,
@@ -306,60 +430,33 @@ impl HeapAlloc for EnvHeap {
         old_size_bits: usize,
         new_size_bits: usize,
     ) {
-        match self {
-            Self::Owned(h) => {
-                h.update_writable_binary_overhead(source, old_size_bits, new_size_bits)
-            }
-            Self::Bound(h) => Self::bound_mut(*h).update_writable_binary_overhead(
-                source,
-                old_size_bits,
-                new_size_bits,
-            ),
-        }
+        env_heap_forward!(self, h => h.update_writable_binary_overhead(source, old_size_bits, new_size_bits))
     }
     fn supports_writable_binary(&self) -> bool {
-        match self {
-            Self::Owned(h) => h.supports_writable_binary(),
-            Self::Bound(h) => Self::bound_ref(*h).supports_writable_binary(),
-        }
+        env_heap_forward_ref!(self, h => h.supports_writable_binary())
     }
     fn link_external_binary(
         &mut self,
         bin_ref: *mut u64,
         x: Arc<ExternalBinary>,
     ) -> Result<(), arinsal_term::TermError> {
-        match self {
-            Self::Owned(h) => h.link_external_binary(bin_ref, x),
-            Self::Bound(h) => Self::bound_mut(*h).link_external_binary(bin_ref, x),
-        }
+        env_heap_forward!(self, h => h.link_external_binary(bin_ref, x))
     }
     fn supports_external_binary(&self) -> bool {
-        match self {
-            Self::Owned(h) => h.supports_external_binary(),
-            Self::Bound(h) => Self::bound_ref(*h).supports_external_binary(),
-        }
+        env_heap_forward_ref!(self, h => h.supports_external_binary())
     }
     fn link_node(&mut self, thing: *mut u64, x: Node) {
-        match self {
-            Self::Owned(h) => h.link_node(thing, x),
-            Self::Bound(h) => Self::bound_mut(*h).link_node(thing, x),
-        }
+        env_heap_forward!(self, h => h.link_node(thing, x))
     }
     fn link_magic_ref(
         &mut self,
         thing: *mut u64,
         x: MagicBin,
     ) -> Result<(), arinsal_term::TermError> {
-        match self {
-            Self::Owned(h) => h.link_magic_ref(thing, x),
-            Self::Bound(h) => Self::bound_mut(*h).link_magic_ref(thing, x),
-        }
+        env_heap_forward!(self, h => h.link_magic_ref(thing, x))
     }
     fn supports_magic(&self) -> bool {
-        match self {
-            Self::Owned(h) => h.supports_magic(),
-            Self::Bound(h) => Self::bound_ref(*h).supports_magic(),
-        }
+        env_heap_forward_ref!(self, h => h.supports_magic())
     }
 }
 
@@ -384,70 +481,75 @@ pub struct ErlNifEnv {
     module: Option<String>,
     library: Option<Arc<Library>>,
     pid: Option<Term>,
-    pending: Option<Term>,
-    scheduled: Option<(NifFn, c_int, Vec<Term>)>,
+    /// `exception_thrown`: `enif_raise_exception` left the reason in `env->proc->fvalue`.
+    exception_thrown: bool,
     independent: bool,
     scratch: Vec<Vec<u8>>,
     owned_binary_allocations: Vec<usize>,
     /// `opened_rt_list`: resource types this load callback created or took over.
     opened: Vec<resources::OpenedType>,
-    /// Reductions the process has left at the start of the call, `None` where
-    /// `enif_consume_timeslice` is a no-op (dirty schedulers, independent environments).
-    reds_left: Option<i64>,
     /// I/O vectors attached to this environment by `enif_inspect_iovec` (`alloc_tmp_obj`).
     tmp_iovecs: Vec<Vec<u64>>,
     /// `Binary*` handles attached to this environment: freed with it.
     tmp_handles: Vec<usize>,
-    /// Reductions `enif_consume_timeslice` took during the call.
-    consumed: i64,
 }
 impl ErlNifEnv {
-    /// Create a process-independent environment with stable owned allocations.
-    pub fn independent() -> Self {
+    fn with_heap(heap: EnvHeap, pid: Option<Term>, independent: bool) -> Self {
         Self {
-            heap: EnvHeap::Owned(Box::new(VecHeap::new())),
-            options: EnvOptions::default(),
-            priv_data: ptr::null_mut(),
-            priv_cell: None,
-            module: None,
-            library: None,
-            pid: None,
-            pending: None,
-            scheduled: None,
-            independent: true,
-            scratch: Vec::new(),
-            owned_binary_allocations: Vec::new(),
-            opened: Vec::new(),
-            reds_left: None,
-            tmp_iovecs: Vec::new(),
-            tmp_handles: Vec::new(),
-            consumed: 0,
-        }
-    }
-    /// Bind a callback to the caller's infallible heap.
-    /// The environment must be dropped before the heap can move or be reused.
-    pub fn bound(heap: &mut ProcessHeapHandle<'_>, pid: Option<Term>) -> Self {
-        // SAFETY: the caller keeps this exclusive heap borrow alive for the callback.
-        let raw = (heap as *mut ProcessHeapHandle<'_>).cast::<ProcessHeapHandle<'static>>();
-        Self {
-            heap: EnvHeap::Bound(raw),
+            heap,
             options: EnvOptions::default(),
             priv_data: ptr::null_mut(),
             priv_cell: None,
             module: None,
             library: None,
             pid,
-            pending: None,
-            scheduled: None,
-            independent: false,
+            exception_thrown: false,
+            independent,
             scratch: Vec::new(),
             owned_binary_allocations: Vec::new(),
             opened: Vec::new(),
-            reds_left: None,
             tmp_iovecs: Vec::new(),
             tmp_handles: Vec::new(),
-            consumed: 0,
         }
+    }
+    /// Create a process-independent environment with stable owned allocations.
+    pub fn independent() -> Self {
+        Self::with_heap(
+            EnvHeap::Owned(Box::new(VecHeap::new()), ExcFields::default()),
+            None,
+            true,
+        )
+    }
+    /// `erts_pre_nif`: bind an environment to the process heap `p` (`env->proc`) and cache
+    /// `HEAP_TOP(p)` / `HEAP_LIMIT(p)` in `hp` / `hp_end`. [`ErlNifEnv::post_nif`] must run
+    /// before anything else allocates on `p`.
+    ///
+    /// Port of erts/emulator/beam/erl_nif.c:249-282 (erts_pre_nif), OTP-29.1.1.
+    pub fn pre_nif(p: &mut ProcessHeap, pid: Option<Term>) -> Self {
+        let hp = p.abi.htop;
+        let hp_end = p.heap_limit();
+        Self::with_heap(
+            EnvHeap::Proc(ProcEnv {
+                proc: p,
+                hp,
+                hp_end,
+                heap_frag: ptr::null_mut(),
+            }),
+            pid,
+            false,
+        )
+    }
+    /// `erts_post_nif`: write the cached heap pointers back to the process (`full_flush_env`)
+    /// and free the temporary objects of the call (`free_tmp_objs`, by drop).
+    ///
+    /// Port of erts/emulator/beam/erl_nif.c:350-355 (erts_post_nif) and erl_nif.c:546-552
+    /// (full_flush_env), OTP-29.1.1. A dirty call's shadow heap is flushed into the real
+    /// process by the dirty executor (`erts_flush_dirty_shadow_proc`).
+    pub fn post_nif(mut self) -> bool {
+        if let Some(p) = self.heap.proc_env() {
+            p.flush_env();
+        }
+        self.exception_thrown
     }
 }
 impl Drop for ErlNifEnv {
@@ -507,96 +609,62 @@ pub struct NifFunction {
     halt_calls: Arc<HaltCalls>,
 }
 impl NifFunction {
-    /// Invoke through a process-bound environment and convert NIF exceptions.
+    /// Invoke on the process heap `p`. An exception returns `THE_NON_VALUE` with the reason in
+    /// `p`'s `freason`/`fvalue`, as `beam_jit_call_nif` sees it.
     ///
     /// Continuations scheduled with `enif_schedule_nif` run inline; use
     /// [`NifFunction::call_on`] where they may have to move to another scheduler.
-    pub fn call(
-        &self,
-        ctx: &mut Ctx<'_, ProcessHeapHandle<'_>>,
-        args: &[Term],
-    ) -> Result<Term, BifError> {
-        self.call_with_pid(ctx, args, None)
+    pub fn call(&self, p: &mut ProcessHeap, args: &[Term]) -> Term {
+        self.call_with_pid(p, args, None)
     }
     /// Invoke with the calling process ID for `enif_self` and `enif_send`.
-    pub fn call_with_pid(
-        &self,
-        ctx: &mut Ctx<'_, ProcessHeapHandle<'_>>,
-        args: &[Term],
-        pid: Option<Term>,
-    ) -> Result<Term, BifError> {
+    pub fn call_with_pid(&self, p: &mut ProcessHeap, args: &[Term], pid: Option<Term>) -> Term {
         if args.len() != self.arity as usize {
-            return Err(BifError::BADARG);
+            // BIF_ERROR(p, BADARG) (bif.h).
+            p.abi.exc.freason = arinsal_term::exc::EXC_BADARG;
+            return Term::NON_VALUE;
         }
-        let mut next = (self.fptr, args.to_vec());
-        loop {
-            match self.step(ctx, next.0, &next.1, pid, SchedulerClass::Normal)? {
-                NifCall::Return(value) => return Ok(value),
-                NifCall::Schedule(trap) => next = (trap.fptr, trap.args),
-            }
-        }
+        self.step(p, self.fptr, args, pid)
     }
     /// Scheduler class this function's dirty flags request.
     pub fn scheduler_class(&self) -> SchedulerClass {
         scheduler_class(self.flags)
     }
-    /// Invoke `fptr` (this function or one of its scheduled continuations) on a
-    /// scheduler of class `current`.
-    ///
-    /// Port of erts/emulator/beam/erl_nif.c:3540 (enif_schedule_nif) and
-    /// erl_nif.c:440 (erts_call_dirty_nif), OTP-29.1.1: a continuation scheduled
-    /// with flags `0` runs at once on a normal scheduler. Any other continuation,
-    /// and every continuation scheduled from a dirty scheduler, is returned so
-    /// the caller reschedules the process on the requested scheduler class.
-    pub fn call_on(
-        &self,
-        ctx: &mut Ctx<'_, ProcessHeapHandle<'_>>,
-        fptr: NifFn,
-        args: &[Term],
-        pid: Option<Term>,
-        current: SchedulerClass,
-    ) -> Result<NifCall, BifError> {
-        let mut result = self.step(ctx, fptr, args, pid, current)?;
-        while let NifCall::Schedule(trap) = &result {
-            if current != SchedulerClass::Normal || scheduler_class(trap.flags) != current {
-                break;
-            }
-            let NifCall::Schedule(trap) = result else {
-                unreachable!()
-            };
-            result = self.step(ctx, trap.fptr, &trap.args, pid, current)?;
-        }
-        Ok(result)
+    /// One call of `fptr` between `erts_pre_nif` and `erts_post_nif`.
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:623-677 (beam_jit_call_nif: pre_nif,
+    // `fp(&env, arity, reg)`, `exception_thrown` -> THE_NON_VALUE, post_nif), OTP-29.1.1.
+    fn step(&self, p: &mut ProcessHeap, fptr: NifFn, args: &[Term], pid: Option<Term>) -> Term {
+        step(
+            (&self.priv_data, &self.halt_calls, self.flags != 0),
+            p,
+            fptr,
+            (args.as_ptr(), args.len()),
+            pid,
+        )
     }
-    fn step(
-        &self,
-        ctx: &mut Ctx<'_, ProcessHeapHandle<'_>>,
-        fptr: NifFn,
-        args: &[Term],
-        pid: Option<Term>,
-        current: SchedulerClass,
-    ) -> Result<NifCall, BifError> {
-        let _call = (self.flags != 0).then(|| self.halt_calls.enter()).flatten();
-        let mut env = ErlNifEnv::bound(&mut ctx.heap, pid);
-        env.priv_data = self.priv_data.load(Ordering::Acquire);
-        env.reds_left = (current == SchedulerClass::Normal && ctx.has_fcalls())
-            .then(|| i64::try_from(ctx.reduction_budget()).unwrap_or(i64::MAX));
-        // SAFETY: the pointer belongs to a loaded library; arguments remain live.
-        let result = unsafe { fptr(&mut env, args.len() as c_int, args.as_ptr()) };
-        // BUMP_REDS of enif_consume_timeslice, applied to the process' FCALLS.
-        ctx.charge_reductions(env.consumed.max(0) as usize);
-        if let Some(reason) = env.pending {
-            return Err(BifError::Error(reason));
-        }
-        if let Some((fptr, flags, args)) = env.scheduled.take() {
-            return Ok(NifCall::Schedule(NifTrap {
-                fptr,
-                flags: flags as u32,
-                args,
-            }));
-        }
-        Ok(NifCall::Return(result))
+}
+
+/// One call of `fptr` between `erts_pre_nif` and `erts_post_nif`, with the library's
+/// `priv_data`; a dirty call counts for the library's on-halt wait.
+// Port of erts/emulator/beam/jit/beam_jit_common.cpp:623-677 (beam_jit_call_nif: pre_nif,
+// `fp(&env, arity, reg)`, `exception_thrown` -> THE_NON_VALUE, post_nif), OTP-29.1.1.
+fn step(
+    (priv_data, halt_calls, dirty): (&AtomicPtr<c_void>, &HaltCalls, bool),
+    p: &mut ProcessHeap,
+    fptr: NifFn,
+    (argv, argc): (*const Term, usize),
+    pid: Option<Term>,
+) -> Term {
+    let _call = dirty.then(|| halt_calls.enter()).flatten();
+    let mut env = ErlNifEnv::pre_nif(p, pid);
+    env.priv_data = priv_data.load(Ordering::Acquire);
+    // SAFETY: the pointer belongs to a loaded library; `argv` holds `argc` live terms (the
+    // caller's argument registers, which a scheduling NIF may overwrite as in erts).
+    let result = unsafe { fptr(&mut env, argc as c_int, argv) };
+    if env.post_nif() {
+        return Term::NON_VALUE;
     }
+    result
 }
 
 /// Map `ErlNifFunc.flags` or `enif_schedule_nif` flags to a scheduler class.
@@ -616,27 +684,6 @@ pub const ERL_NIF_DIRTY_JOB_CPU_BOUND: u32 = 1;
 /// `ERL_NIF_DIRTY_JOB_IO_BOUND` from erl_nif.h.
 pub const ERL_NIF_DIRTY_JOB_IO_BOUND: u32 = 2;
 
-/// Outcome of one NIF invocation.
-pub enum NifCall {
-    /// The NIF returned this term.
-    Return(Term),
-    /// The NIF called `enif_schedule_nif`; the continuation still has to run.
-    Schedule(NifTrap),
-}
-
-/// A continuation scheduled with `enif_schedule_nif`.
-///
-/// Port of erts/emulator/beam/erl_nfunc_sched.h (`ErtsNativeFunc`), OTP-29.1.1.
-/// `args` are process heap terms; the owner keeps them as GC roots.
-#[derive(Clone)]
-pub struct NifTrap {
-    /// Function to call next.
-    pub fptr: NifFn,
-    /// `enif_schedule_nif` flags selecting its scheduler class.
-    pub flags: u32,
-    /// Arguments for `fptr`.
-    pub args: Vec<Term>,
-}
 struct HaltCalls {
     enabled: bool,
     in_flight: Mutex<usize>,
@@ -783,6 +830,26 @@ impl NifLibrary {
     /// Callback at a table index, in `ErlNifEntry` order.
     pub fn function(&self, index: usize) -> Option<&NifFunction> {
         self.functions.get(index)
+    }
+    /// Invoke `fptr`, a function of this library or a function a wrapper scheduled. `dirty`
+    /// marks a call of a dirty NIF, which the on-halt callback waits for. An exception or a
+    /// TRAP (`enif_schedule_nif`) returns `THE_NON_VALUE` with `p`'s `freason` set.
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:623-677 (beam_jit_call_nif with
+    // `NifMod`: the environment takes `priv_data` from the library), OTP-29.1.1.
+    pub fn call(
+        &self,
+        p: &mut ProcessHeap,
+        (fptr, argv, argc): (NifFn, *const Term, usize),
+        pid: Option<Term>,
+        dirty: bool,
+    ) -> Term {
+        step(
+            (&self.priv_data, &self.halt_calls, dirty),
+            p,
+            fptr,
+            (argv, argc),
+            pid,
+        )
     }
     /// Run the callback registered with `ERL_NIF_OPT_ON_HALT`.
     pub fn execute_on_halt(&self) {
@@ -1134,6 +1201,20 @@ pub(crate) fn put<T>(out: *mut T, value: T) {
         // SAFETY: a non-NULL out-parameter of a NIF API call is writable by contract.
         unsafe { *out = value }
     }
+}
+/// `is_scheduler()`: 1 on a normal scheduler, -1 on a dirty one (0 off-scheduler threads
+/// report as normal here).
+// Port of erts/emulator/beam/erl_nif.c:168-177 (is_scheduler), OTP-29.1.1.
+pub(crate) fn is_scheduler() -> c_int {
+    match arinsal_sched::current_scheduler_type() {
+        arinsal_sched::SchedulerType::Normal => 1,
+        _ => -1,
+    }
+}
+/// `BUMP_REDS(p, gc)`: take `gc` reductions from `p->fcalls`, not below zero.
+// Port of erts/emulator/beam/bif.h:71-78 (BUMP_REDS), OTP-29.1.1.
+pub(crate) fn bump_reds(p: &mut ProcessHeap, gc: i32) {
+    p.abi.fcalls = (p.abi.fcalls - gc).max(0);
 }
 pub(crate) fn term(bits: u64) -> Term {
     // SAFETY: callers obtain bits from existing terms or the NIF ABI.

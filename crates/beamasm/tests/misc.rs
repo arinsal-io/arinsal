@@ -278,3 +278,56 @@ fn native_apply_fun_improper_list_raises_badarg() {
     assert_eq!(regs.x_reg_array[1], arinsal_beamasm::rt::fixture_term(list));
     assert_eq!(cells, [tagged(7), tagged(8)]);
 }
+
+/// `beamasm_emit_call_nif` lays the stub out as erts: the MFA in the `ErtsCodeInfo`, the
+/// trampoline, `b dispatch` over `func`/`m`/`dfunc` at the `call_nif_shared` offsets, then
+/// `adr x2, entry` and the absolute jump to `call_nif_yield_helper`.
+// Port of erts/emulator/beam/jit/beam_jit_main.cpp:542-575 and instr_bif.cpp:956-992,
+// OTP-29.1.1.
+#[test]
+fn call_nif_stub_layout() {
+    use arinsal_beamasm::common::beam_asm_h::{
+        BEAM_ASM_FUNC_PROLOGUE_SIZE, BEAM_ASM_NFUNC_SIZE, FUNC_INFO_BYTES, NIF_STUB_CODE_BYTES,
+    };
+    use arinsal_beamasm::module::beamasm_emit_call_nif;
+    let mut buf = [0u8; FUNC_INFO_BYTES + NIF_STUB_CODE_BYTES];
+    let helper = 0x1234_5678_9abc_usize;
+    beamasm_emit_call_nif(
+        (0x11, 0x22, 3),
+        0xaaaa_0000,
+        0xbbbb_0000,
+        0xcccc_0000,
+        helper,
+        &mut buf,
+    )
+    .expect("stub");
+    let word = |offset: usize| u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
+    let insn = |offset: usize| u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap());
+    // ErtsCodeInfo: flag word clear, MFA at 16/24/32.
+    assert_eq!(insn(4), 0);
+    assert_eq!((word(16), word(24), word(32)), (0x11, 0x22, 3));
+    let code = FUNC_INFO_BYTES;
+    // Trampoline: `str x30, [x20, #-8]!`, `b next`, `udf #0xB1F`.
+    assert_eq!(insn(code + 4), 0x1400_0002);
+    assert_eq!(insn(code + 8), 0x0000_0B1F);
+    // `b dispatch` skips the three words; call_nif_shared reads them at I + 16/24/32.
+    let b = code + BEAM_ASM_FUNC_PROLOGUE_SIZE;
+    assert_eq!(insn(b), 0x1400_0007);
+    assert_eq!(
+        (word(b + 4), word(b + 12), word(b + 20)),
+        (0xaaaa_0000, 0xbbbb_0000, 0xcccc_0000)
+    );
+    // dispatch = entry + BEAM_ASM_NFUNC_SIZE + 24: `adr x2, entry`.
+    let dispatch = code + BEAM_ASM_NFUNC_SIZE + 24;
+    let adr = insn(dispatch);
+    assert_eq!(adr & 0x9f00_001f, 0x1000_0002);
+    let immlo = (adr >> 29) & 3;
+    let immhi = (adr >> 5) & 0x7_ffff;
+    let imm = (((immhi << 2) | immlo) << 11) as i32 >> 11;
+    assert_eq!(imm, -((BEAM_ASM_NFUNC_SIZE + 24) as i32));
+    // Then `br x17` ends the sequence within the 64 code bytes.
+    let br = (dispatch + 4..code + NIF_STUB_CODE_BYTES)
+        .step_by(4)
+        .find(|&offset| insn(offset) == 0xd61f_0220);
+    assert!(br.is_some());
+}

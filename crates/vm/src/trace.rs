@@ -150,13 +150,16 @@ impl TraceFrameKind {
     /// The kind of the trace frame whose return address is `address`.
     #[inline]
     pub(crate) fn of(address: usize) -> Option<Self> {
-        // The four stubs are consecutive `mov x1, #kind; b` pairs (rt.rs), 8 bytes apart.
-        let offset =
-            address.wrapping_sub(arinsal_beamasm::rt::arinsal_return_trace as *const () as usize);
-        if offset > 24 || !offset.is_multiple_of(8) {
-            return None;
-        }
-        Self::from_index(offset as u64 / 8)
+        // erts' BeamIsReturn* macros compare each return address with its exact stub. The x86
+        // stubs have variable instruction lengths, so they are not a fixed-stride address range.
+        [
+            Self::ReturnTrace,
+            Self::ExceptionTrace,
+            Self::ReturnToTrace,
+            Self::CallTraceReturn,
+        ]
+        .into_iter()
+        .find(|&kind| address == kind.address())
     }
 
     /// The kind passed in x1 by its return stub.
@@ -3079,6 +3082,15 @@ pub(crate) fn push_native_trace_frame(
         }
         index += 1 + kind.data_words();
     }
+    process.return_trace_frames += frames
+        .iter()
+        .filter(|(kind, _)| {
+            matches!(
+                kind,
+                TraceFrameKind::ReturnTrace | TraceFrameKind::ExceptionTrace
+            )
+        })
+        .count() as isize;
     for (kind, data) in &frames {
         if matches!(
             kind,
@@ -3115,9 +3127,15 @@ pub(crate) fn native_return_event(
 
 /// A return or exception trace frame of `session` left the stack.
 pub(crate) fn release_return_frame(process: &mut Process, session: u64) {
+    consume_return_trace_frame(process);
     if crate::trace_bp::is_meta_id(session) {
         crate::trace_bp::release_meta_frame(process, session);
     }
+}
+
+fn consume_return_trace_frame(process: &mut Process) {
+    debug_assert!(process.return_trace_frames > 0);
+    process.return_trace_frames -= 1;
 }
 
 fn native_return_event_inner(
@@ -3684,6 +3702,276 @@ pub(crate) fn emit_process(
     emit_filtered_without_ctx(vm, process, subject, class, name, fields, None);
 }
 
+/// Emits the return event from the x86 JIT's `return_trace` runtime call.
+// Port of erts/emulator/beam/erl_trace.c:1062-1099 (erts_trace_return), OTP-29.1.1.
+fn native_trace_return(process: &mut Process, mfa: u64, value: Term, tracer: Term, session: Term) {
+    // Port of erl_trace.c:1069-1070: consume the frame before resolving its tracer.
+    consume_return_trace_frame(process);
+    let Some(pid) = process.self_pid else {
+        return;
+    };
+    if tracer == Term::NIL {
+        return;
+    }
+    let Some((module, function, arity)) = crate::raw::beam_common_ffi::code_mfa(mfa) else {
+        return;
+    };
+    let Some(arity) = Term::small(i64::from(arity)) else {
+        return;
+    };
+    let Ok(mfa) = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+        .tuple(&[Term::atom(module), Term::atom(function), arity])
+    else {
+        return;
+    };
+    let Some(weak_id) = session.as_small() else {
+        return;
+    };
+    let Some(session) = session_id_from_weak_id(process, weak_id).or_else(|| {
+        session
+            .as_small()
+            .and_then(|id| u64::try_from(id).ok())
+            .filter(|id| session_ref(process, *id).is_some())
+    }) else {
+        return;
+    };
+    if tracer == Term::atom(arinsal_term::atoms::TRUE) {
+        if process_tracer(process, session, pid).is_none()
+            || active_session_flags(process, session, pid) & CALL == 0
+        {
+            return;
+        }
+    } else if crate::trace_bp::is_meta_id(session)
+        && let Some(meta) = crate::trace_bp::meta_tracer_by_id(session)
+    {
+        emit_meta_return_without_ctx(process, pid, &meta, mfa, value);
+        return;
+    } else if !session_ref(process, session).is_some() {
+        return;
+    }
+    // Session selection is the Arinsal equivalent of the C tracer reference: it keeps the
+    // event on the active trace session and routes it through that session's process or module
+    // tracer.
+    emit_filtered_without_ctx(
+        None,
+        process,
+        pid,
+        CALL,
+        "return_from",
+        &[mfa, value],
+        Some(session),
+    );
+}
+
+/// Resolves the frame's weak trace-session id through the process's active trace sessions.
+// Port of erl_trace.c (`get_tracer_ref_from_weak_id`), OTP-29.1.1.
+pub(crate) fn session_id_from_weak_id(process: &Process, weak_id: i64) -> Option<u64> {
+    if weak_id == -1 {
+        return Some(0);
+    }
+    sessions()
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|(&(owner, id), session)| {
+            (owner == scope(process) && session.weak_id == weak_id).then_some(id)
+        })
+}
+
+fn emit_meta_return_without_ctx(
+    process: &mut Process,
+    subject: Pid,
+    meta: &crate::trace_bp::MetaTracer,
+    mfa: Term,
+    value: Term,
+) {
+    if is_sensitive(process, subject) {
+        return;
+    }
+    let Some(subject_term) = subject.to_term() else {
+        return;
+    };
+    let entry = Entry {
+        flags: CALL | TIMESTAMP,
+        tracer: meta.tracer(),
+    };
+    if let Tracer::Module { module, state } = &entry.tracer {
+        let event = TraceEvent {
+            flags: entry.flags,
+            tracee: subject_term,
+            name: "return_from",
+            fields: &[mfa, value],
+            extra: None,
+        };
+        if let Some(runtime) = process.runtime {
+            crate::process::with_replica_vm(runtime, |vm| {
+                emit_module(vm, process, None, module, state, event);
+            });
+        }
+        return;
+    }
+    let mut values = vec![
+        crate::atom_cache::put("trace_ts"),
+        subject_term,
+        crate::atom_cache::put("return_from"),
+        mfa,
+        value,
+    ];
+    if let Some(stamp) = timestamp_term(process, entry.flags) {
+        values.push(stamp);
+    }
+    match entry.tracer {
+        Tracer::Pid(pid) if pid != subject => {
+            let mut scratch = VecHeap::new();
+            let Ok(event) = TermBuilder::new(&mut scratch).tuple(&values) else {
+                return;
+            };
+            let Ok(message) = Message::copy_from(event) else {
+                return;
+            };
+            if let Some(runtime) = process.runtime
+                && let Ok(scheduler) = runtime.scheduler()
+            {
+                let _ = scheduler.send(subject, pid, message);
+            }
+        }
+        Tracer::Port(id) => {
+            let Ok(event) =
+                TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+                    .tuple(&values)
+            else {
+                return;
+            };
+            if let Some(port) = Term::port(id) {
+                let _ = crate::port::trace_command(process, port, event);
+            }
+        }
+        Tracer::Default | Tracer::Pid(_) | Tracer::Module { .. } => {}
+    }
+}
+
+/// Resolves a native return-to frame and sends its trace event.
+// Port of erts/emulator/beam/jit/beam_jit_common.cpp:1258-1290 (beam_jit_return_to_trace), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn beam_jit_return_to_trace(
+    header: *mut ProcessHeader,
+    session_weak_id: u64,
+    continuation: *mut u64,
+) {
+    let Some(process) = crate::native_hooks::enter_runtime(header) else {
+        return;
+    };
+    let Some(pid) = process.self_pid else {
+        return;
+    };
+    let Some(weak_id) = crate::native_hooks::from_raw(session_weak_id).as_small() else {
+        return;
+    };
+    let Some(session) = session_id_from_weak_id(process, weak_id) else {
+        return;
+    };
+    if is_sensitive(process, pid) || active_session_flags(process, session, pid) & RETURN_TO == 0 {
+        return;
+    }
+    let stop = process.heap.abi.stop as usize;
+    let address = continuation as usize;
+    if address < stop || !(address - stop).is_multiple_of(core::mem::size_of::<u64>()) {
+        return;
+    }
+    let start = (address - stop) / core::mem::size_of::<u64>();
+    let Some((module, function, arity)) = return_to_target(process, start) else {
+        return;
+    };
+    let names = global_atoms();
+    let (Some(module), Some(function)) = (names.get(&module), names.get(&function)) else {
+        return;
+    };
+    let Ok(mfa) =
+        TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap)).tuple(&[
+            Term::atom(module),
+            Term::atom(function),
+            Term::small(i64::from(arity)).unwrap_or(Term::NIL),
+        ])
+    else {
+        return;
+    };
+    emit_filtered_without_ctx(
+        None,
+        process,
+        pid,
+        RETURN_TO,
+        "return_to",
+        &[mfa],
+        Some(session),
+    );
+}
+
+/// Emits `{trace, Pid, return_from, MFA, Value}` for a native return trace.
+// Port of erts/emulator/beam/erl_trace.c:1062-1099 (erts_trace_return), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn erts_trace_return(
+    header: *mut arinsal_beamasm::ProcessHeader,
+    mfa: *mut arinsal_term::ErtsCodeMfa,
+    value: u64,
+    tracer: u64,
+    session_id: u64,
+) {
+    let Some(process) = crate::native_hooks::enter_runtime(header) else {
+        return;
+    };
+    native_trace_return(
+        process,
+        mfa as usize as u64,
+        crate::native_hooks::from_raw(value),
+        crate::native_hooks::from_raw(tracer),
+        crate::native_hooks::from_raw(session_id),
+    );
+}
+
+/// Updates call time and memory accounting when a traced call frame returns.
+// Port of erts/emulator/beam/beam_bp.c:1352-1415 (erts_call_trace_return), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn erts_call_trace_return(
+    header: *mut ProcessHeader,
+    previous_info: *const core::ffi::c_void,
+    bp_flags: u64,
+    session_weak_id: u64,
+) {
+    let Some(process) = crate::native_hooks::enter_runtime(header) else {
+        return;
+    };
+    let Some(pid) = process.self_pid else {
+        return;
+    };
+    let Some(weak_id) = crate::native_hooks::from_raw(session_weak_id).as_small() else {
+        return;
+    };
+    let Some(session) = session_id_from_weak_id(process, weak_id) else {
+        return;
+    };
+    let Some(flags) = crate::native_hooks::from_raw(bp_flags)
+        .as_small()
+        .and_then(|flags| u32::try_from(flags).ok())
+    else {
+        return;
+    };
+    let previous = if previous_info.is_null() {
+        None
+    } else {
+        let Some((module, function, arity)) =
+            crate::raw::beam_common_ffi::code_mfa(previous_info as usize as u64)
+        else {
+            return;
+        };
+        let names = global_atoms();
+        let (Some(module), Some(function)) = (names.text(module), names.text(function)) else {
+            return;
+        };
+        Some(crate::trace_bp::func_id(module, function, arity))
+    };
+    call_acc_return(process, pid, session, flags, previous);
+}
+
 fn emit_filtered_without_ctx(
     mut vm: Option<&mut Vm>,
     process: &mut Process,
@@ -3833,11 +4121,8 @@ pub(crate) fn running_mfa(process: &mut Process, subject: Pid) -> Result<Option<
         return Ok(Some(tuple));
     }
     let dirty_bif = process.cold.as_ref().and_then(|cold| cold.dirty_bif_mfa);
-    let dirty_finalizer = process
-        .cold
-        .as_ref()
-        .and_then(|cold| cold.nif_pending.as_deref())
-        .and_then(crate::natives::nif::PendingNif::finalizer_mfa);
+    // A process at a wrapper trampoline runs the function the wrapper scheduled.
+    let dirty_finalizer = crate::erl_nfunc_sched::trampoline_mfa(process);
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:944-946 (c_p->current is set when a
     // process yields): a process that yielded in native code runs the function it resumes in.
     let native = process

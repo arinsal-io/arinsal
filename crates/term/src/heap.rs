@@ -2517,6 +2517,37 @@ impl ProcessHeap {
     pub fn heap_cursor(&self) -> (*mut u64, *mut u64) {
         (self.abi.htop, self.abi.stop)
     }
+    /// `HEAP_LIMIT(p)`: the address `HAlloc` may fill the young heap up to.
+    // Port of erts/emulator/beam/erl_process.h:990-998 (HEAP_LIMIT), OTP-29.1.1.
+    #[inline(always)]
+    pub fn heap_limit(&self) -> *mut u64 {
+        self.words
+            .as_ptr()
+            .cast::<u64>()
+            .cast_mut()
+            .wrapping_add(self.heap_limit_words())
+    }
+    /// `MBUF(p)` as `(mem, used_size, alloc_size)`, or `None` without heap fragments.
+    // Port of erts/emulator/beam/erl_process.h (MBUF), OTP-29.1.1.
+    #[inline(always)]
+    pub fn mbuf_head(&self) -> Option<(*mut u64, usize, usize)> {
+        let bp = self.abi.mbuf.head()?;
+        Some((bp.mem(), bp.used_size(), bp.alloc_size()))
+    }
+    /// Set `MBUF(p)->used_size` and move `p->mbuf_sz` by the same amount.
+    // Port of erts/emulator/beam/erl_nif.c:573-590 (flush_env, the heap fragment arm),
+    // OTP-29.1.1.
+    #[inline(always)]
+    pub fn set_mbuf_head_used(&mut self, used: usize) {
+        let bp = self
+            .abi
+            .mbuf
+            .head()
+            .expect("flush_env with a heap fragment");
+        debug_assert!(used <= bp.alloc_size());
+        self.abi.mbuf_sz = (self.abi.mbuf_sz + used).wrapping_sub(bp.used_size());
+        bp.set_used_size(used);
+    }
     /// Return the start and end of the young heap allocation.
     pub fn heap_bounds(&self) -> (*mut u64, *mut u64) {
         (self.abi.heap, self.abi.hend)

@@ -1,4 +1,3 @@
-use arinsal_bifs::{Ctx, ProcessHeapHandle};
 use arinsal_nif::{LoadInfo, load_nif};
 use arinsal_term::{ProcessHeap, Term, TermBuilder, VecHeap};
 use std::path::PathBuf;
@@ -61,13 +60,10 @@ fn benchmark_nif_callbacks() {
         ("bsum", vec![binary], 6),
         ("lsum", vec![list], 6),
     ] {
-        let mut state = arinsal_bifs::BifState::default();
-        let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut output_heap), &mut state);
         assert_eq!(
             lib.lookup(name, args.len())
                 .unwrap()
-                .call(&mut ctx, &args)
-                .unwrap()
+                .call(&mut output_heap, &args)
                 .as_small(),
             Some(expected),
             "{name}"

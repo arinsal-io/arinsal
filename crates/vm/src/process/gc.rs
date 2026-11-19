@@ -13,6 +13,27 @@ pub(crate) struct HibernateCont {
     pub current_mfa: Option<(String, String, u8)>,
 }
 
+/// Records the live arguments and scheduler handoff for `erts_hibernate`.
+// Port of erts/emulator/beam/beam_common.c:1568-1600 (`erts_hibernate`), OTP-29.1.1.
+pub(crate) fn begin_hibernate(
+    process: &mut Process,
+    live_registers: &[arinsal_term::Term],
+    resume_in_place: bool,
+    current_mfa: Option<(String, String, u8)>,
+) {
+    process.gc_live = live_registers.len();
+    process.heap.abi.arity = live_registers.len() as u8;
+    if !resume_in_place {
+        process.msgq_set_save_first();
+    }
+    process.cold_mut().hibernate = Some(HibernateCont {
+        stop: true,
+        resume_in_place,
+        current_mfa,
+    });
+    process.set_hibernate_sched(true);
+}
+
 /// Collect when a slice starts and the heap wants it.
 ///
 /// The caller has already drained the outer queue, so a message that woke this

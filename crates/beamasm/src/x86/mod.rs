@@ -28,4 +28,4 @@ pub mod process_main;
 pub mod rt;
 
 pub use beam_asm::*;
-pub use rt::enter_native_raw;
+pub use rt::{enter_native_raw, set_process_main_labels};

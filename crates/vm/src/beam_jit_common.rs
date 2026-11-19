@@ -6,6 +6,50 @@
 use arinsal_beamasm::ProcessHeader;
 use arinsal_term::Term;
 
+/// `ErtsBifFunc`: a BIF body called with `(Process *, Eterm *, ErtsCodePtr)`.
+pub type ErtsBifFunc = crate::bif_table::Bif;
+
+/// Calls a BIF body and performs the post-call collection required by BeamAsm.
+// Port of erts/emulator/beam/jit/beam_jit_common.cpp:588-616 (`beam_jit_call_bif`), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn beam_jit_call_bif(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    instruction: usize,
+    vbf: ErtsBifFunc,
+    arity: usize,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return arinsal_term::THE_NON_VALUE;
+    };
+    process.heap.note_bif_entry();
+    let live_hf_end = process.heap.bif_live_hf_end();
+
+    let result = vbf(c_p, reg, instruction as u64);
+
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return result;
+    };
+    if process.heap.gc_after_bif_desired() {
+        return crate::raw::gc_ffi::erts_gc_after_bif_call_lhf(
+            c_p,
+            live_hf_end,
+            result,
+            reg,
+            arity as u64,
+        );
+    }
+    result
+}
+
+/// Returns the first non-trace continuation address at or below the stack pointer `E`.
+// Port of erts/emulator/beam/beam_common.c:413-435 (`erts_printable_return_address`),
+// OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn erts_printable_return_address(p: *const ProcessHeader, e: *const u64) -> usize {
+    crate::raw::beam_common_ffi::printable_return_address(p, e)
+}
+
 /// `static void i_emit_nyi(char *msg)`: the JIT hit an instruction it cannot emit.
 // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:397-399 (i_emit_nyi),
 // OTP-29.1.1: `erts_exit(ERTS_ERROR_EXIT, "NYI: %s\n", msg)`.
@@ -418,10 +462,77 @@ mod raw {
 #[cfg(test)]
 mod tests {
     use arinsal_beamasm::ProcessHeader as P;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static BIF_INSTRUCTION: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" fn return_first_argument(_c_p: *mut P, reg: *mut u64, instruction: u64) -> u64 {
+        BIF_INSTRUCTION.store(instruction, Ordering::Relaxed);
+        crate::native_hooks::raw(crate::bif_table::bif_args::<1>(reg)[0])
+    }
+
+    #[test]
+    fn beam_jit_call_bif_runs_the_body_and_gc_epilogue() {
+        let mut process = crate::Process::new();
+        let value =
+            arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
+                .tuple(&[
+                    arinsal_term::Term::small(37).unwrap(),
+                    arinsal_term::Term::small(91).unwrap(),
+                ])
+                .unwrap();
+        let mut registers = arinsal_beamasm::SchedulerRegisters::default();
+        registers.x_reg_array[0] = value;
+        process.heap.set_force_gc(true);
+        let collections_before = process.stats.gc.collections;
+        let instruction = 0x1234_5678;
+
+        let result = super::beam_jit_call_bif(
+            std::ptr::from_mut(process.native_header()),
+            registers.x_reg_array.as_mut_ptr().cast(),
+            instruction,
+            return_first_argument,
+            1,
+        );
+
+        similar_asserts::assert_eq!(BIF_INSTRUCTION.load(Ordering::Relaxed), instruction as u64);
+        similar_asserts::assert_eq!(
+            crate::native_hooks::from_raw(result).classify(),
+            arinsal_term::TermKind::Tuple
+        );
+        assert!(process.stats.gc.collections > collections_before);
+    }
+
+    #[test]
+    fn printable_return_address_skips_a_trace_frame() {
+        let continuation = 0x1234_5678_u64;
+        for kind in [
+            crate::trace::TraceFrameKind::ReturnTrace,
+            crate::trace::TraceFrameKind::ExceptionTrace,
+            crate::trace::TraceFrameKind::ReturnToTrace,
+            crate::trace::TraceFrameKind::CallTraceReturn,
+        ] {
+            let mut stack = vec![kind.address() as u64];
+            stack.resize(1 + kind.data_words(), 0);
+            stack.push(continuation);
+            let process = P {
+                hend: stack.as_mut_ptr().wrapping_add(stack.len()),
+                ..P::default()
+            };
+
+            similar_asserts::assert_eq!(
+                super::erts_printable_return_address(&process, stack.as_ptr()),
+                continuation as usize
+            );
+        }
+    }
 
     #[test]
     fn erts_runtime_symbols_have_erts_signatures() {
         let _: extern "C" fn(*const core::ffi::c_char) = super::i_emit_nyi;
+        let _: extern "C" fn(*mut P, *mut u64, usize, super::ErtsBifFunc, usize) -> u64 =
+            super::beam_jit_call_bif;
+        let _: extern "C" fn(*const P, *const u64) -> usize = super::erts_printable_return_address;
         let _: extern "C" fn(*mut P, *const u64, i32) -> u64 = super::beam_jit_build_argument_list;
         let _: extern "C" fn(*mut P, *mut u64, i32, u64, u32) -> usize =
             super::beam_jit_handle_unloaded_fun;
@@ -446,5 +557,89 @@ mod tests {
             crate::receive::erts_proc_sig_receive_helper;
         let _: extern "C" fn(u64, *mut u64, *mut u64, u64, *mut u64) -> u64 =
             super::beam_jit_get_map_elements;
+    }
+}
+
+/// Calls the NIF of a `call_nif` sequence: `fp` of library `nif_mod`, for the function whose
+/// code (or `ErtsNifBeamStub` code) `I` is.
+// Port of erts/emulator/beam/jit/beam_jit_common.cpp:623-677 (beam_jit_call_nif), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn beam_jit_call_nif(
+    c_p: *mut ProcessHeader,
+    i: usize,
+    reg: *mut u64,
+    fp: usize,
+    nif_mod: usize,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(c_p, reg) else {
+        return arinsal_term::THE_NON_VALUE;
+    };
+    // erts_code_to_codemfa(I); `current` is set to please handle_error.
+    let codemfa = i - std::mem::size_of::<arinsal_term::ErtsCodeMfa>();
+    process.heap.abi.current = codemfa as *const std::ffi::c_void;
+    let arity = crate::natives::raw::code_mfa(codemfa).arity as usize;
+    let value = crate::natives::nif::beam_jit_call_nif(
+        process,
+        (fp, nif_mod),
+        &mut registers.x_reg_array,
+        arity,
+    );
+    // THE_NON_VALUE leaves `c_p->freason`: an exception for handle_error, or TRAP with
+    // `c_p->i` at the trampoline erts_nfunc_schedule set up.
+    if value.is_non_value() {
+        return arinsal_term::THE_NON_VALUE;
+    }
+    crate::native_hooks::raw(value)
+}
+
+/// `enum beam_jit_nif_load_ret`.
+// Port of erts/emulator/beam/jit/beam_jit_common.hpp:517, OTP-29.1.1.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BeamJitNifLoadRet {
+    /// `RET_NIF_success`.
+    Success = 0,
+    /// `RET_NIF_error`.
+    Error = 1,
+    /// `RET_NIF_yield`.
+    Yield = 2,
+}
+
+/// `i_load_nif`: loads the NIF library of the module whose code `I` is in, holding the code
+/// modification permission; a process not given it yields and retries the instruction.
+// Port of erts/emulator/beam/jit/beam_jit_common.cpp:679-704 (beam_jit_load_nif), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn beam_jit_load_nif(
+    c_p: *mut ProcessHeader,
+    i: usize,
+    reg: *mut u64,
+) -> BeamJitNifLoadRet {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(c_p, reg) else {
+        return BeamJitNifLoadRet::Error;
+    };
+    let (Some(runtime), Some(pid)) = (process.runtime, process.self_pid) else {
+        return BeamJitNifLoadRet::Error;
+    };
+    if !crate::natives::code::try_seize_code_mod_permission(runtime, process, pid) {
+        // Yield and try again.
+        process.heap.abi.current = std::ptr::null();
+        process.heap.abi.arity = 2;
+        return BeamJitNifLoadRet::Yield;
+    }
+    let (path, info) = (registers.x_reg_array[0], registers.x_reg_array[1]);
+    let result = crate::process::sched_data::with_sched_data(process, |vm, process, _ctx| {
+        crate::natives::nif::erts_load_nif(vm, process, i, path, info)
+    })
+    .expect("native code runs inside an executor slice, which publishes its scheduler data");
+    crate::natives::code::release_code_mod_permission(runtime);
+    match result {
+        Ok(value) => {
+            registers.x_reg_array[0] = value;
+            BeamJitNifLoadRet::Success
+        }
+        Err(_) => {
+            process.heap.abi.exc.freason = arinsal_term::exc::EXC_BADARG;
+            BeamJitNifLoadRet::Error
+        }
     }
 }

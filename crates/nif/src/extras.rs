@@ -186,10 +186,12 @@ pub extern "C" fn enif_send(
         // scheduler (`msg_env == NULL`, `scheduler > 0`, `c_p` set) charges
         // `copy_sz / ERTS_MSG_COPY_WORDS_PER_REDUCTION`, capped at `CONTEXT_REDS`.
         let env = deref_mut(env);
-        if env.reds_left.is_some() {
+        if super::is_scheduler() > 0
+            && let Some(p) = env.heap.proc_env()
+        {
             let words = size_object(msg);
             if words > 64 {
-                env.consumed += (words / 64).min(4000) as i64;
+                super::bump_reds(p.proc_mut(), (words / 64).min(4000) as i32);
             }
         }
     }

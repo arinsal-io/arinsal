@@ -544,6 +544,111 @@ fn copy_bits(dst: &mut [u8], dst_pos: usize, src: &[u8], src_pos: usize, count: 
     }
 }
 
+/// Compare two bit ranges using erts' aligned-byte and unaligned-bit paths.
+// Port of erts/emulator/beam/erl_bits.h:558-577 and erl_bits.c:2293-2375
+// (`erts_cmp_bits` / `erts_cmp_bits__`), OTP-29.1.1.
+pub fn cmp_bits(a: &[u8], a_offset: usize, b: &[u8], b_offset: usize, size: usize) -> i32 {
+    if size == 0 {
+        return 0;
+    }
+    let mut a_index = a_offset / 8;
+    let mut b_index = b_offset / 8;
+    let mut a_offs = a_offset % 8;
+    let mut b_offs = b_offset % 8;
+    if (a_offs | b_offs | size) & 7 == 0 {
+        for (left, right) in a[a_index..a_index + size / 8]
+            .iter()
+            .zip(&b[b_index..b_index + size / 8])
+        {
+            let difference = i32::from(*left) - i32::from(*right);
+            if difference != 0 {
+                return difference;
+            }
+        }
+        return 0;
+    }
+
+    let mut left = a[a_index];
+    let mut right = b[b_index];
+    a_index += 1;
+    b_index += 1;
+    let mut remaining = size;
+    if a_offs != 0 {
+        loop {
+            let left_bit = (left >> (7 - a_offs)) & 1;
+            let right_bit = (right >> (7 - b_offs)) & 1;
+            let difference = i32::from(left_bit) - i32::from(right_bit);
+            if difference != 0 {
+                return difference;
+            }
+            remaining -= 1;
+            if remaining == 0 {
+                return 0;
+            }
+            b_offs += 1;
+            if b_offs == 8 {
+                b_offs = 0;
+                right = b[b_index];
+                b_index += 1;
+            }
+            a_offs += 1;
+            if a_offs == 8 {
+                a_offs = 0;
+                left = a[a_index];
+                a_index += 1;
+                break;
+            }
+        }
+    }
+
+    if remaining >= 8 {
+        let left_shift = b_offs;
+        let right_shift = 8 - left_shift;
+        loop {
+            let next = b[b_index];
+            b_index += 1;
+            let right_byte = (((u16::from(right) << left_shift) | (u16::from(next) >> right_shift))
+                & 0xff) as u8;
+            let difference = i32::from(left) - i32::from(right_byte);
+            if difference != 0 {
+                return difference;
+            }
+            right = next;
+            remaining -= 8;
+            if remaining < 8 {
+                break;
+            }
+            left = a[a_index];
+            a_index += 1;
+        }
+        if remaining == 0 {
+            return 0;
+        }
+        left = a[a_index];
+    }
+
+    while remaining > 0 {
+        let left_bit = (left >> (7 - a_offs)) & 1;
+        let right_bit = (right >> (7 - b_offs)) & 1;
+        let difference = i32::from(left_bit) - i32::from(right_bit);
+        if difference != 0 {
+            return difference;
+        }
+        remaining -= 1;
+        if remaining == 0 {
+            return 0;
+        }
+        a_offs += 1;
+        b_offs += 1;
+        if b_offs == 8 {
+            b_offs = 0;
+            right = b[b_index];
+            b_index += 1;
+        }
+    }
+    0
+}
+
 /// Store the low `bits` of a machine word at a byte-aligned position without big-integer
 /// arithmetic; false when the segment needs the general path.
 // Port of erts/emulator/beam/erl_bits.c (erts_new_bs_put_integer, small-value byte stores), OTP-29.1.1.
@@ -1615,6 +1720,12 @@ impl Cursor<'_> {
         heap: &mut H,
     ) -> Result<Option<Term>, BitsError> {
         // Port of erts/emulator/beam/erl_bits.c:456 (erts_bs_get_float_2), OTP-29.1.1.
+        if bits == 0 {
+            return TermBuilder::new(heap)
+                .float(0.0)
+                .map(Some)
+                .map_err(|e| term_error(e, 0, 2));
+        }
         if !matches!(bits, 16 | 32 | 64) || bits > self.remaining() {
             return Ok(None);
         }

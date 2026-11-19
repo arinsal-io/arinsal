@@ -818,6 +818,8 @@ impl Vm {
         otp: PathBuf,
     ) -> Self {
         crate::boot::erl_init_global_literals();
+        #[cfg(target_os = "linux")]
+        crate::raw::sys_time::init();
         let mut paths: Vec<PathBuf> = paths.into_iter().collect();
         paths.push(PathBuf::from("."));
         paths.push(PathBuf::from("tools/bench/out/ebin"));

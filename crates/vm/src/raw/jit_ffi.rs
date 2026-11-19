@@ -55,11 +55,3 @@ pub(crate) fn stacktrace_frame_fields(term: Term) -> Option<[Term; 4]> {
     }
     Some([tuple.get(0)?, tuple.get(1)?, tuple.get(2)?, tuple.get(3)?])
 }
-
-/// The call-NIF site embedded in live native code by the VM's loader.
-// Port of erts/emulator/beam/jit/beam_jit_common.cpp (beam_jit_call_nif), OTP-29.1.1.
-pub(crate) fn native_nif_site(address: usize) -> &'static crate::native_helpers::NativeNifSite {
-    // SAFETY: generated code embeds the boxed site owned by its live CompiledVersion; that
-    // version cannot be purged while its native code is executing.
-    unsafe { &*(address as *const crate::native_helpers::NativeNifSite) }
-}

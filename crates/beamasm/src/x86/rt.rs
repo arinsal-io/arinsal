@@ -84,6 +84,19 @@ unsafe extern "C" {
     );
 }
 
+/// `labels[dispatch_nif]` of process_main: the global fragment a schedule-in jumps to when
+/// `c_p->i` points at an `ErtsNativeFunc` trampoline holding `op_call_nif_WWW`. The entry
+/// bridge below is this port's process_main, so it reads the label from here.
+// Port of erts/emulator/beam/jit/x86/process_main.cpp:303-311 (`labels[dispatch_nif]`),
+// OTP-29.1.1.
+static PROCESS_MAIN_DISPATCH_NIF: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Publishes the global fragments process_main dispatches to on schedule-in.
+pub fn set_process_main_labels(dispatch_nif: usize) {
+    PROCESS_MAIN_DISPATCH_NIF.store(dispatch_nif, core::sync::atomic::Ordering::Release);
+}
+
 // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:1136 (get_on_load_address), OTP-29.1.1.
 // The VM exports this static erts helper's C symbol to generated code.
 unsafe extern "C" {
@@ -436,7 +449,7 @@ unsafe extern "C" {
     /// `ErtsCodePtr erts_call_nif_early(Process *, const ErtsCodeInfo *)`.
     pub safe fn erts_call_nif_early(
         c_p: *mut crate::ProcessHeader,
-        code_info: *const super::beam_asm_module::ErtsCodeInfo,
+        code_info: *const crate::common::beam_asm_h::ErtsCodeInfo,
     ) -> usize;
     /// `ErtsCodePtr erts_printable_return_address(const Process *, const Eterm *)`.
     pub safe fn erts_printable_return_address(
@@ -505,7 +518,7 @@ unsafe extern "C" {
     /// `BeamInstr erts_generic_breakpoint(Process *, ErtsCodeInfo *, Eterm *)`.
     pub safe fn erts_generic_breakpoint(
         c_p: *mut crate::ProcessHeader,
-        code_info: *mut super::beam_asm_module::ErtsCodeInfo,
+        code_info: *mut crate::common::beam_asm_h::ErtsCodeInfo,
         reg: *mut u64,
     ) -> usize;
     /// `int erts_call_dirty_nif(ErtsSchedulerData *, Process *, ErtsCodePtr, const Eterm *)`.
@@ -926,6 +939,14 @@ core::arch::global_asm!(
     // emit_leave_runtime<eStack | eHeap>: switch to the Erlang stack.
     "mov r15, [r13 + {htop}]",
     "mov rsp, [r13 + {stop}]",
+    // Port of erts/emulator/beam/jit/x86/process_main.cpp:303-311, OTP-29.1.1: a process
+    // returning from a dirty or scheduled NIF has `c_p->i` (rdx, which the runtime stored in
+    // `c_p->i`) on an `ErtsNativeFunc` trampoline holding `op_call_nif_WWW`, which native
+    // code never starts with; it continues in `dispatch_nif`.
+    "cmp qword ptr [rdx], {op_call_nif}",
+    "jne 4f",
+    "mov rdx, [rip + {dispatch_nif}]",
+    "4:",
     // A call entered from the scheduler returns to its caller's continuation: it is the
     // callee's CP, which on x86-64 is the word on top of the Erlang stack (`entry_return`).
     "mov rax, [rbx + {entry_return}]",
@@ -991,6 +1012,8 @@ core::arch::global_asm!(
     entry_return = const ENTRY_RETURN_DISP,
     exit_fragment = const EXIT_FRAGMENT,
     exit_marker = const EXIT_MARKER,
+    op_call_nif = const arinsal_term::OP_CALL_NIF_WWW,
+    dispatch_nif = sym PROCESS_MAIN_DISPATCH_NIF,
 );
 
 // Port of erts/emulator/beam/jit/x86/instr_map.cpp runtime call prototypes, OTP-29.1.1.
@@ -1088,7 +1111,7 @@ mod tests {
     #[unsafe(no_mangle)]
     extern "C" fn erts_call_nif_early(
         _: *mut crate::ProcessHeader,
-        _: *const super::super::beam_asm_module::ErtsCodeInfo,
+        _: *const crate::common::beam_asm_h::ErtsCodeInfo,
     ) -> usize {
         unreachable!("byte-test fixture")
     }
@@ -1106,7 +1129,7 @@ mod tests {
     #[unsafe(no_mangle)]
     extern "C" fn erts_generic_breakpoint(
         _: *mut crate::ProcessHeader,
-        _: *mut super::super::beam_asm_module::ErtsCodeInfo,
+        _: *mut crate::common::beam_asm_h::ErtsCodeInfo,
         _: *mut u64,
     ) -> usize {
         unreachable!("byte-test fixture")

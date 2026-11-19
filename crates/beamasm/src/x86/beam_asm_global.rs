@@ -480,14 +480,11 @@ fn mfa_address(mfa: &'static ErtsCodeMfa) -> u64 {
     std::ptr::from_ref(mfa) as u64
 }
 
-/// `BEAM_ASM_FUNC_PROLOGUE_SIZE` on x86-64.
-// Port of erts/emulator/beam/jit/beam_asm.h:126-130, OTP-29.1.1.
-pub const BEAM_ASM_FUNC_PROLOGUE_SIZE: u32 = 8;
-
 /// `TEST_YIELD_RETURN_OFFSET` for the `RA` frame layout without code allocation tags
 /// (`erts_alcu_enable_code_atags` is an undocumented `+M` option Arinsal does not have).
 // Port of erts/emulator/beam/jit/x86/instr_common.cpp:3199-3202, OTP-29.1.1.
-pub const TEST_YIELD_RETURN_OFFSET: u32 = BEAM_ASM_FUNC_PROLOGUE_SIZE + 16;
+pub const TEST_YIELD_RETURN_OFFSET: u32 =
+    crate::common::beam_asm_h::BEAM_ASM_FUNC_PROLOGUE_SIZE as u32 + 16;
 
 impl BeamGlobalAssembler {
     /// The labels of every fragment declared up front, so global functions can refer to each

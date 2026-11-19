@@ -8,12 +8,13 @@ use arinsal_x64::enc::{CondCode, Mem, qword_ptr};
 use super::beam_asm::register::{ARG1, ARG2, ARG3, ARG4, ARG5, C_P, E, RET};
 use super::beam_asm::{AsmError, Update, get_x_ref, get_y_ref, process, process_ref};
 use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
-use super::beam_asm_module::{BeamModuleAssembler, ErtsCodeInfo};
+use super::beam_asm_module::BeamModuleAssembler;
 use super::rt::{
     beam_jit_return_to_trace, erts_call_trace_return, erts_generic_breakpoint, erts_hibernate,
     erts_trace_return,
 };
 use crate::common::args::ArgVal;
+use crate::common::beam_asm_h::ErtsCodeInfo;
 
 const BEAM_RETURN_TRACE_FRAME_SZ: u32 = 3;
 const BEAM_RETURN_TO_TRACE_FRAME_SZ: u32 = 1;

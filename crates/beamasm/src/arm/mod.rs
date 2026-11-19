@@ -35,7 +35,7 @@ pub use dump::{DumpError, write_global_note};
 
 use crate::{ExitReason, ProcessHeader, SchedulerRegisters};
 
-pub use rt::enter_native_raw;
+pub use rt::{enter_native_raw, set_process_main_labels};
 
 /// Enters finalized generated code through the reviewed native ABI bridge.
 pub fn enter_native(

@@ -1055,6 +1055,13 @@ fn check_process_code(vm: &Vm, process: &mut Process, name: &str) -> bool {
         return false;
     };
     let native = crate::load::native_code_version(&vm.code.code_meta, old);
+    // Port of erts/emulator/beam/beam_bif_load.c (check_process_code:
+    // erts_check_nfunc_in_area), OTP-29.1.1.
+    if crate::erl_nfunc_sched::erts_check_nfunc_in_area(process, |address| {
+        crate::load::native_code_contains(native.map(Arc::as_ref), address)
+    }) {
+        return true;
+    }
     process.references_code(old, |address| {
         crate::load::native_code_contains(native.map(Arc::as_ref), address)
     })

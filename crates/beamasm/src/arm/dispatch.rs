@@ -6,6 +6,7 @@ use arinsal_a64::{
     exec::{CodeMemory, ExecError},
 };
 
+use crate::common::beam_asm_h::{BREAKPOINT_FLAG_OFFSET, ERTS_ASM_BP_FLAG_BP_NIF_CALL_NIF_EARLY};
 use crate::common::process;
 use crate::{Update, emit_enter_runtime, emit_leave_runtime, rt::arinsal_enter_native_return};
 
@@ -40,6 +41,10 @@ pub struct DispatchFragments {
     eq_exact_list_offset: usize,
     arith_compare_offset: usize,
     bif_element_guard_offset: usize,
+    call_nif_early_offset: usize,
+    call_nif_shared_offset: usize,
+    dispatch_nif_offset: usize,
+    call_nif_yield_helper_offset: usize,
 }
 
 /// C functions called by the comparison fragments (`eq`, `erts_cmp_atoms`, `erts_cmp_compound`).
@@ -94,6 +99,12 @@ pub struct DispatchRuntimeHelpers {
     /// `call_error_handler` of the export trampoline: `(c_p, Export.info) -> Export*` of
     /// `error_handler:undefined_function/3` with X0..X2 set up, or zero. Zero builds none.
     pub call_error_handler: usize,
+    /// `beam_jit_call_nif(c_p, I, reg, fp, NifMod) -> Eterm`, called by `call_nif_shared`.
+    pub beam_jit_call_nif: usize,
+    /// `erts_call_nif_early(c_p, ci) -> ErtsCodePtr`, called by `call_nif_early`.
+    pub erts_call_nif_early: usize,
+    /// Entry of `context_switch_simplified` (`YieldFragments::context_switch`).
+    pub context_switch: usize,
 }
 
 /// Identity sent through the light-BIF fragment to hand a native entry breakpoint to the
@@ -196,6 +207,9 @@ impl DispatchFragments {
             line_breakpoint: LineBreakpointHelpers::default(),
             apply3_resolver: 0,
             call_error_handler: 0,
+            beam_jit_call_nif: 0,
+            erts_call_nif_early: 0,
+            context_switch: 0,
         })
     }
 
@@ -216,6 +230,9 @@ impl DispatchFragments {
             line_breakpoint: line_breakpoint_helpers,
             apply3_resolver,
             call_error_handler,
+            beam_jit_call_nif,
+            erts_call_nif_early,
+            context_switch,
         } = helpers;
         let mut code = CodeBuffer::new();
         let export = code.new_label();
@@ -235,6 +252,12 @@ impl DispatchFragments {
         let eq_exact_list = code.new_label();
         let arith_compare = code.new_label();
         let bif_element_guard = code.new_label();
+        let nif = NifFragmentLabels {
+            call_nif_early: code.new_label(),
+            call_nif_shared: code.new_label(),
+            dispatch_nif: code.new_label(),
+            call_nif_yield_helper: code.new_label(),
+        };
         code.bind(export)
             .map_err(|_error| ExecError::InvalidSize("dispatch fragment"))?;
         emit_export_fragment(
@@ -276,7 +299,7 @@ impl DispatchFragments {
             .map_err(|_| ExecError::InvalidSize("breakpoint fragment"))?;
         code.bind(breakpoint)
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
-        emit_breakpoint_shared(&mut code, breakpoint_helper)
+        emit_breakpoint_shared(&mut code, breakpoint_helper, nif.call_nif_early)
             .map_err(|_| ExecError::InvalidSize("breakpoint fragment"))?;
         code.bind(line_breakpoint)
             .map_err(|_error| ExecError::InvalidSize("dispatch fragment"))?;
@@ -307,6 +330,13 @@ impl DispatchFragments {
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
         emit_save_calls_fun_fragment(&mut code, save_calls_fun_helper)
             .map_err(|_| ExecError::InvalidSize("save_calls fun fragment"))?;
+        emit_nif_fragments(
+            &mut code,
+            nif,
+            (beam_jit_call_nif, erts_call_nif_early, context_switch),
+            raise_exception,
+        )
+        .map_err(|_| ExecError::InvalidSize("call_nif fragments"))?;
         code.bind(raise_exception)
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
         emit_raise_exception_fragment(&mut code, exception_resolver)
@@ -388,6 +418,10 @@ impl DispatchFragments {
             eq_exact_list_offset: labels[&eq_exact_list],
             arith_compare_offset: labels[&arith_compare],
             bif_element_guard_offset: labels[&bif_element_guard],
+            call_nif_early_offset: labels[&nif.call_nif_early],
+            call_nif_shared_offset: labels[&nif.call_nif_shared],
+            dispatch_nif_offset: labels[&nif.dispatch_nif],
+            call_nif_yield_helper_offset: labels[&nif.call_nif_yield_helper],
         })
     }
 
@@ -418,6 +452,28 @@ impl DispatchFragments {
     /// argument registers. `call_light_bif_shared` does not read those.
     pub fn breakpoint(&self) -> usize {
         self.memory.ptr_at(self.breakpoint_offset) as usize
+    }
+
+    /// Entry of `call_nif_early`, branched to by the breakpoint trampoline of a function
+    /// whose `ERTS_ASM_BP_FLAG_CALL_NIF_EARLY` is set.
+    pub fn call_nif_early(&self) -> usize {
+        self.memory.ptr_at(self.call_nif_early_offset) as usize
+    }
+
+    /// Entry of `call_nif_shared`: ARG3 points just past an `ErtsCodeInfo` laid out as an
+    /// `ErtsNativeFunc`.
+    pub fn call_nif_shared(&self) -> usize {
+        self.memory.ptr_at(self.call_nif_shared_offset) as usize
+    }
+
+    /// Entry of `dispatch_nif`: `c_p->i` points into an `ErtsNativeFunc` trampoline.
+    pub fn dispatch_nif(&self) -> usize {
+        self.memory.ptr_at(self.dispatch_nif_offset) as usize
+    }
+
+    /// Entry of `call_nif_yield_helper`, jumped to by every `call_nif` sequence.
+    pub fn call_nif_yield_helper(&self) -> usize {
+        self.memory.ptr_at(self.call_nif_yield_helper_offset) as usize
     }
 
     /// Fragment entered by the patchable `i_line_breakpoint_trampoline` call.
@@ -1533,10 +1589,44 @@ fn emit_call_light_bif_shared(
 fn emit_breakpoint_shared(
     code: &mut CodeBuffer,
     helper: arinsal_a64::buf::Label,
+    call_nif_early: arinsal_a64::buf::Label,
 ) -> Result<(), BufferError> {
     const UPDATE: Update = Update::HEAP_ALLOC
         .union(Update::REDUCTIONS)
         .union(Update::X_REGS);
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:176-229
+    // (emit_i_breakpoint_trampoline_shared), OTP-29.1.1: dispatch on the `breakpoint_flag`
+    // of the caller's ErtsCodeInfo; x30 is the address behind the trampoline's `bl`.
+    const FLAG_OFFSET: i16 = (crate::common::beam_asm_h::FUNC_INFO_BYTES
+        + crate::common::beam_asm_h::BEAM_ASM_FUNC_PROLOGUE_SIZE
+        - BREAKPOINT_FLAG_OFFSET) as i16;
+    let bp_and_nif = code.new_label();
+    let nif_only = code.new_label();
+    let bp_only = code.new_label();
+    code.emit(|encoder| {
+        encoder.ldurb(Gpr::w(0), Gpr::x(30), -FLAG_OFFSET)?;
+        encoder.cmp_imm(
+            Gpr::x(0),
+            u16::from(ERTS_ASM_BP_FLAG_BP_NIF_CALL_NIF_EARLY),
+            false,
+        )
+    })?;
+    code.b_cond(Cond::Eq, bp_and_nif)?;
+    code.tbnz(Gpr::x(0), 0, nif_only)?;
+    code.tbnz(Gpr::x(0), 1, bp_only)?;
+    code.emit(|encoder| encoder.ret(Gpr::x(30)))?;
+    code.bind(bp_and_nif)?;
+    // emit_enter_runtime_frame, generic_bp_local, emit_leave_runtime_frame; then fall through.
+    code.emit(|encoder| {
+        encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16)?;
+        encoder.mov_reg(Gpr::x(29), Gpr::sp())
+    })?;
+    code.bl(bp_only)?;
+    code.emit(|encoder| encoder.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16))?;
+    code.bind(nif_only)?;
+    // call_nif_early returns on its own, unlike generic_bp_local.
+    code.b(call_nif_early)?;
+    code.bind(bp_only)?;
     let error = code.new_label();
     code.emit(|encoder| {
         encoder.str_uoff(
@@ -1576,6 +1666,142 @@ fn emit_breakpoint_shared(
         encoder.ldr_uoff(Gpr::x(30), Gpr::x(19), crate::arm::beam_asm::tmp_mem_ref(4))?;
         encoder.br(Gpr::x(30))
     })
+}
+
+/// Labels of the four NIF call fragments.
+#[derive(Clone, Copy)]
+struct NifFragmentLabels {
+    call_nif_early: arinsal_a64::buf::Label,
+    call_nif_shared: arinsal_a64::buf::Label,
+    dispatch_nif: arinsal_a64::buf::Label,
+    call_nif_yield_helper: arinsal_a64::buf::Label,
+}
+
+/// Emits `call_nif_early`, `call_nif_shared` (with `emit_bif_nif_epilogue`), `dispatch_nif`
+/// and `call_nif_yield_helper`. `helpers` are `beam_jit_call_nif`, `erts_call_nif_early` and
+/// the `context_switch_simplified` entry.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:840-952 (emit_call_nif_early,
+// emit_call_nif_shared, emit_dispatch_nif, emit_call_nif_yield_helper) and 637-728
+// (emit_bif_nif_epilogue), OTP-29.1.1.
+fn emit_nif_fragments(
+    code: &mut CodeBuffer,
+    labels: NifFragmentLabels,
+    (beam_jit_call_nif, erts_call_nif_early, context_switch): (usize, usize, usize),
+    raise_exception: arinsal_a64::buf::Label,
+) -> Result<(), BufferError> {
+    const ARG3: Gpr = Gpr::x(2);
+    const PROCESS_I: u32 = 72;
+    const PROCESS_ARITY: u16 = 80;
+    const PROCESS_CURRENT: u32 = 88;
+    const PROCESS_FREASON: u32 = 40;
+    const CODE_MFA_BYTES: u16 = 24;
+    const CODE_MFA_ARITY: i16 = 16;
+    let prologue = crate::common::beam_asm_h::BEAM_ASM_FUNC_PROLOGUE_SIZE;
+
+    // call_nif_early: ARG2 = the ErtsCodeInfo behind the trampoline's `bl`; the stub's code
+    // from erts_call_nif_early is the phony I. The frame pushed by the trampoline is kept.
+    code.bind(labels.call_nif_early)?;
+    code.emit(|encoder| {
+        encoder.mov_reg(Gpr::x(1), Gpr::x(30))?;
+        encoder.sub_imm(
+            Gpr::x(1),
+            Gpr::x(1),
+            (prologue + crate::common::beam_asm_h::FUNC_INFO_BYTES) as u16,
+            false,
+        )
+    })?;
+    emit_enter_runtime(code, 6, Update::NONE)?;
+    code.emit(|encoder| {
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.mov_const(Gpr::x(17), erts_call_nif_early as u64)?;
+        encoder.blr(Gpr::x(17))
+    })?;
+    emit_leave_runtime(code, 6, Update::NONE)?;
+    code.emit(|encoder| encoder.mov_reg(ARG3, Gpr::x(0)))?;
+    code.b(labels.call_nif_shared)?;
+
+    // call_nif_shared: ARG3 = I, just past an ErtsCodeInfo; reductions are checked in module
+    // code, not here.
+    code.bind(labels.call_nif_shared)?;
+    emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
+    code.emit(|encoder| {
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.mov_reg(Gpr::x(1), ARG3)?;
+        crate::arm::beam_asm::load_x_reg_array(encoder, ARG3)?;
+        encoder.ldr_uoff(Gpr::x(3), Gpr::x(1), (4 + prologue) as u32)?;
+        encoder.ldr_uoff(Gpr::x(4), Gpr::x(1), (12 + prologue) as u32)?;
+        encoder.ldur(Gpr::x(5), Gpr::x(1), (16 + prologue) as i16)?;
+        encoder.mov_const(Gpr::x(17), beam_jit_call_nif as u64)?;
+        encoder.blr(Gpr::x(17))
+    })?;
+    // emit_bif_nif_epilogue.
+    emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
+    let check_trap = code.new_label();
+    let error = code.new_label();
+    code.cbz(Gpr::x(0), check_trap)?;
+    // Return to the continuation the trampoline pushed.
+    code.emit(|encoder| {
+        encoder.mov_reg(Gpr::x(25), Gpr::x(0))?;
+        encoder.ldr_post(Gpr::x(30), Gpr::x(20), 8)?;
+        encoder.ret(Gpr::x(30))
+    })?;
+    code.bind(check_trap)?;
+    code.emit(|encoder| {
+        encoder.ldr_uoff(Gpr::x(9), Gpr::x(21), PROCESS_FREASON)?;
+        encoder.cmp_imm(Gpr::x(9), TRAP_REASON, false)
+    })?;
+    code.b_cond(Cond::Ne, error)?;
+    // The BIF_TRAP macros set c_p->i, c_p->arity and c_p->current: context_switch_simplified
+    // continues at c_p->i.
+    code.emit(|encoder| {
+        encoder.mov_const(Gpr::x(17), context_switch as u64)?;
+        encoder.br(Gpr::x(17))
+    })?;
+    code.bind(error)?;
+    // raise_exception_shared with bif_mfa = c_p->current (set by beam_jit_call_nif); the
+    // exception pc is the continuation on E, which the raise fragment reads behind its host
+    // frame, tagged as a return site like the export fragment's.
+    code.emit(|encoder| {
+        encoder.ldr_uoff(Gpr::x(9), Gpr::x(20), 0)?;
+        encoder.orr_imm(Gpr::x(9), Gpr::x(9), crate::module::RETURN_SITE_TAG as u64)?;
+        encoder.str_uoff(Gpr::x(9), Gpr::x(19), tmp_mem_offset(6))?;
+        encoder.ldr_uoff(Gpr::x(30), Gpr::x(20), 0)?;
+        encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -32)?;
+        encoder.mov_reg(Gpr::x(29), Gpr::sp())
+    })?;
+    code.b(raise_exception)?;
+
+    // dispatch_nif: c_p->i points into an ErtsNativeFunc trampoline, which already has the
+    // NIF call layout.
+    code.bind(labels.dispatch_nif)?;
+    code.emit(|encoder| encoder.ldr_uoff(ARG3, Gpr::x(21), PROCESS_I))?;
+    code.b(labels.call_nif_shared)?;
+
+    // call_nif_yield_helper: ARG3 = the function's entry.
+    code.bind(labels.call_nif_yield_helper)?;
+    let yield_label = code.new_label();
+    code.emit(|encoder| encoder.subs_imm(Gpr::w(22), Gpr::w(22), 1, false))?;
+    code.b_cond(Cond::Le, yield_label)?;
+    code.b(labels.call_nif_shared)?;
+    code.bind(yield_label)?;
+    code.emit(|encoder| {
+        encoder.ldur(Gpr::w(9), ARG3, CODE_MFA_ARITY - CODE_MFA_BYTES as i16)?;
+        encoder.strb_uoff(Gpr::w(9), Gpr::x(21), PROCESS_ARITY)?;
+        encoder.sub_imm(Gpr::x(9), ARG3, CODE_MFA_BYTES, false)?;
+        encoder.str_uoff(Gpr::x(9), Gpr::x(21), PROCESS_CURRENT)?;
+        // Yield to `dispatch` rather than `entry`, so no second frame is pushed.
+        encoder.add_imm(
+            ARG3,
+            ARG3,
+            (crate::common::beam_asm_h::BEAM_ASM_NFUNC_SIZE + 24) as u16,
+            false,
+        )?;
+        // context_switch_simplified: `c_p->i = ARG3`.
+        encoder.str_uoff(ARG3, Gpr::x(21), PROCESS_I)?;
+        encoder.mov_const(Gpr::x(17), context_switch as u64)?;
+        encoder.br(Gpr::x(17))
+    })?;
+    Ok(())
 }
 
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:527-540, OTP-29.1.1.

@@ -67,7 +67,10 @@ impl Process {
             && self.cold.as_ref().is_none_or(|cold| {
                 cold.persistent_get_all.is_none()
                     && cold.apply_roots.is_empty()
-                    && cold.nif_pending.is_none()
+                    && cold
+                        .psd_nfunc_trap_wrapper
+                        .as_ref()
+                        .is_none_or(|nep| nep.get().argc <= 0)
                     && cold.call_memory.is_empty()
             })
             && !self.has_dirty_result_roots()
@@ -194,8 +197,12 @@ impl Process {
                 roots.push_term(&mut state.result);
             }
             roots.push(&mut cold.apply_roots);
-            if let Some(pending) = cold.nif_pending.as_mut() {
-                roots.push(pending.roots_mut());
+            // Port of erts/emulator/beam/erl_gc.c (setup_rootset: erts_setup_nfunc_rootset),
+            // OTP-29.1.1.
+            if let Some(argv) =
+                crate::erl_nfunc_sched::erts_setup_nfunc_rootset(&mut cold.psd_nfunc_trap_wrapper)
+            {
+                roots.push(argv);
             }
             for root in crate::dirty::dirty_root_slots(
                 &mut cold.dirty_bif,

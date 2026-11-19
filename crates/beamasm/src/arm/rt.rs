@@ -196,6 +196,40 @@ macro_rules! asm_sym {
         $name
     };
 }
+/// `labels[dispatch_nif]` of process_main: the global fragment a schedule-in branches to when
+/// `c_p->i` points at an `ErtsNativeFunc` trampoline holding `op_call_nif_WWW`. The entry
+/// trampoline below is this port's process_main, so it reads the label from here.
+// Port of erts/emulator/beam/jit/arm/process_main.cpp:250-267 (`labels[dispatch_nif]`),
+// OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub static ARINSAL_PROCESS_MAIN_DISPATCH_NIF: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Publishes the global fragments process_main dispatches to on schedule-in.
+pub fn set_process_main_labels(dispatch_nif: usize) {
+    ARINSAL_PROCESS_MAIN_DISPATCH_NIF
+        .store(dispatch_nif as u64, core::sync::atomic::Ordering::Release);
+}
+
+#[cfg(target_vendor = "apple")]
+macro_rules! asm_load_dispatch_nif {
+    () => {
+        concat!(
+            "adrp x2, _ARINSAL_PROCESS_MAIN_DISPATCH_NIF@PAGE\n",
+            "ldr x2, [x2, _ARINSAL_PROCESS_MAIN_DISPATCH_NIF@PAGEOFF]"
+        )
+    };
+}
+#[cfg(not(target_vendor = "apple"))]
+macro_rules! asm_load_dispatch_nif {
+    () => {
+        concat!(
+            "adrp x2, ARINSAL_PROCESS_MAIN_DISPATCH_NIF\n",
+            "ldr x2, [x2, :lo12:ARINSAL_PROCESS_MAIN_DISPATCH_NIF]"
+        )
+    };
+}
+
 #[cfg(target_vendor = "apple")]
 macro_rules! asm_load_enter_native_return {
     () => {
@@ -325,6 +359,15 @@ core::arch::global_asm!(
     asm_load_enter_native_return!(),
     // Runtime error fragments use this slot after runtime hooks replace x30.
     "str x30, [x19, #{exit_fragment}]",
+    // Port of erts/emulator/beam/jit/arm/process_main.cpp:250-267, OTP-29.1.1: a process
+    // returning from a dirty or scheduled NIF has `c_p->i` (x2, which the runtime stored in
+    // `c_p->i`) on an `ErtsNativeFunc` trampoline, encoded as UDF(op_call_nif_WWW), UDF(0),
+    // which native code never emits; it continues in `dispatch_nif`.
+    "ldr x9, [x2]",
+    "cmp x9, #{op_call_nif}",
+    "b.ne 3f",
+    asm_load_dispatch_nif!(),
+    "3:",
     // A call entered from the scheduler returns to its caller's continuation, so the
     // callee's frame holds that real CP instead of the bridge (`entry_return`).
     "ldr x9, [x19, #{entry_return}]",
@@ -384,6 +427,7 @@ core::arch::global_asm!(
     "ldp x29, x30, [sp], #16",
     "ret",
     active_code_ix = const super::beam_asm::sched_ref(core::mem::offset_of!(SchedulerRegisters, active_code_ix)),
+    op_call_nif = const arinsal_term::OP_CALL_NIF_WWW,
     entry_return = const super::beam_asm::sched_ref(core::mem::offset_of!(SchedulerRegisters, entry_return)),
     exit_fragment = const super::beam_asm::tmp_mem_ref(4),
     exit_marker = const super::beam_asm::tmp_mem_ref(3),

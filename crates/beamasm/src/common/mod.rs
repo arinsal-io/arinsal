@@ -3,6 +3,7 @@
 //! shared by every target emitter.
 
 pub mod args;
+pub mod beam_asm_h;
 pub mod bs;
 pub mod process;
 pub mod process_offsets;

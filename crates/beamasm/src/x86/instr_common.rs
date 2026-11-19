@@ -1634,13 +1634,14 @@ impl BeamModuleAssembler {
     // have) is off, so `c_p->i` is not stored.
     pub fn emit_i_test_yield(&mut self) -> Result<(), AsmError> {
         use super::beam_asm::register::FCALLS;
-        use super::beam_asm_global::{BEAM_ASM_FUNC_PROLOGUE_SIZE, TEST_YIELD_RETURN_OFFSET};
+        use super::beam_asm_global::TEST_YIELD_RETURN_OFFSET;
+        use crate::common::beam_asm_h::BEAM_ASM_FUNC_PROLOGUE_SIZE;
         let current = self
             .current_label()
             .ok_or(AsmError::Operand("i_test_yield outside a function"))?;
         debug_assert_eq!(
             self.current_label_offset(),
-            Some(self.asm.a.offset() - BEAM_ASM_FUNC_PROLOGUE_SIZE as usize)
+            Some(self.asm.a.offset() - BEAM_ASM_FUNC_PROLOGUE_SIZE)
         );
         self.asm.emit_enter_frame()?;
         self.asm.a.emit_rip_label(current, |e| {

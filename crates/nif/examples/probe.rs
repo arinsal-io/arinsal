@@ -2,7 +2,6 @@ use std::hint::black_box;
 use std::path::Path;
 use std::time::Instant;
 
-use arinsal_bifs::{Ctx, ProcessHeapHandle};
 use arinsal_nif::{LoadInfo, load_nif};
 use arinsal_term::{ProcessHeap, Term, TermBuilder, VecHeap, global_atoms};
 
@@ -33,23 +32,18 @@ fn main() {
     if module == "nb" {
         let args = [Term::small(2).unwrap(), Term::small(3).unwrap()];
         for (name, args) in [("noop", &args[..1]), ("add", &args[..])] {
-            let mut state = arinsal_bifs::BifState::default();
-            let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut output_heap), &mut state);
             let result = library
                 .lookup(name, args.len())
                 .unwrap()
-                .call(&mut ctx, args)
-                .unwrap();
+                .call(&mut output_heap, args);
             println!("{name}: {}", result.as_small().unwrap());
         }
-        let mut state = arinsal_bifs::BifState::default();
-        let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut output_heap), &mut state);
         for (name, args) in [("noop", &args[..1]), ("add", &args[..])] {
             let callback = library.lookup(name, args.len()).unwrap();
             let count = 5_000_000;
             let start = Instant::now();
             for _ in 0..count {
-                black_box(callback.call(black_box(&mut ctx), black_box(args)).unwrap());
+                black_box(callback.call(black_box(&mut output_heap), black_box(args)));
             }
             println!(
                 "{name} adapter: {:.1} ns/call",
@@ -74,13 +68,10 @@ fn main() {
             ("ng_crypto_one_time_nif", vec![aes, key, iv, abc, yes]),
         ];
         for (name, args) in calls {
-            let mut state = arinsal_bifs::BifState::default();
-            let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut output_heap), &mut state);
             let result = library
                 .lookup(name, args.len())
                 .unwrap()
-                .call(&mut ctx, &args)
-                .unwrap();
+                .call(&mut output_heap, &args);
             // SAFETY: heap remains live and stable while printing the result.
             let view = unsafe { result.binary_ref() }.unwrap();
             let data = &view.bytes()[view.start_bit() / 8..][..view.bit_len() / 8];

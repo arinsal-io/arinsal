@@ -34,6 +34,12 @@ pub(crate) fn beamasm_init() {
         unloaded_fun: fragments.unloaded_fun(),
         i_line_breakpoint_cleanup: fragments.line_breakpoint_cleanup(),
     });
+    arinsal_beamasm::set_process_main_labels(fragments.dispatch_nif());
+}
+
+/// The `call_nif_yield_helper` global fragment, which `call_nif` code jumps to.
+pub(crate) fn call_nif_yield_helper() -> Option<usize> {
+    fragments().map(DispatchFragments::call_nif_yield_helper)
 }
 
 fn fragments() -> Option<&'static DispatchFragments> {
@@ -59,9 +65,8 @@ fn fragments() -> Option<&'static DispatchFragments> {
                         as usize,
                     compare: CompareHelpers {
                         eq: crate::utils::eq as *const () as usize,
-                        cmp_atoms: crate::native_hooks::arinsal_cmp_atoms as *const () as usize,
-                        cmp_compound: crate::native_hooks::arinsal_cmp_compound as *const ()
-                            as usize,
+                        cmp_atoms: crate::native_hooks::erts_cmp_atoms as *const () as usize,
+                        cmp_compound: crate::native_hooks::erts_cmp_compound as *const () as usize,
                     },
                     line_breakpoint: arinsal_beamasm::dispatch::LineBreakpointHelpers {
                         garbage_collect: crate::native_helpers::arinsal_beamasm_gc_sync as *const ()
@@ -75,6 +80,11 @@ fn fragments() -> Option<&'static DispatchFragments> {
                         as *const () as usize,
                     call_error_handler: crate::native_helpers::arinsal_beamasm_call_error_handler
                         as *const () as usize,
+                    beam_jit_call_nif: crate::beam_jit_common::beam_jit_call_nif as *const ()
+                        as usize,
+                    erts_call_nif_early: crate::natives::nif::erts_call_nif_early as *const ()
+                        as usize,
+                    context_switch: yield_fragments()?.context_switch(),
                 },
             )
             .ok()?;
@@ -218,13 +228,6 @@ pub(crate) struct CompiledVersion {
     line_breakpoints: Vec<(u32, usize, u32)>,
     // Return addresses of enabled line-breakpoint hits, ascending.
     line_breakpoint_returns: Vec<(usize, usize)>,
-    // Function, arity, call-NIF site (an index into `nif_sites`) and the patch word that
-    // enables its body.
-    nif_patches: Vec<(String, u8, usize, usize)>,
-    // Every call-NIF site compiled into this version's code, which refers to their addresses;
-    // each site is boxed so its address stays put.
-    #[allow(clippy::vec_box)]
-    nif_sites: Vec<Box<crate::native_helpers::NativeNifSite>>,
     literal_heap: std::sync::Mutex<Option<Arc<VecHeap>>>,
     // The module's literal area, which native code refers to directly.
     _module_literals: arinsal_loader::LiteralArea,
@@ -273,10 +276,60 @@ pub(crate) fn patch_native_breakpoints(module: &str, wanted: &[(&str, u8, bool)]
             let Some(&enabled) = wanted.get(key) else {
                 continue;
             };
-            let instruction = if enabled { 0xd503_201f_u32 } else { *branch };
-            let _ = memory.write_bytes(*offset, &instruction.to_le_bytes());
+            // Port of erts/emulator/beam/beam_bp.c:625-640 (consolidate_bp_data /
+            // uninstall_breakpoint), OTP-29.1.1.
+            let ci = *offset - TRAMPOLINE_BRANCH_OFFSET;
+            let _ = if enabled {
+                erts_asm_bp_set_flag(&mut memory, ci, ERTS_ASM_BP_FLAG_BP)
+            } else {
+                erts_asm_bp_unset_flag(&mut memory, ci, *branch, ERTS_ASM_BP_FLAG_BP)
+            };
         }
     }
+}
+
+use arinsal_beamasm::common::beam_asm_h::{BREAKPOINT_FLAG_OFFSET, ERTS_ASM_BP_FLAG_BP};
+/// Bytes from a function's `ErtsCodeInfo` to the branch of its breakpoint trampoline: the
+/// `ErtsCodeInfo` itself, then the `str x30` of emit_enter_erlang_frame.
+// Port of erts/emulator/beam/jit/beam_asm.h:234-238 (`(Uint32 *)rw_p + 1` on AArch64),
+// OTP-29.1.1.
+const TRAMPOLINE_BRANCH_OFFSET: usize = arinsal_beamasm::common::beam_asm_h::FUNC_INFO_BYTES + 4;
+/// `B .enabled`: the trampoline branch rerouted to the `bl` of the shared breakpoint fragment.
+// Port of erts/emulator/beam/jit/beam_asm.h:186-197 (erts_asm_bp_enable), OTP-29.1.1.
+const BP_BRANCH_ENABLED: u32 = 0x1400_0001;
+
+/// Sets `flag` in the `breakpoint_flag` of the `ErtsCodeInfo` at offset `ci`; the first flag
+/// reroutes the trampoline branch to the shared breakpoint fragment.
+// Port of erts/emulator/beam/jit/beam_asm.h:227-242 (erts_asm_bp_set_flag), OTP-29.1.1.
+fn erts_asm_bp_set_flag(
+    memory: &mut arinsal_a64::exec::CodeMemory,
+    ci: usize,
+    flag: u8,
+) -> Result<(), arinsal_a64::exec::ExecError> {
+    memory.write(ci, TRAMPOLINE_BRANCH_OFFSET + 4, |rw| {
+        if rw[BREAKPOINT_FLAG_OFFSET] == 0 {
+            rw[TRAMPOLINE_BRANCH_OFFSET..].copy_from_slice(&BP_BRANCH_ENABLED.to_le_bytes());
+        }
+        rw[BREAKPOINT_FLAG_OFFSET] |= flag;
+    })
+}
+
+/// Clears `flag`; when no flag is left, the trampoline branch goes back to `disabled`, the
+/// branch past the prologue.
+// Port of erts/emulator/beam/jit/beam_asm.h:244-262 (erts_asm_bp_unset_flag) and 199-210
+// (erts_asm_bp_disable), OTP-29.1.1.
+fn erts_asm_bp_unset_flag(
+    memory: &mut arinsal_a64::exec::CodeMemory,
+    ci: usize,
+    disabled: u32,
+    flag: u8,
+) -> Result<(), arinsal_a64::exec::ExecError> {
+    memory.write(ci, TRAMPOLINE_BRANCH_OFFSET + 4, |rw| {
+        rw[BREAKPOINT_FLAG_OFFSET] &= !flag;
+        if rw[BREAKPOINT_FLAG_OFFSET] == 0 {
+            rw[TRAMPOLINE_BRANCH_OFFSET..].copy_from_slice(&disabled.to_le_bytes());
+        }
+    })
 }
 
 /// The address standing for the instrumented function in the stack frame of a native
@@ -354,13 +407,6 @@ impl CompiledVersion {
             .map(|native| native.start)
     }
 
-    /// Whether this version has native code for `function/arity`.
-    pub(crate) fn has_native_function(&self, function: &str, arity: u8) -> bool {
-        self.native_functions
-            .iter()
-            .any(|native| native.function == function && native.arity == arity)
-    }
-
     /// Whether `address` lies in this version's generated code.
     pub(crate) fn contains_code(&self, address: usize) -> bool {
         (self.code_start..self.code_end).contains(&address)
@@ -377,40 +423,55 @@ impl CompiledVersion {
             .filter(|function| pc < function.end)
     }
 
-    fn nif_patch(&self, function: &str, arity: u8) -> Option<(usize, usize)> {
-        self.nif_patches
+    /// The `ErtsCodeInfo` address of the native code of `function/arity`.
+    pub(crate) fn code_info(&self, function: arinsal_term::Atom, arity: u8) -> Option<usize> {
+        self.trace_breakpoints
             .iter()
-            .find(|(name, found, _, _)| name == function && *found == arity)
-            .map(|(_, _, site, offset)| (*site, *offset))
+            .find(|(key, _, _)| *key == (function, arity))
+            .map(|(_, offset, _)| self.code_start + offset - TRAMPOLINE_BRANCH_OFFSET)
     }
 
-    /// Writes the `call_nif` operands of `function/arity`, loaded by `load_nif`, into its
-    /// call-NIF site.
-    // Port of erts/emulator/beam/erl_nif.c:5149-5160 (load_nif_1st_finisher), OTP-29.1.1.
-    pub(crate) fn bind_nif(
-        &self,
-        function: &str,
-        arity: u8,
-        native: crate::natives::nif::NativeFn,
-    ) -> bool {
-        self.nif_patch(function, arity)
-            .and_then(|(site, _)| self.nif_sites.get(site))
-            .is_some_and(|site| site.bind(native))
+    /// [`erts_asm_bp_set_flag`] on the `ErtsCodeInfo` at address `ci`.
+    pub(crate) fn erts_asm_bp_set_flag(&self, ci: usize, flag: u8) {
+        let mut memory = self
+            .memory
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        erts_asm_bp_set_flag(&mut memory, ci - self.code_start, flag)
+            .expect("code info inside the module's code");
     }
 
-    /// Makes native entries of `function/arity` run their bound NIF.
-    // Port of erts/emulator/beam/erl_nif.c:5248-5250 (load_nif_2nd_finisher removes the
-    // call_nif_early breakpoint), OTP-29.1.1.
-    pub(crate) fn enable_nif(&self, function: &str, arity: u8) -> bool {
-        let Some((_, offset)) = self.nif_patch(function, arity) else {
-            return false;
+    /// [`erts_asm_bp_unset_flag`] on the `ErtsCodeInfo` at address `ci`.
+    pub(crate) fn erts_asm_bp_unset_flag(&self, ci: usize, flag: u8) {
+        let offset = ci - self.code_start;
+        let Some(&(_, _, disabled)) = self
+            .trace_breakpoints
+            .iter()
+            .find(|(_, site, _)| *site == offset + TRAMPOLINE_BRANCH_OFFSET)
+        else {
+            return;
         };
-        let Ok(mut memory) = self.memory.lock() else {
-            return false;
-        };
+        let mut memory = self
+            .memory
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        erts_asm_bp_unset_flag(&mut memory, offset, disabled, flag)
+            .expect("code info inside the module's code");
+    }
+
+    /// Copies `call_nif` code over the function whose `ErtsCodeInfo` is at `ci`, from
+    /// `prologue` bytes into its code on.
+    // Port of erts/emulator/beam/erl_nif.c:5149-5160 (load_nif_1st_finisher: sys_memcpy behind
+    // BEAM_ASM_FUNC_PROLOGUE_SIZE), OTP-29.1.1.
+    pub(crate) fn copy_call_nif(&self, ci: usize, code: &[u8], prologue: usize) {
+        let code_rw = ci - self.code_start + arinsal_beamasm::common::beam_asm_h::FUNC_INFO_BYTES;
+        let mut memory = self
+            .memory
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         memory
-            .write_bytes(offset, &0xd503_201f_u32.to_le_bytes())
-            .is_ok()
+            .write_bytes(code_rw + prologue, &code[prologue..])
+            .expect("function body inside the module's code");
     }
 
     // Port of erts/emulator/beam/beam_load.c:258 and jit/asm_load.c:1149-1218, OTP-29.1.1.
@@ -611,9 +672,6 @@ struct VmModuleEnv<'a> {
     coverage: Option<arinsal_loader::Coverage>,
     module_handle: u64,
     lambda_targets: std::cell::RefCell<HashMap<u32, usize>>,
-    // Call-NIF sites of functions a later load_nif may replace.
-    dynamic_nifs:
-        std::cell::RefCell<HashMap<(String, u8), Box<crate::native_helpers::NativeNifSite>>>,
     _lifetime: std::marker::PhantomData<&'a BeamFile>,
 }
 
@@ -702,7 +760,6 @@ impl<'a> VmModuleEnv<'a> {
             coverage: module.coverage.clone(),
             module_handle,
             lambda_targets: std::cell::RefCell::new(HashMap::new()),
-            dynamic_nifs: std::cell::RefCell::new(HashMap::new()),
             _lifetime: std::marker::PhantomData,
         })
     }
@@ -947,21 +1004,6 @@ impl ModuleEnv for VmModuleEnv<'_> {
         ))
     }
 
-    fn dynamic_nif_body(&self, name: &str, arity: u8) -> Option<(usize, usize)> {
-        let mut sites = self.dynamic_nifs.borrow_mut();
-        let site = sites.entry((name.to_owned(), arity)).or_insert_with(|| {
-            crate::native_helpers::NativeNifSite::new(
-                self.module_name.clone(),
-                name.to_owned(),
-                arity,
-            )
-        });
-        Some((
-            std::ptr::from_ref::<crate::native_helpers::NativeNifSite>(site) as usize,
-            crate::native_helpers::arinsal_beamasm_call_nif as *const () as usize,
-        ))
-    }
-
     fn publish_lambda_target(
         &self,
         _beam: &BeamFile,
@@ -1130,12 +1172,12 @@ impl ModuleEnv for VmModuleEnv<'_> {
         );
         arinsal_beamasm::bs_construct::install_bs_gc(self.gc_hook());
         arinsal_beamasm::bs_construct::install_bs_private_append(
-            crate::native_helpers::arinsal_beamasm_bs_private_append_checked as *const () as usize,
+            crate::raw::erl_bits::erts_bs_private_append_checked as *const () as usize,
         );
         use arinsal_beamasm::bs_construct::BsCreateBinHelpers;
         BsCreateBinHelpers {
             append_checked: crate::native_helpers::bs_construct_raw::append_checked,
-            private_append: crate::native_helpers::bs_construct_raw::private_append,
+            private_append: crate::raw::erl_bits::private_append_from_reg,
             init_bits: crate::native_helpers::bs_construct_raw::init_bits,
             bit_size: crate::native_helpers::bs_construct_raw::bit_size,
             utf8_size: crate::native_helpers::bs_construct_raw::utf8_size,
@@ -1324,27 +1366,6 @@ pub(crate) fn compile(
                 .map(|entry| (entry, *target))
         })
         .collect();
-    // Every site stays with the code: the code of a function whose compilation failed may
-    // still hold the address of its site.
-    let mut site_index = HashMap::new();
-    let mut nif_sites = Vec::new();
-    for (key, site) in env.dynamic_nifs.take() {
-        site_index.insert(key, nif_sites.len());
-        nif_sites.push(site);
-    }
-    let nif_patches = compiled
-        .native
-        .nif_patches
-        .iter()
-        .filter_map(|(&label, &offset)| {
-            let function = compiled
-                .functions
-                .iter()
-                .find(|function| function.label == label)?;
-            let site = *site_index.get(&(function.name.to_owned(), function.arity))?;
-            Some((function.name.to_owned(), function.arity, site, offset))
-        })
-        .collect::<Vec<_>>();
     drop(env);
     MODULES.fetch_add(1, Ordering::Relaxed);
     NATIVE.fetch_add(runtime_functions.len() as u64, Ordering::Relaxed);
@@ -1352,7 +1373,7 @@ pub(crate) fn compile(
         .functions
         .iter()
         .filter_map(|function| compiled.native.entries.get(&function.label))
-        .map(|entry| *entry as usize + arinsal_beamasm::module::FUNC_INFO_BYTES)
+        .map(|entry| *entry as usize + arinsal_beamasm::common::beam_asm_h::FUNC_INFO_BYTES)
         .collect::<Vec<_>>();
     function_starts.sort_unstable();
     let code_start = compiled.native.memory.as_ptr() as usize;
@@ -1393,7 +1414,7 @@ pub(crate) fn compile(
             let entry = compiled.native.entries.get(&function.label)?;
             Some((
                 (module.name_atom, name, function.arity),
-                *entry as usize + arinsal_beamasm::module::FUNC_INFO_BYTES,
+                *entry as usize + arinsal_beamasm::common::beam_asm_h::FUNC_INFO_BYTES,
             ))
         })
         .collect::<Vec<_>>();
@@ -1439,11 +1460,10 @@ pub(crate) fn compile(
         .chain(std::iter::once(code_end))
         .collect();
     for function in &compiled.functions {
-        let Some(start) = compiled
-            .native
-            .entries
-            .get(&function.label)
-            .map(|entry| *entry as usize + arinsal_beamasm::module::FUNC_INFO_BYTES)
+        let Some(start) =
+            compiled.native.entries.get(&function.label).map(|entry| {
+                *entry as usize + arinsal_beamasm::common::beam_asm_h::FUNC_INFO_BYTES
+            })
         else {
             if lifetime_trace_enabled() {
                 eprintln!(
@@ -1533,8 +1553,6 @@ pub(crate) fn compile(
             .iter()
             .map(|(resume, site)| (code_start + resume, code_start + site))
             .collect(),
-        nif_patches,
-        nif_sites,
         literal_heap: std::sync::Mutex::new(Some(Arc::from(literal_heap))),
         _module_literals: module.literal_area(),
         _coverage: module.coverage.clone(),
@@ -1572,6 +1590,11 @@ pub(crate) fn set_trace_return_hook(registers: &mut arinsal_beamasm::SchedulerRe
 pub(crate) fn tagged_return_site(pc: usize) -> Option<usize> {
     let tag = arinsal_beamasm::module::RETURN_SITE_TAG;
     (pc & tag != 0).then_some(pc & !tag)
+}
+
+/// `return_address` tagged with [`arinsal_beamasm::module::RETURN_SITE_TAG`].
+pub(crate) fn tag_return_site(return_address: usize) -> usize {
+    return_address | arinsal_beamasm::module::RETURN_SITE_TAG
 }
 
 pub(crate) fn count_native_call() {

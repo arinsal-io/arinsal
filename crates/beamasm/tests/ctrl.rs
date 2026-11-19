@@ -167,7 +167,7 @@ fn move_return_local_call_frame_tail_yield_and_far_call() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn function_entries_are_eight_byte_aligned_behind_a_forty_byte_info_slot() {
-    use arinsal_beamasm::module::FUNC_INFO_BYTES;
+    use arinsal_beamasm::common::beam_asm_h::FUNC_INFO_BYTES;
 
     let mut asm = BeamModuleAssembler::new();
     for label in [1u32, 2, 3] {

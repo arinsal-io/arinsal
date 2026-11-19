@@ -637,31 +637,36 @@ pub extern "C" fn enif_make_ref(e: *mut ErlNifEnv) -> Term {
     Term::local_ref_with_ids(&mut env(e).heap, arinsal_sched::unique::next_ref_words)
         .unwrap_or_else(|| enif_make_badarg(e))
 }
+// Port of erts/emulator/beam/erl_nif.c:1791-1794 (enif_make_badarg), OTP-29.1.1.
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_make_badarg(e: *mut ErlNifEnv) -> Term {
     let bad = Term::atom(global_atoms().get("badarg").expect("preloaded badarg"));
-    env(e).pending = Some(bad);
-    term(0)
+    enif_raise_exception(e, bad)
 }
+// Port of erts/emulator/beam/erl_nif.c:1796-1801 (enif_raise_exception: exception_thrown,
+// `env->proc->fvalue = reason`, BIF_ERROR(env->proc, EXC_ERROR)), OTP-29.1.1.
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_raise_exception(e: *mut ErlNifEnv, reason: Term) -> Term {
-    env(e).pending = Some(reason);
-    term(0)
+    let env = env(e);
+    env.exception_thrown = true;
+    let exc = env.heap.exc_mut();
+    exc.fvalue = bits(reason);
+    exc.freason = arinsal_term::exc::EXC_ERROR;
+    Term::NON_VALUE
 }
+// Port of erts/emulator/beam/erl_nif.c:1803-1808 (enif_has_pending_exception), OTP-29.1.1.
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_has_pending_exception(e: *mut ErlNifEnv, reason: *mut Term) -> c_int {
-    if let Some(r) = env(e).pending {
-        if !reason.is_null() {
-            put(reason, r)
-        };
-        1
-    } else {
-        0
+    let env = env(e);
+    if env.exception_thrown && !reason.is_null() {
+        put(reason, term(env.heap.exc().fvalue));
     }
+    c_int::from(env.exception_thrown)
 }
+// Port of erts/emulator/beam/erl_nif.c:1288-1291 (enif_is_exception), OTP-29.1.1.
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_is_exception(e: *mut ErlNifEnv, t: Term) -> c_int {
-    i32::from(bits(t) == 0 && env(e).pending.is_some())
+    c_int::from(env(e).exception_thrown && t.is_non_value())
 }
 
 #[unsafe(no_mangle)]
@@ -942,44 +947,18 @@ pub extern "C" fn enif_consume_timeslice(e: *mut ErlNifEnv, percent: c_int) -> c
     // Port of erts/emulator/beam/erl_nif.c:3341-3360 (enif_consume_timeslice), OTP-29.1.1:
     // a no-op on a dirty scheduler; otherwise BUMP_REDS of `percent` of CONTEXT_REDS, and 1
     // when the process has no reductions left.
-    const CONTEXT_REDS: i64 = 4000;
-    let env = env(e);
-    let Some(left) = env.reds_left else {
+    const CONTEXT_REDS: i32 = 4000;
+    if super::is_scheduler() < 0 {
+        return 0;
+    }
+    let percent = percent.clamp(1, 100);
+    let Some(p) = env(e).heap.proc_env() else {
         return 0;
     };
-    let percent = i64::from(percent.clamp(1, 100));
-    env.consumed += ((CONTEXT_REDS + 99) / 100) * percent;
-    c_int::from(left - env.consumed <= 0)
+    let proc = p.proc_mut();
+    super::bump_reds(proc, ((CONTEXT_REDS + 99) / 100) * percent);
+    c_int::from(proc.abi.fcalls == 0)
 }
-#[unsafe(no_mangle)]
-pub extern "C" fn enif_schedule_nif(
-    e: *mut ErlNifEnv,
-    _name: *const c_char,
-    flags: c_int,
-    f: Option<unsafe extern "C" fn(*mut ErlNifEnv, c_int, *const Term) -> Term>,
-    argc: c_int,
-    argv: *const Term,
-) -> Term {
-    let Some(f) = f else {
-        return enif_make_badarg(e);
-    };
-    // Port of erts/emulator/beam/erl_nif.c:3540 (enif_schedule_nif), OTP-29.1.1.
-    // Flags other than 0 or a combination of the two dirty job bits raise badarg; a
-    // combination of both selects the I/O pool (see `scheduler_class`).
-    if argc < 0 || (argc > 0 && argv.is_null()) || !(0..=3).contains(&flags) || env(e).independent {
-        return enif_make_badarg(e);
-    };
-    // SAFETY: NIF passes a live argument array whose terms remain on the bound heap.
-    let args = if argc == 0 {
-        Vec::new()
-    } else {
-        // SAFETY: a positive arity requires a live argument array.
-        slice(argv, argc as usize).to_vec()
-    };
-    env(e).scheduled = Some((f, flags, args));
-    term(0)
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_make_new_map(e: *mut ErlNifEnv) -> Term {
     built(env(e), |b| b.flatmap_from_pairs(&[]))
@@ -1117,7 +1096,6 @@ pub(crate) fn retain_exports() {
         enif_make_map_from_arrays as *const () as usize,
         enif_inspect_iolist_as_binary as *const () as usize,
         enif_make_copy as *const () as usize,
-        enif_schedule_nif as *const () as usize,
         enif_raise_exception as *const () as usize,
     ];
     black_box(exports);

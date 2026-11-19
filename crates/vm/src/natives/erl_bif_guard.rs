@@ -39,6 +39,52 @@ pub(crate) extern "C" fn erlang_length_trap(c_p: *mut ProcessHeader, reg: *mut u
     length_run(c_p, reg, i, process, list, acc, original)
 }
 
+/// The common result of erts_trapping_length_1 before the caller packages its trap or error.
+enum LengthOutcome {
+    Complete(Term),
+    Trap,
+    BadArg,
+    SystemLimit,
+}
+
+/// Port of erts/emulator/beam/erl_bif_guard.c:270-312 (erts_trapping_length_1), OTP-29.1.1.
+fn trapping_length(process: &mut crate::Process, args: &mut [Term]) -> LengthOutcome {
+    let [cursor, accumulator] = args else {
+        return LengthOutcome::BadArg;
+    };
+    let Some(mut count) = accumulator.as_small().and_then(|n| usize::try_from(n).ok()) else {
+        return LengthOutcome::BadArg;
+    };
+    let budget = process.heap.abi.fcalls.max(0) as usize * 16;
+    let mut scanned = 0usize;
+    while scanned < budget {
+        let Ok(cons) = Cons::try_from(*cursor) else {
+            break;
+        };
+        *cursor = cons.tail();
+        count = count.wrapping_add(1);
+        scanned += 1;
+    }
+    if Cons::try_from(*cursor).is_ok() {
+        let Some(accumulator) = i64::try_from(count).ok().and_then(Term::small) else {
+            return LengthOutcome::SystemLimit;
+        };
+        args[1] = accumulator;
+        process.heap.abi.exc.freason = arinsal_term::exc::TRAP;
+        process.heap.abi.fcalls = 0;
+        return LengthOutcome::Trap;
+    }
+    if *cursor != Term::NIL {
+        return LengthOutcome::BadArg;
+    }
+    let reds = (scanned / 16).min(i32::MAX as usize) as i32;
+    process.heap.abi.fcalls = (process.heap.abi.fcalls - reds).max(0);
+    match i64::try_from(count).ok().and_then(Term::small) {
+        Some(length) => LengthOutcome::Complete(length),
+        None => LengthOutcome::SystemLimit,
+    }
+}
+
 /// `erts_trapping_length_1` and the result handling of `erlang_length_trap`: the length,
 /// `BIF_TRAP3(&erlang_length_export, ...)`, or `ERTS_BIF_ERROR_TRAPPED1` naming `length/1`
 /// with the original argument.
@@ -51,40 +97,52 @@ fn length_run(
     acc: usize,
     original: Term,
 ) -> u64 {
-    let budget = process.heap.abi.fcalls.max(0) as usize * 16;
-    let mut cursor = list;
-    let mut count = acc;
-    let mut scanned = 0usize;
-    while scanned < budget {
-        let Some(cons) = Cons::try_from(cursor).ok() else {
-            break;
-        };
-        cursor = cons.tail();
-        count += 1;
-        scanned += 1;
-    }
-    if Cons::try_from(cursor).is_ok() {
-        process.heap.abi.fcalls = 0;
-        let Some(acc) = i64::try_from(count).ok().and_then(Term::small) else {
-            return bif_system_limit(c_p);
-        };
-        let trap = crate::natives::erl_bif_lists::bif_trap(
-            process,
-            "erlang:length/3",
-            vec![cursor, acc, original],
-        );
-        return bif_ret(c_p, i, Err(trap));
-    }
-    if cursor != Term::NIL {
-        crate::bif_table::set_bif_arg(reg, 0, original);
-        return bif_badarg(c_p);
-    }
-    let reds = (scanned / 16).min(i32::MAX as usize) as i32;
-    process.heap.abi.fcalls = (process.heap.abi.fcalls - reds).max(0);
-    let Some(value) = i64::try_from(count).ok().and_then(Term::small) else {
+    let Some(accumulator) = i64::try_from(acc).ok().and_then(Term::small) else {
         return bif_system_limit(c_p);
     };
-    crate::native_hooks::raw(value)
+    let mut args = [list, accumulator];
+    match trapping_length(process, &mut args) {
+        LengthOutcome::Complete(value) => crate::native_hooks::raw(value),
+        LengthOutcome::Trap => {
+            let trap = crate::natives::erl_bif_lists::bif_trap(
+                process,
+                "erlang:length/3",
+                vec![args[0], args[1], original],
+            );
+            bif_ret(c_p, i, Err(trap))
+        }
+        LengthOutcome::BadArg => {
+            crate::bif_table::set_bif_arg(reg, 0, original);
+            bif_badarg(c_p)
+        }
+        LengthOutcome::SystemLimit => bif_system_limit(c_p),
+    }
+}
+
+/// Trappable native-code length helper.
+// Port of erts/emulator/beam/erl_bif_guard.c:270-312 (erts_trapping_length_1), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn erts_trapping_length_1(header: *mut ProcessHeader, raw_args: *mut u64) -> u64 {
+    let Some(process) = crate::native_hooks::enter_runtime(header) else {
+        return crate::native_hooks::raw(Term::NON_VALUE);
+    };
+    let outcome = crate::raw::runtime_ffi::with_runtime_terms(raw_args, 2, |args| {
+        trapping_length(process, args)
+    });
+    match outcome {
+        Some(LengthOutcome::Complete(value)) => crate::native_hooks::raw(value),
+        Some(LengthOutcome::Trap) => crate::native_hooks::raw(Term::NON_VALUE),
+        Some(LengthOutcome::BadArg) => {
+            process.heap.abi.exc.freason = arinsal_beamasm::exc::EXC_BADARG;
+            process.heap.abi.exc.fvalue = crate::atom_cache::put("badarg").tagged_word();
+            crate::native_hooks::raw(Term::NON_VALUE)
+        }
+        Some(LengthOutcome::SystemLimit) => {
+            process.heap.abi.exc.freason = arinsal_beamasm::exc::EXC_SYSTEM_LIMIT;
+            crate::native_hooks::raw(Term::NON_VALUE)
+        }
+        None => crate::native_hooks::raw(Term::NON_VALUE),
+    }
 }
 
 /// `erlang:min/2`.

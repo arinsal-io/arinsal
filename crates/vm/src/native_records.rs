@@ -305,6 +305,225 @@ fn update_record(
         .map_err(|_| Failure::SystemLimit)
 }
 
+/// Port of the x86 `GetSource` operands in erl_record.c's native record helpers.
+fn x86_elements(
+    elements: *const u64,
+    count: usize,
+    x: &[Term],
+    stack: &arinsal_term::ProcessHeap,
+) -> Option<Vec<Term>> {
+    let elements = crate::raw::runtime_ffi::RuntimeOperandArray::from_raw(elements, count)?;
+    crate::raw::runtime_ffi::resolve_operands(elements, x, stack)
+}
+
+/// Scans the definition's atom-sorted fields once and writes values for the sorted request.
+// Port of erts/emulator/beam/erl_record.c:223-252 (erl_get_record_elements), OTP-29.1.1.
+fn scan_record_elements(
+    definition: &Definition,
+    values: &[Term],
+    count: usize,
+    mut match_and_put: impl FnMut(usize, Term, Term) -> Option<bool>,
+) -> bool {
+    let mut next = 0;
+    for (key, value) in definition.keys.iter().zip(values) {
+        if next < count {
+            match match_and_put(next, Term::atom(*key), *value) {
+                None => return false,
+                Some(true) => {
+                    next += 1;
+                    if next == count {
+                        return true;
+                    }
+                }
+                Some(false) => {}
+            }
+        }
+    }
+    false
+}
+
+/// Port of erts/emulator/beam/erl_record.c:223-252 (erl_get_record_elements), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn erl_get_record_elements(
+    header: *mut ProcessHeader,
+    reg: *mut u64,
+    source: u64,
+    count: usize,
+    elements: *const u64,
+) -> bool {
+    let Some((process, registers)) = native_hooks::enter_runtime_reg(header, reg) else {
+        return false;
+    };
+    let Some(operands) = crate::raw::runtime_ffi::RuntimeOperandArray::from_raw(elements, count)
+    else {
+        return false;
+    };
+    let Some(snapshot) = native_hooks::from_raw(source).record_snapshot() else {
+        return false;
+    };
+    let Some(definition) = Definition::parse(snapshot.definition) else {
+        return false;
+    };
+    let requests = count / 2;
+    scan_record_elements(
+        &definition,
+        &snapshot.values,
+        requests,
+        |index, key, value| {
+            let descriptor = operands.get(index * 2)?;
+            let requested = crate::raw::runtime_ffi::get_source(
+                descriptor,
+                &registers.x_reg_array,
+                &process.heap,
+            )?;
+            if requested != key {
+                return Some(false);
+            }
+            let destination = operands.get(index * 2 + 1)?;
+            Some(crate::raw::runtime_ffi::put_term_reg(
+                destination,
+                value,
+                &mut registers.x_reg_array,
+                &mut process.heap,
+            ))
+        },
+    )
+}
+
+/// Port of erts/emulator/beam/erl_record.c:254-379 (erl_create_local_native_record), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn erl_create_local_native_record(
+    header: *mut ProcessHeader,
+    reg: *mut u64,
+    definition: u64,
+    live: u64,
+    count: usize,
+    elements: *const u64,
+) -> u64 {
+    x86_create_record(header, reg, definition, live, count, elements, false)
+}
+
+/// Port of erts/emulator/beam/erl_record.c:337-379 (erl_create_native_record), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn erl_create_native_record(
+    header: *mut ProcessHeader,
+    reg: *mut u64,
+    definition_id: u64,
+    live: u64,
+    count: usize,
+    elements: *const u64,
+) -> u64 {
+    x86_create_record(header, reg, definition_id, live, count, elements, true)
+}
+
+fn x86_create_record(
+    header: *mut ProcessHeader,
+    reg: *mut u64,
+    definition: u64,
+    live: u64,
+    count: usize,
+    elements: *const u64,
+    external: bool,
+) -> u64 {
+    let Some((process, registers)) = native_hooks::enter_runtime_reg(header, reg) else {
+        return native_hooks::raw(Term::NON_VALUE);
+    };
+    let Ok(live) = usize::try_from(live) else {
+        return native_hooks::raw(Term::NON_VALUE);
+    };
+    if !count.is_multiple_of(2) {
+        return native_hooks::raw(Term::NON_VALUE);
+    }
+    let Some(values) = x86_elements(elements, count, &registers.x_reg_array, &process.heap) else {
+        return native_hooks::raw(Term::NON_VALUE);
+    };
+    let Some(end) = live.checked_add(count) else {
+        return native_hooks::raw(Term::NON_VALUE);
+    };
+    let Some(staged) = registers.x_reg_array.get_mut(live..end) else {
+        return native_hooks::raw(Term::NON_VALUE);
+    };
+    staged.copy_from_slice(&values);
+    match create_record(
+        process,
+        &mut registers.x_reg_array,
+        native_hooks::from_raw(definition),
+        (live, count, live),
+        external,
+    ) {
+        Ok(record) => native_hooks::raw(record),
+        Err(failure) => {
+            report(process, failure);
+            native_hooks::raw(Term::NON_VALUE)
+        }
+    }
+}
+
+/// Port of erts/emulator/beam/erl_record.c:381-468 (erl_update_native_record), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn erl_update_native_record(
+    header: *mut ProcessHeader,
+    reg: *mut u64,
+    source: u64,
+    live: u64,
+    count: usize,
+    elements: *const u64,
+) -> u64 {
+    let Some((process, registers)) = native_hooks::enter_runtime_reg(header, reg) else {
+        return native_hooks::raw(Term::NON_VALUE);
+    };
+    let Ok(live) = usize::try_from(live) else {
+        return native_hooks::raw(Term::NON_VALUE);
+    };
+    if count == 0 || !count.is_multiple_of(2) {
+        return native_hooks::raw(Term::NON_VALUE);
+    }
+    let Some(values) = x86_elements(elements, count, &registers.x_reg_array, &process.heap) else {
+        return native_hooks::raw(Term::NON_VALUE);
+    };
+    let Some(end) = live.checked_add(count) else {
+        return native_hooks::raw(Term::NON_VALUE);
+    };
+    let Some(staged) = registers.x_reg_array.get_mut(live..end) else {
+        return native_hooks::raw(Term::NON_VALUE);
+    };
+    staged.copy_from_slice(&values);
+    match update_record(
+        process,
+        &mut registers.x_reg_array,
+        native_hooks::from_raw(source),
+        (live, count, live),
+    ) {
+        Ok(record) => native_hooks::raw(record),
+        Err(failure) => {
+            report(process, failure);
+            native_hooks::raw(Term::NON_VALUE)
+        }
+    }
+}
+
+/// Port of erts/emulator/beam/erl_record.c:470-578 (erl_get_local_record_field), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn erl_get_local_record_field(
+    header: *mut ProcessHeader,
+    source: u64,
+    definition_id: u64,
+    name: u64,
+) -> u64 {
+    get_field(header, source, definition_id, name, 1, true)
+}
+
+/// Port of erts/emulator/beam/erl_record.c:507-578 (erl_get_record_field), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn erl_get_record_field(
+    header: *mut ProcessHeader,
+    source: u64,
+    definition_id: u64,
+    name: u64,
+) -> u64 {
+    get_field(header, source, definition_id, name, 1, false)
+}
+
 /// Port of erts/emulator/beam/erl_record.c:223-252 (erl_get_record_elements), OTP-29.1.1.
 /// Reads the sorted keys staged at `base` and replaces each with its value; returns 1 when
 /// every key was found.
@@ -328,17 +547,19 @@ pub extern "C" fn arinsal_beamasm_get_record_elements(
     let Some(definition) = Definition::parse(snapshot.definition) else {
         return 0;
     };
-    let mut next = 0;
-    for (key, value) in definition.keys.iter().zip(&snapshot.values) {
-        if next < count && registers.x_reg_array[base + next] == Term::atom(*key) {
-            registers.x_reg_array[base + next] = *value;
-            next += 1;
-            if next == count {
-                return 1;
+    u64::from(scan_record_elements(
+        &definition,
+        &snapshot.values,
+        count,
+        |index, key, value| {
+            let slot = registers.x_reg_array.get_mut(base + index)?;
+            if *slot != key {
+                return Some(false);
             }
-        }
-    }
-    0
+            *slot = value;
+            Some(true)
+        },
+    ))
 }
 
 /// Port of erts/emulator/beam/erl_record.c:470-578 (erl_get_local_record_field,

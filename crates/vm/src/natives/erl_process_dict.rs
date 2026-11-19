@@ -29,11 +29,30 @@ fn heap_result(process: &mut Process, built: Result<Term, arinsal_term::TermErro
 /// instruction, which does not store HTOP: the lookup never allocates.
 // Port of erts/emulator/beam/erl_process_dict.c (erts_pd_hash_get) and
 // jit/arm/instr_common.cpp (emit_i_get: `runtime_call<..., erts_pd_hash_get>`), OTP-29.1.1.
+#[unsafe(no_mangle)]
 pub extern "C" fn erts_pd_hash_get(c_p: *mut ProcessHeader, key: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     crate::native_hooks::raw(pd_hash_get(process, crate::native_hooks::from_raw(key)))
+}
+
+/// `erts_pd_hash_get` using the hash encoded by the instruction operand.
+// Port of erts/emulator/beam/erl_process_dict.c:451-461 (erts_pd_hash_get_with_hx), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn erts_pd_hash_get_with_hx(c_p: *mut ProcessHeader, hx: u64, key: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let key = crate::native_hooks::from_raw(key);
+    debug_assert_eq!(crate::proc_create::ProcDict::hash(key), hx);
+    crate::native_hooks::raw(
+        process
+            .dictionary
+            .as_ref()
+            .and_then(|dictionary| dictionary.get_with_hash(key, hx))
+            .unwrap_or_else(undefined),
+    )
 }
 
 fn pd_hash_get(process: &Process, key: Term) -> Term {

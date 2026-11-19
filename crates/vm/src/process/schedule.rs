@@ -295,6 +295,7 @@ impl Task for Process {
         // Before the cold state, which holds the hold, is released (erts keeps it in `p->u.terminate`).
         self.unblock_literal_release();
         crate::trace::clear_save_calls(self);
+        crate::erl_nfunc_sched::erts_destroy_nfunc(self);
         self.heap.clear_for_exit();
         // The queues go before the cold state: receive markers linked in them are nodes of
         // the marker block it holds (erts_proc_sig_cleanup_queues skips them).

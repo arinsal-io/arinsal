@@ -1143,8 +1143,10 @@ fn native_exit(
     }
     // Port of erts/emulator/beam/beam_common.c (handle_error), OTP-29.1.1:
     // save the raw trace before reducing the failure state to its primary class or clearing it.
-    let trapped_bif =
-        process.heap.abi.exc.freason == 1 << 10 && matches!(exit, ExitReason::CallUnported { .. });
+    // TRAP is not an exception class: erts' bif/nif epilogue (jit/arm/instr_bif.cpp:676-700,
+    // emit_bif_nif_epilogue) only uses it to pick the context switch, and nothing reads it
+    // after `context_switch_simplified`, so a trap that yields here never reaches handle_error.
+    let trapped_bif = process.heap.abi.exc.freason == 1 << 10;
     if trapped_bif {
         process.heap.abi.exc.freason = 0;
     } else if process.heap.abi.exc.freason == arinsal_term::exc::EXC_FUNCTION_CLAUSE {

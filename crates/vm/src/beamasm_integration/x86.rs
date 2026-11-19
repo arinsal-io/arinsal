@@ -7,8 +7,9 @@
 
 use super::*;
 use arinsal_beam::BeamFile;
-use arinsal_beamasm::beam_asm_module::{
-    BeamCodeHeader, BeamModuleAssembler, ErtsCodeInfo, bp_flag,
+use arinsal_beamasm::beam_asm_module::{BeamCodeHeader, BeamModuleAssembler};
+use arinsal_beamasm::common::beam_asm_h::{
+    BREAKPOINT_FLAG_OFFSET, ERTS_ASM_BP_FLAG_BP, ErtsCodeInfo,
 };
 use arinsal_beamjit::CodeMemory;
 use arinsal_beamjit::LoaderEnv;
@@ -21,9 +22,6 @@ use std::sync::{Mutex, PoisonError, Weak};
 /// `ERTS_DEBUGGER_LINE_BREAKPOINTS`.
 // Port of erts/emulator/beam/erl_debugger.h:27, OTP-29.1.1.
 const ERTS_DEBUGGER_LINE_BREAKPOINTS: u64 = 1 << 1;
-
-/// `offsetof(ErtsCodeInfo, u.metadata.breakpoint_flag)`: the last byte of `u`.
-const BREAKPOINT_FLAG_OFFSET: usize = 7;
 
 fn raw_word(term: Term) -> u64 {
     term.tagged_word()
@@ -269,9 +267,9 @@ pub(crate) fn patch_native_breakpoints(module: &str, wanted: &[(&str, u8, bool)]
                 continue;
             };
             if enabled {
-                version.erts_asm_bp_set_flag(ci, bp_flag::BP as u8);
+                version.erts_asm_bp_set_flag(ci, ERTS_ASM_BP_FLAG_BP);
             } else {
-                version.erts_asm_bp_unset_flag(ci, bp_flag::BP as u8);
+                version.erts_asm_bp_unset_flag(ci, ERTS_ASM_BP_FLAG_BP);
             }
         }
     }
@@ -327,7 +325,7 @@ impl CompiledVersion {
     }
 
     // Port of erts/emulator/beam/jit/beam_asm.h:227-242 (erts_asm_bp_set_flag), OTP-29.1.1.
-    fn erts_asm_bp_set_flag(&self, ci: usize, flag: u8) {
+    pub(crate) fn erts_asm_bp_set_flag(&self, ci: usize, flag: u8) {
         let at = ci + BREAKPOINT_FLAG_OFFSET;
         let current = self.read_byte(at);
         if current == 0 {
@@ -338,7 +336,7 @@ impl CompiledVersion {
     }
 
     // Port of erts/emulator/beam/jit/beam_asm.h:244-262 (erts_asm_bp_unset_flag), OTP-29.1.1.
-    fn erts_asm_bp_unset_flag(&self, ci: usize, flag: u8) {
+    pub(crate) fn erts_asm_bp_unset_flag(&self, ci: usize, flag: u8) {
         let at = ci + BREAKPOINT_FLAG_OFFSET;
         let current = self.read_byte(at);
         if current == 0 {
@@ -362,11 +360,19 @@ impl CompiledVersion {
             .map(|native| native.start)
     }
 
-    /// Whether this version has code for `function/arity`.
-    pub(crate) fn has_native_function(&self, function: &str, arity: u8) -> bool {
-        global_atoms()
-            .get(function)
-            .is_some_and(|atom| self.code_infos.contains_key(&(atom, arity)))
+    /// The `ErtsCodeInfo` address of the code of `function/arity`.
+    pub(crate) fn code_info(&self, function: arinsal_term::Atom, arity: u8) -> Option<usize> {
+        self.code_infos.get(&(function, arity)).copied()
+    }
+
+    /// Copies `call_nif` code over the function whose `ErtsCodeInfo` is at `ci`, from
+    /// `prologue` bytes into its code on.
+    // Port of erts/emulator/beam/erl_nif.c:5149-5160 (load_nif_1st_finisher: sys_memcpy behind
+    // BEAM_ASM_FUNC_PROLOGUE_SIZE), OTP-29.1.1.
+    pub(crate) fn copy_call_nif(&self, ci: usize, code: &[u8], prologue: usize) {
+        let code_rw = ci + std::mem::size_of::<ErtsCodeInfo>() - self.code_start;
+        self.with_memory(|memory| memory.write(code_rw + prologue, &code[prologue..]))
+            .expect("function body inside the module's code");
     }
 
     /// Whether `address` lies in this version's code.
@@ -383,31 +389,6 @@ impl CompiledVersion {
         self.native_functions
             .get(index.checked_sub(1)?)
             .filter(|function| pc < function.end)
-    }
-
-    /// `load_nif`'s rewrite of a function body into `call_nif`: `beamasm_emit_call_nif`,
-    /// which the x86 module assembler does not have yet.
-    // Port of erts/emulator/beam/erl_nif.c:5149-5160 (load_nif_1st_finisher), OTP-29.1.1.
-    pub(crate) fn bind_nif(
-        &self,
-        _function: &str,
-        _arity: u8,
-        _native: crate::natives::nif::NativeFn,
-    ) -> bool {
-        false
-    }
-
-    /// Clears `ERTS_ASM_BP_FLAG_CALL_NIF_EARLY` of `function/arity`.
-    // Port of erts/emulator/beam/erl_nif.c:5248-5250 (load_nif_2nd_finisher), OTP-29.1.1.
-    pub(crate) fn enable_nif(&self, function: &str, arity: u8) -> bool {
-        let Some(&ci) = global_atoms()
-            .get(function)
-            .and_then(|atom| self.code_infos.get(&(atom, arity)))
-        else {
-            return false;
-        };
-        self.erts_asm_bp_unset_flag(ci, bp_flag::CALL_NIF_EARLY as u8);
-        true
     }
 
     /// `beam_load_finalize_code`: ranges, catches, exports, imports and lambdas, then the

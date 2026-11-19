@@ -1089,7 +1089,7 @@ fn patches_reach_the_running_code() {
     assert_eq!(m.get_on_load(), Some(m.get_code(1).unwrap()));
     assert_eq!(
         m.get_on_load(),
-        Some(entry - core::mem::size_of::<super::beam_asm_module::ErtsCodeInfo>())
+        Some(entry - core::mem::size_of::<crate::common::beam_asm_h::ErtsCodeInfo>())
     );
     assert!(code_hdr < m.get_code(1).unwrap());
 
@@ -1373,7 +1373,7 @@ init() -> erlang:load_nif(\"nonexistent\", 0).
     assert_eq!(ours, theirs, "{block:#?}");
     assert_eq!(
         ours.len() - 40,
-        8 * super::beam_asm_module::BEAM_NATIVE_MIN_FUNC_SZ
+        8 * crate::common::beam_asm_h::BEAM_NATIVE_MIN_FUNC_SZ
     );
 }
 

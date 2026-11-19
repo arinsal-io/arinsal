@@ -21,6 +21,17 @@ impl Vm {
             Ok(reg) => reg,
             Err(error) => return Some(Err(error)),
         };
+        let (class, _) = resolved;
+        let has_bif_spec = arity <= u8::MAX as usize
+            && arinsal_spec::bif_lookup(module, function, arity as u8).is_some();
+        if has_bif_spec || class == ImportClass::Native {
+            let table_result = crate::process::sched_data::NativeSlice::run(self, ctx, p, |p| {
+                crate::bif_table::call_from_executor(p, reg, module, function, arity)
+            });
+            if table_result.is_some() {
+                return table_result;
+            }
+        }
         // The body charges BUMP_REDS on FCALLS, as from native code.
         let mut result = self.dispatch_native_source(
             p,
@@ -88,31 +99,11 @@ impl Vm {
     ) -> Option<Result<Term, VmError>> {
         let (class, bits) = resolved;
         let arity = args.len();
-        if arity <= u8::MAX as usize
+        if class == ImportClass::Pure
+            && arity <= u8::MAX as usize
             && arinsal_spec::bif_lookup(module, function, arity as u8).is_some()
         {
-            // Port of erts/emulator/beam/beam_bp.c (`erts_bif_trace`): a traced BIF
-            // calls the pointer selected by the export's `bif_number`.
-            let table_result = {
-                // The BIF table body runs with this scheduler's process data, as from a
-                // generated call fragment.
-                let reg = match self.x_regs() {
-                    Ok(reg) => reg,
-                    Err(error) => return Some(Err(error)),
-                };
-                if let natives::NativeArgs::Slice(values) = args {
-                    reg[..values.len()].copy_from_slice(values);
-                }
-                crate::process::sched_data::NativeSlice::run(self, ctx, p, |p| {
-                    crate::bif_table::call_from_executor(p, reg, module, function, arity)
-                })
-            };
-            if table_result.is_some() {
-                return table_result;
-            }
-            if class == ImportClass::Pure {
-                return None;
-            }
+            return None;
         }
         if class == ImportClass::Dynamic
             && let Some(result) = args.with_values(p, |p, values| {
@@ -129,25 +120,6 @@ impl Vm {
                 fun(self, p, ctx, module, function, args)
             }
             Some(natives::NativeEntry::Resolved(fun)) => fun(self, p, ctx, args),
-            // A native BIF without a named entry is its `bif_table` body.
-            None if class == ImportClass::Native
-                && arinsal_spec::bif_lookup(module, function, arity as u8).is_none() =>
-            {
-                // `bif_table[].f` reads its arguments from the register array.
-                let reg = match self.x_regs() {
-                    Ok(reg) => reg,
-                    Err(error) => return Some(Err(error)),
-                };
-                if let natives::NativeArgs::Slice(values) = args {
-                    reg[..values.len()].copy_from_slice(values);
-                }
-                // `erts_proc_sched_data(c_p)`: the body reaches this scheduler's data as it
-                // does from native code.
-                let arity = args.len();
-                crate::process::sched_data::NativeSlice::run(self, ctx, p, |p| {
-                    crate::bif_table::call_from_executor(p, reg, module, function, arity)
-                })
-            }
             None => None,
         }
     }

@@ -79,6 +79,43 @@ pub(crate) fn beamasm_init() {
     x86::beamasm_init();
 }
 
+/// Emits the `ErtsCodeInfo`, breakpoint trampoline and `call_nif normal_fptr lib dirty_fptr`
+/// of a NIF stub for the function of `info` into `buff` (`ErtsNifBeamStub.info` followed by
+/// `.code`).
+// Port of erts/emulator/beam/jit/beam_jit_main.cpp:542-574 (beamasm_emit_call_nif),
+// OTP-29.1.1.
+pub(crate) fn beamasm_emit_call_nif(
+    info: &arinsal_beamasm::common::beam_asm_h::ErtsCodeInfo,
+    (normal_fptr, lib, dirty_fptr): (usize, usize, usize),
+    buff: &mut [u8; arinsal_beamasm::common::beam_asm_h::FUNC_INFO_BYTES
+             + arinsal_beamasm::common::beam_asm_h::NIF_STUB_CODE_BYTES],
+) -> Result<(), crate::VmError> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let helper = crate::beamasm_integration::call_nif_yield_helper()
+            .ok_or_else(|| crate::VmError::Unsupported("call_nif_yield_helper fragment".into()))?;
+        arinsal_beamasm::module::beamasm_emit_call_nif(
+            (info.mfa.module, info.mfa.function, info.mfa.arity as u8),
+            normal_fptr as u64,
+            lib as u64,
+            dirty_fptr as u64,
+            helper,
+            buff,
+        )
+        .map_err(|error| crate::VmError::Unsupported(format!("beamasm_emit_call_nif: {error:?}")))
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        bga()
+            .bga
+            .beamasm_emit_call_nif(info, normal_fptr, lib, dirty_fptr, buff)
+            .map(drop)
+            .map_err(|error| {
+                crate::VmError::Unsupported(format!("beamasm_emit_call_nif: {error:?}"))
+            })
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 pub(crate) use x86::bga;
 
@@ -125,5 +162,6 @@ mod x86 {
             unloaded_fun: get(GlobalLabels::UnloadedFun),
             i_line_breakpoint_cleanup: get(GlobalLabels::ILineBreakpointCleanup),
         });
+        arinsal_beamasm::set_process_main_labels(get(GlobalLabels::DispatchNif));
     }
 }

@@ -28,30 +28,6 @@ pub(crate) extern "C" fn append_checked(
     crate::native_helpers::bs_append_checked(header, ebs, x, extra_bits, unit, live, alloc)
 }
 
-/// Runs the checked private append against the scheduler's live write cursor.
-// Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1865-1880, OTP-29.1.1.
-pub(crate) extern "C" fn private_append(
-    header: *mut ProcessHeader,
-    reg: *mut u64,
-    source: u64,
-    extra_bits: u64,
-) -> u64 {
-    if header.is_null() || reg.is_null() {
-        return 0;
-    }
-    let registers = SchedulerRegisters::from_reg(reg);
-    // SAFETY: native code passes the live process header and its scheduler register area.
-    unsafe {
-        let state = std::ptr::addr_of_mut!((*registers).erl_bits_state).cast::<u64>();
-        crate::native_helpers::arinsal_beamasm_bs_private_append_checked(
-            state,
-            &mut *header,
-            source,
-            extra_bits,
-        )
-    }
-}
-
 /// Allocates one final bitstring and publishes its write cursor.
 // Port of instr_bs.cpp:1855-1979 (`emit_bs_init_bits_shared`), OTP-29.1.1.
 pub(crate) extern "C" fn init_bits(

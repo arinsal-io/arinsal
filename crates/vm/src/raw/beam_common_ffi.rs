@@ -2,6 +2,110 @@
 // Port of erts/emulator/beam/erl_vm.h (Eterm pointer access) and beam_common.c,
 // OTP-29.1.1.
 
+use arinsal_beamasm::ProcessHeader;
+
+/// Scans the RA-layout Erlang stack from `E` to `STACK_START(p)` and returns the first
+/// continuation address outside a trace frame.
+// Port of erts/emulator/beam/beam_common.c:413-435 (`erts_printable_return_address`),
+// OTP-29.1.1.
+pub(crate) fn printable_return_address(p: *const ProcessHeader, e: *const u64) -> usize {
+    if p.is_null() || e.is_null() {
+        return 0;
+    }
+    // SAFETY: the runtime symbol receives the active process header; `hend` is `STACK_START(p)`.
+    let stack_bottom = unsafe { (*p).hend };
+    if stack_bottom.is_null() || e.addr() >= stack_bottom.addr() {
+        return 0;
+    }
+
+    let mut scanner = e;
+    debug_assert!(arinsal_term::is_cp(read_word(scanner, 0)));
+    while scanner.addr() < stack_bottom.addr() {
+        // `erts_inspect_frame` in the RA layout reads the CP at frame[0].
+        let return_address = read_word(scanner, 0) as usize;
+        debug_assert!(arinsal_term::is_cp(return_address as u64));
+        if let Some(kind) = crate::trace::TraceFrameKind::of(return_address) {
+            scanner = scanner.wrapping_add(arinsal_term::CP_WORDS + kind.data_words());
+        } else {
+            return return_address;
+        }
+    }
+
+    debug_assert!(false, "No continuation pointer on the process stack");
+    0
+}
+
+/// Starts the hibernate scheduler handoff for the live register range.
+// Port of erts/emulator/beam/beam_common.c:1568-1600 (`erts_hibernate`), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn erts_hibernate(c_p: *mut ProcessHeader, regs: *mut u64, arity: i32) {
+    let (Ok(arity), Some((process, registers))) = (
+        usize::try_from(arity),
+        crate::native_hooks::enter_runtime_reg(c_p, regs),
+    ) else {
+        return;
+    };
+    let Some(live_registers) = registers.x_reg_array.get(..arity) else {
+        return;
+    };
+    let current_mfa =
+        code_mfa(process.heap.abi.current as usize as u64).and_then(|(module, function, arity)| {
+            Some((
+                arinsal_term::global_atoms().text(module)?.to_owned(),
+                arinsal_term::global_atoms().text(function)?.to_owned(),
+                arity,
+            ))
+        });
+    crate::process::begin_hibernate(process, live_registers, true, current_mfa);
+}
+
+/// Implements the x86 BeamAsm `apply` C ABI through the shared apply resolver.
+// Port of erts/emulator/beam/beam_common.c:1434-1527 (`apply`), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn apply(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    return_ip: *const core::ffi::c_void,
+    stack_offset: u64,
+) -> *const arinsal_term::ExportEntry {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(c_p, reg) else {
+        return core::ptr::null();
+    };
+    crate::native_helpers::resolve_apply(
+        process,
+        registers,
+        return_ip as usize as u64,
+        stack_offset,
+    )
+    .map_or(core::ptr::null(), |target| target.export)
+}
+
+/// Implements the x86 BeamAsm fixed-arity apply C ABI through the shared resolver.
+// Port of erts/emulator/beam/beam_common.c:1529-1566 (`fixed_apply`), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn fixed_apply(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    arity: u64,
+    return_ip: *const core::ffi::c_void,
+    stack_offset: u64,
+) -> *const arinsal_term::ExportEntry {
+    let (Ok(arity), Some((process, registers))) = (
+        usize::try_from(arity),
+        crate::native_hooks::enter_runtime_reg(c_p, reg),
+    ) else {
+        return core::ptr::null();
+    };
+    crate::native_helpers::resolve_fixed_apply(
+        process,
+        registers,
+        arity,
+        return_ip as usize as u64,
+        stack_offset,
+    )
+    .map_or(core::ptr::null(), |target| target.export)
+}
+
 /// Reads a caller-owned word at `index`.
 pub(crate) fn read_word(words: *const u64, index: usize) -> u64 {
     // SAFETY: generated BeamAsm operations pass aligned operand, X-register, or stack arrays;
