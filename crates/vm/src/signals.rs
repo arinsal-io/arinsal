@@ -1548,7 +1548,6 @@ pub(crate) fn reply_request(
             request,
             how,
             pending.from,
-            process.heap.abi.fcalls,
         );
     }
     let message = if let RemoteOp::Collect { request_id, major } = pending.op {

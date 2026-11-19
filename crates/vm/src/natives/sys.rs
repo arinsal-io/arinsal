@@ -81,7 +81,6 @@ pub(crate) fn copy_literal_area(
     request: Message,
     how: arinsal_sched::LiteralCopyHow,
     requester: arinsal_sched::Pid,
-    limit: i32,
 ) -> Result<(), VmError> {
     let store = process.persistent_terms;
     let area = store.retired_area(area_id);
@@ -108,7 +107,10 @@ pub(crate) fn copy_literal_area(
             )?;
             return Ok(());
         }
-        if literal_scan_words(process) > limit.max(0) as usize * 512 {
+        // Port of erts/emulator/beam/erl_proc_sig_queue.c:8312-8314 (handle_cla:
+        // `erts_check_copy_literals_gc_need_max_reds(c_p) > CONTEXT_REDS` replies `check_gc`),
+        // OTP-29.1.1, with ERTS_CLA_SCAN_WORDS_PER_RED words per reduction.
+        if literal_scan_words(process) > crate::process::CONTEXT_REDS as usize * 512 {
             reply_literal_area_copy(
                 ctx,
                 request,

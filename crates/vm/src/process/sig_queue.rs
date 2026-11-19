@@ -257,7 +257,7 @@ impl Process {
                 continue;
             }
             let Event { from, payload } = node.into_value();
-            match self.handle_signal(ctx, from, payload, limit / SIG_REDS_CNT_FACTOR) {
+            match self.handle_signal(ctx, from, payload) {
                 Ok(cost) => cnt += cost + 1,
                 Err(error) => break Err(error),
             }
@@ -281,7 +281,6 @@ impl Process {
         ctx: &mut RunCtx<'_, Message>,
         from: Pid,
         payload: Payload<Message>,
-        limit: i32,
     ) -> Result<i32, VmError> {
         let Payload::Signal(signal) = payload else {
             unreachable!("message signals are moved to the message queue before this");
@@ -707,7 +706,7 @@ impl Process {
                     requester,
                 } = *copy;
                 crate::natives::sys::copy_literal_area(
-                    self, ctx, area_id, request, how, requester, limit,
+                    self, ctx, area_id, request, how, requester,
                 )?;
                 0
             }
