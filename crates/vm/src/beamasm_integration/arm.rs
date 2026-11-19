@@ -1216,6 +1216,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
 pub(crate) fn compile(
     beam: &arinsal_beam::BeamFile,
     module: &mut arinsal_loader::Module,
+    _md5: Option<[u8; 16]>,
     line_breakpoints: bool,
     code_ix: &crate::code_ix::CodeIndexes,
     failure: &mut Option<arinsal_beamjit::CompileError>,

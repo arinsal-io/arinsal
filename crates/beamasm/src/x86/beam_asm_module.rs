@@ -153,6 +153,8 @@ pub struct BeamModuleAssembler {
     pub literals: HashMap<u64, Vec<Patch>>,
     /// `strings`: every string patch.
     pub strings: Vec<Patch>,
+    /// `CodeHolder::label_by_name`: addresses of named read-only data embedded in this module.
+    rodata_labels: HashMap<String, Label>,
     /// `reg_cache`: `RegisterCache<20, x86::Mem, x86::Gp>` over X slots from `registers` and
     /// Y slots from `E`. ARG2 is excluded as it points to the currently active tuple.
     reg_cache: RegisterCache<20, Mem, Gp>,
@@ -375,6 +377,7 @@ impl BeamModuleAssembler {
             lambdas: HashMap::new(),
             literals: HashMap::new(),
             strings: Vec::new(),
+            rodata_labels: HashMap::new(),
             reg_cache: RegisterCache::with_temporaries(
                 REGISTERS,
                 E,
@@ -512,6 +515,33 @@ impl BeamModuleAssembler {
 
     fn offset(&self) -> usize {
         self.asm.a.offset()
+    }
+
+    /// Embeds nonempty `bytes` at named label `label` in the read-only data section.
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:163-172 (embed_rodata), OTP-29.1.1.
+    pub fn embed_rodata(&mut self, label: &str, bytes: &[u8]) -> Result<(), AsmError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+
+        let label_id = self.asm.new_label();
+        self.asm.a.select(Section::Data);
+        let result: Result<(), AsmError> = (|| {
+            self.asm.bind(label_id)?;
+            self.asm.a.embed(bytes)?;
+            Ok(())
+        })();
+        self.asm.a.select(Section::Code);
+        result?;
+        self.rodata_labels.insert(label.to_owned(), label_id);
+        Ok(())
+    }
+
+    /// Returns the executable address of a named read-only data label after codegen.
+    // Port of erts/emulator/beam/jit/beam_jit_main.cpp:598-601 (beamasm_get_rodata),
+    // OTP-29.1.1.
+    pub fn get_rodata(&self, label: &str) -> Option<usize> {
+        self.asm.get_code(*self.rodata_labels.get(label)?)
     }
 
     /// `find_cache(mem)`.
@@ -1584,5 +1614,25 @@ mod tests {
         assert_eq!(word(2), 42);
         assert_eq!(word(3), 0x1007);
         assert_eq!(&code.code[14..18], &(0x5000_i32 - 0x1012).to_le_bytes());
+    }
+
+    #[test]
+    fn named_rodata_round_trips_through_codegen() {
+        let mut ga =
+            BeamGlobalAssembler::new(crate::common::process_offsets::ProcessOffsets::ERTS_X86_64)
+                .unwrap();
+        ga.codegen().unwrap();
+        let mut module =
+            BeamModuleAssembler::new_module(&ga, 1, 0, vec![ArgType::ANY], []).unwrap();
+        module.embed_rodata("str", &[0, 1, 2, 255]).unwrap();
+        module.embed_rodata("empty", &[]).unwrap();
+
+        let (memory, _) = module.codegen(&BeamCodeHeader::default()).unwrap();
+        let base = memory.as_ptr() as usize;
+        let address = module.get_rodata("str").unwrap();
+        let mut bytes = [0; 4];
+        memory.read(address - base, &mut bytes).unwrap();
+        similar_asserts::assert_eq!(bytes, [0, 1, 2, 255]);
+        assert_eq!(module.get_rodata("empty"), None);
     }
 }

@@ -974,6 +974,7 @@ impl Vm {
         if let Some(native) = beamasm_integration::compile(
             &meta.beam,
             module,
+            meta.md5,
             crate::trace_bp::line_breakpoints_instrumented(),
             &self.code_ix,
             &mut failure,

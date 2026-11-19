@@ -7,7 +7,9 @@
 
 use super::*;
 use arinsal_beam::BeamFile;
-use arinsal_beamasm::beam_asm_module::{BeamModuleAssembler, ErtsCodeInfo, bp_flag};
+use arinsal_beamasm::beam_asm_module::{
+    BeamCodeHeader, BeamModuleAssembler, ErtsCodeInfo, bp_flag,
+};
 use arinsal_beamjit::CodeMemory;
 use arinsal_beamjit::LoaderEnv;
 use arinsal_term::{Term, TermBuilder, VecHeap, from_owned, global_atoms};
@@ -212,8 +214,6 @@ pub(crate) struct CompiledVersion {
     line_breakpoints: Vec<(u32, usize)>,
     literal_heap: Mutex<Option<Arc<VecHeap>>>,
     _module_literals: arinsal_loader::LiteralArea,
-    /// The "str" rodata the string patches point at.
-    _string_table: Box<[u8]>,
     /// The coverage tables the code header points at.
     _coverage: Option<Box<[u64]>>,
     _line_coverage_valid: Option<Vec<u8>>,
@@ -611,6 +611,7 @@ fn file_functions(beam: &BeamFile) -> Vec<arinsal_loader::NativeFunction> {
 pub(crate) fn compile(
     beam: &BeamFile,
     module: &mut arinsal_loader::Module,
+    md5: Option<[u8; 16]>,
     line_breakpoints: bool,
     code_ix: &crate::code_ix::CodeIndexes,
     failure: &mut Option<arinsal_beamjit::CompileError>,
@@ -653,6 +654,23 @@ pub(crate) fn compile(
         *failure = Some(error);
         return None;
     }
+    let Some(md5) = md5 else {
+        fail(failure, "module checksum is missing".to_owned());
+        return None;
+    };
+    // Port of erts/emulator/beam/jit/asm_load.c:987-1000: copy the string table, optional
+    // ETF chunks, and module checksum into the assembler's read-only data section.
+    for (label, bytes) in [
+        ("str", beam.strings.as_slice()),
+        ("attr", beam.attributes.as_deref().unwrap_or_default()),
+        ("compile", beam.compile_info.as_deref().unwrap_or_default()),
+        ("md5", md5.as_slice()),
+    ] {
+        if let Err(error) = stp.ba.embed_rodata(label, bytes) {
+            fail(failure, error.to_string());
+            return None;
+        }
+    }
     // Port of erts/emulator/beam/jit/asm_load.c:1002-1008: the coverage tables move to the
     // prepared code.
     let coverage = stp.coverage.take();
@@ -666,9 +684,39 @@ pub(crate) fn compile(
     load_hdr.loc_index_to_cover_id = loc_index_to_cover_id
         .as_ref()
         .map_or(0, |table| table.as_ptr() as usize);
+    if let Some(attributes) = beam.attributes.as_deref().filter(|bytes| !bytes.is_empty()) {
+        load_hdr.attr_size = attributes.len() as u64;
+        load_hdr.attr_size_on_heap = match arinsal_etf::decode_ext_size(attributes) {
+            Ok(size) => size as u64,
+            Err(error) => {
+                fail(
+                    failure,
+                    format!("bad external term representation of module attributes: {error}"),
+                );
+                return None;
+            }
+        };
+    }
+    if let Some(compile_info) = beam
+        .compile_info
+        .as_deref()
+        .filter(|bytes| !bytes.is_empty())
+    {
+        load_hdr.compile_size = compile_info.len() as u64;
+        load_hdr.compile_size_on_heap = match arinsal_etf::decode_ext_size(compile_info) {
+            Ok(size) => size as u64,
+            Err(error) => {
+                fail(
+                    failure,
+                    format!("bad external term representation of compilation information: {error}"),
+                );
+                return None;
+            }
+        };
+    }
     let line_instr = stp.line_instr.take().unwrap_or_default();
     let mut ba = stp.ba;
-    let (mut memory, _code_hdr) = match arinsal_beamjit::beamasm_codegen(&mut ba, &load_hdr) {
+    let (mut memory, code_hdr) = match arinsal_beamjit::beamasm_codegen(&mut ba, &load_hdr) {
         Ok(generated) => generated,
         Err(error) => {
             fail(failure, error.to_string());
@@ -677,15 +725,39 @@ pub(crate) fn compile(
     };
     let code_start = arinsal_beamjit::beamasm_get_base(&ba)?;
     let code_end = code_start + arinsal_beamjit::beamasm_get_offset(&ba);
+    // Port of erts/emulator/beam/jit/asm_load.c:1081-1122: fill chunk pointers after codegen,
+    // then use the embedded string table for its instruction patches.
+    let code_hdr_offset = code_hdr.checked_sub(code_start)?;
+    for (field_offset, pointer) in [
+        (
+            core::mem::offset_of!(BeamCodeHeader, attr_ptr),
+            ba.get_rodata("attr").unwrap_or(0),
+        ),
+        (
+            core::mem::offset_of!(BeamCodeHeader, compile_ptr),
+            ba.get_rodata("compile").unwrap_or(0),
+        ),
+        (
+            core::mem::offset_of!(BeamCodeHeader, md5_ptr),
+            ba.get_rodata("md5")?,
+        ),
+    ] {
+        if let Err(error) = memory.write(
+            code_hdr_offset + field_offset,
+            &(pointer as u64).to_le_bytes(),
+        ) {
+            fail(failure, format!("writing module code header: {error}"));
+            return None;
+        }
+    }
     // Literals: Arinsal's loader built them in the literal area already, so every literal
     // patch writes the word the emitter recorded.
     for word in env.literal_words() {
         arinsal_beamjit::beamasm_patch_literal(&ba, &mut memory, word, word).ok()?;
     }
-    let string_table: Box<[u8]> = beam.strings.clone().into_boxed_slice();
-    if !string_table.is_empty() {
-        arinsal_beamjit::beamasm_patch_strings(&ba, &mut memory, string_table.as_ptr() as usize)
-            .ok()?;
+    if !beam.strings.is_empty() {
+        let string_table = ba.get_rodata("str")?;
+        arinsal_beamjit::beamasm_patch_strings(&ba, &mut memory, string_table).ok()?;
     }
     drop(env);
     // Port of erts/emulator/beam/jit/asm_load.c:1177-1260: the function table of a module that
@@ -855,7 +927,6 @@ pub(crate) fn compile(
         line_breakpoints,
         literal_heap: Mutex::new(Some(Arc::from(literal_heap))),
         _module_literals: module.literal_area(),
-        _string_table: string_table,
         _coverage: coverage,
         _line_coverage_valid: line_coverage_valid,
         _loc_index_to_cover_id: loc_index_to_cover_id,

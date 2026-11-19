@@ -18,7 +18,9 @@ use arinsal_term::Term;
 
 use super::beam_asm_global::{BeamGlobalAssembler, GLOBAL_LABELS};
 use super::beam_asm_module::{BeamCodeHeader, BeamModuleAssembler};
-use super::jdump::{erts_to_arinsal, gnu_as, matches_with_global_jumps_at};
+use super::jdump::{
+    erts_to_arinsal, gnu_as, matches_with_global_jumps, matches_with_global_jumps_at,
+};
 use crate::common::args::ArgVal;
 use crate::common::types::ArgType;
 use crate::{ExitReason, ProcessHeader, SchedulerRegisters};
@@ -464,6 +466,42 @@ fn global_assembler() -> (BeamGlobalAssembler, arinsal_x64::exec::CodeMemory) {
     }
     let memory = ga.codegen().unwrap();
     (ga, memory)
+}
+
+fn global_assembler_code() -> (
+    Vec<u8>,
+    Vec<(super::beam_asm_global::GlobalLabels, Range<usize>)>,
+) {
+    let mut ga =
+        BeamGlobalAssembler::new(crate::common::process_offsets::ProcessOffsets::ERTS_X86_64)
+            .unwrap();
+    for label in GLOBAL_LABELS {
+        let label_id = ga.label(label);
+        if ga.asm.a.label_location(label_id).is_none() {
+            ga.asm.align_code(8).unwrap();
+            ga.asm.bind(label_id).unwrap();
+            ga.asm.emit(|e| e.ud2()).unwrap();
+        }
+    }
+    let ranges = ga.ranges();
+    let code = std::mem::take(&mut ga.asm.a).finish().unwrap().code;
+    (code, ranges)
+}
+
+fn global_dump_fragment(dump: &str, name: &str) -> Option<Vec<String>> {
+    let label = format!("global::{name}:");
+    let lines = dump.lines().collect::<Vec<_>>();
+    let start = lines.iter().position(|line| line.trim() == label)?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| line.trim().starts_with("global::"))
+        .map_or(lines.len(), |offset| start + 1 + offset);
+    Some(
+        lines[start + 1..end]
+            .iter()
+            .map(|line| line.trim().to_owned())
+            .collect(),
+    )
 }
 
 struct Process {
@@ -939,6 +977,66 @@ fn call_nif_emitter_matches_erts_dump() {
         reference.0,
         &code[start..],
     );
+}
+
+#[test]
+fn call_nif_global_fragments_match_erts_dump() {
+    use super::beam_asm_global::GlobalLabels;
+
+    let Some(dump) = super::jdump::erts_dump("beam_asm_global") else {
+        eprintln!("skipping: no beam_asm_global +JDdump");
+        return;
+    };
+    let (code, ranges) = global_assembler_code();
+    for (label, name) in [
+        (GlobalLabels::CallNifEarly, "call_nif_early"),
+        (GlobalLabels::CallNifShared, "call_nif_shared"),
+        (GlobalLabels::DispatchNif, "dispatch_nif"),
+        (GlobalLabels::CallNifYieldHelper, "call_nif_yield_helper"),
+    ] {
+        let expected = global_dump_fragment(&dump, name)
+            .unwrap_or_else(|| panic!("erts dump has no global::{name}"));
+        let mut expected = expected
+            .into_iter()
+            .filter(|line| !line.starts_with("global::"))
+            .map(|line| erts_to_arinsal(&line))
+            .collect::<Vec<_>>();
+        if expected.last().is_some_and(|line| line == "align 8") {
+            expected.pop();
+        }
+        let layout = expected
+            .iter()
+            .map(|line| {
+                if let Some((op, _)) = line.split_once(" global::") {
+                    match op {
+                        "jmp" => ".byte 0xe9, 0, 0, 0, 0".to_owned(),
+                        "short jmp" => ".byte 0xeb, 0".to_owned(),
+                        _ => panic!("unexpected global branch: {line}"),
+                    }
+                } else if let Some(target) = line.strip_prefix("call ")
+                    && target.parse::<u64>().is_ok()
+                {
+                    ".byte 0x40, 0xe8, 0, 0, 0, 0".to_owned()
+                } else {
+                    line.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        let body_len = gnu_as(&layout)
+            .unwrap_or_else(|| panic!("GNU as could not size global::{name}"))
+            .len();
+        let range = ranges
+            .iter()
+            .find(|(found, _)| *found == label)
+            .map(|(_, range)| range.clone())
+            .unwrap_or_else(|| panic!("Arinsal has no {label:?} fragment"));
+        assert_eq!(
+            matches_with_global_jumps(&expected, &code[range.start..range.start + body_len], &[],),
+            Some(true),
+            "global::{name}: expected={expected:?}; actual={:02x?}",
+            &code[range.start..range.start + body_len],
+        );
+    }
 }
 
 /// The patch sites of a module after codegen: an import, a literal, a string and a fun entry
