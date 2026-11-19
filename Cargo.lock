@@ -91,6 +91,7 @@ dependencies = [
  "arinsal-spec",
  "arinsal-term",
  "arinsal-x64",
+ "similar-asserts",
  "smallvec",
  "thiserror",
 ]
