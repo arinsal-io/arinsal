@@ -126,7 +126,7 @@ pub fn open_max() -> libc::c_int {
 }
 
 pub fn ctime(value: libc::time_t) -> String {
-    let mut buffer = [0_i8; 32];
+    let mut buffer = [0 as libc::c_char; 32];
     // SAFETY: `buffer` is writable and `value` is a valid time_t input.
     let result = unsafe { libc::ctime_r(&value, buffer.as_mut_ptr()) };
     if result.is_null() {
@@ -376,7 +376,7 @@ pub fn open_pty_master() -> io::Result<(RawFd, CString, RawFd)> {
 fn openpty_fallback() -> io::Result<(RawFd, CString, RawFd)> {
     let mut master = -1;
     let mut slave_fd = -1;
-    let mut name = vec![0_i8; 1024];
+    let mut name = vec![0 as libc::c_char; 1024];
     // SAFETY: all output pointers remain writable for the call; optional termios/winsize are null.
     if unsafe {
         libc::openpty(
@@ -411,7 +411,7 @@ unsafe extern "C" {
 fn openpty_fallback() -> io::Result<(RawFd, CString, RawFd)> {
     let mut master = -1;
     let mut slave_fd = -1;
-    let mut name = vec![0_i8; 1024];
+    let mut name = vec![0 as libc::c_char; 1024];
     // SAFETY: all output pointers remain writable for the call; optional termios/winsize are null.
     if unsafe {
         openpty(

@@ -374,7 +374,7 @@ pub fn current_time() -> u32 {
 
 // erts equivalent: ctime() in epmd.c:dbg_gen_printf.
 pub fn ctime(timestamp: u32) -> String {
-    let mut output = [0i8; 32];
+    let mut output = [0 as libc::c_char; 32];
     let value = timestamp as libc::time_t;
     // SAFETY: output has sufficient capacity for the fixed ctime_r format.
     let result = unsafe { libc::ctime_r(&value, output.as_mut_ptr()) };

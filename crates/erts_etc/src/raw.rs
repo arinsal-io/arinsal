@@ -446,7 +446,10 @@ impl ErlCallClient {
             };
             // SAFETY: `term` is at least as large and aligned as OTP's ei_term output.
             let decoded = unsafe { ei_decode_ei_term(reply.0.buff, &mut index, &mut term) };
-            if decoded < 0 || !matches!(term.ei_type as u8, b'h' | b'i') || term.arity != 2 {
+            if decoded < 0
+                || !matches!(u8::from_ne_bytes(term.ei_type.to_ne_bytes()), b'h' | b'i')
+                || term.arity != 2
+            {
                 return Err(-1);
             }
             let mut atom = [c_char::default(); MAXATOMLEN];
