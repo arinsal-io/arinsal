@@ -3,6 +3,7 @@
 //! Dirty NIFs and dirty `enif_schedule_nif` continuations move the calling process
 //! to the dirty scheduler pools (see [`DirtyNifJob`]).
 
+use crate::code_ix::{code_tables, erts_active_code_ix};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -1436,11 +1437,10 @@ pub(crate) fn has_tracer_nifs(module_name: &str) -> bool {
 
 /// Binds the NIF library `key` to its module instance in the active code index.
 // Port of erts/emulator/beam/erl_nif.c:4748 (load_nif: `module_p->curr.nif`), OTP-29.1.1.
-fn publish(vm: &mut Vm, key: &str) {
+fn publish(key: &str) {
     crate::code_ix::global().update_active(|tables| {
         tables.loaded_nifs.insert(key.to_owned());
     });
-    vm.refresh_code();
 }
 
 fn patch_native(module: &arinsal_loader::Module, entry: usize, index: u32) -> Result<(), VmError> {
@@ -1509,13 +1509,11 @@ fn nif_open_error(
 }
 
 fn validate_image(
-    vm: &Vm,
     module_id: usize,
     caller: &str,
     image: &arinsal_nif::NifImage,
 ) -> Result<Vec<(usize, usize)>, String> {
-    let module = vm
-        .code
+    let module = code_tables(erts_active_code_ix())
         .modules
         .get(module_id)
         .ok_or_else(|| format!("module {caller} is not loaded"))?;
@@ -1571,7 +1569,6 @@ fn validate_image(
 // load_nif_1st_finisher), OTP-29.1.1. Functions without native code run in the interpreter,
 // whose entries get the library's `NifBinding` under the same lock.
 fn install_stubs(
-    vm: &mut Vm,
     module_id: usize,
     library: arinsal_nif::NifLibrary,
     binds: &[(usize, usize)],
@@ -1587,7 +1584,7 @@ fn install_stubs(
         scheduler,
         finish: Mutex::new(None),
     });
-    let result = finish_stubs(vm, module_id, &lib, binds);
+    let result = finish_stubs(module_id, &lib, binds);
     match result {
         Ok(()) => {
             // Port of erts/emulator/beam/erl_nif.c:4997 (`prepare_opened_rt`): the resource
@@ -1614,13 +1611,12 @@ fn install_stubs(
 }
 
 fn finish_stubs(
-    vm: &mut Vm,
     module_id: usize,
     lib: &Arc<ModuleNif>,
     binds: &[(usize, usize)],
 ) -> Result<(), VmError> {
-    let module = Arc::clone(&vm.code.modules[module_id]);
-    let version = native_version(vm, module_id);
+    let module = Arc::clone(&code_tables(erts_active_code_ix()).modules[module_id]);
+    let version = native_version(module_id);
     let mut interpreted = Vec::new();
     let mut beam_stubv = Vec::new();
     for &(entry, index) in binds {
@@ -1825,19 +1821,16 @@ pub extern "C" fn erts_call_nif_early(
 }
 
 /// The native code of `module_id`, when the module was compiled by BeamAsm.
-fn native_version(
-    vm: &Vm,
-    module_id: usize,
-) -> Option<Arc<crate::beamasm_integration::CompiledVersion>> {
-    vm.code
+fn native_version(module_id: usize) -> Option<Arc<crate::beamasm_integration::CompiledVersion>> {
+    code_tables(erts_active_code_ix())
         .code_meta
         .get(module_id)
         .and_then(|meta| meta.as_ref())
         .and_then(|meta| meta.beamasm.clone())
 }
 
-fn bind_tracer(vm: &mut Vm, module_id: usize) -> Result<(), VmError> {
-    let module = Arc::clone(&vm.code.modules[module_id]);
+fn bind_tracer(module_id: usize) -> Result<(), VmError> {
+    let module = Arc::clone(&code_tables(erts_active_code_ix()).modules[module_id]);
     let find = |wanted: &str, wanted_arity: u8| {
         module.functions.iter().find_map(|(entry, name, arity)| {
             (*name == wanted && *arity == wanted_arity).then_some(*entry)
@@ -1861,7 +1854,6 @@ fn bind_tracer(vm: &mut Vm, module_id: usize) -> Result<(), VmError> {
 }
 
 fn load_dynamic(
-    vm: &mut Vm,
     process: &mut Process,
     (caller_id, prev_id): (usize, Option<usize>),
     caller: &str,
@@ -1873,7 +1865,7 @@ fn load_dynamic(
         Ok(image) => image,
         Err(error) => return nif_open_error(process, path, error),
     };
-    let binds = match validate_image(vm, caller_id, caller, &image) {
+    let binds = match validate_image(caller_id, caller, &image) {
         Ok(binds) => binds,
         Err(message) => return error_reason(process, "bad_lib", &message),
     };
@@ -1896,7 +1888,7 @@ fn load_dynamic(
         .as_ref()
         .and_then(|runtime| runtime.scheduler().ok())
         .map_or_else(Weak::new, Arc::downgrade);
-    install_stubs(vm, caller_id, library, &binds, scheduler)?;
+    install_stubs(caller_id, library, &binds, scheduler)?;
     Ok(Term::atom(arinsal_term::atoms::OK))
 }
 
@@ -1914,7 +1906,7 @@ fn intern_load_atoms(module: &str) -> Result<(), VmError> {
 
 // Port of erts/emulator/beam/emu/bif_instrs.tab:i_load_nif: the load runs holding the code
 // modification permission; a caller that is not given it yields and retries the call.
-fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
+fn load_nif(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     let runtime = process.runtime;
     let pid = process.self_pid;
     if let (Some(runtime), Some(pid)) = (&runtime, pid)
@@ -1928,7 +1920,7 @@ fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, V
     // The call site (`I`) names the caller.
     let result = crate::natives::proc::native_call_site(process)
         .ok_or_else(|| VmError::Unsupported("load_nif without a call site".into()))
-        .and_then(|(_, pc)| erts_load_nif(vm, process, pc, path, info));
+        .and_then(|(_, pc)| erts_load_nif(process, pc, path, info));
     if let (Some(runtime), Some(_)) = (&runtime, pid) {
         crate::natives::code::release_code_mod_permission(runtime);
     }
@@ -1938,7 +1930,6 @@ fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, V
 /// Loads the NIF library `filename` for the module whose code `i` is in.
 // Port of erts/emulator/beam/erl_nif.c:4708-5040 (erts_load_nif), OTP-29.1.1.
 pub(crate) fn erts_load_nif(
-    vm: &mut Vm,
     process: &mut Process,
     i: usize,
     path: Term,
@@ -1951,7 +1942,6 @@ pub(crate) fn erts_load_nif(
     };
     bytes.extend(b".so");
     // The caller's code (and its native version) may have been loaded by another scheduler.
-    vm.refresh_code();
     // Port of erts/emulator/beam/erl_nif.c:4744-4772 (erts_load_nif), OTP-29.1.1: the library
     // binds to the module whose code called load_nif (`erts_find_function_from_pc`); a pending
     // on_load instance takes it, and a call from old code is refused.
@@ -1959,42 +1949,51 @@ pub(crate) fn erts_load_nif(
     let function = crate::native_function_at(pc)
         .ok_or_else(|| VmError::Unsupported("load_nif without a call site".into()))?;
     let caller_instance = [
-        vm.code.pending_on_load.get(function.module),
-        vm.code.loaded.get(function.module),
-        vm.code.old.get(function.module),
+        code_tables(erts_active_code_ix())
+            .pending_on_load
+            .get(function.module),
+        code_tables(erts_active_code_ix())
+            .loaded
+            .get(function.module),
+        code_tables(erts_active_code_ix()).old.get(function.module),
     ]
     .into_iter()
     .flatten()
     .copied()
     .find(|&id| {
-        crate::load::native_code_range(&vm.code.code_meta, id)
+        crate::load::native_code_range(&code_tables(erts_active_code_ix()).code_meta, id)
             .is_some_and(|(start, end)| (start..end).contains(&pc))
     });
     let caller = function.module.to_owned();
-    if caller_instance.is_some() && caller_instance == vm.code.old.get(&caller).copied() {
+    if caller_instance.is_some()
+        && caller_instance == code_tables(erts_active_code_ix()).old.get(&caller).copied()
+    {
         return error_reason(
             process,
             "old_code",
             &format!("Calling load_nif from old module '{caller}' not allowed"),
         );
     }
-    let caller_id = vm
-        .code
+    let caller_id = code_tables(erts_active_code_ix())
         .pending_on_load
         .get(&caller)
-        .or_else(|| vm.code.loaded.get(&caller))
+        .or_else(|| code_tables(erts_active_code_ix()).loaded.get(&caller))
         .copied()
         .or(caller_instance)
         .ok_or_else(|| VmError::Unsupported("load_nif caller".into()))?;
     // Port of erts/emulator/beam/erl_nif.c:4758-4772 (erts_load_nif), OTP-29.1.1: `prev_mi` is
     // the old code, or for a pending on_load instance the current code when there is one.
-    let prev_id = if vm.code.pending_on_load.get(&caller) == Some(&caller_id) {
-        vm.code
+    let prev_id = if code_tables(erts_active_code_ix())
+        .pending_on_load
+        .get(&caller)
+        == Some(&caller_id)
+    {
+        code_tables(erts_active_code_ix())
             .loaded
             .get(&caller)
-            .or_else(|| vm.code.old.get(&caller))
+            .or_else(|| code_tables(erts_active_code_ix()).old.get(&caller))
     } else {
-        vm.code.old.get(&caller)
+        code_tables(erts_active_code_ix()).old.get(&caller)
     }
     .copied()
     .filter(|&id| id != caller_id);
@@ -2005,8 +2004,7 @@ pub(crate) fn erts_load_nif(
             "load_nif/2 must be explicitly called from the NIF module. It cannot be called through apply/3.",
         );
     }
-    if vm
-        .code
+    if code_tables(erts_active_code_ix())
         .loaded_nifs
         .contains(&crate::load::nif_key(&caller, caller_id))
     {
@@ -2027,12 +2025,12 @@ pub(crate) fn erts_load_nif(
             Term::atom(arinsal_term::atoms::OK)
         }
         "erl_tracer" => {
-            bind_tracer(vm, caller_id)?;
+            bind_tracer(caller_id)?;
             intern_load_atoms(&caller)?;
             Term::atom(arinsal_term::atoms::OK)
         }
         _ => {
-            let term = load_dynamic(vm, process, (caller_id, prev_id), &caller, &bytes, info)?;
+            let term = load_dynamic(process, (caller_id, prev_id), &caller, &bytes, info)?;
             if term != Term::atom(arinsal_term::atoms::OK) {
                 return Ok(term);
             }
@@ -2042,7 +2040,7 @@ pub(crate) fn erts_load_nif(
     };
     if loaded == Term::atom(arinsal_term::atoms::OK) {
         let key = crate::load::nif_key(&caller, caller_id);
-        publish(vm, &key);
+        publish(&key);
     }
     Ok(loaded)
 }
@@ -2634,12 +2632,12 @@ pub(crate) fn load_nif_2(
 }
 
 fn call_load_nif(
-    vm: &mut Vm,
+    _vm: &mut Vm,
     process: &mut Process,
     _ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    load_nif(vm, process, args)
+    load_nif(process, args)
 }
 
 fn call_nif_error(
@@ -2689,8 +2687,7 @@ fn call_values(
         return Some(Err(VmError::Trap(crate::exceptions::Trap::error(reason))));
     }
     if module == "erl_tracer"
-        && vm
-            .code
+        && code_tables(erts_active_code_ix())
             .loaded_nifs
             .iter()
             .any(|key| key.starts_with("erl_tracer#"))

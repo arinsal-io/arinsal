@@ -1,6 +1,7 @@
 //! VM interp implementation.
 
 use super::*;
+use crate::code_ix::{code_tables, erts_active_code_ix};
 
 pub(crate) fn gc_stress_enabled() -> bool {
     static GC_STRESS: OnceLock<bool> = OnceLock::new();
@@ -115,14 +116,20 @@ impl Vm {
         module_id: usize,
         target: usize,
     ) -> Result<(), VmError> {
-        let native = self.code.modules.get(module_id).and_then(|module| {
-            self.beamasm_targets.function_for_target(
-                module_id,
-                module,
-                crate::load::native_code_range(&self.code.code_meta, module_id),
-                target,
-            )
-        });
+        let native = code_tables(erts_active_code_ix())
+            .modules
+            .get(module_id)
+            .and_then(|module| {
+                self.beamasm_targets.function_for_target(
+                    module_id,
+                    module,
+                    crate::load::native_code_range(
+                        &code_tables(erts_active_code_ix()).code_meta,
+                        module_id,
+                    ),
+                    target,
+                )
+            });
         let Some(native) = native else {
             return Err(VmError::Unsupported(format!(
                 "position {target} of module {module_id} is not a native function entry"
@@ -136,7 +143,6 @@ impl Vm {
     /// apply or a trap. A process without one is an error: the JIT flavor runs nothing else.
     // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-317, OTP-29.1.1.
     pub(crate) fn enter_native_position(&mut self, p: &mut Process) -> Result<RunState, VmError> {
-        self.refresh_code();
         p.heap.abi.i = std::ptr::null();
         if p.native_retry().is_none() {
             p.set_native_retry_site(None);

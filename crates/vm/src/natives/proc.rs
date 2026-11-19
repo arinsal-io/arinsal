@@ -1,5 +1,6 @@
 //! Process configuration and introspection BIFs.
 
+use crate::code_ix::{code_tables, erts_active_code_ix};
 use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_sched::{Pid, Priority, RunCtx, Signal};
@@ -3163,22 +3164,22 @@ fn call_values(
             // erts_internal_trace_info_3), OTP-29.1.1.
             ("trace_info", [spec, item]) if module == "erlang" => {
                 let (spec, item) = (*spec, *item);
-                with_code_mod_permission(vm, process, ctx, |vm, process, ctx| {
-                    trace_info(vm, process, ctx, spec, item)
+                with_code_mod_permission(vm, process, ctx, |_vm, process, ctx| {
+                    trace_info(process, ctx, spec, item)
                 })
             }
             ("trace_info", [session, spec, item]) if module == "erts_internal" => {
                 let (session, spec, item) = (*session, *spec, *item);
-                with_code_mod_permission(vm, process, ctx, |vm, process, ctx| {
+                with_code_mod_permission(vm, process, ctx, |_vm, process, ctx| {
                     let session = if atom_name(session).as_deref() == Some("any") {
                         0
                     } else {
                         trace_session_id(process, session).ok_or_else(badarg)?
                     };
-                    trace_session_info(vm, process, ctx, session, spec, item)
+                    trace_session_info(process, ctx, session, spec, item)
                 })
             }
-            ("fun_info_mfa", [fun]) if module == "erlang" => fun_info_mfa(vm, process, *fun),
+            ("fun_info_mfa", [fun]) if module == "erlang" => fun_info_mfa(process, *fun),
             _ => {
                 debug_assert!(
                     !super::listed(IMPLEMENTED, "erlang", function, args.len() as u8)
@@ -3819,7 +3820,6 @@ fn trace(
     flags: Term,
 ) -> Result<Term, VmError> {
     // A tracer module may have been loaded by another scheduler just now.
-    vm.refresh_code();
     let on = if how == Term::atom(arinsal_term::atoms::TRUE) {
         true
     } else if how == Term::atom(arinsal_term::atoms::FALSE) {
@@ -4207,7 +4207,6 @@ fn trace_session_refs_term(
 
 // Port of erts/emulator/beam/erl_bif_trace.c:1403-1465, OTP-29.1.1.
 fn trace_session_info(
-    vm: &Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     session: u64,
@@ -4338,7 +4337,7 @@ fn trace_session_info(
         return make_tuple(process, &[item, value]);
     }
     if let Some(mfa) = trace_mfa(spec) {
-        return trace_info_function(vm, process, ctx, session, mfa, item);
+        return trace_info_function(process, ctx, session, mfa, item);
     }
     if let Some(port) = spec.as_port() {
         if port != 0 && !crate::port::is_live(process, port) {
@@ -4425,7 +4424,6 @@ fn trace_session_info(
 }
 
 fn trace_info(
-    vm: &Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     spec: Term,
@@ -4489,7 +4487,7 @@ fn trace_info(
         return make_tuple(process, &[item, value]);
     }
     if let Some(mfa) = trace_mfa(spec) {
-        return trace_info_function(vm, process, ctx, 0, mfa, item);
+        return trace_info_function(process, ctx, 0, mfa, item);
     }
     if let Some(port) = spec.as_port() {
         if port != 0 && !crate::port::is_live(process, port) {
@@ -4606,7 +4604,6 @@ fn meta_tracer_from_term(flag: Term) -> Result<crate::trace::Tracer, VmError> {
 // Port of erts/emulator/beam/erl_bif_trace.c:1913-1960 (trace_info_func) and 2132-2290
 // (trace_info_func_epilogue), OTP-29.1.1.
 fn trace_info_function(
-    vm: &Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     session: u64,
@@ -4620,7 +4617,7 @@ fn trace_info_function(
     let key = atom_name(item).unwrap_or_default();
     if key == "session" {
         // Port of erts/emulator/beam/erl_bif_trace.c:2427-2468 (trace_info_sessions), OTP-29.1.1.
-        if !function_exists(vm, &module, &function, arity) {
+        if !function_exists(&module, &function, arity) {
             return make_tuple(process, &[item, Term::atom(arinsal_term::atoms::UNDEFINED)]);
         }
         let refs = crate::trace_bp::sessions_for_function(process, &module, &function, arity)
@@ -4640,7 +4637,7 @@ fn trace_info_function(
         _ => return Err(badarg()),
     };
     // A function that does not exist reports `undefined`, an untraced one `false`.
-    if !function_exists(vm, &module, &function, arity) {
+    if !function_exists(&module, &function, arity) {
         return make_tuple(process, &[item, Term::atom(arinsal_term::atoms::UNDEFINED)]);
     }
     let mut info =
@@ -4818,13 +4815,14 @@ fn trace_info_function(
 
 /// Count the functions of the current code of the selected modules.
 // Port of erts/emulator/beam/erl_bif_trace.c:1594-1640 (erts_set_trace_pattern), OTP-29.1.1.
-fn matched_functions(vm: &Vm, module: &str, function: &str, arity: Option<u8>) -> usize {
-    vm.code
+fn matched_functions(module: &str, function: &str, arity: Option<u8>) -> usize {
+    code_tables(erts_active_code_ix())
         .modules
         .iter()
         .enumerate()
         .filter(|(id, loaded)| {
-            (module == "_" || loaded.name == module) && vm.code.loaded.get(&loaded.name) == Some(id)
+            (module == "_" || loaded.name == module)
+                && code_tables(erts_active_code_ix()).loaded.get(&loaded.name) == Some(id)
         })
         .flat_map(|(_, loaded)| loaded.functions.iter())
         .filter(|(_, name, n)| {
@@ -4833,8 +4831,8 @@ fn matched_functions(vm: &Vm, module: &str, function: &str, arity: Option<u8>) -
         .count()
 }
 
-fn function_exists(vm: &Vm, module: &str, function: &str, arity: u8) -> bool {
-    matched_functions(vm, module, function, Some(arity)) > 0
+fn function_exists(module: &str, function: &str, arity: u8) -> bool {
+    matched_functions(module, function, Some(arity)) > 0
         || arinsal_bifs::lookup(module, function, arity).is_some()
         || arinsal_spec::bif_lookup(module, function, arity).is_some()
 }
@@ -5191,12 +5189,10 @@ fn run_finish_stage(
     use crate::trace_bp::FinishStage;
     match stage {
         FinishStage::Install => {
-            vm.refresh_code();
             crate::trace_bp::with_install_view(|| vm.refresh_trace_functions(process, functions));
         }
         FinishStage::Commit => crate::trace_bp::commit_staged(process),
         FinishStage::Uninstall => {
-            vm.refresh_code();
             vm.refresh_trace_functions(process, functions);
         }
         FinishStage::Consolidate => crate::trace_bp::consolidate_staged(process, functions),
@@ -5253,7 +5249,6 @@ fn trace_pattern(
     flags: Term,
 ) -> Result<Term, VmError> {
     // Patch the current code of every module, including loads this scheduler's VM has not seen.
-    vm.refresh_code();
     if let Some(event) = atom_name(spec)
         && matches!(event.as_str(), "send" | "receive")
     {
@@ -5394,7 +5389,7 @@ fn trace_pattern(
         };
         Some(u8::try_from(*arity).map_err(|_| badarg())?)
     };
-    let functions = bp_functions(vm, &module, &function, arity);
+    let functions = bp_functions(&module, &function, arity);
     // Port of erts/emulator/beam/erl_bif_trace.c:2661-2725 (erts_set_trace_pattern): the count
     // is of the matched functions; only clearing, pausing and restarting skip the ones that
     // have no breakpoint.
@@ -5442,15 +5437,19 @@ fn trace_pattern(
 /// The functions of the current code of the selected modules.
 // Port of erts/emulator/beam/beam_bp.c:183-260 (erts_bp_match_functions), OTP-29.1.1.
 pub(crate) fn bp_functions(
-    vm: &Vm,
     module: &str,
     function: &str,
     arity: Option<u8>,
 ) -> Vec<crate::trace_bp::BpFunction> {
     let mut functions = Vec::new();
     let mut positions = std::collections::HashMap::new();
-    for (id, loaded) in vm.code.modules.iter().enumerate() {
-        if (module != "_" && loaded.name != module) || vm.code.loaded.get(&loaded.name) != Some(&id)
+    for (id, loaded) in code_tables(erts_active_code_ix())
+        .modules
+        .iter()
+        .enumerate()
+    {
+        if (module != "_" && loaded.name != module)
+            || code_tables(erts_active_code_ix()).loaded.get(&loaded.name) != Some(&id)
         {
             continue;
         }
@@ -5547,7 +5546,7 @@ fn processes_next(
 }
 
 // Port of erts/emulator/beam/erl_bif_info.c:4011 (fun_info_mfa_1), OTP-29.1.1.
-fn fun_info_mfa(vm: &Vm, process: &mut Process, fun: Term) -> Result<Term, VmError> {
+fn fun_info_mfa(process: &mut Process, fun: Term) -> Result<Term, VmError> {
     // SAFETY: The fun stays rooted in the caller heap for this BIF.
     let view = unsafe { fun.fun_ref() }.ok_or_else(badarg)?;
     let (module, name, arity) = match view {
@@ -5561,16 +5560,19 @@ fn fun_info_mfa(vm: &Vm, process: &mut Process, fun: Term) -> Result<Term, VmErr
                 .text(entry.module)
                 .ok_or_else(badarg)?
                 .to_string();
-            let function = vm.code.loaded.get(&module_name).and_then(|&id| {
-                vm.code.modules[id]
-                    .funs
-                    .iter()
-                    .find(|slot| slot.entry.index == entry.index)
-                    .map(|slot| (id, slot.target))
-            });
+            let function = code_tables(erts_active_code_ix())
+                .loaded
+                .get(&module_name)
+                .and_then(|&id| {
+                    code_tables(erts_active_code_ix()).modules[id]
+                        .funs
+                        .iter()
+                        .find(|slot| slot.entry.index == entry.index)
+                        .map(|slot| (id, slot.target))
+                });
             let name = function
                 .and_then(|(id, target)| {
-                    vm.code.modules[id]
+                    code_tables(erts_active_code_ix()).modules[id]
                         .function_at(target)
                         .map(|(name, _)| name.to_owned())
                 })

@@ -38,9 +38,6 @@ pub(super) fn process_main(
     }
     let schedule_started =
         crate::natives::erts_debug::long_schedule_monitored(process).then(std::time::Instant::now);
-    // A process runs with the code index active when it is scheduled in.
-    // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-247, OTP-29.1.1.
-    lend_vm(esdp).refresh_code();
     // Port of erts/emulator/beam/erl_process.c:12616 (erl_create_process: `p->i =
     // beam_run_process`), OTP-29.1.1: a spawned process (`p->u.initial` set) enters at the
     // stub on its first run. It is installed here, not at spawn, because process_info and

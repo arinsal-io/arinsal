@@ -102,7 +102,7 @@ use std::sync::{Arc, OnceLock};
 
 pub(crate) use calls::ImportOutcome;
 pub(crate) use interp::{RunState, XREG_POISON, gc_stress_enabled, xreg_poison_enabled};
-pub(crate) use load::{CodeMeta, CodeTables};
+pub(crate) use load::CodeMeta;
 pub use native_bridge::{
     NativeFile, NativeFunction, NativeLine, NativeLines, arinsal_native_raise, native_function_at,
     register_native_function, run_native,
@@ -144,7 +144,7 @@ mod boot_loop1_shared_tests {
     }
 
     #[test]
-    fn prepared_module_is_visible_to_other_scheduler_replicas() {
+    fn loaded_module_is_in_the_active_code_tables() {
         let Ok(reference) = RefErl::start() else {
             eprintln!("erl unavailable; skipping shared code publication test");
             return;
@@ -156,13 +156,10 @@ mod boot_loop1_shared_tests {
                 &[],
             )
             .unwrap();
-        let mut first = Vm::shared_replica(&[]);
-        let mut second = Vm::shared_replica(&[]);
-        let id = first.load_bytes(&beam).unwrap();
-        second.refresh_code();
-        assert_eq!(second.code.modules[id].name, "boot_loop1_shared");
-        assert!(crate::code_ix::global().active_tables().modules.len() > id);
-        drop((first, second));
+        let mut vm = Vm::shared_replica(&[]);
+        let id = vm.load_bytes(&beam).unwrap();
+        let code = crate::code_ix::code_tables(crate::code_ix::erts_active_code_ix());
+        assert_eq!(code.modules[id].name, "boot_loop1_shared");
     }
 }
 
@@ -288,8 +285,6 @@ pub struct Vm {
     pub(crate) runtime: Option<&'static crate::process::Runtime>,
     pub(crate) statistics_origins: crate::natives::sys::StatisticsOrigins,
     pub(crate) otp_root: Option<PathBuf>,
-    /// The code tables of `erts_active_code_ix()` this VM reads (see [`Vm::refresh_code`]).
-    pub(crate) code: Arc<CodeTables>,
     beamasm_targets: beamasm_integration::NativeTargetCache,
     /// A scheduler's VM; the node's own VM owns the child setup.
     replica: bool,

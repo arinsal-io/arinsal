@@ -1,5 +1,6 @@
 //! Process-aware BIFs. These use the running process and scheduler context.
 
+use crate::code_ix::{code_tables, erts_active_code_ix};
 use crate::process::{Message, Runtime};
 use crate::{Process, Vm, VmError};
 use arinsal_sched::{Pid, Priority, RunCtx, Signal};
@@ -547,7 +548,6 @@ fn task_tuple(process: &mut Process, values: &[Term]) -> Result<Term, VmError> {
 // `copy_literals` is not a request type here; the literal-area collector sends
 // that work through `send_copy_request/3`.
 fn request_system_task(
-    vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
@@ -599,12 +599,15 @@ fn request_system_task(
             let module = arg0
                 .and_then(atom_name)
                 .ok_or_else(|| badarg("request_system_task"))?;
-            vm.refresh_code();
-            let old = vm.code.old.get(&module).copied();
+            let old = code_tables(erts_active_code_ix()).old.get(&module).copied();
             let op = RemoteOp::CheckProcessCode {
                 module: old,
                 native: old.and_then(|old| {
-                    crate::load::native_code_version(&vm.code.code_meta, old).cloned()
+                    crate::load::native_code_version(
+                        &code_tables(erts_active_code_ix()).code_meta,
+                        old,
+                    )
+                    .cloned()
                 }),
                 async_request: Some(Message::copy_from(req_id)?),
                 kill: false,
@@ -1069,9 +1072,7 @@ fn call_resolved(
             dirty_process_handle_signals(vm, process, ctx, *arg)
         }
         (SignalBif::RequestSystemTask3, [_, _, _])
-        | (SignalBif::RequestSystemTask4, [_, _, _, _]) => {
-            request_system_task(vm, process, ctx, args)
-        }
+        | (SignalBif::RequestSystemTask4, [_, _, _, _]) => request_system_task(process, ctx, args),
         _ => Err(VmError::Unsupported("resolved signal BIF arity".into())),
     }
 }

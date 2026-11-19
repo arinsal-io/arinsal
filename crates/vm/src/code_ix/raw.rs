@@ -62,6 +62,26 @@ impl<T> RawSlot<T> {
         read(unsafe { &*ptr })
     }
 
+    /// The published value as erts readers see `module_tables[ix]` / `export_tables[ix]`: a
+    /// plain pointer load with no lock, no reference count and no guard.
+    ///
+    /// The value stays alive while the caller has not passed a thread-progress point since
+    /// the load: a replaced value is released only by a thread-progress later operation
+    /// ([`RetireOp`]), as erts frees an old code index generation only after
+    /// `erts_commit_staging_code_ix` and thread progress.
+    // Port of erts/emulator/beam/code_ix.h (erts_active_code_ix) and module.c / export.c
+    // (`module_tables[code_ix]`, `export_tables[code_ix]` read without a lock), OTP-29.1.1.
+    #[inline(always)]
+    pub(crate) fn get(&self) -> &T {
+        let ptr = self.ptr.load(Ordering::Acquire);
+        assert!(!ptr.is_null(), "code table slot is empty");
+        // SAFETY: publication transfers an Arc ownership reference to the slot; a replaced
+        // value is released only by a thread-progress later operation, after every reader that
+        // loaded it reached a progress point (erts' code index publication rule). Readers do
+        // not keep the reference across a scheduler progress point.
+        unsafe { &*ptr }
+    }
+
     /// Clone the slot's `Arc` ownership while its table pointer is protected by the caller's
     /// reader lifetime. Used only by non-hot snapshot paths.
     #[inline]

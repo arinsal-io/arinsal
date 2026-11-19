@@ -62,9 +62,6 @@ static the_staging_code_index: AtomicU32 = AtomicU32::new(0);
 pub(crate) struct CodeIndexes {
     /// `module_tables[ERTS_NUM_CODE_IX]`, the export tables and the ranges of each code index.
     tables: [RawSlot<CodeTables>; ERTS_NUM_CODE_IX],
-    /// Generation of each slot's tables, published after the tables: a scheduled-in process
-    /// compares its code index with one atomic read, like `erts_active_code_ix()`.
-    generations: [AtomicU64; ERTS_NUM_CODE_IX],
     /// `bccix[ERTS_NUM_CODE_IX].beam_catches`: the catch table of each code index. Readers load
     /// the active slot; the pools that own the free lists are in `bccix`.
     catches: [RawSlot<crate::beam_catches::CatchVec>; ERTS_NUM_CODE_IX],
@@ -94,7 +91,6 @@ impl CodeIndexes {
         let initial = Arc::new(CodeTables::new());
         let (bccix, catch_vec) = crate::beam_catches::beam_catches_init();
         Self {
-            generations: std::array::from_fn(|_| AtomicU64::new(initial.generation)),
             tables: std::array::from_fn(|_| RawSlot::new(Arc::clone(&initial))),
             catches: std::array::from_fn(|_| RawSlot::new(Arc::clone(&catch_vec))),
             bccix,
@@ -134,16 +130,8 @@ impl CodeIndexes {
         self.tables.get(table_ix).map(|tables| tables.read(read))
     }
 
-    /// Generation of the active tables.
-    // Port of erts/emulator/beam/code_ix.h (erts_active_code_ix: one atomic read), OTP-29.1.1.
-    pub(crate) fn active_generation(&self) -> u64 {
-        self.generations[self.active()].load(Ordering::Acquire)
-    }
-
     fn store_slot(&self, ix: usize, tables: Arc<CodeTables>) {
-        let generation = tables.generation;
         self.store_raw_slot(&self.tables[ix], tables);
-        self.generations[ix].store(generation, Ordering::Release);
     }
 
     fn store_raw_slot<T>(&self, slot: &RawSlot<T>, value: Arc<T>) {
@@ -874,6 +862,30 @@ thread_local! {
 static CODE_BARRIER_THREADS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// `erts_active_code_ix()` (code_ix.h): one atomic load of [`the_active_code_index`].
+// Port of erts/emulator/beam/code_ix.h (erts_active_code_ix), OTP-29.1.1.
+#[inline(always)]
+pub(crate) fn erts_active_code_ix() -> usize {
+    the_active_code_index.load(Ordering::Acquire) as usize
+}
+
+/// The code-indexed tables of `code_ix`: `module_tables[code_ix]` (module.c),
+/// `export_tables[code_ix]` (export.c) and the fun table. A reader holds the reference while it
+/// runs, never across a scheduler thread-progress point; a commit never changes a published
+/// generation, it publishes a new one and frees the replaced one after thread progress
+/// (code_ix.c erts_commit_staging_code_ix).
+// Port of erts/emulator/beam/module.c (erts_get_module reads module_tables[code_ix]) and
+// export.c (erts_find_export_entry reads export_tables[code_ix]), OTP-29.1.1.
+#[inline(always)]
+pub(crate) fn code_tables(code_ix: usize) -> &'static CodeTables {
+    let table_ix = if code_ix == ERTS_SAVE_CALLS_CODE_IX {
+        erts_active_code_ix()
+    } else {
+        code_ix
+    };
+    global().tables[table_ix].get()
+}
+
 static CODE_IX: OnceLock<Arc<CodeIndexes>> = OnceLock::new();
 
 /// The code indexes once they exist: the fragments published by `beamasm_init` come first.
@@ -1018,7 +1030,7 @@ mod tests {
         });
         staging.abort();
         assert_eq!((code.active(), code.staging()), (active, staging_ix));
-        assert_eq!(code.active_generation(), before.generation);
+        assert_eq!(code.active_tables().generation, before.generation);
         assert!(!code.active_tables().loaded.contains_key("aborted_mod"));
         // A later staging area does not see the aborted change either.
         let staging = code.start_staging();
@@ -1050,17 +1062,17 @@ mod tests {
     #[test]
     fn nested_staging_joins_and_commits_once() {
         let code = node();
-        let generation = code.active_generation();
+        let generation = code.active_tables().generation;
         let outer = code.start_staging();
         let inner = code.start_staging();
         inner.with(|tables| {
             tables.loaded.insert("inner_mod", 2);
         });
         drop(inner);
-        assert_eq!(code.active_generation(), generation);
+        assert_eq!(code.active_tables().generation, generation);
         assert!(!code.active_tables().loaded.contains_key("inner_mod"));
         drop(outer);
-        assert_ne!(code.active_generation(), generation);
+        assert_ne!(code.active_tables().generation, generation);
         assert!(code.active_tables().loaded.contains_key("inner_mod"));
     }
 

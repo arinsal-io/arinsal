@@ -1311,9 +1311,6 @@ pub(crate) extern "C" fn sched_bif_light<B: SchedBif>(
     // The call site a raising or suspending BIF names (`c_p->i` at the call).
     process.native_call_pc = registers.tmp_mem[6] as usize;
     let result = crate::process::sched_data::with_sched_data(process, |vm, process, ctx| {
-        // The executor's VM view follows the active code index before a BIF reads it
-        // (function_exported/3, module_loaded/1, ...).
-        vm.refresh_code();
         (B::BODY)(vm, process, ctx, &args[..B::ARITY])
     })
     .expect("native code runs inside an executor slice, which publishes its scheduler data");

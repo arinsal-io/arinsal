@@ -137,7 +137,7 @@ pub(super) fn context_switch(
                 let live = usize::from(live);
                 let mut vm = lend_vm(esdp);
                 let handler = vm.load_named("erts_internal").is_ok_and(|id| {
-                    vm.code.modules[id]
+                    crate::code_ix::code_tables(crate::code_ix::erts_active_code_ix()).modules[id]
                         .functions
                         .iter()
                         .any(|(_, name, arity)| *name == "breakpoint" && *arity == 4)
@@ -443,9 +443,6 @@ pub(super) fn context_switch(
                 );
             }
             process.gc_live = usize::from(export.arity);
-            // Like call_import_general: code loaded by another scheduler must be
-            // visible to the BIF (function_exported/3, module_loaded/1, ...).
-            lend_vm(esdp).refresh_code();
             if matches!(
                 export.class,
                 arinsal_loader::ImportClass::Native
@@ -729,7 +726,10 @@ pub(super) fn context_switch(
                     return Ok(Flow::Continue);
                 }
             }
-            let loaded = lend_vm(esdp).code.loaded.get(&export.module).copied();
+            let loaded = crate::code_ix::code_tables(crate::code_ix::erts_active_code_ix())
+                .loaded
+                .get(&export.module)
+                .copied();
             let module_id = match loaded {
                 Some(module_id) => module_id,
                 // Like call_import: a module with -on_load is loaded through
@@ -803,7 +803,10 @@ pub(super) fn context_switch(
             // the call, then enters the function's code; a traced return
             // leaves through the native trace stub.
             if crate::export::has_export_breakpoint(export.export_object()) {
-                let module = Arc::clone(&lend_vm(esdp).code.modules[module_id]);
+                let module = Arc::clone(
+                    &crate::code_ix::code_tables(crate::code_ix::erts_active_code_ix()).modules
+                        [module_id],
+                );
                 let function = module
                     .exports
                     .iter()
@@ -815,7 +818,11 @@ pub(super) fn context_switch(
                         vm.beamasm_targets.function_for_target(
                             module_id,
                             &module,
-                            crate::load::native_code_range(&vm.code.code_meta, module_id),
+                            crate::load::native_code_range(
+                                &crate::code_ix::code_tables(crate::code_ix::erts_active_code_ix())
+                                    .code_meta,
+                                module_id,
+                            ),
                             entry,
                         )
                     });
@@ -841,7 +848,8 @@ pub(super) fn context_switch(
                     return Ok(Flow::Continue);
                 }
             }
-            let target_ip = lend_vm(esdp).code.modules[module_id]
+            let target_ip = crate::code_ix::code_tables(crate::code_ix::erts_active_code_ix())
+                .modules[module_id]
                 .export_slot(&export.function, export.arity)
                 .map(arinsal_loader::ExportSlot::target);
             if let Some(target_ip) = target_ip {

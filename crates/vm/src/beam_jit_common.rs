@@ -624,8 +624,8 @@ pub extern "C" fn beam_jit_load_nif(
         return BeamJitNifLoadRet::Yield;
     }
     let (path, info) = (registers.x_reg_array[0], registers.x_reg_array[1]);
-    let result = crate::process::sched_data::with_sched_data(process, |vm, process, _ctx| {
-        crate::natives::nif::erts_load_nif(vm, process, i, path, info)
+    let result = crate::process::sched_data::with_sched_data(process, |_vm, process, _ctx| {
+        crate::natives::nif::erts_load_nif(process, i, path, info)
     })
     .expect("native code runs inside an executor slice, which publishes its scheduler data");
     crate::natives::code::release_code_mod_permission(runtime);

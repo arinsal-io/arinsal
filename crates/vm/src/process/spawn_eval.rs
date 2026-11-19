@@ -1,4 +1,5 @@
 use super::*;
+use crate::code_ix::{code_tables, erts_active_code_ix};
 
 impl Runtime {
     /// Create a distributed child with its remote monitor (and optional link) installed before
@@ -200,7 +201,7 @@ impl Vm {
             reductions,
         );
         let keep = matches!(&result, Ok(done) if done.text == "ok");
-        crate::natives::code::finish_after_on_load(self, module, keep)
+        crate::natives::code::finish_after_on_load(module, keep)
     }
 
     /// Run an exported function with schedulable BEAM processes.
@@ -276,15 +277,23 @@ impl Vm {
         if module != "erl_init" {
             initialize_feature_defaults(arinsal_pterm::global_store())?;
         }
-        self.refresh_code();
-        if !self.code.loaded.contains_key(module)
-            && !self.code.pending_on_load.contains_key(module)
+        if !code_tables(erts_active_code_ix())
+            .loaded
+            .contains_key(module)
+            && !code_tables(erts_active_code_ix())
+                .pending_on_load
+                .contains_key(module)
             && let Err(error) = self.load_named(module)
-            && !self.code.pending_on_load.contains_key(module)
+            && !code_tables(erts_active_code_ix())
+                .pending_on_load
+                .contains_key(module)
         {
             return Err(error);
         }
-        if self.code.pending_on_load.contains_key(module) {
+        if code_tables(erts_active_code_ix())
+            .pending_on_load
+            .contains_key(module)
+        {
             self.run_pending_on_load(module, workers, reductions)?;
         }
         let module_id = self.load_named(module)?;
@@ -295,7 +304,7 @@ impl Vm {
         if module != "erl_init" {
             let _ = self.load_named("erts_internal");
         }
-        if self.code.modules[module_id]
+        if code_tables(erts_active_code_ix()).modules[module_id]
             .export(function, args.len() as u8)
             .is_none()
         {
@@ -497,7 +506,6 @@ impl Vm {
             while arinsal_pterm::global_store().has_retired() {
                 std::thread::park_timeout(std::time::Duration::from_millis(1));
             }
-            self.refresh_code();
             result
         })()
     }

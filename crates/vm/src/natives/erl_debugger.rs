@@ -1,5 +1,6 @@
 //! OTP debugger BIFs and debugger event delivery.
 
+use crate::code_ix::{code_tables, erts_active_code_ix};
 use crate::{Process, Vm, VmError};
 use arinsal_etf::OwnedTerm as O;
 use arinsal_sched::{Pid, RunCtx};
@@ -89,11 +90,11 @@ fn call_impl(
         ("erl_debugger", "unregister", [pid, session]) => unregister(process, *pid, *session),
         ("erl_debugger", "whereis", []) => whereis(process),
         ("erl_debugger", "breakpoint", [module, line, enable]) => {
-            breakpoint(vm, process, *module, *line, *enable)
+            breakpoint(process, *module, *line, *enable)
         }
-        ("erl_debugger", "breakpoints", [module]) => breakpoints(vm, process, *module, None),
+        ("erl_debugger", "breakpoints", [module]) => breakpoints(process, *module, None),
         ("erl_debugger", "breakpoints", [module, function, arity]) => {
-            breakpoints(vm, process, *module, Some((*function, *arity)))
+            breakpoints(process, *module, Some((*function, *arity)))
         }
         ("erl_debugger", "stack_frames", [pid, max_size]) => stack_frames(process, *pid, *max_size),
         ("erl_debugger", "peek_stack_frame_slot", [pid, frame, slot, max_size]) => {
@@ -198,7 +199,6 @@ fn whereis(process: &Process) -> Result<Term, VmError> {
 
 // Port of erts/emulator/beam/erl_debugger.c:318-403, OTP-29.1.1.
 fn breakpoint(
-    vm: &mut Vm,
     process: &mut Process,
     module: Term,
     line: Term,
@@ -216,13 +216,13 @@ fn breakpoint(
     {
         return Err(badarg());
     }
-    let Some(&id) = vm.code.loaded.get(&module) else {
+    let Some(&id) = code_tables(erts_active_code_ix()).loaded.get(&module) else {
         return result_error(
             process,
             O::Tuple(vec![O::Atom("badkey".into()), O::Atom(module)]),
         );
     };
-    let Some(code) = vm.code.modules.get(id) else {
+    let Some(code) = code_tables(erts_active_code_ix()).modules.get(id) else {
         return result_error(
             process,
             O::Tuple(vec![O::Atom("badkey".into()), O::Atom(module)]),
@@ -271,7 +271,6 @@ fn breakpoint(
 
 // Port of erts/emulator/beam/erl_debugger.c:447-555, OTP-29.1.1.
 fn breakpoints(
-    vm: &Vm,
     process: &mut Process,
     module_term: Term,
     function: Option<(Term, Term)>,
@@ -285,7 +284,7 @@ fn breakpoints(
             ))
         })
         .transpose()?;
-    let Some(&id) = vm.code.loaded.get(&module_name) else {
+    let Some(&id) = code_tables(erts_active_code_ix()).loaded.get(&module_name) else {
         return if function.is_some() {
             result_error(
                 process,
@@ -295,7 +294,10 @@ fn breakpoints(
             result_error(process, O::Atom("badkey".into()))
         };
     };
-    let code = vm.code.modules.get(id).ok_or_else(badarg)?;
+    let code = code_tables(erts_active_code_ix())
+        .modules
+        .get(id)
+        .ok_or_else(badarg)?;
     if let Some((function, arity)) = function {
         let Some((start, _, _)) = code
             .functions
@@ -825,14 +827,13 @@ fn debug_breakpoint(
             return Err(badarg());
         }
     }
-    let matches = vm
-        .code
+    let matches = code_tables(erts_active_code_ix())
         .loaded
         .values()
         .copied()
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
-        .filter_map(|id| vm.code.modules.get(id))
+        .filter_map(|id| code_tables(erts_active_code_ix()).modules.get(id))
         .flat_map(|code| {
             code.functions
                 .iter()

@@ -88,10 +88,6 @@ impl Task for Process {
                         &zero,
                     );
                 } else {
-                    // The `in` event resolves the current function against the active code
-                    // index, so this scheduler's replica must be current first
-                    // (erts_find_function_from_pc reads the active code index).
-                    lend_vm(esdp).refresh_code();
                     // The MFA tuple is built on the process heap, where erts' HAlloc never fails.
                     let running = crate::trace::running_mfa(process, pid).unwrap_or(None);
                     let running_fields = [running.unwrap_or(Term::small(0).expect("small zero"))];

@@ -1,5 +1,6 @@
 //! Local closures, export funs, and dynamic calls.
 
+use crate::code_ix::{code_tables, erts_active_code_ix};
 use crate::{EvalResult, ImportOutcome, Process, Vm, VmError, exceptions};
 use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle};
 use arinsal_loader::Module;
@@ -221,12 +222,12 @@ impl Vm {
         match view.unwrap() {
             FunRef::Local { entry, free_vars } => {
                 // Port of erts/emulator/beam/beam_common.c:1621-1624 (call_fun), OTP-29.1.1.
-                self.refresh_code();
                 let cached = entry.get_dispatch(0).and_then(|(id, target, generation)| {
                     if generation == self.code_generation() {
                         return Some((id, target));
                     }
-                    (self.code.module_live.get(id) == Some(&true)).then_some((id, target))
+                    (code_tables(erts_active_code_ix()).module_live.get(id) == Some(&true))
+                        .then_some((id, target))
                 });
                 let resolved = match cached {
                     Some(cached) if !crate::natives::code::erts_purge_state().pending(cached.0) => {
@@ -317,11 +318,14 @@ impl Vm {
             ("erts_code_purger".to_owned(), "pending_purge_lambda")
         } else {
             let handler = error_handler_module(p);
-            let ready = self.code.loaded.get(&handler).is_some_and(|id| {
-                self.code.modules[*id]
-                    .export("undefined_lambda", 3)
-                    .is_some()
-            });
+            let ready = code_tables(erts_active_code_ix())
+                .loaded
+                .get(&handler)
+                .is_some_and(|id| {
+                    code_tables(erts_active_code_ix()).modules[*id]
+                        .export("undefined_lambda", 3)
+                        .is_some()
+                });
             if !ready {
                 return Err(VmError::Trap(exceptions::Trap::error(Term::atom(
                     global_atoms()
@@ -356,25 +360,31 @@ impl Vm {
     ) -> Result<Option<(usize, usize)>, VmError> {
         let name = atom_name(Term::atom(entry.module))
             .ok_or_else(|| VmError::Unsupported("lambda module atom".into()))?;
-        let found = [self.code.loaded.get(&name), self.code.old.get(&name)]
-            .into_iter()
-            .flatten()
-            .find_map(|&id| {
-                self.code.modules[id]
-                    .funs
-                    .iter()
-                    .find(|slot| {
-                        slot.entry.index == entry.index
-                            && slot.entry.uniq == entry.uniq
-                            && slot.entry.arity == entry.arity
-                    })
-                    .map(|slot| (id, slot.target))
-            });
+        let found = [
+            code_tables(erts_active_code_ix()).loaded.get(&name),
+            code_tables(erts_active_code_ix()).old.get(&name),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|&id| {
+            code_tables(erts_active_code_ix()).modules[id]
+                .funs
+                .iter()
+                .find(|slot| {
+                    slot.entry.index == entry.index
+                        && slot.entry.uniq == entry.uniq
+                        && slot.entry.arity == entry.arity
+                })
+                .map(|slot| (id, slot.target))
+        });
         let Some((module_id, target)) = found else {
             // Port of erts/emulator/beam/beam_common.c:1702-1712 (call_fun), OTP-29.1.1:
             // current code without this fun is `badfun`; no current code goes to
             // `error_handler:undefined_lambda/3`.
-            if self.code.loaded.contains_key(&name) {
+            if code_tables(erts_active_code_ix())
+                .loaded
+                .contains_key(&name)
+            {
                 let reason = badfun_reason(p, self.reg_prefix(arity + 1)?, arity)?;
                 return Err(VmError::Trap(exceptions::Trap::error(reason)));
             }
@@ -421,8 +431,8 @@ impl Vm {
         if !crate::trace_bp::any_pattern()
             && !crate::trace::saves_calls(p)
             && !self.unloaded_on_load(p, module)
-            && let Some(&module_id) = self.code.loaded.get(&module_atom)
-            && let Some(target) = self.code.modules[module_id]
+            && let Some(&module_id) = code_tables(erts_active_code_ix()).loaded.get(&module_atom)
+            && let Some(target) = code_tables(erts_active_code_ix()).modules[module_id]
                 .export_slot_atom(function_atom, arity as u8)
                 .map(arinsal_loader::ExportSlot::target)
         {
@@ -878,7 +888,9 @@ impl Vm {
                 });
             }
         };
-        let Some(target) = self.code.modules[module_id].export(function, arity as u8) else {
+        let Some(target) =
+            code_tables(erts_active_code_ix()).modules[module_id].export(function, arity as u8)
+        else {
             // Port of erts/emulator/beam/beam_common.c (call_error_handler).
             if self.should_autoload(p, module) {
                 return self.call_undefined_function_with_ctx(p, module, function, arity, ctx);
@@ -897,8 +909,11 @@ impl Vm {
             && crate::trace_bp::breakpoint_kinds(p, module, function, arity as u8).1
             && let Some(native) = self.beamasm_targets.function_for_target(
                 module_id,
-                &self.code.modules[module_id],
-                crate::load::native_code_range(&self.code.code_meta, module_id),
+                &code_tables(erts_active_code_ix()).modules[module_id],
+                crate::load::native_code_range(
+                    &code_tables(erts_active_code_ix()).code_meta,
+                    module_id,
+                ),
                 target,
             )
         {
@@ -972,7 +987,11 @@ impl Vm {
     /// autoloads the consolidated beam. Port of
     /// `error_handler:undefined_function/3`, OTP-29.1.1.
     pub(super) fn should_autoload(&self, p: &Process, module: &str) -> bool {
-        if module == "error_handler" || self.code.pending_on_load.contains_key(module) {
+        if module == "error_handler"
+            || code_tables(erts_active_code_ix())
+                .pending_on_load
+                .contains_key(module)
+        {
             return false;
         }
         p.runtime
@@ -1004,11 +1023,14 @@ impl Vm {
         // with no handler, the undef stack frame must retain the original call arguments.
         // `process_flag(error_handler, Module)` also disables autoload for that module.
         let handler = error_handler_module(p);
-        let ready = self.code.loaded.get(&handler).is_some_and(|id| {
-            self.code.modules[*id]
-                .export("undefined_function", 3)
-                .is_some()
-        });
+        let ready = code_tables(erts_active_code_ix())
+            .loaded
+            .get(&handler)
+            .is_some_and(|id| {
+                code_tables(erts_active_code_ix()).modules[*id]
+                    .export("undefined_function", 3)
+                    .is_some()
+            });
         if !ready {
             return Err(VmError::Exception {
                 reason: "undef".into(),
@@ -1048,11 +1070,14 @@ impl Vm {
         // (`call_error_handler`), OTP-29.1.1. A breakpoint dispatches through the
         // process-configured handler just like an undefined call does.
         let handler = error_handler_module(p);
-        let ready = self
-            .code
+        let ready = code_tables(erts_active_code_ix())
             .loaded
             .get(&handler)
-            .is_some_and(|id| self.code.modules[*id].export("breakpoint", 3).is_some());
+            .is_some_and(|id| {
+                code_tables(erts_active_code_ix()).modules[*id]
+                    .export("breakpoint", 3)
+                    .is_some()
+            });
         if !ready {
             return Err(VmError::Exception {
                 reason: "undef".into(),
@@ -1378,24 +1403,27 @@ impl Vm {
     /// Port of erts/emulator/beam/erl_fun.c:37 (erts_get_fun_mfa), OTP-29.1.1.
     fn fun_function_name(&self, entry: &arinsal_term::FunEntry) -> Option<String> {
         let module = atom_name(Term::atom(entry.module))?;
-        let (id, target) = [self.code.loaded.get(&module), self.code.old.get(&module)]
-            .into_iter()
-            .flatten()
-            .find_map(|&id| {
-                self.code.modules[id]
-                    .funs
-                    .iter()
-                    .find(|slot| {
-                        slot.entry.index == entry.index
-                            && slot.entry.uniq == entry.uniq
-                            && slot.entry.arity == entry.arity
-                    })
-                    .map(|slot| (id, slot.target))
-            })?;
+        let (id, target) = [
+            code_tables(erts_active_code_ix()).loaded.get(&module),
+            code_tables(erts_active_code_ix()).old.get(&module),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|&id| {
+            code_tables(erts_active_code_ix()).modules[id]
+                .funs
+                .iter()
+                .find(|slot| {
+                    slot.entry.index == entry.index
+                        && slot.entry.uniq == entry.uniq
+                        && slot.entry.arity == entry.arity
+                })
+                .map(|slot| (id, slot.target))
+        })?;
         if crate::natives::code::erts_purge_state().pending(id) {
             return None;
         }
-        self.code.modules[id]
+        code_tables(erts_active_code_ix()).modules[id]
             .function_at(target)
             .map(|(name, _)| name.to_owned())
     }

@@ -1,6 +1,7 @@
 //! Module loading and code index management.
 
 use super::*;
+use crate::code_ix::{code_tables, erts_active_code_ix};
 use arinsal_term::{Atom, FunEntry, global_atoms};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 
@@ -772,8 +773,8 @@ impl Vm {
         module: &str,
         name: &str,
     ) -> Option<&arinsal_beam::NativeRecord> {
-        let id = *self.code.loaded.get(module)?;
-        self.code
+        let id = *code_tables(erts_active_code_ix()).loaded.get(module)?;
+        code_tables(erts_active_code_ix())
             .modules
             .get(id)?
             .records
@@ -837,7 +838,8 @@ impl Vm {
     }
 
     fn for_node(paths: Vec<PathBuf>, otp_root: Option<PathBuf>, replica: bool) -> Self {
-        let code_ix = crate::code_ix::global();
+        // erts_code_ix_init runs before the first module is loaded.
+        crate::code_ix::global();
         Self {
             paths,
             runtime: None,
@@ -847,7 +849,6 @@ impl Vm {
                 crate::natives::sys::initialize_statistics_origins()
             },
             otp_root,
-            code: code_ix.active_tables(),
             beamasm_targets: beamasm_integration::NativeTargetCache::new(),
             replica,
             esdp_registers: 0,
@@ -879,18 +880,21 @@ impl Vm {
         let staging = crate::code_ix::global().start_staging();
         staging.with(|tables| tables.exports.note_beam(&beam));
         drop(staging);
-        self.refresh_code();
         Ok(())
     }
 
     /// Live module versions. A purged version is omitted once its slot can be reused.
     pub fn module_storage_count(&self) -> usize {
-        self.code.module_live.iter().filter(|live| **live).count()
+        code_tables(erts_active_code_ix())
+            .module_live
+            .iter()
+            .filter(|live| **live)
+            .count()
     }
 
     /// Module-table length, including slots retained for reuse after a purge.
     pub fn module_table_len(&self) -> usize {
-        self.code.modules.len()
+        code_tables(erts_active_code_ix()).modules.len()
     }
 
     /// The coverage mode modules loaded now get (`code:get_coverage_mode/0`).
@@ -1065,13 +1069,12 @@ impl Vm {
             id
         });
         drop(staging);
-        self.refresh_code();
         self.register_native_targets(id);
         Ok(())
     }
 
     fn register_native_targets(&mut self, id: usize) {
-        if let Some(module) = self.code.modules.get(id) {
+        if let Some(module) = code_tables(erts_active_code_ix()).modules.get(id) {
             self.beamasm_targets.register_module(id, module);
         }
     }
@@ -1095,11 +1098,13 @@ impl Vm {
         bytes: &[u8],
         file: Option<(&str, &Path)>,
     ) -> Result<usize, VmError> {
-        self.refresh_code();
-        if let Some(&id) = self.code.loaded.get(&beam.module) {
+        if let Some(&id) = code_tables(erts_active_code_ix()).loaded.get(&beam.module) {
             return Ok(id);
         }
-        if let Some(&id) = self.code.pending_on_load.get(&beam.module) {
+        if let Some(&id) = code_tables(erts_active_code_ix())
+            .pending_on_load
+            .get(&beam.module)
+        {
             return Ok(id);
         }
         let module_name = beam.module.clone();
@@ -1113,7 +1118,6 @@ impl Vm {
         // Another scheduler may have loaded the module since this one looked.
         if let Some(id) = staging.with(|tables| tables.loaded.get(&module_name).copied()) {
             staging.abort();
-            self.refresh_code();
             return Ok(id);
         }
         staging.with(|tables| {
@@ -1159,7 +1163,6 @@ impl Vm {
             id
         });
         drop(staging);
-        self.refresh_code();
         self.register_native_targets(id);
         Ok(id)
     }
@@ -1234,28 +1237,9 @@ impl Vm {
         })
     }
 
-    /// Makes this VM read the tables of `erts_active_code_ix()`. This owned snapshot is checked
-    /// at schedule-in and before code-sensitive access; raw slot borrows themselves end inside
-    /// their lookup closure before the scheduler reaches a thread-progress point.
-    // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-247 and code_ix.h
-    // (erts_active_code_ix), OTP-29.1.1: with the code index unchanged this is one load and a
-    // compare.
-    #[inline(always)]
-    pub(crate) fn refresh_code(&mut self) {
-        if self.code.generation != crate::code_ix::global().active_generation() {
-            self.reload_code();
-        }
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn reload_code(&mut self) {
-        self.code = crate::code_ix::global().active_tables();
-    }
-
-    /// Generation of the tables this VM reads; interpreter caches are valid only within it.
+    /// Generation of the active code tables; interpreter caches are valid only within it.
     pub(crate) fn code_generation(&self) -> u64 {
-        self.code.generation
+        code_tables(erts_active_code_ix()).generation
     }
 
     /// Patch the breakpoints of several functions of one module, publishing the module once:
@@ -1267,7 +1251,11 @@ impl Vm {
         targets: &[(usize, &str, u8)],
         process: &Process,
     ) {
-        let Some(module) = self.code.modules.get(module_id).cloned() else {
+        let Some(module) = code_tables(erts_active_code_ix())
+            .modules
+            .get(module_id)
+            .cloned()
+        else {
             return;
         };
         let mut global_patches = Vec::new();
@@ -1280,7 +1268,7 @@ impl Vm {
                 .function_for_target(
                     module_id,
                     &module,
-                    native_code_range(&self.code.code_meta, module_id),
+                    native_code_range(&code_tables(erts_active_code_ix()).code_meta, module_id),
                     *entry,
                 )
                 .is_some()
@@ -1318,7 +1306,6 @@ impl Vm {
         // The new table generation makes import caches holding the old export target resolve
         // again.
         crate::code_ix::global().patch_all(|_| {});
-        self.refresh_code();
         self.register_native_targets(module_id);
     }
 
@@ -1336,11 +1323,13 @@ impl Vm {
             if function.entry == 0 {
                 continue;
             }
-            let Some(&module_id) = self.code.loaded.get(&function.module) else {
+            let Some(&module_id) = code_tables(erts_active_code_ix())
+                .loaded
+                .get(&function.module)
+            else {
                 continue;
             };
-            if self
-                .code
+            if code_tables(erts_active_code_ix())
                 .modules
                 .get(module_id)
                 .is_some_and(|module| module.name == function.module)
@@ -1368,8 +1357,7 @@ impl Vm {
         function_name: &str,
         arity: Option<u8>,
     ) {
-        let targets = self
-            .code
+        let targets = code_tables(erts_active_code_ix())
             .modules
             .iter()
             .enumerate()
@@ -1393,8 +1381,7 @@ impl Vm {
     }
 
     pub(crate) fn refresh_all_trace_breakpoints(&mut self, process: &Process) {
-        let targets = self
-            .code
+        let targets = code_tables(erts_active_code_ix())
             .modules
             .iter()
             .enumerate()
@@ -1414,7 +1401,9 @@ impl Vm {
 
     /// The module is not current, `code_server` is up, and its beam has `-on_load`.
     pub(crate) fn unloaded_on_load(&self, process: &Process, name: &str) -> bool {
-        if self.code.loaded.contains_key(name) || !self.should_autoload(process, name) {
+        if code_tables(erts_active_code_ix()).loaded.contains_key(name)
+            || !self.should_autoload(process, name)
+        {
             return false;
         }
         let file = format!("{name}.beam");
@@ -1442,8 +1431,7 @@ impl Vm {
         process: &Process,
         name: &str,
     ) -> Result<usize, VmError> {
-        self.refresh_code();
-        let was_loaded = self.code.loaded.contains_key(name);
+        let was_loaded = code_tables(erts_active_code_ix()).loaded.contains_key(name);
         // Port of erts/emulator/beam/beam_common.c (call_error_handler), OTP-29.1.1: once the
         // code server runs, a call into a module that is not loaded goes through
         // error_handler:undefined_function/3, and the code server loads it with the staging and
@@ -1459,11 +1447,14 @@ impl Vm {
     }
 
     pub(crate) fn load_named(&mut self, name: &str) -> Result<usize, VmError> {
-        self.refresh_code();
-        if let Some(&id) = self.code.loaded.get(name) {
+        if let Some(&id) = code_tables(erts_active_code_ix()).loaded.get(name) {
             return Ok(id);
         }
-        if self.code.deleted.contains(name) || self.code.pending_on_load.contains_key(name) {
+        if code_tables(erts_active_code_ix()).deleted.contains(name)
+            || code_tables(erts_active_code_ix())
+                .pending_on_load
+                .contains_key(name)
+        {
             return Err(VmError::Load(format!("module {name} not found")));
         }
         let file = format!("{name}.beam");
@@ -1481,7 +1472,7 @@ impl Vm {
         // which a module that runs natively never needs decoded.
         let beam = arinsal_beam::read(&bytes).map_err(|e| VmError::Load(e.to_string()))?;
         self.load_current(beam, &bytes, Some((name, &path)))?;
-        self.code
+        code_tables(erts_active_code_ix())
             .loaded
             .get(name)
             .copied()
@@ -1492,6 +1483,7 @@ impl Vm {
 #[cfg(test)]
 mod purge_free_tests {
     use crate::Vm;
+    use crate::code_ix::{code_tables, erts_active_code_ix};
     use std::process::Command;
 
     fn beam(source: &str) -> Option<Vec<u8>> {
@@ -1526,7 +1518,6 @@ mod purge_free_tests {
         let id = vm.load_bytes(&beam).unwrap();
         crate::natives::code::erts_purge_state().hold_stage_permission_for_test(true);
         let released = crate::code_ix::global().update_active(|tables| tables.release(id));
-        vm.refresh_code();
         let native = released.expect("native code of the old version");
         drop(native);
         crate::natives::code::erts_purge_state().hold_stage_permission_for_test(false);
@@ -1564,23 +1555,52 @@ mod purge_free_tests {
         };
         let mut vm = Vm::new([]);
         let id = vm.load_bytes(&beam).unwrap();
-        assert!(!vm.code.modules[id].functions.is_empty());
-        assert!(!vm.code.modules[id].exports.is_empty());
-        assert!(!vm.code.modules[id].funs.is_empty());
-        let export_count = vm.code.exports.order.len();
-        let fun_count = vm.code.fun_entries().count();
+        assert!(
+            !code_tables(erts_active_code_ix()).modules[id]
+                .functions
+                .is_empty()
+        );
+        assert!(
+            !code_tables(erts_active_code_ix()).modules[id]
+                .exports
+                .is_empty()
+        );
+        assert!(
+            !code_tables(erts_active_code_ix()).modules[id]
+                .funs
+                .is_empty()
+        );
+        let export_count = code_tables(erts_active_code_ix()).exports.order.len();
+        let fun_count = code_tables(erts_active_code_ix()).fun_entries().count();
 
         let native = crate::code_ix::global()
             .update_active(|tables| tables.release(id))
             .expect("native code of the purged version");
-        vm.refresh_code();
 
-        assert!(vm.code.modules[id].functions.is_empty());
-        assert!(!vm.code.modules[id].exports.is_empty());
-        assert!(!vm.code.modules[id].funs.is_empty());
-        similar_asserts::assert_eq!(vm.code.exports.order.len(), export_count);
-        similar_asserts::assert_eq!(vm.code.fun_entries().count(), fun_count);
-        assert!(vm.code.code_meta[id].is_none());
+        assert!(
+            code_tables(erts_active_code_ix()).modules[id]
+                .functions
+                .is_empty()
+        );
+        assert!(
+            !code_tables(erts_active_code_ix()).modules[id]
+                .exports
+                .is_empty()
+        );
+        assert!(
+            !code_tables(erts_active_code_ix()).modules[id]
+                .funs
+                .is_empty()
+        );
+        similar_asserts::assert_eq!(
+            code_tables(erts_active_code_ix()).exports.order.len(),
+            export_count
+        );
+        similar_asserts::assert_eq!(
+            code_tables(erts_active_code_ix()).fun_entries().count(),
+            fun_count
+        );
+        assert!(code_tables(erts_active_code_ix()).code_meta[id].is_none());
         native.unpublish();
         drop(native);
     }
