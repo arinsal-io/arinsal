@@ -6506,15 +6506,12 @@ impl<T: Task> Runner<'_, T> {
         let task = cell.task_mut();
         // The handler runs with the target's own `fcalls`, as erts' handler passes its `reds`.
         process.shared.set_reds(reds);
-        let result = {
-            let mut ctx = RunCtx {
-                inner: self,
-                proc: &process.shared,
-                esdp: &mut *esdp,
-            };
-            handle(task, &mut ctx)
+        let mut ctx = RunCtx {
+            inner: self,
+            proc: &process.shared,
+            esdp: &mut *esdp,
         };
-        result
+        handle(task, &mut ctx)
     }
 }
 
