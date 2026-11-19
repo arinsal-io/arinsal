@@ -169,13 +169,11 @@ fn reference_inet_gethost() -> PathBuf {
             return path;
         }
     }
-    [
-        PathBuf::from("$HOME/.asdf/installs/erlang/29.1.1/erts-17.1/bin/inet_gethost"),
-        PathBuf::from("/home/ubuntu/.asdf/installs/erlang/29.1.1/erts-17.1/bin/inet_gethost"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
-    .expect("OTP 29.1.1 erts-17.1/bin/inet_gethost is required for differential tests")
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".asdf/installs/erlang/29.1.1"))
+        .map(|root| root.join("erts-17.1/bin/inet_gethost"))
+        .filter(|path| path.is_file())
+        .expect("OTP 29.1.1 erts-17.1/bin/inet_gethost is required for differential tests")
 }
 
 fn temporary_directory() -> PathBuf {

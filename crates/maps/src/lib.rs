@@ -2130,7 +2130,7 @@ mod key_order_tests {
         let float = builder.float(1.0).unwrap();
         let float_map = builder.flatmap_from_pairs(&[(key, float)]).unwrap();
 
-        let output = match Command::new("$HOME/.asdf/installs/erlang/29.1.1/bin/erl")
+        let output = match Command::new("erl")
             .args([
                 "-noshell",
                 "-eval",

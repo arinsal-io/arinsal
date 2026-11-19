@@ -168,7 +168,7 @@ fn printer_matches_erts_term_to_string() {
         halt().
         "##
     );
-    let output = match Command::new("$HOME/.asdf/installs/erlang/29.1.1/bin/erl")
+    let output = match Command::new("erl")
         .args(["-noshell", "-eval", &script])
         .output()
     {

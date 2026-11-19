@@ -7,11 +7,6 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-const OTP_ROOTS: [&str; 2] = [
-    "$HOME/.asdf/installs/erlang/29.1.1",
-    "/home/ubuntu/.asdf/installs/erlang/29.1.1",
-];
-
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
@@ -584,9 +579,9 @@ fn otp_program(name: &str) -> PathBuf {
             return candidate;
         }
     }
-    OTP_ROOTS
-        .iter()
-        .map(|root| PathBuf::from(root).join(format!("erts-17.1/bin/{name}")))
-        .find(|candidate| candidate.is_file())
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".asdf/installs/erlang/29.1.1"))
+        .map(|root| root.join(format!("erts-17.1/bin/{name}")))
+        .filter(|candidate| candidate.is_file())
         .expect("OTP-29.1.1 helper executable is required for differential tests")
 }

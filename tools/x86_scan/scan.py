@@ -8,7 +8,7 @@ import collections
 import pathlib
 import re
 
-DEFAULT_ROOT = pathlib.Path("$HOME/dev/beam/ref/otp-29/erts/emulator/beam/jit/x86")
+DEFAULT_ROOT = pathlib.Path(__file__).resolve().parents[2] / "ref/otp-29/erts/emulator/beam/jit/x86"
 CALL = re.compile(r"\ba\.([A-Za-z_]\w*)\s*\(")
 FEATURE = re.compile(r"CpuFeatures::X86::k(BMI2|LZCNT|POPCNT|AVX|MOVBE)")
 FEATURE_MNEMONICS = {

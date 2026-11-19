@@ -124,7 +124,7 @@ fn compound_term_comparison_matches_erts() {
         end, Pairs),
         halt().
     "#;
-    let output = match Command::new("$HOME/.asdf/installs/erlang/29.1.1/bin/erl")
+    let output = match Command::new("erl")
         .args(["-noshell", "-eval", expression])
         .output()
     {

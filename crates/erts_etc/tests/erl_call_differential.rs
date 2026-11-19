@@ -218,10 +218,6 @@ fn reference_root() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
         roots.push(PathBuf::from(home).join(".asdf/installs/erlang/29.1.1"));
     }
-    roots.extend([
-        PathBuf::from("$HOME/.asdf/installs/erlang/29.1.1"),
-        PathBuf::from("/home/ubuntu/.asdf/installs/erlang/29.1.1"),
-    ]);
     roots
         .into_iter()
         .find(|root| root.join("erts-17.1/bin/erl").is_file())

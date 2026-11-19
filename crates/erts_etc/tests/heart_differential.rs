@@ -3,11 +3,6 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-const HEART_ROOTS: [&str; 2] = [
-    "$HOME/.asdf/installs/erlang/29.1.1",
-    "/home/ubuntu/.asdf/installs/erlang/29.1.1",
-];
-
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
@@ -90,10 +85,10 @@ fn otp_heart() -> PathBuf {
             return candidate;
         }
     }
-    HEART_ROOTS
-        .iter()
-        .map(|root| PathBuf::from(root).join("erts-17.1/bin/heart"))
-        .find(|candidate| candidate.is_file())
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".asdf/installs/erlang/29.1.1"))
+        .map(|root| root.join("erts-17.1/bin/heart"))
+        .filter(|candidate| candidate.is_file())
         .expect("OTP-29.1.1 heart executable is required for differential tests")
 }
 
