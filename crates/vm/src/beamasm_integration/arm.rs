@@ -344,6 +344,16 @@ pub(crate) fn patch_native_line_breakpoint(module: &str, line: u32, enabled: boo
 }
 
 impl CompiledVersion {
+    /// Address of the code entry for this version's `-on_load` function.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:994 (get_on_load_address), OTP-29.1.1.
+    pub(crate) fn on_load_address(&self) -> Option<usize> {
+        let (name, arity) = self.on_load.as_ref()?;
+        self.native_functions
+            .iter()
+            .find(|native| native.function == *name && native.arity == *arity)
+            .map(|native| native.start)
+    }
+
     /// Whether this version has native code for `function/arity`.
     pub(crate) fn has_native_function(&self, function: &str, arity: u8) -> bool {
         self.native_functions

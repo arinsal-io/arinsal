@@ -64,6 +64,16 @@ pub trait LoaderEnv {
     fn tuple_literal(&self, elements: &[u64]) -> Result<u64, String>;
     /// `stp->bif_imports[index]->f`: the C function of the BIF the import `index` names.
     fn bif_import(&self, beam: &BeamFile, index: u32) -> Result<u64, String>;
+    /// `bif_table[erts_active_export_entry(M,F,A)->bif_number].f` for `call_bif_mfa`.
+    fn bif_mfa_function(&self, module: &str, function: &str, arity: u8) -> Result<u64, String> {
+        Err(format!(
+            "module environment has no BIF function for {module}:{function}/{arity}"
+        ))
+    }
+    /// `BIF_TRAP_EXPORT(BIF_send_2)` and `send_2` for the generated `send` instruction.
+    fn send_target(&self) -> Result<(u64, u64), String> {
+        Err("module environment has no send/2 export".into())
+    }
 }
 
 /// The word of a literal the load added after the file's own (`beamfile_add_literal`): key

@@ -23,8 +23,9 @@ use arinsal_beamasm::beam_asm_module::{BeamCodeHeader, BeamModuleAssembler};
 use arinsal_beamasm::common::args::ArgVal;
 use arinsal_beamasm::common::types::ArgType;
 use arinsal_beamops::beam_opcodes::{
-    op_empty_func_line, op_executable_line_II, op_func_line_I, op_i_debug_line_IIt,
-    op_i_func_info_IaaI, op_i_test_yield, op_int_code_end, op_line_I, op_nif_start,
+    op_call_bif_mfa_aaI, op_empty_func_line, op_executable_line_II, op_func_line_I,
+    op_i_debug_line_IIt, op_i_func_info_IaaI, op_i_test_yield, op_int_code_end, op_line_I,
+    op_nif_start, op_send,
 };
 use arinsal_beamops::{self as beamops, NewLiteral, OpSink, SpecificOperand};
 pub use arinsal_x64::exec::CodeMemory;
@@ -61,7 +62,10 @@ pub fn beamasm_new_assembler(
     jit: &BeamAsm,
     beam: &BeamFile,
 ) -> Result<BeamModuleAssembler, AsmError> {
-    BeamModuleAssembler::new_module(
+    let module = arinsal_term::global_atoms()
+        .intern(&beam.module)
+        .map_err(|_| AsmError::Operand("module atom"))?;
+    BeamModuleAssembler::new_module_with_module(
         &jit.bga,
         beam.code.label_count,
         beam.code.function_count as usize,
@@ -69,6 +73,7 @@ pub fn beamasm_new_assembler(
         beam.lambdas
             .iter()
             .map(|lambda| (lambda.index, lambda.label, lambda.num_free)),
+        Some(module),
     )
 }
 
@@ -437,7 +442,7 @@ impl<E: LoaderEnv + ?Sized> LoaderState<'_, E> {
     /// coverage counters after it, and the function count check at the end of the code.
     // Port of erts/emulator/beam/jit/asm_load.c:609-772 (beam_load_emit_op, after the
     // operand massaging), OTP-29.1.1.
-    fn emit_specific(&mut self, specific: u16) -> Result<(), String> {
+    fn emit_specific(&mut self, specific: u16, operands: &[SpecificOperand]) -> Result<(), String> {
         let function_count = self.beam.code.function_count;
         match specific {
             op_i_func_info_IaaI => {
@@ -468,6 +473,36 @@ impl<E: LoaderEnv + ?Sized> LoaderState<'_, E> {
                 }
                 self.are_nifs
                     .get_or_insert_with(|| vec![0; function_count as usize])[n - 1] = 1;
+            }
+            _ => {}
+        }
+
+        match specific {
+            op_call_bif_mfa_aaI => {
+                let [
+                    SpecificOperand::Atom(module),
+                    SpecificOperand::Atom(function),
+                    SpecificOperand::Unsigned(arity),
+                ] = operands
+                else {
+                    return Err("call_bif_mfa operands".into());
+                };
+                let module = self.beam.atom(*module).ok_or("call_bif_mfa module atom")?;
+                let function = self
+                    .beam
+                    .atom(*function)
+                    .ok_or("call_bif_mfa function atom")?;
+                let arity = u8::try_from(*arity).map_err(|_| "call_bif_mfa arity")?;
+                let function = self
+                    .env
+                    .bif_mfa_function(module, function, arity)?
+                    .try_into()
+                    .map_err(|_| "call_bif_mfa function pointer")?;
+                self.ba.set_call_bif_mfa_function(function);
+            }
+            op_send => {
+                let (export, function) = self.env.send_target()?;
+                self.ba.set_send_target(export as usize, function as usize);
             }
             _ => {}
         }
@@ -556,7 +591,7 @@ impl<E: LoaderEnv + ?Sized> OpSink for LoaderState<'_, E> {
             .ok_or_else(|| format!("no specific instruction {specific}"))?;
         beam_load_emit_op(self.beam, self.env, info.sign, operands, &mut self.args)
             .map_err(|error| format!("{}: {error}", info.name))?;
-        self.emit_specific(specific)
+        self.emit_specific(specific, operands)
             .map_err(|error| format!("{} ({}): {error}", info.name, beamops::generic_op_name(op)))
     }
 }

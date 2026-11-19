@@ -1240,7 +1240,8 @@ impl BeamModuleAssembler {
         }
 
         self.asm.bind(mixed)?;
-        let guard = beam_label(self, fail)?.is_some();
+        let fail_index = arg_label(fail)?;
+        let guard = fail_index != 0;
         let fragment = match (guard, increment_zero) {
             (true, true) => GlobalLabels::MulGuardShared,
             (true, false) => GlobalLabels::MulAddGuardShared,
@@ -1248,7 +1249,10 @@ impl BeamModuleAssembler {
             (false, false) => GlobalLabels::MulAddBodyShared,
         };
         safe_arith_fragment_call(self, fragment)?;
-        if let Some(fail_label) = beam_label(self, fail)? {
+        if guard {
+            let fail_label = self
+                .resolve_beam_label(fail_index)
+                .ok_or(AsmError::Operand("arithmetic fail label"))?;
             self.asm.jcc(CondCode::E, fail_label)?;
         }
         self.asm.bind(next)?;

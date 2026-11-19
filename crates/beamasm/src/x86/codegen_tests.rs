@@ -9,6 +9,7 @@
 //! massaged here as asm_load.c's `beam_load_emit_op` does for the instructions this module
 //! uses, and dispatched by name to the emitters ported so far.
 
+use std::ops::Range;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -17,7 +18,7 @@ use arinsal_term::Term;
 
 use super::beam_asm_global::{BeamGlobalAssembler, GLOBAL_LABELS};
 use super::beam_asm_module::{BeamCodeHeader, BeamModuleAssembler};
-use super::jdump::gnu_as;
+use super::jdump::{erts_to_arinsal, gnu_as, matches_with_global_jumps_at};
 use crate::common::args::ArgVal;
 use crate::common::types::ArgType;
 use crate::{ExitReason, ProcessHeader, SchedulerRegisters};
@@ -63,7 +64,201 @@ fn compile() -> Option<Vec<u8>> {
     Some(beam)
 }
 
+fn compile_source_with_dependencies(
+    module: &str,
+    source: &str,
+    dependencies: &[(&str, &str)],
+) -> Option<Vec<u8>> {
+    let dir = std::env::temp_dir().join(format!("arinsal-x86-{module}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    for (dependency, dependency_source) in dependencies {
+        std::fs::write(dir.join(format!("{dependency}.erl")), dependency_source).ok()?;
+        let status = Command::new("erlc")
+            .args(["+deterministic", "-o"])
+            .arg(&dir)
+            .arg(dir.join(format!("{dependency}.erl")))
+            .status()
+            .ok()?;
+        if !status.success() {
+            return None;
+        }
+    }
+    std::fs::write(dir.join(format!("{module}.erl")), source).ok()?;
+    let status = Command::new("erlc")
+        .args(["+deterministic", "-pa"])
+        .arg(&dir)
+        .arg("-o")
+        .arg(&dir)
+        .arg(dir.join(format!("{module}.erl")))
+        .status()
+        .ok()?;
+    let beam = if status.success() {
+        std::fs::read(dir.join(format!("{module}.beam"))).ok()?
+    } else {
+        return None;
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    Some(beam)
+}
+
 const NIL: u64 = 0x3b;
+const TEST_FUNCTION_POINTER: usize = 0x1234_5678_9abc_def0;
+const TEST_EXPORT_POINTER: usize = 0x2345_6789_abcd_ef01;
+
+fn module_types(beam: &arinsal_beam::BeamFile) -> Vec<ArgType> {
+    beam.types.as_ref().map_or_else(
+        || vec![ArgType::ANY],
+        |types| {
+            types
+                .entries
+                .iter()
+                .map(|entry| ArgType {
+                    union_bits: entry.union_bits,
+                    min: entry.lower_bound,
+                    max: entry.upper_bound,
+                    unit: entry.unit,
+                })
+                .collect()
+        },
+    )
+}
+
+fn full_dump_blocks(dump: &str) -> Vec<(String, Vec<String>)> {
+    let is_header = |line: &str| {
+        line.strip_prefix("# ").is_some_and(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+    };
+    let mut blocks = Vec::new();
+    let mut current: Option<(String, Vec<String>)> = None;
+    for line in dump.lines() {
+        if is_header(line) {
+            if let Some(block) = current.take() {
+                blocks.push(block);
+            }
+            current = Some((line[2..].to_owned(), Vec::new()));
+        } else if let Some((_, lines)) = current.as_mut()
+            && !line.starts_with('#')
+        {
+            lines.push(line.trim().to_owned());
+        }
+    }
+    blocks.extend(current);
+    blocks
+}
+
+fn module_code_lines(lines: &[String], op_name: &str, code_offset: usize) -> Vec<String> {
+    let mut in_code = true;
+    let mut result = lines
+        .iter()
+        .filter_map(|line| {
+            if line.starts_with(".section .rodata") {
+                in_code = false;
+                return None;
+            }
+            if line.starts_with(".section .text") {
+                in_code = true;
+                return None;
+            }
+            if !in_code {
+                return None;
+            }
+            let line = if let Some((prefix, address)) = line.split_once("ptr [") {
+                let address = address.trim_end_matches(']');
+                if address.starts_with('L')
+                    || address.starts_with("label_")
+                    || address.contains('/')
+                {
+                    format!("{prefix}ptr [rip + 0]")
+                } else {
+                    erts_to_arinsal(line)
+                }
+            } else {
+                erts_to_arinsal(line)
+            };
+            let line = line
+                .strip_prefix("align ")
+                .map(|alignment| format!(".balign {alignment}"))
+                .unwrap_or(line);
+            let line = line
+                .strip_prefix(".dq ")
+                .map(|value| format!(".quad {value}"))
+                .unwrap_or(line);
+            // Native record headers use different immediate tag bits in the two term layouts.
+            let line = match line.as_str() {
+                "and al, 63" => "and al, 252".to_owned(),
+                "cmp al, 28" => "cmp al, 60".to_owned(),
+                _ => line,
+            };
+            let line = if let Some((op, value)) = line.split_once(", ")
+                && op.starts_with("mov ")
+                && value
+                    .parse::<u64>()
+                    .is_ok_and(|value| (1 << 32..1 << 47).contains(&value))
+            {
+                let register = op.trim_start_matches("mov ");
+                let pointer = if (op_name.starts_with("call_light_bif") || op_name == "send")
+                    && register == "rcx"
+                {
+                    TEST_EXPORT_POINTER
+                } else if op_name == "i_call_on_load_function" && register == "rcx" {
+                    std::ptr::from_ref(&super::instr_bif::CALL_ON_LOAD_MFA) as usize
+                } else {
+                    TEST_FUNCTION_POINTER
+                };
+                format!("{op}, {pointer}")
+            } else {
+                line
+            };
+            Some(line)
+        })
+        .collect::<Vec<_>>();
+    let Some((align_at, alignment)) = result.iter().enumerate().find_map(|(index, line)| {
+        line.strip_prefix(".balign ")
+            .and_then(|alignment| alignment.parse::<usize>().ok())
+            .map(|alignment| (index, alignment))
+    }) else {
+        return result;
+    };
+    if result[..align_at].iter().any(|line| !line.ends_with(':')) {
+        return result;
+    }
+    let pad = (alignment - code_offset % alignment) % alignment;
+    if pad == 0 {
+        result.remove(align_at);
+        return result;
+    }
+    let nops: [&[u8]; 9] = [
+        &[0x90],
+        &[0x66, 0x90],
+        &[0x0f, 0x1f, 0x00],
+        &[0x0f, 0x1f, 0x40, 0x00],
+        &[0x0f, 0x1f, 0x44, 0x00, 0x00],
+        &[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00],
+        &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00],
+        &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        &[0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    ];
+    let mut bytes = Vec::new();
+    let mut remaining = pad;
+    while remaining > 0 {
+        let count = remaining.min(nops.len());
+        bytes.extend_from_slice(nops[count - 1]);
+        remaining -= count;
+    }
+    result[align_at] = format!(
+        ".byte {}",
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:#04x}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    result
+}
 
 fn make_small(value: i64) -> u64 {
     ((value as u64) << 4) | 0xf
@@ -81,14 +276,14 @@ fn massage(sign: &str, operands: &[SpecificOperand]) -> Result<Vec<ArgVal>, Stri
         let curr = rest.next().ok_or("operand missing")?;
         args.push(match (letter, curr) {
             ('n', SpecificOperand::Nil) => ArgVal::Immediate(NIL),
-            (
-                'x' | 'd' | 'S' | 's',
-                SpecificOperand::X(index) | SpecificOperand::TypedX { index, .. },
-            ) => ArgVal::X(*index),
-            (
-                'y' | 'd' | 'S' | 's',
-                SpecificOperand::Y(index) | SpecificOperand::TypedY { index, .. },
-            ) => ArgVal::Y(*index),
+            ('x' | 'd' | 'S' | 's', SpecificOperand::X(index)) => ArgVal::X(*index),
+            ('x' | 'd' | 'S' | 's', SpecificOperand::TypedX { index, type_index }) => {
+                ArgVal::typed_x(*index, *type_index)
+            }
+            ('y' | 'd' | 'S' | 's', SpecificOperand::Y(index)) => ArgVal::Y(*index),
+            ('y' | 'd' | 'S' | 's', SpecificOperand::TypedY { index, type_index }) => {
+                ArgVal::typed_y(*index, *type_index)
+            }
             ('a' | 'c' | 's' | 'i', SpecificOperand::Atom(index)) => {
                 ArgVal::Immediate(Term::atom(arinsal_term::Atom(*index)).word())
             }
@@ -101,10 +296,13 @@ fn massage(sign: &str, operands: &[SpecificOperand]) -> Result<Vec<ArgVal>, Stri
             // A defined label is verified as `TAG_u` and becomes `TAG_f`.
             ('L', SpecificOperand::Unsigned(label)) => ArgVal::Label(*label as u32),
             ('i', SpecificOperand::Unsigned(value)) => ArgVal::Immediate(*value),
+            ('c' | 'q' | 's', SpecificOperand::Literal(index)) => {
+                ArgVal::Literal(u64::from(*index))
+            }
             ('e', SpecificOperand::Unsigned(value)) => ArgVal::Export(*value as u32),
             // The BIF function pointer of an import: only `module_info`'s substituted
             // instructions take one here.
-            ('b', SpecificOperand::Unsigned(_)) => ArgVal::Word(0),
+            ('b', SpecificOperand::Unsigned(_)) => ArgVal::Word(TEST_FUNCTION_POINTER as u64),
             (letter, other) => return Err(format!("bad tag {other:?} for '{letter}'")),
         });
     }
@@ -117,8 +315,10 @@ fn massage(sign: &str, operands: &[SpecificOperand]) -> Result<Vec<ArgVal>, Stri
             }
             SpecificOperand::Unsigned(value) => ArgVal::Word(*value),
             SpecificOperand::Label(label) => ArgVal::Label(*label),
-            SpecificOperand::X(index) | SpecificOperand::TypedX { index, .. } => ArgVal::X(*index),
-            SpecificOperand::Y(index) | SpecificOperand::TypedY { index, .. } => ArgVal::Y(*index),
+            SpecificOperand::X(index) => ArgVal::X(*index),
+            SpecificOperand::TypedX { index, type_index } => ArgVal::typed_x(*index, *type_index),
+            SpecificOperand::Y(index) => ArgVal::Y(*index),
+            SpecificOperand::TypedY { index, type_index } => ArgVal::typed_y(*index, *type_index),
             other => return Err(format!("unsupported primitive type {other:?}")),
         });
     }
@@ -129,15 +329,26 @@ fn massage(sign: &str, operands: &[SpecificOperand]) -> Result<Vec<ArgVal>, Stri
 struct Loader<'a> {
     ba: &'a mut BeamModuleAssembler,
     emitted: Vec<&'static str>,
+    spans: Vec<OpSpan>,
     /// The function being emitted (its name atom).
     function: ArgVal,
     /// The instructions emitted as `ud2`, with their function.
     substituted: Vec<(ArgVal, &'static str)>,
 }
 
+#[derive(Debug)]
+struct OpSpan {
+    name: &'static str,
+    code: Range<usize>,
+    data: Range<usize>,
+}
+
 impl OpSink for Loader<'_> {
     fn new_literal(&mut self, _index: u32, literal: &NewLiteral) -> Result<(), String> {
-        Err(format!("unexpected literal {literal:?}"))
+        match literal {
+            NewLiteral::Record { .. } => Ok(()),
+            _ => Err(format!("unexpected literal {literal:?}")),
+        }
     }
 
     fn emit(
@@ -149,6 +360,8 @@ impl OpSink for Loader<'_> {
         let info = arinsal_beamops::specific_op_info(specific).ok_or("no specific op")?;
         let a = massage(info.sign, operands)?;
         let m = &mut *self.ba;
+        let code_start = m.asm.a.bytes(arinsal_x64::buf::Section::Code).len();
+        let data_start = m.asm.a.bytes(arinsal_x64::buf::Section::Data).len();
         // `opc[].name` is the print name: the instruction name and `_<signature>`.
         let suffix = format!("_{}", info.sign);
         let name = info.name.strip_suffix(suffix.as_str()).unwrap_or(info.name);
@@ -174,6 +387,45 @@ impl OpSink for Loader<'_> {
             "i_select_val_bins" => m.emit_i_select_val_bins(a[0], a[1], a[2], &a[3..]),
             "i_is_tuple_of_arity" => m.emit_i_is_tuple_of_arity(a[0], a[1], a[2]),
             "i_get_tuple_element" => m.emit_i_get_tuple_element(a[0], a[1], a[2]),
+            "is_any_native_record" => m.emit_is_any_native_record(a[0], a[1]),
+            "is_native_record" => m.emit_is_native_record(a[0], a[1], a[2], a[3]),
+            "is_record_accessible" => m.emit_is_record_accessible(a[0], a[1], a[2]),
+            "i_get_record_elements" => m.emit_i_get_record_elements(a[0], a[1], a[2], &a[3..]),
+            "i_create_local_native_record" => {
+                m.emit_i_create_local_native_record(a[0], a[1], a[2], a[3], &a[4..])
+            }
+            "i_create_native_record" => {
+                m.emit_i_create_native_record(a[0], a[1], a[2], a[3], &a[4..])
+            }
+            "i_update_native_record" => {
+                m.emit_i_update_native_record(a[0], a[1], a[2], a[3], &a[4..])
+            }
+            "get_record_field" => m.emit_get_record_field(a[0], a[1], a[2], a[3], a[4]),
+            "return_trace" => m.emit_return_trace(),
+            "i_call_trace_return" => m.emit_i_call_trace_return(),
+            "i_return_to_trace" => m.emit_i_return_to_trace(),
+            "i_hibernate" => m.emit_i_hibernate(),
+            "call_bif" => m.emit_call_bif(a[0]),
+            "call_bif_mfa" => {
+                m.set_call_bif_mfa_function(TEST_FUNCTION_POINTER);
+                m.emit_call_bif_mfa(a[0], a[1], a[2])
+            }
+            "call_nif" => m.emit_call_nif(a[0], a[1], a[2]),
+            "call_light_bif" => m.emit_call_light_bif(a[0], a[1]),
+            "send" => {
+                m.set_send_target(TEST_EXPORT_POINTER, TEST_FUNCTION_POINTER);
+                m.emit_send()
+            }
+            "nif_start" => m.emit_nif_start(),
+            "i_call_on_load_function" => m.emit_i_call_on_load_function(),
+            "i_load_nif" => m.emit_i_load_nif(),
+            "i_bif1" => m.emit_i_bif1(a[0], a[1], a[2], a[3]),
+            "i_bif2" => m.emit_i_bif2(a[0], a[1], a[2], a[3], a[4]),
+            "i_bif3" => m.emit_i_bif3(a[0], a[1], a[2], a[3], a[4], a[5]),
+            "nofail_bif1" => m.emit_nofail_bif1(a[0], a[1], a[2]),
+            "nofail_bif2" => m.emit_nofail_bif2(a[0], a[1], a[2], a[3]),
+            "i_length_setup" => m.emit_i_length_setup(a[0], a[1], a[2]),
+            "i_length" => m.emit_i_length(a[0], a[1], a[2]),
             "current_tuple" => Ok(()),
             "i_func_info" => {
                 self.function = a[2];
@@ -187,6 +439,11 @@ impl OpSink for Loader<'_> {
             }
         };
         self.emitted.push(info.name);
+        self.spans.push(OpSpan {
+            name: info.name,
+            code: code_start..m.asm.a.bytes(arinsal_x64::buf::Section::Code).len(),
+            data: data_start..m.asm.a.bytes(arinsal_x64::buf::Section::Data).len(),
+        });
         result.map_err(|error| format!("{name}: {error:?}"))
     }
 }
@@ -252,19 +509,22 @@ fn erlc_module_runs_as_x86_native_code() {
     let beam = arinsal_beam::parse(&bytes).unwrap();
     let (ga, _global) = global_assembler();
 
-    let mut ba = BeamModuleAssembler::new_module(
+    let module = arinsal_term::global_atoms().intern("x86_first").unwrap();
+    let mut ba = BeamModuleAssembler::new_module_with_module(
         &ga,
         beam.code.label_count,
         beam.code.function_count as usize,
-        vec![ArgType::ANY],
+        module_types(&beam),
         beam.lambdas
             .iter()
             .map(|lambda| (lambda.index, lambda.label, lambda.num_free)),
+        Some(module),
     )
     .unwrap();
     let mut loader = Loader {
         ba: &mut ba,
         emitted: Vec::new(),
+        spans: Vec::new(),
         function: ArgVal::Immediate(NIL),
         substituted: Vec::new(),
     };
@@ -372,6 +632,313 @@ fn erlc_module_runs_as_x86_native_code() {
     // Each call and return spends one reduction for the prologue and one for the return.
     assert!(p.header.fcalls < 4000);
     assert_eq!(p.header.stop, heap.wrapping_add(256));
+}
+
+#[test]
+fn requested_module_emitters_match_erts_dump() {
+    const MODULE: &str = "x86_rec_trace_bif";
+    const EXT_MODULE: &str = "x86_rec_trace_bif_ext";
+    const EXT_SOURCE: &str = r#"-module(x86_rec_trace_bif_ext).
+-export_record([external]).
+-record #external{a=17,b=23}.
+"#;
+    const SOURCE: &str = r#"-module(x86_rec_trace_bif).
+-export([mk/2,get/1,put/2,isr/1,len/1,add/2,send_to/2,load/0,nif/1,init/0,
+         get_any/1,put_any/3,accessible/1,call_on_load/0,abs1/1,elem/2,guard/1,
+         record_test/2,equal/2,mk_ext/0,get_ext/1]).
+-import_record(x86_rec_trace_bif_ext,[external]).
+-export_record([r]).
+-record #r{a=0,b=1}.
+-nifs([nif/1]).
+-on_load(init/0).
+init() -> ok.
+mk(A,B) -> #r{a=A,b=B}.
+get(R) -> R#r.a.
+put(R,A) -> R#r{a=A}.
+isr(R) when is_record(R,r) -> true; isr(_) -> false.
+len(X) -> length(X).
+add(A,B) -> A+B.
+send_to(P,M) -> P ! M.
+load() -> erlang:load_nif("none",0).
+nif(X) -> X.
+get_any(#_{a=A,b=B}=R) -> {A,B,R#_.a,R#_.b};
+get_any(_) -> none.
+put_any(R,A,B) -> R#_{a=A,b=B}.
+accessible(R) -> if is_integer(R#_.a) -> true; true -> false end.
+call_on_load() -> erlang:call_on_load_function(?MODULE).
+abs1(X) -> erlang:abs(X).
+elem(T,I) -> element(I,T).
+record_test(R,Tag) -> is_record(R,Tag).
+equal(A,B) -> A == B.
+mk_ext() -> #external{}.
+get_ext(R) -> R#external.a.
+guard(X) when is_atom(X), is_function(X,1) -> true; guard(_) -> false.
+"#;
+    let Some(beam_bytes) =
+        compile_source_with_dependencies(MODULE, SOURCE, &[(EXT_MODULE, EXT_SOURCE)])
+    else {
+        eprintln!("skipping: erlc not available");
+        return;
+    };
+    let Some(dumps) = erts_dump_of(&[(EXT_MODULE, EXT_SOURCE, &[]), (MODULE, SOURCE, &[])]) else {
+        return;
+    };
+    let beam = arinsal_beam::parse(&beam_bytes).unwrap();
+    let (ga, _global) = global_assembler();
+    let module = arinsal_term::global_atoms().intern(MODULE).unwrap();
+    let mut ba = BeamModuleAssembler::new_module_with_module(
+        &ga,
+        beam.code.label_count,
+        beam.code.function_count as usize,
+        module_types(&beam),
+        beam.lambdas
+            .iter()
+            .map(|lambda| (lambda.index, lambda.label, lambda.num_free)),
+        Some(module),
+    )
+    .unwrap();
+    let mut loader = Loader {
+        ba: &mut ba,
+        emitted: Vec::new(),
+        spans: Vec::new(),
+        function: ArgVal::Immediate(NIL),
+        substituted: Vec::new(),
+    };
+    arinsal_beamops::load_code(&beam, false, true, &mut TransformArena::new(), &mut loader)
+        .unwrap();
+    let spans = std::mem::take(&mut loader.spans);
+    drop(loader);
+    let dump_blocks = full_dump_blocks(&dumps[1]);
+    let code = ba.asm.a.bytes(arinsal_x64::buf::Section::Code).to_vec();
+    let mut checked = std::collections::HashSet::new();
+    let mut occurrences = std::collections::HashMap::<&str, usize>::new();
+    for span in spans {
+        if !span.name.starts_with("is_any_native_record")
+            && !span.name.starts_with("is_native_record")
+            && !span.name.starts_with("is_record_accessible")
+            && !span.name.starts_with("i_get_record_elements")
+            && !span.name.starts_with("i_create_local_native_record")
+            && !span.name.starts_with("i_create_native_record")
+            && !span.name.starts_with("i_update_native_record")
+            && !span.name.starts_with("get_record_field")
+            && !span.name.starts_with("call_bif")
+            && !span.name.starts_with("call_nif")
+            && !span.name.starts_with("call_light_bif")
+            && !span.name.starts_with("send")
+            && !span.name.starts_with("i_bif")
+            && !span.name.starts_with("nofail_bif")
+            && !span.name.starts_with("i_length")
+            && !span.name.starts_with("i_call_on_load_function")
+            && !span.name.starts_with("i_load_nif")
+            && !span.name.starts_with("nif_start")
+        {
+            continue;
+        }
+        checked.insert(span.name);
+        let occurrence = occurrences.entry(span.name).or_default();
+        let reference = dump_blocks
+            .iter()
+            .filter(|(name, _)| name == span.name)
+            .nth(*occurrence)
+            .map(|(_, lines)| lines)
+            .unwrap_or_else(|| panic!("erts dump did not contain emitted {}", span.name));
+        *occurrence += 1;
+        let mut expected = module_code_lines(reference, span.name, span.code.start);
+        if span.name == "i_call_on_load_function"
+            && let Some(probe) = expected.iter().position(|line| line == "call rax")
+        {
+            // erts logs the sizing probe of `aligned_call(Target)` before rewinding the code
+            // offset; only the second `call rax` remains in the machine code.
+            expected.remove(probe);
+        }
+        let actual = &code[span.code.clone()];
+        assert_eq!(
+            matches_with_global_jumps_at(&expected, actual, &[], span.code.start),
+            Some(true),
+            "{}: expected={expected:?}; actual={actual:02x?}; code={:?}; data={:?}",
+            span.name,
+            span.code,
+            span.data,
+        );
+    }
+    for prefix in [
+        "is_any_native_record",
+        "is_native_record",
+        "is_record_accessible",
+        "i_get_record_elements",
+        "i_create_local_native_record",
+        "i_update_native_record",
+        "i_create_native_record",
+        "get_record_field",
+        "call_light_bif",
+        "send",
+        "i_bif1",
+        "i_bif2",
+        "i_bif3",
+        "nofail_bif1",
+        "nofail_bif2",
+        "i_length_setup",
+        "i_length",
+        "i_load_nif",
+        "nif_start",
+        "i_call_on_load_function",
+    ] {
+        assert!(
+            checked.iter().any(|name| name.starts_with(prefix)),
+            "{prefix} was not byte-compared: {checked:?}"
+        );
+    }
+}
+
+#[test]
+fn trace_emitters_match_erts_boot_dump() {
+    let Some(erts) = super::jdump::erts_dump("erts_beamasm") else {
+        eprintln!("skipping: no erl +JDdump");
+        return;
+    };
+    let Some(gen_server) = super::jdump::erts_dump("gen_server") else {
+        eprintln!("skipping: no gen_server +JDdump");
+        return;
+    };
+    let (ga, _global) = global_assembler();
+    type Emit = fn(&mut BeamModuleAssembler) -> Result<(), super::beam_asm::AsmError>;
+    for (dump, op, emit) in [
+        (
+            &erts,
+            "return_trace",
+            BeamModuleAssembler::emit_return_trace as Emit,
+        ),
+        (
+            &erts,
+            "i_call_trace_return",
+            BeamModuleAssembler::emit_i_call_trace_return as Emit,
+        ),
+        (
+            &erts,
+            "i_return_to_trace",
+            BeamModuleAssembler::emit_i_return_to_trace as Emit,
+        ),
+        (
+            &gen_server,
+            "i_hibernate",
+            BeamModuleAssembler::emit_i_hibernate as Emit,
+        ),
+    ] {
+        let blocks = full_dump_blocks(dump);
+        let reference = blocks
+            .iter()
+            .find(|(name, _)| name == op)
+            .unwrap_or_else(|| panic!("erts dump did not contain {op}"));
+        let mut module =
+            BeamModuleAssembler::new_module(&ga, 2, 0, vec![ArgType::ANY], []).unwrap();
+        let start = module.asm.a.bytes(arinsal_x64::buf::Section::Code).len();
+        emit(&mut module).unwrap();
+        let code = module.asm.a.bytes(arinsal_x64::buf::Section::Code);
+        let expected = module_code_lines(&reference.1, op, start);
+        assert_eq!(
+            matches_with_global_jumps_at(&expected, &code[start..], &[], start),
+            Some(true),
+            "{op}: expected={expected:?}; actual={:02x?}",
+            &code[start..],
+        );
+    }
+}
+
+#[test]
+fn bif_entry_emitters_match_erts_dump() {
+    let Some(dump) = super::jdump::erts_dump("atomics") else {
+        eprintln!("skipping: no atomics +JDdump");
+        return;
+    };
+    let blocks = full_dump_blocks(&dump);
+    let reference = blocks
+        .iter()
+        .find(|(name, _)| name == "call_bif_mfa_aaI")
+        .expect("erts atomics dump has no call_bif_mfa");
+    let (ga, _global) = global_assembler();
+    let module_atom = ArgVal::Immediate(atom_word("atomics"));
+    let function_atom = ArgVal::Immediate(atom_word("put"));
+    for use_mfa in [false, true] {
+        let mut module =
+            BeamModuleAssembler::new_module(&ga, 3, 1, vec![ArgType::ANY], []).unwrap();
+        module.emit_i_func_label(ArgVal::Label(1)).unwrap();
+        module
+            .emit_i_func_info(ArgVal::Word(1), module_atom, function_atom, ArgVal::Word(3))
+            .unwrap();
+        module
+            .emit_aligned_label(ArgVal::Label(2), ArgVal::Word(4))
+            .unwrap();
+        if use_mfa {
+            module.set_call_bif_mfa_function(TEST_FUNCTION_POINTER);
+        }
+        let start = module.asm.a.bytes(arinsal_x64::buf::Section::Code).len();
+        if use_mfa {
+            module
+                .emit_call_bif_mfa(module_atom, function_atom, ArgVal::Word(3))
+                .unwrap();
+        } else {
+            module
+                .emit_call_bif(ArgVal::Word(TEST_FUNCTION_POINTER as u64))
+                .unwrap();
+        }
+        let code = module.asm.a.bytes(arinsal_x64::buf::Section::Code);
+        let expected = module_code_lines(&reference.1, &reference.0, start);
+        assert_eq!(
+            matches_with_global_jumps_at(&expected, &code[start..], &[], start),
+            Some(true),
+            "{}: expected={expected:?}; actual={:02x?}",
+            reference.0,
+            &code[start..],
+        );
+    }
+}
+
+#[test]
+fn call_nif_emitter_matches_erts_dump() {
+    let Some(dump) = super::jdump::erts_dump("prim_file") else {
+        eprintln!("skipping: no prim_file +JDdump");
+        return;
+    };
+    let blocks = full_dump_blocks(&dump);
+    let reference = blocks
+        .iter()
+        .find(|(name, _)| name == "call_nif_WWW")
+        .expect("erts prim_file dump has no call_nif");
+    let words = reference
+        .1
+        .iter()
+        .filter_map(|line| line.strip_prefix(".dq "))
+        .map(|word| u64::from_str_radix(word.trim_start_matches("0x"), 16).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(words.len(), 3, "{reference:?}");
+    let (ga, _global) = global_assembler();
+    let yield_helper = ga
+        .asm
+        .get_code(ga.label(super::beam_asm_global::GlobalLabels::CallNifYieldHelper))
+        .unwrap();
+    let mut module = BeamModuleAssembler::new_module(&ga, 2, 1, vec![ArgType::ANY], []).unwrap();
+    let start = module.asm.a.bytes(arinsal_x64::buf::Section::Code).len();
+    module
+        .emit_call_nif(
+            ArgVal::Word(words[0]),
+            ArgVal::Word(words[1]),
+            ArgVal::Word(words[2]),
+        )
+        .unwrap();
+    let code = module.asm.a.bytes(arinsal_x64::buf::Section::Code);
+    let mut expected = module_code_lines(&reference.1, &reference.0, start);
+    for line in &mut expected {
+        if line == &format!("mov r9, {TEST_FUNCTION_POINTER}") {
+            *line = format!("mov r9, {yield_helper}");
+        }
+    }
+    assert_eq!(
+        matches_with_global_jumps_at(&expected, &code[start..], &[], start),
+        Some(true),
+        "{}: expected={expected:?}; actual={:02x?}",
+        reference.0,
+        &code[start..],
+    );
 }
 
 /// The patch sites of a module after codegen: an import, a literal, a string and a fun entry

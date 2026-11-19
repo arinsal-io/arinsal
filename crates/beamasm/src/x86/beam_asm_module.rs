@@ -6,18 +6,19 @@
 
 use std::collections::HashMap;
 
+use arinsal_term::Atom;
 use arinsal_x64::buf::{Label, Section};
 use arinsal_x64::enc::{Gp, Mem, MemBase};
 
 use super::beam_asm::register::{
     ARG1, ARG2, ARG3, ARG4, ARG5, ARG6, E, REGISTERS, RET, TMP1, TMP2,
 };
-use super::beam_asm::{AsmError, BeamAssembler, Distance, Update, get_arg_ref, tmp_mem_q};
+use super::beam_asm::{AsmError, BeamAssembler, Distance, Update, get_arg_ref};
 use super::beam_asm_global::{
     BEAM_ASM_FUNC_PROLOGUE_SIZE, BeamGlobalAssembler, GLOBAL_LABELS, GlobalLabels,
 };
 pub use super::rt::{beam_catches_cons, i_emit_nyi};
-use crate::common::args::{ArgVal, REG_MASK, Relation, memory_relation};
+use crate::common::args::{ArgVal, REG_MASK};
 use crate::common::register_cache::{CacheMem, RegisterCache};
 use crate::common::types::{ArgType, BeamModuleAssemblerCommon};
 
@@ -180,6 +181,15 @@ pub struct BeamModuleAssembler {
     /// `beam->types.entries`: the module's type table, which the type index of a register
     /// operand points into (`BeamModuleAssemblerCommon::getTypeEntry`).
     pub beam_types: Vec<ArgType>,
+    /// `mod`: the atom of the module being assembled; used by `auto_local` record access.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp (`BeamModuleAssembler::mod`),
+    // OTP-29.1.1.
+    pub module: Option<Atom>,
+    /// The `bif_table[e->bif_number].f` resolved by the loader for the current `call_bif_mfa`.
+    /// erts resolves it while emitting that instruction from its active export table.
+    pub(super) current_bif_mfa_function: Option<usize>,
+    /// The `BIF_TRAP_EXPORT(BIF_send_2)` and `send_2` addresses supplied by the loader.
+    pub(super) send_target: Option<(usize, usize)>,
 }
 
 impl BeamModuleAssemblerCommon for BeamModuleAssembler {
@@ -388,6 +398,9 @@ impl BeamModuleAssembler {
             on_load: None,
             code_end: None,
             beam_types: vec![ArgType::ANY],
+            module: None,
+            current_bif_mfa_function: None,
+            send_target: None,
         }
     }
 
@@ -403,6 +416,20 @@ impl BeamModuleAssembler {
         num_functions: usize,
         beam_types: Vec<ArgType>,
         lambdas: impl IntoIterator<Item = (u32, u32, u32)>,
+    ) -> Result<Self, AsmError> {
+        Self::new_module_with_module(ga, num_labels, num_functions, beam_types, lambdas, None)
+    }
+
+    /// Assembles a module with its `mod` atom, as the loader passes to erts' constructor.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp (`BeamModuleAssembler::mod`),
+    // OTP-29.1.1.
+    pub fn new_module_with_module(
+        ga: &BeamGlobalAssembler,
+        num_labels: u32,
+        num_functions: usize,
+        beam_types: Vec<ArgType>,
+        lambdas: impl IntoIterator<Item = (u32, u32, u32)>,
+        module: Option<Atom>,
     ) -> Result<Self, AsmError> {
         let mut m = Self::with_fragment_addresses(num_labels, ga.ptrs().to_vec());
         m.offsets = ga.offsets;
@@ -423,6 +450,7 @@ impl BeamModuleAssembler {
                 },
             );
         }
+        m.module = module;
         let code_header = m.asm.new_label();
         m.asm.align_code(8)?;
         m.asm.bind(code_header)?;
@@ -439,6 +467,19 @@ impl BeamModuleAssembler {
             .get(&index)
             .map(|lambda| lambda.trampoline)
             .ok_or(AsmError::Operand("lambda index"))
+    }
+
+    /// Supplies the loader's active-export resolution for the next `call_bif_mfa` instruction.
+    // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:1154-1163 (call_bif_mfa resolves
+    // `erts_active_export_entry` and `bif_table[e->bif_number].f`), OTP-29.1.1.
+    pub fn set_call_bif_mfa_function(&mut self, function: usize) {
+        self.current_bif_mfa_function = Some(function);
+    }
+
+    /// Supplies `BIF_TRAP_EXPORT(BIF_send_2)` and `send_2` for the next `send` instruction.
+    // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:648-660 (emit_send), OTP-29.1.1.
+    pub fn set_send_target(&mut self, export: usize, function: usize) {
+        self.send_target = Some((export, function));
     }
 
     /// A module assembler calling the fragments of `ga`, whose code is placed at `ga_base`.
@@ -958,6 +999,17 @@ impl BeamModuleAssembler {
 /// label boundaries, line markers, breakpoint trampolines and the stubs of instructions that
 /// are never executed.
 impl BeamModuleAssembler {
+    /// Calls the global `raise_exception_null_exp` fragment, using its return address as the
+    /// exception PC.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:256-263
+    // (BeamModuleAssembler::emit_raise_exception()), OTP-29.1.1.
+    pub(crate) fn emit_raise_exception_current(&mut self) -> Result<(), AsmError> {
+        let fragment = self.ga_get(GlobalLabels::RaiseExceptionNullExp)?;
+        self.safe_fragment_call(fragment)?;
+        self.last_error_offset = self.asm.a.offset();
+        Ok(())
+    }
+
     /// `emit_nyi(msg)`: calls `i_emit_nyi`, which halts the emulator; never returns.
     // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:401-412 (emit_nyi), OTP-29.1.1.
     pub fn emit_nyi(&mut self, msg: &'static core::ffi::CStr) -> Result<(), AsmError> {
@@ -1382,91 +1434,6 @@ impl BeamModuleAssembler {
             self.write_patch(rw, patch, string_table as u64 + patch.val_offs as u64)?;
         }
         Ok(())
-    }
-
-    /// Builds the argument vector and stores a guard BIF entry in the erts call registers.
-    // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:125-162
-    // (emit_setup_guard_bif), OTP-29.1.1.
-    fn emit_setup_guard_bif(&mut self, args: &[ArgVal], bif: ArgVal) -> Result<(), AsmError> {
-        use super::beam_asm::register::{ARG1, ARG2, ARG4};
-        assert!(!args.is_empty() && args.len() <= 3);
-
-        let contiguous = matches!(args[0], ArgVal::X(_) | ArgVal::Y(_))
-            && args
-                .windows(2)
-                .all(|pair| memory_relation(pair[0], pair[1]) == Relation::Consecutive);
-        if contiguous {
-            let first =
-                get_arg_ref(args[0], 8).ok_or(AsmError::Operand("BIF argument register"))?;
-            self.asm.emit(|e| e.lea(ARG2, first))?;
-        } else {
-            self.asm.emit(|e| e.lea(ARG2, tmp_mem_q(2)))?;
-            for (index, arg) in args.iter().copied().enumerate() {
-                self.mov_arg_to_mem(
-                    arinsal_x64::enc::qword_ptr(ARG2, (index * 8) as i32),
-                    arg,
-                    ARG1,
-                )?;
-            }
-        }
-        self.mov_arg_to_reg(ARG4, bif)
-    }
-
-    /// Emits the shared guard or body call for a unary BIF.
-    // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:164-177 (emit_i_bif1), OTP-29.1.1.
-    pub fn emit_i_bif1(
-        &mut self,
-        src: ArgVal,
-        fail: ArgVal,
-        bif: ArgVal,
-        dst: ArgVal,
-    ) -> Result<(), AsmError> {
-        use super::beam_asm::register::RET;
-        self.emit_setup_guard_bif(&[src], bif)?;
-        let ArgVal::Label(fail) = fail else {
-            return Err(AsmError::Operand("BIF failure label"));
-        };
-        if fail != 0 {
-            let fragment = self.ga_get(GlobalLabels::IBifGuardShared)?;
-            self.safe_fragment_call(fragment)?;
-            let label = self
-                .resolve_beam_label(fail)
-                .ok_or(AsmError::Operand("unknown failure label"))?;
-            self.asm.jcc(arinsal_x64::enc::CondCode::E, label)?;
-        } else {
-            let fragment = self.ga_get(GlobalLabels::IBifBodyShared)?;
-            self.safe_fragment_call(fragment)?;
-        }
-        self.mov_arg_from_reg(dst, RET)
-    }
-
-    /// Emits the shared guard or body call for a binary BIF.
-    // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:179-192 (emit_i_bif2), OTP-29.1.1.
-    pub fn emit_i_bif2(
-        &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
-        fail: ArgVal,
-        bif: ArgVal,
-        dst: ArgVal,
-    ) -> Result<(), AsmError> {
-        use super::beam_asm::register::RET;
-        self.emit_setup_guard_bif(&[lhs, rhs], bif)?;
-        let ArgVal::Label(fail) = fail else {
-            return Err(AsmError::Operand("BIF failure label"));
-        };
-        if fail != 0 {
-            let fragment = self.ga_get(GlobalLabels::IBifGuardShared)?;
-            self.safe_fragment_call(fragment)?;
-            let label = self
-                .resolve_beam_label(fail)
-                .ok_or(AsmError::Operand("unknown failure label"))?;
-            self.asm.jcc(arinsal_x64::enc::CondCode::E, label)?;
-        } else {
-            let fragment = self.ga_get(GlobalLabels::IBifBodyShared)?;
-            self.safe_fragment_call(fragment)?;
-        }
-        self.mov_arg_from_reg(dst, RET)
     }
 }
 

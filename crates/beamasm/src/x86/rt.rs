@@ -84,6 +84,13 @@ unsafe extern "C" {
     );
 }
 
+// Port of erts/emulator/beam/jit/x86/instr_bif.cpp:1136 (get_on_load_address), OTP-29.1.1.
+// The VM exports this static erts helper's C symbol to generated code.
+unsafe extern "C" {
+    /// `ErtsCodePtr get_on_load_address(Process *, Eterm)`.
+    pub safe fn get_on_load_address(c_p: *mut crate::ProcessHeader, module: u64) -> usize;
+}
+
 // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:28-32 (`extern "C" { #include
 // "bif.h" #include "beam_common.h" }`) and erl_gc.h, OTP-29.1.1: the runtime functions the
 // fragments of this file call by address (`runtime_call`). They are defined with these erts
@@ -194,6 +201,97 @@ unsafe extern "C" {
     pub safe fn eq(a: u64, b: u64) -> i32;
 }
 
+// Port of erts/emulator/beam/erl_process_dict.h, erl_bif_op.h, erl_utils.h and
+// erts/emulator/sys/{unix/erl_unix_sys.h,win32/erl_win_sys.h}: runtime calls and the
+// perf-counter callback table consumed by instr_common.cpp, OTP-29.1.1.
+unsafe extern "C" {
+    /// `Eterm erts_pd_hash_get(Process *p, Eterm id)` (erl_process_dict.h).
+    pub safe fn erts_pd_hash_get(c_p: *mut crate::ProcessHeader, id: u64) -> u64;
+    /// `Eterm erts_pd_hash_get_with_hx(Process *p, erts_ihash_t hx, Eterm id)`
+    /// (erl_process_dict.h); `erts_ihash_t` is a machine word.
+    pub safe fn erts_pd_hash_get_with_hx(c_p: *mut crate::ProcessHeader, hx: u64, id: u64) -> u64;
+    /// `Eterm erl_is_function(Process *p, Eterm term, Eterm arity)` (erl_bif_op.h).
+    pub safe fn erl_is_function(c_p: *mut crate::ProcessHeader, term: u64, arity: u64) -> u64;
+    /// `Sint erts_cmp_compound(Eterm a, Eterm b, int exact, int eq_only)` (utils.h).
+    pub safe fn erts_cmp_compound(a: u64, b: u64, exact: i32, eq_only: i32) -> i64;
+    /// `int erts_cmp_atoms(Eterm a, Eterm b)` (erl_utils.h).
+    pub safe fn erts_cmp_atoms(a: u64, b: u64) -> i32;
+}
+
+/// The perf-counter function table in erts' `ErtsSysTimeData__`.
+// Port of erts/emulator/sys/unix/erl_unix_sys.h:215-245, OTP-29.1.1.
+#[cfg(not(target_os = "windows"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ErtsSysTimeReadOnlyData {
+    #[cfg(target_os = "linux")]
+    /// `os_monotonic_time`, present when Linux uses the runtime function-pointer call path.
+    pub os_monotonic_time: extern "C" fn() -> u64,
+    #[cfg(target_os = "linux")]
+    /// `os_times`, present when Linux uses the runtime function-pointer call path.
+    pub os_times: extern "C" fn(*mut u64, *mut u64),
+    /// `perf_counter`.
+    pub perf_counter: extern "C" fn() -> u64,
+    /// `perf_counter_unit`.
+    pub perf_counter_unit: u64,
+    /// `ticks_per_sec`.
+    pub ticks_per_sec: i32,
+}
+
+/// The perf-counter function table in erts' Windows `ErtsSysTimeData__`.
+// Port of erts/emulator/sys/win32/erl_win_sys.h:185-201, OTP-29.1.1.
+#[cfg(target_os = "windows")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ErtsSysTimeReadOnlyData {
+    /// `os_monotonic_time`.
+    pub os_monotonic_time: extern "C" fn() -> u64,
+    /// `os_times`.
+    pub os_times: extern "C" fn(*mut u64, *mut u64),
+    /// `sys_hrtime`, the perf counter on Windows.
+    pub sys_hrtime: extern "C" fn() -> u64,
+}
+
+/// The cache-line-sized `r` union in erts' `ErtsSysTimeData__`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union ErtsSysTimeDataReadOnly {
+    /// The initialized read-only time callbacks.
+    pub o: ErtsSysTimeReadOnlyData,
+    /// The erts cache-line alignment member.
+    pub align: [u8; 64],
+}
+
+/// The `r` member of `ErtsSysTimeData__`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ErtsSysTimeData {
+    /// The callback table union.
+    pub r: ErtsSysTimeDataReadOnly,
+}
+
+unsafe extern "C" {
+    /// `ErtsSysTimeData__ erts_sys_time_data__` (erl_unix_sys.h / erl_win_sys.h).
+    pub safe static erts_sys_time_data__: ErtsSysTimeData;
+}
+
+/// Returns the initialized callback address embedded by `i_perf_counter`.
+pub fn perf_counter_address() -> usize {
+    // SAFETY: BeamAsm compiles modules only after erts initializes this process-lifetime table;
+    // the target-specific C-layout declarations above select the same callback member as
+    // instr_common.cpp (`perf_counter` on Unix, `sys_hrtime` on Windows).
+    unsafe {
+        #[cfg(target_os = "windows")]
+        {
+            erts_sys_time_data__.r.o.sys_hrtime as *const () as usize
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            erts_sys_time_data__.r.o.perf_counter as *const () as usize
+        }
+    }
+}
+
 // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:397-399 (i_emit_nyi) and
 // erts/emulator/beam/beam_catches.h:38 (beam_catches_cons), OTP-29.1.1. erts defines
 // `i_emit_nyi` static in beam_asm_module.cpp around `erts_exit(ERTS_ERROR_EXIT, "NYI: %s\n",
@@ -252,6 +350,133 @@ unsafe extern "C" {
     pub safe fn erts_continue_exit_process(c_p: *mut crate::ProcessHeader);
 }
 
+// Port of erts/emulator/beam/jit/x86/instr_records.cpp and instr_trace.cpp runtime-call
+// declarations, OTP-29.1.1. These helpers are part of the BeamAsm runtime ABI.
+unsafe extern "C" {
+    /// `bool erl_get_record_elements(Process *, Eterm *, Eterm, Uint, const Eterm *)`.
+    pub safe fn erl_get_record_elements(
+        c_p: *mut crate::ProcessHeader,
+        registers: *mut u64,
+        source: u64,
+        count: usize,
+        elements: *const u64,
+    ) -> bool;
+    /// `Eterm erl_create_local_native_record(Process *, Eterm *, Eterm, Uint, Uint, const Eterm *)`.
+    pub safe fn erl_create_local_native_record(
+        c_p: *mut crate::ProcessHeader,
+        registers: *mut u64,
+        definition: u64,
+        live: u64,
+        count: usize,
+        elements: *const u64,
+    ) -> u64;
+    /// `Eterm erl_create_native_record(Process *, Eterm *, Eterm, Uint, Uint, const Eterm *)`.
+    pub safe fn erl_create_native_record(
+        c_p: *mut crate::ProcessHeader,
+        registers: *mut u64,
+        definition_id: u64,
+        live: u64,
+        count: usize,
+        elements: *const u64,
+    ) -> u64;
+    /// `Eterm erl_update_native_record(Process *, Eterm *, Eterm, Uint, Uint, const Eterm *)`.
+    pub safe fn erl_update_native_record(
+        c_p: *mut crate::ProcessHeader,
+        registers: *mut u64,
+        source: u64,
+        live: u64,
+        count: usize,
+        elements: *const u64,
+    ) -> u64;
+    /// `Eterm erl_get_local_record_field(Process *, Eterm, Eterm, Eterm)`.
+    pub safe fn erl_get_local_record_field(
+        c_p: *mut crate::ProcessHeader,
+        source: u64,
+        definition_id: u64,
+        name: u64,
+    ) -> u64;
+    /// `Eterm erl_get_record_field(Process *, Eterm, Eterm, Eterm)`.
+    pub safe fn erl_get_record_field(
+        c_p: *mut crate::ProcessHeader,
+        source: u64,
+        definition_id: u64,
+        name: u64,
+    ) -> u64;
+    /// `void erts_call_trace_return(Process *, const ErtsCodeInfo *, Eterm, Eterm)`.
+    pub safe fn erts_call_trace_return(
+        c_p: *mut crate::ProcessHeader,
+        previous_info: *const core::ffi::c_void,
+        value: u64,
+        tracer: u64,
+    );
+    /// `void erts_trace_return(Process *, ErtsCodeMFA *, Eterm, ErtsTracer, Eterm)`.
+    pub safe fn erts_trace_return(
+        c_p: *mut crate::ProcessHeader,
+        mfa: *mut arinsal_term::ErtsCodeMfa,
+        value: u64,
+        tracer: u64,
+        session_id: u64,
+    );
+    /// `void erts_hibernate(Process *, Eterm *, int)`.
+    pub safe fn erts_hibernate(c_p: *mut crate::ProcessHeader, registers: *mut u64, arg: i32);
+    /// `void beam_jit_return_to_trace(Process *, Eterm, Eterm *)`.
+    pub safe fn beam_jit_return_to_trace(
+        c_p: *mut crate::ProcessHeader,
+        session_id: u64,
+        continuation: *mut u64,
+    );
+}
+
+// Port of erts/emulator/beam/jit/x86/instr_bif.cpp runtime-call declarations, OTP-29.1.1.
+unsafe extern "C" {
+    /// `Eterm erts_trapping_length_1(Process *, Eterm *)`.
+    pub safe fn erts_trapping_length_1(c_p: *mut crate::ProcessHeader, args: *mut u64) -> u64;
+    /// `ErtsCodeMFA *ubif2mfa(void *)`.
+    pub safe fn ubif2mfa(function: *const core::ffi::c_void) -> *const arinsal_term::ErtsCodeMfa;
+    /// `ErtsCodePtr erts_call_nif_early(Process *, const ErtsCodeInfo *)`.
+    pub safe fn erts_call_nif_early(
+        c_p: *mut crate::ProcessHeader,
+        code_info: *const super::beam_asm_module::ErtsCodeInfo,
+    ) -> usize;
+    /// `ErtsCodePtr erts_printable_return_address(const Process *, const Eterm *)`.
+    pub safe fn erts_printable_return_address(
+        c_p: *const crate::ProcessHeader,
+        stack: *const u64,
+    ) -> usize;
+    /// `Eterm beam_jit_call_bif(Process *, Eterm *, ErtsCodePtr, ErtsBifFunc, Uint)`.
+    pub safe fn beam_jit_call_bif(
+        c_p: *mut crate::ProcessHeader,
+        registers: *mut u64,
+        instruction: usize,
+        function: usize,
+        arity: usize,
+    ) -> u64;
+    /// `Eterm beam_jit_call_nif(Process *, ErtsCodePtr, Eterm *, BeamJitNifF *, erl_module_nif *)`.
+    pub safe fn beam_jit_call_nif(
+        c_p: *mut crate::ProcessHeader,
+        instruction: usize,
+        registers: *mut u64,
+        function: usize,
+        module: usize,
+    ) -> u64;
+    /// `enum beam_jit_nif_load_ret beam_jit_load_nif(Process *, ErtsCodePtr, Eterm *)`.
+    pub safe fn beam_jit_load_nif(
+        c_p: *mut crate::ProcessHeader,
+        instruction: usize,
+        registers: *mut u64,
+    ) -> i32;
+    /// `void erts_msacc_set_bif_state(ErtsMsAcc *, Eterm, const void *)`.
+    pub safe fn erts_msacc_set_bif_state(msacc: usize, module: u64, function: usize) -> usize;
+    /// `void erts_msacc_update_cache(ErtsMsAcc **)`.
+    pub safe fn erts_msacc_update_cache(cache: *mut usize);
+    /// `void erts_msacc_set_state_m__(ErtsMsAcc *, Uint, int)`.
+    pub safe fn erts_msacc_set_state_m__(msacc: usize, state: usize, active: i32);
+    /// `ErtsMsAcc *erts_msacc_cache`.
+    pub safe static erts_msacc_cache: usize;
+    /// `int erts_alcu_enable_code_atags`.
+    pub safe static erts_alcu_enable_code_atags: i32;
+}
+
 // Port of erts/emulator/beam/jit/beam_jit_common.hpp, OTP-29.1.1: the JIT-only runtime
 // helpers of jit/beam_jit_common.cpp the x86 fragments call by address. `instr_fun` re-exports
 // them.
@@ -277,33 +502,6 @@ unsafe extern "C" {
 // Port of erts/emulator/beam/jit/beam_jit_common.hpp, global.h and beam_bp.h, OTP-29.1.1:
 // runtime entries called by the x86 BIF, NIF and export-breakpoint fragments.
 unsafe extern "C" {
-    /// `Eterm beam_jit_call_bif(Process *, Eterm *, ErtsCodePtr, ErtsBifFunc, Uint)`.
-    pub safe fn beam_jit_call_bif(
-        c_p: *mut crate::ProcessHeader,
-        reg: *mut u64,
-        instruction: usize,
-        function: usize,
-        arity: usize,
-    ) -> u64;
-    /// `Eterm beam_jit_call_nif(Process *, ErtsCodePtr, Eterm *, BeamJitNifF *,
-    /// struct erl_module_nif *)`.
-    pub safe fn beam_jit_call_nif(
-        c_p: *mut crate::ProcessHeader,
-        instruction: usize,
-        reg: *mut u64,
-        function: usize,
-        nif_module: usize,
-    ) -> u64;
-    /// `ErtsCodePtr erts_call_nif_early(Process *, const ErtsCodeInfo *)`.
-    pub safe fn erts_call_nif_early(
-        c_p: *mut crate::ProcessHeader,
-        code_info: *const super::beam_asm_module::ErtsCodeInfo,
-    ) -> usize;
-    /// `ErtsCodePtr erts_printable_return_address(const Process *, const Eterm *)`.
-    pub safe fn erts_printable_return_address(
-        c_p: *const crate::ProcessHeader,
-        e: *const u64,
-    ) -> usize;
     /// `BeamInstr erts_generic_breakpoint(Process *, ErtsCodeInfo *, Eterm *)`.
     pub safe fn erts_generic_breakpoint(
         c_p: *mut crate::ProcessHeader,
@@ -854,7 +1052,19 @@ unsafe extern "C" {
 mod tests {
     use super::*;
 
-    // The differential byte tests take these runtime addresses but never execute them.
+    // Runtime symbols referenced by the BIF and trace fragment byte comparisons.
+    #[unsafe(no_mangle)]
+    extern "C" fn get_on_load_address(_: *mut ProcessHeader, _: u64) -> usize {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_trapping_length_1(_: *mut ProcessHeader, _: *mut u64) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn ubif2mfa(_: *const core::ffi::c_void) -> *const arinsal_term::ErtsCodeMfa {
+        unreachable!("byte-test fixture")
+    }
     #[unsafe(no_mangle)]
     extern "C" fn beam_jit_call_bif(
         _: *mut crate::ProcessHeader,
@@ -863,15 +1073,6 @@ mod tests {
         _: usize,
         _: usize,
     ) -> u64 {
-        unreachable!("byte-test fixture")
-    }
-    #[unsafe(no_mangle)]
-    extern "C" fn call_error_handler(
-        _: *mut crate::ProcessHeader,
-        _: *const arinsal_term::ErtsCodeMfa,
-        _: *mut u64,
-        _: u64,
-    ) -> usize {
         unreachable!("byte-test fixture")
     }
     #[unsafe(no_mangle)]
@@ -892,6 +1093,10 @@ mod tests {
         unreachable!("byte-test fixture")
     }
     #[unsafe(no_mangle)]
+    extern "C" fn beam_jit_load_nif(_: *mut ProcessHeader, _: usize, _: *mut u64) -> i32 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
     extern "C" fn erts_printable_return_address(
         _: *const crate::ProcessHeader,
         _: *const u64,
@@ -906,7 +1111,90 @@ mod tests {
     ) -> usize {
         unreachable!("byte-test fixture")
     }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_call_trace_return(
+        _: *mut ProcessHeader,
+        _: *const core::ffi::c_void,
+        _: u64,
+        _: u64,
+    ) {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_trace_return(
+        _: *mut ProcessHeader,
+        _: *mut arinsal_term::ErtsCodeMfa,
+        _: u64,
+        _: u64,
+        _: u64,
+    ) {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_hibernate(_: *mut ProcessHeader, _: *mut u64, _: i32) {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn beam_jit_return_to_trace(_: *mut ProcessHeader, _: u64, _: *mut u64) {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_cmp_compound(_: u64, _: u64, _: i32, _: i32) -> i64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_cmp_atoms(_: u64, _: u64) -> i32 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_pd_hash_get(_: *mut crate::ProcessHeader, _: u64) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_pd_hash_get_with_hx(_: *mut crate::ProcessHeader, _: u64, _: u64) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erl_is_function(_: *mut crate::ProcessHeader, _: u64, _: u64) -> u64 {
+        unreachable!("byte-test fixture")
+    }
 
+    extern "C" fn test_perf_counter() -> u64 {
+        0
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    extern "C" fn test_os_times(_: *mut u64, _: *mut u64) {}
+
+    #[cfg(all(not(target_os = "windows"), target_os = "linux"))]
+    const TEST_TIME_READ_ONLY: ErtsSysTimeReadOnlyData = ErtsSysTimeReadOnlyData {
+        os_monotonic_time: test_perf_counter,
+        os_times: test_os_times,
+        perf_counter: test_perf_counter,
+        perf_counter_unit: 1,
+        ticks_per_sec: 1,
+    };
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
+    const TEST_TIME_READ_ONLY: ErtsSysTimeReadOnlyData = ErtsSysTimeReadOnlyData {
+        perf_counter: test_perf_counter,
+        perf_counter_unit: 1,
+        ticks_per_sec: 1,
+    };
+
+    #[cfg(target_os = "windows")]
+    const TEST_TIME_READ_ONLY: ErtsSysTimeReadOnlyData = ErtsSysTimeReadOnlyData {
+        os_monotonic_time: test_perf_counter,
+        os_times: test_os_times,
+        sys_hrtime: test_perf_counter,
+    };
+
+    #[unsafe(no_mangle)]
+    static erts_sys_time_data__: ErtsSysTimeData = ErtsSysTimeData {
+        r: ErtsSysTimeDataReadOnly {
+            o: TEST_TIME_READ_ONLY,
+        },
+    };
     // Runtime symbols referenced by map fragment byte comparisons.
     #[unsafe(no_mangle)]
     extern "C" fn erts_gc_new_map(
@@ -1148,6 +1436,59 @@ mod tests {
     #[unsafe(no_mangle)]
     static the_active_code_index: u32 = 0;
 
+    // Fixtures for the native record emitters' runtime-call addresses.
+    #[unsafe(no_mangle)]
+    extern "C" fn erl_get_record_elements(
+        _: *mut ProcessHeader,
+        _: *mut u64,
+        _: u64,
+        _: usize,
+        _: *const u64,
+    ) -> bool {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erl_create_local_native_record(
+        _: *mut ProcessHeader,
+        _: *mut u64,
+        _: u64,
+        _: u64,
+        _: usize,
+        _: *const u64,
+    ) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erl_create_native_record(
+        _: *mut ProcessHeader,
+        _: *mut u64,
+        _: u64,
+        _: u64,
+        _: usize,
+        _: *const u64,
+    ) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erl_update_native_record(
+        _: *mut ProcessHeader,
+        _: *mut u64,
+        _: u64,
+        _: u64,
+        _: usize,
+        _: *const u64,
+    ) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erl_get_local_record_field(_: *mut ProcessHeader, _: u64, _: u64, _: u64) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erl_get_record_field(_: *mut ProcessHeader, _: u64, _: u64, _: u64) -> u64 {
+        unreachable!("byte-test fixture")
+    }
+
     // Fixtures for the runtime functions the fragments of the byte tests call, so the test
     // binary links; the tests only take their addresses.
     #[unsafe(no_mangle)]
@@ -1156,6 +1497,15 @@ mod tests {
         _pc: usize,
         _reg: *mut u64,
         _bif_mfa: *const arinsal_term::ErtsCodeMfa,
+    ) -> usize {
+        unreachable!("byte-test fixture")
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn call_error_handler(
+        _: *mut crate::ProcessHeader,
+        _: *const arinsal_term::ErtsCodeMfa,
+        _: *mut u64,
+        _: u64,
     ) -> usize {
         unreachable!("byte-test fixture")
     }

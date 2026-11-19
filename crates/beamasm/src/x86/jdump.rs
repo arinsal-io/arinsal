@@ -40,6 +40,114 @@ pub(crate) fn erts_dump(module: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// Emits old-style BEAM instructions that OTP 29's compiler no longer generates.
+pub(crate) fn generated_misc_emitters_dump() -> Option<String> {
+    static DUMP: OnceLock<Option<String>> = OnceLock::new();
+    DUMP.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!(
+            "arinsal-x86-jdump-misc-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).ok()?;
+        let set_tuple_eval = concat!(
+            "M=arinsal_port_misc_fixture,",
+            "Forms=[{attribute,1,module,M},{attribute,1,export,[{f,0}]},",
+            "{function,1,f,0,[{clause,1,[],[],[{integer,1,1}]}]}],",
+            "{ok,M,{M,Ex,Attr,Anno,Fs,NL}}=compile:forms(Forms,[to_asm]),",
+            "Fs1=[case F of {function,f,0,Entry,Ins}->",
+            "{function,f,0,Entry,lists:sublist(Ins,length(Ins)-1)++",
+            "[{set_tuple_element,{x,0},{x,1},1},return]}; _->F end || F<-Fs],",
+            "{ok,B}=beam_asm:module({M,Ex,Attr,Anno,Fs1,NL},[],[],[]),",
+            "{module,M}=code:load_binary(M,\"fixture.beam\",B),halt()."
+        );
+        let debug_line_eval = concat!(
+            "M=arinsal_port_debug_line_fixture,",
+            "Forms=[{attribute,1,module,M},{attribute,1,export,[{f,2}]},",
+            "{function,1,f,2,[{clause,1,[{var,1,'X'},{var,1,'Y'}],[],[{integer,1,1}]}]}],",
+            "{ok,M,{M,Ex,Attr,Anno,Fs,NL}}=compile:forms(Forms,[to_asm]),",
+            "Fs1=[case F of {function,f,2,Entry,Ins}->",
+            "{function,f,2,Entry,lists:sublist(Ins,length(Ins)-1)++",
+            "[{debug_line,{atom,am_line},[{location,\"fixture.erl\",1}],1,2,[]},return]};",
+            "_ -> F end || F<-Fs],",
+            "{ok,B}=beam_asm:module({M,Ex,Attr,Anno,Fs1,NL},[],[],[]),",
+            "code:load_binary(M,\"debug_line.beam\",B),halt()."
+        );
+        let compare_eval = concat!(
+            "M2=arinsal_port_compare_fixture,",
+            "Forms2=[{attribute,1,module,M2},{attribute,1,export,[{f,2}]},",
+            "{function,1,f,2,[{clause,1,[{var,1,'X'},{var,1,'Y'}],[],[{integer,1,1}]}]}],",
+            "{ok,M2,{M2,Ex2,Attr2,Anno2,Fs2,NL2}}=compile:forms(Forms2,[to_asm]),",
+            "Fs3=[case F of {function,f,2,Entry,Ins}->",
+            "{function,f,2,Entry,lists:sublist(Ins,length(Ins)-1)++",
+            "[{is_eq,{f,3},{x,0},{x,1}},return,{label,3},return]}; _->F end || F<-Fs2],",
+            "{ok,B2}=beam_asm:module({M2,Ex2,Attr2,Anno2,Fs3,NL2},[],[],[]),",
+            "code:load_binary(M2,\"compare.beam\",B2),halt()."
+        );
+        let i_get_eval = concat!(
+            "M=arinsal_port_i_get_fixture,",
+            "Forms=[{attribute,1,module,M},{attribute,1,export,[{f,1}]},",
+            "{function,1,f,1,[{clause,1,[{var,1,'Key'}],[],",
+            "[{call,1,{remote,1,{atom,1,erlang},{atom,1,get}},[{var,1,'Key'}]}]}]}],",
+            "{ok,M,{M,Ex,Attr,Anno,Fs,NL}}=compile:forms(Forms,[to_asm]),",
+            "{ok,B}=beam_asm:module({M,Ex,Attr,Anno,Fs,NL},[],[],[]),",
+            "{module,M}=code:load_binary(M,\"i_get.beam\",B),halt()."
+        );
+        let run = |options: &[&str], eval: &str| {
+            Command::new("timeout")
+                .args(["30", "erl", "+JDdump", "true"])
+                .args(options)
+                .args(["-noshell", "-eval", eval])
+                .current_dir(&dir)
+                .output()
+        };
+        let set_tuple_output = run(&[], set_tuple_eval).ok()?;
+        assert!(
+            set_tuple_output.status.success(),
+            "OTP failed to emit the set_tuple_element fixture: {}",
+            String::from_utf8_lossy(&set_tuple_output.stderr)
+        );
+        let debug_line_output = run(&["+D", "+Dibpl", "true"], debug_line_eval).ok()?;
+        assert!(
+            debug_line_output.status.success(),
+            "OTP failed to emit the debug_line fixture: {}",
+            String::from_utf8_lossy(&debug_line_output.stderr)
+        );
+        let compare_output = run(&[], compare_eval).ok()?;
+        assert!(
+            compare_output.status.success(),
+            "OTP failed to emit the comparison fixture: {}",
+            String::from_utf8_lossy(&compare_output.stderr)
+        );
+        let i_get_output = run(&[], i_get_eval).ok()?;
+        assert!(
+            i_get_output.status.success(),
+            "OTP failed to emit the process dictionary fixture: {}",
+            String::from_utf8_lossy(&i_get_output.stderr)
+        );
+        let first = std::fs::read(dir.join("arinsal_port_misc_fixture.asm")).ok()?;
+        let debug_line = std::fs::read(dir.join("arinsal_port_debug_line_fixture.asm")).ok()?;
+        let second = std::fs::read(dir.join("arinsal_port_compare_fixture.asm")).unwrap_or_else(|error| {
+            panic!(
+                "OTP did not dump comparison fixture ({error}); status {:?}; stdout: {}; stderr: {}",
+                compare_output.status,
+                String::from_utf8_lossy(&compare_output.stdout),
+                String::from_utf8_lossy(&compare_output.stderr)
+            )
+        });
+        let i_get = std::fs::read(dir.join("arinsal_port_i_get_fixture.asm")).ok()?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Some(format!(
+            "{}\n{}\n{}\n{}",
+            String::from_utf8_lossy(&first),
+            String::from_utf8_lossy(&debug_line),
+            String::from_utf8_lossy(&second),
+            String::from_utf8_lossy(&i_get)
+        ))
+    })
+    .clone()
+}
+
 /// The instruction lines of every `# <op>` block in a module dump. A block ends at the next
 /// instruction header or label; `# comment text` lines inside it are dropped.
 pub(crate) fn op_blocks(dump: &str, op: &str) -> Vec<Vec<String>> {
@@ -187,6 +295,53 @@ fn asmjit_size_optimized(line: &str) -> String {
     line.to_string()
 }
 
+fn asmjit_compact_qword_cmp(line: &str) -> Option<String> {
+    use arinsal_x64::enc::{
+        R8, R9, R10, R11, R12, R13, R14, R15, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, qword_ptr,
+    };
+    let operands = line.strip_prefix("cmp qword ptr [")?;
+    let (address, immediate) = operands.split_once("], ")?;
+    let immediate = immediate.parse::<i64>().ok()?;
+    i8::try_from(immediate).ok()?;
+    let (base, disp) = match address.split_once('+') {
+        Some((base, disp)) => (base, disp.parse::<i32>().ok()?),
+        None => (address, 0),
+    };
+    let base = match base {
+        "rax" => RAX,
+        "rbx" => RBX,
+        "rcx" => RCX,
+        "rdx" => RDX,
+        "rsp" => RSP,
+        "rbp" => RBP,
+        "rsi" => RSI,
+        "rdi" => RDI,
+        "r8" => R8,
+        "r9" => R9,
+        "r10" => R10,
+        "r11" => R11,
+        "r12" => R12,
+        "r13" => R13,
+        "r14" => R14,
+        "r15" => R15,
+        _ => return None,
+    };
+    let mut assembler = crate::x86::beam_asm::BeamAssembler::new();
+    assembler
+        .emit(|e| e.cmp_mi(qword_ptr(base, disp), immediate))
+        .ok()?;
+    Some(format!(
+        ".byte {}",
+        assembler
+            .a
+            .bytes(arinsal_x64::buf::Section::Code)
+            .iter()
+            .map(|byte| format!("{byte:#04x}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
 /// Rewrites one erts dump line to Arinsal's layouts: `Process` fields (`[r13+N]`) and the
 /// scheduler registers' auxiliary area (`[rbx-N]`: erts' `runtime_stack` is at -64 and
 /// `TMP_MEM1..5` follow it; Arinsal's start at -128).
@@ -227,16 +382,71 @@ pub(crate) fn erts_to_arinsal(line: &str) -> String {
     if line.contains(&aux(-16)) {
         line = line.replace(&aux(-16), &aux(crate::ERL_BITS_STATE_DISP));
     }
-    line
+    asmjit_compact_qword_cmp(&line).unwrap_or(line)
 }
 
-/// Compares `ours` with erts' fragment text, ignoring the displacements of jumps to other
-/// fragments (`jmp global::x`, `short jmp global::x`, `jz global::x`), whose targets lie
-/// elsewhere in each layout. `None` without binutils.
+fn branch_placeholder(op: &str, fill: u8) -> String {
+    let op = op.strip_prefix("{disp32} ").unwrap_or(op);
+    let (short, condition) = if let Some(jump) = op.strip_prefix("short j") {
+        (true, jump)
+    } else if let Some(jump) = op.strip_prefix("j") {
+        (false, jump)
+    } else {
+        (false, op)
+    };
+    let condition = match condition {
+        "mp" => None,
+        "o" => Some(0),
+        "no" => Some(1),
+        "b" | "c" | "nae" => Some(2),
+        "ae" | "nb" | "nc" => Some(3),
+        "e" | "z" => Some(4),
+        "ne" | "nz" => Some(5),
+        "be" | "na" => Some(6),
+        "a" | "nbe" => Some(7),
+        "s" => Some(8),
+        "ns" => Some(9),
+        "p" | "pe" => Some(10),
+        "np" | "po" => Some(11),
+        "l" | "nge" => Some(12),
+        "ge" | "nl" => Some(13),
+        "le" | "ng" => Some(14),
+        "g" | "nle" => Some(15),
+        _ => None,
+    };
+    let (opcode, width): (Vec<u8>, usize) = match (short, condition) {
+        (_, None) if op == "call" => (vec![0xe8], 4),
+        (_, None) if op == "jmp" => (vec![0xe9], 4),
+        (true, None) if op == "short jmp" => (vec![0xeb], 1),
+        (true, Some(cc)) => (vec![0x70 | cc], 1),
+        (false, Some(cc)) => (vec![0x0f, 0x80 | cc], 4),
+        _ => panic!("unknown jump `{op}`"),
+    };
+    let bytes = opcode
+        .into_iter()
+        .chain(std::iter::repeat_n(fill, width))
+        .map(|byte| format!("{byte:#04x}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(".byte {bytes}")
+}
+
+/// Compares `ours` with erts' assembler text, ignoring out-of-span branch relocations,
+/// absolute runtime-call targets and process-local atom indices. `None` without binutils.
 pub(crate) fn matches_with_global_jumps(
     lines: &[String],
     ours: &[u8],
     unbound: &[&str],
+) -> Option<bool> {
+    matches_with_global_jumps_at(lines, ours, unbound, 0)
+}
+
+/// Compares a module instruction at its real code-section offset, preserving erts' alignment.
+pub(crate) fn matches_with_global_jumps_at(
+    lines: &[String],
+    ours: &[u8],
+    unbound: &[&str],
+    code_offset: usize,
 ) -> Option<bool> {
     // `emit_leave_runtime<eCodeIndex>` loads `the_active_code_index` by its process-local
     // address. This symbol moves between the short-lived reference `erl` and this test process.
@@ -256,10 +466,39 @@ pub(crate) fn matches_with_global_jumps(
             }
         })
         .collect();
-    let placeholder = |fill: u8, all_near: bool| -> Vec<String> {
+    let labels: std::collections::HashSet<&str> = lines
+        .iter()
+        .filter_map(|line| line.strip_suffix(':'))
+        .collect();
+    let external_label = lines.iter().any(|line| {
+        let Some((_, target)) = line.rsplit_once(' ') else {
+            return false;
+        };
+        (target.starts_with('L') || target.starts_with("label_")) && !labels.contains(target)
+    });
+    let placeholder = |fill: u8, all_near: bool, atom_variant: usize| -> Vec<String> {
         normalized
             .iter()
             .map(|line| {
+                // Atom table indices are process-local. Keep the two tag bytes fixed and vary
+                // only the index bits while comparing the x86 instruction encoding.
+                if let Some((instruction, immediate)) = line.split_once(", ")
+                    && (instruction.starts_with("mov ") || instruction.starts_with("cmp "))
+                    && let Ok(value) = immediate.parse::<u32>()
+                    && value & 0x3f == 0x0b
+                {
+                    let index_bits = match atom_variant {
+                        0 => 0x80,
+                        1 => 0x7fff_ffc0 & !0x80,
+                        2 => 0x100,
+                        _ => unreachable!(),
+                    };
+                    let value = (value & 0x3f) | index_bits;
+                    return format!("{instruction}, {value}");
+                }
+                if line.contains("ptr [rip + 0]") && fill != 0 {
+                    return line.replace("ptr [rip + 0]", "ptr [rip - 1]");
+                }
                 // `runtime_call` / `abs_jmp`: asmjit's 6-byte `REX call/jmp rel32` to an
                 // absolute address, relocated at load; the address is erts' own.
                 if let Some((op, target)) = line.split_once(' ')
@@ -271,71 +510,68 @@ pub(crate) fn matches_with_global_jumps(
                         ".byte 0x40, {opcode:#04x}, {fill:#04x}, {fill:#04x}, {fill:#04x}, {fill:#04x}"
                     );
                 }
-                let Some((op, target)) = line.split_once(" global::") else {
+                if let Some((op, target)) = line.split_once(" global::") {
+                    // A fragment Arinsal does not emit yet is unbound here, so asmjit's rule gives
+                    // the near form where erts reached it backward with rel8; with fragments
+                    // missing, the layout also moves bound targets out of rel8 reach
+                    // (`all_near`).
+                    let op = match op.strip_prefix("short ") {
+                        Some(near) if all_near || unbound.contains(&target) => near,
+                        _ => op,
+                    };
+                    return branch_placeholder(op, fill);
+                }
+                let (prefix, operation) = match line.strip_prefix("{disp32} ") {
+                    Some(near) => ("{disp32} ", near),
+                    None => ("", line.as_str()),
+                };
+                let Some((op, target)) = operation.split_once(' ') else {
                     return line.clone();
                 };
-                // A fragment Arinsal does not emit yet is unbound here, so asmjit's rule gives
-                // the near form where erts reached it backward with rel8; with fragments
-                // missing, the layout also moves bound targets out of rel8 reach
-                // (`all_near`).
+                if (op != "call" && !op.starts_with('j'))
+                    || !(target.starts_with('L') || target.starts_with("label_"))
+                    || labels.contains(target)
+                {
+                    return line.clone();
+                }
                 let op = match op.strip_prefix("short ") {
-                    Some(near) if all_near || unbound.contains(&target) => near,
+                    Some(near) if all_near => near,
                     _ => op,
                 };
-                let condition = match op.strip_prefix("short ").unwrap_or(op) {
-                    "jo" => 0x80,
-                    "jno" => 0x81,
-                    "jb" | "jc" | "jnae" => 0x82,
-                    "jae" | "jnb" | "jnc" => 0x83,
-                    "je" | "jz" => 0x84,
-                    "jne" | "jnz" => 0x85,
-                    "jbe" | "jna" => 0x86,
-                    "ja" | "jnbe" => 0x87,
-                    "js" => 0x88,
-                    "jns" => 0x89,
-                    "jp" | "jpe" => 0x8a,
-                    "jnp" | "jpo" => 0x8b,
-                    "jl" | "jnge" => 0x8c,
-                    "jge" | "jnl" => 0x8d,
-                    "jle" | "jng" => 0x8e,
-                    "jg" | "jnle" => 0x8f,
-                    _ => 0,
-                };
-                let opcode: Vec<u8> = if op == "short jmp" {
-                    vec![0xeb]
-                } else if op == "call" {
-                    vec![0xe8]
-                } else if op == "jmp" {
-                    vec![0xe9]
-                } else if op.starts_with("short ") {
-                    // The short-branch opcode is 0x70 + the low four condition bits.
-                    vec![0x70 + (condition - 0x80)]
-                } else if condition != 0 {
-                    vec![0x0f, condition]
-                } else {
-                    panic!("unknown jump `{op}`")
-                };
-                let width = if op.starts_with("short") { 1 } else { 4 };
-                let bytes: Vec<String> = opcode
-                    .iter()
-                    .copied()
-                    .chain(std::iter::repeat_n(fill, width))
-                    .map(|b| format!("{b:#04x}"))
-                    .collect();
-                format!(".byte {}", bytes.join(", "))
+                let op = format!("{prefix}{op}");
+                branch_placeholder(&op, fill)
             })
             .collect()
     };
     let matches = |all_near: bool| -> Option<bool> {
-        let zeros = gnu_as(&placeholder(0, all_near))?;
-        let ones = gnu_as(&placeholder(0xff, all_near))?;
-        Some(
-            ours.len() == zeros.len()
-                && ours
-                    .iter()
-                    .zip(zeros.iter().zip(&ones))
-                    .all(|(o, (z, f))| z != f || o == z),
-        )
+        let assemble = |fill, atom_variant| {
+            let mut lines = placeholder(fill, all_near, atom_variant);
+            if code_offset != 0 {
+                lines.insert(0, format!(".fill {code_offset}, 1, 0"));
+            }
+            let bytes = gnu_as(&lines)?;
+            Some(bytes.get(code_offset..)?.to_vec())
+        };
+        let baseline = assemble(0, 0)?;
+        let mut varying_bits = vec![0; baseline.len()];
+        for atom_variant in 0..3 {
+            for fill in [0, 0xff] {
+                let bytes = assemble(fill, atom_variant)?;
+                if bytes.len() != baseline.len() {
+                    return Some(false);
+                }
+                for (mask, (base, byte)) in varying_bits.iter_mut().zip(baseline.iter().zip(bytes))
+                {
+                    *mask |= base ^ byte;
+                }
+            }
+        }
+        let matched = ours.len() == baseline.len()
+            && ours
+                .iter()
+                .zip(baseline.iter().zip(&varying_bits))
+                .all(|(ours, (base, mask))| (ours ^ base) & !mask == 0);
+        Some(matched)
     };
-    Some(matches(false)? || (!unbound.is_empty() && matches(true)?))
+    Some(matches(false)? || ((!unbound.is_empty() || external_label) && matches(true)?))
 }

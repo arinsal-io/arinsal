@@ -284,6 +284,8 @@ pub const fn emit_boxed_val(src: Gp, bytes: i32, size: u8) -> Mem {
 
 pub use crate::common::process;
 
+const _: () = assert!(process::FLAGS == core::mem::offset_of!(ProcessHeader, flags) as i32);
+
 /// `x86::ptr(c_p, offsetof(Process, field), size)`.
 pub const fn process_ref(offset: i32, size: u8) -> Mem {
     Mem::base_disp(C_P, offset, size)
@@ -746,7 +748,7 @@ impl BeamAssembler {
         self.aligned_call_with(|e| e.call_m(target))
     }
 
-    /// `erlang_call(Gp, spill)`: calls a checked fun target through its entry register.
+    /// `erlang_call(Gp, spill)`: calls a register target with a CP-aligned return address.
     // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:327-348 (erlang_call), OTP-29.1.1.
     pub fn erlang_call_r(&mut self, target: Gp) -> Result<(), AsmError> {
         self.emit_assert_redzone_unused();
@@ -801,6 +803,10 @@ impl BeamAssembler {
     /// `emit_assert_runtime_stack()`: emits nothing outside `JIT_HARD_DEBUG`.
     // Port of erts/emulator/beam/jit/x86/beam_asm.hpp (emit_assert_runtime_stack), OTP-29.1.1.
     pub fn emit_assert_runtime_stack(&mut self) {}
+
+    /// `emit_assert_erlang_stack()`: hard-debug validation of E, omitted in release builds.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:626-644, OTP-29.1.1.
+    pub fn emit_assert_erlang_stack(&mut self) {}
 
     /// `emit_assert_redzone_unused()`: emits nothing outside `JIT_HARD_DEBUG`.
     // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:302-322, OTP-29.1.1.

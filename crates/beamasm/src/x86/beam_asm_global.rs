@@ -516,6 +516,8 @@ impl BeamGlobalAssembler {
         use GlobalLabels as G;
         Some(match label {
             G::GarbageCollect => Self::emit_garbage_collect,
+            // Port of erts/emulator/beam/jit/x86/instr_bif.cpp fragment emitters,
+            // OTP-29.1.1.
             G::BifNifEpilogue => Self::emit_bif_nif_epilogue,
             G::CallBifShared => Self::emit_call_bif_shared,
             G::CallLightBifShared => Self::emit_call_light_bif_shared,
@@ -532,6 +534,15 @@ impl BeamGlobalAssembler {
             G::BifElementShared => Self::emit_bif_element_shared,
             G::CheckFloatError => Self::emit_check_float_error,
             G::FconvShared => Self::emit_fconv_shared,
+            G::IBifBodyShared => Self::emit_i_bif_body_shared,
+            G::IBifGuardShared => Self::emit_i_bif_guard_shared,
+            G::ILengthBodyShared => Self::emit_i_length_body_shared,
+            G::ILengthGuardShared => Self::emit_i_length_guard_shared,
+            G::ILoadNifShared => Self::emit_i_load_nif_shared,
+            // Port of erts/emulator/beam/jit/x86/instr_trace.cpp fragment emitters,
+            // OTP-29.1.1.
+            G::GenericBpLocal => Self::emit_generic_bp_local,
+            G::DebugBp => Self::emit_debug_bp,
             G::HandleElementError => Self::emit_handle_element_error,
             G::HandleHdError => Self::emit_handle_hd_error,
             G::HandleMapGetBadkey => Self::emit_handle_map_get_badkey,
@@ -561,6 +572,14 @@ impl BeamGlobalAssembler {
             G::GetSint64Shared => Self::emit_get_sint64_shared,
             G::ConstructUtf8Shared => Self::emit_construct_utf8_shared,
             G::StoreUnaligned => Self::emit_store_unaligned,
+            // Port of erts/emulator/beam/jit/x86/instr_common.cpp shared comparison fragments,
+            // OTP-29.1.1.
+            G::IsEqExactListShared => Self::emit_is_eq_exact_list_shared,
+            G::IsEqExactShallowBoxedShared => Self::emit_is_eq_exact_shallow_boxed_shared,
+            G::ArithEqShared => Self::emit_arith_eq_shared,
+            G::ArithCompareShared => Self::emit_arith_compare_shared,
+            G::IsInRangeShared => Self::emit_is_in_range_shared,
+            G::IsGeLtShared => Self::emit_is_ge_lt_shared,
             // Port of erts/emulator/beam/jit/x86/instr_map.cpp map fragments, OTP-29.1.1.
             G::IGetMapElementShared => Self::emit_i_get_map_element_shared,
             G::IGetMapElementHashShared => Self::emit_i_get_map_element_hash_shared,
@@ -1006,7 +1025,10 @@ mod tests {
                 | G::DispatchSaveCallsExport
                 | G::UnloadedFun
                 | G::ILoopRecShared
-                | G::CallLightBifShared => {
+                | G::BifNifEpilogue
+                | G::CallBifShared
+                | G::CallLightBifShared
+                | G::CallNifShared => {
                     vec![active]
                 }
                 G::PlusBodyShared => vec![mfa_address(&crate::x86::instr_arith::PLUS_MFA)],
@@ -1024,6 +1046,8 @@ mod tests {
                 G::IBnotBodyShared => vec![mfa_address(&crate::x86::instr_arith::BNOT_MFA)],
                 G::IBslBodyShared => vec![mfa_address(&crate::x86::instr_arith::BSL_MFA)],
                 G::IBsrBodyShared => vec![mfa_address(&crate::x86::instr_arith::BSR_MFA)],
+                G::ILengthBodyShared => vec![mfa_address(&crate::x86::instr_bif::LENGTH_MFA)],
+                G::ILoadNifShared => vec![mfa_address(&crate::x86::instr_bif::LOAD_NIF_MFA)],
                 _ => Vec::new(),
             }
         };
@@ -1051,10 +1075,46 @@ mod tests {
                 .into_iter()
                 .map(|l| rewrite(l, &mut static_addresses))
                 .map(|line| {
-                    if let Some(data) = line.strip_prefix(".dq ") {
+                    let line = if let Some(data) = line.strip_prefix(".dq ") {
                         format!(".quad {data}")
                     } else {
-                        line.replace("[L", "[rip + L")
+                        line
+                    };
+                    match (label, line.as_str()) {
+                        (GlobalLabels::CallLightBifShared, "cmp dword ptr [rcx+36], 0") => format!(
+                            "cmp dword ptr [rcx+{}], 0",
+                            core::mem::offset_of!(arinsal_term::ExportEntry, is_bif_traced)
+                        ),
+                        (GlobalLabels::CallLightBifShared, "add rcx, 64") => {
+                            format!("add rcx, {}", arinsal_term::EXPORT_MFA_OFFSET)
+                        }
+                        (GlobalLabels::CallLightBifShared, "movzx r8d, byte ptr [r8+80]") => {
+                            format!(
+                                "movzx r8d, byte ptr [r8+{}]",
+                                arinsal_term::EXPORT_MFA_OFFSET
+                                    + core::mem::offset_of!(arinsal_term::ErtsCodeMfa, arity)
+                                        as u32
+                            )
+                        }
+                        (GlobalLabels::CallLightBifShared, "movzx esi, byte ptr [rcx+80]") => {
+                            format!(
+                                "movzx esi, byte ptr [rcx+{}]",
+                                arinsal_term::EXPORT_MFA_OFFSET
+                                    + core::mem::offset_of!(arinsal_term::ErtsCodeMfa, arity)
+                                        as u32
+                            )
+                        }
+                        (GlobalLabels::CallLightBifShared, "lea rcx, qword ptr [rcx+64]") => {
+                            format!(
+                                "lea rcx, qword ptr [rcx+{}]",
+                                arinsal_term::EXPORT_MFA_OFFSET
+                            )
+                        }
+                        (GlobalLabels::GenericBpGlobal, "lea rsi, qword ptr [rax+48]") => format!(
+                            "lea rsi, qword ptr [rax+{}]",
+                            arinsal_term::EXPORT_INFO_OFFSET
+                        ),
+                        _ => line.replace("[L", "[rip + L"),
                     }
                 })
                 .collect();

@@ -1,4 +1,6 @@
 //! Runtime helper bodies called by BeamAsm generated code.
+//!
+//! Port of erts/emulator/beam/jit/x86/instr_bif.cpp:1136 (`get_on_load_address`).
 
 #[path = "native_helpers/bs_construct_raw.rs"]
 pub(crate) mod bs_construct_raw;
@@ -8,6 +10,33 @@ use arinsal_bits::MatchOps;
 use arinsal_term::{HeapAlloc, PreparedWritableAppend, Term, TermBuilder};
 
 use crate::beamasm_integration::ExportDispatch;
+
+/// Resolves the on-load function in the process-visible active code tables.
+// Port of erts/emulator/beam/jit/x86/instr_bif.cpp:1136 (get_on_load_address), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_on_load_address(header: *mut ProcessHeader, module_raw: u64) -> usize {
+    let Some(process) = crate::native_hooks::process_from_header(header) else {
+        return 0;
+    };
+    let runtime = process.runtime;
+    let address = crate::native_hooks::from_raw(module_raw)
+        .as_atom()
+        .and_then(|module| arinsal_term::global_atoms().text(module))
+        .and_then(|module| {
+            runtime?.with_active_code(|_, tables| {
+                let id = tables.pending_on_load.get(module).copied()?;
+                let meta = tables.code_meta.get(id)?.as_ref()?;
+                meta.beamasm.as_ref()?.on_load_address()
+            })
+        });
+    match address {
+        Some(address) => address,
+        None => {
+            process.heap.abi.exc.freason = arinsal_term::exc::EXC_BADARG;
+            0
+        }
+    }
+}
 
 struct StaticNif {
     module: String,

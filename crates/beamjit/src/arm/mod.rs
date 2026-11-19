@@ -330,6 +330,24 @@ impl<E: ModuleEnv + ?Sized> crate::beam_asm::LoaderEnv for E {
             .map(|identity| ModuleEnv::bif_function(self, identity) as u64)
             .ok_or_else(|| format!("import {index} not a BIF"))
     }
+    fn bif_mfa_function(&self, module: &str, function: &str, arity: u8) -> Result<u64, String> {
+        // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:912 (emit_call_bif_mfa),
+        // OTP-29.1.1: resolve the active export, then call its `bif_table[e->bif_number].f`.
+        let entry = ModuleEnv::bif_mfa_entry(self, module, function, arity)?;
+        let bif = ModuleEnv::bif_function(self, entry);
+        (bif != 0)
+            .then_some(bif as u64)
+            .ok_or_else(|| format!("no BIF function for {module}:{function}/{arity}"))
+    }
+    fn send_target(&self) -> Result<(u64, u64), String> {
+        // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:691 (emit_send), OTP-29.1.1:
+        // pass the send trap export and its `bif_table` function to `call_light_bif_shared`.
+        let export = ModuleEnv::send_export_entry(self);
+        let bif = ModuleEnv::light_bif_func(self, export);
+        (export != 0 && bif != 0)
+            .then_some((export as u64, bif as u64))
+            .ok_or_else(|| "no erlang:send/2 BIF entry".into())
+    }
 }
 
 extern "C" fn unused_add_stacktrace(

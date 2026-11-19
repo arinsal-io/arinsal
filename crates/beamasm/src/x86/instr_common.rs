@@ -8,22 +8,26 @@ use arinsal_term::{Term, atoms};
 use arinsal_x64::enc::{CondCode, Mem, qword_ptr};
 
 use super::beam_asm::register::{
-    ARG1, ARG1D, ARG2, ARG2D, ARG3, ARG4, C_P, E, HTOP, RET, RETB, RETD,
+    ARG1, ARG1D, ARG2, ARG2D, ARG3, ARG3D, ARG4, ARG5, ARG5D, C_P, E, HTOP, RET, RETB, RETD,
 };
 use super::beam_asm::{
     AsmError, BeamAssembler, CpuFeature, Distance, TAG_PRIMARY_BOXED, TAG_PRIMARY_LIST,
-    emit_boxed_val, get_arg_ref, get_car_ref, get_cdr_ref, get_y_ref, process, process_ref,
+    TAG_PRIMARY_MASK, emit_boxed_val, get_arg_ref, get_car_ref, get_cdr_ref, get_y_ref, process,
+    process_ref, tmp_mem_q,
 };
 use super::beam_asm::{Update, get_x_ref};
 use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
 use super::beam_asm_module::{BeamModuleAssembler, Patch, PatchCatch, arg_label, arg_word};
 pub use super::rt::{
-    add_stacktrace, build_stacktrace, erts_continue_exit_process, erts_do_exit_process,
-    erts_sanitize_freason, raw_raise,
+    add_stacktrace, build_stacktrace, erl_is_function, erts_cmp_atoms, erts_cmp_compound,
+    erts_continue_exit_process, erts_do_exit_process, erts_pd_hash_get, erts_pd_hash_get_with_hx,
+    erts_sanitize_freason, perf_counter_address, raw_raise,
 };
 use crate::common::args::ArgVal;
 use crate::common::args::{Relation, memory_relation};
 use crate::common::types::{BeamModuleAssemblerCommon, type_id};
+use arinsal_term::TermKind;
+use arinsal_term::raw::{Cons, Tuple, bitstring_extent, term_from_bits};
 
 const NIL: i64 = 0x3b;
 const TAG_IMMED1_MASK: i64 = 0x0f;
@@ -33,9 +37,11 @@ const TAG_IMMED1_PORT: i64 = 0x07;
 const TAG_IMMED2_MASK: i64 = 0x3f;
 const TAG_IMMED2_ATOM: i64 = 0x0b;
 const TAG_HEADER_MASK: i64 = 0x3f;
+const TAG_PTR_MASK: i64 = 0x7;
 const TAG_HEADER_POS_BIG: i64 = 0x08;
 const TAG_HEADER_REF: i64 = 0x10;
 const TAG_HEADER_FLOAT: i64 = 0x58;
+const TAG_HEADER_FLOAT_MASKED: i64 = TAG_HEADER_FLOAT & TAG_HEADER_MASK;
 const TAG_HEADER_EXTERNAL_PID: i64 = 0x30;
 const TAG_HEADER_EXTERNAL_PORT: i64 = 0x34;
 const TAG_HEADER_EXTERNAL_REF: i64 = 0x38;
@@ -47,9 +53,98 @@ const FUN_SUBTAG: i64 = 0x14;
 const AM_FALSE: i64 = 0x0b;
 const AM_TRUE: i64 = 0x4b;
 const HEADER_SUB_BITS: i64 = 0x124;
+const HEADER_ARITY_OFFS: i64 = 6;
+const FUN_HEADER_ARITY_OFFS: i64 = HEADER_ARITY_OFFS + 2;
+const TAG_HEADER_NEG_BIG: i64 = 0x0c;
+const TAG_HEADER_FLONUM: i64 = 0x58;
+const TAG_IMMED1_SIZE: i64 = 4;
+const MAP_HEADER_FLATMAP: i64 = 0x12c;
+const SUB_BITS_START_OFFSET: i32 = 16;
+const SUB_BITS_END_OFFSET: i32 = 24;
+const ERTS_MAX_UINT64_HEAP_SIZE: u64 = 2;
+const POS_BIGNUM_HEADER_ONE_DIGIT: i64 = (1 << HEADER_ARITY_OFFS) | TAG_HEADER_POS_BIG;
+
+fn is_int32(value: i64) -> bool {
+    value as i32 as i64 == value
+}
+
+fn literal_is_list_of_immediates(term: arinsal_term::Term) -> Option<(usize, arinsal_term::Term)> {
+    let mut current = term;
+    let mut len = 0;
+    let mut first = None;
+    loop {
+        if current == arinsal_term::Term::NIL {
+            return Some((len, first.unwrap_or(arinsal_term::Term::NIL)));
+        }
+        let cell = Cons::try_from(current).ok()?;
+        let head = cell.head();
+        if !head.is_immed() {
+            return None;
+        }
+        first.get_or_insert(head);
+        len += 1;
+        current = cell.tail();
+    }
+}
+
+fn literal_is_shallow_boxed(term: arinsal_term::Term) -> bool {
+    if term.classify() == TermKind::Tuple {
+        return Tuple::try_from(term)
+            .is_ok_and(|tuple| tuple.elements().all(|value| value.is_immed()));
+    }
+    let Some(header) = term.header() else {
+        return false;
+    };
+    let subtag = (header as i64) & BIG_TAG_MASK;
+    matches!(subtag, TAG_HEADER_POS_BIG | TAG_HEADER_NEG_BIG) || header as i64 == TAG_HEADER_FLONUM
+}
+
+fn literal_is_empty_bitstring(term: arinsal_term::Term) -> bool {
+    bitstring_extent(term).is_some_and(|(_, bits)| bits == 0)
+}
+
+fn literal_is_empty_map(term: arinsal_term::Term) -> bool {
+    term.classify() == TermKind::Map
+        && term.is_flatmap()
+        && term
+            .flatmap_keys_tuple()
+            .and_then(|keys| Tuple::try_from(keys).ok())
+            .is_some_and(|tuple| tuple.arity() == 0)
+}
+
+fn emit_vmovsd(
+    m: &mut BeamAssembler,
+    dst: arinsal_x64::enc::Xmm,
+    src: arinsal_x64::enc::Mem,
+) -> Result<(), AsmError> {
+    if BeamAssembler::has_cpu_feature(CpuFeature::Avx) {
+        m.emit(|e| e.vmovsd_xm(dst, src))
+    } else {
+        m.emit(|e| e.movsd_xm(dst, src))
+    }
+}
+
+fn emit_vucomisd_xx(
+    m: &mut BeamAssembler,
+    lhs: arinsal_x64::enc::Xmm,
+    rhs: arinsal_x64::enc::Xmm,
+) -> Result<(), AsmError> {
+    if BeamAssembler::has_cpu_feature(CpuFeature::Avx) {
+        m.emit(|e| e.vucomisd_xx(lhs, rhs))
+    } else {
+        m.emit(|e| e.ucomisd_xx(lhs, rhs))
+    }
+}
 
 fn arg_ref(arg: ArgVal, size: u8) -> Result<Mem, AsmError> {
     get_arg_ref(arg, size).ok_or(AsmError::Operand("BEAM register operand"))
+}
+
+fn immediate_word(arg: ArgVal) -> Result<i64, AsmError> {
+    match arg {
+        ArgVal::Immediate(word) => Ok(word as i64),
+        _ => Err(AsmError::Operand("immediate operand")),
+    }
 }
 
 impl BeamModuleAssembler {
@@ -1123,6 +1218,286 @@ impl BeamModuleAssembler {
 }
 
 impl BeamGlobalAssembler {
+    /// Compares the literal cons chain element by element.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:1728-1767
+    // (emit_is_eq_exact_list_shared), OTP-29.1.1.
+    pub(crate) fn emit_is_eq_exact_list_shared(&mut self) -> Result<(), AsmError> {
+        let loop_label = self.asm.new_label();
+        let mid = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.short_jmp(mid)?;
+        self.asm.bind(loop_label)?;
+        self.asm.emit_ptr_val(ARG1, ARG1);
+        self.asm.emit_ptr_val(ARG2, ARG2);
+        self.asm.emit(|e| e.mov_rm(RET, get_car_ref(ARG1, 8)))?;
+        self.asm.emit(|e| e.mov_rm(ARG1, get_cdr_ref(ARG1, 8)))?;
+        self.asm.emit(|e| e.cmp_mr(get_car_ref(ARG2, 8), RET))?;
+        self.asm.short_jcc(CondCode::NE, done)?;
+        self.asm.emit(|e| e.mov_rm(ARG2, get_cdr_ref(ARG2, 8)))?;
+        self.asm.bind(mid)?;
+        self.asm.emit(|e| e.cmp_rr(ARG1, ARG2))?;
+        self.asm.short_jcc(CondCode::E, done)?;
+        self.asm.emit(|e| e.mov_rr(RETD, ARG1D))?;
+        self.asm.emit(|e| e.or_rr(RETD, ARG2D))?;
+        self.asm.emit_is_not_cons(loop_label, RET, Distance::Long)?;
+        self.asm.emit(|e| e.cmp_ri(RETB, 0))?;
+        self.asm.bind(done)?;
+        self.asm.emit(|e| e.ret())
+    }
+
+    /// Compares a literal tuple, bignum or float's heap words.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:1770-1818
+    // (emit_is_eq_exact_shallow_boxed_shared), OTP-29.1.1.
+    pub(crate) fn emit_is_eq_exact_shallow_boxed_shared(&mut self) -> Result<(), AsmError> {
+        let loop_label = self.asm.new_label();
+        let done = self.asm.new_label();
+        let not_equal = self.asm.new_label();
+        self.asm.emit(|e| e.mov_rr(RETD, ARG1D))?;
+        self.asm.emit(|e| e.or_rr(RETD, ARG2D))?;
+        self.asm.emit_is_boxed(not_equal, RET, Distance::Long)?;
+        self.asm.emit(|e| e.and_ri(ARG1, !TAG_PTR_MASK))?;
+        self.asm.emit(|e| e.and_ri(ARG2, !TAG_PTR_MASK))?;
+        self.asm.emit(|e| e.mov_rm(ARG3, qword_ptr(ARG1, 0)))?;
+        self.asm.emit(|e| e.shr_ri(ARG3, HEADER_ARITY_OFFS))?;
+        self.asm.emit(|e| e.dec_r(ARG3))?;
+        self.asm.mov_imm(ARG4, 0)?;
+        self.asm.bind(loop_label)?;
+        if BeamAssembler::has_cpu_feature(CpuFeature::Avx) {
+            self.asm
+                .emit(|e| e.vmovdqu_xm(Xmm(0), Mem::base_index(ARG1, ARG4, 0, 0, 16)))?;
+            self.asm
+                .emit(|e| e.vpxor_xxm(Xmm(0), Xmm(0), Mem::base_index(ARG2, ARG4, 0, 0, 16)))?;
+            self.asm.emit(|e| e.vptest_xx(Xmm(0), Xmm(0)))?;
+        } else {
+            let lhs0 = Mem::base_index(ARG1, ARG4, 0, 0, 8);
+            let rhs0 = Mem::base_index(ARG2, ARG4, 0, 0, 8);
+            let lhs1 = Mem::base_index(ARG1, ARG4, 0, 8, 8);
+            let rhs1 = Mem::base_index(ARG2, ARG4, 0, 8, 8);
+            self.asm.emit(|e| e.mov_rm(RET, lhs0))?;
+            self.asm.emit(|e| e.cmp_rm(RET, rhs0))?;
+            self.asm.short_jcc(CondCode::NE, done)?;
+            self.asm.emit(|e| e.mov_rm(RET, lhs1))?;
+            self.asm.emit(|e| e.cmp_rm(RET, rhs1))?;
+        }
+        self.asm.short_jcc(CondCode::NE, done)?;
+        self.asm.emit(|e| e.add_ri(ARG4, 16))?;
+        self.asm.emit(|e| e.sub_ri(ARG3, 2))?;
+        self.asm.jcc(CondCode::GE, loop_label)?;
+        self.asm.emit(|e| e.cmp_ri(ARG3.r8(), -2))?;
+        self.asm.short_jcc(CondCode::E, done)?;
+        let lhs = Mem::base_index(ARG1, ARG4, 0, 0, 8);
+        let rhs = Mem::base_index(ARG2, ARG4, 0, 0, 8);
+        self.asm.emit(|e| e.mov_rm(RET, lhs))?;
+        self.asm.emit(|e| e.cmp_rm(RET, rhs))?;
+        self.asm.bind(done)?;
+        self.asm.emit(|e| e.ret())?;
+        self.asm.bind(not_equal)?;
+        self.asm.emit(|e| e.cmp_ri(RETB, 0))?;
+        self.asm.emit(|e| e.ret())
+    }
+}
+
+impl BeamGlobalAssembler {
+    /// Compares numeric terms for arithmetic equality, returning flags for the caller.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:2138-2179
+    // (emit_arith_eq_shared), OTP-29.1.1.
+    pub(crate) fn emit_arith_eq_shared(&mut self) -> Result<(), AsmError> {
+        let generic = self.asm.new_label();
+        self.asm.emit(|e| e.mov_rr(ARG3D, ARG1D))?;
+        self.asm.emit(|e| e.or_rr(ARG3D, ARG2D))?;
+        self.asm.emit(|e| e.and_ri(ARG3D, 1))?;
+        self.asm.short_jcc(CondCode::NE, generic)?;
+        let boxed = self.asm.emit_ptr_val(ARG3, ARG1);
+        self.asm
+            .emit(|e| e.mov_rm(ARG3, emit_boxed_val(boxed, 0, 8)))?;
+        let boxed = self.asm.emit_ptr_val(ARG5, ARG2);
+        self.asm
+            .emit(|e| e.mov_rm(ARG5, emit_boxed_val(boxed, 0, 8)))?;
+        self.asm.emit(|e| e.and_ri(ARG3D, TAG_HEADER_MASK))?;
+        self.asm.emit(|e| e.and_ri(ARG5D, TAG_HEADER_MASK))?;
+        self.asm
+            .emit(|e| e.sub_ri(ARG3D, TAG_HEADER_FLOAT_MASKED))?;
+        self.asm
+            .emit(|e| e.sub_ri(ARG5D, TAG_HEADER_FLOAT_MASKED))?;
+        self.asm.emit(|e| e.or_rr(ARG3D, ARG5D))?;
+        self.asm.short_jcc(CondCode::NE, generic)?;
+
+        let boxed = self.asm.emit_ptr_val(ARG1, ARG1);
+        emit_vmovsd(&mut self.asm, Xmm(0), emit_boxed_val(boxed, 8, 8))?;
+        let boxed = self.asm.emit_ptr_val(ARG2, ARG2);
+        emit_vmovsd(&mut self.asm, Xmm(1), emit_boxed_val(boxed, 8, 8))?;
+        emit_vucomisd_xx(&mut self.asm, Xmm(0), Xmm(1))?;
+        self.asm.emit(|e| e.ret())?;
+
+        self.asm.bind(generic)?;
+        self.asm.emit_enter_runtime(Update::NONE)?;
+        self.asm.mov_imm(ARG3, 0)?;
+        self.asm.mov_imm(ARG4, 1)?;
+        self.asm
+            .runtime_call(erts_cmp_compound as *const () as usize)?;
+        self.asm.emit_leave_runtime(Update::NONE)?;
+        self.asm.emit(|e| e.test_rr(RET, RET))?;
+        self.asm.emit(|e| e.ret())
+    }
+
+    /// Compares terms in Erlang term order, returning flags for the caller.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:2222-2319
+    // (emit_arith_compare_shared), OTP-29.1.1.
+    pub(crate) fn emit_arith_compare_shared(&mut self) -> Result<(), AsmError> {
+        let atom_compare = self.asm.new_label();
+        let generic_compare = self.asm.new_label();
+        self.asm.emit_enter_frame()?;
+
+        self.asm.emit(|e| e.mov_rr(ARG3D, ARG1D))?;
+        self.asm.emit(|e| e.or_rr(ARG3D, ARG2D))?;
+        self.asm.emit(|e| e.and_ri(ARG3D, 1))?;
+        self.asm.short_jcc(CondCode::NE, atom_compare)?;
+        let boxed = self.asm.emit_ptr_val(ARG3, ARG1);
+        self.asm
+            .emit(|e| e.mov_rm(ARG3, emit_boxed_val(boxed, 0, 8)))?;
+        let boxed = self.asm.emit_ptr_val(ARG5, ARG2);
+        self.asm
+            .emit(|e| e.mov_rm(ARG5, emit_boxed_val(boxed, 0, 8)))?;
+        self.asm.emit(|e| e.and_ri(ARG3D, TAG_HEADER_MASK))?;
+        self.asm.emit(|e| e.and_ri(ARG5D, TAG_HEADER_MASK))?;
+        self.asm
+            .emit(|e| e.sub_ri(ARG3D, TAG_HEADER_FLOAT_MASKED))?;
+        self.asm
+            .emit(|e| e.sub_ri(ARG5D, TAG_HEADER_FLOAT_MASKED))?;
+        self.asm.emit(|e| e.or_rr(ARG3D, ARG5D))?;
+        self.asm.jcc(CondCode::NE, generic_compare)?;
+        let boxed = self.asm.emit_ptr_val(ARG1, ARG1);
+        emit_vmovsd(&mut self.asm, Xmm(0), emit_boxed_val(boxed, 8, 8))?;
+        let boxed = self.asm.emit_ptr_val(ARG2, ARG2);
+        emit_vmovsd(&mut self.asm, Xmm(1), emit_boxed_val(boxed, 8, 8))?;
+        emit_vucomisd_xx(&mut self.asm, Xmm(0), Xmm(1))?;
+        self.asm.emit(|e| e.setcc_r(CondCode::A, enc::AL))?;
+        self.asm.emit(|e| e.setcc_r(CondCode::B, enc::AH))?;
+        self.asm.emit(|e| e.sub_rr(enc::AL, enc::AH))?;
+        self.asm.emit_leave_frame()?;
+        self.asm.emit(|e| e.ret())?;
+
+        self.asm.bind(atom_compare)?;
+        self.asm.emit(|e| e.mov_rr(ARG3D, ARG1D))?;
+        self.asm.emit(|e| e.mov_rr(ARG5D, ARG2D))?;
+        self.asm.emit(|e| e.and_ri(ARG3D, TAG_IMMED2_MASK))?;
+        self.asm.emit(|e| e.and_ri(ARG5D, TAG_IMMED2_MASK))?;
+        self.asm.emit(|e| e.sub_ri(ARG3D, TAG_IMMED2_ATOM))?;
+        self.asm.emit(|e| e.sub_ri(ARG5D, TAG_IMMED2_ATOM))?;
+        self.asm.emit(|e| e.or_rr(ARG3D, ARG5D))?;
+        self.asm.jcc(CondCode::NE, generic_compare)?;
+        self.asm.emit_enter_runtime(Update::NONE)?;
+        self.asm
+            .runtime_call(erts_cmp_atoms as *const () as usize)?;
+        self.asm.emit_leave_runtime(Update::NONE)?;
+        self.asm.emit(|e| e.test_rr(RETD, RETD))?;
+        self.asm.emit_leave_frame()?;
+        self.asm.emit(|e| e.ret())?;
+
+        self.asm.bind(generic_compare)?;
+        self.asm.emit_enter_runtime(Update::NONE)?;
+        self.asm.mov_imm(ARG3, 0)?;
+        self.asm.mov_imm(ARG4, 0)?;
+        self.asm
+            .runtime_call(erts_cmp_compound as *const () as usize)?;
+        self.asm.emit_leave_runtime(Update::NONE)?;
+        self.asm.emit(|e| e.test_rr(RET, RET))?;
+        self.asm.emit_leave_frame()?;
+        self.asm.emit(|e| e.ret())
+    }
+
+    /// Compares a source against an inclusive integer range using float and generic fallbacks.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:2577-2652
+    // (emit_is_in_range_shared), OTP-29.1.1.
+    pub(crate) fn emit_is_in_range_shared(&mut self) -> Result<(), AsmError> {
+        let immediate = self.asm.new_label();
+        let generic_compare = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.emit_is_boxed(immediate, ARG1, Distance::Long)?;
+        let boxed = self.asm.emit_ptr_val(ARG4, ARG1);
+        self.asm
+            .emit(|e| e.cmp_mi(emit_boxed_val(boxed, 0, 8), TAG_HEADER_FLONUM))?;
+        self.asm.short_jcc(CondCode::NE, generic_compare)?;
+        emit_vmovsd(&mut self.asm, Xmm(0), emit_boxed_val(boxed, 8, 8))?;
+        self.asm.emit(|e| e.sar_ri(ARG2, TAG_IMMED1_SIZE))?;
+        self.asm.emit(|e| e.sar_ri(ARG3, TAG_IMMED1_SIZE))?;
+        if BeamAssembler::has_cpu_feature(CpuFeature::Avx) {
+            self.asm.emit(|e| e.vcvtsi2sd_xxr(Xmm(1), Xmm(1), ARG2))?;
+            self.asm.emit(|e| e.vcvtsi2sd_xxr(Xmm(2), Xmm(2), ARG3))?;
+        } else {
+            self.asm.emit(|e| e.cvtsi2sd_xr(Xmm(1), ARG2))?;
+            self.asm.emit(|e| e.cvtsi2sd_xr(Xmm(2), ARG3))?;
+        }
+        self.asm.mov_imm(RET, u64::MAX)?;
+        self.asm.mov_imm(enc::RCX, 0)?;
+        emit_vucomisd_xx(&mut self.asm, Xmm(0), Xmm(2))?;
+        self.asm.emit(|e| e.setcc_r(CondCode::A, enc::CL))?;
+        emit_vucomisd_xx(&mut self.asm, Xmm(1), Xmm(0))?;
+        self.asm
+            .emit(|e| e.cmovcc_rr(CondCode::BE, RET, enc::RCX))?;
+        self.asm.emit(|e| e.cmp_ri(RET, 0))?;
+        self.asm.emit(|e| e.ret())?;
+
+        self.asm.bind(immediate)?;
+        self.asm.mov_imm(RET, 1)?;
+        self.asm.emit(|e| e.cmp_ri(RET, 0))?;
+        self.asm.emit(|e| e.ret())?;
+
+        self.asm.bind(generic_compare)?;
+        self.asm.emit_enter_runtime(Update::NONE)?;
+        self.asm.emit(|e| e.mov_mr(tmp_mem_q(0), ARG1))?;
+        self.asm.emit(|e| e.mov_mr(tmp_mem_q(1), ARG3))?;
+        self.asm.mov_imm(ARG3, 0)?;
+        self.asm.mov_imm(ARG4, 0)?;
+        self.asm
+            .runtime_call(erts_cmp_compound as *const () as usize)?;
+        self.asm.emit(|e| e.test_rr(RET, RET))?;
+        self.asm.jcc(CondCode::S, done)?;
+        self.asm.emit(|e| e.mov_rm(ARG1, tmp_mem_q(0)))?;
+        self.asm.emit(|e| e.mov_rm(ARG2, tmp_mem_q(1)))?;
+        self.asm.mov_imm(ARG3, 0)?;
+        self.asm.mov_imm(ARG4, 0)?;
+        self.asm
+            .runtime_call(erts_cmp_compound as *const () as usize)?;
+        self.asm.emit(|e| e.test_rr(RET, RET))?;
+        self.asm.bind(done)?;
+        self.asm.emit_leave_runtime(Update::NONE)?;
+        self.asm.emit(|e| e.ret())
+    }
+
+    /// Checks `Src >= A && Src < B` after generic term comparisons.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:2776-2822
+    // (emit_is_ge_lt_shared), OTP-29.1.1.
+    pub(crate) fn emit_is_ge_lt_shared(&mut self) -> Result<(), AsmError> {
+        let done = self.asm.new_label();
+        self.asm.emit_enter_runtime(Update::NONE)?;
+        self.asm.emit(|e| e.mov_mr(tmp_mem_q(0), ARG1))?;
+        self.asm.emit(|e| e.mov_mr(tmp_mem_q(1), ARG3))?;
+        self.asm.mov_imm(ARG3, 0)?;
+        self.asm.mov_imm(ARG4, 0)?;
+        self.asm
+            .runtime_call(erts_cmp_compound as *const () as usize)?;
+        self.asm.emit(|e| e.test_rr(RET, RET))?;
+        self.asm.short_jcc(CondCode::S, done)?;
+        self.asm.emit(|e| e.mov_rm(ARG1, tmp_mem_q(1)))?;
+        self.asm.emit(|e| e.mov_rm(ARG2, tmp_mem_q(0)))?;
+        self.asm.mov_imm(ARG3, 0)?;
+        self.asm.mov_imm(ARG4, 0)?;
+        self.asm
+            .runtime_call(erts_cmp_compound as *const () as usize)?;
+        self.asm.mov_imm(ARG1, u64::MAX)?;
+        self.asm.mov_imm(ARG4, 1)?;
+        self.asm.emit(|e| e.test_rr(RET, RET))?;
+        self.asm.emit(|e| e.cmovcc_rr(CondCode::S, RET, ARG1))?;
+        self.asm.emit(|e| e.cmovcc_rr(CondCode::G, RET, ARG4))?;
+        self.asm.emit(|e| e.add_ri(RET, 1))?;
+        self.asm.bind(done)?;
+        self.asm.emit_leave_runtime(Update::NONE)?;
+        self.asm.emit(|e| e.ret())
+    }
+}
+
+impl BeamGlobalAssembler {
     /// Attaches a stacktrace to an error reason: `ARG3` is the reason, `ARG2` the trace.
     // Port of erts/emulator/beam/jit/x86/instr_common.cpp:3138-3152 (emit_raise_shared),
     // OTP-29.1.1.
@@ -1319,7 +1694,7 @@ mod tests {
     use similar_asserts::assert_eq;
 
     /// Real boot modules whose dumps the x86 emitter tests compare against.
-    const MODULES: [&str; 16] = [
+    const MODULES: [&str; 17] = [
         "lists",
         "maps",
         "gen_server",
@@ -1336,6 +1711,7 @@ mod tests {
         "file",
         "erlang",
         "erts_beamasm",
+        "os",
     ];
 
     /// The `i_move_sd` operands of an erts block emitted with a fresh register cache: one
@@ -1427,6 +1803,30 @@ mod tests {
                 } else {
                     lines.push(".byte 0x40, 0xe8, 0, 0, 0, 0".to_owned());
                 }
+                continue;
+            }
+            if op == "call"
+                && (matches!(
+                    target,
+                    "rax"
+                        | "rcx"
+                        | "rdx"
+                        | "rbx"
+                        | "rsp"
+                        | "rbp"
+                        | "rsi"
+                        | "rdi"
+                        | "r8"
+                        | "r9"
+                        | "r10"
+                        | "r11"
+                        | "r12"
+                        | "r13"
+                        | "r14"
+                        | "r15"
+                ) || target.starts_with("qword ptr "))
+            {
+                lines.push(line);
                 continue;
             }
             if op == "call" && !labels.contains(target) {
@@ -1551,6 +1951,44 @@ mod tests {
         block.iter().find_map(|line| {
             let (dst, src) = line.strip_prefix("mov ")?.split_once(", ")?;
             (dst == register).then(|| arg_slot(src)).flatten()
+        })
+    }
+
+    fn tracked_source_for_register(block: &[String], register: &str) -> Option<ArgVal> {
+        let mut values = std::collections::HashMap::<String, ArgVal>::new();
+        for line in block {
+            let Some((dst, src)) = line.strip_prefix("mov ").and_then(|s| s.split_once(", "))
+            else {
+                continue;
+            };
+            let value = arg_slot(src)
+                .or_else(|| {
+                    src.parse::<i64>()
+                        .ok()
+                        .map(|word| ArgVal::Immediate(word as u64))
+                })
+                .or_else(|| values.get(src).copied());
+            if let Some(value) = value {
+                values.insert(dst.to_owned(), value);
+                if dst == register {
+                    return Some(value);
+                }
+            }
+        }
+        None
+    }
+
+    fn immediate_move(block: &[String], register: &str) -> Option<u64> {
+        block.iter().find_map(|line| {
+            let (dst, value) = line.strip_prefix("mov ")?.split_once(", ")?;
+            (dst == register).then(|| value.parse().ok()).flatten()
+        })
+    }
+
+    fn cmp_memory_immediate(block: &[String]) -> Option<(ArgVal, u64)> {
+        block.iter().find_map(|line| {
+            let (memory, value) = line.strip_prefix("cmp ")?.split_once(", ")?;
+            Some((arg_slot(memory)?, value.parse().ok()?))
         })
     }
 
@@ -1685,10 +2123,37 @@ mod tests {
             .iter()
             .map(|m| erts_dump(m))
             .collect::<Option<Vec<_>>>()?;
-        Some(dumps.iter().flat_map(|d| full_op_blocks(d, op)).collect())
+        let mut blocks: Vec<Vec<String>> =
+            dumps.iter().flat_map(|d| full_op_blocks(d, op)).collect();
+        if let Some(dump) = crate::x86::jdump::generated_misc_emitters_dump() {
+            blocks.extend(full_op_blocks(&dump, op));
+        }
+        Some(blocks)
     }
 
     fn full_op_blocks(dump: &str, op: &str) -> Vec<Vec<String>> {
+        let is_requested_op = |name: &str| {
+            let prefix_match = name == op || name.starts_with(&format!("{op}_"));
+            prefix_match
+                && !matches!(
+                    (op, name),
+                    ("is_eq", name) if name.starts_with("is_eq_exact_")
+                )
+                && !matches!(
+                    (op, name),
+                    ("is_ne", name) if name.starts_with("is_ne_exact_")
+                )
+                && !matches!(
+                    (op, name),
+                    ("is_ge", name) if name.starts_with("is_ge_ge_") || name.starts_with("is_ge_lt_")
+                )
+                && !matches!(
+                    (op, name),
+                    ("i_get", name) if name.starts_with("i_get_hash_")
+                        || name.starts_with("i_get_map_")
+                        || name.starts_with("i_get_tuple_")
+                )
+        };
         let is_header = |line: &str| {
             line.strip_prefix("# ").is_some_and(|name| {
                 !name.is_empty()
@@ -1703,7 +2168,7 @@ mod tests {
             if is_header(line) {
                 blocks.extend(current.take());
                 let name = line.strip_prefix("# ").unwrap();
-                if name == op || name.starts_with(&format!("{op}_")) {
+                if is_requested_op(name) {
                     current = Some(Vec::new());
                 }
             } else if let Some(block) = current.as_mut()
@@ -1969,9 +2434,34 @@ mod tests {
         block: &[String],
         emit: impl FnOnce(&mut BeamModuleAssembler, &[u32]) -> Result<(), AsmError>,
     ) -> bool {
+        let Some((expected, label_count)) = expected_block_bytes(block) else {
+            return false;
+        };
+        emitted_with_labels(label_count, emit).is_some_and(|ours| ours == expected)
+    }
+
+    fn expected_block_bytes(block: &[String]) -> Option<(Vec<u8>, usize)> {
         const FILLER: usize = 48;
         let labels = external_labels(block);
-        let mut expected_lines = block.to_vec();
+        let defined: std::collections::HashSet<&str> = block
+            .iter()
+            .filter_map(|line| line.strip_suffix(':'))
+            .collect();
+        let mut expected_lines: Vec<String> = block
+            .iter()
+            .map(|line| crate::x86::jdump::erts_to_arinsal(line))
+            .collect();
+        for line in &mut expected_lines {
+            if let Some(target) = line.strip_prefix("call ") {
+                if target.parse::<u64>().is_ok() {
+                    *line = ".byte 0x40, 0xe8, 0, 0, 0, 0".to_owned();
+                } else if (target.starts_with('L') || target.starts_with("label_"))
+                    && !defined.contains(target)
+                {
+                    *line = ".byte 0xe8, 0, 0, 0, 0".to_owned();
+                }
+            }
+        }
         for (index, label) in labels.iter().enumerate() {
             let replacement = format!("fail{index}");
             for line in &mut expected_lines {
@@ -1989,29 +2479,26 @@ mod tests {
             expected_lines.extend(std::iter::repeat_n("mov r10, r10".to_owned(), FILLER));
             expected_lines.push(format!("fail{index}:"));
         }
-        let Some(expected) = gnu_as(&expected_lines) else {
-            return false;
-        };
+        Some((gnu_as(&expected_lines)?, labels.len()))
+    }
 
-        let mut m = BeamModuleAssembler::new(4);
-        let fail_labels: Vec<u32> = (1..=labels.len() as u32).collect();
-        if emit(&mut m, &fail_labels).is_err() {
-            return false;
-        }
-        for index in 0..labels.len() {
+    fn emitted_with_labels(
+        label_count: usize,
+        emit: impl FnOnce(&mut BeamModuleAssembler, &[u32]) -> Result<(), AsmError>,
+    ) -> Option<Vec<u8>> {
+        const FILLER: usize = 48;
+        let addresses = vec![Some(0x1000); super::super::beam_asm_global::GLOBAL_LABELS.len()];
+        let mut m = BeamModuleAssembler::with_fragment_addresses(4, addresses);
+        let fail_labels: Vec<u32> = (1..=label_count as u32).collect();
+        emit(&mut m, &fail_labels).ok()?;
+        for index in 0..label_count {
             for _ in 0..FILLER {
-                if m.asm.emit(|e| e.mov_rr(TMP1, TMP1)).is_err() {
-                    return false;
-                }
+                m.asm.emit(|e| e.mov_rr(TMP1, TMP1)).ok()?;
             }
-            let Some(label) = m.resolve_beam_label(index as u32 + 1) else {
-                return false;
-            };
-            if m.asm.bind(label).is_err() {
-                return false;
-            }
+            let label = m.resolve_beam_label(index as u32 + 1)?;
+            m.asm.bind(label).ok()?;
         }
-        m.asm.a.bytes(Section::Code) == expected
+        Some(m.asm.a.bytes(Section::Code).to_vec())
     }
 
     fn assert_source_op_matches(
@@ -2079,6 +2566,99 @@ mod tests {
         type_id::PID | type_id::ALWAYS_BOXED,
         type_id::PORT | type_id::ALWAYS_BOXED,
     ];
+
+    fn test_types() -> Vec<ArgType> {
+        let mut types = TYPE_VARIANTS
+            .into_iter()
+            .map(|union_bits| ArgType {
+                union_bits,
+                ..ArgType::ANY
+            })
+            .collect::<Vec<_>>();
+        types.push(ArgType {
+            union_bits: type_id::INTEGER,
+            min: Some(-100),
+            max: Some(100),
+            unit: 1,
+        });
+        types
+    }
+
+    fn typed_pair_dump_matches(
+        op: &str,
+        emit: impl Fn(&mut BeamModuleAssembler, u32, ArgVal, ArgVal) -> Result<(), AsmError>,
+    ) -> bool {
+        let Some(blocks) = dump_blocks(op) else {
+            return false;
+        };
+        for block in blocks.iter().filter(|block| !block.is_empty()).take(40) {
+            let (Some(lhs), Some(rhs)) = (
+                tracked_source_for_register(block, "rdi"),
+                tracked_source_for_register(block, "rsi"),
+            ) else {
+                continue;
+            };
+            let labels = external_labels(block);
+            if labels.len() != 1 {
+                continue;
+            }
+            let Some((expected, label_count)) = expected_block_bytes(block) else {
+                continue;
+            };
+            let types = test_types();
+            for lhs_type in &types {
+                for rhs_type in &types {
+                    let (lhs_type, rhs_type) = (*lhs_type, *rhs_type);
+                    let ours = emitted_with_labels(label_count, |m, fail| {
+                        let [fail] = fail else {
+                            return Err(AsmError::Operand("expected one comparison failure label"));
+                        };
+                        let lhs = m.typed_arg(lhs, lhs_type);
+                        let rhs = m.typed_arg(rhs, rhs_type);
+                        emit(m, *fail, lhs, rhs)
+                    });
+                    if ours.as_deref() == Some(expected.as_slice()) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn typed_literal_dump_matches(
+        op: &str,
+        emit: impl Fn(&mut BeamModuleAssembler, u32, ArgVal, ArgVal) -> Result<(), AsmError>,
+    ) -> bool {
+        let Some(blocks) = dump_blocks(op) else {
+            return false;
+        };
+        for block in blocks.iter().filter(|block| !block.is_empty()).take(80) {
+            let Some((src, immediate)) = cmp_memory_immediate(block) else {
+                continue;
+            };
+            let labels = external_labels(block);
+            if labels.len() != 1 {
+                continue;
+            }
+            let Some((expected, label_count)) = expected_block_bytes(block) else {
+                continue;
+            };
+            for ty in test_types() {
+                let ours = emitted_with_labels(label_count, |m, fail| {
+                    let [fail] = fail else {
+                        return Err(AsmError::Operand("expected one comparison failure label"));
+                    };
+                    let src = m.typed_arg(src, ty);
+                    emit(m, *fail, src, ArgVal::Immediate(immediate))
+                });
+                if ours.as_deref() == Some(expected.as_slice()) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 
     fn assert_typed_source_op_matches(
         op: &str,
@@ -2379,6 +2959,413 @@ mod tests {
             })
         });
         assert!(matched, "no byte-identical erts dump block for put_tuple2");
+    }
+
+    #[test]
+    fn remaining_misc_emitters_match_erts_dumps() {
+        if erts_dump("lists").is_none() {
+            eprintln!("skipping: `erl +JDdump true` unavailable");
+            return;
+        }
+
+        assert!(typed_literal_dump_matches(
+            "is_eq_exact",
+            |m, fail, src, rhs| { m.emit_is_eq_exact(ArgVal::Label(fail), src, rhs) }
+        ));
+        assert!(typed_literal_dump_matches(
+            "is_ne_exact",
+            |m, fail, src, rhs| { m.emit_is_ne_exact(ArgVal::Label(fail), src, rhs) }
+        ));
+        assert!(typed_pair_dump_matches("is_eq", |m, fail, lhs, rhs| {
+            m.emit_is_eq(ArgVal::Label(fail), lhs, rhs)
+        }));
+        assert!(typed_pair_dump_matches("is_ne", |m, fail, lhs, rhs| {
+            m.emit_is_ne(ArgVal::Label(fail), lhs, rhs)
+        }));
+        assert!(typed_pair_dump_matches("is_lt", |m, fail, lhs, rhs| {
+            m.emit_is_lt(ArgVal::Label(fail), lhs, rhs)
+        }));
+        assert!(typed_pair_dump_matches("is_ge", |m, fail, lhs, rhs| {
+            m.emit_is_ge(ArgVal::Label(fail), lhs, rhs)
+        }));
+
+        let ge_lt_blocks = dump_blocks("is_ge_lt").unwrap();
+        let ge_lt_matched = ge_lt_blocks.iter().any(|block| {
+            let (Some(src), Some(min), Some(max)) = (
+                tracked_source_for_register(block, "rdi"),
+                immediate_move(block, "esi"),
+                immediate_move(block, "edx"),
+            ) else {
+                return false;
+            };
+            let labels = external_labels(block);
+            if labels.len() != 2 {
+                return false;
+            }
+            let Some((expected, label_count)) = expected_block_bytes(block) else {
+                return false;
+            };
+            test_types().into_iter().any(|ty| {
+                emitted_with_labels(label_count, |m, fail| {
+                    let [fail1, fail2] = fail else {
+                        return Err(AsmError::Operand("expected two range failure labels"));
+                    };
+                    let src = m.typed_arg(src, ty);
+                    m.emit_is_ge_lt(
+                        ArgVal::Label(*fail1),
+                        ArgVal::Label(*fail2),
+                        src,
+                        ArgVal::Immediate(min),
+                        ArgVal::Immediate(max),
+                    )
+                })
+                .is_some_and(|ours| ours == expected)
+            })
+        });
+        assert!(
+            ge_lt_matched,
+            "no byte-identical erts dump block for is_ge_lt"
+        );
+
+        let ge_ge_blocks = dump_blocks("is_ge_ge").unwrap();
+        let ge_ge_matched = ge_ge_blocks.iter().any(|block| {
+            let (Some(src), Some(min), Some(diff)) = (
+                tracked_source_for_register(block, "rax"),
+                block
+                    .iter()
+                    .find_map(|line| line.strip_prefix("sub rax, ")?.parse().ok()),
+                block
+                    .iter()
+                    .find_map(|line| line.strip_prefix("cmp rax, ")?.parse().ok()),
+            ) else {
+                return false;
+            };
+            let labels = external_labels(block);
+            if labels.len() != 2 {
+                return false;
+            }
+            let Some((expected, label_count)) = expected_block_bytes(block) else {
+                return false;
+            };
+            test_types().into_iter().any(|ty| {
+                emitted_with_labels(label_count, |m, fail| {
+                    let [fail1, fail2] = fail else {
+                        return Err(AsmError::Operand("expected two range failure labels"));
+                    };
+                    let src = m.typed_arg(src, ty);
+                    m.emit_is_ge_ge(
+                        ArgVal::Label(*fail1),
+                        ArgVal::Label(*fail2),
+                        src,
+                        ArgVal::Immediate(min),
+                        ArgVal::Immediate(min.wrapping_add(diff)),
+                    )
+                })
+                .is_some_and(|ours| ours == expected)
+            })
+        });
+        assert!(
+            ge_ge_matched,
+            "no byte-identical erts dump block for is_ge_ge"
+        );
+
+        let int_ge_blocks = dump_blocks("is_int_ge").unwrap();
+        let int_ge_matched = int_ge_blocks.iter().any(|block| {
+            let (Some(src), Some(min)) = (
+                tracked_source_for_register(block, "rcx"),
+                block
+                    .iter()
+                    .find_map(|line| line.strip_prefix("cmp rcx, ")?.parse().ok()),
+            ) else {
+                return false;
+            };
+            let labels = external_labels(block);
+            if labels.len() != 1 {
+                return false;
+            }
+            let Some((expected, label_count)) = expected_block_bytes(block) else {
+                return false;
+            };
+            test_types().into_iter().any(|ty| {
+                emitted_with_labels(label_count, |m, fail| {
+                    let [fail] = fail else {
+                        return Err(AsmError::Operand("expected one integer failure label"));
+                    };
+                    let src = m.typed_arg(src, ty);
+                    m.emit_is_int_ge(ArgVal::Label(*fail), src, ArgVal::Immediate(min))
+                })
+                .is_some_and(|ours| ours == expected)
+            })
+        });
+        assert!(
+            int_ge_matched,
+            "no byte-identical erts dump block for is_int_ge"
+        );
+
+        let int_range_blocks = dump_blocks("is_int_in_range").unwrap();
+        let int_range_matched = int_range_blocks.iter().any(|block| {
+            let (Some(src), Some(min), Some(diff)) = (
+                tracked_source_for_register(block, "rax"),
+                block
+                    .iter()
+                    .find_map(|line| line.strip_prefix("sub rax, ")?.parse().ok()),
+                block
+                    .iter()
+                    .find_map(|line| line.strip_prefix("cmp rax, ")?.parse().ok()),
+            ) else {
+                return false;
+            };
+            let labels = external_labels(block);
+            if labels.len() != 1 {
+                return false;
+            }
+            let Some((expected, label_count)) = expected_block_bytes(block) else {
+                return false;
+            };
+            test_types().into_iter().any(|ty| {
+                emitted_with_labels(label_count, |m, fail| {
+                    let [fail] = fail else {
+                        return Err(AsmError::Operand("expected one range failure label"));
+                    };
+                    let src = m.typed_arg(src, ty);
+                    m.emit_is_int_in_range(
+                        ArgVal::Label(*fail),
+                        src,
+                        ArgVal::Immediate(min),
+                        ArgVal::Immediate(min.wrapping_add(diff)),
+                    )
+                })
+                .is_some_and(|ours| ours == expected)
+            })
+        });
+        assert!(
+            int_range_matched,
+            "no byte-identical erts dump block for is_int_in_range"
+        );
+
+        let range_blocks = dump_blocks("is_in_range").unwrap();
+        let range_matched = range_blocks.iter().any(|block| {
+            let Some(src) = tracked_source_for_register(block, "rdi") else {
+                return false;
+            };
+            let bounds: Vec<u64> = block
+                .iter()
+                .filter_map(|line| line.strip_prefix("cmp rdi, ")?.parse().ok())
+                .collect();
+            let [min, max, ..] = bounds.as_slice() else {
+                return false;
+            };
+            let labels = external_labels(block);
+            if !(labels.len() == 1 || labels.len() == 2) {
+                return false;
+            }
+            let Some((expected, label_count)) = expected_block_bytes(block) else {
+                return false;
+            };
+            test_types().into_iter().any(|ty| {
+                emitted_with_labels(label_count, |m, fail| {
+                    let (small_fail, large_fail) = match fail {
+                        [only] => (*only, *only),
+                        [small, large] => (*small, *large),
+                        _ => return Err(AsmError::Operand("range failure labels")),
+                    };
+                    let src = m.typed_arg(src, ty);
+                    m.emit_is_in_range(
+                        ArgVal::Label(small_fail),
+                        ArgVal::Label(large_fail),
+                        src,
+                        ArgVal::Immediate(*min),
+                        ArgVal::Immediate(*max),
+                    )
+                })
+                .is_some_and(|ours| ours == expected)
+            })
+        });
+        assert!(
+            range_matched,
+            "no byte-identical erts dump block for is_in_range"
+        );
+
+        let function_blocks = dump_blocks("is_function2").unwrap();
+        let function_matched = function_blocks.iter().any(|block| {
+            let (Some(src), Some(header)) = (
+                tracked_source_for_register(block, "rdi"),
+                block.iter().find_map(|line| {
+                    line.strip_prefix("cmp word ptr [rdi-2], ")?
+                        .parse::<u64>()
+                        .ok()
+                }),
+            ) else {
+                return false;
+            };
+            let arity = (header.saturating_sub(FUN_SUBTAG as u64)) >> FUN_HEADER_ARITY_OFFS;
+            let Some(small) = Term::small(arity as i64) else {
+                return false;
+            };
+            assert_block_matches(block, |m| {
+                m.emit_is_function2(ArgVal::Label(1), src, ArgVal::Immediate(small.word()))
+            })
+        });
+        assert!(
+            function_matched,
+            "no byte-identical erts dump block for is_function2"
+        );
+
+        let append_blocks = dump_blocks("append_cons").unwrap();
+        let append_matched = append_blocks.iter().any(|block| {
+            let Some(head) = tracked_source_for_register(block, "rdi") else {
+                return false;
+            };
+            let Some(index) = block.iter().find_map(|line| {
+                let lhs = line.strip_prefix("mov qword ptr ")?.split_once(", ")?.0;
+                let (base, offset) = parse_mem(lhs)?;
+                (base == "r15" && offset >= 0 && offset % 16 == 0).then_some((offset / 16) as u64)
+            }) else {
+                return false;
+            };
+            assert_block_matches(block, |m| m.emit_append_cons(ArgVal::Word(index), head))
+        });
+        assert!(
+            append_matched,
+            "no byte-identical erts dump block for append_cons"
+        );
+
+        let store_blocks = dump_blocks("store_cons").unwrap();
+        let store_matched = store_blocks.iter().any(|block| {
+            let len = block
+                .iter()
+                .find_map(|line| line.strip_prefix("add r15, ")?.parse::<u64>().ok())
+                .map(|bytes| bytes / 16);
+            let dst = stored_slots(block).first().copied();
+            let (Some(len), Some(dst)) = (len, dst) else {
+                return false;
+            };
+            assert_block_matches(block, |m| m.emit_store_cons(ArgVal::Word(len), dst))
+        });
+        assert!(
+            store_matched,
+            "no byte-identical erts dump block for store_cons"
+        );
+
+        let get_blocks = dump_blocks("i_get").unwrap();
+        let get_matched = get_blocks.iter().any(|block| {
+            let (Some(src), Some(dst)) = (
+                tracked_source_for_register(block, "rsi"),
+                stored_slots(block).first().copied(),
+            ) else {
+                return false;
+            };
+            assert_block_matches(block, |m| m.emit_i_get(src, dst))
+        });
+        assert!(get_matched, "no byte-identical erts dump block for i_get");
+
+        let get_hash_blocks = dump_blocks("i_get_hash").unwrap();
+        let get_hash_matched = get_hash_blocks.iter().any(|block| {
+            let (Some(hash), Some(src), Some(dst)) = (
+                immediate_move(block, "esi"),
+                immediate_move(block, "edx"),
+                stored_slots(block).first().copied(),
+            ) else {
+                return false;
+            };
+            assert_block_matches(block, |m| {
+                m.emit_i_get_hash(ArgVal::Immediate(src), ArgVal::Word(hash), dst)
+            })
+        });
+        assert!(
+            get_hash_matched,
+            "no byte-identical erts dump block for i_get_hash"
+        );
+
+        let node_blocks = dump_blocks("node").unwrap();
+        let node_matched = node_blocks.iter().any(|block| {
+            let Some(dst) = stored_slots(block).first().copied() else {
+                return false;
+            };
+            let mut rewritten = block.clone();
+            for line in &mut rewritten {
+                if line.starts_with("mov r10, ") && line[9..].parse::<u64>().is_ok() {
+                    *line = format!("mov r10, {}", arinsal_term::erts_this_node_addr());
+                    break;
+                }
+            }
+            assert_block_matches(&rewritten, |m| m.emit_node(dst))
+        });
+        assert!(node_matched, "no byte-identical erts dump block for node");
+
+        let Some(generated) = crate::x86::jdump::generated_misc_emitters_dump() else {
+            eprintln!("skipping generated old-op checks: `erl` or `timeout` unavailable");
+            return;
+        };
+        let set_tuple_blocks = full_op_blocks(&generated, "set_tuple_element");
+        assert!(set_tuple_blocks.iter().any(|block| {
+            assert_block_matches(block, |m| {
+                m.emit_set_tuple_element(ArgVal::X(0), ArgVal::X(1), ArgVal::Word(16))
+            })
+        }));
+        let debug_line_blocks = full_op_blocks(&generated, "i_debug_line");
+        let debug_line_matched = debug_line_blocks.iter().any(|block| {
+            if !block.iter().any(|line| line == "align 8") {
+                return false;
+            }
+            let Some(line) = block
+                .first()
+                .and_then(|line| line.strip_prefix("mov r10, "))
+            else {
+                return false;
+            };
+            let Ok(index) = line.parse::<u32>() else {
+                return false;
+            };
+            const NOPS: [&[u8]; 8] = [
+                &[],
+                &[0x90],
+                &[0x66, 0x90],
+                &[0x0f, 0x1f, 0x00],
+                &[0x0f, 0x1f, 0x40, 0x00],
+                &[0x0f, 0x1f, 0x44, 0x00, 0x00],
+                &[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00],
+                &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00],
+            ];
+            (0..8).any(|start| {
+                let mut expected = vec![0x41, 0xba];
+                expected.extend_from_slice(&index.to_le_bytes());
+                let padding = (8 - (start + expected.len()) % 8) % 8;
+                expected.extend_from_slice(NOPS[padding]);
+                let ours = emitted_with_fragments_at(start, |m| {
+                    m.emit_i_debug_line(ArgVal::Word(0), ArgVal::Word(1), ArgVal::Word(2))
+                });
+                ours == expected
+            })
+        });
+        assert!(
+            debug_line_matched,
+            "no byte-identical erts dump block for i_debug_line"
+        );
+
+        let perf_blocks = dump_blocks("i_perf_counter").unwrap();
+        let perf_matched = perf_blocks.iter().any(|block| {
+            let mut rewritten = block.clone();
+            for line in &mut rewritten {
+                if line.starts_with("mov rax, ") && line[9..].parse::<u64>().is_ok() {
+                    *line = format!("mov rax, {}", super::perf_counter_address());
+                    break;
+                }
+            }
+            let Some(expected) = expected_erts_block(&rewritten, 0, true) else {
+                return false;
+            };
+            emitted_with_fragments_at(0, |m| m.emit_i_perf_counter()).as_slice()
+                == expected.as_slice()
+        });
+        assert!(
+            perf_matched,
+            "no byte-identical erts dump block for i_perf_counter"
+        );
+
+        let validation_blocks = dump_blocks("i_validate").unwrap();
+        assert!(validation_blocks.iter().all(Vec::is_empty));
+        assert!(emitted(|m| m.emit_i_validate(ArgVal::Word(0))).is_empty());
     }
 
     #[test]
@@ -3107,5 +4094,990 @@ impl BeamModuleAssembler {
         self.asm.emit_leave_runtime(spec)?;
         let schedule = self.resolve_fragment(do_schedule);
         self.asm.jmp(schedule)
+    }
+}
+
+impl BeamModuleAssembler {
+    /// `i_validate Arity` has no instructions in a non-DEBUG erts build.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:215-216 (emit_i_validate), OTP-29.1.1.
+    pub fn emit_i_validate(&mut self, arity: ArgVal) -> Result<(), AsmError> {
+        let _ = arg_word(arity)?;
+        Ok(())
+    }
+
+    /// Looks up a process dictionary key through the hash table.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:419-431 (emit_i_get), OTP-29.1.1.
+    pub fn emit_i_get(&mut self, src: ArgVal, dst: ArgVal) -> Result<(), AsmError> {
+        self.mov_arg_to_reg(ARG2, src)?;
+        self.asm.emit_enter_runtime(Update::NONE)?;
+        self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
+        self.asm
+            .runtime_call(erts_pd_hash_get as *const () as usize)?;
+        self.asm.emit_leave_runtime(Update::NONE)?;
+        self.mov_arg_from_reg(dst, RET)
+    }
+
+    /// Looks up a process dictionary key using the compiler supplied hash.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:433-448 (emit_i_get_hash), OTP-29.1.1.
+    pub fn emit_i_get_hash(
+        &mut self,
+        src: ArgVal,
+        hash: ArgVal,
+        dst: ArgVal,
+    ) -> Result<(), AsmError> {
+        self.mov_arg_to_reg(ARG2, hash)?;
+        self.mov_arg_to_reg(ARG3, src)?;
+        self.asm.emit_enter_runtime(Update::NONE)?;
+        self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
+        self.asm
+            .runtime_call(erts_pd_hash_get_with_hx as *const () as usize)?;
+        self.asm.emit_leave_runtime(Update::NONE)?;
+        self.mov_arg_from_reg(dst, RET)
+    }
+
+    /// Loads `erts_this_node->sysname`.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:750-762 (emit_node), OTP-29.1.1.
+    pub fn emit_node(&mut self, dst: ArgVal) -> Result<(), AsmError> {
+        let reg = self.alloc_temp_reg();
+        let sysname = arinsal_term::ERL_NODE_SYSNAME_OFFSET as i32;
+        self.preserve_cache(&[reg], &[], |m| {
+            m.asm
+                .mov_imm(reg, arinsal_term::erts_this_node_addr() as u64)?;
+            m.asm.emit(|e| e.mov_rm(reg, qword_ptr(reg, 0)))?;
+            m.asm.emit(|e| e.mov_rm(reg, qword_ptr(reg, sysname)))
+        })?;
+        self.mov_arg_from_reg(dst, reg)
+    }
+
+    /// Appends one cons cell at the requested heap index and returns its tagged pointer in ARG2.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:803-813 (emit_append_cons), OTP-29.1.1.
+    pub fn emit_append_cons(&mut self, index: ArgVal, head: ArgVal) -> Result<(), AsmError> {
+        let offset = arg_word(index)?
+            .checked_mul(16)
+            .and_then(|n| i32::try_from(n).ok())
+            .ok_or(AsmError::Operand("cons heap offset"))?;
+        self.mov_arg_to_mem(qword_ptr(HTOP, offset), head, ARG1)?;
+        self.preserve_cache(&[ARG2], &[], |m| {
+            m.asm
+                .emit(|e| e.mov_mr(qword_ptr(HTOP, offset + 8), ARG2))?;
+            m.asm
+                .emit(|e| e.lea(ARG2, qword_ptr(HTOP, offset + i32::from(TAG_PRIMARY_LIST))))
+        })
+    }
+
+    /// Advances HTOP across a cons cell and stores the cell pointer.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:815-826 (emit_store_cons), OTP-29.1.1.
+    pub fn emit_store_cons(&mut self, len: ArgVal, dst: ArgVal) -> Result<(), AsmError> {
+        let bytes = arg_word(len)?
+            .checked_mul(16)
+            .and_then(|n| i32::try_from(n).ok())
+            .ok_or(AsmError::Operand("cons heap size"))?;
+        self.preserve_cache(&[HTOP], &[], |m| {
+            m.asm.emit(|e| e.add_ri(HTOP, i64::from(bytes)))
+        })?;
+        self.mov_arg_from_reg(dst, ARG2)
+    }
+
+    /// Writes one element into a tuple.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:1116-1127 (emit_set_tuple_element), OTP-29.1.1.
+    pub fn emit_set_tuple_element(
+        &mut self,
+        element: ArgVal,
+        tuple: ArgVal,
+        offset: ArgVal,
+    ) -> Result<(), AsmError> {
+        self.mov_arg_to_reg(ARG1, tuple)?;
+        let boxed_ptr = self.asm.emit_ptr_val(ARG1, ARG1);
+        let offset = i32::try_from(arg_word(offset)?)
+            .map_err(|_| AsmError::Operand("tuple element byte offset"))?;
+        self.mov_arg_to_mem(emit_boxed_val(boxed_ptr, offset, 8), element, ARG2)
+    }
+
+    /// Checks a fun value against a literal arity or calls `erl_is_function/3` for a dynamic one.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:1298-1330 (emit_is_function2), OTP-29.1.1.
+    pub fn emit_is_function2(
+        &mut self,
+        fail: ArgVal,
+        src: ArgVal,
+        arity: ArgVal,
+    ) -> Result<(), AsmError> {
+        let fail = self
+            .resolve_beam_label(arg_label(fail)?)
+            .ok_or(AsmError::Operand("function test to an unknown label"))?;
+        let Some(arity_value) = arity.small_signed() else {
+            self.mov_arg_to_reg(ARG2, src)?;
+            self.mov_arg_to_reg(ARG3, arity)?;
+            self.asm.emit_enter_runtime(Update::NONE)?;
+            self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
+            self.asm
+                .runtime_call(erl_is_function as *const () as usize)?;
+            self.asm.emit_leave_runtime(Update::NONE)?;
+            self.asm.emit(|e| e.cmp_ri(RET, 0x4b))?;
+            return self.asm.jcc(CondCode::NE, fail);
+        };
+        if !(0..=255).contains(&arity_value) {
+            return self.asm.jmp(fail);
+        }
+
+        self.mov_arg_to_reg(ARG1, src)?;
+        self.emit_is_boxed_source(fail, src, ARG1, Distance::Long)?;
+        let boxed_ptr = self.asm.emit_ptr_val(ARG1, ARG1);
+        let expected = FUN_SUBTAG | (arity_value << FUN_HEADER_ARITY_OFFS);
+        self.preserve_cache(&[], &[], |m| {
+            m.asm
+                .emit(|e| e.cmp_mi(emit_boxed_val(boxed_ptr, 0, 2), expected))?;
+            m.asm.jcc(CondCode::NE, fail)
+        })
+    }
+
+    /// Emits the tag-only inequality test shared by exact comparisons.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:1814-1857
+    // (emit_is_unequal_based_on_tags), OTP-29.1.1.
+    fn emit_is_unequal_based_on_tags(
+        &mut self,
+        unequal: arinsal_x64::buf::Label,
+        src1: ArgVal,
+        reg1: arinsal_x64::enc::Gp,
+        src2: ArgVal,
+        reg2: arinsal_x64::enc::Gp,
+        distance: Distance,
+    ) -> Result<(), AsmError> {
+        if self.always_one_of(src1, type_id::ALWAYS_BOXED) {
+            return self.asm.emit_is_boxed(unequal, reg2, distance);
+        }
+        if self.always_one_of(src2, type_id::ALWAYS_BOXED) {
+            return self.asm.emit_is_boxed(unequal, reg1, distance);
+        }
+        if self.exact_type(src1, type_id::CONS) {
+            return self.asm.emit_is_cons(unequal, reg2, distance);
+        }
+        if self.exact_type(src2, type_id::CONS) {
+            return self.asm.emit_is_cons(unequal, reg1, distance);
+        }
+
+        self.asm.emit(|e| e.mov_rr(RETD, reg1.r32()))?;
+        self.asm.emit(|e| e.or_rr(RETD, reg2.r32()))?;
+        if self.never_one_of(src1, type_id::CONS) || self.never_one_of(src2, type_id::CONS) {
+            return self.asm.emit_is_boxed(unequal, RET, distance);
+        }
+        if self.never_one_of(src1, type_id::ALWAYS_BOXED)
+            || self.never_one_of(src2, type_id::ALWAYS_BOXED)
+        {
+            return self.asm.emit_is_cons(unequal, RET, distance);
+        }
+        self.asm.emit(|e| e.and_ri(RETB, TAG_PRIMARY_MASK as i64))?;
+        self.asm.emit(|e| e.cmp_ri(RETB, TAG_PRIMARY_MASK as i64))?;
+        self.asm.jcc_dist(CondCode::E, unequal, distance)
+    }
+
+    /// Leaves ZF set when both comparison operands must be immediate terms.
+    // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:1859-1882
+    // (emit_are_both_immediate), OTP-29.1.1.
+    fn emit_are_both_immediate(
+        &mut self,
+        src1: ArgVal,
+        reg1: arinsal_x64::enc::Gp,
+        src2: ArgVal,
+        reg2: arinsal_x64::enc::Gp,
+    ) -> Result<(), AsmError> {
+        if self.always_immediate(src1) {
+            self.asm.emit(|e| e.mov_rr(RETD, reg2.r32()))?;
+        } else if self.always_immediate(src2) {
+            self.asm.emit(|e| e.mov_rr(RETD, reg1.r32()))?;
+        } else {
+            self.asm.emit(|e| e.mov_rr(RETD, reg1.r32()))?;
+            self.asm.emit(|e| e.and_rr(RETD, reg2.r32()))?;
+        }
+        self.asm.emit(|e| e.and_ri(RETB, TAG_PRIMARY_MASK as i64))?;
+        self.asm.emit(|e| e.cmp_ri(RETB, TAG_PRIMARY_MASK as i64))
+    }
+
+    /// Exact equality with literal-specialized list, shallow-boxed, bitstring and map cases.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:1820-1972
+    // (emit_is_eq_exact), OTP-29.1.1.
+    pub fn emit_is_eq_exact(&mut self, fail: ArgVal, x: ArgVal, y: ArgVal) -> Result<(), AsmError> {
+        let fail = self
+            .resolve_beam_label(arg_label(fail)?)
+            .ok_or(AsmError::Operand("exact compare to an unknown label"))?;
+        if let ArgVal::Literal(bits) = y {
+            let literal = term_from_bits(bits);
+            if let Some((len, head)) = literal_is_list_of_immediates(literal) {
+                if len == 1 {
+                    let head = head.word() as i64;
+                    self.mov_arg_to_reg(RET, x)?;
+                    if !self.exact_type(x, type_id::CONS) {
+                        self.asm.emit_is_cons(fail, RET, Distance::Long)?;
+                    }
+                    let ptr = self.asm.emit_ptr_val(RET, RET);
+                    if is_int32(head) {
+                        self.asm.emit(|e| e.cmp_mi(get_car_ref(ptr, 8), head))?;
+                    } else {
+                        self.asm.mov_imm(ARG1, head as u64)?;
+                        self.asm.emit(|e| e.cmp_mr(get_car_ref(ptr, 8), ARG1))?;
+                    }
+                    self.asm.jcc(CondCode::NE, fail)?;
+                    self.asm.emit(|e| e.cmp_mi(get_cdr_ref(ptr, 8), NIL))?;
+                    self.asm.jcc(CondCode::NE, fail)?;
+                    return Ok(());
+                }
+                self.mov_arg_to_reg(ARG2, y)?;
+                self.mov_arg_to_reg(ARG1, x)?;
+                let fragment = self.ga_get(GlobalLabels::IsEqExactListShared)?;
+                self.safe_fragment_call(fragment)?;
+                return self.asm.jcc(CondCode::NE, fail);
+            }
+            if literal_is_shallow_boxed(literal) {
+                self.mov_arg_to_reg(ARG2, y)?;
+                self.mov_arg_to_reg(ARG1, x)?;
+                let fragment = self.ga_get(GlobalLabels::IsEqExactShallowBoxedShared)?;
+                self.safe_fragment_call(fragment)?;
+                return self.asm.jcc(CondCode::NE, fail);
+            }
+            if literal_is_empty_bitstring(literal) {
+                self.mov_arg_to_reg(ARG2, x)?;
+                self.emit_is_boxed_source(fail, x, ARG2, Distance::Long)?;
+                let boxed = self.asm.emit_ptr_val(ARG2, ARG2);
+                self.asm
+                    .emit(|e| e.mov_rm(ARG1, emit_boxed_val(boxed, 8, 8)))?;
+                let not_sub_bits = self.asm.new_label();
+                if self.masked_types(x, type_id::MAYBE_BOXED) == type_id::BITSTRING {
+                    self.asm
+                        .emit(|e| e.cmp_mi(emit_boxed_val(boxed, 0, 8), HEADER_SUB_BITS))?;
+                } else {
+                    self.asm
+                        .emit(|e| e.mov_rm(RETD, emit_boxed_val(boxed, 0, 4)))?;
+                    self.asm.emit(|e| e.cmp_ri(RETD, HEADER_SUB_BITS))?;
+                }
+                self.asm.short_jcc(CondCode::NE, not_sub_bits)?;
+                self.asm
+                    .emit(|e| e.mov_rm(ARG1, emit_boxed_val(boxed, SUB_BITS_END_OFFSET, 8)))?;
+                self.asm
+                    .emit(|e| e.sub_rm(ARG1, emit_boxed_val(boxed, SUB_BITS_START_OFFSET, 8)))?;
+                self.asm.bind(not_sub_bits)?;
+                if self.masked_types(x, type_id::MAYBE_BOXED) == type_id::BITSTRING {
+                    self.asm.emit(|e| e.test_rr(ARG1, ARG1))?;
+                } else {
+                    self.asm.emit(|e| e.and_ri(RETD, BITSTRING_TAG_MASK))?;
+                    self.asm.emit(|e| e.sub_ri(RETD, TAG_HEADER_HEAP_BITS))?;
+                    self.asm.emit(|e| e.or_rr(RETD, ARG1D))?;
+                }
+                return self.asm.jcc(CondCode::NE, fail);
+            }
+            if literal_is_empty_map(literal) {
+                self.mov_arg_to_reg(ARG1, x)?;
+                self.emit_is_boxed_source(fail, x, ARG1, Distance::Long)?;
+                let boxed = self.asm.emit_ptr_val(ARG1, ARG1);
+                self.asm
+                    .emit(|e| e.cmp_mi(emit_boxed_val(boxed, 0, 4), MAP_HEADER_FLATMAP))?;
+                self.asm.jcc(CondCode::NE, fail)?;
+                self.asm
+                    .emit(|e| e.cmp_mi(emit_boxed_val(boxed, 8, 4), 0))?;
+                return self.asm.jcc(CondCode::NE, fail);
+            }
+        }
+
+        if x.is_register() && self.always_immediate(y) {
+            return self
+                .cmp_arg_mem(arg_ref(x, 8)?, y, ARG1)
+                .and_then(|()| self.preserve_cache(&[], &[], |m| m.asm.jcc(CondCode::NE, fail)));
+        }
+
+        let next = self.asm.new_label();
+        self.mov_arg_to_reg(ARG2, y)?;
+        self.mov_arg_to_reg(ARG1, x)?;
+        self.asm.emit(|e| e.cmp_rr(ARG1, ARG2))?;
+        self.asm.short_jcc(CondCode::E, next)?;
+        if self.exact_type(x, type_id::INTEGER) && self.exact_type(y, type_id::INTEGER) {
+            self.asm.emit(|e| e.mov_rr(RETD, ARG1D))?;
+            self.asm.emit(|e| e.or_rr(RETD, ARG2D))?;
+            self.asm.emit_test_boxed(RET)?;
+            self.asm.jcc(CondCode::NE, fail)?;
+        } else if !self.always_same_types(x, y) {
+            self.emit_is_unequal_based_on_tags(next, x, ARG1, y, ARG2, Distance::Long)?;
+        }
+        if self.always_one_of(x, type_id::INTEGER | type_id::FLOAT)
+            || self.always_one_of(y, type_id::INTEGER | type_id::FLOAT)
+        {
+            let fragment = self.ga_get(GlobalLabels::IsEqExactShallowBoxedShared)?;
+            self.safe_fragment_call(fragment)?;
+            self.asm.jcc(CondCode::NE, fail)?;
+        } else {
+            self.asm.emit_enter_runtime(Update::NONE)?;
+            self.asm.runtime_call(super::rt::eq as *const () as usize)?;
+            self.asm.emit_leave_runtime(Update::NONE)?;
+            self.asm.emit(|e| e.test_rr(RETD, RETD))?;
+            self.asm.jcc(CondCode::E, fail)?;
+        }
+        self.asm.bind(next)
+    }
+
+    /// Exact non-equality with literal-specialized checks matching the equality emitter.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:1974-2178
+    // (emit_is_ne_exact), OTP-29.1.1.
+    pub fn emit_is_ne_exact(&mut self, fail: ArgVal, x: ArgVal, y: ArgVal) -> Result<(), AsmError> {
+        let fail = self
+            .resolve_beam_label(arg_label(fail)?)
+            .ok_or(AsmError::Operand("exact compare to an unknown label"))?;
+        if let ArgVal::Literal(bits) = y {
+            let literal = term_from_bits(bits);
+            if let Some((len, head)) = literal_is_list_of_immediates(literal) {
+                if len == 1 {
+                    let next = self.asm.new_label();
+                    let head = head.word() as i64;
+                    self.mov_arg_to_reg(RET, x)?;
+                    if !self.exact_type(x, type_id::CONS) {
+                        self.asm.emit_is_cons(next, RET, Distance::Short)?;
+                    }
+                    let ptr = self.asm.emit_ptr_val(RET, RET);
+                    if is_int32(head) {
+                        self.asm.emit(|e| e.cmp_mi(get_car_ref(ptr, 8), head))?;
+                    } else {
+                        self.asm.mov_imm(ARG1, head as u64)?;
+                        self.asm.emit(|e| e.cmp_mr(get_car_ref(ptr, 8), ARG1))?;
+                    }
+                    self.asm.short_jcc(CondCode::NE, next)?;
+                    self.asm.emit(|e| e.cmp_mi(get_cdr_ref(ptr, 8), NIL))?;
+                    self.asm.jcc(CondCode::E, fail)?;
+                    return self.asm.bind(next);
+                }
+                self.mov_arg_to_reg(ARG2, y)?;
+                self.mov_arg_to_reg(ARG1, x)?;
+                let fragment = self.ga_get(GlobalLabels::IsEqExactListShared)?;
+                self.safe_fragment_call(fragment)?;
+                return self.asm.jcc(CondCode::E, fail);
+            }
+            if literal_is_shallow_boxed(literal) {
+                self.mov_arg_to_reg(ARG2, y)?;
+                self.mov_arg_to_reg(ARG1, x)?;
+                let fragment = self.ga_get(GlobalLabels::IsEqExactShallowBoxedShared)?;
+                self.safe_fragment_call(fragment)?;
+                return self.asm.jcc(CondCode::E, fail);
+            }
+            if literal_is_empty_bitstring(literal) {
+                let next = self.asm.new_label();
+                self.mov_arg_to_reg(ARG2, x)?;
+                self.emit_is_boxed_source(next, x, ARG2, Distance::Short)?;
+                let boxed = self.asm.emit_ptr_val(ARG2, ARG2);
+                self.asm
+                    .emit(|e| e.mov_rm(ARG1, emit_boxed_val(boxed, 8, 8)))?;
+                let not_sub_bits = self.asm.new_label();
+                if self.masked_types(x, type_id::MAYBE_BOXED) == type_id::BITSTRING {
+                    self.asm
+                        .emit(|e| e.cmp_mi(emit_boxed_val(boxed, 0, 8), HEADER_SUB_BITS))?;
+                } else {
+                    self.asm
+                        .emit(|e| e.mov_rm(RETD, emit_boxed_val(boxed, 0, 4)))?;
+                    self.asm.emit(|e| e.cmp_ri(RETD, HEADER_SUB_BITS))?;
+                }
+                self.asm.short_jcc(CondCode::NE, not_sub_bits)?;
+                self.asm
+                    .emit(|e| e.mov_rm(ARG1, emit_boxed_val(boxed, SUB_BITS_END_OFFSET, 8)))?;
+                self.asm
+                    .emit(|e| e.sub_rm(ARG1, emit_boxed_val(boxed, SUB_BITS_START_OFFSET, 8)))?;
+                self.asm.bind(not_sub_bits)?;
+                if self.masked_types(x, type_id::MAYBE_BOXED) == type_id::BITSTRING {
+                    self.asm.emit(|e| e.test_rr(ARG1, ARG1))?;
+                } else {
+                    self.asm.emit(|e| e.and_ri(RETD, BITSTRING_TAG_MASK))?;
+                    self.asm.emit(|e| e.sub_ri(RETD, TAG_HEADER_HEAP_BITS))?;
+                    self.asm.emit(|e| e.or_rr(RETD, ARG1D))?;
+                }
+                self.asm.short_jcc(CondCode::E, fail)?;
+                return self.asm.bind(next);
+            }
+            if literal_is_empty_map(literal) {
+                let next = self.asm.new_label();
+                self.mov_arg_to_reg(ARG1, x)?;
+                self.emit_is_boxed_source(next, x, ARG1, Distance::Short)?;
+                let boxed = self.asm.emit_ptr_val(ARG1, ARG1);
+                self.asm
+                    .emit(|e| e.cmp_mi(emit_boxed_val(boxed, 0, 4), MAP_HEADER_FLATMAP))?;
+                self.asm.short_jcc(CondCode::NE, next)?;
+                self.asm
+                    .emit(|e| e.cmp_mi(emit_boxed_val(boxed, 8, 4), 0))?;
+                self.asm.jcc(CondCode::E, fail)?;
+                return self.asm.bind(next);
+            }
+        }
+
+        if x.is_register() && self.always_immediate(y) {
+            self.cmp_arg_mem(arg_ref(x, 8)?, y, ARG1)?;
+            return self.preserve_cache(&[], &[], |m| m.asm.jcc(CondCode::E, fail));
+        }
+
+        let next = self.asm.new_label();
+        self.mov_arg_to_reg(ARG2, y)?;
+        self.mov_arg_to_reg(ARG1, x)?;
+        self.asm.emit(|e| e.cmp_rr(ARG1, ARG2))?;
+        self.asm.jcc(CondCode::E, fail)?;
+        if self.exact_type(x, type_id::INTEGER) && self.exact_type(y, type_id::INTEGER) {
+            self.asm.emit(|e| e.mov_rr(RETD, ARG1D))?;
+            self.asm.emit(|e| e.or_rr(RETD, ARG2D))?;
+            self.asm.emit_test_boxed(RET)?;
+            self.asm.short_jcc(CondCode::NE, next)?;
+        } else if !self.always_same_types(x, y) {
+            self.emit_is_unequal_based_on_tags(next, x, ARG1, y, ARG2, Distance::Short)?;
+        }
+        if self.always_one_of(x, type_id::INTEGER | type_id::FLOAT)
+            || self.always_one_of(y, type_id::INTEGER | type_id::FLOAT)
+        {
+            let fragment = self.ga_get(GlobalLabels::IsEqExactShallowBoxedShared)?;
+            self.safe_fragment_call(fragment)?;
+            self.asm.jcc(CondCode::E, fail)?;
+        } else {
+            self.asm.emit_enter_runtime(Update::NONE)?;
+            self.asm.runtime_call(super::rt::eq as *const () as usize)?;
+            self.asm.emit_leave_runtime(Update::NONE)?;
+            self.asm.emit(|e| e.test_rr(RETD, RETD))?;
+            self.asm.jcc(CondCode::NE, fail)?;
+        }
+        self.asm.bind(next)
+    }
+
+    /// Arithmetic equality, including the fast immediate and float paths.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:2181-2204 (emit_is_eq), OTP-29.1.1.
+    pub fn emit_is_eq(&mut self, fail: ArgVal, lhs: ArgVal, rhs: ArgVal) -> Result<(), AsmError> {
+        let fail = self
+            .resolve_beam_label(arg_label(fail)?)
+            .ok_or(AsmError::Operand("compare to an unknown label"))?;
+        let next = self.asm.new_label();
+        self.mov_arg_to_reg(ARG2, rhs)?;
+        self.mov_arg_to_reg(ARG1, lhs)?;
+        self.asm.emit(|e| e.cmp_rr(ARG1, ARG2))?;
+        self.asm.short_jcc(CondCode::E, next)?;
+        if self.always_one_of(lhs, type_id::CONS | type_id::ALWAYS_BOXED)
+            || self.always_one_of(rhs, type_id::CONS | type_id::ALWAYS_BOXED)
+        {
+            // erts omits the immediate test when either operand cannot be immediate.
+        } else {
+            self.emit_are_both_immediate(lhs, ARG1, rhs, ARG2)?;
+            self.asm.jcc(CondCode::E, fail)?;
+        }
+        let fragment = self.ga_get(GlobalLabels::ArithEqShared)?;
+        self.safe_fragment_call(fragment)?;
+        self.asm.jcc(CondCode::NE, fail)?;
+        self.asm.bind(next)
+    }
+
+    /// Arithmetic non-equality, including the fast immediate and float paths.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:2206-2219 (emit_is_ne), OTP-29.1.1.
+    pub fn emit_is_ne(&mut self, fail: ArgVal, lhs: ArgVal, rhs: ArgVal) -> Result<(), AsmError> {
+        let fail = self
+            .resolve_beam_label(arg_label(fail)?)
+            .ok_or(AsmError::Operand("compare to an unknown label"))?;
+        let next = self.asm.new_label();
+        self.mov_arg_to_reg(ARG2, rhs)?;
+        self.mov_arg_to_reg(ARG1, lhs)?;
+        self.asm.emit(|e| e.cmp_rr(ARG1, ARG2))?;
+        self.asm.jcc(CondCode::E, fail)?;
+        if !(self.always_one_of(lhs, type_id::CONS | type_id::ALWAYS_BOXED)
+            || self.always_one_of(rhs, type_id::CONS | type_id::ALWAYS_BOXED))
+        {
+            self.emit_are_both_immediate(lhs, ARG1, rhs, ARG2)?;
+            self.asm.short_jcc(CondCode::E, next)?;
+        }
+        let fragment = self.ga_get(GlobalLabels::ArithEqShared)?;
+        self.safe_fragment_call(fragment)?;
+        self.asm.jcc(CondCode::E, fail)?;
+        self.asm.bind(next)
+    }
+
+    /// Emits Erlang term ordering for the `is_lt` guard instruction.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:2321-2416 (emit_is_lt), OTP-29.1.1.
+    pub fn emit_is_lt(&mut self, fail: ArgVal, lhs: ArgVal, rhs: ArgVal) -> Result<(), AsmError> {
+        let fail = self
+            .resolve_beam_label(arg_label(fail)?)
+            .ok_or(AsmError::Operand("compare to an unknown label"))?;
+        let generic = self.asm.new_label();
+        let do_jge = self.asm.new_label();
+        let next = self.asm.new_label();
+        let both_small = self.always_small(lhs) && self.always_small(rhs);
+        let mut need_generic = !both_small;
+        let never_small = lhs.is_literal() || rhs.is_literal();
+        self.mov_arg_to_reg(ARG2, rhs)?;
+        self.mov_arg_to_reg(ARG1, lhs)?;
+
+        if both_small {
+        } else if self.always_small(lhs)
+            && self.exact_type(rhs, type_id::INTEGER)
+            && self.get_type_entry(rhs).min.is_some()
+        {
+            need_generic = false;
+            self.asm.emit_is_not_boxed(next, ARG2, Distance::Short)?;
+        } else if self.always_small(lhs)
+            && self.exact_type(rhs, type_id::INTEGER)
+            && self.get_type_entry(rhs).max.is_some()
+        {
+            need_generic = false;
+            self.asm.emit_is_not_boxed(fail, ARG2, Distance::Long)?;
+        } else if self.exact_type(lhs, type_id::INTEGER)
+            && self.get_type_entry(lhs).min.is_some()
+            && self.always_small(rhs)
+        {
+            need_generic = false;
+            self.asm.emit_is_not_boxed(fail, ARG1, Distance::Long)?;
+        } else if self.exact_type(lhs, type_id::INTEGER)
+            && self.get_type_entry(lhs).max.is_some()
+            && self.always_small(rhs)
+        {
+            self.asm.emit_is_not_boxed(next, ARG1, Distance::Short)?;
+        } else if never_small {
+            self.asm.emit(|e| e.cmp_rr(ARG1, ARG2))?;
+            self.asm.short_jcc(CondCode::E, do_jge)?;
+        } else if self.always_one_of(lhs, type_id::INTEGER | type_id::ALWAYS_BOXED)
+            && self.always_one_of(rhs, type_id::INTEGER | type_id::ALWAYS_BOXED)
+        {
+            if self.always_small(lhs) {
+                self.asm.emit_is_not_boxed(generic, ARG2, Distance::Short)?;
+            } else if self.always_small(rhs) {
+                self.asm.emit_is_not_boxed(generic, ARG1, Distance::Short)?;
+            } else {
+                self.asm.emit(|e| e.mov_rr(RETD, ARG1D))?;
+                self.asm.emit(|e| e.and_rr(RETD, ARG2D))?;
+                self.asm.emit_is_not_boxed(generic, RET, Distance::Short)?;
+            }
+        } else {
+            if self.always_small(rhs) {
+                self.asm.emit(|e| e.mov_rr(RETD, ARG1D))?;
+            } else if self.always_small(lhs) {
+                self.asm.emit(|e| e.mov_rr(RETD, ARG2D))?;
+            } else {
+                self.asm.emit(|e| e.cmp_rr(ARG1, ARG2))?;
+                self.asm.short_jcc(CondCode::E, do_jge)?;
+                self.asm.emit(|e| e.mov_rr(RETD, ARG1D))?;
+                self.asm.emit(|e| e.and_rr(RETD, ARG2D))?;
+            }
+            self.asm.emit(|e| e.and_ri(RETB, TAG_IMMED1_MASK))?;
+            self.asm.emit(|e| e.cmp_ri(RETB, TAG_IMMED1_SMALL))?;
+            self.asm.short_jcc(CondCode::NE, generic)?;
+        }
+
+        if !never_small {
+            self.asm.emit(|e| e.cmp_rr(ARG1, ARG2))?;
+            if need_generic {
+                self.asm.short_jmp(do_jge)?;
+            }
+        }
+        self.asm.bind(generic)?;
+        if need_generic {
+            let fragment = self.ga_get(GlobalLabels::ArithCompareShared)?;
+            self.safe_fragment_call(fragment)?;
+        }
+        self.asm.bind(do_jge)?;
+        self.asm.jcc(CondCode::GE, fail)?;
+        self.asm.bind(next)
+    }
+
+    /// Emits Erlang term ordering for the `is_ge` guard instruction.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:2418-2575 (emit_is_ge), OTP-29.1.1.
+    pub fn emit_is_ge(&mut self, fail: ArgVal, lhs: ArgVal, rhs: ArgVal) -> Result<(), AsmError> {
+        let fail = self
+            .resolve_beam_label(arg_label(fail)?)
+            .ok_or(AsmError::Operand("compare to an unknown label"))?;
+        let both_small = self.always_small(lhs) && self.always_small(rhs);
+        if both_small
+            && lhs.is_register()
+            && matches!(rhs, ArgVal::Immediate(_))
+            && is_int32(immediate_word(rhs)?)
+        {
+            let imm = immediate_word(rhs)?;
+            let mem = arg_ref(lhs, 8)?;
+            return self.preserve_cache(&[], &[], |m| {
+                m.asm.emit(|e| e.cmp_mi(mem, imm))?;
+                m.asm.jcc(CondCode::L, fail)
+            });
+        } else if both_small
+            && rhs.is_register()
+            && matches!(lhs, ArgVal::Immediate(_))
+            && is_int32(immediate_word(lhs)?)
+        {
+            let imm = immediate_word(lhs)?;
+            let mem = arg_ref(rhs, 8)?;
+            return self.preserve_cache(&[], &[], |m| {
+                m.asm.emit(|e| e.cmp_mi(mem, imm))?;
+                m.asm.jcc(CondCode::G, fail)
+            });
+        }
+
+        let generic = self.asm.new_label();
+        let small = self.asm.new_label();
+        let do_jl = self.asm.new_label();
+        let next = self.asm.new_label();
+        let mut need_generic = !both_small;
+        let never_small = lhs.is_literal() || rhs.is_literal();
+        self.mov_arg_to_reg(ARG2, rhs)?;
+        self.mov_arg_to_reg(ARG1, lhs)?;
+
+        if both_small {
+        } else if self.always_small(lhs)
+            && self.exact_type(rhs, type_id::INTEGER)
+            && self.get_type_entry(rhs).min.is_some()
+        {
+            need_generic = false;
+            self.asm.emit_is_not_boxed(fail, ARG2, Distance::Long)?;
+        } else if self.always_small(lhs)
+            && self.exact_type(rhs, type_id::INTEGER)
+            && self.get_type_entry(rhs).max.is_some()
+        {
+            need_generic = false;
+            self.asm.emit_is_not_boxed(next, ARG2, Distance::Short)?;
+        } else if self.exact_type(lhs, type_id::INTEGER)
+            && self.get_type_entry(lhs).max.is_some()
+            && self.always_small(rhs)
+        {
+            need_generic = false;
+            self.asm.emit_is_not_boxed(fail, ARG1, Distance::Long)?;
+        } else if self.exact_type(lhs, type_id::INTEGER)
+            && self.get_type_entry(lhs).min.is_some()
+            && self.always_small(rhs)
+        {
+            self.asm.emit_is_not_boxed(next, ARG1, Distance::Short)?;
+        } else if self.exact_type(lhs, type_id::INTEGER) && self.always_small(rhs) {
+            let sign_bit = TAG_HEADER_NEG_BIG - TAG_HEADER_POS_BIG;
+            need_generic = false;
+            self.asm.emit_is_boxed(small, ARG1, Distance::Short)?;
+            let boxed = self.asm.emit_ptr_val(ARG1, ARG1);
+            self.asm
+                .emit(|e| e.mov_rm(RETD, emit_boxed_val(boxed, 0, 4)))?;
+            self.asm.emit(|e| e.test_ri(RETB, sign_bit))?;
+            self.asm.jcc(CondCode::NE, fail)?;
+            self.asm.short_jmp(next)?;
+        } else if self.always_small(lhs) && self.exact_type(rhs, type_id::INTEGER) {
+            need_generic = false;
+            self.asm.emit_is_boxed(small, ARG2, Distance::Short)?;
+            let boxed = self.asm.emit_ptr_val(ARG2, ARG2);
+            self.asm
+                .emit(|e| e.mov_rm(RETD, emit_boxed_val(boxed, 0, 4)))?;
+            self.asm.emit(|e| e.and_ri(RETB, TAG_HEADER_MASK))?;
+            self.asm.emit(|e| e.cmp_ri(RETB, TAG_HEADER_NEG_BIG))?;
+            self.asm.short_jmp(do_jl)?;
+        } else if never_small {
+            self.asm.emit(|e| e.cmp_rr(ARG1, ARG2))?;
+            self.asm.short_jcc(CondCode::E, next)?;
+        } else if self.always_one_of(lhs, type_id::INTEGER | type_id::ALWAYS_BOXED)
+            && self.always_one_of(rhs, type_id::INTEGER | type_id::ALWAYS_BOXED)
+        {
+            if self.always_small(lhs) {
+                self.asm.emit_is_not_boxed(generic, ARG2, Distance::Short)?;
+            } else if self.always_small(rhs) {
+                self.asm.emit_is_not_boxed(generic, ARG1, Distance::Short)?;
+            } else {
+                self.asm.emit(|e| e.mov_rr(RETD, ARG1D))?;
+                self.asm.emit(|e| e.and_rr(RETD, ARG2D))?;
+                self.asm.emit_is_not_boxed(generic, RET, Distance::Short)?;
+            }
+        } else {
+            if self.always_small(rhs) {
+                self.asm.emit(|e| e.mov_rr(RETD, ARG1D))?;
+            } else if self.always_small(lhs) {
+                self.asm.emit(|e| e.mov_rr(RETD, ARG2D))?;
+            } else {
+                self.asm.emit(|e| e.cmp_rr(ARG1, ARG2))?;
+                self.asm.short_jcc(CondCode::E, next)?;
+                self.asm.emit(|e| e.mov_rr(RETD, ARG1D))?;
+                self.asm.emit(|e| e.and_rr(RETD, ARG2D))?;
+            }
+            self.asm.emit(|e| e.and_ri(RETB, TAG_IMMED1_MASK))?;
+            self.asm.emit(|e| e.cmp_ri(RETB, TAG_IMMED1_SMALL))?;
+            self.asm.short_jcc(CondCode::NE, generic)?;
+        }
+
+        self.asm.bind(small)?;
+        if !never_small {
+            self.cmp_preserve_cache_rr(ARG1, ARG2)?;
+            if need_generic {
+                self.asm.short_jmp(do_jl)?;
+            }
+        }
+        self.asm.bind(generic)?;
+        if need_generic {
+            let fragment = self.ga_get(GlobalLabels::ArithCompareShared)?;
+            self.safe_fragment_call(fragment)?;
+        }
+        self.asm.bind(do_jl)?;
+        self.preserve_cache(&[], &[], |m| m.asm.jcc(CondCode::L, fail))?;
+        self.asm.bind(next)
+    }
+
+    /// Checks the fused `Src >= A && Src < B` instruction.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:2824-2855
+    // (emit_is_ge_lt), OTP-29.1.1.
+    pub fn emit_is_ge_lt(
+        &mut self,
+        fail1: ArgVal,
+        fail2: ArgVal,
+        src: ArgVal,
+        a: ArgVal,
+        b: ArgVal,
+    ) -> Result<(), AsmError> {
+        let fail1 = self
+            .resolve_beam_label(arg_label(fail1)?)
+            .ok_or(AsmError::Operand("range test to an unknown label"))?;
+        let fail2 = self
+            .resolve_beam_label(arg_label(fail2)?)
+            .ok_or(AsmError::Operand("range test to an unknown label"))?;
+        let generic = self.asm.new_label();
+        let next = self.asm.new_label();
+        self.mov_arg_to_reg(ARG2, a)?;
+        self.mov_arg_to_reg(ARG3, b)?;
+        self.mov_arg_to_reg(ARG1, src)?;
+        self.asm.emit(|e| e.mov_rr(RETD, ARG1D))?;
+        self.asm.emit(|e| e.and_ri(RETB, TAG_IMMED1_MASK))?;
+        self.asm.emit(|e| e.cmp_ri(RETB, TAG_IMMED1_SMALL))?;
+        self.asm.short_jcc(CondCode::NE, generic)?;
+        self.asm.emit(|e| e.cmp_rr(ARG1, ARG2))?;
+        self.asm.jcc(CondCode::L, fail1)?;
+        self.asm.emit(|e| e.cmp_rr(ARG3, ARG1))?;
+        self.asm.jcc(CondCode::GE, fail2)?;
+        self.asm.short_jmp(next)?;
+        self.asm.bind(generic)?;
+        let fragment = self.ga_get(GlobalLabels::IsGeLtShared)?;
+        self.safe_fragment_call(fragment)?;
+        self.asm.jcc(CondCode::L, fail1)?;
+        self.asm.jcc(CondCode::G, fail2)?;
+        self.asm.bind(next)
+    }
+
+    /// Checks two inclusive lower bounds while loading the source once when its type is small.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:2858-2886
+    // (emit_is_ge_ge), OTP-29.1.1.
+    pub fn emit_is_ge_ge(
+        &mut self,
+        fail1: ArgVal,
+        fail2: ArgVal,
+        src: ArgVal,
+        a: ArgVal,
+        b: ArgVal,
+    ) -> Result<(), AsmError> {
+        if !self.always_small(src) {
+            self.emit_is_ge(fail1, src, a)?;
+            return self.emit_is_ge(fail2, src, b);
+        }
+        let fail1 = self
+            .resolve_beam_label(arg_label(fail1)?)
+            .ok_or(AsmError::Operand("range test to an unknown label"))?;
+        let fail2 = self
+            .resolve_beam_label(arg_label(fail2)?)
+            .ok_or(AsmError::Operand("range test to an unknown label"))?;
+        self.mov_arg_to_reg(RET, src)?;
+        self.sub(RET, immediate_word(a)?, ARG1)?;
+        self.preserve_cache(&[], &[], |m| m.asm.jcc(CondCode::L, fail1))?;
+        self.cmp(
+            RET,
+            immediate_word(b)?.wrapping_sub(immediate_word(a)?),
+            ARG1,
+        )?;
+        self.preserve_cache(&[], &[], |m| m.asm.jcc(CondCode::B, fail2))
+    }
+
+    /// Checks that a small integer lies in an inclusive range.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:2889-2915
+    // (emit_is_int_in_range), OTP-29.1.1.
+    pub fn emit_is_int_in_range(
+        &mut self,
+        fail: ArgVal,
+        src: ArgVal,
+        min: ArgVal,
+        max: ArgVal,
+    ) -> Result<(), AsmError> {
+        let fail = self
+            .resolve_beam_label(arg_label(fail)?)
+            .ok_or(AsmError::Operand("integer range test to an unknown label"))?;
+        self.mov_arg_to_reg(RET, src)?;
+        self.sub(RET, immediate_word(min)?, ARG1)?;
+        self.preserve_cache(&[RET], &[], |m| {
+            m.asm.emit(|e| e.test_ri(RETB, TAG_IMMED1_MASK))?;
+            m.asm.jcc(CondCode::NE, fail)
+        })?;
+        self.cmp(
+            RET,
+            immediate_word(max)?.wrapping_sub(immediate_word(min)?),
+            ARG1,
+        )?;
+        self.preserve_cache(&[], &[], |m| m.asm.jcc(CondCode::A, fail))
+    }
+
+    /// Checks that an integer is greater than or equal to a small lower bound.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:2917-2960
+    // (emit_is_int_ge), OTP-29.1.1.
+    pub fn emit_is_int_ge(
+        &mut self,
+        fail: ArgVal,
+        src: ArgVal,
+        min: ArgVal,
+    ) -> Result<(), AsmError> {
+        let fail = self
+            .resolve_beam_label(arg_label(fail)?)
+            .ok_or(AsmError::Operand("integer compare to an unknown label"))?;
+        let small = self.asm.new_label();
+        let bignum_fail = self.asm.new_label();
+        let bignum_next = self.asm.new_label();
+        let src_reg = enc::RCX;
+        self.mov_arg_to_reg(src_reg, src)?;
+        if self.always_one_of(src, type_id::INTEGER | type_id::ALWAYS_BOXED) {
+            self.emit_is_boxed_source(small, src, src_reg, Distance::Long)?;
+        } else {
+            self.preserve_cache(&[RET], &[], |m| {
+                m.asm.emit(|e| e.mov_rr(RETD, src_reg.r32()))?;
+                m.asm.emit(|e| e.and_ri(RETB, TAG_IMMED1_MASK))?;
+                m.asm.emit(|e| e.cmp_ri(RETB, TAG_IMMED1_SMALL))?;
+                m.asm.short_jcc(CondCode::E, small)
+            })?;
+            self.emit_is_boxed_source(fail, src, src_reg, Distance::Long)?;
+        }
+        let boxed = self.asm.emit_ptr_val(src_reg, src_reg);
+        self.preserve_cache(&[RET], &[], |m| {
+            m.asm
+                .emit(|e| e.mov_rm(RETD, emit_boxed_val(boxed, 0, 4)))?;
+            m.asm.emit(|e| e.and_ri(RETB, TAG_HEADER_MASK))?;
+            m.asm.emit(|e| e.cmp_ri(RETB, TAG_HEADER_POS_BIG))?;
+            m.asm.short_jcc(CondCode::E, bignum_next)?;
+            m.asm.bind(bignum_fail)?;
+            m.asm.jmp(fail)?;
+            m.asm.bind(small)?;
+            m.cmp(src_reg, immediate_word(min)?, RET)?;
+            m.asm.short_jcc(CondCode::L, bignum_fail)
+        })?;
+        self.asm.bind(bignum_next)
+    }
+
+    /// Tests whether Src is inside the inclusive range [Min, Max].
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:2654-2773
+    // (emit_is_in_range), OTP-29.1.1.
+    pub fn emit_is_in_range(
+        &mut self,
+        small_fail: ArgVal,
+        large_fail: ArgVal,
+        src: ArgVal,
+        min: ArgVal,
+        max: ArgVal,
+    ) -> Result<(), AsmError> {
+        let small_fail = self
+            .resolve_beam_label(arg_label(small_fail)?)
+            .ok_or(AsmError::Operand("range test to an unknown label"))?;
+        let large_fail = self
+            .resolve_beam_label(arg_label(large_fail)?)
+            .ok_or(AsmError::Operand("range test to an unknown label"))?;
+        let same_fail = small_fail == large_fail;
+        let next = self.asm.new_label();
+        let generic = self.asm.new_label();
+        let mut need_generic = true;
+        self.mov_arg_to_reg(ARG1, src)?;
+
+        if self.always_small(src) {
+            need_generic = false;
+        } else if self.always_one_of(src, type_id::INTEGER | type_id::ALWAYS_BOXED) {
+            if same_fail && self.never_one_of(src, type_id::FLOAT) {
+                need_generic = false;
+                self.preserve_cache(&[], &[], |m| {
+                    m.asm.emit(|e| e.test_ri(ARG1.r8(), 1))?;
+                    m.asm.short_jcc(CondCode::E, small_fail)
+                })?;
+            } else {
+                self.asm.emit(|e| e.test_ri(ARG1.r8(), 1))?;
+                self.asm.short_jcc(CondCode::E, generic)?;
+            }
+        } else if same_fail {
+            let min_imm = immediate_word(min)?;
+            let max_imm = immediate_word(max)?;
+            self.asm.emit(|e| e.mov_rr(RET, ARG1))?;
+            self.sub(RET, min_imm, ARG4)?;
+            self.asm.emit(|e| e.test_ri(RETB, TAG_IMMED1_MASK))?;
+            self.asm.jcc(CondCode::NE, generic)?;
+            self.cmp(RET, max_imm.wrapping_sub(min_imm), ARG4)?;
+            self.asm.jcc(CondCode::A, small_fail)?;
+            need_generic = false;
+            self.asm.short_jmp(next)?;
+        } else {
+            self.asm.emit(|e| e.mov_rr(RETD, ARG1D))?;
+            self.asm.emit(|e| e.and_ri(RETB, TAG_IMMED1_MASK))?;
+            self.asm.emit(|e| e.cmp_ri(RETB, TAG_IMMED1_SMALL))?;
+            self.asm.short_jcc(CondCode::NE, generic)?;
+        }
+
+        if same_fail {
+            self.preserve_cache(&[ARG1, RET], &[], |m| {
+                m.sub(ARG1, immediate_word(min)?, RET)?;
+                m.cmp(
+                    ARG1,
+                    immediate_word(max)?.wrapping_sub(immediate_word(min)?),
+                    RET,
+                )?;
+                m.asm.jcc(CondCode::A, small_fail)
+            })?;
+        } else {
+            self.preserve_cache(&[RET], &[], |m| {
+                m.cmp_arg_reg(ARG1, min, RET)?;
+                m.asm.jcc(CondCode::L, small_fail)?;
+                m.cmp_arg_reg(ARG1, max, RET)?;
+                m.asm.jcc(CondCode::G, large_fail)
+            })?;
+        }
+        if need_generic {
+            self.asm.short_jmp(next)?;
+        }
+        self.asm.bind(generic)?;
+        if need_generic {
+            self.mov_arg_to_reg(ARG2, min)?;
+            self.mov_arg_to_reg(ARG3, max)?;
+            let fragment = self.ga_get(GlobalLabels::IsInRangeShared)?;
+            self.safe_fragment_call(fragment)?;
+            if same_fail {
+                self.asm.jcc(CondCode::NE, small_fail)?;
+            } else {
+                self.asm.jcc(CondCode::L, small_fail)?;
+                self.asm.jcc(CondCode::G, large_fail)?;
+            }
+        }
+        self.asm.bind(next)
+    }
+
+    /// Emits the `os:perf_counter/0` instruction, producing a small or heap bignum.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:3281-3329
+    // (emit_i_perf_counter), OTP-29.1.1.
+    pub fn emit_i_perf_counter(&mut self) -> Result<(), AsmError> {
+        let next = self.asm.new_label();
+        let small = self.asm.new_label();
+        self.asm.emit_enter_runtime(Update::NONE)?;
+        self.asm.mov_imm(RET, perf_counter_address() as u64)?;
+        self.asm.dynamic_runtime_call(RET)?;
+        self.asm.emit_leave_runtime(Update::NONE)?;
+        self.asm.emit(|e| e.mov_rr(ARG1, RET))?;
+        self.asm.emit(|e| e.sar_ri(ARG1, 59))?;
+        self.asm.emit(|e| e.add_ri(ARG1, 1))?;
+        self.asm.emit(|e| e.cmp_ri(ARG1, 1))?;
+        self.asm.jcc(CondCode::BE, small)?;
+        self.asm.emit(|e| e.mov_mr(tmp_mem_q(0), RET))?;
+        self.emit_gc_test(0, ERTS_MAX_UINT64_HEAP_SIZE, 0)?;
+        self.asm.emit(|e| e.mov_rm(ARG1, tmp_mem_q(0)))?;
+        self.asm
+            .emit(|e| e.mov_mi(qword_ptr(HTOP, 0), POS_BIGNUM_HEADER_ONE_DIGIT))?;
+        self.asm.emit(|e| e.mov_mr(qword_ptr(HTOP, 8), ARG1))?;
+        self.asm
+            .emit(|e| e.lea(RET, qword_ptr(HTOP, i32::from(TAG_PRIMARY_BOXED))))?;
+        self.asm.emit(|e| e.add_ri(HTOP, 16))?;
+        self.asm.short_jmp(next)?;
+        self.asm.bind(small)?;
+        self.asm.emit(|e| e.shl_ri(RET, TAG_IMMED1_SIZE))?;
+        self.asm.emit(|e| e.or_ri(RET, TAG_IMMED1_SMALL))?;
+        self.asm.bind(next)?;
+        self.mov_arg_from_reg(ArgVal::X(0), RET)
+    }
+
+    /// Stores the live count for the line-breakpoint trampoline and aligns its entry.
+    // Port of erts/emulator/beam/jit/x86/instr_common.cpp:3352-3373
+    // (emit_i_debug_line), OTP-29.1.1.
+    pub fn emit_i_debug_line(
+        &mut self,
+        _loc: ArgVal,
+        _index: ArgVal,
+        live: ArgVal,
+    ) -> Result<(), AsmError> {
+        let live = arg_word(live)?;
+        if live > 255 {
+            return Err(AsmError::Operand("debug line live count"));
+        }
+        self.asm.mov_imm(super::beam_asm::register::TMP1, live)?;
+        self.asm.align_code(8)
     }
 }
