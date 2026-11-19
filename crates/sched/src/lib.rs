@@ -5612,18 +5612,6 @@ pub struct RunCtx<'a, M: SignalMessage> {
     /// The data of the scheduler thread running the slice (`esdp`), kept for the thread's
     /// lifetime.
     esdp: &'a mut EsdpCore,
-    /// `reds_used` as process_main hands it to `erts_schedule` at the context switch
-    /// (`REDS_IN - FCALLS`): the task reports it once when its slice ends.
-    reds_used: u32,
-    /// `REDS_IN`: the reductions the slice was scheduled in with.
-    budget: u32,
-    /// erts_schedule's `state & ERTS_PSFLG_SYS_TASKS` at schedule-in.
-    sys_task_run: bool,
-    /// A dirty signal handler acts for a process whose dirty job is executing.
-    dirty_running: bool,
-    /// A dirty signal handler acts for a process queued on a dirty run queue but not yet
-    /// executing (erts `ERTS_PSFLG_DIRTY_ACTIVE_SYS` without `ERTS_PSFLG_DIRTY_RUNNING`).
-    dirty_queued: bool,
 }
 
 /// One scheduler's data (`esdp`). The scheduler thread's start function builds it, and
@@ -5677,6 +5665,30 @@ struct EsdpCore {
     wall_enabled: bool,
     /// Collection time already moved into the GC microstate, for this slice's process.
     gc_accounted_total: u64,
+    /// `reds_used` as process_main hands it to `erts_schedule` at the context switch
+    /// (`REDS_IN - FCALLS`): the task reports it once when its slice ends.
+    reds_used: u32,
+    /// `REDS_IN`: the reductions the slice was scheduled in with.
+    budget: u32,
+    /// erts_schedule's `state & ERTS_PSFLG_SYS_TASKS` at schedule-in.
+    sys_task_run: bool,
+    /// A dirty signal handler acts for a process whose dirty job is executing.
+    dirty_running: bool,
+    /// A dirty signal handler acts for a process queued on a dirty run queue but not yet
+    /// executing (erts `ERTS_PSFLG_DIRTY_ACTIVE_SYS` without `ERTS_PSFLG_DIRTY_RUNNING`).
+    dirty_queued: bool,
+}
+
+/// The per-slice counters of [`EsdpCore`]: erts keeps them as locals of `erts_schedule` /
+/// `process_main` (`calls`, `state`), so a handler acting as another process on the same
+/// scheduler runs with its own set and puts the caller's back.
+#[derive(Clone, Copy)]
+struct SliceCounters {
+    reds_used: u32,
+    budget: u32,
+    sys_task_run: bool,
+    dirty_running: bool,
+    dirty_queued: bool,
 }
 
 impl EsdpCore {
@@ -5690,7 +5702,30 @@ impl EsdpCore {
             msacc_enabled: false,
             wall_enabled: false,
             gc_accounted_total: 0,
+            reds_used: 0,
+            budget: 0,
+            sys_task_run: false,
+            dirty_running: false,
+            dirty_queued: false,
         }
+    }
+
+    fn counters(&self) -> SliceCounters {
+        SliceCounters {
+            reds_used: self.reds_used,
+            budget: self.budget,
+            sys_task_run: self.sys_task_run,
+            dirty_running: self.dirty_running,
+            dirty_queued: self.dirty_queued,
+        }
+    }
+
+    fn set_counters(&mut self, c: SliceCounters) {
+        self.reds_used = c.reds_used;
+        self.budget = c.budget;
+        self.sys_task_run = c.sys_task_run;
+        self.dirty_running = c.dirty_running;
+        self.dirty_queued = c.dirty_queued;
     }
 
     /// Schedule-in of one slice: the accounting caches `process_main` refreshes at every
@@ -5844,8 +5879,8 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     // Port of erts/emulator/beam/jit/arm/process_main.cpp (context_switch: `reds_used`
     // passed to erts_schedule), OTP-29.1.1.
     pub fn consume(&mut self, count: u32) -> bool {
-        self.reds_used = self.reds_used.saturating_add(count);
-        self.reds_used < self.budget
+        self.esdp.reds_used = self.esdp.reds_used.saturating_add(count);
+        self.esdp.reds_used < self.esdp.budget
     }
     /// Number of scheduler workers available to this runtime.
     pub fn scheduler_count(&self) -> usize {
@@ -5876,10 +5911,10 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     #[inline(always)]
     pub fn fast_slice_ok_before_signals(&self) -> bool {
         self.scheduler_key() != 0
-            && self.reds_used < self.budget
-            && !self.sys_task_run
-            && !self.dirty_running
-            && !self.dirty_queued
+            && self.esdp.reds_used < self.esdp.budget
+            && !self.esdp.sys_task_run
+            && !self.esdp.dirty_running
+            && !self.esdp.dirty_queued
     }
     /// Type of the scheduler executing this process turn.
     pub fn scheduler_type(&self) -> SchedulerType {
@@ -5927,12 +5962,12 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     ///
     /// Port of erts/emulator/beam/erl_process.h (`ERTS_PSFLG_DIRTY_RUNNING`), OTP-29.1.1.
     pub fn dirty_running(&self) -> bool {
-        self.dirty_running
+        self.esdp.dirty_running
     }
     /// Whether a dirty signal handler acts for a process queued for a dirty scheduler and not
     /// executing. Port of erts/emulator/beam/erl_process.h (`ERTS_PSFLG_DIRTY_ACTIVE_SYS`).
     pub fn dirty_queued(&self) -> bool {
-        self.dirty_queued
+        self.esdp.dirty_queued
     }
     /// Handle the queued signals of process `pid` while it is in a dirty state, with its
     /// task cell locked and a context acting as that process. `reds` is what the caller has
@@ -6051,11 +6086,11 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     /// Reductions of the quantum not yet reported through [`RunCtx::consume`]. A context
     /// acting as another process (a dirty signal handler) has the caller's reductions left.
     pub fn remaining(&self) -> u32 {
-        self.budget.saturating_sub(self.reds_used)
+        self.esdp.budget.saturating_sub(self.esdp.reds_used)
     }
     /// Reductions reported through [`RunCtx::consume`] in this process turn so far.
     pub fn consumed(&self) -> u32 {
-        self.reds_used
+        self.esdp.reds_used
     }
     /// Scheduler-wide reductions committed before this process turn.
     pub fn total_reductions(&self) -> u64 {
@@ -6209,7 +6244,7 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     /// Whether this run was scheduled for system tasks (erts `ERTS_PSFLG_RUNNING_SYS`).
     /// The task should handle its queued signals before executing code.
     pub fn sys_task_run(&self) -> bool {
-        self.sys_task_run
+        self.esdp.sys_task_run
     }
     /// User priority of a live process.
     pub fn process_priority(&self, pid: Pid) -> Option<Priority> {
@@ -6488,18 +6523,25 @@ impl<T: Task> Runner<'_, T> {
         // The handling scheduler's own esdp, as erts' erts_internal_dirty_process_handle_signals_1
         // runs the target's signals with `c_p` the target and `esdp` the caller's scheduler.
         let task = cell.task_mut();
-        let mut ctx = RunCtx {
-            inner: self,
-            proc: &process.shared,
-            esdp,
+        let state = process.input.state().load(Ordering::SeqCst);
+        let caller = esdp.counters();
+        esdp.set_counters(SliceCounters {
             reds_used: 0,
             budget: reds,
             sys_task_run: false,
-            dirty_running: process.input.state().load(Ordering::SeqCst) & psflg::DIRTY_RUNNING != 0,
-            dirty_queued: process.input.state().load(Ordering::SeqCst) & psflg::DIRTY_WORK != 0
-                && process.input.state().load(Ordering::SeqCst) & psflg::DIRTY_RUNNING == 0,
+            dirty_running: state & psflg::DIRTY_RUNNING != 0,
+            dirty_queued: state & psflg::DIRTY_WORK != 0 && state & psflg::DIRTY_RUNNING == 0,
+        });
+        let result = {
+            let mut ctx = RunCtx {
+                inner: self,
+                proc: &process.shared,
+                esdp: &mut *esdp,
+            };
+            handle(task, &mut ctx)
         };
-        handle(task, &mut ctx)
+        esdp.set_counters(caller);
+        result
     }
 }
 
@@ -9551,15 +9593,17 @@ fn run_slice<T: Task>(esdp: &mut ErtsSchedulerData<T>, process: ProcRef<T>) -> S
         let result = {
             let task = cell.task_mut();
             esdp.schedule_in(accounting_flags, || task.gc_nanoseconds());
-            let mut ctx = RunCtx {
-                inner: &mut runner,
-                proc: &process.shared,
-                esdp,
+            esdp.set_counters(SliceCounters {
                 reds_used: 0,
                 budget,
                 sys_task_run,
                 dirty_running: false,
                 dirty_queued: false,
+            });
+            let mut ctx = RunCtx {
+                inner: &mut runner,
+                proc: &process.shared,
+                esdp,
             };
             if ctx.esdp.msacc_enabled {
                 ctx.set_msacc_state(MsaccState::Emulator);
@@ -9586,7 +9630,12 @@ fn run_slice<T: Task>(esdp: &mut ErtsSchedulerData<T>, process: ProcRef<T>) -> S
             let active_ns = accounting_started.map_or(0, |started| {
                 started.elapsed().as_nanos().min(u64::MAX as u128) as u64
             });
-            (outcome, ctx.reds_used, ctx.esdp.virtual_reds, active_ns)
+            (
+                outcome,
+                ctx.esdp.reds_used,
+                ctx.esdp.virtual_reds,
+                active_ns,
+            )
         };
         runner.flush();
         result
@@ -9637,15 +9686,17 @@ fn run_process<T: Task>(esdp: &mut ErtsSchedulerData<T>, process: ProcRef<T>) ->
     let (outcome, reds_used, virtual_reds, active_ns) = {
         let task = cell.task_mut();
         esdp.schedule_in(accounting_flags, || task.gc_nanoseconds());
-        let mut ctx = RunCtx {
-            inner: &mut runner,
-            proc: &process.shared,
-            esdp,
+        esdp.set_counters(SliceCounters {
             reds_used: 0,
             budget,
             sys_task_run,
             dirty_running: false,
             dirty_queued: false,
+        });
+        let mut ctx = RunCtx {
+            inner: &mut runner,
+            proc: &process.shared,
+            esdp,
         };
         if ctx.esdp.msacc_enabled {
             ctx.set_msacc_state(MsaccState::Emulator);
@@ -9665,7 +9716,12 @@ fn run_process<T: Task>(esdp: &mut ErtsSchedulerData<T>, process: ProcRef<T>) ->
         let active_ns = accounting_started.map_or(0, |started| {
             started.elapsed().as_nanos().min(u64::MAX as u128) as u64
         });
-        (outcome, ctx.reds_used, ctx.esdp.virtual_reds, active_ns)
+        (
+            outcome,
+            ctx.esdp.reds_used,
+            ctx.esdp.virtual_reds,
+            active_ns,
+        )
     };
     runner.flush();
     if matches!(outcome, RunOutcome::Exit(_)) {
