@@ -13,7 +13,7 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_HOSTNAME: usize = 253;
 const MAX_NODE: usize = 257;
@@ -927,19 +927,37 @@ fn terminate_child(pid: i32) {
     }
 }
 
+/// `gettimeofday(&now, NULL)` as `(tv_sec, tv_usec)`.
+fn gettimeofday() -> (i64, i64) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    (now.as_secs() as i64, i64::from(now.subsec_micros()))
+}
+
 // Port of lib/erl_interface/src/prog/erl_call.c (wait_for_erlang), OTP-29.1.1.
 fn wait_for_erlang(listener: &TcpListener, magic: i32, timeout: Duration) -> Result<bool, i32> {
-    let deadline = Instant::now() + timeout;
+    // gettimeofday(&now, NULL); stop_time = now + timeout, normalised as erl_call.c does.
+    let now = gettimeofday();
+    let mut stop_sec = now.0 + timeout.as_secs() as i64;
+    let mut stop_usec = now.1 + i64::from(timeout.subsec_micros());
+    while stop_usec > 1_000_000 {
+        stop_sec += 1;
+        stop_usec -= 1_000_000;
+    }
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        // Adjust the timeout to (stop_time - now).
+        let now = gettimeofday();
+        let mut to_sec = stop_sec - now.0;
+        let mut to_usec = stop_usec - now.1;
+        while to_usec < 0 && to_sec > 0 {
+            to_usec += 1_000_000;
+            to_sec -= 1;
+        }
+        if to_sec < 0 {
             return Ok(false);
         }
-        match raw::wait_readable(
-            listener.as_raw_fd(),
-            remaining.as_secs() as i64,
-            remaining.subsec_nanos() as i64,
-        ) {
+        match raw::wait_readable(listener.as_raw_fd(), to_sec, to_usec * 1000) {
             Ok(false) => return Ok(false),
             Err(errno) => return Err(errno),
             Ok(true) => {}
