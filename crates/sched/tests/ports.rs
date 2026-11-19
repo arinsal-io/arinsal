@@ -3,7 +3,7 @@
 //! (erl_port_task.c erts_port_task_execute, erl_process.c schedule/try_steal_task).
 
 use arinsal_sched::{
-    Config, PortExecution, PortRunQueue, RunCtx, RunOutcome, RunPort, Scheduler, Task,
+    Config, PortExecution, PortRunQueue, RunOutcome, RunPort, Scheduler, Task,
     current_normal_scheduler,
 };
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -59,8 +59,13 @@ struct Idle;
 impl Task for Idle {
     type Message = ();
     type SchedulerData = ();
-    fn run(&mut self, _: &mut RunCtx<()>, _: &mut (), _: u32, _calls: &mut u32) -> RunOutcome {
-        RunOutcome::Exit(0)
+    fn run(
+        c_p: &mut arinsal_sched::CP<'_, Self>,
+        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        _: u32,
+        _calls: &mut u32,
+    ) -> RunOutcome {
+        esdp.with_ctx(c_p, |_, _, _| RunOutcome::Exit(0))
     }
 }
 
@@ -71,19 +76,20 @@ impl Task for Busy {
     type Message = ();
     type SchedulerData = ();
     fn run(
-        &mut self,
-        ctx: &mut RunCtx<()>,
-        _: &mut (),
+        c_p: &mut arinsal_sched::CP<'_, Self>,
+        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
         budget: u32,
         calls: &mut u32,
     ) -> RunOutcome {
-        if self.0.load(Ordering::Relaxed) {
-            return RunOutcome::Exit(0);
-        }
-        self.1
-            .store(ctx.scheduler_id().unwrap_or(usize::MAX), Ordering::Relaxed);
-        *calls = budget;
-        RunOutcome::Yield
+        esdp.with_ctx(c_p, |this, _, ctx| {
+            if this.0.load(Ordering::Relaxed) {
+                return RunOutcome::Exit(0);
+            }
+            this.1
+                .store(ctx.scheduler_id().unwrap_or(usize::MAX), Ordering::Relaxed);
+            *calls = budget;
+            RunOutcome::Yield
+        })
     }
 }
 

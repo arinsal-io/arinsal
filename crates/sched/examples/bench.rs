@@ -1,6 +1,6 @@
 //! Release-mode dummy-task benchmarks: `cargo run -r -p arinsal-sched --example bench -- all`.
 
-use arinsal_sched::{Config, Pid, RunCtx, RunOutcome, Scheduler, Task};
+use arinsal_sched::{Config, Pid, RunOutcome, Scheduler, Task};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -27,66 +27,67 @@ impl Task for Dummy {
     type Message = ();
     type SchedulerData = ();
     fn run(
-        &mut self,
-        ctx: &mut RunCtx<()>,
-        _: &mut (),
+        c_p: &mut arinsal_sched::CP<'_, Self>,
+        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
         budget: u32,
         calls: &mut u32,
     ) -> RunOutcome {
-        match &mut self.mode {
-            Mode::Forward(to) => {
-                while ctx.receive().is_some() {
-                    let n = self.count.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n < self.limit {
+        esdp.with_ctx(c_p, |this, _, ctx| {
+            match &mut this.mode {
+                Mode::Forward(to) => {
+                    while ctx.receive().is_some() {
+                        let n = this.count.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n < this.limit {
+                            ctx.send(*to, ()).unwrap();
+                        }
+                        *calls += 4;
+                        if *calls >= budget {
+                            return RunOutcome::Yield;
+                        }
+                    }
+                }
+                Mode::Sink => {
+                    while ctx.receive().is_some() {
+                        this.count.fetch_add(1, Ordering::Relaxed);
+                        *calls += 1;
+                        if *calls >= budget {
+                            return RunOutcome::Yield;
+                        }
+                    }
+                }
+                Mode::Burst(to, count) => {
+                    while *count > 0 {
                         ctx.send(*to, ()).unwrap();
+                        *count -= 1;
+                        *calls += 4;
+                        if *calls >= budget {
+                            return RunOutcome::Yield;
+                        }
                     }
-                    *calls += 4;
-                    if *calls >= budget {
-                        return RunOutcome::Yield;
+                    return RunOutcome::Exit(0);
+                }
+                Mode::Fanout {
+                    receivers,
+                    remaining,
+                    next,
+                } => {
+                    while *remaining > 0 {
+                        ctx.send(receivers[*next], ()).unwrap();
+                        *remaining -= 1;
+                        *next = (*next + 1) % receivers.len();
+                        *calls += 4;
+                        if *calls >= budget {
+                            return RunOutcome::Yield;
+                        }
                     }
+                    return RunOutcome::Exit(0);
+                }
+                Mode::Idle(started) => {
+                    started.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            Mode::Sink => {
-                while ctx.receive().is_some() {
-                    self.count.fetch_add(1, Ordering::Relaxed);
-                    *calls += 1;
-                    if *calls >= budget {
-                        return RunOutcome::Yield;
-                    }
-                }
-            }
-            Mode::Burst(to, count) => {
-                while *count > 0 {
-                    ctx.send(*to, ()).unwrap();
-                    *count -= 1;
-                    *calls += 4;
-                    if *calls >= budget {
-                        return RunOutcome::Yield;
-                    }
-                }
-                return RunOutcome::Exit(0);
-            }
-            Mode::Fanout {
-                receivers,
-                remaining,
-                next,
-            } => {
-                while *remaining > 0 {
-                    ctx.send(receivers[*next], ()).unwrap();
-                    *remaining -= 1;
-                    *next = (*next + 1) % receivers.len();
-                    *calls += 4;
-                    if *calls >= budget {
-                        return RunOutcome::Yield;
-                    }
-                }
-                return RunOutcome::Exit(0);
-            }
-            Mode::Idle(started) => {
-                started.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        RunOutcome::Wait { timeout_ms: None }
+            RunOutcome::Wait { timeout_ms: None }
+        })
     }
 }
 

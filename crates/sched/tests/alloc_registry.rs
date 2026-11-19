@@ -2,7 +2,7 @@
 //! instance 0 (erts_alloc_register_scheduler). One test per process: registration is global.
 
 use arinsal_alloc::typed::{AllocBlock, ErtsAlcType, instance_count};
-use arinsal_sched::{Config, RunCtx, RunOutcome, Scheduler, Task};
+use arinsal_sched::{Config, RunOutcome, Scheduler, Task};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -11,8 +11,13 @@ struct Idle;
 impl Task for Idle {
     type Message = ();
     type SchedulerData = ();
-    fn run(&mut self, _: &mut RunCtx<()>, _: &mut (), _: u32, _calls: &mut u32) -> RunOutcome {
-        RunOutcome::Exit(0)
+    fn run(
+        c_p: &mut arinsal_sched::CP<'_, Self>,
+        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        _: u32,
+        _calls: &mut u32,
+    ) -> RunOutcome {
+        esdp.with_ctx(c_p, |_, _, _| RunOutcome::Exit(0))
     }
 }
 

@@ -3,7 +3,7 @@
 //! (`+sfwi`, erl_process.c `runq_supervisor`), which is off by default: then the work waits
 //! until the call returns. With the supervisor on, an idle scheduler takes the work over
 //! (`wake_scheduler_on_empty_runq`, `try_steal_task`).
-use arinsal_sched::{Config, Priority, RunCtx, RunOutcome, Scheduler, Task};
+use arinsal_sched::{Config, Priority, RunOutcome, Scheduler, Task};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -18,19 +18,26 @@ enum Probe {
 impl Task for Probe {
     type Message = ();
     type SchedulerData = ();
-    fn run(&mut self, _ctx: &mut RunCtx<()>, _: &mut (), _: u32, _calls: &mut u32) -> RunOutcome {
-        match self {
-            Probe::Block { running, release } => {
-                running.store(true, Ordering::Release);
-                while !release.load(Ordering::Acquire) {
-                    std::thread::sleep(Duration::from_millis(1));
+    fn run(
+        c_p: &mut arinsal_sched::CP<'_, Self>,
+        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        _: u32,
+        _calls: &mut u32,
+    ) -> RunOutcome {
+        esdp.with_ctx(c_p, |this, _, _ctx| {
+            match this {
+                Probe::Block { running, release } => {
+                    running.store(true, Ordering::Release);
+                    while !release.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                Probe::Quick(done) => {
+                    done.fetch_add(1, Ordering::AcqRel);
                 }
             }
-            Probe::Quick(done) => {
-                done.fetch_add(1, Ordering::AcqRel);
-            }
-        }
-        RunOutcome::Exit(0)
+            RunOutcome::Exit(0)
+        })
     }
 }
 

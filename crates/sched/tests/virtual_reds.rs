@@ -2,7 +2,7 @@
 // Port of erts/emulator/beam/erl_process.c:9678 (`reds = actual_reds = calls -
 // esdp->virtual_reds`) and erl_process.h:529 (ERTS_PROC_REDUCTIONS_EXECUTED), OTP-29.1.1.
 
-use arinsal_sched::{Config, RunCtx, RunOutcome, Scheduler, Task};
+use arinsal_sched::{Config, RunOutcome, Scheduler, Task};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -15,11 +15,18 @@ struct Slice {
 impl Task for Slice {
     type Message = ();
     type SchedulerData = ();
-    fn run(&mut self, ctx: &mut RunCtx<()>, _: &mut (), _: u32, calls: &mut u32) -> RunOutcome {
-        *calls = self.consumed;
-        ctx.add_virtual_reds(self.virtual_reds);
-        let _ = self.done.send(());
-        RunOutcome::Exit(0)
+    fn run(
+        c_p: &mut arinsal_sched::CP<'_, Self>,
+        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        _: u32,
+        calls: &mut u32,
+    ) -> RunOutcome {
+        esdp.with_ctx(c_p, |this, _, ctx| {
+            *calls = this.consumed;
+            ctx.add_virtual_reds(this.virtual_reds);
+            let _ = this.done.send(());
+            RunOutcome::Exit(0)
+        })
     }
 }
 

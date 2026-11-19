@@ -71,6 +71,12 @@ impl<C> ProcLock<C> {
     pub(crate) fn get_mut(&mut self) -> &mut C {
         self.data.get_mut()
     }
+
+    /// The data's address, with the lock's interior-mutable provenance; dereferencing it
+    /// mutably requires that the caller holds the lock.
+    pub(crate) fn data_ptr(&self) -> *mut C {
+        self.data.get()
+    }
 }
 
 impl<C> std::ops::Deref for ProcLockGuard<'_, C> {

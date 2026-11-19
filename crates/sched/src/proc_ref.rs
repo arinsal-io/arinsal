@@ -8,10 +8,12 @@
 //! erts_schedule_thr_prgr_later_cleanup_op), OTP-29.1.1. Every `unsafe` of the process lifetime is
 //! in this module.
 
-use super::{Event, Incoming, Process, SignalMessage, Task};
+use super::{Event, Incoming, Pid, ProcShared, Process, SignalMessage, Task};
 use crate::ptab_slot::Progress;
 use arinsal_alloc::typed::{ErtsAlcType, fix_alloc_payload_at, fix_free_payload_at};
+use raw::ProcLockGuard;
 use std::any::TypeId;
+use std::marker::PhantomData;
 use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering, fence};
@@ -375,6 +377,64 @@ impl<M: SignalMessage> SignalProbe<M> {
     /// The process's receive timer.
     pub(crate) fn timer(&self) -> &crate::ReceiveTimer {
         self.field(self.timer)
+    }
+}
+
+/// `Process *c_p`: the one pointer to the running process struct, which the scheduler derives
+/// from the reference it holds while it holds the main lock. It reaches the task (the first
+/// member, guarded by the lock) and the shared part of the same struct, so code given the
+/// running process reaches every field of it, as erts code reaches any field from `c_p`. It
+/// has no state of its own.
+// Port of erts/emulator/beam/erl_process.c:9607 (erts_schedule returns the `Process *` that
+// process_main runs, with ERTS_PROC_LOCK_MAIN held), OTP-29.1.1.
+pub struct CP<'a, T: Task> {
+    p: &'a Process<T>,
+    /// The slice holds the main lock: the task is reached only through this handle for `'a`.
+    _locked: PhantomData<&'a mut TaskCell<T>>,
+}
+
+impl<'a, T: Task> CP<'a, T> {
+    /// `c_p` of `process`, whose main lock the caller holds in `locked` for `'a`.
+    pub(crate) fn new(
+        process: &'a Process<T>,
+        locked: &'a mut ProcLockGuard<'_, TaskCell<T>>,
+    ) -> Self {
+        debug_assert!(std::ptr::eq(
+            &**locked,
+            process.cell.data_ptr().cast_const()
+        ));
+        Self {
+            p: process,
+            _locked: PhantomData,
+        }
+    }
+
+    /// The task part of the process (the VM's `Process` fields).
+    #[inline(always)]
+    pub fn task(&mut self) -> &mut T {
+        // SAFETY: `p` is a live `&Process<T>` for `'a`, and the cell is reached through its
+        // `UnsafeCell` (`data_ptr`), so the shared provenance allows the write. The main
+        // lock is held for `'a` and its guard is mutably borrowed by this handle, so no other
+        // reference to the cell exists while the returned borrow of `self` lives.
+        unsafe { (*self.p.cell.data_ptr()).task_mut() }
+    }
+
+    /// The scheduler-side part of the process (`p->state`, signal queues, flags).
+    #[inline(always)]
+    pub(crate) fn shared(&self) -> &'a ProcShared<T::Message> {
+        &self.p.shared
+    }
+
+    /// `c_p->common.id`.
+    #[inline(always)]
+    pub fn pid(&self) -> Pid {
+        self.shared().pid
+    }
+
+    /// `c_p->state` ([`crate::psflg`]).
+    #[inline(always)]
+    pub fn state(&self) -> &'a AtomicU32 {
+        self.shared().input.state()
     }
 }
 

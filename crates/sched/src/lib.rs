@@ -36,19 +36,26 @@
 //! permit if it precedes `thread::park`.
 //!
 //! ```
-//! use arinsal_sched::{Config, RunCtx, RunOutcome, Scheduler, Task};
+//! use arinsal_sched::{CP, Config, ErtsSchedulerData, RunOutcome, Scheduler, Task};
 //!
 //! struct Echo;
 //! impl Task for Echo {
 //!     type Message = u64; // Replace with a VM heap-fragment envelope.
 //!     type SchedulerData = ();
-//!     fn run(&mut self, ctx: &mut RunCtx<Self::Message>, _: &mut (), _budget: u32, _calls: &mut u32) -> RunOutcome {
-//!         if let Some(event) = ctx.receive() {
-//!             if let arinsal_sched::Payload::Message(value) = event.payload {
-//!                 let _ = ctx.send(event.from, value);
+//!     fn run(
+//!         c_p: &mut CP<'_, Self>,
+//!         esdp: &mut ErtsSchedulerData<Self>,
+//!         _budget: u32,
+//!         _calls: &mut u32,
+//!     ) -> RunOutcome {
+//!         esdp.with_ctx(c_p, |_, _, ctx| {
+//!             if let Some(event) = ctx.receive() {
+//!                 if let arinsal_sched::Payload::Message(value) = event.payload {
+//!                     let _ = ctx.send(event.from, value);
+//!                 }
 //!             }
-//!         }
-//!         RunOutcome::Wait { timeout_ms: None }
+//!             RunOutcome::Wait { timeout_ms: None }
+//!         })
 //!     }
 //! }
 //! let sched = Scheduler::<Echo>::new(Config::default());
@@ -83,8 +90,8 @@ pub use sig_queue::{
 pub use timer::{TimerId, TimerRef};
 
 use arinsal_term::ptab::{PTAB_ID_DATA_MASK, PtabIdRing};
-pub use proc_ref::SignalProbe;
 use proc_ref::raw::{ProcLock, ProcLockGuard};
+pub use proc_ref::{CP, SignalProbe};
 use proc_ref::{ErasedProcRef, ProcRef, TaskCell};
 use std::any::Any;
 use std::cell::RefCell;
@@ -1172,42 +1179,50 @@ pub trait Task: Send + 'static {
     /// Task-side part of one scheduler's data (`ErtsSchedulerData`): created once per normal
     /// or dirty scheduler and lent to every [`Task::run`] on it.
     type SchedulerData: Default + Send + 'static;
-    /// Execute cooperatively, consuming at most `budget` reductions (`p->fcalls = reds`), on
-    /// the scheduler whose data is `data`, and store in `calls` the reductions the slice used
+    /// Execute the process `c_p` cooperatively, consuming at most `budget` reductions
+    /// (`p->fcalls = reds`), on the scheduler whose data is `esdp`, and store in `calls` the reductions the slice used
     /// (`REDS_IN - FCALLS` from `c_p->fcalls`, or the dirty scheduler's own count), which
     /// the scheduler passes on to `erts_schedule(esdp, p, calls)`.
     ///
     /// Port of erts/emulator/beam/erl_process.c:9607 (erts_schedule returns the process to
     /// run to process_main, which keeps `esdp` at hand), OTP-29.1.1.
     fn run(
-        &mut self,
-        ctx: &mut RunCtx<Self::Message>,
-        data: &mut Self::SchedulerData,
+        c_p: &mut CP<'_, Self>,
+        esdp: &mut ErtsSchedulerData<Self>,
         budget: u32,
         calls: &mut u32,
-    ) -> RunOutcome;
+    ) -> RunOutcome
+    where
+        Self: Sized;
     /// `copy_in_registers(c_p, reg)`: load the saved argument registers into this scheduler's
-    /// register array before the slice runs.
+    /// register array (`esdp->registers`) before the slice runs.
     ///
     /// Port of erts/emulator/beam/beam_common.c:336 (copy_in_registers, called by process_main
     /// after erts_schedule returns), OTP-29.1.1.
-    fn copy_in_registers(&mut self, _data: &mut Self::SchedulerData) {}
+    fn copy_in_registers(_c_p: &mut CP<'_, Self>, _esdp: &mut ErtsSchedulerData<Self>)
+    where
+        Self: Sized,
+    {
+    }
     /// `copy_out_registers(c_p, reg)`: save the `c_p->arity` live registers out of this
     /// scheduler's register array when the slice switches out.
     ///
     /// Port of erts/emulator/beam/beam_common.c:306 (copy_out_registers, called by
     /// process_main before erts_schedule), OTP-29.1.1.
-    fn copy_out_registers(&mut self, _data: &mut Self::SchedulerData) {}
+    fn copy_out_registers(_c_p: &mut CP<'_, Self>, _esdp: &mut ErtsSchedulerData<Self>)
+    where
+        Self: Sized,
+    {
+    }
     /// `trace_schedule_in(p, state)`: the schedule-in trace events of a traced process,
     /// emitted once the process is picked, before its slice runs.
     ///
     /// Port of erts/emulator/beam/erl_process.c:10508 (trace_schedule_in, called by
     /// erts_schedule when ERTS_IS_P_TRACED(p)), OTP-29.1.1.
-    fn trace_schedule_in(
-        &mut self,
-        _ctx: &mut RunCtx<Self::Message>,
-        _data: &mut Self::SchedulerData,
-    ) {
+    fn trace_schedule_in(_c_p: &mut CP<'_, Self>, _esdp: &mut ErtsSchedulerData<Self>)
+    where
+        Self: Sized,
+    {
     }
     /// `trace_schedule_out(p, state)`: the schedule-out trace events of a traced process
     /// whose slice ended with `outcome`.
@@ -1215,11 +1230,12 @@ pub trait Task: Send + 'static {
     /// Port of erts/emulator/beam/erl_process.c:10548 (trace_schedule_out, called by
     /// erts_schedule when ERTS_IS_P_TRACED(p)), OTP-29.1.1.
     fn trace_schedule_out(
-        &mut self,
-        _ctx: &mut RunCtx<Self::Message>,
-        _data: &mut Self::SchedulerData,
+        _c_p: &mut CP<'_, Self>,
+        _esdp: &mut ErtsSchedulerData<Self>,
         _outcome: &RunOutcome,
-    ) {
+    ) where
+        Self: Sized,
+    {
     }
     /// Release task-owned runtime registrations after all workers have stopped.
     fn scheduler_shutdown(&mut self) {}
@@ -5622,7 +5638,7 @@ pub struct RunCtx<'a, M: SignalMessage> {
 /// thread's lifetime.
 // Port of erts/emulator/beam/erl_process.h:687 (struct ErtsSchedulerData_), OTP-29.1.1, in
 // its field order where Arinsal has the field.
-struct ErtsSchedulerData<T: Task> {
+pub struct ErtsSchedulerData<T: Task> {
     /// `registers`, with the rest of the VM's per-scheduler part (code replica).
     registers: T::SchedulerData,
     /// `timer_wheel`, `next_tmo_ref`, `timer_service` and `aux_work_data` of a normal
@@ -5697,6 +5713,55 @@ impl EsdpCore {
         } else {
             0
         };
+    }
+}
+
+impl<T: Task> ErtsSchedulerData<T> {
+    /// `esdp->registers` with the rest of the task's per-scheduler part.
+    #[inline(always)]
+    pub fn registers(&mut self) -> &mut T::SchedulerData {
+        &mut self.registers
+    }
+
+    /// The signal and timer operations of this scheduler (the run queue it points into and its
+    /// local state): two field reads, no state.
+    #[inline(always)]
+    fn runner(&self) -> Runner<'_, T> {
+        Runner {
+            inner: &self.run_queue,
+            local: self.local.as_deref(),
+            // A normal scheduler, the one with local state, is a managed thread.
+            managed: self.local.is_some(),
+        }
+    }
+
+    /// Run `f` on the task of `c_p`, this scheduler's `registers` and a [`RunCtx`] over
+    /// `esdp` and `c_p`: the code that still takes a `RunCtx` reaches the scheduler through it.
+    #[inline(always)]
+    pub fn with_ctx<R>(
+        &mut self,
+        c_p: &mut CP<'_, T>,
+        f: impl FnOnce(&mut T, &mut T::SchedulerData, &mut RunCtx<'_, T::Message>) -> R,
+    ) -> R {
+        let shared = c_p.shared();
+        let ErtsSchedulerData {
+            registers,
+            local,
+            core,
+            run_queue,
+            ..
+        } = self;
+        let mut runner = Runner {
+            inner: run_queue,
+            local: local.as_deref(),
+            managed: local.is_some(),
+        };
+        let mut ctx = RunCtx {
+            inner: &mut runner,
+            proc: shared,
+            esdp: core,
+        };
+        f(c_p.task(), registers, &mut ctx)
     }
 }
 
@@ -8431,18 +8496,19 @@ mod spawn_request_tests {
         type SchedulerData = ();
 
         fn run(
-            &mut self,
-            ctx: &mut RunCtx<'_, ()>,
-            _: &mut (),
+            c_p: &mut crate::CP<'_, Self>,
+            esdp: &mut crate::ErtsSchedulerData<Self>,
             _: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
-            while let Some(event) = ctx.receive() {
-                if matches!(event.payload, Payload::Signal(Signal::Link)) {
-                    self.0.fetch_add(1, Ordering::Relaxed);
+            esdp.with_ctx(c_p, |this, _, ctx| {
+                while let Some(event) = ctx.receive() {
+                    if matches!(event.payload, Payload::Signal(Signal::Link)) {
+                        this.0.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
-            }
-            RunOutcome::Wait { timeout_ms: None }
+                RunOutcome::Wait { timeout_ms: None }
+            })
         }
     }
 
@@ -8488,13 +8554,12 @@ mod dirty_state_tests {
         type SchedulerData = ();
 
         fn run(
-            &mut self,
-            _ctx: &mut RunCtx<'_, ()>,
-            _: &mut (),
+            c_p: &mut crate::CP<'_, Self>,
+            esdp: &mut crate::ErtsSchedulerData<Self>,
             _: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
-            RunOutcome::Wait { timeout_ms: None }
+            esdp.with_ctx(c_p, |_, _, _ctx| RunOutcome::Wait { timeout_ms: None })
         }
     }
 
@@ -8747,13 +8812,12 @@ mod offline_scheduler_tests {
         type SchedulerData = ();
 
         fn run(
-            &mut self,
-            _ctx: &mut RunCtx<'_, ()>,
-            _: &mut (),
+            c_p: &mut crate::CP<'_, Self>,
+            esdp: &mut crate::ErtsSchedulerData<Self>,
             _budget: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
-            RunOutcome::Yield
+            esdp.with_ctx(c_p, |_, _, _ctx| RunOutcome::Yield)
         }
     }
 
@@ -8797,36 +8861,37 @@ mod proxy_requeue_tests {
         type SchedulerData = ();
 
         fn run(
-            &mut self,
-            ctx: &mut RunCtx<'_, ()>,
-            _: &mut (),
+            c_p: &mut crate::CP<'_, Self>,
+            esdp: &mut crate::ErtsSchedulerData<Self>,
             _budget: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
-            match self {
-                Probe::Blocker(release) => {
-                    while !release.load(Ordering::Acquire) {
-                        std::thread::yield_now();
+            esdp.with_ctx(c_p, |this, _, ctx| {
+                match this {
+                    Probe::Blocker(release) => {
+                        while !release.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                    }
+                    Probe::Yielder(runs) => {
+                        return if runs.fetch_add(1, Ordering::AcqRel) == 0 {
+                            RunOutcome::Yield
+                        } else {
+                            RunOutcome::Exit(0)
+                        };
+                    }
+                    Probe::SelfWaker(runs) => {
+                        if runs.fetch_add(1, Ordering::AcqRel) == 0 {
+                            let me = ctx.pid();
+                            ctx.send(me, ()).unwrap();
+                        } else {
+                            // The message is never consumed, so leave for good on the second run.
+                            return RunOutcome::Exit(0);
+                        }
                     }
                 }
-                Probe::Yielder(runs) => {
-                    return if runs.fetch_add(1, Ordering::AcqRel) == 0 {
-                        RunOutcome::Yield
-                    } else {
-                        RunOutcome::Exit(0)
-                    };
-                }
-                Probe::SelfWaker(runs) => {
-                    if runs.fetch_add(1, Ordering::AcqRel) == 0 {
-                        let me = ctx.pid();
-                        ctx.send(me, ()).unwrap();
-                    } else {
-                        // The message is never consumed, so leave for good on the second run.
-                        return RunOutcome::Exit(0);
-                    }
-                }
-            }
-            RunOutcome::Wait { timeout_ms: None }
+                RunOutcome::Wait { timeout_ms: None }
+            })
         }
     }
 
@@ -9051,13 +9116,12 @@ mod rq_double_enqueue_tests {
         type SchedulerData = ();
 
         fn run(
-            &mut self,
-            _ctx: &mut RunCtx<'_, ()>,
-            _: &mut (),
+            c_p: &mut crate::CP<'_, Self>,
+            esdp: &mut crate::ErtsSchedulerData<Self>,
             _budget: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
-            RunOutcome::Yield
+            esdp.with_ctx(c_p, |_, _, _ctx| RunOutcome::Yield)
         }
     }
 
@@ -9503,18 +9567,11 @@ fn run_slice<T: Task>(esdp: &mut ErtsSchedulerData<T>, process: ProcRef<T>) -> S
         .dirty_no
         .map(|(kind, _)| kind)
         .expect("a dirty scheduler has its pool");
-    let ErtsSchedulerData {
-        registers: data,
-        core: esdp,
-        run_queue: inner,
-        ..
-    } = esdp;
-    let inner: &Inner<T> = inner;
-    let worker = esdp.worker;
+    let worker = esdp.core.worker;
     // Port of erts/emulator/beam/erl_process.c:10183 (schedule: `reds = context_reds` for
     // every process scheduled in), OTP-29.1.1.
-    let budget = inner.config.reductions;
-    let accounting_flags = inner.accounting_flags.load(Ordering::Relaxed);
+    let budget = esdp.run_queue.config.reductions;
+    let accounting_flags = esdp.run_queue.accounting_flags.load(Ordering::Relaxed);
     let accounting_started = (accounting_flags & ACCOUNTING_WALL != 0).then(Instant::now);
     let mut cell = lock_cell(&process);
     if let Some(job) = cell.task_mut().take_dirty_job(kind) {
@@ -9528,50 +9585,44 @@ fn run_slice<T: Task>(esdp: &mut ErtsSchedulerData<T>, process: ProcRef<T>) -> S
         cell.task_mut().finish_dirty_job(result);
     }
     let (outcome, reds_used, virtual_reds, active_ns) = {
-        let mut runner = Runner {
-            inner,
-            local: None,
-            managed: false,
-        };
-        let result = {
-            let task = cell.task_mut();
-            esdp.schedule_in(accounting_flags, || task.gc_nanoseconds());
-            let mut ctx = RunCtx {
-                inner: &mut runner,
-                proc: &process.shared,
-                esdp,
-            };
-            if ctx.esdp.msacc_enabled {
-                ctx.set_msacc_state(MsaccState::Emulator);
-            }
-            // A normal scheduler thread already has its type, like `esdp->type`.
-            let thread_type = worker
-                .is_none()
-                .then(|| SCHEDULER_TYPE.with(|current| current.replace(ctx.esdp.sched_type)));
-            // Port of erts/emulator/beam/beam_common.c:179-300 (erts_dirty_process_main:
-            // copy_in_registers after erts_schedule, copy_out_registers before the next),
-            // OTP-29.1.1.
-            task.trace_schedule_in(&mut ctx, data);
-            task.copy_in_registers(data);
-            let mut calls = 0;
-            let outcome = task.run(&mut ctx, data, budget, &mut calls);
-            task.copy_out_registers(data);
-            task.trace_schedule_out(&mut ctx, data, &outcome);
-            if let Some(thread_type) = thread_type {
-                SCHEDULER_TYPE.with(|current| current.set(thread_type));
-            }
-            if ctx.esdp.msacc_enabled {
-                ctx.set_msacc_state(MsaccState::Other);
-                ctx.account_gc_total(task.gc_nanoseconds());
-            }
-            let active_ns = accounting_started.map_or(0, |started| {
-                started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+        let mut c_p = CP::new(&process, &mut cell);
+        esdp.core
+            .schedule_in(accounting_flags, || c_p.task().gc_nanoseconds());
+        if esdp.core.msacc_enabled {
+            esdp.with_ctx(&mut c_p, |_, _, ctx| {
+                ctx.set_msacc_state(MsaccState::Emulator)
             });
-            (outcome, calls, ctx.esdp.virtual_reds, active_ns)
-        };
-        runner.flush();
-        result
+        }
+        // A normal scheduler thread already has its type, like `esdp->type`.
+        let thread_type = worker
+            .is_none()
+            .then(|| SCHEDULER_TYPE.with(|current| current.replace(esdp.core.sched_type)));
+        // Port of erts/emulator/beam/beam_common.c:179-300 (erts_dirty_process_main:
+        // copy_in_registers after erts_schedule, copy_out_registers before the next),
+        // OTP-29.1.1.
+        T::trace_schedule_in(&mut c_p, esdp);
+        T::copy_in_registers(&mut c_p, esdp);
+        let mut calls = 0;
+        let outcome = T::run(&mut c_p, esdp, budget, &mut calls);
+        T::copy_out_registers(&mut c_p, esdp);
+        T::trace_schedule_out(&mut c_p, esdp, &outcome);
+        if let Some(thread_type) = thread_type {
+            SCHEDULER_TYPE.with(|current| current.set(thread_type));
+        }
+        if esdp.core.msacc_enabled {
+            let gc_ns = c_p.task().gc_nanoseconds();
+            esdp.with_ctx(&mut c_p, |_, _, ctx| {
+                ctx.set_msacc_state(MsaccState::Other);
+                ctx.account_gc_total(gc_ns);
+            });
+        }
+        let active_ns = accounting_started.map_or(0, |started| {
+            started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+        });
+        (outcome, calls, esdp.core.virtual_reds, active_ns)
     };
+    esdp.runner().flush();
+    let inner: &Inner<T> = &esdp.run_queue;
     if matches!(outcome, RunOutcome::Exit(_)) {
         exit_cleanup(inner, &process, &mut cell);
     }
@@ -9591,59 +9642,47 @@ fn run_slice<T: Task>(esdp: &mut ErtsSchedulerData<T>, process: ProcRef<T>) -> S
 // Port of erts/emulator/beam/erl_process.c (erts_schedule: schedule-in half) and
 // jit/arm/process_main.cpp (process_main), OTP-29.1.1.
 fn run_process<T: Task>(esdp: &mut ErtsSchedulerData<T>, process: ProcRef<T>) -> SliceEnd<T> {
-    let ErtsSchedulerData {
-        registers: data,
-        local,
-        core: esdp,
-        run_queue: inner,
-        ..
-    } = esdp;
-    let inner: &Inner<T> = inner;
-    let local_cell: &RefCell<Local<T>> = local
-        .as_ref()
-        .expect("a normal scheduler has its local state");
-    // Port of erts/emulator/beam/erl_process.c:7028-7134 (active_sys_enqueue), OTP-29.1.1:
-    // keep the elevated priority while ordered system-task signals are still pending.
-    let budget = inner.config.reductions;
+    debug_assert!(
+        esdp.local.is_some(),
+        "a normal scheduler has its local state"
+    );
+    let budget = esdp.run_queue.config.reductions;
     // `schedule_next` has synchronized the scheduler's accounting state with these flags.
-    let accounting_flags = inner.accounting_flags.load(Ordering::Relaxed);
+    let accounting_flags = esdp.run_queue.accounting_flags.load(Ordering::Relaxed);
     let accounting_started = (accounting_flags & ACCOUNTING_WALL != 0).then(Instant::now);
     let mut cell = lock_cell(&process);
-    let mut runner = Runner {
-        inner,
-        local: Some(local_cell),
-        managed: true,
-    };
     let (outcome, reds_used, virtual_reds, active_ns) = {
-        let task = cell.task_mut();
-        esdp.schedule_in(accounting_flags, || task.gc_nanoseconds());
-        let mut ctx = RunCtx {
-            inner: &mut runner,
-            proc: &process.shared,
-            esdp,
-        };
-        if ctx.esdp.msacc_enabled {
-            ctx.set_msacc_state(MsaccState::Emulator);
+        let mut c_p = CP::new(&process, &mut cell);
+        esdp.core
+            .schedule_in(accounting_flags, || c_p.task().gc_nanoseconds());
+        if esdp.core.msacc_enabled {
+            esdp.with_ctx(&mut c_p, |_, _, ctx| {
+                ctx.set_msacc_state(MsaccState::Emulator)
+            });
         }
         // Port of erts/emulator/beam/jit/x86/process_main.cpp:200,277 and beam_emu.c:395,496
         // (process_main: copy_in_registers after erts_schedule returns, copy_out_registers
         // when the slice switches out), OTP-29.1.1.
-        task.trace_schedule_in(&mut ctx, data);
-        task.copy_in_registers(data);
+        T::trace_schedule_in(&mut c_p, esdp);
+        T::copy_in_registers(&mut c_p, esdp);
         let mut calls = 0;
-        let outcome = task.run(&mut ctx, data, budget, &mut calls);
-        task.copy_out_registers(data);
-        task.trace_schedule_out(&mut ctx, data, &outcome);
-        if ctx.esdp.msacc_enabled {
-            ctx.set_msacc_state(MsaccState::Other);
-            ctx.account_gc_total(task.gc_nanoseconds());
+        let outcome = T::run(&mut c_p, esdp, budget, &mut calls);
+        T::copy_out_registers(&mut c_p, esdp);
+        T::trace_schedule_out(&mut c_p, esdp, &outcome);
+        if esdp.core.msacc_enabled {
+            let gc_ns = c_p.task().gc_nanoseconds();
+            esdp.with_ctx(&mut c_p, |_, _, ctx| {
+                ctx.set_msacc_state(MsaccState::Other);
+                ctx.account_gc_total(gc_ns);
+            });
         }
         let active_ns = accounting_started.map_or(0, |started| {
             started.elapsed().as_nanos().min(u64::MAX as u128) as u64
         });
-        (outcome, calls, ctx.esdp.virtual_reds, active_ns)
+        (outcome, calls, esdp.core.virtual_reds, active_ns)
     };
-    runner.flush();
+    esdp.runner().flush();
+    let inner: &Inner<T> = &esdp.run_queue;
     if matches!(outcome, RunOutcome::Exit(_)) {
         exit_cleanup(inner, &process, &mut cell);
     }
@@ -11222,20 +11261,21 @@ mod worker_drop_tests {
         type SchedulerData = ();
 
         fn run(
-            &mut self,
-            _ctx: &mut RunCtx<'_, ()>,
-            _: &mut (),
+            c_p: &mut crate::CP<'_, Self>,
+            esdp: &mut crate::ErtsSchedulerData<Self>,
             _budget: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
-            // The last scheduler handle drops on this worker while its cell is locked.
-            match &self.slot {
-                Some(slot) => {
-                    drop(slot.lock().unwrap().take());
-                    RunOutcome::Exit(0)
+            esdp.with_ctx(c_p, |this, _, _ctx| {
+                // The last scheduler handle drops on this worker while its cell is locked.
+                match &this.slot {
+                    Some(slot) => {
+                        drop(slot.lock().unwrap().take());
+                        RunOutcome::Exit(0)
+                    }
+                    None => RunOutcome::Wait { timeout_ms: None },
                 }
-                None => RunOutcome::Wait { timeout_ms: None },
-            }
+            })
         }
 
         fn scheduler_shutdown(&mut self) {

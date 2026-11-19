@@ -1,4 +1,4 @@
-use arinsal_sched::{Config, Payload, RunCtx, RunOutcome, Scheduler, Task};
+use arinsal_sched::{Config, Payload, RunOutcome, Scheduler, Task};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -9,15 +9,22 @@ impl Task for Sink {
     type Message = u64;
     type SchedulerData = ();
 
-    fn run(&mut self, ctx: &mut RunCtx<u64>, _: &mut (), _: u32, _calls: &mut u32) -> RunOutcome {
-        while let Some(event) = ctx.receive() {
-            match event.payload {
-                Payload::Timer { message, .. } => self.0.lock().unwrap().push(*message),
-                Payload::Message(message) => self.0.lock().unwrap().push(message),
-                _ => unreachable!(),
+    fn run(
+        c_p: &mut arinsal_sched::CP<'_, Self>,
+        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        _: u32,
+        _calls: &mut u32,
+    ) -> RunOutcome {
+        esdp.with_ctx(c_p, |this, _, ctx| {
+            while let Some(event) = ctx.receive() {
+                match event.payload {
+                    Payload::Timer { message, .. } => this.0.lock().unwrap().push(*message),
+                    Payload::Message(message) => this.0.lock().unwrap().push(message),
+                    _ => unreachable!(),
+                }
             }
-        }
-        RunOutcome::Wait { timeout_ms: None }
+            RunOutcome::Wait { timeout_ms: None }
+        })
     }
 }
 
@@ -114,18 +121,25 @@ impl Task for ReentrantTimerTask {
     type Message = u64;
     type SchedulerData = ();
 
-    fn run(&mut self, ctx: &mut RunCtx<u64>, _: &mut (), _: u32, _calls: &mut u32) -> RunOutcome {
-        let Some(scheduler) = self.scheduler.get().and_then(Weak::upgrade) else {
-            return RunOutcome::Exit(1);
-        };
-        let Ok(timer) = scheduler.start_timer(ctx.pid(), 60_000, 1) else {
-            return RunOutcome::Exit(2);
-        };
-        let remaining = scheduler.read_timer(timer);
-        let canceled = scheduler.cancel_timer(timer);
-        let after_cancel = scheduler.read_timer(timer);
-        let _ = self.result.send((remaining, canceled, after_cancel));
-        RunOutcome::Exit(0)
+    fn run(
+        c_p: &mut arinsal_sched::CP<'_, Self>,
+        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        _: u32,
+        _calls: &mut u32,
+    ) -> RunOutcome {
+        esdp.with_ctx(c_p, |this, _, ctx| {
+            let Some(scheduler) = this.scheduler.get().and_then(Weak::upgrade) else {
+                return RunOutcome::Exit(1);
+            };
+            let Ok(timer) = scheduler.start_timer(ctx.pid(), 60_000, 1) else {
+                return RunOutcome::Exit(2);
+            };
+            let remaining = scheduler.read_timer(timer);
+            let canceled = scheduler.cancel_timer(timer);
+            let after_cancel = scheduler.read_timer(timer);
+            let _ = this.result.send((remaining, canceled, after_cancel));
+            RunOutcome::Exit(0)
+        })
     }
 }
 
@@ -165,30 +179,37 @@ impl Task for CrossCancelTask {
     type Message = u64;
     type SchedulerData = ();
 
-    fn run(&mut self, ctx: &mut RunCtx<u64>, _: &mut (), _: u32, _calls: &mut u32) -> RunOutcome {
-        let Some(scheduler) = self.scheduler.get().and_then(Weak::upgrade) else {
-            return RunOutcome::Exit(1);
-        };
-        let Ok(timer) = scheduler.start_timer(ctx.pid(), 60_000, 1) else {
-            return RunOutcome::Exit(2);
-        };
-        self.slots.lock().unwrap()[self.me] = Some(timer);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let other = loop {
-            if let Some(other) = self.slots.lock().unwrap()[1 - self.me] {
-                break other;
-            }
-            if Instant::now() > deadline {
-                return RunOutcome::Exit(3);
-            }
-            thread::yield_now();
-        };
-        // Both workers now ask each other at the same time; erts serves such requests as
-        // aux work, so neither may block the other.
-        let read = scheduler.read_timer(other);
-        let canceled = scheduler.cancel_timer(other);
-        let _ = self.result.send((self.me, read, canceled));
-        RunOutcome::Exit(0)
+    fn run(
+        c_p: &mut arinsal_sched::CP<'_, Self>,
+        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        _: u32,
+        _calls: &mut u32,
+    ) -> RunOutcome {
+        esdp.with_ctx(c_p, |this, _, ctx| {
+            let Some(scheduler) = this.scheduler.get().and_then(Weak::upgrade) else {
+                return RunOutcome::Exit(1);
+            };
+            let Ok(timer) = scheduler.start_timer(ctx.pid(), 60_000, 1) else {
+                return RunOutcome::Exit(2);
+            };
+            this.slots.lock().unwrap()[this.me] = Some(timer);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let other = loop {
+                if let Some(other) = this.slots.lock().unwrap()[1 - this.me] {
+                    break other;
+                }
+                if Instant::now() > deadline {
+                    return RunOutcome::Exit(3);
+                }
+                thread::yield_now();
+            };
+            // Both workers now ask each other at the same time; erts serves such requests as
+            // aux work, so neither may block the other.
+            let read = scheduler.read_timer(other);
+            let canceled = scheduler.cancel_timer(other);
+            let _ = this.result.send((this.me, read, canceled));
+            RunOutcome::Exit(0)
+        })
     }
 }
 
@@ -256,17 +277,24 @@ impl Task for Victim {
     type Message = u64;
     type SchedulerData = ();
 
-    fn run(&mut self, ctx: &mut RunCtx<u64>, _: &mut (), _: u32, _calls: &mut u32) -> RunOutcome {
-        if !self.started {
-            self.started = true;
-            self.own.send(ctx.start_timer(60_000, 1).unwrap()).unwrap();
-        }
-        if ctx.receive().is_some() {
-            ctx.cancel_target_timers(ctx.pid());
-            self.done.send(()).unwrap();
-            return RunOutcome::Exit(0);
-        }
-        RunOutcome::Wait { timeout_ms: None }
+    fn run(
+        c_p: &mut arinsal_sched::CP<'_, Self>,
+        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        _: u32,
+        _calls: &mut u32,
+    ) -> RunOutcome {
+        esdp.with_ctx(c_p, |this, _, ctx| {
+            if !this.started {
+                this.started = true;
+                this.own.send(ctx.start_timer(60_000, 1).unwrap()).unwrap();
+            }
+            if ctx.receive().is_some() {
+                ctx.cancel_target_timers(ctx.pid());
+                this.done.send(()).unwrap();
+                return RunOutcome::Exit(0);
+            }
+            RunOutcome::Wait { timeout_ms: None }
+        })
     }
 }
 

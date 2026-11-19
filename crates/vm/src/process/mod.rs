@@ -6,6 +6,13 @@ use arinsal_pterm::RetiredArea;
 use arinsal_sched::{
     Config, Event, Payload, Pid, RunCtx, RunOutcome, Scheduler, Signal, Task, proc_flags,
 };
+
+/// erts' `Process *c_p`: the running VM process, with whole-struct provenance.
+// Port of erts/emulator/beam/erl_process.h (`Process *c_p`), OTP-29.1.1.
+pub(crate) type CP<'a> = arinsal_sched::CP<'a, Process>;
+/// erts' `ErtsSchedulerData *esdp` of the VM: monomorphic over the VM process, as erts' is.
+// Port of erts/emulator/beam/erl_process.h:687 (struct ErtsSchedulerData_), OTP-29.1.1.
+pub(crate) type ErtsSchedulerData = arinsal_sched::ErtsSchedulerData<Process>;
 use arinsal_term::ptab::PtabIdRing;
 use arinsal_term::{
     Atom, ProcessHeap, SharedCopyCache, Term, TermBuilder, VecHeap, copy_struct_litopt, copy_term,

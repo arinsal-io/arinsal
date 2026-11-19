@@ -1,4 +1,4 @@
-use arinsal_sched::{Config, Event, Payload, Pid, RunCtx, RunOutcome, Scheduler, Signal, Task};
+use arinsal_sched::{Config, Event, Payload, Pid, RunOutcome, Scheduler, Signal, Task};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -10,16 +10,23 @@ struct Collector {
 impl Task for Collector {
     type Message = u32;
     type SchedulerData = ();
-    fn run(&mut self, ctx: &mut RunCtx<u32>, _: &mut (), _: u32, _calls: &mut u32) -> RunOutcome {
-        while let Some(Event { from, payload }) = ctx.receive() {
-            let entry = match payload {
-                Payload::Message(n) => (ctx.pid(), from, n, false),
-                Payload::Signal(Signal::Unlink(n)) => (ctx.pid(), from, n as u32, true),
-                _ => panic!("unexpected signal"),
-            };
-            self.output.lock().unwrap().push(entry);
-        }
-        RunOutcome::Wait { timeout_ms: None }
+    fn run(
+        c_p: &mut arinsal_sched::CP<'_, Self>,
+        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        _: u32,
+        _calls: &mut u32,
+    ) -> RunOutcome {
+        esdp.with_ctx(c_p, |this, _, ctx| {
+            while let Some(Event { from, payload }) = ctx.receive() {
+                let entry = match payload {
+                    Payload::Message(n) => (ctx.pid(), from, n, false),
+                    Payload::Signal(Signal::Unlink(n)) => (ctx.pid(), from, n as u32, true),
+                    _ => panic!("unexpected signal"),
+                };
+                this.output.lock().unwrap().push(entry);
+            }
+            RunOutcome::Wait { timeout_ms: None }
+        })
     }
 }
 
@@ -97,11 +104,18 @@ struct CountTask(Arc<AtomicUsize>);
 impl Task for CountTask {
     type Message = ();
     type SchedulerData = ();
-    fn run(&mut self, ctx: &mut RunCtx<()>, _: &mut (), _: u32, _calls: &mut u32) -> RunOutcome {
-        while ctx.receive().is_some() {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-        RunOutcome::Wait { timeout_ms: None }
+    fn run(
+        c_p: &mut arinsal_sched::CP<'_, Self>,
+        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        _: u32,
+        _calls: &mut u32,
+    ) -> RunOutcome {
+        esdp.with_ctx(c_p, |this, _, ctx| {
+            while ctx.receive().is_some() {
+                this.0.fetch_add(1, Ordering::Relaxed);
+            }
+            RunOutcome::Wait { timeout_ms: None }
+        })
     }
 }
 
@@ -149,20 +163,21 @@ impl Task for SchedulingProbe {
     type Message = ();
     type SchedulerData = ();
     fn run(
-        &mut self,
-        _ctx: &mut RunCtx<()>,
-        _: &mut (),
+        c_p: &mut arinsal_sched::CP<'_, Self>,
+        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
         _budget: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
-        let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
-        self.peak.fetch_max(active, Ordering::AcqRel);
-        while !self.release.load(Ordering::Acquire) {
-            std::thread::yield_now();
-        }
-        self.active.fetch_sub(1, Ordering::AcqRel);
-        self.complete.fetch_add(1, Ordering::Release);
-        RunOutcome::Exit(0)
+        esdp.with_ctx(c_p, |this, _, _ctx| {
+            let active = this.active.fetch_add(1, Ordering::AcqRel) + 1;
+            this.peak.fetch_max(active, Ordering::AcqRel);
+            while !this.release.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            this.active.fetch_sub(1, Ordering::AcqRel);
+            this.complete.fetch_add(1, Ordering::Release);
+            RunOutcome::Exit(0)
+        })
     }
 }
 
@@ -174,17 +189,18 @@ impl Task for PriorityCounter {
     type Message = ();
     type SchedulerData = ();
     fn run(
-        &mut self,
-        _ctx: &mut RunCtx<()>,
-        _: &mut (),
+        c_p: &mut arinsal_sched::CP<'_, Self>,
+        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
         _budget: u32,
         _calls: &mut u32,
     ) -> RunOutcome {
-        if self.stop.load(Ordering::Acquire) {
-            return RunOutcome::Exit(0);
-        }
-        self.count.fetch_add(1, Ordering::Relaxed);
-        RunOutcome::Yield
+        esdp.with_ctx(c_p, |this, _, _ctx| {
+            if this.stop.load(Ordering::Acquire) {
+                return RunOutcome::Exit(0);
+            }
+            this.count.fetch_add(1, Ordering::Relaxed);
+            RunOutcome::Yield
+        })
     }
 }
 
@@ -289,16 +305,17 @@ fn hot_mailbox_repeated_waits_do_not_lose_wakes() {
         type Message = ();
         type SchedulerData = ();
         fn run(
-            &mut self,
-            ctx: &mut RunCtx<()>,
-            _: &mut (),
+            c_p: &mut arinsal_sched::CP<'_, Self>,
+            esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
             _: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
-            if ctx.receive().is_some() {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-            RunOutcome::Wait { timeout_ms: None }
+            esdp.with_ctx(c_p, |this, _, ctx| {
+                if ctx.receive().is_some() {
+                    this.0.fetch_add(1, Ordering::Relaxed);
+                }
+                RunOutcome::Wait { timeout_ms: None }
+            })
         }
     }
     let count = Arc::new(AtomicUsize::new(0));
@@ -335,13 +352,12 @@ fn worker_blocks_preserve_sender_message_signal_order() {
         type Message = u32;
         type SchedulerData = ();
         fn run(
-            &mut self,
-            ctx: &mut RunCtx<u32>,
-            _: &mut (),
+            c_p: &mut arinsal_sched::CP<'_, Self>,
+            esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
             _: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
-            match self {
+            esdp.with_ctx(c_p, |this, _, ctx| match this {
                 Work::Producer(to) => {
                     for sequence in 0..1_000 {
                         if sequence % 2 == 0 {
@@ -363,7 +379,7 @@ fn worker_blocks_preserve_sender_message_signal_order() {
                     }
                     RunOutcome::Wait { timeout_ms: None }
                 }
-            }
+            })
         }
     }
     let output = Arc::new(Mutex::new(Vec::new()));
@@ -403,13 +419,12 @@ fn ping_pong_gives_external_work_a_turn() {
         type Message = ();
         type SchedulerData = ();
         fn run(
-            &mut self,
-            ctx: &mut RunCtx<()>,
-            _: &mut (),
+            c_p: &mut arinsal_sched::CP<'_, Self>,
+            esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
             _: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
-            match self {
+            esdp.with_ctx(c_p, |this, _, ctx| match this {
                 Work::Ping(to, count) => {
                     if ctx.receive().is_some() {
                         let value = count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -423,7 +438,7 @@ fn ping_pong_gives_external_work_a_turn() {
                     observed.store(count.load(Ordering::Relaxed), Ordering::Release);
                     RunOutcome::Exit(0)
                 }
-            }
+            })
         }
     }
     let count = Arc::new(AtomicUsize::new(0));
@@ -464,8 +479,13 @@ fn pid_generation() {
     impl Task for Exit {
         type Message = ();
         type SchedulerData = ();
-        fn run(&mut self, _: &mut RunCtx<()>, _: &mut (), _: u32, _calls: &mut u32) -> RunOutcome {
-            RunOutcome::Exit(0)
+        fn run(
+            c_p: &mut arinsal_sched::CP<'_, Self>,
+            esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+            _: u32,
+            _calls: &mut u32,
+        ) -> RunOutcome {
+            esdp.with_ctx(c_p, |_, _, _| RunOutcome::Exit(0))
         }
     }
     let sched = Scheduler::new(Config {
@@ -535,24 +555,31 @@ struct ProgressRacer {
 impl Task for ProgressRacer {
     type Message = u32;
     type SchedulerData = ();
-    fn run(&mut self, ctx: &mut RunCtx<u32>, _: &mut (), _: u32, _calls: &mut u32) -> RunOutcome {
-        if !self.bound {
-            self.bound = true;
-            ctx.bind_scheduler(if self.blocker { 1 } else { 2 });
-            return RunOutcome::Yield;
-        }
-        for _ in 0..50 {
-            if self.blocker {
-                ctx.block_thread_progress(Duration::ZERO);
-            } else {
-                let _ = ctx.scheduler_stats(0);
+    fn run(
+        c_p: &mut arinsal_sched::CP<'_, Self>,
+        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        _: u32,
+        _calls: &mut u32,
+    ) -> RunOutcome {
+        esdp.with_ctx(c_p, |this, _, ctx| {
+            if !this.bound {
+                this.bound = true;
+                ctx.bind_scheduler(if this.blocker { 1 } else { 2 });
+                return RunOutcome::Yield;
             }
-        }
-        if self.rounds.fetch_add(1, Ordering::AcqRel) + 1 >= 400 {
-            RunOutcome::Exit(0)
-        } else {
-            RunOutcome::Yield
-        }
+            for _ in 0..50 {
+                if this.blocker {
+                    ctx.block_thread_progress(Duration::ZERO);
+                } else {
+                    let _ = ctx.scheduler_stats(0);
+                }
+            }
+            if this.rounds.fetch_add(1, Ordering::AcqRel) + 1 >= 400 {
+                RunOutcome::Exit(0)
+            } else {
+                RunOutcome::Yield
+            }
+        })
     }
 }
 
@@ -604,26 +631,33 @@ struct LaterWaiter {
 impl Task for LaterWaiter {
     type Message = u32;
     type SchedulerData = ();
-    fn run(&mut self, ctx: &mut RunCtx<u32>, _: &mut (), _: u32, _calls: &mut u32) -> RunOutcome {
-        if !self.bound {
-            self.bound = true;
-            ctx.bind_scheduler(if self.spinner { 1 } else { 2 });
-            return RunOutcome::Yield;
-        }
-        if self.spinner {
-            self.spinning.store(true, Ordering::Release);
-            while !self.release.load(Ordering::Acquire) {
-                std::thread::yield_now();
+    fn run(
+        c_p: &mut arinsal_sched::CP<'_, Self>,
+        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        _: u32,
+        _calls: &mut u32,
+    ) -> RunOutcome {
+        esdp.with_ctx(c_p, |this, _, ctx| {
+            if !this.bound {
+                this.bound = true;
+                ctx.bind_scheduler(if this.spinner { 1 } else { 2 });
+                return RunOutcome::Yield;
             }
-            return RunOutcome::Exit(0);
-        }
-        if !self.spinning.load(Ordering::Acquire) {
-            return RunOutcome::Yield;
-        }
-        let fired = Arc::clone(&self.fired);
-        ctx.thread_progress_later(move || fired.store(true, Ordering::Release));
-        self.scheduled.store(true, Ordering::Release);
-        RunOutcome::Exit(0)
+            if this.spinner {
+                this.spinning.store(true, Ordering::Release);
+                while !this.release.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                return RunOutcome::Exit(0);
+            }
+            if !this.spinning.load(Ordering::Acquire) {
+                return RunOutcome::Yield;
+            }
+            let fired = Arc::clone(&this.fired);
+            ctx.thread_progress_later(move || fired.store(true, Ordering::Release));
+            this.scheduled.store(true, Ordering::Release);
+            RunOutcome::Exit(0)
+        })
     }
 }
 
@@ -671,9 +705,16 @@ struct Idle;
 impl Task for Idle {
     type Message = ();
     type SchedulerData = ();
-    fn run(&mut self, ctx: &mut RunCtx<()>, _: &mut (), _: u32, _calls: &mut u32) -> RunOutcome {
-        while ctx.receive().is_some() {}
-        RunOutcome::Wait { timeout_ms: None }
+    fn run(
+        c_p: &mut arinsal_sched::CP<'_, Self>,
+        esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
+        _: u32,
+        _calls: &mut u32,
+    ) -> RunOutcome {
+        esdp.with_ctx(c_p, |_, _, ctx| {
+            while ctx.receive().is_some() {}
+            RunOutcome::Wait { timeout_ms: None }
+        })
     }
 }
 
@@ -728,21 +769,22 @@ fn wait_timer_keeps_its_position_across_reentry() {
         type Message = ();
         type SchedulerData = ();
         fn run(
-            &mut self,
-            ctx: &mut RunCtx<()>,
-            _: &mut (),
+            c_p: &mut arinsal_sched::CP<'_, Self>,
+            esdp: &mut arinsal_sched::ErtsSchedulerData<Self>,
             _: u32,
             _calls: &mut u32,
         ) -> RunOutcome {
-            while ctx.receive().is_some() {}
-            let pos = *self
-                .pos
-                .get_or_insert_with(|| arinsal_sched::receive_timeout_pos(200));
-            if arinsal_sched::monotonic_now_ms() >= pos {
-                *self.fired.lock().unwrap() = Some(Instant::now());
-                return RunOutcome::Exit(0);
-            }
-            RunOutcome::WaitTimer { timeout_pos: pos }
+            esdp.with_ctx(c_p, |this, _, ctx| {
+                while ctx.receive().is_some() {}
+                let pos = *this
+                    .pos
+                    .get_or_insert_with(|| arinsal_sched::receive_timeout_pos(200));
+                if arinsal_sched::monotonic_now_ms() >= pos {
+                    *this.fired.lock().unwrap() = Some(Instant::now());
+                    return RunOutcome::Exit(0);
+                }
+                RunOutcome::WaitTimer { timeout_pos: pos }
+            })
         }
     }
     let sched = Scheduler::new(Config {
