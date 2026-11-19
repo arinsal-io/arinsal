@@ -27,9 +27,6 @@ const TMP3: Gpr = Gpr::x(11);
 use crate::exc::{EXC_BADMATCH, EXC_BADRECORD, EXC_CASE_CLAUSE, EXC_IF_CLAUSE, EXC_TRY_CLAUSE};
 /// `freason` flag of a native `raw_raise`: the low bits are the class (`EXTAG_*`) and `c_p->ftrace` holds the stacktrace being re-raised.
 pub const RAW_RAISE: u64 = crate::exc::EXF_HAS_EXT_INFO;
-/// `freason` flag of a native `raise/2` (`i_raise`) whose stacktrace in `c_p->ftrace` is valid:
-/// the exception keeps that stacktrace but is not a raw rethrow.
-pub const RERAISE: u64 = crate::exc::EXF_RESTORE_NFUNC;
 const NIL: u64 = 0x3b;
 const TAG_IMMED2_CATCH: u64 = 0x1b;
 /// Stands in for `THE_NON_VALUE` in X0 while a native handler runs: a catch immediate is
@@ -262,11 +259,11 @@ impl BeamModuleAssembler {
         &mut self,
         trace: ArgVal,
         value: ArgVal,
-        class_helper: usize,
+        sanitize_freason: usize,
         resolver: ExceptionResolver,
     ) -> Result<(), ModuleError> {
-        if class_helper == 0 {
-            return Err(ModuleError::InvalidOperand("raise class helper is missing"));
+        if sanitize_freason == 0 {
+            return Err(ModuleError::InvalidOperand("freason sanitizer is missing"));
         }
         if let Some((raise_shared, _)) = self.raise_fragments {
             // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3032-3044 (emit_raise),
@@ -287,20 +284,20 @@ impl BeamModuleAssembler {
             e.mov_reg(XREGS[1], TMP2)
         })?;
 
-        // i_raise/0 needs the raw trace's saved class. This helper mirrors
-        // erts_sanitize_freason without moving the heap or Erlang stack.
+        // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3020-3044, OTP-29.1.1:
+        // `erts_sanitize_freason` writes `PRIMARY_EXCEPTION` to `c_p->freason`.
         let update = crate::Update::NONE;
         self.code.emit(|e| e.str_uoff(XREGS[1], C_P, 48))?;
-        crate::emit_enter_runtime(&mut self.code, 3, update)?;
+        self.code.emit(|e| e.str_uoff(XREGS[2], C_P, 56))?;
+        crate::emit_enter_runtime(&mut self.code, 2, update)?;
         self.code.emit(|e| {
             e.mov_reg(Gpr::x(0), C_P)?;
-            e.mov_reg(Gpr::x(1), XREGS[2])?;
-            e.mov_reg(Gpr::x(2), XREGS[1])
+            e.mov_reg(Gpr::x(1), XREGS[2])
         })?;
-        self.fragment_call(class_helper)?;
-        crate::emit_leave_runtime(&mut self.code, 3, update)?;
+        self.fragment_call(sanitize_freason)?;
+        crate::emit_leave_runtime(&mut self.code, 2, update)?;
         self.code.emit(|e| {
-            e.mov_reg(TMP3, Gpr::x(0))?;
+            e.ldr_uoff(TMP3, C_P, 40)?;
             e.ldr_uoff(TMP2, C_P, 48)
         })?;
         self.emit_exception_transfer(TMP3, TMP2, XREGS[2], resolver)

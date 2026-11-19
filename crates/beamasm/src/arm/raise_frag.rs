@@ -26,6 +26,7 @@ const VALUE: Gpr = Gpr::x(26);
 const TRACE: Gpr = Gpr::x(27);
 const PROCESS_FREASON: u32 = 40;
 const PROCESS_FVALUE: u32 = 48;
+const PROCESS_FTRACE: u32 = 56;
 const PROCESS_I: u32 = 72;
 const PROCESS_HTOP_STOP: u32 = 8;
 const NATIVE_ERROR_PC_SLOT: u32 = crate::arm::beam_asm::tmp_mem_ref(6);
@@ -43,12 +44,11 @@ pub struct RaiseFragments {
 
 impl RaiseFragments {
     /// Emits the shared raise fragments once for the VM. `resolver` is the native catch
-    /// resolver (`handle_error`) and `class_helper` restores the class of a saved stacktrace
-    /// (`erts_sanitize_freason`).
-    // Port of erts/emulator/beam/jit/arm/instr_common.cpp (emit_raise_shared) and
-    // erts/emulator/beam/jit/arm/beam_asm_global.cpp (emit_raise_exception,
-    // emit_raise_exception_shared), OTP-29.1.1.
-    pub fn new(resolver: usize, class_helper: usize) -> Result<Self, ExecError> {
+    /// resolver (`handle_error`) and `sanitize_freason` writes the primary exception code
+    /// from a saved stacktrace (`erts_sanitize_freason`).
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3020-3044 (emit_raise_shared) and
+    // beam_asm_global.cpp:300-329 (emit_raise_exception, emit_raise_exception_shared), OTP-29.1.1.
+    pub fn new(resolver: usize, sanitize_freason: usize) -> Result<Self, ExecError> {
         let mut code = CodeBuffer::new();
         let fail = |_: BufferError| ExecError::InvalidSize("raise fragment");
         let raise = code.new_label();
@@ -59,22 +59,23 @@ impl RaiseFragments {
         code.emit(|e| {
             e.mov_reg(TRACE, ARG2)?;
             e.mov_reg(VALUE, ARG1)?;
-            e.str_uoff(VALUE, C_P, PROCESS_FVALUE)
+            e.str_uoff(VALUE, C_P, PROCESS_FVALUE)?;
+            e.str_uoff(TRACE, C_P, PROCESS_FTRACE)
         })
         .map_err(fail)?;
-        emit_enter_runtime(&mut code, 3, Update::NONE).map_err(fail)?;
+        emit_enter_runtime(&mut code, 2, Update::NONE).map_err(fail)?;
         code.emit(|e| {
             e.mov_reg(ARG1, C_P)?;
             e.mov_reg(ARG2, TRACE)?;
-            e.mov_reg(ARG3, VALUE)?;
-            e.mov_const(SUPER_TMP, class_helper as u64)?;
+            e.mov_const(SUPER_TMP, sanitize_freason as u64)?;
             e.str_uoff(Gpr::x(30), C_P, PROCESS_I)?;
             e.blr(SUPER_TMP)
         })
         .map_err(fail)?;
-        emit_leave_runtime(&mut code, 3, Update::NONE).map_err(fail)?;
+        emit_leave_runtime(&mut code, 2, Update::NONE).map_err(fail)?;
         code.emit(|e| {
             e.ldr_uoff(Gpr::x(30), C_P, PROCESS_I)?;
+            e.ldr_uoff(ARG1, C_P, PROCESS_FREASON)?;
             e.ldr_uoff(ARG2, C_P, PROCESS_FVALUE)?;
             e.mov_reg(ARG3, TRACE)
         })

@@ -220,17 +220,6 @@ pub(super) fn class_term(class: Class) -> Result<Term, VmError> {
     })
 }
 
-pub(super) fn parse_class(term: Term) -> Option<Class> {
-    let atom = term.as_atom()?;
-    let name = arinsal_term::global_atoms().text(atom)?;
-    match name {
-        "error" => Some(Class::Error),
-        "exit" => Some(Class::Exit),
-        "throw" => Some(Class::Throw),
-        _ => None,
-    }
-}
-
 pub(crate) fn empty_trace_handle(class: Class) -> Term {
     let class = match class {
         Class::Error => 0,

@@ -45,44 +45,6 @@ struct StaticNif {
     entry: arinsal_bifs::BifFn,
 }
 
-/// Restores the class saved with an OTP raw stacktrace for native `raise/2`.
-// Port of erts/emulator/beam/jit/arm/instr_common.cpp:3018-3030, OTP-29.1.1.
-pub extern "C" fn arinsal_beamasm_raise_class(
-    header: *mut ProcessHeader,
-    trace_raw: u64,
-    _value_raw: u64,
-) -> u64 {
-    let Some(process) = crate::native_hooks::enter_runtime(header) else {
-        return 0;
-    };
-    let trace = crate::native_hooks::from_raw(trace_raw);
-    // erts_sanitize_freason treats NIL as a trace produced in native code: there is
-    // no saved class to restore, so handle_error must save a fresh trace.
-    if trace == Term::NIL {
-        return arinsal_beamasm::exc::EXC_ERROR;
-    }
-    let empty_class = crate::exceptions::empty_trace_class(trace);
-    let raw_class = crate::stacktrace::raw_class(process, trace);
-    let class = empty_class.or(raw_class).or(process.exc_class).or_else(|| {
-        // x3 of `reg` holds the class atom a catch put there (found_catch).
-        let reg = (crate::Vm {}).x_regs().ok()?;
-        crate::exceptions::parse_class(reg[3])
-    });
-    // Port of erts/emulator/beam/beam_common.c (erts_sanitize_freason), OTP-29.1.1: a valid
-    // stacktrace is re-raised as is.
-    let reraise = arinsal_term::exc::EXF_RESTORE_NFUNC;
-    match class {
-        Some(arinsal_bifs::Class::Error) => reraise | arinsal_beamasm::exc::EXTAG_ERROR,
-        Some(arinsal_bifs::Class::Exit) => reraise | arinsal_beamasm::exc::EXTAG_EXIT,
-        Some(arinsal_bifs::Class::Throw) => reraise | arinsal_beamasm::exc::EXTAG_THROWN,
-        None => {
-            process.heap.abi.exc.fvalue =
-                crate::native_hooks::raw(Term::atom(arinsal_term::atoms::BADARG));
-            arinsal_beamasm::exc::EXC_ERROR
-        }
-    }
-}
-
 // Adapter for erts/emulator/beam/jit/arm/instr_bs.cpp:2387-2400, OTP-29.1.1:
 // this table retains module string bytes used by `am_string` segments.
 fn match_strings() -> &'static std::sync::RwLock<Vec<std::sync::Arc<[u8]>>> {
@@ -1645,24 +1607,6 @@ fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifEr
     process.heap.abi.exc.ftrace = ftrace;
 }
 
-/// The `raise/3` list for this failure, copied back onto the heap.
-///
-/// Port of erts/emulator/beam/bif.c:1643 (`c_p->ftrace = stacktrace` when the
-/// list is already a stacktrace), OTP-29.1.1. The catch's `build_stacktrace`
-/// then returns that list instead of walking native frames.
-pub(crate) fn take_explicit_raise(process: &mut crate::Process) -> Option<Term> {
-    if process.heap.abi.exc.freason
-        & (arinsal_beamasm::exc::EXF_ARGLIST | arinsal_beamasm::exc::EXF_HAS_EXT_INFO)
-        == 0
-        && process.heap.abi.exc.ftrace != 0
-    {
-        let trace = crate::native_hooks::from_raw(process.heap.abi.exc.ftrace);
-        process.heap.abi.exc.ftrace = 0;
-        return Some(trace);
-    }
-    None
-}
-
 /// Resolves a native exception to the innermost catch handler, or 0 to let the scheduler exit.
 ///
 /// Port of erts/emulator/beam/beam_common.c:449 (`handle_error`) and
@@ -1696,12 +1640,11 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
 /// `GET_EXC_CLASS(freason)` for a failure `handle_error` completes in native code, or `None`
 /// for one the scheduler completes.
 ///
-/// The scheduler keeps: TRAP; `function_clause` (its top frame is built from the current
-/// function's arguments); re-raise words carrying `EXF_RESTORE_NFUNC` or a class atom; and
-/// generic `EXF_HAS_EXT_INFO` errors. The native resolver takes the generic codes
+/// The scheduler keeps TRAP; `function_clause` (whose top frame uses the current function's
+/// arguments); and generic `EXF_HAS_EXT_INFO` errors. The native resolver takes the generic codes
 /// (`EXC_ERROR`, `EXC_EXIT`, `EXC_THROWN`, optionally with `EXF_ARGLIST`), `error/3`'s encoded
 /// argument tuple, indexed errors (`(index << 10) | EXC_ERROR`, optionally with
-/// `EXF_HAS_EXT_INFO`), and a `raw_raise` re-raise (a class code without `EXF_SAVETRACE`).
+/// `EXF_HAS_EXT_INFO`), and saved traces whose freason is a `PRIMARY_EXCEPTION` value.
 #[inline]
 pub(crate) fn native_exception_class(
     freason: u64,
@@ -1709,19 +1652,24 @@ pub(crate) fn native_exception_class(
 ) -> Option<arinsal_bifs::Class> {
     use arinsal_beamasm::exc::{
         EXC_ERROR, EXC_EXIT, EXC_INDEXBITS, EXC_THROWN, EXF_ARGLIST, EXF_HAS_EXT_INFO,
-        EXF_SAVETRACE,
+        EXF_RESTORE_NFUNC, EXF_SAVETRACE,
     };
+    // handle_error has already restored the wrapper. erts retains this bit until
+    // PRIMARY_EXCEPTION, but it is not part of exception decoding.
+    let freason = freason & !EXF_RESTORE_NFUNC;
     if freason == arinsal_term::exc::EXC_FUNCTION_CLAUSE {
         return None;
     }
+    let primary = freason != 0 && arinsal_term::exc::primary_exception(freason) == freason;
     let handled = if freason & EXC_INDEXBITS != 0 {
         freason & !(EXC_INDEXBITS | EXF_HAS_EXT_INFO) == EXC_ERROR
     } else if freason & EXF_HAS_EXT_INFO != 0 {
         error_arglist && freason == EXC_ERROR | EXF_ARGLIST | EXF_HAS_EXT_INFO
     } else {
-        matches!(freason & !EXF_ARGLIST, EXC_ERROR | EXC_EXIT | EXC_THROWN)
-            || matches!(freason | EXF_SAVETRACE, EXC_ERROR | EXC_EXIT | EXC_THROWN)
-                && freason & EXF_SAVETRACE == 0
+        primary
+            || matches!(freason & !EXF_ARGLIST, EXC_ERROR | EXC_EXIT | EXC_THROWN)
+            || (matches!(freason | EXF_SAVETRACE, EXC_ERROR | EXC_EXIT | EXC_THROWN)
+                && freason & EXF_SAVETRACE == 0)
     };
     if handled {
         crate::stacktrace::class_from_freason(freason)
@@ -1733,7 +1681,8 @@ pub(crate) fn native_exception_class(
 /// Identifies `error/2,3`'s encoded arglist using the same BIF MFA passed to `handle_error`.
 pub(crate) fn is_error_arglist(_process: &crate::Process, _bif_info: u64, freason: u64) -> bool {
     // beam_common.c handle_error: `if (c_p->freason & EXF_ARGLIST)` — only error/2,3 set it.
-    use arinsal_beamasm::exc::{EXC_ERROR, EXF_ARGLIST, EXF_HAS_EXT_INFO};
+    use arinsal_beamasm::exc::{EXC_ERROR, EXF_ARGLIST, EXF_HAS_EXT_INFO, EXF_RESTORE_NFUNC};
+    let freason = freason & !EXF_RESTORE_NFUNC;
     freason & EXF_ARGLIST != 0 && freason & !(EXF_ARGLIST | EXF_HAS_EXT_INFO) == EXC_ERROR
 }
 

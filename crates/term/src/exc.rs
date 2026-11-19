@@ -22,14 +22,21 @@ pub const EXF_THROWN: u64 = 1 << (EXF_OFFSET + 1);
 pub const EXF_LOG: u64 = 1 << (EXF_OFFSET + 2);
 /// Occurred in native code.
 pub const EXF_NATIVE: u64 = 1 << (EXF_OFFSET + 3);
+/// Flags retained by `PRIMARY_EXCEPTION`.
+pub const EXF_PRIMARY: u64 = EXF_PANIC | EXF_THROWN | EXF_LOG | EXF_NATIVE;
 /// Save the stacktrace in internal form.
 pub const EXF_SAVETRACE: u64 = 1 << (EXF_OFFSET + 4);
 /// Has an argument list for the top of the trace.
 pub const EXF_ARGLIST: u64 = 1 << (EXF_OFFSET + 5);
-/// Restore the original bif/nif; a re-raise of a saved stacktrace uses it in `i_raise`.
+/// Restore the original BIF or NIF after a native-function wrapper fails.
 pub const EXF_RESTORE_NFUNC: u64 = 1 << (EXF_OFFSET + 6);
 /// Has extended error information; `raw_raise` of a stacktrace uses it.
 pub const EXF_HAS_EXT_INFO: u64 = 1 << (EXF_OFFSET + 7);
+
+/// Keeps the class and primary flags, as `PRIMARY_EXCEPTION` does in `error.h`.
+pub const fn primary_exception(freason: u64) -> u64 {
+    freason & (EXF_PRIMARY | EXC_CLASSBITS)
+}
 
 /// Bit position of the error-table index.
 pub const EXC_OFFSET: u32 = 10;

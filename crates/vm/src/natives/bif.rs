@@ -2339,8 +2339,7 @@ pub(crate) extern "C" fn throw_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64
     primary_exception(c_p, reg, arinsal_term::exc::EXC_THROWN)
 }
 
-/// `erlang:raise/3`: a bad class or stacktrace returns the atom `badarg`; otherwise the
-/// exception leaves `fvalue` = the reason and `ftrace` = the stacktrace.
+/// `erlang:raise/3` stores a sanitized `freason` and erts' internal ftrace tuple.
 // Port of erts/emulator/beam/bif.c (raise_3), OTP-29.1.1.
 pub(crate) extern "C" fn raise_3(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     use arinsal_term::exc::{EXC_ERROR, EXC_EXIT, EXC_THROWN};
@@ -2348,17 +2347,20 @@ pub(crate) extern "C" fn raise_3(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64
         return 0;
     };
     let [class, value, stacktrace] = bif_args::<3>(reg);
-    let freason = match class.as_atom() {
-        Some(atom) if atom == atoms::ERROR => EXC_ERROR,
-        Some(atom) if atom == atoms::EXIT => EXC_EXIT,
-        Some(atom) if atom == atoms::THROW => EXC_THROWN,
+    let (class, freason) = match class.as_atom() {
+        Some(atom) if atom == atoms::ERROR => (arinsal_bifs::Class::Error, EXC_ERROR),
+        Some(atom) if atom == atoms::EXIT => (arinsal_bifs::Class::Exit, EXC_EXIT),
+        Some(atom) if atom == atoms::THROW => (arinsal_bifs::Class::Throw, EXC_THROWN),
         _ => return crate::native_hooks::raw(Term::atom(atoms::BADARG)),
     };
     if !valid_raise_stacktrace(stacktrace) {
         return crate::native_hooks::raw(Term::atom(atoms::BADARG));
     }
+    let Ok(stacktrace) = crate::stacktrace::save_explicit(process, class, stacktrace) else {
+        return bif_system_limit(c_p);
+    };
     let exc = &mut process.heap.abi.exc;
-    exc.freason = freason;
+    exc.freason = freason & !arinsal_term::exc::EXF_SAVETRACE;
     exc.fvalue = value.word();
     exc.ftrace = stacktrace.word();
     arinsal_term::THE_NON_VALUE

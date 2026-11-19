@@ -109,21 +109,14 @@ pub(crate) fn handle_error_core(
     bif_info: u64,
 ) -> usize {
     let (mut pc, mut bif_info) = (pc, bif_info);
-    // Port of erts/emulator/beam/beam_common.c:470-472 (handle_error: EXF_RESTORE_NFUNC ->
-    // erts_nfunc_restore_error), OTP-29.1.1. Arinsal's native `raise/2` still reuses this bit
-    // for a re-raise (`catch::RERAISE`), which never happens while a wrapper is in use; the
-    // bit is cleared here so the exit path does not read the NIF exception as that re-raise.
-    if process.heap.abi.exc.freason & arinsal_term::exc::EXF_RESTORE_NFUNC != 0
-        && crate::erl_nfunc_sched::get_nfunc_trap_wrapper(process)
-            .is_some_and(|nep| nep.get().argc >= 0)
-    {
+    // Port of erts/emulator/beam/beam_common.c:458-459 (handle_error), OTP-29.1.1.
+    if process.heap.abi.exc.freason & arinsal_term::exc::EXF_RESTORE_NFUNC != 0 {
         crate::erl_nfunc_sched::erts_nfunc_restore_error(
             process,
             &mut pc,
             registers,
             &mut bif_info,
         );
-        process.heap.abi.exc.freason &= !arinsal_term::exc::EXF_RESTORE_NFUNC;
     }
     process.heap.abi.i = pc as *const core::ffi::c_void;
     let freason = process.heap.abi.exc.freason;
@@ -141,14 +134,6 @@ pub(crate) fn handle_error_core(
     };
     let trace = if freason & arinsal_beamasm::exc::EXF_SAVETRACE == 0 {
         crate::native_hooks::from_raw(process.heap.abi.exc.ftrace)
-    } else if let Some(explicit) = crate::native_helpers::take_explicit_raise(process) {
-        if explicit == Term::NIL {
-            crate::exceptions::empty_trace_handle(class)
-        } else if let Ok(trace) = crate::stacktrace::save_explicit(process, class, explicit) {
-            trace
-        } else {
-            return 0;
-        }
     } else {
         let top = crate::native_helpers::native_bif_top(process, bif_info, registers);
         let input = crate::stacktrace::StackTraceSave {
@@ -285,12 +270,8 @@ pub extern "C" fn erts_sanitize_freason(c_p: *mut ProcessHeader, exception: u64)
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return;
     };
-    const EXF_PRIMARY: u64 = arinsal_beamasm::exc::EXF_PANIC
-        | arinsal_beamasm::exc::EXF_THROWN
-        | arinsal_beamasm::exc::EXF_LOG
-        | arinsal_beamasm::exc::EXF_NATIVE;
     process.heap.abi.exc.freason = crate::stacktrace::raw_freason(term(exception))
-        .map(|freason| freason & (EXF_PRIMARY | arinsal_beamasm::exc::EXC_CLASSBITS))
+        .map(arinsal_term::exc::primary_exception)
         .unwrap_or(arinsal_beamasm::exc::EXC_ERROR);
 }
 

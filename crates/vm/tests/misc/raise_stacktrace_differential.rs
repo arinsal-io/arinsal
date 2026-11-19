@@ -4,14 +4,29 @@ use arinsal_term::{Term, VecHeap, from_owned, to_owned};
 
 const SOURCE: &str = r#"
 -module(raise_stacktrace_differential).
--export([explicit/0, limited/1, invalid_frame/0, error3_none/2, error3_list/2, error3_empty/2,
-         error_none/0]).
+-export([explicit/0, explicit_classes/0, reraise_after_bif_trap/0, limited/1, invalid_frame/0,
+         error3_none/2, error3_list/2, error3_empty/2, error_none/0]).
 
 explicit() ->
     try erlang:raise(error, reason,
                      [{legacy_module, legacy_function, 2},
                       {modern_module, modern_function, 1,
                        [{file, "trace.erl"}, {line, 7}]}])
+    catch Class:Reason:Stack -> {Class, Reason, Stack}
+    end.
+
+explicit_classes() ->
+    [try erlang:raise(Class, {raised, Class}, [])
+     catch C:R:S -> {C, R, S}
+     end || Class <- [error, exit, throw]].
+
+reraise_after_bif_trap() ->
+    Bytes = lists:duplicate(400000, $a),
+    try lists:map(fun(_) ->
+        try list_to_binary([Bytes, oops])
+        catch Class:Reason:Stack -> erlang:raise(Class, Reason, Stack)
+        end
+    end, [one])
     catch Class:Reason:Stack -> {Class, Reason, Stack}
     end.
 
@@ -56,6 +71,25 @@ fn vm_call(vm: &mut arinsal_vm::Vm, function: &str, args: &[OwnedTerm]) -> CallR
     }
 }
 
+fn trim_difftest_server_frame(result: CallResult) -> CallResult {
+    let CallResult::Ok(mut result) = result else {
+        return result;
+    };
+    let OwnedTerm::Tuple(fields) = &mut result else {
+        return CallResult::Ok(result);
+    };
+    if let Some(OwnedTerm::List { elems, .. }) = fields.get_mut(2) {
+        elems.retain(|frame| {
+            !matches!(frame,
+                OwnedTerm::Tuple(fields)
+                    if matches!(fields.first(), Some(OwnedTerm::Atom(module))
+                        if module == "difftest_server")
+            )
+        });
+    }
+    CallResult::Ok(result)
+}
+
 #[test]
 fn legacy_raise_frames_and_depth_match_otp() {
     let Ok(reference) = RefErl::start() else {
@@ -71,11 +105,32 @@ fn legacy_raise_frames_and_depth_match_otp() {
     let mut vm = crate::common::node();
     vm.load_bytes(&beam).expect("load test module");
 
-    for function in ["explicit", "invalid_frame", "error_none"] {
+    for function in [
+        "explicit",
+        "explicit_classes",
+        "invalid_frame",
+        "error_none",
+    ] {
         let expected = reference.call("raise_stacktrace_differential", function, &[]);
         let actual = vm_call(&mut vm, function, &[]);
         similar_asserts::assert_eq!(actual, expected, "{function}");
     }
+    // RefErl::call adds its RPC frame to traces; direct VM evaluation has no such frame.
+    let expected = trim_difftest_server_frame(reference.call(
+        "raise_stacktrace_differential",
+        "reraise_after_bif_trap",
+        &[],
+    ));
+    let actual = vm
+        .eval_scheduled(
+            "raise_stacktrace_differential",
+            "reraise_after_bif_trap",
+            &[],
+            1,
+        )
+        .map(|outcome| CallResult::Ok(outcome.term))
+        .unwrap_or_else(|error| CallResult::TransportError(error.to_string()));
+    similar_asserts::assert_eq!(actual, expected, "reraise_after_bif_trap");
     for depth in [0, 1, 2, 8] {
         let args = [OwnedTerm::Int(depth)];
         let expected = reference.call("raise_stacktrace_differential", "limited", &args);

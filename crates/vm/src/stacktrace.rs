@@ -535,7 +535,7 @@ pub(super) fn capture(
 ///
 /// Port of erts/emulator/beam/bif.c (`raise_3`), OTP-29.1.1.
 pub(super) fn save_explicit(p: &mut Process, class: Class, trace: Term) -> Result<Term, VmError> {
-    let freason = class_to_freason(Some(class));
+    let freason = class_to_freason(Some(class)) & !arinsal_beamasm::exc::EXF_SAVETRACE;
     let args = normalize_raise_trace(p, trace)?;
     let mut heap = TraceHeap::new(&mut p.heap);
     let stack_trace = StackTrace::allocate_raised(&mut heap, freason)?;
@@ -1054,17 +1054,6 @@ pub(super) fn with_saved<R>(term: Term, f: impl FnOnce(&mut RawTrace) -> R) -> O
 /// True when `term` is a saved raw trace.
 pub(super) fn is_saved(term: Term) -> bool {
     raised_args(term).is_some() || with_saved(term, |_| ()).is_some()
-}
-
-/// Exception class saved with a raw trace for a later `raise` instruction.
-// Port of erts/emulator/beam/beam_common.c:1131-1146 (`get_freason_ptr_from_exc`) as read by
-// `erts_sanitize_freason`, OTP-29.1.1: the class is `StackTrace.freason`, element 1 of the
-// ftrace tuple; the trace itself is not decoded.
-pub(super) fn raw_class(_p: &Process, term: Term) -> Option<Class> {
-    saved_freason_word(term)?
-        .with_bignum_digits_mut(|digits| digits.first().copied())
-        .flatten()
-        .and_then(class_from_freason)
 }
 
 /// Args carried by the negative StackTrace used for an explicit `raise/3` trace.

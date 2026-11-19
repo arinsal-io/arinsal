@@ -1160,15 +1160,13 @@ fn native_exit(
         let class =
             crate::stacktrace::class_from_freason(freason).unwrap_or(arinsal_bifs::Class::Error);
         return Err(exceptions::raise_from_ftrace(process, class, reason, trace));
-    } else if matches!(
-        process.heap.abi.exc.freason,
-        freason if freason == (crate::stacktrace::class_to_freason(Some(arinsal_bifs::Class::Error)) & !arinsal_beamasm::exc::EXF_SAVETRACE)
-            || freason == (crate::stacktrace::class_to_freason(Some(arinsal_bifs::Class::Exit)) & !arinsal_beamasm::exc::EXF_SAVETRACE)
-            || freason == (crate::stacktrace::class_to_freason(Some(arinsal_bifs::Class::Throw)) & !arinsal_beamasm::exc::EXF_SAVETRACE)
-    ) && native_ftrace != 0
+    } else if process.heap.abi.exc.freason != 0
+        && arinsal_term::exc::primary_exception(process.heap.abi.exc.freason)
+            == process.heap.abi.exc.freason & !arinsal_beamasm::exc::EXF_RESTORE_NFUNC
+        && native_ftrace != 0
     {
         // Port of erts/emulator/beam/beam_common.c (`handle_error`), OTP-29.1.1:
-        // `raw_raise` has already stored the trace and cleared EXF_SAVETRACE.
+        // `raw_raise` and `i_raise` retain primary freason bits and the saved trace.
         let freason = process.heap.abi.exc.freason;
         let reason = crate::native_hooks::from_raw(process.heap.abi.exc.fvalue);
         let trace = crate::native_hooks::from_raw(native_ftrace);
@@ -1177,23 +1175,6 @@ fn native_exit(
         let class =
             crate::stacktrace::class_from_freason(freason).unwrap_or(arinsal_bifs::Class::Error);
         return Err(exceptions::raise_from_ftrace(process, class, reason, trace));
-    } else if process.heap.abi.exc.freason & arinsal_term::exc::EXF_RESTORE_NFUNC != 0 {
-        // Port of erts/emulator/beam/beam_common.c (`handle_error`) and `i_raise`, OTP-29.1.1.
-        // `raw_raise` clears EXF_SAVETRACE; its exact sanitized class is handled above.
-        // EXF_HAS_EXT_INFO remains ordinary error metadata and must not select this path.
-        let raw_rethrow = false;
-        let class = crate::stacktrace::class_from_freason(process.heap.abi.exc.freason)
-            .unwrap_or(arinsal_bifs::Class::Error);
-        process.heap.abi.exc.freason = 0;
-        let trace = crate::native_hooks::from_raw(native_ftrace);
-        return Err(VmError::Trap(exceptions::Trap {
-            class,
-            reason: crate::native_hooks::from_raw(process.heap.abi.exc.fvalue),
-            trace: Some(trace),
-            top: None,
-            raw_rethrow,
-            untrappable: false,
-        }));
     } else if process.heap.abi.exc.freason > 3 && process.heap.abi.exc.freason & 0x3ff == 0x50 {
         // Port of erts/emulator/beam/beam_common.c:742-775 (expand_error_value), OTP-29.1.1.
         let index = process.heap.abi.exc.freason >> 10;

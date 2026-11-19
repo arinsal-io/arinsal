@@ -132,7 +132,7 @@ fn raise_fragments() -> Option<&'static arinsal_beamasm::raise_frag::RaiseFragme
         .get_or_init(|| {
             arinsal_beamasm::raise_frag::RaiseFragments::new(
                 crate::native_helpers::arinsal_beamasm_exception_resolver as *const () as usize,
-                crate::native_helpers::arinsal_beamasm_raise_class as *const () as usize,
+                crate::beam_common::erts_sanitize_freason as *const () as usize,
             )
             .ok()
         })
@@ -990,7 +990,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
     }
 
     fn raise_class_helper(&self) -> usize {
-        crate::native_helpers::arinsal_beamasm_raise_class as *const () as usize
+        crate::beam_common::erts_sanitize_freason as *const () as usize
     }
 
     fn raw_raise_helper(&self) -> usize {
