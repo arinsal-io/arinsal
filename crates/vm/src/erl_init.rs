@@ -21,3 +21,27 @@ pub(crate) fn erts_backtrace_depth() -> usize {
 pub(crate) fn set_erts_backtrace_depth(n: usize) -> usize {
     ERTS_BACKTRACE_DEPTH.swap(n, Ordering::Relaxed)
 }
+
+/// The node's runtime-system tables that `erl_start` (erl_init.c) initialises once per OS
+/// process: the process and port tables (`erts_proc`, `erts_port`), `erts_schedulers`, the
+/// registered-name table (register.c `process_reg`), the trap exports and the statistics
+/// state. erts keeps each as its own global; here they are still fields of one
+/// [`crate::process::Runtime`] that `erl_start` creates and that lives until `erts_exit`.
+static ERTS_RUNTIME: std::sync::OnceLock<&'static crate::process::Runtime> =
+    std::sync::OnceLock::new();
+
+/// The runtime-system tables once `erl_start` created them.
+#[inline]
+pub(crate) fn erts_runtime() -> Option<&'static crate::process::Runtime> {
+    ERTS_RUNTIME.get().copied()
+}
+
+/// `erl_start` (erl_init.c): creates the runtime-system tables on the first call; later calls
+/// return the ones that exist.
+// Port of erts/emulator/beam/erl_init.c (erl_start: erts_init_process, erts_init_port,
+// erts_init_scheduling, init_register_table, ...), OTP-29.1.1.
+pub(crate) fn erl_start(
+    create: impl FnOnce() -> &'static crate::process::Runtime,
+) -> &'static crate::process::Runtime {
+    ERTS_RUNTIME.get_or_init(create)
+}

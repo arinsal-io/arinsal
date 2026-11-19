@@ -281,8 +281,6 @@ pub struct EvalResult {
 /// Lazy module loader and single-process execution engine.
 pub struct Vm {
     paths: Vec<PathBuf>,
-    /// The node runtime has VM lifetime, like erts' process, port, and scheduler tables.
-    pub(crate) runtime: Option<&'static crate::process::Runtime>,
     pub(crate) statistics_origins: crate::natives::sys::StatisticsOrigins,
     pub(crate) otp_root: Option<PathBuf>,
     beamasm_targets: beamasm_integration::NativeTargetCache,
@@ -330,7 +328,7 @@ impl Drop for Vm {
     fn drop(&mut self) {
         // Port of erts/emulator/beam/erl_init.c (erts_exit), OTP-29.1.1.
         if !self.replica
-            && let Some(runtime) = self.runtime
+            && let Some(runtime) = crate::erl_init::erts_runtime()
             && let Ok(scheduler) = runtime.scheduler()
         {
             scheduler.release();
@@ -338,7 +336,7 @@ impl Drop for Vm {
         // erts_exit ends the OS process and with it the forker socket: erl_child_setup reads
         // end of file and exits.
         if !self.replica
-            && let Some(runtime) = self.runtime
+            && let Some(runtime) = crate::erl_init::erts_runtime()
         {
             crate::spawn_drv::shutdown_forker(runtime);
         }

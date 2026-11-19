@@ -842,7 +842,6 @@ impl Vm {
         crate::code_ix::global();
         Self {
             paths,
-            runtime: None,
             statistics_origins: if replica {
                 crate::natives::sys::StatisticsOrigins::now()
             } else {

@@ -313,9 +313,7 @@ impl Vm {
             ))));
         }
         let (sender, receiver) = mpsc::channel();
-        let runtime: &'static Runtime = if let Some(runtime) = self.runtime {
-            runtime
-        } else {
+        let runtime: &'static Runtime = crate::erl_init::erl_start(|| {
             // erl_init.c (erts_init_trace -> init_sys_msg_dispatcher): the dispatcher thread
             // exists from node start.
             crate::erl_trace::init_sys_msg_dispatcher();
@@ -323,7 +321,7 @@ impl Vm {
             let port_layout = arinsal_term::ptab::port_table_layout();
             let port_ids = PtabIdRing::new(port_layout.max());
             let named_ets = Arc::new(arinsal_ets::NamedTableIndex::new());
-            let runtime: &'static Runtime = Box::leak(Box::new(Runtime {
+            Box::leak(Box::new(Runtime {
                 statistics: crate::natives::sys::StatisticsState::new(self.statistics_origins),
                 code: Arc::clone(&code),
                 trap_exports: std::array::from_fn(|_| OnceLock::new()),
@@ -352,10 +350,8 @@ impl Vm {
                 gc_defaults: crate::natives::sys::GcDefaults::boot(),
                 persistent_terms: arinsal_pterm::global_store(),
                 multi_scheduling: Mutex::new(MultiScheduling::default()),
-            }));
-            self.runtime = Some(runtime);
-            runtime
-        };
+            }))
+        });
         *runtime.result.lock().unwrap() = sender;
         let first_runtime = runtime.scheduler.get().is_none();
         (|| -> Result<ScheduledResult, VmError> {
