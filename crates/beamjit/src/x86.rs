@@ -23,9 +23,9 @@ use arinsal_beamasm::beam_asm_module::{BeamCodeHeader, BeamModuleAssembler};
 use arinsal_beamasm::common::args::ArgVal;
 use arinsal_beamasm::common::types::ArgType;
 use arinsal_beamops::beam_opcodes::{
-    op_call_bif_mfa_aaI, op_empty_func_line, op_executable_line_II, op_func_line_I,
-    op_i_debug_line_IIt, op_i_func_info_IaaI, op_i_test_yield, op_int_code_end, op_line_I,
-    op_nif_start, op_send,
+    op_aligned_label_Lt, op_call_bif_mfa_aaI, op_empty_func_line, op_executable_line_II,
+    op_func_line_I, op_i_debug_line_IIt, op_i_func_info_IaaI, op_i_test_yield, op_int_code_end,
+    op_line_I, op_nif_start, op_send,
 };
 use arinsal_beamops::{self as beamops, NewLiteral, OpSink, SpecificOperand};
 pub use arinsal_x64::exec::CodeMemory;
@@ -260,6 +260,9 @@ pub struct LoaderState<'a, E: LoaderEnv + ?Sized> {
     args: Vec<ArgVal>,
     /// `function_number`: the functions seen so far.
     pub function_number: u32,
+    /// The functions emitted so far, for the code header's function table that
+    /// `beam_load_finalize_code` writes from the assembler's `functions`.
+    pub functions: Vec<EmittedFunction>,
     /// `function`: the name of the current function, for error messages.
     pub function: u64,
     /// `arity`: the arity of the current function.
@@ -283,6 +286,23 @@ pub struct LoaderState<'a, E: LoaderEnv + ?Sized> {
     pub line_coverage_valid: Option<Vec<u8>>,
     /// `loc_index_to_cover_id`.
     pub loc_index_to_cover_id: Option<Vec<u32>>,
+}
+
+/// A function as the emit saw it: the name and arity of its `i_func_info`, the first
+/// `aligned_label` after it (the entry, `int_func_start`'s `Entry_Label`) and whether its
+/// body starts with `nif_start`.
+// Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp (emit_i_func_info appends the
+// function's ErtsCodeInfo to `functions`) and generators.tab (int_func_start), OTP-29.1.1.
+#[derive(Clone, Copy, Debug)]
+pub struct EmittedFunction {
+    /// Global atom index of the function name.
+    pub atom: u32,
+    /// The function's arity.
+    pub arity: u8,
+    /// The entry label.
+    pub entry_label: u32,
+    /// The body starts with `nif_start`.
+    pub nif_stub: bool,
 }
 
 /// `stp->beam.lines.item_count`: the items of the line chunk plus the undefined location 0,
@@ -361,6 +381,7 @@ pub fn beam_load_prepare_emit<'a, E: LoaderEnv + ?Sized>(
         ba,
         args: Vec::new(),
         function_number: 0,
+        functions: Vec::new(),
         function: 0,
         arity: 0,
         current_li: 0,
@@ -452,6 +473,17 @@ impl<E: LoaderEnv + ?Sized> LoaderState<'_, E> {
                     ));
                 }
                 self.function_number += 1;
+                let (Some(SpecificOperand::Atom(atom)), Some(SpecificOperand::Unsigned(arity))) =
+                    (operands.get(2), operands.get(3))
+                else {
+                    return Err("i_func_info operands".into());
+                };
+                self.functions.push(EmittedFunction {
+                    atom: *atom,
+                    arity: *arity as u8,
+                    entry_label: 0,
+                    nif_stub: false,
+                });
                 // Save context for error messages.
                 self.function = arg_value(self.args[2]);
                 self.arity = arg_value(self.args[3]);
@@ -466,10 +498,23 @@ impl<E: LoaderEnv + ?Sized> LoaderState<'_, E> {
                     func_line[n] = li;
                 }
             }
+            // The first aligned label after the `i_func_info` is the entry label.
+            op_aligned_label_Lt => {
+                // `L` is massaged from `TAG_u` to the label (asm_load.c, case 'L').
+                if let (Some(function), Some(ArgVal::Label(label))) =
+                    (self.functions.last_mut(), self.args.first())
+                    && function.entry_label == 0
+                {
+                    function.entry_label = *label;
+                }
+            }
             op_nif_start => {
                 let n = self.function_number as usize;
                 if n == 0 {
                     return Err("nif_start outside a function".into());
+                }
+                if let Some(function) = self.functions.last_mut() {
+                    function.nif_stub = true;
                 }
                 self.are_nifs
                     .get_or_insert_with(|| vec![0; function_count as usize])[n - 1] = 1;
@@ -487,10 +532,13 @@ impl<E: LoaderEnv + ?Sized> LoaderState<'_, E> {
                 else {
                     return Err("call_bif_mfa operands".into());
                 };
-                let module = self.beam.atom(*module).ok_or("call_bif_mfa module atom")?;
-                let function = self
-                    .beam
-                    .atom(*function)
+                // The transformed operands name global atoms (`SpecificOperand::Atom`).
+                let atoms = arinsal_term::global_atoms();
+                let module = atoms
+                    .text(arinsal_term::Atom(*module))
+                    .ok_or("call_bif_mfa module atom")?;
+                let function = atoms
+                    .text(arinsal_term::Atom(*function))
                     .ok_or("call_bif_mfa function atom")?;
                 let arity = u8::try_from(*arity).map_err(|_| "call_bif_mfa arity")?;
                 let function = self

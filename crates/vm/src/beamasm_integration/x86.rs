@@ -176,6 +176,31 @@ impl LoaderEnv for X86LoaderEnv<'_> {
             .map(|f| *f as u64)
             .ok_or_else(|| format!("import index {index} is out of range"))
     }
+
+    // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:912 (emit_call_bif_mfa), OTP-29.1.1:
+    // the active export of M:F/A, then its `bif_table[e->bif_number].f`.
+    fn bif_mfa_function(&self, module: &str, function: &str, arity: u8) -> Result<u64, String> {
+        let entry = bif_mfa_entry(module, function, arity)
+            .ok_or_else(|| format!("no BIF export for {module}:{function}/{arity}"))?;
+        let bif = export_dispatch(entry).map_or(0, |export| export.bif_table_function());
+        (bif != 0)
+            .then_some(bif as u64)
+            .ok_or_else(|| format!("no BIF function for {module}:{function}/{arity}"))
+    }
+
+    // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:691-705 (emit_send), OTP-29.1.1:
+    // `BIF_TRAP_EXPORT(BIF_send_2)` and `send_2` for `call_light_bif_shared`.
+    fn send_target(&self) -> Result<(u64, u64), String> {
+        let export = Arc::as_ptr(
+            make_export((arinsal_term::atoms::ERLANG, arinsal_term::atoms::SEND, 2))
+                .ok_or("no erlang:send/2 export")?,
+        ) as usize;
+        let bif =
+            crate::bif_table::function(crate::raw::jit_ffi::export_entry(export).bif_number());
+        (bif != 0)
+            .then_some((export as u64, bif as u64))
+            .ok_or_else(|| "no erlang:send/2 BIF function".into())
+    }
 }
 
 /// The loaded module instance (`struct erl_module_instance` with its code header) of x86
@@ -545,45 +570,6 @@ fn is_line_breakpoint_trampoline(memory: &CodeMemory, offset: usize) -> bool {
         == Some(target)
 }
 
-/// The function of each `func_info` of the file: name, arity, entry label (the label after
-/// it) and whether its body starts with `nif_start`.
-fn file_functions(beam: &BeamFile) -> Vec<arinsal_loader::NativeFunction> {
-    use arinsal_beam::Operand;
-    use arinsal_spec::Opcode;
-    let instructions = &beam.code.instructions;
-    let mut functions = Vec::new();
-    for (at, instruction) in instructions.iter().enumerate() {
-        if instruction.op != Opcode::FuncInfo {
-            continue;
-        }
-        let (Some(Operand::Atom(name)), Some(Operand::U(arity))) =
-            (instruction.args.get(1), instruction.args.get(2))
-        else {
-            continue;
-        };
-        let Some(atom) = beam.atom(*name).and_then(|name| global_atoms().get(name)) else {
-            continue;
-        };
-        let Some((entry_at, Some(Operand::Label(entry_label)))) = instructions[at + 1..]
-            .iter()
-            .enumerate()
-            .find(|(_, next)| next.op == Opcode::Label)
-            .map(|(offset, next)| (at + 1 + offset, next.args.first()))
-        else {
-            continue;
-        };
-        functions.push(arinsal_loader::NativeFunction {
-            atom,
-            arity: *arity as u8,
-            entry_label: *entry_label,
-            nif_stub: instructions
-                .get(entry_at + 1)
-                .is_some_and(|next| next.op == Opcode::NifStart),
-        });
-    }
-    functions
-}
-
 /// Loads `beam` with the x86 module assembler: `load_code` with `stp->ba`, then
 /// `beam_load_finish_emit` (`beamasm_codegen`, the literal and string patches). The
 /// rest of the patches wait for `beam_load_finalize_code` ([`CompiledVersion::install`]).
@@ -696,6 +682,17 @@ pub(crate) fn compile(
         };
     }
     let line_instr = stp.line_instr.take().unwrap_or_default();
+    // Port of erts/emulator/beam/jit/asm_load.c:1177-1260 (beam_load_finalize_code: the code
+    // header's function table is the assembler's `functions`), OTP-29.1.1.
+    let functions: Vec<_> = std::mem::take(&mut stp.functions)
+        .into_iter()
+        .map(|function| arinsal_loader::NativeFunction {
+            atom: arinsal_term::Atom(function.atom),
+            arity: function.arity,
+            entry_label: function.entry_label,
+            nif_stub: function.nif_stub,
+        })
+        .collect();
     let mut ba = stp.ba;
     let (mut memory, code_hdr) = match arinsal_beamjit::beamasm_codegen(&mut ba, &load_hdr) {
         Ok(generated) => generated,
@@ -741,9 +738,6 @@ pub(crate) fn compile(
         arinsal_beamjit::beamasm_patch_strings(&ba, &mut memory, string_table).ok()?;
     }
     drop(env);
-    // Port of erts/emulator/beam/jit/asm_load.c:1177-1260: the function table of a module that
-    // was not decoded comes from its `func_info`s.
-    let functions = file_functions(beam);
     if module.awaits_native_functions() {
         if let Err(error) = module.finish_native(beam, &functions) {
             fail(failure, format!("{error:?}"));

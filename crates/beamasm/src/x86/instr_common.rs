@@ -1054,8 +1054,11 @@ impl BeamModuleAssembler {
             .ok_or(AsmError::Operand("tagged tuple test to an unknown label"))?;
         let arity_word = i64::try_from(arg_word(arity_word)?)
             .map_err(|_| AsmError::Operand("tuple arity word"))?;
-        let tag_word =
-            i64::try_from(arg_word(tag_word)?).map_err(|_| AsmError::Operand("tuple tag word"))?;
+        // `const ArgAtom &Tag`: the tagged atom word, an immediate operand.
+        let ArgVal::Immediate(tag_word) = tag_word else {
+            return Err(AsmError::Operand("tuple tag atom"));
+        };
+        let tag_word = i64::try_from(tag_word).map_err(|_| AsmError::Operand("tuple tag atom"))?;
         self.mov_arg_to_reg(ARG2, src)?;
         self.emit_is_boxed_source(fail, src, ARG2, Distance::Long)?;
         let boxed_ptr = self.asm.emit_ptr_val(ARG2, ARG2);
@@ -1088,8 +1091,11 @@ impl BeamModuleAssembler {
             .ok_or(AsmError::Operand("record test to an unknown label"))?;
         let arity_word = i64::try_from(arg_word(arity_word)?)
             .map_err(|_| AsmError::Operand("tuple arity word"))?;
-        let tag_word =
-            i64::try_from(arg_word(tag_word)?).map_err(|_| AsmError::Operand("tuple tag word"))?;
+        // `const ArgAtom &Tag`: the tagged atom word, an immediate operand.
+        let ArgVal::Immediate(tag_word) = tag_word else {
+            return Err(AsmError::Operand("tuple tag atom"));
+        };
+        let tag_word = i64::try_from(tag_word).map_err(|_| AsmError::Operand("tuple tag atom"))?;
         self.mov_arg_to_reg(ARG2, src)?;
         self.emit_is_boxed_source(not_tuple, src, ARG2, Distance::Long)?;
         let boxed_ptr = self.asm.emit_ptr_val(ARG2, ARG2);
@@ -3450,7 +3456,7 @@ mod tests {
                     ArgVal::Label(not_record),
                     src,
                     ArgVal::Word(*arity),
-                    ArgVal::Word(*tag),
+                    ArgVal::Immediate(*tag),
                 )
             },
         );
@@ -3463,7 +3469,7 @@ mod tests {
                 ArgVal::Label(fail),
                 src,
                 ArgVal::Word(*arity),
-                ArgVal::Word(*tag),
+                ArgVal::Immediate(*tag),
             )
         });
         assert_typed_source_op_matches("i_test_arity_fsA", |m, block, fail, src| {

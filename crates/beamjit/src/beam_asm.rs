@@ -252,6 +252,8 @@ pub fn beam_load_emit_op(
             SpecificOperand::Nil => ArgVal::Immediate(NIL),
             SpecificOperand::Atom(index) => ArgVal::Immediate(env.atom(beam, *index)?),
             SpecificOperand::Unsigned(value) => ArgVal::Word(*value),
+            // asm_load.c:604-607: `TAG_v` is `'I'` with the arity header as is.
+            SpecificOperand::ArityVal(header) => ArgVal::Immediate(*header),
             SpecificOperand::Label(label) => ArgVal::Label(*label),
             SpecificOperand::X(_)
             | SpecificOperand::TypedX { .. }

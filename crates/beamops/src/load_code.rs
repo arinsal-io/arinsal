@@ -438,8 +438,9 @@ fn operand(arg: BeamOpArg, keep_type: bool) -> Result<SpecificOperand, LoadCodeE
         TAG_N => SpecificOperand::Nil,
         TAG_L => SpecificOperand::FloatRegister(arg.val as u32),
         TAG_Q => SpecificOperand::Literal(arg.val as u32),
-        // The arity header of `select_tuple_arity`.
-        TAG_V => SpecificOperand::Unsigned(arg.val >> 6),
+        // Port of erts/emulator/beam/jit/asm_load.c:604-607 (`case TAG_v: curr->type = 'I'`),
+        // OTP-29.1.1: the arity header of `select_tuple_arity`, kept as the header word.
+        TAG_V => SpecificOperand::ArityVal(arg.val),
         TAG_O => SpecificOperand::SmallInt(0),
         other => {
             return Err(error(format!(

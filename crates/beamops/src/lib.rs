@@ -80,6 +80,9 @@ pub enum SpecificOperand {
     SmallInt(i64),
     /// Unsigned immediate.
     Unsigned(u64),
+    /// A tuple arity header (`make_arityval(Arity)`): `TAG_v` of `select_tuple_arity`, which
+    /// asm_load.c passes to the assembler as an `'I'` immediate with the header word as is.
+    ArityVal(u64),
     /// Nil operand.
     Nil,
     /// An X register with the compiler's `Type` chunk entry (`{tr, Reg, Type}`); only produced

@@ -2128,6 +2128,8 @@ fn arg(
         }
         SpecificOperand::SmallInt(value) => env.integer_literal(*value).map(ArgVal::Literal),
         SpecificOperand::Unsigned(value) => Ok(ArgVal::Immediate(*value)),
+        // The arm `emit_tuple_arity` compares the arity shifted out of the header word.
+        SpecificOperand::ArityVal(header) => Ok(ArgVal::Immediate(*header >> 6)),
         SpecificOperand::Nil => Ok(ArgVal::Immediate(0x3b)),
         _ => Err("operand form is not accepted by the module assembler".to_owned()),
     }

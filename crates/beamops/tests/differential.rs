@@ -297,6 +297,7 @@ fn operand_type(operand: &SpecificOperand) -> char {
         SpecificOperand::Literal(_) => 'q',
         SpecificOperand::SmallInt(_) => 'i',
         SpecificOperand::Unsigned(_) => 'u',
+        SpecificOperand::ArityVal(_) => 'v',
         SpecificOperand::Nil => 'n',
     }
 }
