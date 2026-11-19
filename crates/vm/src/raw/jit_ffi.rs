@@ -4,7 +4,7 @@
 //! The symbols take C pointers by erts' signatures; the callers stay safe by going through
 //! these functions. Every function states what the generated code guarantees.
 
-use arinsal_term::ExportEntry;
+use arinsal_term::{ExportEntry, Term};
 
 /// Writes `value` through a C out-pointer (`int *get_outp`, `ErtsMessage **msgpp`,
 /// `double *resp`).
@@ -34,4 +34,32 @@ pub(crate) fn export_entry<'a>(address: usize) -> &'a ExportEntry {
     // SAFETY: the address is an export entry taken from the export tables or returned by the
     // runtime; entries are leaked when created and never freed, like erts' export entries.
     unsafe { &*(address as *const ExportEntry) }
+}
+
+/// The head and tail of a process-owned stacktrace list cell.
+// Port of erts/emulator/beam/erl_bif_info.c (erts_build_stacktrace), OTP-29.1.1.
+pub(crate) fn stacktrace_cons_parts(term: Term) -> Option<(Term, Term)> {
+    // SAFETY: callers pass a symbolic trace rooted in the live process heap and do not collect
+    // or move that heap while its fields are copied.
+    unsafe { term.cons_ref() }
+}
+
+/// Copies the four fields of a process-owned stacktrace frame tuple.
+// Port of erts/emulator/beam/erl_bif_info.c (erts_build_stacktrace), OTP-29.1.1.
+pub(crate) fn stacktrace_frame_fields(term: Term) -> Option<[Term; 4]> {
+    // SAFETY: callers pass a frame from a symbolic trace rooted in the live process heap; the
+    // tuple view is used only to copy its fields before any heap allocation can collect.
+    let tuple = unsafe { term.tuple_ref() }?;
+    if tuple.len() != 4 {
+        return None;
+    }
+    Some([tuple.get(0)?, tuple.get(1)?, tuple.get(2)?, tuple.get(3)?])
+}
+
+/// The call-NIF site embedded in live native code by the VM's loader.
+// Port of erts/emulator/beam/jit/beam_jit_common.cpp (beam_jit_call_nif), OTP-29.1.1.
+pub(crate) fn native_nif_site(address: usize) -> &'static crate::native_helpers::NativeNifSite {
+    // SAFETY: generated code embeds the boxed site owned by its live CompiledVersion; that
+    // version cannot be purged while its native code is executing.
+    unsafe { &*(address as *const crate::native_helpers::NativeNifSite) }
 }

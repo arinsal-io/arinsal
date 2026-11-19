@@ -24,6 +24,24 @@ pub(crate) fn write_word(output: *mut u64, value: u64) -> bool {
     true
 }
 
+/// Reconstitutes an Eterm received from native runtime code.
+// Port of erts/emulator/beam/beam_common.c (handle_error), OTP-29.1.1.
+pub(crate) fn term_from_raw_bits(bits: u64) -> arinsal_term::Term {
+    // SAFETY: the native runtime hook passes a tagged BEAM term in its `Eterm` argument.
+    unsafe { arinsal_term::Term::from_raw_bits(bits) }
+}
+
+/// Attaches the process X file to the scheduler's register array for the current slice.
+// Port of erts/emulator/beam/beam_common.c (copy_in_registers), OTP-29.1.1.
+pub(crate) fn attach_process_registers(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+) {
+    // SAFETY: the scheduler owns `registers` at a stable address for this process's slice and
+    // calls `copy_out_registers` before scheduling it out, matching the attach/detach lifetime.
+    unsafe { process.x.attach(registers) };
+}
+
 /// Gives a runtime root range to a closure while keeping its raw-pointer borrow local.
 pub(crate) fn with_mut_terms<R>(
     words: *mut u64,

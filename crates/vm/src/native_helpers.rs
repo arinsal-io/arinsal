@@ -359,10 +359,7 @@ pub extern "C" fn arinsal_beamasm_call_nif(
     };
     // `reg`: the NIF's arguments, as beam_jit_call_nif passes them.
     let reg = &mut registers.x_reg_array;
-    // SAFETY: `site` is the address this call-NIF body was compiled with: a boxed
-    // `NativeNifSite` owned by the `CompiledVersion` whose code is executing, which keeps the
-    // box until it frees that code.
-    let site = unsafe { &*(site as usize as *const NativeNifSite) };
+    let site = crate::raw::jit_ffi::native_nif_site(site as usize);
     let Some(native) = site.call.get() else {
         crate::native_hooks::set_error(process, "undef");
         return 0;

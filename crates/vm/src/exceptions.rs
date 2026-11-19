@@ -158,8 +158,7 @@ impl Trap {
 
 /// Decode an exception raised by a native runtime hook after native state is committed.
 pub(super) fn native_trap(class: u64, reason: u64) -> Result<Trap, VmError> {
-    // SAFETY: The native hook accepts only tagged BEAM terms supplied by generated code.
-    let reason = unsafe { Term::from_raw_bits(reason) };
+    let reason = crate::raw::beam_common_ffi::term_from_raw_bits(reason);
     // `class` is a `freason` (error.h `EXC_*`): the class is its low bits.
     let class = stacktrace::class_from_freason(class)
         .ok_or_else(|| VmError::Unsupported("native exception class".into()))?;
@@ -746,26 +745,15 @@ pub(super) fn materialize(p: &mut Process, trace: Term) -> Result<Term, VmError>
 }
 
 fn strip_top_location(p: &mut Process, trace: Term) -> Result<Term, VmError> {
-    // SAFETY: The symbolic trace is process-owned; fragment allocation below cannot collect it.
-    let Some((head, tail)) = (unsafe { trace.cons_ref() }) else {
+    // The symbolic trace is process-owned; fragment allocation below cannot collect it.
+    let Some((head, tail)) = crate::raw::jit_ffi::stacktrace_cons_parts(trace) else {
         return Ok(trace);
     };
-    // SAFETY: Stack frames are tuples allocated on a live process heap.
-    let Some(frame) = (unsafe { head.tuple_ref() }) else {
+    // Stack frames are tuples allocated on a live process heap.
+    let Some(frame) = crate::raw::jit_ffi::stacktrace_frame_fields(head) else {
         return Ok(trace);
     };
-    if frame.len() != 4 {
-        return Ok(trace);
-    }
-    let frame = tuple(
-        p,
-        &[
-            frame.get(0).unwrap(),
-            frame.get(1).unwrap(),
-            frame.get(2).unwrap(),
-            Term::NIL,
-        ],
-    )?;
+    let frame = tuple(p, &[frame[0], frame[1], frame[2], Term::NIL])?;
     TermBuilder::new(&mut ProcessHeapHandle(&mut p.heap))
         .cons(frame, tail)
         .map_err(|e| VmError::Unsupported(format!("raw stacktrace {e:?}")))

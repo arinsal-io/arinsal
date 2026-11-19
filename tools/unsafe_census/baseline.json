@@ -6,7 +6,7 @@
     "args": 0,
     "arith": 0,
     "beam": 0,
-    "beamasm": 109,
+    "beamasm": 163,
     "beamjit": 2,
     "beamops": 0,
     "bifs": 6,
@@ -28,11 +28,11 @@
     "packet": 0,
     "pterm": 3,
     "re": 18,
-    "sched": 122,
+    "sched": 127,
     "spec": 0,
-    "term": 402,
-    "vm": 353,
-    "x64": 13,
+    "term": 404,
+    "vm": 414,
+    "x64": 15,
     "drv": 93
   }
 }

@@ -1,4 +1,5 @@
 //! x86_64 executable memory backed by the ERTS dual-mapped JIT allocator path.
+//! This module owns the crate's OS mapping and executable-memory unsafe operations.
 //!
 //! Port of `erts/emulator/beam/jit/beam_jit_main.cpp:181-229` and asmjit's
 //! `JitAllocator::alloc/release` plus `VirtMem::alloc_dual_mapping`, OTP-29.1.1.

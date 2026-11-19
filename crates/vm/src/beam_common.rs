@@ -12,10 +12,7 @@ use arinsal_term::{Term, TermBuilder, exc};
 // Port of erts/emulator/beam/beam_common.c:336 (copy_in_registers), OTP-29.1.1: `reg` is
 // `esdp->registers`; the X file stays the array until copy_out_registers.
 pub(crate) fn copy_in_registers(c_p: &mut Process, reg: &mut arinsal_beamasm::SchedulerRegisters) {
-    // SAFETY: `reg` is the scheduler's register file in its `SchedulerData`, which outlives
-    // the slice and is not moved while it runs; `copy_out_registers` detaches before the
-    // scheduler loop schedules the process out.
-    unsafe { c_p.x.attach(reg) };
+    crate::raw::beam_common_ffi::attach_process_registers(c_p, reg);
 }
 
 /// Save the `c_p->arity` live registers from the scheduler's register array into the process
