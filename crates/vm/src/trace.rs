@@ -1296,7 +1296,6 @@ pub(crate) fn emit_external_process_event(
 }
 
 pub(crate) fn traced_port_by_other(
-    vm: &Vm,
     process: &mut Process,
     session: u64,
     port: u64,
@@ -1338,7 +1337,7 @@ pub(crate) fn traced_port_by_other(
             .is_ok_and(|scheduler| scheduler.lookup(tracer)),
         Tracer::Port(tracer) => runtime.ports.contains(tracer),
         Tracer::Module { module, state } => {
-            module_tracer_alive(vm, process, &module, &state, Term::port(port))
+            module_tracer_alive(process, &module, &state, Term::port(port))
         }
     }
 }
@@ -1411,7 +1410,6 @@ pub(crate) fn port_session_refs(process: &Process, port: u64) -> Vec<(String, i6
 /// Whether `pid` is already traced in `session` by a live tracer other than `tracer`.
 // Port of erts/emulator/beam/erl_bif_trace.c:853-863 (start_trace), OTP-29.1.1.
 pub(crate) fn traced_by_other(
-    vm: &Vm,
     process: &mut Process,
     session: u64,
     pid: Pid,
@@ -1453,7 +1451,7 @@ pub(crate) fn traced_by_other(
             .is_ok_and(|scheduler| scheduler.lookup(tracer)),
         Tracer::Port(id) => runtime.ports.contains(id),
         Tracer::Module { module, state } => {
-            module_tracer_alive(vm, process, &module, &state, pid.to_term())
+            module_tracer_alive(process, &module, &state, pid.to_term())
         }
     }
 }
@@ -1462,7 +1460,6 @@ pub(crate) fn traced_by_other(
 // Port of erts/emulator/beam/erl_trace.c:3374-3390 (erts_is_tracer_enabled), OTP-29.1.1: a
 // tracer whose module was deleted, purged or reloaded without the NIFs is no longer a tracer.
 fn module_tracer_alive(
-    vm: &Vm,
     process: &mut Process,
     module: &str,
     state: &OwnedTerm,
@@ -1478,7 +1475,6 @@ fn module_tracer_alive(
         return false;
     };
     let result = crate::natives::nif::invoke_tracer(
-        vm,
         process,
         module,
         "enabled",
@@ -1762,12 +1758,7 @@ fn trace_action_flags(value: Term) -> Option<(u64, Option<Tracer>)> {
 }
 
 // Port of erts/emulator/beam/erl_trace.c:3374-3390 (erts_is_tracer_enabled), OTP-29.1.1.
-fn match_trace_tracer_alive(
-    vm: &mut Vm,
-    process: &mut Process,
-    tracee: Pid,
-    tracer: &Tracer,
-) -> bool {
+fn match_trace_tracer_alive(process: &mut Process, tracee: Pid, tracer: &Tracer) -> bool {
     match tracer {
         Tracer::Default => true,
         Tracer::Pid(pid) => process.runtime.as_ref().is_some_and(|runtime| {
@@ -1780,7 +1771,7 @@ fn match_trace_tracer_alive(
             .as_ref()
             .is_some_and(|runtime| runtime.ports.contains(*port)),
         Tracer::Module { module, state } => {
-            module_tracer_alive(vm, process, module, state, tracee.to_term())
+            module_tracer_alive(process, module, state, tracee.to_term())
         }
     }
 }
@@ -1789,7 +1780,6 @@ fn match_trace_tracer_alive(
 // (set_match_trace and do_trace), OTP-29.1.1: the resolved session tracer is installed on the
 // tracee, a nil tracer clears trace flags, and an inactive tracer rejects the update.
 fn apply_match_trace_action(
-    vm: &mut Vm,
     process: &mut Process,
     session: u64,
     current: Pid,
@@ -1862,7 +1852,7 @@ fn apply_match_trace_action(
         _ => return false,
     };
     if let Some(tracer) = tracer.as_ref()
-        && !match_trace_tracer_alive(vm, process, target, tracer)
+        && !match_trace_tracer_alive(process, target, tracer)
     {
         return false;
     }
@@ -2113,7 +2103,7 @@ fn run_call_match(
         })
         .map_err(|()| VmError::Unsupported("invalid trace match specification".into()))?;
     let current_stacktraces = if spec.uses_current_stacktrace {
-        current_stacktraces(vm, process)?
+        current_stacktraces(process)?
     } else {
         Vec::new()
     };
@@ -2208,7 +2198,7 @@ fn call_event_scope(
             // The session does not trace calls of this process.
             bp_flags &= !(HIT_LOCAL | HIT_GLOBAL | acc_flags);
         } else if bp_flags & (HIT_LOCAL | HIT_GLOBAL) != 0
-            && !session_call_enabled(vm, process, ctx, hit.session, pid)
+            && !session_call_enabled(process, ctx, hit.session, pid)
         {
             bp_flags &= !(HIT_LOCAL | HIT_GLOBAL);
         } else if bp_flags & (HIT_LOCAL | HIT_GLOBAL) != 0 {
@@ -2248,7 +2238,7 @@ fn call_event_scope(
             // the current event uses the pre-match tracer and flags; match trace actions affect
             // later events from the tracee.
             for (name, _heap, arguments) in outcome.trace_actions {
-                let _ = apply_match_trace_action(vm, process, hit.session, pid, &name, &arguments);
+                let _ = apply_match_trace_action(process, hit.session, pid, &name, &arguments);
             }
             if !silent {
                 let return_to = !outcome.suppress_call
@@ -2269,7 +2259,7 @@ fn call_event_scope(
             && let Some(meta) = hit.meta_tracer.as_ref()
             // Port of erts/emulator/beam/erl_trace.c:1211-1240 (erts_call_trace, meta branch),
             // OTP-29.1.1: `remove` clears the meta tracer of the breakpoint.
-            && module_call_enabled(vm, process, ctx, &meta.tracer(), pid).unwrap_or_else(|| {
+            && module_call_enabled(process, ctx, &meta.tracer(), pid).unwrap_or_else(|| {
                 meta.clear();
                 false
             })
@@ -2287,7 +2277,6 @@ fn call_event_scope(
             {
                 if !outcome.suppress_call {
                     emit_meta_call_event(
-                        vm,
                         process,
                         ctx,
                         meta,
@@ -2299,8 +2288,7 @@ fn call_event_scope(
                 }
                 // The call event uses the pre-match state; trace actions affect later events.
                 for (name, _heap, arguments) in outcome.trace_actions {
-                    let _ =
-                        apply_match_trace_action(vm, process, hit.session, pid, &name, &arguments);
+                    let _ = apply_match_trace_action(process, hit.session, pid, &name, &arguments);
                 }
                 if outcome.return_trace || outcome.exception_trace {
                     actions.push(CallActions {
@@ -2378,7 +2366,6 @@ fn call_event_scope(
 // :3305-3371 (is_tracer_ref_enabled), OTP-29.1.1: `trace_status` and then `call` are asked
 // before the match specification runs, so a discarded call pushes no return trace frame.
 fn session_call_enabled(
-    vm: &Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     session: u64,
@@ -2392,7 +2379,7 @@ fn session_call_enabled(
     let Some(tracer) = tracer else {
         return false;
     };
-    match module_call_enabled(vm, process, ctx, &tracer, pid) {
+    match module_call_enabled(process, ctx, &tracer, pid) {
         Some(enabled) => enabled,
         None => {
             // The tracee is the current process, so the tracer is removed right away.
@@ -2406,7 +2393,6 @@ fn session_call_enabled(
 /// `trace_status` with `remove` (or no longer has its NIFs).
 // Port of erts/emulator/beam/erl_trace.c:3270-3303 (call_enabled_tracer), OTP-29.1.1.
 fn module_call_enabled(
-    vm: &Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     tracer: &Tracer,
@@ -2426,7 +2412,6 @@ fn module_call_enabled(
     };
     crate::natives::nif::refresh_hub(process, ctx);
     let status = crate::natives::nif::invoke_tracer(
-        vm,
         process,
         module,
         "enabled",
@@ -2437,7 +2422,6 @@ fn module_call_enabled(
         return None;
     }
     let call = crate::natives::nif::invoke_tracer(
-        vm,
         process,
         module,
         "enabled",
@@ -2462,7 +2446,6 @@ pub(crate) fn is_initial_call(process: &Process, module: &str, function: &str, a
 // OTP-29.1.1.
 #[allow(clippy::too_many_arguments)] // The call and its tracer are separate inputs.
 fn emit_meta_call_event(
-    vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     meta: &crate::trace_bp::MetaTracer,
@@ -2472,14 +2455,13 @@ fn emit_meta_call_event(
     extra: Option<Term>,
 ) -> Result<(), VmError> {
     let mfa = call_mfa_term(process, module, function, args, false)?;
-    emit_meta(vm, process, ctx, meta, "call", &[mfa], extra, true);
+    emit_meta(process, ctx, meta, "call", &[mfa], extra, true);
     Ok(())
 }
 
 /// Send a trace event of the traced process to a meta tracer.
 #[allow(clippy::too_many_arguments)] // The event and its meta tracer are separate inputs.
 fn emit_meta(
-    vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     meta: &crate::trace_bp::MetaTracer,
@@ -2532,7 +2514,6 @@ fn emit_meta(
             };
             crate::natives::nif::refresh_hub(process, ctx);
             let status = crate::natives::nif::invoke_tracer(
-                vm,
                 process,
                 module,
                 "enabled",
@@ -2559,7 +2540,6 @@ fn emit_meta(
         tracer,
     };
     deliver(
-        Some(vm),
         process,
         ctx,
         subject,
@@ -2860,7 +2840,7 @@ fn caller_info(
 }
 
 // Port of erts/emulator/beam/erl_db_util.c:5375-5421 (matchCurrentStacktrace), OTP-29.1.1.
-fn current_stacktraces(vm: &Vm, process: &mut Process) -> Result<Vec<(VecHeap, Term)>, VmError> {
+fn current_stacktraces(process: &mut Process) -> Result<Vec<(VecHeap, Term)>, VmError> {
     // Reserve one slot beyond OTP's MAX_BACKTRACE_SIZE for the current frame, which is
     // removed before the caller prefixes are built below.
     let trace = crate::stacktrace::build(process, 65)?;
@@ -2877,12 +2857,7 @@ fn current_stacktraces(vm: &Vm, process: &mut Process) -> Result<Vec<(VecHeap, T
     let callers = elems.get(1..).unwrap_or_default();
     // Port of erts/emulator/beam/error.h:206 (MAX_BACKTRACE_SIZE), OTP-29.1.1. Capture once
     // at the runtime maximum, then apply each match-spec's requested depth to the saved callers.
-    let backtrace_depth = process
-        .runtime
-        .as_ref()
-        .map_or(vm.backtrace_depth, |runtime| {
-            runtime.backtrace_depth.load(Ordering::Acquire)
-        });
+    let backtrace_depth = crate::erl_init::erts_backtrace_depth();
     let maximum = backtrace_depth.min(callers.len());
     let mut traces = Vec::with_capacity(maximum + 1);
     for depth in 0..=maximum {
@@ -3202,7 +3177,7 @@ fn native_return_event_inner(
         "return_from"
     };
     if let Some(meta) = meta {
-        emit_meta(vm, process, ctx, &meta, name, &[mfa, value], None, false);
+        emit_meta(process, ctx, &meta, name, &[mfa, value], None, false);
     } else {
         emit_filtered(
             Some(vm),
@@ -3273,7 +3248,7 @@ pub(crate) fn bif_return_events(
         if wanted {
             if crate::trace_bp::is_meta_id(action.session) {
                 if let Some(meta) = crate::trace_bp::meta_tracer_by_id(action.session) {
-                    emit_meta(vm, process, ctx, &meta, name, &[mfa, value], None, false);
+                    emit_meta(process, ctx, &meta, name, &[mfa, value], None, false);
                 }
             } else {
                 emit_filtered(
@@ -3709,14 +3684,13 @@ pub(crate) fn send_hooks_idle(process: &Process) -> bool {
 }
 
 pub(crate) fn emit_process(
-    vm: Option<&mut Vm>,
     process: &mut Process,
     subject: Pid,
     class: u64,
     name: &str,
     fields: &[Term],
 ) {
-    emit_filtered_without_ctx(vm, process, subject, class, name, fields, None);
+    emit_filtered_without_ctx(process, subject, class, name, fields, None);
 }
 
 /// Emits the return event from the x86 JIT's `return_trace` runtime call.
@@ -3770,7 +3744,6 @@ fn native_trace_return(process: &mut Process, mfa: u64, value: Term, tracer: Ter
     // event on the active trace session and routes it through that session's process or module
     // tracer.
     emit_filtered_without_ctx(
-        None,
         process,
         pid,
         CALL,
@@ -3820,11 +3793,7 @@ fn emit_meta_return_without_ctx(
             fields: &[mfa, value],
             extra: None,
         };
-        if let Some(runtime) = process.runtime {
-            crate::process::with_replica_vm(runtime, |vm| {
-                emit_module(vm, process, None, module, state, event);
-            });
-        }
+        emit_module(process, None, module, state, event);
         return;
     }
     let mut values = vec![
@@ -3912,15 +3881,7 @@ pub extern "C" fn beam_jit_return_to_trace(
     else {
         return;
     };
-    emit_filtered_without_ctx(
-        None,
-        process,
-        pid,
-        RETURN_TO,
-        "return_to",
-        &[mfa],
-        Some(session),
-    );
+    emit_filtered_without_ctx(process, pid, RETURN_TO, "return_to", &[mfa], Some(session));
 }
 
 /// Emits `{trace, Pid, return_from, MFA, Value}` for a native return trace.
@@ -3990,7 +3951,6 @@ pub extern "C" fn erts_call_trace_return(
 }
 
 fn emit_filtered_without_ctx(
-    mut vm: Option<&mut Vm>,
     process: &mut Process,
     subject: Pid,
     class: u64,
@@ -4040,13 +4000,7 @@ fn emit_filtered_without_ctx(
                 fields,
                 extra: None,
             };
-            if let Some(vm) = vm.as_deref_mut() {
-                emit_module(vm, process, None, module, state, event);
-            } else if let Some(runtime) = process.runtime {
-                crate::process::with_replica_vm(runtime, |vm| {
-                    emit_module(vm, process, None, module, state, event);
-                });
-            }
+            emit_module(process, None, module, state, event);
             continue;
         }
         let mut values = Vec::with_capacity(3 + fields.len());
@@ -4177,7 +4131,7 @@ pub(crate) fn running_mfa(process: &mut Process, subject: Pid) -> Result<Option<
 
 #[allow(clippy::too_many_arguments)] // Trace event identity and routing stay explicit at emission sites.
 fn emit_filtered(
-    mut vm: Option<&mut Vm>,
+    vm: Option<&mut Vm>,
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     subject: Pid,
@@ -4283,7 +4237,6 @@ fn emit_filtered(
             }
         }
         deliver(
-            vm.as_deref_mut(),
             process,
             ctx,
             subject,
@@ -4301,7 +4254,6 @@ fn emit_filtered(
 // erts/emulator/beam/erl_trace.c:3150-3260 (send_to_tracer_nif), OTP-29.1.1.
 #[allow(clippy::too_many_arguments)] // The event and its tracer are separate inputs.
 fn deliver(
-    vm: Option<&mut Vm>,
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     subject: Pid,
@@ -4319,14 +4271,7 @@ fn deliver(
             fields,
             extra,
         };
-        if let Some(vm) = vm {
-            emit_module(vm, process, Some(ctx), module, state, event);
-        } else if let Some(runtime) = process.runtime {
-            // Receive tracing runs inside signal handling, which has no Vm of its own.
-            crate::process::with_replica_vm(runtime, |vm| {
-                emit_module(vm, process, Some(ctx), module, state, event);
-            });
-        }
+        emit_module(process, Some(ctx), module, state, event);
         return;
     }
     let mut values = Vec::with_capacity(3 + fields.len() + 1);
@@ -4413,7 +4358,6 @@ fn timestamp_term(process: &mut Process, flags: u64) -> Option<Term> {
 }
 
 fn emit_module(
-    vm: &mut Vm,
     process: &mut Process,
     ctx: Option<&mut RunCtx<'_, crate::Process>>,
     module: &str,
@@ -4444,7 +4388,6 @@ fn emit_module(
         "call" | "return_from" | "exception_from" | "return_to"
     ) {
         let action = crate::natives::nif::invoke_tracer(
-            vm,
             process,
             module,
             "enabled",
@@ -4499,7 +4442,6 @@ fn emit_module(
         return;
     };
     let _ = crate::natives::nif::invoke_tracer(
-        vm,
         process,
         module,
         "trace",

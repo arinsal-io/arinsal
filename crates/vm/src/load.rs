@@ -837,7 +837,7 @@ impl Vm {
     }
 
     fn for_node(paths: Vec<PathBuf>, otp_root: Option<PathBuf>, replica: bool) -> Self {
-        let code_ix = Arc::clone(crate::code_ix::global());
+        let code_ix = crate::code_ix::global();
         Self {
             paths,
             runtime: None,
@@ -848,12 +848,8 @@ impl Vm {
             },
             otp_root,
             code: code_ix.active_tables(),
-            native_fns: code_ix.native_fns(),
-            purge_state: Arc::clone(&code_ix.purge_state),
             beamasm_targets: beamasm_integration::NativeTargetCache::new(),
-            code_ix,
             replica,
-            backtrace_depth: 8,
             esdp_registers: 0,
         }
     }
@@ -880,7 +876,7 @@ impl Vm {
     /// `module_info(exports)` on a booted node.
     pub fn note_beam_exports(&mut self, bytes: &[u8]) -> Result<(), VmError> {
         let beam = arinsal_beam::read(bytes).map_err(|e| VmError::Load(e.to_string()))?;
-        let staging = self.code_ix.start_staging();
+        let staging = crate::code_ix::global().start_staging();
         staging.with(|tables| tables.exports.note_beam(&beam));
         drop(staging);
         self.refresh_code();
@@ -899,11 +895,11 @@ impl Vm {
 
     /// The coverage mode modules loaded now get (`code:get_coverage_mode/0`).
     pub(crate) fn coverage_mode(&self) -> arinsal_loader::CoverageMode {
-        self.code_ix.coverage_mode()
+        crate::code_ix::global().coverage_mode()
     }
 
     pub(crate) fn set_coverage_mode(&mut self, mode: arinsal_loader::CoverageMode) {
-        self.code_ix.set_coverage_mode(mode);
+        crate::code_ix::global().set_coverage_mode(mode);
     }
 
     /// Whether the coverage table or the debugger line metadata need the instructions
@@ -960,7 +956,7 @@ impl Vm {
     /// Gives prepared native code the node-canonical entries that the staged module will use.
     // Port of erts/emulator/beam/jit/asm_load.c:1218 (erts_fun_entry_put), OTP-29.1.1.
     pub(crate) fn intern_prepared_fun_entries(&self, module: &mut Module) {
-        self.code_ix.intern_module_fun_entries(module);
+        crate::code_ix::global().intern_module_fun_entries(module);
     }
 
     /// Compiles `module` with BeamAsm into `meta`.
@@ -978,7 +974,7 @@ impl Vm {
             module,
             meta.md5,
             crate::trace_bp::line_breakpoints_instrumented(),
-            &self.code_ix,
+            crate::code_ix::global(),
             &mut failure,
         ) {
             // Port of erts/emulator/beam/jit/asm_load.c:1020 (stp->on_load = beamasm_get_on_load):
@@ -1030,7 +1026,7 @@ impl Vm {
         let mut meta = CodeMeta::from_beam_owned(beam, bytes);
         let mut module = self.prepare_module(&meta.beam, bytes, meta.md5)?;
         let name = module.name.clone();
-        let staging = self.code_ix.start_staging();
+        let staging = crate::code_ix::global().start_staging();
         let mut released = None;
         staging.with(|tables| {
             if let Some(old_id) = tables.old.remove(&name) {
@@ -1113,7 +1109,7 @@ impl Vm {
         self.decode_for_native_tables(&mut meta.beam)
             .map_err(|error| VmError::Load(error.to_string()))?;
         let mut module = self.prepare_module(&meta.beam, bytes, meta.md5)?;
-        let staging = self.code_ix.start_staging();
+        let staging = crate::code_ix::global().start_staging();
         // Another scheduler may have loaded the module since this one looked.
         if let Some(id) = staging.with(|tables| tables.loaded.get(&module_name).copied()) {
             staging.abort();
@@ -1194,7 +1190,7 @@ impl Vm {
         // erts_start_staging_code_ix, then end and commit in staging_epilogue, or
         // erts_abort_staging_code_ix), OTP-29.1.1: the modules of this load become current
         // together.
-        let staging = self.code_ix.start_staging();
+        let staging = crate::code_ix::global().start_staging();
         let not_purged: Vec<_> = staging.with(|tables| {
             names
                 .iter()
@@ -1246,7 +1242,7 @@ impl Vm {
     // compare.
     #[inline(always)]
     pub(crate) fn refresh_code(&mut self) {
-        if self.code.generation != self.code_ix.active_generation() {
+        if self.code.generation != crate::code_ix::global().active_generation() {
             self.reload_code();
         }
     }
@@ -1254,8 +1250,7 @@ impl Vm {
     #[cold]
     #[inline(never)]
     fn reload_code(&mut self) {
-        self.code = self.code_ix.active_tables();
-        self.native_fns = self.code_ix.native_fns();
+        self.code = crate::code_ix::global().active_tables();
     }
 
     /// Generation of the tables this VM reads; interpreter caches are valid only within it.
@@ -1322,7 +1317,7 @@ impl Vm {
         }
         // The new table generation makes import caches holding the old export target resolve
         // again.
-        self.code_ix.patch_all(|_| {});
+        crate::code_ix::global().patch_all(|_| {});
         self.refresh_code();
         self.register_native_targets(module_id);
     }
@@ -1529,12 +1524,12 @@ mod purge_free_tests {
         // A module whose load did not make it current (a failed on_load) stays published, so
         // freeing it has to unpublish its exports.
         let id = vm.load_bytes(&beam).unwrap();
-        vm.purge_state.hold_stage_permission_for_test(true);
-        let released = vm.code_ix.update_active(|tables| tables.release(id));
+        crate::natives::code::erts_purge_state().hold_stage_permission_for_test(true);
+        let released = crate::code_ix::global().update_active(|tables| tables.release(id));
         vm.refresh_code();
         let native = released.expect("native code of the old version");
         drop(native);
-        vm.purge_state.hold_stage_permission_for_test(false);
+        crate::natives::code::erts_purge_state().hold_stage_permission_for_test(false);
     }
 
     // erts_internal:purge_module/2 `complete` queues the old code's literals for release when
@@ -1550,7 +1545,7 @@ mod purge_free_tests {
         let mut vm = Vm::new([]);
         let id = vm.load_bytes(&beam).unwrap();
         let store = arinsal_pterm::global_store();
-        let released = vm.code_ix.update_active(|tables| tables.release(id));
+        let released = crate::code_ix::global().update_active(|tables| tables.release(id));
         let native = released.expect("native code of the old version");
         let before = store.retired_generation();
         native.unpublish();
@@ -1575,8 +1570,7 @@ mod purge_free_tests {
         let export_count = vm.code.exports.order.len();
         let fun_count = vm.code.fun_entries().count();
 
-        let native = vm
-            .code_ix
+        let native = crate::code_ix::global()
             .update_active(|tables| tables.release(id))
             .expect("native code of the purged version");
         vm.refresh_code();

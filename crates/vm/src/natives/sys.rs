@@ -464,12 +464,12 @@ fn call_garbage_collect(
 }
 
 fn call_system_flag(
-    vm: &mut Vm,
+    _vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    system_flag(vm, process, ctx, args)
+    system_flag(process, ctx, args)
 }
 
 fn call_scheduler_wall_time(
@@ -3001,7 +3001,6 @@ fn statistics(
 }
 
 fn system_flag(
-    vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
@@ -3019,9 +3018,9 @@ fn system_flag(
         "min_bin_vheap_size" => heap_minimum(process, args[1], false),
         "max_heap_size" => max_heap_flag(process, args[1]),
         "debug_flags" => Ok(Term::atom(arinsal_term::atoms::TRUE)),
-        "backtrace_depth" => backtrace_depth(vm, process, args[1]),
+        "backtrace_depth" => backtrace_depth(args[1]),
         "trace_control_word" => trace_control_word(process, args[1]),
-        "sequential_tracer" => crate::seq_trace::set_system_tracer(vm, process, args[1]),
+        "sequential_tracer" => crate::seq_trace::set_system_tracer(process, args[1]),
         "reset_seq_trace" => {
             crate::seq_trace::clear_all();
             Ok(Term::atom(arinsal_term::atoms::TRUE))
@@ -4549,16 +4548,10 @@ fn heap_minimum(process: &Process, value: Term, heap: bool) -> Result<Term, VmEr
     Term::small(previous).ok_or_else(badarg)
 }
 
-fn backtrace_depth(vm: &mut Vm, process: &Process, value: Term) -> Result<Term, VmError> {
+fn backtrace_depth(value: Term) -> Result<Term, VmError> {
     let requested = value.as_small().filter(|n| *n >= 0).ok_or_else(badarg)?;
     let requested = (requested as usize).min(64);
-    let previous = process
-        .runtime
-        .as_ref()
-        .map_or(vm.backtrace_depth, |runtime| {
-            runtime.backtrace_depth.swap(requested, Ordering::AcqRel)
-        });
-    vm.backtrace_depth = requested;
+    let previous = crate::erl_init::set_erts_backtrace_depth(requested);
     Term::small(previous as i64).ok_or_else(badarg)
 }
 

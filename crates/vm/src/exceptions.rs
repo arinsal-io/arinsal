@@ -540,25 +540,19 @@ pub(super) fn resume(
         } else if empty_trace_class(trace).is_some() || stacktrace::is_saved(trace) {
             trace
         } else {
-            save_explicit(p, trace, trap.class, vm.backtrace_depth)?
+            save_explicit(p, trace, trap.class)?
         }
     } else {
         // `reg`, the scheduler's register array (`esdp->registers`), as handle_error passes it.
         let registers = vm.reg_prefix(crate::proc_create::ATTACHED_X_REGS)?;
-        save_raw(
-            p,
-            registers,
-            vm.backtrace_depth,
-            trap.class,
-            trap.top.as_ref(),
-        )?
+        save_raw(p, registers, trap.class, trap.top.as_ref())?
     };
     p.heap.abi.exc.ftrace = crate::native_hooks::raw(trace);
     trap.reason = crate::native_hooks::from_raw(p.heap.abi.exc.fvalue);
     let trace = if trap.raw_rethrow && trap.reason == atom("function_clause")? {
         let cooked = materialize(p, trace)?;
         let stripped = strip_top_location(p, cooked)?;
-        save_explicit(p, stripped, trap.class, vm.backtrace_depth)?
+        save_explicit(p, stripped, trap.class)?
     } else {
         trace
     };
@@ -671,18 +665,11 @@ pub(super) fn resume(
 fn save_raw(
     p: &mut Process,
     registers: &[Term],
-    depth: usize,
     class: Class,
     top: Option<&stacktrace::TopFrame>,
 ) -> Result<Term, VmError> {
-    // Port of erts/emulator/beam/beam_common.c:885 (`save_stacktrace`), OTP-29.1.1:
-    // `erts_backtrace_depth` is runtime-wide, so a process resumed by another scheduler
-    // must use the same limit as the scheduler that handled `system_flag/2`.
-    let depth = p.runtime.as_ref().map_or(depth, |runtime| {
-        runtime
-            .backtrace_depth
-            .load(std::sync::atomic::Ordering::Acquire)
-    });
+    // Port of erts/emulator/beam/beam_common.c:885 (`save_stacktrace`), OTP-29.1.1.
+    let depth = crate::erl_init::erts_backtrace_depth();
     let error_pc = std::mem::take(&mut p.native_error_pc);
     // `handle_error` passes its `pc` directly to `save_stacktrace`; frame identity is
     // resolved later by `build_stacktrace` through the active ranges table.
@@ -704,13 +691,8 @@ fn save_raw(
     )
 }
 
-fn save_explicit(
-    p: &mut Process,
-    trace: Term,
-    class: Class,
-    backtrace_depth: usize,
-) -> Result<Term, VmError> {
-    stacktrace::save_explicit(p, class, trace, backtrace_depth)
+fn save_explicit(p: &mut Process, trace: Term, class: Class) -> Result<Term, VmError> {
+    stacktrace::save_explicit(p, class, trace)
 }
 
 pub(super) fn materialize(p: &mut Process, trace: Term) -> Result<Term, VmError> {

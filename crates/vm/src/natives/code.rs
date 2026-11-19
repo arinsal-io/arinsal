@@ -210,6 +210,16 @@ struct PurgeInner {
     holds_stage_permission: bool,
 }
 
+/// `static ErtsPurgeState purge_state` of beam_bif_load.c: one per runtime system.
+static PURGE_STATE: std::sync::LazyLock<PurgeState> = std::sync::LazyLock::new(PurgeState::default);
+
+/// The runtime system's `purge_state` (beam_bif_load.c).
+// Port of erts/emulator/beam/beam_bif_load.c:66 (`purge_state`), OTP-29.1.1.
+#[inline]
+pub(crate) fn erts_purge_state() -> &'static PurgeState {
+    &PURGE_STATE
+}
+
 impl PurgeState {
     /// Whether calls into module instance `id` must wait for the purge.
     #[inline]
@@ -1270,7 +1280,6 @@ fn get_debug_info(vm: &Vm, process: &mut Process, module: Term) -> Result<Term, 
 
 // Port of erts/emulator/beam/beam_bif_load.c:679-745 (delete_module_1), OTP-29.1.1.
 fn delete(
-    vm: &mut Vm,
     process: &Process,
     name: &str,
 ) -> Result<(Term, Option<crate::code_ix::EndedStaging>), VmError> {
@@ -1279,7 +1288,7 @@ fn delete(
         Undefined,
         Deleted,
     }
-    let staging = vm.code_ix.start_staging();
+    let staging = crate::code_ix::global().start_staging();
     let outcome = staging.with(|tables| {
         if tables.old.contains_key(name) {
             return Outcome::NotPurged;
@@ -1352,7 +1361,7 @@ fn purge(
     phase: &str,
 ) -> Result<Term, VmError> {
     vm.refresh_code();
-    let state = std::sync::Arc::clone(&vm.purge_state);
+    let state = crate::natives::code::erts_purge_state();
     match phase {
         "prepare" | "prepare_on_load" if state.is_prepared() => return Err(badarg()),
         "abort" | "complete" if !state.is_module(name) => return Err(badarg()),
@@ -1370,7 +1379,7 @@ fn purge(
     // Purging changes the old code of the active code index in place (erts_rwlock_old_code).
     let result = match phase {
         "prepare" | "prepare_on_load" => {
-            let old = vm.code_ix.update_active(|tables| {
+            let old = crate::code_ix::global().update_active(|tables| {
                 if phase == "prepare_on_load"
                     && let Some(id) = tables.pending_on_load.remove(name)
                 {
@@ -1387,13 +1396,19 @@ fn purge(
                         let (start, end) = native.code_range();
                         start..end
                     });
-                let tables = vm.code_ix.active_tables();
-                state.prepare(name, id, vm.code_ix.active(), code, tables.fun_entries());
+                let tables = crate::code_ix::global().active_tables();
+                state.prepare(
+                    name,
+                    id,
+                    crate::code_ix::global().active(),
+                    code,
+                    tables.fun_entries(),
+                );
             }
             old.is_some()
         }
         "abort" => {
-            let code_ix = vm.code_ix.active();
+            let code_ix = crate::code_ix::global().active();
             if state.abort_prepare(code_ix) {
                 ctx.block_thread_progress(std::time::Duration::ZERO);
             }
@@ -1401,11 +1416,11 @@ fn purge(
             false
         }
         _ => {
-            let code_ix = vm.code_ix.active();
+            let code_ix = crate::code_ix::global().active();
             state.complete_fun_purge(code_ix);
             // g_code_fix: drop the old version's slot once nothing references it.
             let mut freed = Vec::new();
-            let removed = vm.code_ix.update_active(|tables| {
+            let removed = crate::code_ix::global().update_active(|tables| {
                 let pending = std::mem::take(&mut *tables.condemned);
                 let mut keep = Vec::new();
                 for id in pending {
@@ -1464,7 +1479,7 @@ pub(crate) fn finish_after_on_load(vm: &mut Vm, name: &str, keep: bool) -> Resul
     }
     let module = arinsal_term::global_atoms().get(name);
     if keep {
-        let staging = vm.code_ix.start_staging();
+        let staging = crate::code_ix::global().start_staging();
         let ix = staging.ix();
         staging.with(|tables| {
             if let Some(module) = module {
@@ -1813,7 +1828,7 @@ fn call_values(
             }
             // Port of erts/emulator/beam/beam_bif_load.c:691-694, OTP-29.1.1.
             seize_code_load_permission(process, Some(ctx.pid()))?;
-            match delete(vm, process, &name) {
+            match delete(process, &name) {
                 Ok((result, Some(ended))) => {
                     if let Some(runtime) = process.runtime {
                         let pid = ctx.pid();
@@ -2349,7 +2364,7 @@ mod tests {
         assert_eq!(loaded(&mut vm, &deletion), OwnedTerm::Atom("ok".into()));
         reference.load("arinsal_hot_delete", &deletion).unwrap();
         let process = Process::new();
-        let (deleted, ended) = delete(&mut vm, &process, "arinsal_hot_delete").unwrap();
+        let (deleted, ended) = delete(&process, "arinsal_hot_delete").unwrap();
         if let Some(ended) = ended {
             ended.commit();
         }

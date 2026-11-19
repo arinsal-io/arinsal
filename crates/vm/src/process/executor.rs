@@ -289,10 +289,8 @@ pub(super) fn process_main_dispatch(
         if crate::code_ix::take_code_barrier() {
             ctx.block_thread_progress(std::time::Duration::ZERO);
         }
-        reg.active_code_ix = lend_vm(esdp)
-            .code_ix
-            .process_code_ix(crate::trace::saves_calls(process))
-            as u64;
+        reg.active_code_ix =
+            crate::code_ix::global().process_code_ix(crate::trace::saves_calls(process)) as u64;
         let native = {
             // Port of erts `c_p->scheduler_data`: a BIF native code calls reaches this
             // scheduler's data through the process while the slice runs.
@@ -536,35 +534,4 @@ impl Process {
         self.initial_mfa = Some((module, function, arity));
         Ok(())
     }
-}
-
-thread_local! {
-    static TRACER_REPLICAS: std::cell::RefCell<Vec<(usize, Vm)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Run `f` on a code replica of `runtime` private to this worker, for callers that need a
-/// [`Vm`] while the executor's own is borrowed (receive tracing runs inside signal handling,
-/// which has only the process). The replica is taken out while `f` runs, so a nested call
-/// simply builds another one.
-pub(crate) fn with_replica_vm<R>(runtime: &'static Runtime, f: impl FnOnce(&mut Vm) -> R) -> R {
-    let key = runtime as *const Runtime as usize;
-    let cached = TRACER_REPLICAS.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        slot.iter()
-            .position(|(cached_key, _)| *cached_key == key)
-            .map(|index| slot.swap_remove(index).1)
-    });
-    let mut vm = cached.unwrap_or_else(|| Vm::shared_replica(&runtime.paths));
-    vm.refresh_code();
-    let result = f(&mut vm);
-    TRACER_REPLICAS.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        // Runtimes come and go in tests; keep only the most recent replicas.
-        if slot.len() >= 4 {
-            slot.remove(0);
-        }
-        slot.push((key, vm));
-    });
-    result
 }

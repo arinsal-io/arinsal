@@ -880,7 +880,7 @@ fn remote_send(
     with_sched(
         process,
         reg,
-        |vm, process, ctx| match crate::dist::try_remote_send_with_options(
+        |_vm, process, ctx| match crate::dist::try_remote_send_with_options(
             process,
             ctx,
             to,
@@ -891,7 +891,6 @@ fn remote_send(
         )? {
             RemoteSendOutcome::Sent => {
                 crate::trace::emit_process(
-                    Some(vm),
                     process,
                     ctx.pid(),
                     crate::trace::SEND,
@@ -902,7 +901,6 @@ fn remote_send(
             }
             RemoteSendOutcome::Continue(send_ctx) => {
                 crate::trace::emit_process(
-                    Some(vm),
                     process,
                     ctx.pid(),
                     crate::trace::SEND,

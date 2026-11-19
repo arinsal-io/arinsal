@@ -985,12 +985,11 @@ impl Process {
         &mut self,
         ctx: Option<&mut arinsal_sched::RunCtx<'_, crate::Process>>,
     ) -> Result<(), VmError> {
-        self.remove_message_inner(None, ctx)
+        self.remove_message_inner(ctx)
     }
 
     fn remove_message_inner(
         &mut self,
-        vm: Option<&mut crate::Vm>,
         ctx: Option<&mut arinsal_sched::RunCtx<'_, crate::Process>>,
     ) -> Result<(), VmError> {
         // Port of erts/emulator/beam/erl_message.c:975 (erts_save_message_in_proc,
@@ -1027,7 +1026,7 @@ impl Process {
         {
             let message =
                 arinsal_term::to_owned(term).unwrap_or(arinsal_etf::OwnedTerm::atom("undefined"));
-            crate::seq_trace::on_receive(vm, self, ctx, pid, state, message);
+            crate::seq_trace::on_receive(self, ctx, pid, state, message);
         }
         // Port of erts/emulator/beam/erl_proc_sig_queue.h:2367
         // (erts_msgq_unlink_msg_set_save_first), OTP-29.1.1.

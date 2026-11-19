@@ -189,10 +189,7 @@ fn pending_purge_lambda(
         return 0;
     };
     if let (Some(pid), Some(name)) = (process.self_pid, arinsal_term::global_atoms().text(module))
-        && runtime
-            .code_indexes()
-            .purge_state
-            .suspend_on_pending_lambda(name, pid)
+        && crate::natives::code::erts_purge_state().suspend_on_pending_lambda(name, pid)
     {
         crate::suspend::suspend_self(process);
         // ERTS_VBUMP_ALL_REDS: the callee's reduction check leaves the scheduler.

@@ -6,7 +6,6 @@ use arinsal_sched::{Pid, Priority, RunCtx, Signal};
 use arinsal_term::{
     Atom, FunRef, HeapReservation, Term, TermBuilder, TermError, TermKind, global_atoms,
 };
-use std::sync::atomic::Ordering;
 
 fn atom_name(term: Term) -> Option<String> {
     Some(global_atoms().text(term.as_atom()?)?.to_string())
@@ -1047,7 +1046,7 @@ fn process_info_aux(
         },
         arinsal_term::atoms::CURRENT_FUNCTION => process_info_item_current_function(vm, process)?,
         arinsal_term::atoms::CURRENT_LOCATION => process_info_item_current_location(vm, process)?,
-        arinsal_term::atoms::CURRENT_STACKTRACE => current_stacktrace(vm, process, reserve)?,
+        arinsal_term::atoms::CURRENT_STACKTRACE => current_stacktrace(process, reserve)?,
         arinsal_term::atoms::GARBAGE_COLLECTION => {
             process_info_item_garbage_collection(src, process, *reserve)?
         }
@@ -2230,17 +2229,10 @@ fn backtrace_with(process: &Process) -> Vec<u8> {
     text
 }
 
-fn current_stacktrace(
-    vm: Option<&Vm>,
-    process: &mut Process,
-    reserve: &mut usize,
-) -> Result<Term, VmError> {
+fn current_stacktrace(process: &mut Process, reserve: &mut usize) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_bif_info.c:2397-2404 (current_stacktrace), OTP-29.1.1:
     // erts reads the runtime-wide limit, shared by every scheduler.
-    let depth = process.runtime.as_ref().map_or_else(
-        || vm.map(|vm| vm.backtrace_depth).unwrap_or(8),
-        |runtime| runtime.backtrace_depth.load(Ordering::Acquire),
-    );
+    let depth = crate::erl_init::erts_backtrace_depth();
     crate::stacktrace::build_for_process_info(process, depth, reserve)
 }
 
@@ -3146,7 +3138,7 @@ fn call_values(
                 })
             }
             ("trace_session_create", [name, tracer, options]) if module == "erts_internal" => {
-                trace_session_create(vm, process, ctx, *name, *tracer, *options)
+                trace_session_create(process, ctx, *name, *tracer, *options)
             }
             // Port of erts/emulator/beam/erl_bif_trace.c:1278-1322
             // (erts_internal_trace_session_destroy_1), OTP-29.1.1.
@@ -3867,7 +3859,6 @@ fn trace(
         }
         if tuple.len() == 3 {
             tracer = module_tracer(
-                vm,
                 tuple.get(1).ok_or_else(badarg)?,
                 tuple.get(2).ok_or_else(badarg)?,
             )?;
@@ -3875,7 +3866,7 @@ fn trace(
         }
         let target = tuple.get(1).ok_or_else(badarg)?;
         if let Some((module, state)) = tuple2(target) {
-            tracer = module_tracer(vm, module, state)?;
+            tracer = module_tracer(module, state)?;
             continue;
         }
         if let Some(pid) = Pid::from_term(target) {
@@ -3913,7 +3904,7 @@ fn trace(
     // Port of erts/emulator/beam/erl_bif_trace.c:853-863 and 1103-1108 (start_trace), OTP-29.1.1:
     // a tracee keeps a live tracer; such tracees are skipped and not counted.
     let apply = |process: &mut Process, pid: Pid| {
-        if on && crate::trace::traced_by_other(vm, process, session, pid, &tracer) {
+        if on && crate::trace::traced_by_other(process, session, pid, &tracer) {
             return false;
         }
         crate::trace::configure_session(process, session, pid, on, process_mask, tracer.clone());
@@ -3949,7 +3940,7 @@ fn trace(
         if !known {
             return Err(badarg());
         }
-        if on && crate::trace::traced_port_by_other(vm, process, session, id, &tracer) {
+        if on && crate::trace::traced_port_by_other(process, session, id, &tracer) {
             return Err(badarg());
         }
         crate::trace::configure_port(process, session, id, on, port_mask, tracer.clone());
@@ -4074,7 +4065,6 @@ fn trace(
 
 // Port of erts/emulator/beam/erl_bif_trace.c:1232-1276 (trace_session_create), OTP-29.1.1.
 fn trace_session_create(
-    vm: &Vm,
     process: &mut Process,
     _ctx: &RunCtx<'_, crate::Process>,
     name: Term,
@@ -4101,7 +4091,7 @@ fn trace_session_create(
         }
         crate::trace::Tracer::Port(id)
     } else if let Some((module, state)) = tuple2(tracer_term) {
-        module_tracer(vm, module, state)?
+        module_tracer(module, state)?
     } else {
         return Err(badarg());
     };
@@ -4118,9 +4108,9 @@ fn trace_session_create(
 }
 
 // Port of erts/emulator/beam/erl_trace.c:3017-3060 (load_tracer_nif), OTP-29.1.1.
-fn module_tracer(vm: &Vm, module: Term, state: Term) -> Result<crate::trace::Tracer, VmError> {
+fn module_tracer(module: Term, state: Term) -> Result<crate::trace::Tracer, VmError> {
     let module = atom_name(module).ok_or_else(badarg)?;
-    if !crate::natives::nif::has_tracer_nifs(vm, &module) {
+    if !crate::natives::nif::has_tracer_nifs(&module) {
         return Err(badarg());
     }
     let state = arinsal_term::to_owned(state).map_err(|_| badarg())?;
@@ -4586,7 +4576,7 @@ fn trace_info(
 
 /// The tracer of a `{meta, Tracer}` or `{meta, Module, State}` trace_pattern flag.
 // Port of erts/emulator/beam/erl_trace.c:3090-3129 (erts_term_to_tracer), OTP-29.1.1.
-fn meta_tracer_from_term(vm: &Vm, flag: Term) -> Result<crate::trace::Tracer, VmError> {
+fn meta_tracer_from_term(flag: Term) -> Result<crate::trace::Tracer, VmError> {
     // SAFETY: The flag list stays rooted for this BIF call.
     let tuple = unsafe { flag.tuple_ref() }.ok_or_else(badarg)?;
     let fields = (0..tuple.len())
@@ -4606,7 +4596,7 @@ fn meta_tracer_from_term(vm: &Vm, flag: Term) -> Result<crate::trace::Tracer, Vm
         [prefix, module, state]
             if atom_name(*prefix).as_deref() == Some("meta") && module.as_atom().is_some() =>
         {
-            module_tracer(vm, *module, *state)
+            module_tracer(*module, *state)
         }
         _ => Err(badarg()),
     }
@@ -5309,7 +5299,7 @@ fn trace_pattern(
     let mut is_global = false;
     for flag in flag_values {
         if flag.classify() == TermKind::Tuple && session_tracer_nil {
-            meta_tracer = Some(meta_tracer_from_term(vm, flag)?);
+            meta_tracer = Some(meta_tracer_from_term(flag)?);
             names.push("meta".into());
             continue;
         }

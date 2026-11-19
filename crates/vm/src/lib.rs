@@ -25,6 +25,7 @@ mod dist;
 mod erl_arith;
 mod erl_bits;
 mod erl_gc;
+mod erl_init;
 mod erl_map;
 mod erl_nfunc_sched;
 mod erl_osenv;
@@ -160,7 +161,7 @@ mod boot_loop1_shared_tests {
         let id = first.load_bytes(&beam).unwrap();
         second.refresh_code();
         assert_eq!(second.code.modules[id].name, "boot_loop1_shared");
-        assert!(first.code_ix.active_tables().modules.len() > id);
+        assert!(crate::code_ix::global().active_tables().modules.len() > id);
         drop((first, second));
     }
 }
@@ -289,16 +290,9 @@ pub struct Vm {
     pub(crate) otp_root: Option<PathBuf>,
     /// The code tables of `erts_active_code_ix()` this VM reads (see [`Vm::refresh_code`]).
     pub(crate) code: Arc<CodeTables>,
-    /// Cache of the node's NIF body slots.
-    native_fns: Arc<Vec<Option<crate::natives::nif::NativeFn>>>,
-    purge_state: Arc<crate::natives::code::PurgeState>,
     beamasm_targets: beamasm_integration::NativeTargetCache,
-    /// Code indexes and per-index code tables of this node (`code_ix.c`).
-    pub(crate) code_ix: Arc<crate::code_ix::CodeIndexes>,
     /// A scheduler's VM; the node's own VM owns the child setup.
     replica: bool,
-    // ---- vm_exc ----
-    backtrace_depth: usize,
     /// `esdp->registers`: the address of the scheduler's register file while this scheduler's
     /// executor runs a process, zero otherwise. An address so `Vm` stays `Send`.
     // Port of erts/emulator/beam/erl_process.h (ErtsSchedulerData.registers), OTP-29.1.1.

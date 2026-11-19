@@ -184,7 +184,6 @@ impl Task for Process {
             let trace_scheduling = crate::trace::running_procs_enabled();
             if trace_scheduling {
                 crate::trace::emit_process(
-                    None,
                     process,
                     ctx.pid(),
                     crate::trace::RUNNING_PROCS,
@@ -246,7 +245,6 @@ impl Task for Process {
             process.native = None;
             if trace_scheduling {
                 crate::trace::emit_process(
-                    None,
                     process,
                     ctx.pid(),
                     crate::trace::RUNNING_PROCS,

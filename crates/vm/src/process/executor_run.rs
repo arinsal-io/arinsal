@@ -398,8 +398,7 @@ pub(super) fn process_main(
                                 if crate::code_ix::take_code_barrier() {
                                     ctx.block_thread_progress(std::time::Duration::ZERO);
                                 }
-                                reg.active_code_ix = lend_vm(esdp)
-                                    .code_ix
+                                reg.active_code_ix = crate::code_ix::global()
                                     .process_code_ix(crate::trace::saves_calls(process))
                                     as u64;
                                 let native = {

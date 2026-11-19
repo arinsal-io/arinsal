@@ -220,7 +220,7 @@ impl Process {
         let Ok(info) = TermBuilder::new(&mut scratch).list_from_iter(tuples) else {
             return;
         };
-        crate::trace::emit_process(None, self, pid, crate::trace::GC, tag, &[info]);
+        crate::trace::emit_process(self, pid, crate::trace::GC, tag, &[info]);
     }
 
     /// Collect live registers together with only on-heap mailbox message roots.

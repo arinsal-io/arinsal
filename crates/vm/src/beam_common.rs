@@ -144,7 +144,7 @@ pub(crate) fn handle_error_core(
     } else if let Some(explicit) = crate::native_helpers::take_explicit_raise(process) {
         if explicit == Term::NIL {
             crate::exceptions::empty_trace_handle(class)
-        } else if let Ok(trace) = crate::stacktrace::save_explicit(process, class, explicit, 8) {
+        } else if let Ok(trace) = crate::stacktrace::save_explicit(process, class, explicit) {
             trace
         } else {
             return 0;
@@ -153,7 +153,7 @@ pub(crate) fn handle_error_core(
         let top = crate::native_helpers::native_bif_top(process, bif_info, registers);
         let input = crate::stacktrace::StackTraceSave {
             class,
-            depth: crate::stacktrace::runtime_backtrace_depth(process, 8),
+            depth: crate::erl_init::erts_backtrace_depth(),
             freason,
             native_pc: (pc != 0).then_some(pc),
             top: top.as_ref().map(crate::stacktrace::SaveTop::Live),

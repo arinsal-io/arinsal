@@ -450,9 +450,8 @@ fn seq_spawn_events(
         owned(child_term),
     ]);
     let synchronous = !so.r#async;
-    with_sched(parent, reg, |vm, parent, ctx| {
+    with_sched(parent, reg, |_vm, parent, ctx| {
         Some(crate::seq_trace::spawn_events(
-            vm,
             parent,
             ctx,
             request,

@@ -200,7 +200,7 @@ fn report_max_heap(
     // `msg = erts_process_gc_info(...)` and `erts_build_stacktrace(&hfact, p, 0,
     // erts_backtrace_depth, 1)`.
     let gc_info = crate::natives::proc::process_gc_info(process).unwrap_or(Term::NIL);
-    let depth = crate::stacktrace::runtime_backtrace_depth(process, 8);
+    let depth = crate::erl_init::erts_backtrace_depth();
     let stacktrace = crate::stacktrace::build(process, depth).unwrap_or(Term::NIL);
     let built = (|| -> Result<Term, VmError> {
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);

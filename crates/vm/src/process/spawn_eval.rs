@@ -310,13 +310,12 @@ impl Vm {
             // erl_init.c (erts_init_trace -> init_sys_msg_dispatcher): the dispatcher thread
             // exists from node start.
             crate::erl_trace::init_sys_msg_dispatcher();
-            let code = Arc::clone(&self.code_ix);
+            let code = Arc::clone(crate::code_ix::global());
             let port_layout = arinsal_term::ptab::port_table_layout();
             let port_ids = PtabIdRing::new(port_layout.max());
             let named_ets = Arc::new(arinsal_ets::NamedTableIndex::new());
             let runtime: &'static Runtime = Box::leak(Box::new(Runtime {
                 statistics: crate::natives::sys::StatisticsState::new(self.statistics_origins),
-                backtrace_depth: AtomicUsize::new(8),
                 code: Arc::clone(&code),
                 trap_exports: std::array::from_fn(|_| OnceLock::new()),
                 system_processes: Mutex::new(std::collections::HashSet::new()),

@@ -195,18 +195,14 @@ fn update_serial(process: &mut Process, pid: Pid) -> Option<Token> {
 }
 
 // Port of erts/emulator/beam/erl_trace.c:449-489 (system sequential tracer), OTP-29.1.1.
-pub(crate) fn set_system_tracer(
-    vm: &Vm,
-    process: &mut Process,
-    value: Term,
-) -> Result<Term, VmError> {
+pub(crate) fn set_system_tracer(process: &mut Process, value: Term) -> Result<Term, VmError> {
     let module_state = if value.classify() == arinsal_term::TermKind::Tuple {
         let (module, _) = crate::natives::proc::tuple2(value).ok_or_else(badarg)?;
         let module = module
             .as_atom()
             .and_then(|atom| arinsal_term::global_atoms().text(atom))
             .ok_or_else(badarg)?;
-        if !crate::natives::nif::has_tracer_nifs(vm, module) {
+        if !crate::natives::nif::has_tracer_nifs(module) {
             return Err(badarg());
         }
         true
@@ -336,7 +332,6 @@ pub(crate) fn get_token_term(process: &mut Process, _pid: Pid) -> Result<Term, V
 /// Attach the sender's current token to an ordinary message and emit its send event.
 // Port of erts/emulator/beam/erl_message.c:739-757 (erts_send_message, seq trace), OTP-29.1.1.
 pub(crate) fn on_send(
-    vm: Option<&mut Vm>,
     process: &mut Process,
     ctx: Option<&mut RunCtx<'_, crate::Process>>,
     pid: Pid,
@@ -346,7 +341,6 @@ pub(crate) fn on_send(
     let token = update_serial(process, pid)?;
     if let (Ok(receiver), Ok(message)) = (to_owned(receiver), to_owned(message)) {
         emit(
-            vm,
             process,
             ctx,
             pid,
@@ -365,7 +359,6 @@ pub(crate) fn on_send(
 /// Adopt a message token at the successful receive boundary.
 // Port of erts/emulator/beam/emu/msg_instrs.tab:161-203 (remove_message), OTP-29.1.1.
 pub(crate) fn on_receive(
-    vm: Option<&mut Vm>,
     process: &mut Process,
     ctx: Option<&mut RunCtx<'_, crate::Process>>,
     pid: Pid,
@@ -398,7 +391,6 @@ pub(crate) fn on_receive(
         .and_then(|p| to_owned(p).ok())
         .unwrap_or_else(|| OwnedTerm::atom("undefined"));
     emit(
-        vm,
         process,
         ctx,
         pid,
@@ -433,7 +425,6 @@ pub(crate) fn on_exit_signal(
         owned(Some(reason)),
     ]);
     emit(
-        None,
         process,
         Some(ctx),
         to,
@@ -474,7 +465,6 @@ pub(crate) fn spawn_prepare(
 /// A synchronous spawn also receives the reply at once. Returns the reply's token.
 // Port of erts/emulator/beam/erl_process.c:12818-12832 and 12980-13003, OTP-29.1.1.
 pub(crate) fn spawn_events(
-    vm: &mut Vm,
     parent: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     request: &Token,
@@ -491,7 +481,6 @@ pub(crate) fn spawn_events(
     };
     for kind in ["send", "receive"] {
         emit(
-            Some(&mut *vm),
             parent,
             Some(&mut *ctx),
             parent_pid,
@@ -509,7 +498,6 @@ pub(crate) fn spawn_events(
     reply.lastcnt = request.serial;
     reply.serial = request.serial + 1;
     emit(
-        Some(&mut *vm),
         parent,
         Some(&mut *ctx),
         parent_pid,
@@ -526,7 +514,6 @@ pub(crate) fn spawn_events(
         parent.seq_trace_lastcnt = reply.serial;
         parent.seq_trace_clock = reply.serial;
         emit(
-            Some(vm),
             parent,
             Some(ctx),
             parent_pid,
@@ -554,7 +541,6 @@ fn term(process: &mut Process, owned: &OwnedTerm) -> Result<Term, VmError> {
     .map_err(|e| VmError::Unsupported(format!("seq_trace term: {e:?}")))
 }
 fn emit(
-    vm: Option<&mut Vm>,
     process: &mut Process,
     mut ctx: Option<&mut RunCtx<'_, crate::Process>>,
     tracee: Pid,
@@ -667,8 +653,7 @@ fn emit(
         }
     } else if target_term.as_port().is_some() {
         let _ = crate::port::trace_command(process, target_term, event);
-    } else if let Some(vm) = vm
-        && let OwnedTerm::Tuple(parts) = &target
+    } else if let OwnedTerm::Tuple(parts) = &target
         && parts.len() == 2
         && let OwnedTerm::Atom(module) = &parts[0]
         && let Some(state) = from_owned(&parts[1], &mut scratch).ok()
@@ -681,7 +666,6 @@ fn emit(
         };
         let tag = Term::atom(arinsal_term::atoms::SEQ_TRACE);
         let action = crate::natives::nif::invoke_tracer(
-            vm,
             process,
             module,
             "enabled",
@@ -712,7 +696,6 @@ fn emit(
             return;
         };
         let _ = crate::natives::nif::invoke_tracer(
-            vm,
             process,
             module,
             "trace",
@@ -723,7 +706,7 @@ fn emit(
 }
 
 pub(crate) fn call(
-    vm: &mut Vm,
+    _vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
@@ -743,9 +726,9 @@ pub(crate) fn call(
                 }
             }
             ("seq_trace_info", [component]) => info(process, ctx.pid(), *component),
-            ("seq_trace_print", [message]) => print(vm, process, ctx, ctx.pid(), None, *message),
+            ("seq_trace_print", [message]) => print(process, ctx, ctx.pid(), None, *message),
             ("seq_trace_print", [label, message]) => {
-                print(vm, process, ctx, ctx.pid(), Some(*label), *message)
+                print(process, ctx, ctx.pid(), Some(*label), *message)
             }
             _ => return None,
         };
@@ -951,7 +934,6 @@ fn info(process: &mut Process, _pid: Pid, component: Term) -> Result<Term, VmErr
 }
 // Port of erts/emulator/beam/erl_bif_trace.c:3229-3258 (seq_trace_print), OTP-29.1.1.
 fn print(
-    vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     pid: Pid,
@@ -971,7 +953,6 @@ fn print(
         return Ok(Term::atom(arinsal_term::atoms::FALSE));
     };
     emit(
-        Some(vm),
         process,
         Some(ctx),
         pid,

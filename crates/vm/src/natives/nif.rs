@@ -62,8 +62,8 @@ pub(crate) fn invalidate_tracer_callbacks() {
         .clear();
 }
 
-fn tracer_callback(vm: &Vm, module_name: &str, function: &str, arity: u8) -> Option<NativeFn> {
-    let code = vm.code_ix.active_tables();
+fn tracer_callback(module_name: &str, function: &str, arity: u8) -> Option<NativeFn> {
+    let code = crate::code_ix::global().active_tables();
     let generation = code.generation;
     let key = module_name.to_owned();
     {
@@ -108,7 +108,7 @@ fn tracer_callback(vm: &Vm, module_name: &str, function: &str, arity: u8) -> Opt
     } else if let Some(module) = current.and_then(|id| code.modules.get(id)) {
         // erl_tracer is not yet a static NIF library (erl_tracer.c via erts_static_nif_tab):
         // its callbacks are the bodies bind_tracer gave its entries.
-        let native_fns = vm.code_ix.native_fns();
+        let native_fns = crate::code_ix::global().native_fns();
         for &(name, expected_arity) in TRACER_FUNCTIONS {
             let Some(ordinal) = module.functions.iter().position(|(_, found, found_arity)| {
                 *found == name && *found_arity == expected_arity
@@ -1416,7 +1416,6 @@ pub(crate) fn erts_call_dirty_nif_finish(c_p: &mut Process, result: DirtyNifResu
 }
 /// Invoke one patched tracer NIF synchronously on the tracee's scheduler.
 pub(crate) fn invoke_tracer(
-    vm: &Vm,
     process: &mut Process,
     module: &str,
     function: &str,
@@ -1425,20 +1424,20 @@ pub(crate) fn invoke_tracer(
 ) -> Option<Term> {
     let arity = u8::try_from(args.len()).ok()?;
     let native = specialized
-        .and_then(|specialized| tracer_callback(vm, module, specialized, arity))
-        .or_else(|| tracer_callback(vm, module, function, arity))?;
+        .and_then(|specialized| tracer_callback(module, specialized, arity))
+        .or_else(|| tracer_callback(module, function, arity))?;
     call_native(&mut process.heap, &native, args).ok()
 }
 
-pub(crate) fn has_tracer_nifs(vm: &Vm, module_name: &str) -> bool {
-    tracer_callback(vm, module_name, "enabled", 3).is_some()
-        && tracer_callback(vm, module_name, "trace", 5).is_some()
+pub(crate) fn has_tracer_nifs(module_name: &str) -> bool {
+    tracer_callback(module_name, "enabled", 3).is_some()
+        && tracer_callback(module_name, "trace", 5).is_some()
 }
 
 /// Binds the NIF library `key` to its module instance in the active code index.
 // Port of erts/emulator/beam/erl_nif.c:4748 (load_nif: `module_p->curr.nif`), OTP-29.1.1.
 fn publish(vm: &mut Vm, key: &str) {
-    vm.code_ix.update_active(|tables| {
+    crate::code_ix::global().update_active(|tables| {
         tables.loaded_nifs.insert(key.to_owned());
     });
     vm.refresh_code();
@@ -1453,8 +1452,8 @@ fn patch_native(module: &arinsal_loader::Module, entry: usize, index: u32) -> Re
     Ok(())
 }
 
-fn push_native(vm: &mut Vm, function: NativeFn) -> Result<u32, VmError> {
-    vm.code_ix
+fn push_native(function: NativeFn) -> Result<u32, VmError> {
+    crate::code_ix::global()
         .push_native_fn(function)
         .ok_or_else(|| VmError::Unsupported("native table".into()))
 }
@@ -1643,7 +1642,7 @@ fn finish_stubs(
                     index: u32::try_from(index)
                         .map_err(|_| VmError::Unsupported("nif index".into()))?,
                 });
-                interpreted.push((entry, push_native(vm, binding)?));
+                interpreted.push((entry, push_native(binding)?));
             }
         }
     }
@@ -1855,7 +1854,7 @@ fn bind_tracer(vm: &mut Vm, module_id: usize) -> Result<(), VmError> {
         (enabled, tracer_enabled as BifFn),
         (trace, tracer_trace as BifFn),
     ] {
-        let index = push_native(vm, NativeFn::Bif(body))?;
+        let index = push_native(NativeFn::Bif(body))?;
         patch_native(&module, entry, index)?;
     }
     Ok(())

@@ -534,14 +534,9 @@ pub(super) fn capture(
 /// Preserve the supplied `raise/3` trace in Args behind erts' negative StackTrace marker.
 ///
 /// Port of erts/emulator/beam/bif.c (`raise_3`), OTP-29.1.1.
-pub(super) fn save_explicit(
-    p: &mut Process,
-    class: Class,
-    trace: Term,
-    backtrace_depth: usize,
-) -> Result<Term, VmError> {
+pub(super) fn save_explicit(p: &mut Process, class: Class, trace: Term) -> Result<Term, VmError> {
     let freason = class_to_freason(Some(class));
-    let args = normalize_raise_trace(p, trace, backtrace_depth)?;
+    let args = normalize_raise_trace(p, trace)?;
     let mut heap = TraceHeap::new(&mut p.heap);
     let stack_trace = StackTrace::allocate_raised(&mut heap, freason)?;
     Ftrace {
@@ -554,17 +549,13 @@ pub(super) fn save_explicit(
 
 // Port of erts/emulator/beam/bif.c (`raise_3`), OTP-29.1.1: copy only when a legacy
 // frame needs conversion or the runtime backtrace limit truncates the supplied trace.
-fn normalize_raise_trace(
-    p: &mut Process,
-    trace: Term,
-    backtrace_depth: usize,
-) -> Result<Term, VmError> {
+fn normalize_raise_trace(p: &mut Process, trace: Term) -> Result<Term, VmError> {
     // `raise/3` already validated the list; walk it in place, copying only when a frame needs
     // converting or the backtrace limit truncates it (bif.c, `raise_3`).
     if trace == Term::NIL {
         return Ok(trace);
     }
-    let max_depth = runtime_backtrace_depth(p, backtrace_depth);
+    let max_depth = crate::erl_init::erts_backtrace_depth();
     let frames = arinsal_term::term_sequence_frames(trace)
         .ok_or_else(|| VmError::Unsupported("raise stacktrace list".into()))?;
     let length = frames.len();
@@ -756,16 +747,6 @@ impl SaveTop<'_> {
             _ => None,
         }
     }
-}
-
-/// `erts_backtrace_depth`: a plain global int in erts, read without ordering; nothing else is
-/// published with it.
-pub(super) fn runtime_backtrace_depth(p: &Process, fallback: usize) -> usize {
-    p.runtime.as_ref().map_or(fallback, |runtime| {
-        runtime
-            .backtrace_depth
-            .load(std::sync::atomic::Ordering::Relaxed)
-    })
 }
 
 fn save_ftrace_values(

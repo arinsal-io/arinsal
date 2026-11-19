@@ -229,7 +229,9 @@ impl Vm {
                     (self.code.module_live.get(id) == Some(&true)).then_some((id, target))
                 });
                 let resolved = match cached {
-                    Some(cached) if !self.purge_state.pending(cached.0) => Some(cached),
+                    Some(cached) if !crate::natives::code::erts_purge_state().pending(cached.0) => {
+                        Some(cached)
+                    }
                     // A cached target in code pending purge is re-resolved: the fun
                     // entry may also exist in the current instance, where erts
                     // already dispatches it.
@@ -238,7 +240,7 @@ impl Vm {
                 let Some((module_id, target)) = resolved else {
                     return self.call_lambda_handler(p, entry.module, arity, false, ctx);
                 };
-                if self.purge_state.pending(module_id) {
+                if crate::natives::code::erts_purge_state().pending(module_id) {
                     return self.call_lambda_handler(p, entry.module, arity, true, ctx);
                 }
                 // The caller module's register file is sized from its own beam.
@@ -306,7 +308,7 @@ impl Vm {
             // Port of erts/emulator/beam/beam_bif_load.c:1977
             // (erts_suspend_process_on_pending_purge_lambda), OTP-29.1.1.
             if let Some(pid) = p.self_pid
-                && self.purge_state.suspend_on_pending_lambda(&name, pid)
+                && crate::natives::code::erts_purge_state().suspend_on_pending_lambda(&name, pid)
             {
                 crate::suspend::suspend_self(p);
                 // erts_suspend + ERTS_VBUMP_ALL_REDS (beam_bif_load.c:2003-2004).
@@ -1390,7 +1392,7 @@ impl Vm {
                     })
                     .map(|slot| (id, slot.target))
             })?;
-        if self.purge_state.pending(id) {
+        if crate::natives::code::erts_purge_state().pending(id) {
             return None;
         }
         self.code.modules[id]

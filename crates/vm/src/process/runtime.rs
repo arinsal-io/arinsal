@@ -3,8 +3,6 @@ use super::*;
 /// Shared interpreter and scheduler handles for a set of local processes.
 pub(crate) struct Runtime {
     pub(crate) statistics: crate::natives::sys::StatisticsState,
-    /// Node-wide backtrace depth shared by scheduler VM replicas.
-    pub(crate) backtrace_depth: AtomicUsize,
     /// The node's code indexes and their code tables.
     pub(super) code: Arc<crate::code_ix::CodeIndexes>,
     /// Runtime-owned stable exports indexed by the target id interned with each continuation.

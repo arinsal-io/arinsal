@@ -207,7 +207,6 @@ impl Process {
                 &[value, target],
             ),
             None => crate::trace::emit_process(
-                vm,
                 self,
                 sender,
                 crate::trace::SEND,
@@ -246,14 +245,7 @@ impl Process {
             .self_pid
             .ok_or_else(|| VmError::Unsupported("send requires a scheduled process".into()))?;
         if target.as_port().is_some() {
-            crate::trace::emit_process(
-                vm.as_deref_mut(),
-                self,
-                sender,
-                crate::trace::SEND,
-                "send",
-                &[value, target],
-            );
+            crate::trace::emit_process(self, sender, crate::trace::SEND, "send", &[value, target]);
             return crate::port::process_send(self, ctx, target, value, suspend);
         }
         // Port of erts/emulator/beam/bif.c:2469-2480,2511 (do_send), OTP-29.1.1: internal pids
@@ -271,14 +263,7 @@ impl Process {
             None => false,
         };
         if remote {
-            crate::trace::emit_process(
-                vm.as_deref_mut(),
-                self,
-                sender,
-                crate::trace::SEND,
-                "send",
-                &[value, target],
-            );
+            crate::trace::emit_process(self, sender, crate::trace::SEND, "send", &[value, target]);
             return Ok(PortSend::Sent);
         }
         let local_name = if local_destination {
@@ -338,7 +323,6 @@ impl Process {
                     let sent =
                         crate::port::process_send(self, ctx.as_deref_mut(), port, value, suspend)?;
                     crate::trace::emit_process(
-                        vm.as_deref_mut(),
                         self,
                         sender,
                         crate::trace::SEND,
@@ -392,14 +376,7 @@ impl Process {
             "send"
         };
         if hooked {
-            self.trace_send(
-                vm.as_deref_mut(),
-                ctx.as_deref_mut(),
-                sender,
-                event,
-                value,
-                target,
-            );
+            self.trace_send(vm, ctx.as_deref_mut(), sender, event, value, target);
         }
         let seq_token = SendMeta {
             alias: via_alias,
@@ -414,14 +391,7 @@ impl Process {
                     } else {
                         target
                     };
-                    crate::seq_trace::on_send(
-                        vm,
-                        self,
-                        ctx.as_deref_mut(),
-                        sender,
-                        seq_receiver,
-                        value,
-                    )
+                    crate::seq_trace::on_send(self, ctx.as_deref_mut(), sender, seq_receiver, value)
                 };
                 state.map_or(crate::seq_trace::SeqState::Nil, |token| {
                     crate::seq_trace::SeqState::Token(token)

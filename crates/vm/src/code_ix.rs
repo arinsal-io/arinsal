@@ -85,7 +85,6 @@ pub(crate) struct CodeIndexes {
     native_fns: RwLock<Arc<Vec<Option<crate::natives::nif::NativeFn>>>>,
     /// `erts_coverage_mode`: applies to modules loaded after it is set.
     coverage_mode: Mutex<arinsal_loader::CoverageMode>,
-    pub(crate) purge_state: Arc<crate::natives::code::PurgeState>,
 }
 
 impl CodeIndexes {
@@ -106,7 +105,6 @@ impl CodeIndexes {
             released: Condvar::new(),
             native_fns: RwLock::default(),
             coverage_mode: Mutex::new(arinsal_loader::CoverageMode::None),
-            purge_state: Arc::default(),
         }
     }
 
@@ -388,11 +386,11 @@ impl CodeIndexes {
     pub(crate) fn start_staging(self: &Arc<Self>) -> Staging {
         let nested = loop {
             let nested = self.seize(false);
-            if nested || !self.purge_state.stage_permission_held() {
+            if nested || !crate::natives::code::erts_purge_state().stage_permission_held() {
                 break nested;
             }
             self.release();
-            self.purge_state.wait_for_stage_permission();
+            crate::natives::code::erts_purge_state().wait_for_stage_permission();
         };
         if !nested {
             let copy = CodeTables::clone(&self.active_tables());
