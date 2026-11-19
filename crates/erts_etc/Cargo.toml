@@ -56,3 +56,7 @@ path = "src/bin/run_erl.rs"
 [[bin]]
 name = "arinsal_to_erl"
 path = "src/bin/to_erl.rs"
+
+[[bin]]
+name = "arinsal_inet_gethost"
+path = "src/bin/inet_gethost.rs"
