@@ -35,6 +35,14 @@ pub(crate) type SaveField = arinsal_sched::NextField<Event<Message>>;
 
 pub(crate) type MessageNode = arinsal_sched::OwnedSignal<Event<Message>>;
 
+/// Work charged by `handle_cla` while it scans the message queue.
+pub(crate) struct LiteralCopyWork {
+    pub(crate) messages_copied: u32,
+    pub(crate) messages_scanned: usize,
+    pub(crate) words_scanned: usize,
+    pub(crate) words_copied: usize,
+}
+
 /// The term of a message node.
 pub(crate) fn queued_term(node: &MessageNode) -> Term {
     queued(node).term
@@ -430,13 +438,6 @@ impl MessageQueue {
                 .is_some_and(|heap| heap.has_heap_reference(|term| area.contains(term)))
     }
 
-    /// Check queue roots and detached fragments for pointers into a retiring area.
-    // Port of erts/emulator/beam/beam_bif_load.c:1046-1092, OTP-29.1.1.
-    pub(crate) fn has_literal_area_reference(&self, area: &RetiredArea) -> bool {
-        self.with_inline_words()
-            .any(|(entry, inline)| Self::references_area(entry, inline, area))
-    }
-
     /// Maximum detached message words inspected by literal-copy checks.
     pub(crate) fn literal_scan_words(&self) -> usize {
         self.with_inline_words()
@@ -457,9 +458,12 @@ impl MessageQueue {
         &mut self,
         heap: &mut ProcessHeap,
         area: &RetiredArea,
-    ) -> Result<u32, VmError> {
+    ) -> Result<LiteralCopyWork, VmError> {
+        let messages_scanned = self.len();
+        let words_scanned = self.literal_scan_words();
         let mut shared_copy = SharedCopyCache::default();
-        let mut copied = 0;
+        let mut copied = 0_u32;
+        let mut words_copied = 0_usize;
         let mut failure = None;
         self.entries.relink_each(|_, mut node| {
             if failure.is_some() {
@@ -469,6 +473,8 @@ impl MessageQueue {
             if !Self::references_area(queued(&node), inline, area) {
                 return node;
             }
+            words_copied =
+                words_copied.saturating_add(arinsal_term::size_object(queued(&node).term));
             match copy_term_preserving_sharing_with_cache(
                 queued(&node).term,
                 &mut arinsal_bifs::ProcessHeapHandle(heap),
@@ -494,7 +500,12 @@ impl MessageQueue {
         });
         match failure {
             Some(error) => Err(error),
-            None => Ok(copied),
+            None => Ok(LiteralCopyWork {
+                messages_copied: copied,
+                messages_scanned,
+                words_scanned,
+                words_copied,
+            }),
         }
     }
 

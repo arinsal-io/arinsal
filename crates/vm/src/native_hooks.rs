@@ -269,9 +269,11 @@ pub extern "C" fn ubif2mfa(function: *const core::ffi::c_void) -> *const arinsal
         if crate::bif_table::function(i32::from(spec.index)) != address {
             continue;
         }
-        if let Some(export) =
-            crate::beamasm_integration::bif_mfa_export(spec.module, spec.name, spec.arity)
-        {
+        if let Some(export) = crate::beamasm_integration::bif_mfa_export(
+            spec.module,
+            spec.name,
+            u32::from(spec.arity),
+        ) {
             return std::ptr::from_ref(export.mfa());
         }
     }

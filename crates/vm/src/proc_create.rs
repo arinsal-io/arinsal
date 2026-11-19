@@ -624,6 +624,12 @@ impl ProcDict {
         self.num_elements
     }
 
+    /// Number of dictionary words inspected by `erts_check_copy_literals_gc_need`.
+    // Port of erts/emulator/beam/erl_process_dict.h:39 (`ERTS_PD_SIZE`), OTP-29.1.1.
+    pub(crate) fn literal_scan_words(&self) -> usize {
+        self.used_slots as usize
+    }
+
     pub(crate) fn entries(&self) -> DictEntries<'_> {
         DictEntries {
             nodes: &self.nodes,
@@ -1643,6 +1649,10 @@ pub(crate) struct ProcessCold {
     /// `ERTS_PSD_NFUNC_TRAP_WRAPPER`: the `ErtsNativeFunc` of a native call that scheduled
     /// itself; its saved arguments are GC roots while it is in use.
     pub(crate) psd_nfunc_trap_wrapper: Option<crate::erl_nfunc_sched::NativeFuncBox>,
+    /// `ERTS_PSD_DIST_ENTRY` of a process distribution controller (set with
+    /// `F_DISTRIBUTION` by setup_connection_distctrl); its exit runs erts_do_net_exits on
+    /// the entry; net_kernel's is `erts_this_dist_entry` (set by setnode_2).
+    pub(crate) psd_dist_entry: Option<std::sync::Arc<crate::node_tables::DistEntry>>,
     /// Set while the process handles its signals before executing code (erts
     /// `ERTS_PSFLG_RUNNING_SYS`): the only place system tasks execute (erl_process.c
     /// execute_sys_tasks), as no Erlang, native or BIF code is half-way done; a potentially

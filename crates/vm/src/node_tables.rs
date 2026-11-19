@@ -91,8 +91,13 @@ pub(crate) struct DistState {
     pub(crate) owner: Pid,
     pub(crate) input_handler: Pid,
     pub(crate) output: VecDeque<ErtsDistOutputBuf>,
-    /// Serializes port writes so concurrent schedulers cannot reorder atom-cache headers.
+    /// `dep->finalized_out_queue`: buffers `erts_dist_command` finalized while the port was
+    /// busy, written first when it is not.
+    pub(crate) finalized_out_queue: VecDeque<ErtsDistOutputBuf>,
+    /// `dep->dist_cmd_scheduled`: a dist command task is scheduled or running.
     pub(crate) flushing_output: bool,
+    /// `dep->dist_cmd`: the handle of the scheduled dist command task.
+    pub(crate) dist_cmd: Option<arinsal_drv::port_task::TaskHandle>,
     pub(crate) incoming_cache: AtomCache,
     /// Incomplete incoming fragmented signals, keyed by OTP sequence id.
     pub(crate) incoming_fragments: HashMap<u64, IncomingDistFragment>,
@@ -131,7 +136,9 @@ impl DistState {
             owner,
             input_handler: owner,
             output: VecDeque::new(),
+            finalized_out_queue: VecDeque::new(),
             flushing_output: false,
+            dist_cmd: None,
             incoming_cache: AtomCache::new(),
             incoming_fragments: HashMap::new(),
             outgoing_cache: ErtsAtomCache::default(),
@@ -442,8 +449,13 @@ fn set_node_not_alive(scheduler: &arinsal_sched::Scheduler<crate::Process>) {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        let events =
-            lock().nodes_monitor_events("nodedown", &nodename, u32::MAX, true, reason.as_deref());
+        let events = lock().nodes_monitor_events(
+            "nodedown",
+            &nodename,
+            u32::MAX,
+            true,
+            reason.as_deref().map(OwnedTerm::atom),
+        );
         let _ = crate::dist::send_nodes_monitor_events(scheduler, events);
     });
 }
@@ -486,6 +498,13 @@ pub(crate) fn find_dist_entry(sysname: &str) -> Option<Arc<DistEntry>> {
 /// `erts_prtsd_get(prt, ERTS_PRTSD_DIST_ENTRY)` of `port_id`; callers check
 /// `dep->cid == prt->common.id` under the entry lock.
 // Port of erts/emulator/beam/dist.c:3999 (erts_dist_command), OTP-29.1.1.
+/// `erts_this_dist_entry`: the dist entry of this node, set by `erts_set_this_node`
+/// (setnode_2); net_kernel holds it as its `ERTS_PSD_DIST_ENTRY` while the node is alive.
+// Port of erts/emulator/beam/erl_node_tables.c (erts_this_dist_entry), OTP-29.1.1.
+pub(crate) fn erts_this_dist_entry() -> Option<Arc<DistEntry>> {
+    lock().entries.get(this_node().0).cloned()
+}
+
 pub(crate) fn port_dist_entry(
     runtime: &crate::process::Runtime,
     port_id: u64,
@@ -499,13 +518,6 @@ pub(crate) fn dep_controls_port(dep: &DistEntry, port_id: u64) -> bool {
         .dist
         .as_ref()
         .is_some_and(|state| state.port_id == Some(port_id))
-}
-
-/// True when the port handle controls a live distribution connection.
-pub(crate) fn is_dist_port(handle: &crate::port::PortHandle) -> bool {
-    handle
-        .dist_entry()
-        .is_some_and(|dep| dep_controls_port(&dep, handle.id()))
 }
 
 const CON_ID_MASK: u32 = 0x00ff_ffff;
@@ -805,7 +817,7 @@ impl NodeTables {
         node: &str,
         connection_id: u32,
         visible: bool,
-        reason: Option<&str>,
+        reason: Option<OwnedTerm>,
     ) -> Vec<NodesMonitorEvent> {
         let node_type = if visible { "visible" } else { "hidden" };
         let node_term = OwnedTerm::Atom(node.to_owned());
@@ -836,7 +848,9 @@ impl NodeTables {
                     if what == "nodedown" && options.nodedown_reason {
                         info.push((
                             OwnedTerm::atom("nodedown_reason"),
-                            OwnedTerm::atom(reason.unwrap_or("connection_closed")),
+                            reason
+                                .clone()
+                                .unwrap_or_else(|| OwnedTerm::atom("connection_closed")),
                         ));
                     }
                     let info = if options.info_map {

@@ -170,7 +170,7 @@ impl Process {
                 break Ok(false);
             }
             handled = true;
-            let Some(node) = self.pop_sig_cont_signal() else {
+            let Some(mut node) = self.pop_sig_cont_signal() else {
                 break Ok(true);
             };
             if arinsal_sched::RecvMarker::is_marker(&node) {
@@ -178,6 +178,46 @@ impl Process {
                 self.recv_marker_enter_msgq(node);
                 cnt += 1;
                 continue;
+            }
+            if let Payload::Signal(Signal::LiteralAreaCopy(request)) = &mut node.payload {
+                // `handle_cla` gets the adjustment limit chosen by erts: signals followed by
+                // more queue entries receive the minimum adjustment budget; a last signal gets
+                // the remaining budget, with that same minimum.
+                let min_adj_limit =
+                    SIG_REDS_CNT_FACTOR.saturating_mul(crate::process::CONTEXT_REDS) / 6;
+                let adj_limit = if self.sig_cont_empty() {
+                    limit.saturating_sub(cnt).max(min_adj_limit)
+                } else {
+                    min_adj_limit
+                };
+                match crate::natives::sys::handle_cla(self, request, adj_limit) {
+                    Ok(crate::natives::sys::HandleClaResult::Yield { cnt: cla_cnt }) => {
+                        self.sig_cont_mut().push_front_node(node);
+                        cnt = cnt.saturating_add(cla_cnt);
+                        break Ok(false);
+                    }
+                    Ok(crate::natives::sys::HandleClaResult::Complete {
+                        result,
+                        cnt: cla_cnt,
+                    }) => {
+                        ctx.consume_fetched();
+                        let Event { payload, .. } = node.into_value();
+                        let Payload::Signal(Signal::LiteralAreaCopy(copy)) = payload else {
+                            unreachable!("the literal-copy signal is preserved while handled");
+                        };
+                        crate::natives::sys::reply_literal_area_copy(
+                            ctx,
+                            copy.request,
+                            copy.requester,
+                            result,
+                        )?;
+                        cnt = cnt.saturating_add(
+                            cla_cnt.min(SIG_REDS_CNT_FACTOR * crate::process::CONTEXT_REDS),
+                        );
+                        continue;
+                    }
+                    Err(error) => break Err(error),
+                }
             }
             ctx.consume_fetched();
             if !node.is_lazy() && !matches!(node.payload, Payload::Signal(_)) {
@@ -730,17 +770,8 @@ impl Process {
             arinsal_sched::Signal::Alias(_) | arinsal_sched::Signal::Unalias(_) => {
                 return Err(VmError::Unsupported("process aliases".into()));
             }
-            arinsal_sched::Signal::LiteralAreaCopy(copy) => {
-                let arinsal_sched::LiteralAreaCopyRequest {
-                    area_id,
-                    request,
-                    how,
-                    requester,
-                } = *copy;
-                crate::natives::sys::copy_literal_area(
-                    self, ctx, area_id, request, how, requester,
-                )?;
-                0
+            arinsal_sched::Signal::LiteralAreaCopy(_) => {
+                unreachable!("handle_cla preserves the literal-copy signal while it yields")
             }
         };
         Ok(cost)

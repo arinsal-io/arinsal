@@ -30,7 +30,7 @@ const TAG_IMMED1_SIZE: i64 = 4;
 const SMALL_BITS: u32 = 60;
 const SMALL_ZERO: i64 = TAG_IMMED1_SMALL;
 
-const fn bif_mfa(function: arinsal_term::Atom, arity: u64) -> ErtsCodeMfa {
+const fn bif_mfa(function: arinsal_term::Atom, arity: usize) -> ErtsCodeMfa {
     ErtsCodeMfa {
         module: Term::atom(atoms::ERLANG).word(),
         function: Term::atom(function).word(),

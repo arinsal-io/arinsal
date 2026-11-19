@@ -100,6 +100,20 @@ impl<T> Default for RecvMarker<T> {
 }
 
 impl<T> RecvMarker<T> {
+    /// Initialise one of the two markers stored on an `ErtsYieldAdjMsgQ`.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:7893-7914 (init_yield_marker), OTP-29.1.1.
+    pub fn init_yield(&mut self) {
+        self.prev_next = std::ptr::null_mut();
+        self.mark_type = RECV_MARKER_TYPE_YIELD;
+        self.pass = 100;
+        self.set_save = 0;
+        self.in_sigq = 0;
+        self.in_msgq = 0;
+        self.in_prioq = 0;
+        self.prev_ix = -100;
+        self.next_ix = -100;
+    }
+
     /// The signal node of the marker, to link into a queue (`markp->sig.common.tag =
     /// ERTS_RECV_MARKER_TAG`). `materialise` is never called for a marker: the queues hand
     /// marker nodes back to the block.
@@ -144,6 +158,48 @@ impl<T> RecvMarker<T> {
         signal.lazy_meta().is_some_and(crate::is_recv_marker_meta)
     }
 }
+
+/// The two queue markers retained by `ErtsCLAData` while a copy-literal operation yields.
+// Port of erts/emulator/beam/erl_proc_sig_queue.c:224-230 (ErtsYieldAdjMsgQ), OTP-29.1.1.
+pub struct YieldAdjMsgQ<T> {
+    /// The next position to scan in the message queue.
+    pub next: RecvMarker<T>,
+    /// The end of the message range preceding the copy-literal signal.
+    pub last: RecvMarker<T>,
+}
+
+impl<T> Default for YieldAdjMsgQ<T> {
+    fn default() -> Self {
+        let mut next = RecvMarker::default();
+        let mut last = RecvMarker::default();
+        next.init_yield();
+        last.init_yield();
+        Self { next, last }
+    }
+}
+
+impl<T> Clone for YieldAdjMsgQ<T> {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl<T> std::fmt::Debug for YieldAdjMsgQ<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("YieldAdjMsgQ")
+            .field("next_in_msgq", &self.next.in_msgq)
+            .field("last_in_msgq", &self.last.in_msgq)
+            .finish()
+    }
+}
+
+impl<T> PartialEq for YieldAdjMsgQ<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.next.in_msgq == other.next.in_msgq && self.last.in_msgq == other.last.in_msgq
+    }
+}
+
+impl<T> Eq for YieldAdjMsgQ<T> {}
 
 /// The message queue (`sig_qs.first`/`last`/`save`/`mq_len`).
 #[repr(C)]

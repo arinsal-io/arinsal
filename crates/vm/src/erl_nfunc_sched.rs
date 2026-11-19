@@ -119,7 +119,7 @@ pub(crate) fn erts_nfunc_schedule(
     if nep.argc < 0 {
         // First schedule; save things that might need to be restored.
         let (saved, mfa, pc, current) = first.expect("first erts_nfunc_schedule has an mfa");
-        let arity = mfa.arity as usize;
+        let arity = mfa.arity;
         saved[..arity].copy_from_slice(&reg[..arity]);
         nep.pc = pc;
         nep.mfa = std::ptr::from_ref(mfa);
@@ -133,7 +133,7 @@ pub(crate) fn erts_nfunc_schedule(
     }
     nep.trampoline.info.mfa.module = crate::native_hooks::raw(module);
     nep.trampoline.info.mfa.function = crate::native_hooks::raw(func);
-    nep.trampoline.info.mfa.arity = argv.len() as u64;
+    nep.trampoline.info.mfa.arity = argv.len();
     nep.trampoline.dfunc = dfunc;
     nep.func = ifunc;
     *used_proc.arity = argv.len() as u8;
@@ -202,7 +202,7 @@ pub(crate) fn i_is_call_nif(p: &mut Process) -> bool {
 
 /// The MFA of the trampoline `c_p->i` is at, when the process is about to run a scheduled
 /// wrapper call.
-pub(crate) fn trampoline_mfa(p: &mut Process) -> Option<(&'static str, &'static str, u8)> {
+pub(crate) fn trampoline_mfa(p: &mut Process) -> Option<(&'static str, &'static str, u32)> {
     if !i_is_call_nif(p) {
         return None;
     }
@@ -210,5 +210,5 @@ pub(crate) fn trampoline_mfa(p: &mut Process) -> Option<(&'static str, &'static 
     let atoms = arinsal_term::global_atoms();
     let module = atoms.text(crate::native_hooks::from_raw(mfa.module).as_atom()?)?;
     let function = atoms.text(crate::native_hooks::from_raw(mfa.function).as_atom()?)?;
-    Some((module, function, mfa.arity as u8))
+    Some((module, function, mfa.arity as u32))
 }

@@ -480,7 +480,11 @@ impl<H: HeapAlloc> LiteralDecoder<'_, '_, H> {
                     return None;
                 };
                 self.values.truncate(start);
-                let arity = u8::try_from(arity.as_small()?).ok()?;
+                let arity = arity.as_small()?;
+                if arity < 0 {
+                    return None;
+                }
+                let arity = arity as u32;
                 // Port of erts/emulator/beam/external.c (dec_term EXPORT_EXT:
                 // erts_export_get_or_make_stub), OTP-29.1.1.
                 let entry = crate::fun::export_get_or_make_stub(
@@ -741,9 +745,9 @@ mod tests {
         bad(&[131, 103, 119, 1, b'n', 0, 0, 0, 1, 0, 0, 0, 0, 4]);
         // A map with a repeated key.
         bad(&[131, 116, 0, 0, 0, 2, 97, 1, 97, 1, 97, 1, 97, 2]);
-        // An export with a bad arity, a fun whose creator is not a pid, a record with a
+        // An export with a negative arity, a fun whose creator is not a pid, a record with a
         // repeated field.
-        bad(&[131, 113, 119, 1, b'm', 119, 1, b'f', 98, 0, 0, 1, 0]);
+        bad(&[131, 113, 119, 1, b'm', 119, 1, b'f', 98, 255, 255, 255, 255]);
         let mut fun = vec![131, 112, 0, 0, 0, 0, 1];
         fun.extend([0u8; 16]);
         fun.extend([0, 0, 0, 0, 0, 0, 0, 0]);

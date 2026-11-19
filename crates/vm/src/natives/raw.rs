@@ -3,7 +3,7 @@
 //! Port of erts/emulator/beam/erl_term.h (typed term accessors), OTP-29.1.1. Heap terms passed
 //! here are live in the running process and stay unmoved until the accessor returns.
 
-use arinsal_term::{FunRef, Term};
+use arinsal_term::Term;
 use num_bigint::BigInt;
 
 /// The integer represented by a small integer or live bignum.
@@ -26,12 +26,8 @@ pub(crate) fn float(term: Term) -> Option<f64> {
 }
 
 /// Arity of a local or exported function term.
-pub(crate) fn fun_arity(term: Term) -> Option<u8> {
-    // SAFETY: the term and any local fun entry remain live for the whole BIF call.
-    match unsafe { term.fun_ref() }? {
-        FunRef::Local { entry, .. } => Some(entry.arity),
-        FunRef::Export { entry } => Some(entry.arity()),
-    }
+pub(crate) fn fun_arity(term: Term) -> Option<u32> {
+    term.fun_arity().map(u32::from)
 }
 
 /// The `ErtsCodeMFA` at `address`: inside the `ErtsCodeInfo` of loaded native code or of an

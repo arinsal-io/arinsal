@@ -166,10 +166,10 @@ impl Task for Process {
         self.stats.gc.nanoseconds
     }
 
-    // Inlined into the worker loop: see `Executor::run`. The dirty scheduler
-    // path (`run_slice`) gets its own copy, which the normal schedulers never execute.
-    #[inline(always)]
-    fn run(c_p: &mut CP<'_>, esdp: &ErtsSchedulerData, budget: u32, calls: &mut u32) {
+    // Port of erts/emulator/beam/erl_process.c:10232-10440 (erts_schedule, schedule-in of the
+    // selected process after `p->scheduler_data = esdp` and trace_schedule_in: `p->fcalls =
+    // reds`), OTP-29.1.1.
+    fn schedule_in(c_p: &mut CP<'_>, esdp: &ErtsSchedulerData, reds: u32) {
         esdp.with_ctx(c_p, |process, ctx| {
             // `c_p` (the native prefix at the start of this task) and the process state word are in
             // one process struct, the state word at `offsetof(Process, state)` from `c_p`.
@@ -179,8 +179,7 @@ impl Task for Process {
                 crate::process::PROCESS_STATE_OFFSET
             );
             // Port of erts/emulator/beam/erl_trace.c:704-716 (trace_sched), OTP-29.1.1.
-            let trace_scheduling = crate::trace::running_procs_enabled();
-            if trace_scheduling {
+            if crate::trace::running_procs_enabled() {
                 crate::trace::emit_process(
                     process,
                     ctx.pid(),
@@ -211,7 +210,7 @@ impl Task for Process {
             }
             // Port of erts/emulator/beam/erl_alloc.c (erts_alloc passes `esdp->no` to the
             // thread-specific allocators), OTP-29.1.1: the process heap allocates on this scheduler's
-            // instance without looking the thread up, for the span of this run.
+            // instance without looking the thread up, while it is scheduled in.
             let data = arinsal_sched::erts_sched_registers(esdp);
             let alloc_ix = data.alloc_ix.get().unwrap_or_else(|| {
                 let ix = arinsal_alloc::thread_alloc_ix();
@@ -223,12 +222,19 @@ impl Task for Process {
             if process.receive_timeout_pos.is_some() {
                 process.receive_timeout_schedule_in();
             }
-            // Port of erts/emulator/beam/erl_process.c:10435 (`p->fcalls = reds`) and
-            // jit/arm/process_main.cpp (`def_arg_reg[5] = REDS_IN = FCALLS`), OTP-29.1.1: the
-            // slice's one counter starts at the budget.
-            let reds_in = budget.min(i32::MAX as u32) as i32;
-            process.heap.abi.fcalls = reds_in;
-            process.x.set_reds_in(reds_in);
+            // Port of erts/emulator/beam/erl_process.c:10435 (`p->fcalls = reds`), OTP-29.1.1.
+            process.heap.abi.fcalls = reds.min(i32::MAX as u32) as i32;
+        })
+    }
+
+    // Inlined into the worker loop: the slice between erts_schedule's schedule-in and
+    // schedule-out, as process_main runs it.
+    #[inline(always)]
+    fn run(c_p: &mut CP<'_>, esdp: &ErtsSchedulerData, _budget: u32, calls: &mut u32) {
+        esdp.with_ctx(c_p, |process, ctx| {
+            // Port of jit/arm/process_main.cpp and jit/x86/process_main.cpp (`REDS_IN =
+            // FCALLS` after erts_schedule returns), OTP-29.1.1.
+            process.x.set_reds_in(process.heap.abi.fcalls);
             // Port of erts/emulator/beam/beam_common.c (erts_dirty_process_main: `start_time`),
             // OTP-29.1.1: a dirty CPU scheduler charges the time from picking the process up.
             let dirty_start = (ctx.scheduler_type() == arinsal_sched::SchedulerType::DirtyCpu)
@@ -238,10 +244,23 @@ impl Task for Process {
                         .unwrap_or_else(std::time::Instant::now)
                 });
             process.run_task(ctx);
-            *calls = process.context_switch(ctx, dirty_start);
+            *calls = process.reds_used(ctx, dirty_start);
+        })
+    }
+
+    // Port of erts/emulator/beam/erl_process.c:9660-9700 (erts_schedule, schedule-out of the
+    // process that ran: `actual_reds = calls - esdp->virtual_reds`, `p->reds += actual_reds`,
+    // then trace_schedule_out), OTP-29.1.1.
+    fn schedule_out(c_p: &mut CP<'_>, esdp: &ErtsSchedulerData, calls: u32) {
+        esdp.with_ctx(c_p, |process, ctx| {
+            let virtual_reds = std::mem::take(&mut process.virtual_reds);
+            ctx.add_virtual_reds(virtual_reds);
+            process.reductions_used = process
+                .reductions_used
+                .saturating_add(u64::from(calls.saturating_sub(virtual_reds)));
             process.heap.set_alloc_ix(None);
             process.native = None;
-            if trace_scheduling {
+            if crate::trace::running_procs_enabled() {
                 crate::trace::emit_process(
                     process,
                     ctx.pid(),
@@ -427,21 +446,19 @@ impl Task for Process {
 }
 
 impl Process {
-    /// The context switch's reduction count, taken once per slice: `reds_used` is what the
-    /// slice took from FCALLS, `p->reds` gains it less what `ERTS_VBUMP_REDS` gave up, and
-    /// it is returned as the `calls` the scheduler passes to `erts_schedule`. A dirty scheduler charges by its own rule instead.
+    /// The reductions the slice used, the `calls` the scheduler passes to `erts_schedule`:
+    /// what it took from FCALLS on a normal scheduler, a dirty scheduler's own rule otherwise.
+    /// `p->virtual_reds` stays for erts_schedule's schedule-out to subtract.
     // Port of erts/emulator/beam/jit/arm/process_main.cpp (context_switch: `reds_used =
-    // REDS_IN - FCALLS`), beam_common.c (erts_dirty_process_main: `reds_used`) and
-    // erl_process.c:9678-9700 (erts_schedule: `actual_reds = calls - esdp->virtual_reds`,
-    // `p->reds += actual_reds`), OTP-29.1.1.
+    // REDS_IN - FCALLS`) and beam_common.c (erts_dirty_process_main: `reds_used`), OTP-29.1.1.
     #[inline(always)]
-    fn context_switch(
-        &mut self,
+    fn reds_used(
+        &self,
         ctx: &mut RunCtx<'_, crate::Process>,
         dirty_start: Option<std::time::Instant>,
     ) -> u32 {
-        let virtual_reds = std::mem::take(&mut self.virtual_reds);
-        let reds_used = match ctx.scheduler_type() {
+        let virtual_reds = self.virtual_reds;
+        match ctx.scheduler_type() {
             arinsal_sched::SchedulerType::Normal => {
                 u32::try_from(self.x.reds_in().saturating_sub(self.heap.abi.fcalls)).unwrap_or(0)
             }
@@ -452,12 +469,7 @@ impl Process {
                     .unwrap_or(i32::MAX as u32)
                     .min(i32::MAX as u32)
             }
-        };
-        ctx.add_virtual_reds(virtual_reds);
-        self.reductions_used = self
-            .reductions_used
-            .saturating_add(u64::from(reds_used.saturating_sub(virtual_reds)));
-        reds_used
+        }
     }
 
     #[inline(always)]

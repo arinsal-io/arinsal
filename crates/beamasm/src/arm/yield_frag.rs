@@ -51,7 +51,9 @@ impl YieldFragments {
 
         code.bind(dispatch_return).map_err(fail)?;
         code.emit(|e| {
-            e.str_uoff(Gpr::x(30), C_P, PROCESS_I)?;
+            // `context_switch_simplified` receives the resume PC in ARG3.
+            e.mov_reg(ARG3, Gpr::x(30))?;
+            e.str_uoff(Gpr::xzr(), C_P, PROCESS_CURRENT)?;
             e.mov_const(TMP2, 1)?;
             e.strb_uoff(TMP2, C_P, PROCESS_ARITY)
         })
@@ -78,7 +80,10 @@ impl YieldFragments {
                 .union(Update::X_REGS),
         )
         .map_err(fail)?;
+        // Port of erts/emulator/beam/jit/arm/process_main.cpp:124-162
+        // (context_switch_simplified_local), OTP-29.1.1.
         code.emit(|e| {
+            e.str_uoff(ARG3, C_P, PROCESS_I)?;
             e.mov_const(Gpr::x(0), 1)?;
             e.str_uoff(
                 Gpr::x(0),
@@ -106,8 +111,8 @@ impl YieldFragments {
         })
     }
 
-    /// Entry of `context_switch_simplified`: the continuation is in `c_p->i` and the live X
-    /// count in `c_p->arity`.
+    /// Entry of `context_switch_simplified`: ARG3 is stored in `c_p->i`; live X count is in
+    /// `c_p->arity`.
     pub fn context_switch(&self) -> usize {
         self.memory.ptr_at(self.context_switch_offset) as usize
     }

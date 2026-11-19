@@ -112,7 +112,7 @@ pub enum OwnedTerm {
     Export {
         module: String,
         function: String,
-        arity: u8,
+        arity: u32,
     },
     /// Local fun (`NEW_FUN_EXT`). The embedded creator PID is retained for ETF fidelity.
     Fun {
@@ -496,13 +496,13 @@ impl Frame {
                 let module = expect_atom(it.next().unwrap(), end)?;
                 let function = expect_atom(it.next().unwrap(), end)?;
                 let arity = expect_int(it.next().unwrap(), end)?;
-                if !(0..=255).contains(&arity) {
+                if arity < 0 {
                     return Err(invalid(end, "invalid export arity"));
                 }
                 OwnedTerm::Export {
                     module,
                     function,
-                    arity: arity as u8,
+                    arity: arity as u32,
                 }
             }
             Kind::Fun {

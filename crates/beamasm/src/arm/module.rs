@@ -277,8 +277,6 @@ pub struct BeamModuleAssembler {
     #[allow(dead_code)]
     exception_resolver: usize,
     catch_patches: Vec<(usize, Label)>,
-    /// Shared out-of-line `function_clause` raiser, bound in `finalize` when any function uses it.
-    func_clause_stub: Option<Label>,
     /// Shared `call_fun` error handler and its resolver, bound in `finalize` when used.
     call_fun_error_stub: Option<(Label, usize)>,
     /// Shared arithmetic slow-path fragments keyed by hook address and operation code.
@@ -301,14 +299,16 @@ pub struct BeamModuleAssembler {
     /// Out-of-line `i_test_yield` continuations (stub, continuation, live X registers).
     yield_stubs: Vec<(Label, Label, u8)>,
     /// Process-wide yield fragments: `dispatch_return`, `i_test_yield_shared` and
-    /// `context_switch_simplified`. Unset in assemblers that run without a VM.
-    yield_fragments: Option<(usize, usize, usize)>,
+    /// `context_switch_simplified`. Zero addresses are used only by standalone assembler tests.
+    pub(super) yield_fragments: (usize, usize, usize),
     /// Address of the process-wide `call_nif_yield_helper` fragment that `call_nif` jumps to
     /// (0: not installed).
     call_nif_yield_helper: usize,
-    /// Process-wide exception fragments: `raise_shared` and `raise_exception`. Unset in
-    /// assemblers that run without a VM.
-    pub(super) raise_fragments: Option<(usize, usize)>,
+    /// Process-wide `raise_shared`, `raise_exception_shared`, and `i_func_info_shared` fragments.
+    /// A zero `i_func_info_shared` address means the code header is invalid, as in NIF stub
+    /// assembly and standalone assembler tests.
+    /// Zero addresses are used only by standalone assembler tests.
+    pub(super) raise_fragments: (usize, usize, usize),
     /// Process-wide `handle_map_get_badmap`, `handle_map_get_badkey` and
     /// `handle_map_size_error` fragments. Unset in assemblers that run without a VM.
     pub(super) map_error_fragments: Option<(usize, usize, usize)>,
@@ -365,23 +365,15 @@ pub fn beamasm_emit_call_nif(
     ba.emit_i_entry_label(2)?;
     ba.emit_i_breakpoint_trampoline(0)?;
     ba.emit_call_nif(normal_fptr, lib, dirty_fptr)?;
-    // ERTS_CT_ASSERT(sizeof(stub->code) <= BEAM_NATIVE_MIN_FUNC_SZ * sizeof(Eterm)).
-    let size = ba.code.offset() - start;
+    ba.flush_dispatch_fragments()?;
+    let words = ba.code.finish()?;
+    let size = words.len() * 4 - start;
     if size > buf.len() {
         return Err(ModuleError::InvalidOperand(
             "call_nif stub exceeds ErtsNifBeamStub",
         ));
     }
-    // codegen: the stub's `i_func_info` is data only (its `bl` never runs), so the shared
-    // function_clause target lies past the copied bytes.
-    if let Some(stub) = ba.func_clause_stub.take() {
-        ba.code.bind(stub)?;
-        ba.code.emit(|e| {
-            e.udf(0xB1F);
-            Ok(())
-        })?;
-    }
-    let words = ba.code.finish()?;
+    // ERTS_CT_ASSERT(sizeof(stub->code) <= BEAM_NATIVE_MIN_FUNC_SZ * sizeof(Eterm)).
     let bytes = words
         .iter()
         .flat_map(|word| word.to_le_bytes())
@@ -503,19 +495,18 @@ impl BeamModuleAssembler {
             error_pc_label,
             exception_resolver: 0,
             catch_patches: Vec::new(),
-            func_clause_stub: None,
             call_fun_error_stub: None,
             arith_fragments: Vec::new(),
             dispatch_fragments: Vec::new(),
             gc_fragments: Vec::new(),
             yield_stubs: Vec::new(),
-            yield_fragments: None,
+            yield_fragments: (0, 0, 0),
             call_nif_yield_helper: 0,
             arith_compare_shared: 0,
             eq_exact_list_shared: 0,
             element_guard_shared: 0,
             element_error: None,
-            raise_fragments: None,
+            raise_fragments: (0, 0, 0),
             map_error_fragments: None,
             entry_offset: None,
             entry_label: None,
@@ -792,10 +783,14 @@ impl BeamModuleAssembler {
         self.element_guard_shared = fragment;
     }
 
-    /// Installs the process-wide `raise_shared` and `raise_exception` fragments so `raise`
-    /// and `raw_raise` call them instead of carrying the exception transfer inline.
-    pub fn set_raise_fragments(&mut self, raise_shared: usize, raise_exception: usize) {
-        self.raise_fragments = Some((raise_shared, raise_exception));
+    /// Installs the process-wide exception fragments emitted by the ARM global assembler.
+    pub fn set_raise_fragments(
+        &mut self,
+        raise_shared: usize,
+        raise_exception: usize,
+        func_info_shared: usize,
+    ) {
+        self.raise_fragments = (raise_shared, raise_exception, func_info_shared);
     }
 
     /// Installs the process-wide `handle_map_get_badmap`, `handle_map_get_badkey` and
@@ -813,7 +808,7 @@ impl BeamModuleAssembler {
         test_yield_shared: usize,
         context_switch: usize,
     ) {
-        self.yield_fragments = Some((dispatch_return, test_yield_shared, context_switch));
+        self.yield_fragments = (dispatch_return, test_yield_shared, context_switch);
     }
 
     /// Emits `b.cond` to this module's dispatch stub of the process-wide fragment `target`.
@@ -823,7 +818,21 @@ impl BeamModuleAssembler {
         cond: Cond,
         target: usize,
     ) -> Result<(), ModuleError> {
-        let label = match self
+        let label = self.fragment_label(target);
+        self.code.b_cond(cond, label)?;
+        Ok(())
+    }
+
+    /// Emits a non-linking branch to a process-wide fragment through this module's dispatch stub.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp (resolve_fragment), OTP-29.1.1.
+    pub(super) fn fragment_branch(&mut self, target: usize) -> Result<(), ModuleError> {
+        let label = self.fragment_label(target);
+        self.code.b(label)?;
+        Ok(())
+    }
+
+    fn fragment_label(&mut self, target: usize) -> Label {
+        match self
             .dispatch_fragments
             .iter()
             .find(|(known, _)| *known == target)
@@ -834,8 +843,17 @@ impl BeamModuleAssembler {
                 self.dispatch_fragments.push((target, label));
                 label
             }
-        };
-        self.code.b_cond(cond, label)?;
+        }
+    }
+
+    fn flush_dispatch_fragments(&mut self) -> Result<(), ModuleError> {
+        for (target, label) in std::mem::take(&mut self.dispatch_fragments) {
+            self.code.bind(label)?;
+            self.code.emit(|e| {
+                e.mov_const(Gpr::x(17), target as u64)?;
+                e.br(Gpr::x(17))
+            })?;
+        }
         Ok(())
     }
 
@@ -996,12 +1014,11 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
-    /// Emits the `ErtsCodeInfo` slot that precedes a function's entry: the `bl` into the
+    /// Emits the `ErtsCodeInfo` slot that precedes a function's entry: the `bl` into the shared
     /// function clause fragment, the breakpoint flag, the generic breakpoint word and the MFA.
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:499-540 (emit_i_func_info) and
-    // 484-497 (emit_i_func_info_shared), OTP-29.1.1: a failing head match branches here and
-    // raises error:function_clause with the function's arguments as the top frame. Like erts'
-    // `bl`, the link register points 4 bytes into the slot, inside the function's code range.
+    // 484-497 (emit_i_func_info_shared), OTP-29.1.1: the `bl` return address points four bytes
+    // into the slot, where the global fragment derives the MFA and sets `c_p->current`.
     pub fn emit_i_func_info(
         &mut self,
         _label: u32,
@@ -1010,16 +1027,17 @@ impl BeamModuleAssembler {
         arity: u8,
     ) -> Result<(), ModuleError> {
         self.function_arity = arity;
-        let stub = match self.func_clause_stub {
-            Some(stub) => stub,
-            None => {
-                let stub = self.code.new_label();
-                self.func_clause_stub = Some(stub);
-                stub
-            }
-        };
+        let func_info_shared = self.raise_fragments.2;
         let start = self.code.offset();
-        self.code.bl(stub)?;
+        if func_info_shared == 0 {
+            // `code_header.is_valid()` is false when erts builds the temporary NIF stub.
+            self.code.emit(|encoder| {
+                encoder.udf(0xF1F0);
+                Ok(())
+            })?;
+        } else {
+            self.fragment_call(func_info_shared)?;
+        }
         self.code.emit(|e| {
             e.embed_uint32(0);
             e.embed_uint64(0);
@@ -1232,7 +1250,10 @@ impl BeamModuleAssembler {
         for (stub, continuation, live) in std::mem::take(&mut self.yield_stubs) {
             self.code.bind(stub)?;
             self.code.adr(Gpr::x(8), continuation)?;
-            self.code.emit(|e| e.str_uoff(Gpr::x(8), C_P, 72))?;
+            self.code.emit(|e| {
+                e.str_uoff(Gpr::x(8), C_P, 72)?;
+                e.mov_reg(Gpr::x(2), Gpr::x(8))
+            })?;
             self.emit_yield_live(live)?;
             self.code.b(self.yield_label)?;
         }
@@ -1255,10 +1276,11 @@ impl BeamModuleAssembler {
     pub fn test_yield(&mut self) -> Result<(), ModuleError> {
         // The yield sequence is out of line so the fall-through path has no taken branch,
         // like erts' `b.le` to the shared context-switch fragment.
-        if let (Some((_, test_yield_shared, _)), Some(entry), Some(after_entry)) =
-            (self.yield_fragments, self.entry_label, self.entry_offset)
+        if self.yield_fragments.1 != 0
+            && let (Some(entry), Some(after_entry)) = (self.entry_label, self.entry_offset)
             && self.code.offset() == after_entry + crate::yield_frag::FUNC_PROLOGUE_SIZE
         {
+            let test_yield_shared = self.yield_fragments.1;
             self.code.adr(Gpr::x(2), entry)?;
             self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 1, false))?;
             self.fragment_branch_cond(Cond::Le, test_yield_shared)?;
@@ -1316,7 +1338,10 @@ impl BeamModuleAssembler {
         let true_word = arinsal_term::Term::atom(arinsal_term::atoms::TRUE).tagged_word();
         self.code.emit(|e| e.mov_const(XREGS[0], true_word))?;
         self.code.adr(Gpr::x(8), continuation)?;
-        self.code.emit(|e| e.str_uoff(Gpr::x(8), C_P, 72))?;
+        self.code.emit(|e| {
+            e.str_uoff(Gpr::x(8), C_P, 72)?;
+            e.mov_reg(Gpr::x(2), Gpr::x(8))
+        })?;
         self.emit_yield_live(1)?;
         self.code.b(self.yield_label)?;
         self.code.bind(continuation)?;
@@ -1422,7 +1447,8 @@ impl BeamModuleAssembler {
         // The yield path is the forward `b.mi`, so a return with reductions left falls
         // through to `ret`. erts keeps that sequence in the shared dispatch_return fragment.
         self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 1, false))?;
-        if let Some((dispatch_return, _, _)) = self.yield_fragments {
+        if self.yield_fragments.0 != 0 {
+            let dispatch_return = self.yield_fragments.0;
             self.fragment_branch_cond(Cond::Mi, dispatch_return)?;
             self.code.emit(|e| e.ret(Gpr::x(30)))?;
             return Ok(());
@@ -1431,7 +1457,10 @@ impl BeamModuleAssembler {
         self.code.b_cond(Cond::Mi, stub)?;
         self.code.emit(|e| e.ret(Gpr::x(30)))?;
         self.code.bind(stub)?;
-        self.code.emit(|e| e.str_uoff(Gpr::x(30), C_P, 72))?;
+        self.code.emit(|e| {
+            e.str_uoff(Gpr::x(30), C_P, 72)?;
+            e.mov_reg(Gpr::x(2), Gpr::x(30))
+        })?;
         self.emit_yield_live(1)?;
         self.code.b(self.yield_label)?;
         Ok(())
@@ -2015,18 +2044,7 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1440-1454 and
     // beam_asm_module.cpp:596-603,724-732 (fragment_call / resolve_fragment), OTP-29.1.1.
     pub(super) fn fragment_call(&mut self, target: usize) -> Result<(), ModuleError> {
-        let label = match self
-            .dispatch_fragments
-            .iter()
-            .find(|(known, _)| *known == target)
-        {
-            Some(&(_, label)) => label,
-            None => {
-                let label = self.code.new_label();
-                self.dispatch_fragments.push((target, label));
-                label
-            }
-        };
+        let label = self.fragment_label(target);
         self.code.bl(label)?;
         Ok(())
     }
@@ -2557,31 +2575,6 @@ impl BeamModuleAssembler {
     /// Finalizes veneers and copies the module into executable memory.
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:556-610, 796-814, OTP-29.1.1
     pub fn finalize(mut self) -> Result<FinalizedModule, ModuleError> {
-        // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:484-497 (emit_i_func_info_shared),
-        // OTP-29.1.1: freason = EXC_FUNCTION_CLAUSE, then the shared exception exit. The runtime
-        // takes the argument list from the published X registers and the function from the pc.
-        let function_clause = arinsal_term::Term::atom(
-            arinsal_term::global_atoms()
-                .intern("function_clause")
-                .map_err(|_| ModuleError::InvalidOperand("function_clause atom"))?,
-        )
-        .tagged_word();
-        if let Some(stub) = self.func_clause_stub.take() {
-            self.code.bind(stub)?;
-            self.code.emit(|e| {
-                e.mov_const(Gpr::x(8), EXC_FUNCTION_CLAUSE)?;
-                e.str_uoff(Gpr::x(8), Gpr::x(21), 40)?;
-                e.mov_const(Gpr::x(8), function_clause)?;
-                e.str_uoff(Gpr::x(8), Gpr::x(21), 48)?;
-                e.mov_reg(Gpr::x(3), Gpr::xzr())
-            })?;
-            // x30 points 4 bytes into the function's `i_func_info` slot (the `bl` in
-            // `emit_i_func_info`). Registered native function ranges start at the entry after
-            // the slot, so the recorded pc is moved there.
-            self.code
-                .emit(|e| e.add_imm(Gpr::x(30), Gpr::x(30), (FUNC_INFO_BYTES - 4) as u16, false))?;
-            self.code.b(self.error_label)?;
-        }
         self.flush_yield_stubs()?;
         if let Some((from_guard, direct)) = self.element_error.take() {
             self.emit_element_error_stubs(from_guard, direct)?;
@@ -2697,7 +2690,8 @@ impl BeamModuleAssembler {
         }
         let entry_label = self.yield_label;
         self.code.bind(entry_label)?;
-        if let Some((_, _, context_switch)) = self.yield_fragments {
+        if self.yield_fragments.2 != 0 {
+            let context_switch = self.yield_fragments.2;
             self.code.emit(|e| {
                 e.mov_const(Gpr::x(17), context_switch as u64)?;
                 e.br(Gpr::x(17))
@@ -2738,8 +2732,9 @@ impl BeamModuleAssembler {
             let resolver = self.exception_resolver;
             self.code.emit(|e| {
                 e.mov_reg(Gpr::x(0), C_P)?;
-                crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(1))?;
-                e.mov_reg(Gpr::x(2), E)?;
+                e.ldr_uoff(Gpr::x(1), SCHEDULER_REGS, NATIVE_ERROR_PC_SLOT)?;
+                crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(2))?;
+                // ARG4 was set by the raise site: null for a plain error or `bif_mfa` for a BIF.
                 e.mov_const(Gpr::x(17), resolver as u64)?;
                 e.blr(Gpr::x(17))?;
                 e.mov_reg(Gpr::x(14), Gpr::x(0))
@@ -2759,14 +2754,7 @@ impl BeamModuleAssembler {
         })?;
         self.code.bind(native_catch)?;
         self.code.emit(|e| e.br(Gpr::x(14)))?;
-        let dispatch_fragments = std::mem::take(&mut self.dispatch_fragments);
-        for (target, label) in dispatch_fragments {
-            self.code.bind(label)?;
-            self.code.emit(|e| {
-                e.mov_const(Gpr::x(17), target as u64)?;
-                e.br(Gpr::x(17))
-            })?;
-        }
+        self.flush_dispatch_fragments()?;
         let (words, labels, literal_relocations) =
             self.code.finish_with_labels_and_relocations()?;
         let trace_breakpoints = self

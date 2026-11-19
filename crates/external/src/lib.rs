@@ -345,7 +345,7 @@ struct OutputSlice<'a> {
     position: usize,
     failed: bool,
     /// The I/O vector of a dist encode (`ctx->iov`), which referenced binaries go into.
-    iov: Option<&'a mut dist::TtbDistEncodeContext>,
+    iov: Option<dist::DistIovSink<'a>>,
 }
 
 impl<'a> OutputSlice<'a> {

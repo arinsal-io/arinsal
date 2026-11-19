@@ -3108,6 +3108,8 @@ fn internal_state_set(
             eprintln!("{reason}");
             std::process::exit(1);
         }
+        // Port of erts/emulator/beam/erl_bif_info.c (erts_debug_set_internal_state_2,
+        // "kill_dist_connection") and dist.c (erts_kill_dist_connection), OTP-29.1.1.
         Some("kill_dist_connection") => {
             let Some(node) = arg_name(value) else {
                 return Ok(Term::atom(arinsal_term::atoms::FALSE));
@@ -3115,7 +3117,7 @@ fn internal_state_set(
             let Some(runtime) = process.runtime.as_ref() else {
                 return Ok(Term::atom(arinsal_term::atoms::FALSE));
             };
-            let (port_id, connection_id) = {
+            let connection_id = {
                 let tables = crate::node_tables::lock();
                 let Some(entry) = tables
                     .entries
@@ -3125,28 +3127,10 @@ fn internal_state_set(
                 else {
                     return Ok(Term::atom(arinsal_term::atoms::FALSE));
                 };
-                (
-                    entry.dist.as_ref().and_then(|state| state.port_id),
-                    entry.connection_id,
-                )
+                entry.connection_id
             };
-            if let Some(port_id) = port_id {
-                let port = runtime.ports.get(port_id);
-                if !crate::port::close_by_id(process, ctx, port_id)? {
-                    return Ok(Term::atom(arinsal_term::atoms::FALSE));
-                }
-                if let Some(port) = port {
-                    crate::dist::port_connection_closed(runtime, &port)?;
-                }
-                return Ok(Term::atom(arinsal_term::atoms::TRUE));
-            }
-            return Ok(Term::atom(
-                if crate::dist::kill_connection(runtime, &node, connection_id)? {
-                    arinsal_term::atoms::TRUE
-                } else {
-                    arinsal_term::atoms::FALSE
-                },
-            ));
+            crate::dist::kill_connection(runtime, &node, connection_id)?;
+            return Ok(Term::atom(arinsal_term::atoms::TRUE));
         }
         Some("wait")
             if [

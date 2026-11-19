@@ -740,7 +740,7 @@ pub(crate) fn consolidate_staged(process: &Process, functions: &[BpFunction]) {
         crate::beamasm_integration::set_bif_traced(
             &function.module,
             &function.function,
-            function.arity,
+            u32::from(function.arity),
             traced,
         );
     }
@@ -1233,7 +1233,7 @@ pub extern "C" fn erts_generic_breakpoint(
             .unwrap_or("")
     };
     let (module, function) = (name(mfa.module), name(mfa.function));
-    let arity = (mfa.arity as usize).min(registers.x_reg_array.len());
+    let arity = mfa.arity.min(registers.x_reg_array.len());
     let debug = arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
         arinsal_sched::RunCtx::with_current(esdp, |ctx| {
             let debug = generic_breakpoint(

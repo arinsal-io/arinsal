@@ -142,8 +142,12 @@ fn call_setnode2(
         // `net_kernel->flags` with net_kernel's locks held (dist.c:5043-5046): the caller's own
         // flags when net_kernel calls, else net_kernel's under its main lock (free while thread
         // progress is blocked).
-        let mut set_distribution = |flags: &mut ProcessHeap| {
-            if exiting || flags.has_flag(pflags::F_DISTRIBUTION) {
+        // `!ERTS_PROC_IS_EXITING(net_kernel) && !ERTS_PROC_GET_DIST_ENTRY(net_kernel)`.
+        let mut set_distribution = |flags: &mut ProcessHeap,
+                                    psd_dist_entry: &mut Option<
+            std::sync::Arc<node_tables::DistEntry>,
+        >| {
+            if exiting || psd_dist_entry.is_some() {
                 return false;
             }
             // Port of dist.c:5030-5037: a creation below 4 is raised to 4.
@@ -151,15 +155,25 @@ fn call_setnode2(
             node_tables::set_this_node(name.clone(), creation.max(4));
             node_tables::set_alive(true);
             events = node_tables::lock().nodes_monitor_events("nodeup", name, u32::MAX, true, None);
-            // F_DISTRIBUTION: the exit of net_kernel runs erts_do_net_exits (dist.c:5045).
+            // F_DISTRIBUTION: the exit of net_kernel runs erts_do_net_exits (dist.c:5045) on
+            // its dist entry, the new erts_this_dist_entry.
             flags.set_flag(pflags::F_DISTRIBUTION, true);
+            *psd_dist_entry = node_tables::erts_this_dist_entry();
             true
         };
         success = if net_kernel == me {
-            set_distribution(&mut process.heap)
+            let mut psd = process.cold_mut().psd_dist_entry.take();
+            let set = set_distribution(&mut process.heap, &mut psd);
+            process.cold_mut().psd_dist_entry = psd;
+            set
         } else {
             scheduler
-                .try_with_task(net_kernel, |task| set_distribution(&mut task.heap))
+                .try_with_task(net_kernel, |task| {
+                    let mut psd = task.cold_mut().psd_dist_entry.take();
+                    let set = set_distribution(&mut task.heap, &mut psd);
+                    task.cold_mut().psd_dist_entry = psd;
+                    set
+                })
                 .unwrap_or(false)
         };
         if success {

@@ -83,24 +83,17 @@ fn loopback_hostname_preload(directory: &Path) -> (&'static str, OsString) {
 }
 
 fn reference_binary(name: &str) -> PathBuf {
-    let mut roots = Vec::new();
-    if let Some(root) = std::env::var_os("ARINSAL_OTP_ROOT") {
-        roots.push(PathBuf::from(root));
-    }
-    if let Some(root) = std::env::var_os("ERL_ROOT") {
-        roots.push(PathBuf::from(root));
-    }
-    if let Some(asdf) = std::env::var_os("ASDF_DIR") {
-        roots.push(PathBuf::from(asdf).join("installs/erlang/29.1.1"));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        roots.push(PathBuf::from(home).join(".asdf/installs/erlang/29.1.1"));
-    }
-    roots
-        .into_iter()
-        .map(|root| root.join("erts-17.1/bin").join(name))
-        .find(|path| path.is_file())
-        .unwrap_or_else(|| panic!("OTP-29.1.1 reference binary missing: {name}"))
+    let root = arinsal_difftest::reference::otp_root()
+        .expect("reference OTP is required; set ARINSAL_OTP_ROOT or put erl on PATH");
+    let path = root
+        .join("erts-17.1/bin")
+        .join(arinsal_difftest::reference::program(name));
+    assert!(
+        path.is_file(),
+        "reference OTP binary is missing: {}",
+        path.display()
+    );
+    path
 }
 
 fn differential(

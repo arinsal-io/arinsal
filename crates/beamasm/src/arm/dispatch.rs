@@ -966,14 +966,17 @@ fn emit_export_fragment(
             encoder.blr(Gpr::x(17))
         })?;
         emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
+        code.emit(|encoder| encoder.mov_reg(Gpr::x(9), Gpr::x(0)))?;
+        // Keep the export trampoline frame for the shared raise fragment: it
+        // restores the BEAM continuation before calling handle_error.
+        // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:207-223,
+        // OTP-29.1.1.
+        code.cbz(Gpr::x(9), raise_exception)?;
         code.emit(|encoder| {
-            encoder.mov_reg(Gpr::x(9), Gpr::x(0))?;
             encoder.ldr_uoff(Gpr::x(0), Gpr::sp(), 16)?;
             encoder.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 32)?;
             encoder.ldr_post(Gpr::x(10), Gpr::x(20), 8)
         })?;
-        // No error handler: the BIF path below reports `undef` with the arguments intact.
-        code.cbz(Gpr::x(9), not_error_handler)?;
         code.emit(|encoder| {
             encoder.mov_reg(Gpr::x(0), Gpr::x(9))?;
             encoder.ldr_regoff(Gpr::x(14), Gpr::x(0), Gpr::x(24), 3)?;
@@ -1303,10 +1306,15 @@ fn emit_raise_exception_fragment(
     code.emit(|encoder| {
         encoder.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 32)?;
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
-        crate::arm::beam_asm::load_x_reg_array(encoder, Gpr::x(1))?;
-        encoder.mov_reg(Gpr::x(2), Gpr::x(20))?;
-        // Export trampolines provide their MFA through c_p->current, like erts.
-        encoder.mov_reg(Gpr::x(3), Gpr::xzr())?;
+        encoder.mov_reg(Gpr::x(1), Gpr::x(30))?;
+        crate::arm::beam_asm::load_x_reg_array(encoder, Gpr::x(2))?;
+        // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:300-321
+        // (raise_exception_shared: process, PC, registers, current MFA), OTP-29.1.1.
+        encoder.ldr_uoff(
+            Gpr::x(3),
+            Gpr::x(21),
+            std::mem::offset_of!(crate::ProcessHeader, current) as u32,
+        )?;
         encoder.mov_const(Gpr::x(17), resolver as u64)?;
         encoder.blr(Gpr::x(17))
     })?;
@@ -1475,11 +1483,18 @@ fn emit_call_light_bif_shared(
     code.cbz(Gpr::x(17), scheduler_error)?;
     code.emit(|encoder| {
         // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:539-545, OTP-29.1.1:
-        // the BIF MFA is process->current; this fragment has no call-site bif_mfa argument.
-        encoder.mov_reg(Gpr::x(3), Gpr::xzr())?;
+        // handle_error(c_p, pc, reg, &export->info.mfa); the entry (pc) was spilled to
+        // tmp_mem[6] and the Export* to the host frame.
+        encoder.ldr_uoff(Gpr::x(3), Gpr::sp(), 16)?;
+        encoder.add_imm(
+            Gpr::x(3),
+            Gpr::x(3),
+            crate::bif::EXPORT_MFA_OFFSET as u16,
+            false,
+        )?;
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
-        crate::arm::beam_asm::load_x_reg_array(encoder, Gpr::x(1))?;
-        encoder.mov_reg(Gpr::x(2), Gpr::x(20))?;
+        encoder.ldr_uoff(Gpr::x(1), Gpr::x(19), crate::arm::beam_asm::tmp_mem_ref(6))?;
+        crate::arm::beam_asm::load_x_reg_array(encoder, Gpr::x(2))?;
         encoder.blr(Gpr::x(17))
     })?;
     code.cbz(Gpr::x(0), scheduler_error)?;
@@ -1750,9 +1765,11 @@ fn emit_nif_fragments(
         encoder.cmp_imm(Gpr::x(9), TRAP_REASON, false)
     })?;
     code.b_cond(Cond::Ne, error)?;
-    // The BIF_TRAP macros set c_p->i, c_p->arity and c_p->current: context_switch_simplified
-    // continues at c_p->i.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:700-701 (emit_bif_nif_epilogue):
+    // BIF_TRAP sets c_p->i, c_p->arity and c_p->current; ARG3 receives c_p->i for the
+    // simplified context switch.
     code.emit(|encoder| {
+        encoder.ldr_uoff(ARG3, Gpr::x(21), PROCESS_I)?;
         encoder.mov_const(Gpr::x(17), context_switch as u64)?;
         encoder.br(Gpr::x(17))
     })?;

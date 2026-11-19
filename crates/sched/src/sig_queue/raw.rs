@@ -7,7 +7,7 @@
 
 use std::ptr::NonNull;
 
-use super::OwnedSignal;
+use super::{InSignal, OwnedSignal, SignalQueue};
 
 /// A signal node held outside any queue with its type erased, for the scheduler's pending
 /// signal slot, which is not generic (`esdp->pending_signal.sig`, erl_process.h:735).
@@ -47,6 +47,23 @@ impl HeldNode {
         // and this handle was its only owner.
         unsafe { OwnedSignal::from_raw(node.cast()) }
     }
+}
+
+/// Link a signal at `first` while retaining queue ownership and signal counts.
+// Port of erts/emulator/beam/erl_proc_sig_queue.c:367-382 (`save_delayed_nm_signal`), OTP-29.1.1.
+pub(super) fn push_front<T: InSignal>(queue: &mut SignalQueue<T>, signal: OwnedSignal<T>) {
+    let non_message = super::non_message_signal(&signal);
+    let node = signal.into_raw();
+    // SAFETY: the queue owns `node`, and `first` is either empty or the first node it owns.
+    unsafe {
+        (*node.as_ptr()).next = queue.first;
+        queue.first = Some(node);
+    }
+    if queue.last.is_none() {
+        queue.last = Some(node);
+    }
+    queue.len += 1;
+    queue.non_messages += usize::from(non_message);
 }
 
 impl Drop for HeldNode {

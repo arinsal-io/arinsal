@@ -134,9 +134,9 @@ fn function_arity_matches(function: Term, arity: Term) -> Option<bool> {
         return Some(false);
     };
     Some(
-        arity
-            .flatten()
-            .is_some_and(|arity| crate::natives::raw::fun_arity(function) == Some(arity)),
+        arity.flatten().is_some_and(|arity| {
+            crate::natives::raw::fun_arity(function) == Some(u32::from(arity))
+        }),
     )
 }
 

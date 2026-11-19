@@ -907,7 +907,7 @@ fn load_nif_rejects_a_function_missing_from_nifs_like_erts() {
 }
 
 #[test]
-fn load_errors_and_roundtrip_match_erts() {
+fn load_nif_errors_and_roundtrip_match_erts() {
     let Ok(erl) = RefErl::start() else {
         eprintln!("erl unavailable; skipping dynamic NIF differential test");
         return;

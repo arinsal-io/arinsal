@@ -25,11 +25,8 @@ impl Drop for TempDir {
 }
 
 fn otp_root() -> PathBuf {
-    std::env::var_os("ARINSAL_TEST_OTP_ROOT")
-        .or_else(|| std::env::var_os("ARINSAL_OTP_ROOT"))
-        .map(PathBuf::from)
-        .or_else(|| arinsal_args::discover_otp_root(&arinsal_args::ProcessEnv).map(PathBuf::from))
-        .expect("set ARINSAL_TEST_OTP_ROOT or put OTP 29.1.1 erl on PATH")
+    arinsal_difftest::reference::otp_root()
+        .expect("reference OTP is required; set ARINSAL_OTP_ROOT or put erl on PATH")
 }
 
 fn timeout_program() -> PathBuf {

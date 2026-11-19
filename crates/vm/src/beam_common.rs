@@ -193,7 +193,7 @@ pub extern "C" fn call_error_handler(
 pub(crate) fn call_error_handler_core(
     process: &mut Process,
     registers: &mut arinsal_beamasm::SchedulerRegisters,
-    mfa: (arinsal_term::Atom, arinsal_term::Atom, u8),
+    mfa: (arinsal_term::Atom, arinsal_term::Atom, u32),
     mfa_pointer: *const arinsal_term::ErtsCodeMfa,
     function: arinsal_term::Atom,
 ) -> usize {
@@ -220,7 +220,7 @@ pub(crate) fn call_error_handler_core(
         process.heap.abi.exc.freason = exc::EXC_UNDEF;
         return 0;
     };
-    let arity = usize::from(mfa.2);
+    let arity = mfa.2 as usize;
     if registers.x_reg_array.len() < arity
         || process
             .ensure_objv(arity.saturating_mul(2), &mut registers.x_reg_array[..arity])

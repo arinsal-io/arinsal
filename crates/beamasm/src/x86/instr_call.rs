@@ -12,7 +12,7 @@ pub use super::rt::{apply, fixed_apply, save_calls};
 use crate::common::args::ArgVal;
 
 // Port of the `apply3_mfa` initializer in instr_call.cpp:145, OTP-29.1.1.
-const fn mfa(function: arinsal_term::Atom, arity: u64) -> ErtsCodeMfa {
+const fn mfa(function: arinsal_term::Atom, arity: usize) -> ErtsCodeMfa {
     ErtsCodeMfa {
         module: Term::atom(atoms::ERLANG).word(),
         function: Term::atom(function).word(),

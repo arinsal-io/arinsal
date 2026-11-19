@@ -4,19 +4,25 @@
 use arinsal_a64::enc::Gpr;
 use arinsal_beam::BeamFile;
 use arinsal_beamasm::{
-    ExitReason, ProcessHeader, SchedulerRegisters, module::BeamModuleAssembler, rt::read_heap_word,
+    ExitReason, ProcessHeader, SchedulerRegisters, module::BeamModuleAssembler,
+    raise_frag::RaiseFragments, rt::read_heap_word, yield_frag::YieldFragments,
 };
 use arinsal_beamjit::{ModuleEnv, compile_module_with_env};
 use similar_asserts::assert_eq;
 use std::{
     fs,
     process::Command,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Instant,
 };
 
 static MAP_LOOKUP_RESULT: AtomicU64 = AtomicU64::new(0);
 static MAP_LOOKUP_KEY: AtomicU64 = AtomicU64::new(0);
+static YIELD_FRAGMENTS: OnceLock<YieldFragments> = OnceLock::new();
+static RAISE_FRAGMENTS: OnceLock<RaiseFragments> = OnceLock::new();
 
 extern "C" fn build_stacktrace_for_compile(_header: *mut ProcessHeader, _trace: u64) -> u64 {
     0
@@ -31,9 +37,35 @@ extern "C" fn raw_raise_for_compile(
     1
 }
 
+extern "C" fn raise_class_for_compile(_header: *mut ProcessHeader, _trace: u64) {}
+
 struct TestEnv;
 
 impl ModuleEnv for TestEnv {
+    fn yield_fragments(&self) -> (usize, usize, usize) {
+        let fragments = YIELD_FRAGMENTS.get_or_init(|| YieldFragments::new().unwrap());
+        (
+            fragments.dispatch_return(),
+            fragments.i_test_yield_shared(),
+            fragments.context_switch(),
+        )
+    }
+
+    fn raise_fragments(&self) -> (usize, usize, usize) {
+        let fragments = RAISE_FRAGMENTS.get_or_init(|| {
+            RaiseFragments::new(
+                exception_resolver as *const () as usize,
+                raise_class_for_compile as *const () as usize,
+            )
+            .unwrap()
+        });
+        (
+            fragments.raise_shared(),
+            fragments.raise_exception_shared(),
+            fragments.func_info_shared(),
+        )
+    }
+
     fn raise_class_helper(&self) -> usize {
         1
     }
@@ -297,8 +329,8 @@ extern "C" fn bs_create_bin_put(
 
 extern "C" fn exception_resolver(
     _process: *mut ProcessHeader,
+    _pc: u64,
     _registers: *mut u64,
-    _stack: *mut u64,
     _bif_info: u64,
 ) -> usize {
     0

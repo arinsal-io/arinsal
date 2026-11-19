@@ -458,7 +458,7 @@ pub struct BeamGlobalAssembler {
 }
 
 /// `ErtsCodeMFA` a global fragment raises with (`static ErtsCodeMFA mfa` in its emitter).
-const fn bif_mfa(function: arinsal_term::Atom, arity: u64) -> ErtsCodeMfa {
+const fn bif_mfa(function: arinsal_term::Atom, arity: usize) -> ErtsCodeMfa {
     ErtsCodeMfa {
         module: Term::atom(atoms::ERLANG).word(),
         function: Term::atom(function).word(),

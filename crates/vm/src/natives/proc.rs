@@ -1483,7 +1483,7 @@ fn process_info_item_current_location(
         let source = native.flatten().or_else(|| {
             let pc = native_position(process)?;
             crate::native_bridge::with_native_function_at(pc, |f| {
-                (f.module == module_name && f.function == function && f.arity == arity)
+                (f.module == module_name && f.function == function && u32::from(f.arity) == arity)
                     .then(|| {
                         f.line_at(pc)
                             .map(|(file, line)| (file.to_owned(), u64::from(line)))
@@ -1837,13 +1837,7 @@ pub(crate) fn fun_info_arity_light(
     if *what != Term::atom(arinsal_term::atoms::ARITY) {
         return None;
     }
-    let arity = {
-        let view = crate::raw::beam_common_ffi::fun_ref(*fun)?;
-        match view {
-            arinsal_term::FunRef::Local { entry, .. } => entry.arity,
-            arinsal_term::FunRef::Export { entry } => entry.arity(),
-        }
-    };
+    let arity = u32::from(fun.fun_arity()?);
     // Port of erts/emulator/beam/erl_bif_info.c:3976 (`HAlloc(p, 3)`), OTP-29.1.1:
     // release the inspected fun before a possible collection and reserve the result tuple.
     if let Err(error) = process.ensure_entry(3, &mut []) {
@@ -2008,9 +2002,9 @@ pub(crate) fn native_call_site(
 
 // Port of erts/emulator/beam/erl_bif_info.c (`process_info_aux`, ERTS_PI_IX_INITIAL_CALL),
 // OTP-29.1.1: the spawn entry stores module and function atoms, so no name interning is needed.
-fn initial_call_atoms(vm: Option<&Vm>, process: &Process) -> Result<(Atom, Atom, u8), VmError> {
+fn initial_call_atoms(vm: Option<&Vm>, process: &Process) -> Result<(Atom, Atom, u32), VmError> {
     if let Some((module, function, arity)) = process.initial_mfa {
-        return Ok((module, function, arity));
+        return Ok((module, function, u32::from(arity)));
     }
     resolve_mfa_atoms(vm, process)
 }
@@ -2018,12 +2012,12 @@ fn initial_call_atoms(vm: Option<&Vm>, process: &Process) -> Result<(Atom, Atom,
 // Port of erts/emulator/beam/erl_bif_info.c (`current_function`), OTP-29.1.1. The regular
 // interpreter and native paths already expose MFA atoms; only synthetic trap metadata needs
 // interning because Arinsal currently stores those exceptional names as text.
-fn resolve_mfa_atoms(vm: Option<&Vm>, process: &Process) -> Result<(Atom, Atom, u8), VmError> {
+fn resolve_mfa_atoms(vm: Option<&Vm>, process: &Process) -> Result<(Atom, Atom, u32), VmError> {
     let intern = |name: &str| global_atoms().intern(name).map_err(|_| badarg());
     if let Some((module, function, arity)) =
         process.cold.as_ref().and_then(|cold| cold.dirty_bif_mfa)
     {
-        return Ok((intern(module)?, intern(function)?, arity));
+        return Ok((intern(module)?, intern(function)?, u32::from(arity)));
     }
     if let Some((module, rest)) = process
         .cold
@@ -2031,17 +2025,25 @@ fn resolve_mfa_atoms(vm: Option<&Vm>, process: &Process) -> Result<(Atom, Atom, 
         .and_then(|cold| cold.bif_trap.as_ref())
         .and_then(|pending| pending.continuation.split_once(':'))
         && let Some((function, arity)) = rest.rsplit_once('/')
-        && let Ok(arity) = arity.parse::<u8>()
+        && let Ok(arity) = arity.parse::<u32>()
     {
         return Ok((intern(module)?, intern(function)?, arity));
     }
     if let Some((function, _)) = native_call_site(process) {
-        return Ok((function.module_atom, function.function_atom, function.arity));
+        return Ok((
+            function.module_atom,
+            function.function_atom,
+            u32::from(function.arity),
+        ));
     }
     if let Some(function) =
         native_position(process).and_then(crate::native_bridge::native_function_at)
     {
-        return Ok((function.module_atom, function.function_atom, function.arity));
+        return Ok((
+            function.module_atom,
+            function.function_atom,
+            u32::from(function.arity),
+        ));
     }
     // Port of erts/emulator/beam/erl_process.c:12614 (`p->current = &p->u.initial`), OTP-29.1.1:
     // a process that has not run yet is in its initial function.
@@ -2056,11 +2058,11 @@ fn native_position(process: &Process) -> Option<usize> {
         .or_else(|| Some(process.heap.abi.i as usize).filter(|&pc| pc != 0))
 }
 
-fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8), VmError> {
+fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u32), VmError> {
     if let Some((module, function, arity)) =
         process.cold.as_ref().and_then(|cold| cold.dirty_bif_mfa)
     {
-        return Ok((module.to_owned(), function.to_owned(), arity));
+        return Ok((module.to_owned(), function.to_owned(), u32::from(arity)));
     }
     // A trapped BIF reports its continuation export, as erts does.
     if let Some((module, rest)) = process
@@ -2069,7 +2071,7 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
         .and_then(|cold| cold.bif_trap.as_ref())
         .and_then(|pending| pending.continuation.split_once(':'))
         && let Some((function, arity)) = rest.rsplit_once('/')
-        && let Ok(arity) = arity.parse::<u8>()
+        && let Ok(arity) = arity.parse::<u32>()
     {
         return Ok((module.to_owned(), function.to_owned(), arity));
     }
@@ -2077,7 +2079,7 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
         return Ok((
             function.module.to_owned(),
             function.function.to_owned(),
-            function.arity,
+            u32::from(function.arity),
         ));
     }
     if let Some(function) =
@@ -2086,7 +2088,7 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
         return Ok((
             function.module.to_owned(),
             function.function.to_owned(),
-            function.arity,
+            u32::from(function.arity),
         ));
     }
     // erl_process.c:12614 (`p->current = &p->u.initial`): a process that has not run yet.
@@ -5554,11 +5556,14 @@ fn processes_next(
 fn fun_info_mfa(process: &mut Process, fun: Term) -> Result<Term, VmError> {
     // SAFETY: The fun stays rooted in the caller heap for this BIF.
     let view = unsafe { fun.fun_ref() }.ok_or_else(badarg)?;
+    // Port of erts/emulator/beam/erl_bif_info.c:4011 (`fun_info_mfa_1`):
+    // the reported arity comes from the fun header's arity byte.
+    let fun_arity = i64::from(fun.fun_arity().ok_or_else(badarg)?);
     let (module, name, arity) = match view {
         FunRef::Export { entry } => (
             Term::atom(entry.module()),
             Term::atom(entry.function()),
-            i64::from(entry.arity()),
+            fun_arity,
         ),
         FunRef::Local { entry, .. } => {
             let module_name = global_atoms()
@@ -5584,7 +5589,7 @@ fn fun_info_mfa(process: &mut Process, fun: Term) -> Result<Term, VmError> {
                 .and_then(|name| global_atoms().intern(&name).ok())
                 .map(Term::atom)
                 .unwrap_or(Term::NIL);
-            (Term::atom(entry.module), name, i64::from(entry.arity))
+            (Term::atom(entry.module), name, fun_arity)
         }
     };
     let arity = Term::small(arity).ok_or_else(badarg)?;

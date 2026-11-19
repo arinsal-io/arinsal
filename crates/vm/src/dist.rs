@@ -489,11 +489,22 @@ fn setup_connection_distctrl(
     if entry.dist.is_some() {
         return badarg_res;
     }
+    // ERTS_PROC_GET_DIST_ENTRY(c_p): net_kernel (erts_this_dist_entry) or a controller.
+    if c_p
+        .cold
+        .as_deref()
+        .is_some_and(|cold| cold.psd_dist_entry.is_some())
+    {
+        return badarg_res;
+    }
+    c_p.heap
+        .set_flag(arinsal_term::pflags::F_DISTRIBUTION, true);
+    c_p.cold_mut().psd_dist_entry = Some(Arc::clone(&scdcp.dep));
     if let Some(redsp) = redsp {
         *redsp = 5;
     }
     let ctrlr = ctx.pid().to_term().ok_or_else(badarg)?;
-    if !setup_connection_epiloge_rwunlock(
+    let connected = setup_connection_epiloge_rwunlock(
         c_p,
         ctx,
         entry,
@@ -504,7 +515,12 @@ fn setup_connection_distctrl(
         scdcp.creation,
         scdcp.setup_pid,
         busy_limit,
-    )? {
+    );
+    if !matches!(connected, Ok(true)) {
+        c_p.heap
+            .set_flag(arinsal_term::pflags::F_DISTRIBUTION, false);
+        c_p.cold_mut().psd_dist_entry = None;
+        connected?;
         return badarg_res;
     }
     let Some(bpp) = bpp else {
@@ -567,13 +583,19 @@ fn get_data(
         let Some(mut packet) = state.output.pop_front() else {
             return Ok(None);
         };
-        state.pending_bytes = state.pending_bytes.saturating_sub(packet.size() as u64);
+        let obufsize = packet.size() as u64;
         let finalize = erts_encode_ext_dist_header_finalize(
             &mut packet,
             &mut state.outgoing_cache,
             state.flags,
             &mut reds,
         );
+        if reds < 0 {
+            // Finalize needs to be restarted: the buffer stays first in the queue.
+            state.output.push_front(packet);
+            return Ok(Some(None));
+        }
+        state.pending_bytes = state.pending_bytes.saturating_sub(obufsize);
         state.written = state.written.saturating_add(1);
         let resume = if state.busy && state.pending_bytes < state.busy_limit / 2 {
             state.busy = false;
@@ -581,16 +603,25 @@ fn get_data(
         } else {
             Vec::new()
         };
-        Ok(Some((
+        Ok(Some(Some((
             packet,
             state.get_size,
             finalize,
             state.handle,
             resume,
-        )))
+        ))))
     })?;
-    let Some((packet, sized, finalize, conn_handle, resume)) = bytes else {
+    let Some(bytes) = bytes else {
         return Ok(Term::atom(arinsal_term::atoms::NONE));
+    };
+    let Some((packet, sized, finalize, conn_handle, resume)) = bytes else {
+        // ERTS_BIF_YIELD1(BIF_TRAP_EXPORT(BIF_dist_ctrl_get_data_1), BIF_P, BIF_ARG_1).
+        crate::bif_traps::vbump_all_reds(process);
+        return Err(crate::natives::erl_bif_lists::bif_trap(
+            process,
+            "erlang:dist_ctrl_get_data/1",
+            vec![handle],
+        ));
     };
     let runtime = process.runtime.ok_or_else(badarg)?;
     if let DistHeaderFinalize::SpawnNotSupported(ctl) = finalize {
@@ -605,18 +636,8 @@ fn get_data(
     let size = packet.size();
     // The buffer's I/O vector as a list of binaries referencing its Binaries
     // (erts_wrap_refc_bitstring), all in one HAlloc of `hsz` words; an empty buffer (a signal
-    // transcoded into a tick) is the empty I/O vector. The header rewritten for the wire is in
-    // a Binary of its own (erts rewrites it in place in the buffer's Binary).
-    let (header, iov) = packet.into_iov();
-    let mut elems = Vec::with_capacity(iov.len() + 1);
-    if !header.is_empty() {
-        let mut bin = arinsal_term::RefcBinary::new_uninit(header.len()).map_err(|_| badarg())?;
-        bin.bytes_mut_unique()
-            .ok_or_else(badarg)?
-            .copy_from_slice(&header);
-        elems.push(DistCtrlElem::Header(bin, header.len()));
-    }
-    elems.extend(iov.into_iter().map(DistCtrlElem::Iov));
+    // transcoded into a tick) is the empty I/O vector.
+    let elems = packet.into_iov();
     let mut hsz = (2 + ERL_REFC_BITS_SIZE) * elems.len();
     if sized {
         // 2-tuple; the size is a small.
@@ -628,12 +649,9 @@ fn get_data(
     let mut parts = Vec::with_capacity(elems.len());
     for elem in elems {
         parts.push(
-            match elem {
-                DistCtrlElem::Header(bin, len) => builder.refc_binary(bin, len * 8),
-                DistCtrlElem::Iov(iov) => {
-                    let (bin, offset, len) = iov.into_parts();
-                    builder.wrap_refc_bitstring(bin, offset, len)
-                }
+            {
+                let (bin, offset, len) = elem.into_parts();
+                builder.wrap_refc_bitstring(bin, offset, len)
             }
             .map_err(|_| badarg())?,
         );
@@ -649,12 +667,6 @@ fn get_data(
 
 /// Reductions per process resumed when a dist queue drains (dist.c).
 const ERTS_PORT_REDS_DIST_CMD_RESUMED: i64 = 5;
-
-/// One element of the I/O vector `dist_ctrl_get_data` returns.
-enum DistCtrlElem {
-    Header(arinsal_term::RefcBinary, usize),
-    Iov(arinsal_external::dist::DistIov),
-}
 
 /// `ERL_REFC_BITS_SIZE` (erl_bits.h): the heap words of a BinRef and its SubBits.
 const ERL_REFC_BITS_SIZE: usize = 3 + 5;
@@ -1674,26 +1686,32 @@ pub(crate) fn net_kernel_exited(
     } else {
         "net_kernel_terminated"
     };
-    let (ports, pending) = {
+    // The controllers of the visible and hidden (connected or exiting) entries.
+    let (dist_ctrl, pending) = {
         let tables = node_tables::lock();
-        let mut ports = Vec::new();
+        let mut dist_ctrl = Vec::new();
         let mut pending = Vec::new();
         for (name, dep) in &tables.entries {
             let entry = dep.lock();
-            if let Some(port_id) = entry.dist.as_ref().and_then(|state| state.port_id)
-                && entry.state == node_tables::ConnState::Connected
-            {
-                ports.push(port_id);
-            } else if entry.state == node_tables::ConnState::Pending {
+            if entry.state == node_tables::ConnState::Pending {
                 pending.push((name.clone(), entry.connection_id, entry.entry_ref));
+            } else if entry.connected
+                && let Some(state) = entry.dist.as_ref()
+            {
+                dist_ctrl.push((state.port_id, state.owner));
             }
         }
-        (ports, pending)
+        (dist_ctrl, pending)
     };
     let reason_term = Term::atom(global_atoms().intern(nd_reason).map_err(|_| badarg())?);
-    for port_id in ports {
-        if let Some(port) = Term::port(port_id) {
-            crate::port::exit_port(process, port, reason_term)?;
+    for cid in dist_ctrl {
+        match cid {
+            (None, pid) => schedule_kill_dist_ctrl_proc(runtime, pid)?,
+            (Some(port_id), _) => {
+                if let Some(port) = Term::port(port_id) {
+                    crate::port::exit_port(process, port, reason_term)?;
+                }
+            }
         }
     }
     for (name, conn_id, entry_ref) in pending {
@@ -1831,29 +1849,90 @@ fn reassemble_fragment(
     }
 }
 
-/// Tear down a port-controlled connection after the peer socket closes.
-pub(crate) fn port_connection_closed(
-    runtime: &crate::process::Runtime,
-    port: &crate::port::PortHandle,
+/// `erts_do_net_exits(dep, reason)` for the exit of an `F_DISTRIBUTION` process: net_kernel
+/// (`dep == erts_this_dist_entry`) takes the node down, a process controller its
+/// connection.
+// Port of erts/emulator/beam/dist.c (erts_do_net_exits), OTP-29.1.1.
+pub(crate) fn erts_do_net_exits(
+    process: &mut Process,
+    runtime: &'static crate::process::Runtime,
+    dep: &Arc<node_tables::DistEntry>,
+    pid: Pid,
+    reason: Term,
 ) -> Result<(), VmError> {
-    let port_id = port.id();
-    // Port of erts/emulator/beam/io.c:3911-3917 (terminate_port): the port drops its
-    // `ERTS_PRTSD_DIST_ENTRY` reference.
-    let Some(dep) = port.set_dist_entry(None) else {
-        return Ok(());
+    if node_tables::erts_this_dist_entry().is_some_and(|this| Arc::ptr_eq(&this, dep)) {
+        net_kernel_exited(process, runtime, reason)
+    } else {
+        erts_do_net_exits_ctrl(
+            runtime,
+            dep,
+            crate::natives::erts_debug::DistCid::Pid(pid),
+            reason,
+        )
+    }
+}
+
+/// `erts_do_net_exits(dep, reason)` called from a distribution controller (port or
+/// process) that exits: the connection goes down with `reason` (`{shutdown, R}` of a
+/// process controller unwrapped to `R`), links and monitors over it are taken down, the
+/// suspended senders resumed and the node monitors told `nodedown` (`connection_closed` for
+/// `normal`).
+// Port of erts/emulator/beam/dist.c:922 (erts_do_net_exits, "Call from distribution
+// controller (port/process)"), OTP-29.1.1.
+pub(crate) fn erts_do_net_exits_ctrl(
+    runtime: &crate::process::Runtime,
+    dep: &Arc<node_tables::DistEntry>,
+    cid: crate::natives::erts_debug::DistCid,
+    mut reason: Term,
+) -> Result<(), VmError> {
+    use crate::natives::erts_debug::DistCid;
+    if matches!(cid, DistCid::Pid(_))
+        && let Ok(tpl) = arinsal_term::raw::Tuple::try_from(reason)
+        && tpl.arity() == 2
+        && tpl.get(0) == Some(Term::atom(arinsal_term::atoms::SHUTDOWN))
+        && let Some(inner) = tpl.get(1)
+    {
+        // Supervised distribution controllers may exit "normally" with {shutdown,Reason}.
+        reason = inner;
+    }
+    let nodedown_reason = if reason == Term::atom(arinsal_term::atoms::NORMAL) {
+        OwnedTerm::atom("connection_closed")
+    } else {
+        owned(reason)?
     };
     let node = dep.sysname.clone();
+    if let DistCid::Port(port_id) = cid {
+        // A scheduled dist command task is aborted (erts_port_task_abort(&dep->dist_cmd));
+        // `dist_cmd_scheduled` stays set so none is scheduled again.
+        let task = {
+            let mut entry = dep.lock();
+            entry
+                .dist
+                .as_mut()
+                .filter(|state| state.port_id == Some(port_id))
+                .and_then(|state| {
+                    state.flushing_output = true;
+                    state.dist_cmd.take()
+                })
+        };
+        if let Some(task) = task
+            && task.is_scheduled()
+            && let Some(drv) = runtime.ports.get(port_id).and_then(|port| port.drv_port())
+        {
+            drv.abort_task(&task);
+        }
+    }
     let (watchers, node_events, mld, suspendees) = {
         let mut tables = node_tables::lock();
         let (connection_id, visible, suspendees) = {
             let mut entry = dep.lock();
             // Port of erts/emulator/beam/dist.c:3599-3611 (discard output from an obsolete
-            // connection), OTP-29.1.1.
-            if !entry
-                .dist
-                .as_ref()
-                .is_some_and(|state| state.port_id == Some(port_id))
-            {
+            // connection), OTP-29.1.1: only the controller of the current connection.
+            let current = entry.dist.as_ref().is_some_and(|state| match cid {
+                DistCid::Port(port_id) => state.port_id == Some(port_id),
+                DistCid::Pid(pid) => state.port_id.is_none() && state.owner == pid,
+            });
+            if !current {
                 return Ok(());
             }
             (
@@ -1869,7 +1948,7 @@ pub(crate) fn port_connection_closed(
             &node,
             connection_id,
             visible,
-            Some("connection_closed"),
+            Some(nodedown_reason),
         );
         (watchers, events, mld, suspendees)
     };
@@ -1883,38 +1962,57 @@ pub(crate) fn port_connection_closed(
     Ok(())
 }
 
-/// Kill a connected distribution entry that has no port controller.
-/// Port of erts/emulator/beam/dist.c:4788-4811 (`erts_kill_dist_connection`), OTP-29.1.1.
+/// `erts_kill_dist_connection(dep, conn_id)`: a connected entry of that connection goes
+/// `EXITING`; a port controller gets the dist command task, which terminates the port
+/// (`killed`) and so runs `erts_do_net_exits`.
+// Port of erts/emulator/beam/dist.c (erts_kill_dist_connection, kill_connection),
+// OTP-29.1.1.
 pub(crate) fn kill_connection(
     runtime: &crate::process::Runtime,
     node: &str,
     connection_id: u32,
 ) -> Result<bool, VmError> {
-    let (watchers, node_events, mld, suspendees) = {
-        let mut tables = node_tables::lock();
-        let Some(mut entry) = tables.entries.get(node).map(|dep| dep.lock()) else {
-            return Ok(false);
-        };
-        if !entry.connected || entry.connection_id != connection_id {
-            return Ok(false);
-        }
-        let visible = entry.visible;
-        let suspendees = get_suspended_on_de(&mut entry);
-        drop(entry);
-        let mld = tables.take_mld(node);
-        let watchers = tables.disconnect(node);
-        let events =
-            tables.nodes_monitor_events("nodedown", node, connection_id, visible, Some("killed"));
-        (watchers, events, mld, suspendees)
+    let tables = node_tables::lock();
+    let Some(mut entry) = tables.entries.get(node).map(|dep| dep.lock()) else {
+        return Ok(false);
     };
-    elink::links_connection_down(runtime, mld.clone());
-    emon::monitors_connection_down(runtime, mld.as_ref());
-    resume_dist_senders(runtime, suspendees);
-    notify_node_watchers(runtime, node, watchers)?;
-    send_nodes_monitor_events(runtime.scheduler()?, node_events)?;
-    // Port of erts/emulator/beam/dist.c:1114 (erts_do_net_exits: dec_no_nodes).
-    node_tables::dec_no_nodes(runtime);
+    if !entry.connected
+        || entry.connection_id != connection_id
+        || entry.state != node_tables::ConnState::Connected
+    {
+        return Ok(false);
+    }
+    entry.state = node_tables::ConnState::Exiting;
+    let cid = entry
+        .dist
+        .as_ref()
+        .map(|state| (state.port_id, state.owner));
+    drop(entry);
+    drop(tables);
+    match cid {
+        Some((Some(port_id), _)) => flush_port_output(runtime, port_id)?,
+        Some((None, pid)) => schedule_kill_dist_ctrl_proc(runtime, pid)?,
+        None => {}
+    }
     Ok(true)
+}
+
+/// Sends the process controller `pid` a `kill` exit signal from the init process; its exit
+/// then runs `erts_do_net_exits` for the connection.
+// Port of erts/emulator/beam/dist.c:897-917 (kill_dist_ctrl_proc,
+// schedule_kill_dist_ctrl_proc), OTP-29.1.1.
+fn schedule_kill_dist_ctrl_proc(
+    runtime: &crate::process::Runtime,
+    pid: Pid,
+) -> Result<(), VmError> {
+    let Some(&init) = runtime.init_process_id.get() else {
+        return Ok(());
+    };
+    let message = Message::copy_from(Term::atom(arinsal_term::atoms::KILL))?;
+    let _ = runtime
+        .scheduler()?
+        .signal(init, pid, Signal::Exit(Box::new(message)));
+    Ok(())
 }
 
 fn notify_node_watchers(
@@ -3886,11 +3984,16 @@ pub(crate) fn dsend_continue(
 /// Schedule the dist command task that drains the entry's queued buffers into its port.
 ///
 /// Port of erts/emulator/beam/dist.c (erts_schedule_dist_command): the output goes out in
-/// a `ERTS_PORT_TASK_DIST_CMD` task of the connection's port, at most one scheduled at a time.
+/// a `ERTS_PORT_TASK_DIST_CMD` task of the connection's port, at most one scheduled at a time
+/// (`dep->dist_cmd_scheduled`, handle in `dep->dist_cmd`). An exiting entry gets the task to
+/// terminate the port.
 fn flush_port_output(runtime: &crate::process::Runtime, port_id: u64) -> Result<(), VmError> {
+    let dep = node_tables::port_dist_entry(runtime, port_id);
     let claimed = {
-        let dep = node_tables::port_dist_entry(runtime, port_id);
         let mut entry = dep.as_ref().map(|dep| dep.lock());
+        let exiting = entry
+            .as_ref()
+            .is_some_and(|entry| entry.state == node_tables::ConnState::Exiting);
         let Some(state) = entry
             .as_mut()
             .and_then(|entry| entry.dist.as_mut())
@@ -3898,7 +4001,9 @@ fn flush_port_output(runtime: &crate::process::Runtime, port_id: u64) -> Result<
         else {
             return Ok(());
         };
-        if state.port_busy || state.flushing_output || state.output.is_empty() {
+        let idle =
+            state.port_busy || (state.output.is_empty() && state.finalized_out_queue.is_empty());
+        if state.flushing_output || (idle && !exiting) {
             false
         } else {
             state.flushing_output = true;
@@ -3918,14 +4023,24 @@ fn flush_port_output(runtime: &crate::process::Runtime, port_id: u64) -> Result<
         dist_cmd_done(runtime, port_id);
         return Ok(());
     };
-    drv.schedule_dist_cmd(Box::new(move |op| {
+    let task = drv.schedule_dist_cmd(Box::new(move |op, initial_reds| {
         if op == arinsal_drv::port_task::SigOp::Exec {
-            dist_cmd(task_runtime, port_id)
+            dist_cmd(task_runtime, port_id, initial_reds)
         } else {
             dist_cmd_done(task_runtime, port_id);
             0
         }
     }));
+    if let Some(task) = task
+        && let Some(dep) = dep
+        && let Some(state) = dep
+            .lock()
+            .dist
+            .as_mut()
+            .filter(|state| state.port_id == Some(port_id) && state.flushing_output)
+    {
+        state.dist_cmd = Some(task);
+    }
     Ok(())
 }
 
@@ -3939,119 +4054,234 @@ fn dist_cmd_done(runtime: &crate::process::Runtime, port_id: u64) {
             .filter(|state| state.port_id == Some(port_id))
     {
         state.flushing_output = false;
+        state.dist_cmd = None;
     }
 }
 
-/// Packets one dist command task writes before it yields the scheduler.
-const DIST_CMD_PACKETS: usize = 64;
+/// Reductions of `erts_dist_command` (dist.c).
+const ERTS_PORT_REDS_DIST_CMD_START: i64 = 5;
+const ERTS_PORT_REDS_DIST_CMD_EXIT: i64 = 200;
+const ERTS_PORT_REDS_MASK: i64 = 0x003f_ffff_ffff_ffff;
 
-/// Port of erts/emulator/beam/dist.c (erts_dist_command, dist_port_commandv) and dist.c:4161-4178
-/// (drain queue and resume senders), OTP-29.1.1. Runs in the connection port's task with the
-/// port locked; returns its reductions.
-fn dist_cmd(runtime: &crate::process::Runtime, port_id: u64) -> i32 {
-    let mut written = 0usize;
-    loop {
-        if written >= DIST_CMD_PACKETS {
-            // Out of reductions: stay scheduled by queueing the next slice.
-            let again = node_tables::port_dist_entry(runtime, port_id).is_some_and(|dep| {
-                dep.lock()
-                    .dist
-                    .as_ref()
-                    .filter(|state| state.port_id == Some(port_id))
-                    .is_some_and(|state| !state.port_busy && !state.output.is_empty())
-            });
-            dist_cmd_done(runtime, port_id);
-            if again {
-                let _ = flush_port_output(runtime, port_id);
-            }
-            break;
+/// `ERTS_PORT_REDS_DIST_CMD_DATA(SZ)`: one reduction per KiB written, at least one.
+// Port of erts/emulator/beam/dist.c (ERTS_PORT_REDS_DIST_CMD_DATA), OTP-29.1.1.
+fn erts_port_reds_dist_cmd_data(size: usize) -> i64 {
+    if size < 1 << 10 {
+        1
+    } else {
+        ((size as i64) >> 10) & ERTS_PORT_REDS_MASK
+    }
+}
+
+/// `dist_port_commandv`: one output buffer written to the connection's port as its I/O
+/// vector, the binaries referenced. Returns the bytes written, whether the port is busy
+/// now (`ERTS_PTS_FLG_BUSY_PORT`) and whether it is gone (`ERTS_PTS_FLG_EXIT`).
+// Port of erts/emulator/beam/dist.c (dist_port_commandv), OTP-29.1.1.
+fn dist_port_commandv(
+    runtime: &crate::process::Runtime,
+    port_id: u64,
+    obuf: ErtsDistOutputBuf,
+) -> (usize, bool, bool) {
+    let size = obuf.size();
+    let mut eiov = arinsal_drv::CommandVector::new();
+    eiov.extend(obuf.into_iov().into_iter().map(|iov| {
+        let (bin, offset, len) = iov.into_parts();
+        arinsal_drv::CommandPiece::Refc(
+            arinsal_drv::RefcSegment::new(bin, offset, len)
+                .expect("an I/O vector element lies inside its Binary"),
+        )
+    }));
+    let sock = runtime
+        .ports
+        .get(port_id)
+        .and_then(|handle| handle.tcp_driver_data());
+    match sock.map(|sock| crate::inet_drv::dist_outputv(&sock, eiov)) {
+        Some(Ok(busy)) => (size, busy, false),
+        _ => (size, false, true),
+    }
+}
+
+/// `erts_dist_command(prt, initial_reds)`: the connection port's task. An exiting entry
+/// terminates the port (`killed`). Otherwise both queues are taken: the finalized queue is
+/// written first unless the port is busy; the out queue is finalized and written buffer by
+/// buffer, and when the port is (or becomes) busy only finalized into the finalized queue.
+/// The task is scheduled again when the reductions run out (`reds <= 0`) with buffers left;
+/// when everything queued has been written and the port is not busy, senders suspended on
+/// the busy entry are resumed. Returns the reductions used, `initial_reds - reds`.
+// Port of erts/emulator/beam/dist.c (erts_dist_command), OTP-29.1.1.
+fn dist_cmd(runtime: &crate::process::Runtime, port_id: u64, initial_reds: i32) -> i32 {
+    let initial = i64::from(initial_reds);
+    let mut reds = initial - ERTS_PORT_REDS_DIST_CMD_START;
+    let ret = |reds: i64| {
+        (initial - reds.max(i64::from(i32::MIN / 2))).clamp(0, i64::from(i32::MAX)) as i32
+    };
+    let Some(dep) = node_tables::port_dist_entry(runtime, port_id) else {
+        return ret(reds);
+    };
+    let (mut oq, mut foq, flags, conn_handle, mut port_busy) = {
+        let mut entry = dep.lock();
+        let exiting = entry.state == node_tables::ConnState::Exiting;
+        let Some(state) = entry
+            .dist
+            .as_mut()
+            .filter(|state| state.port_id == Some(port_id))
+        else {
+            return ret(reds);
+        };
+        // erts_atomic_set_mb(&dep->dist_cmd_scheduled, 0).
+        state.flushing_output = false;
+        state.dist_cmd = None;
+        if exiting {
+            drop(entry);
+            crate::port::driver_port_exit(
+                runtime,
+                port_id,
+                Term::atom(arinsal_term::atoms::KILLED),
+            );
+            reds -= ERTS_PORT_REDS_DIST_CMD_EXIT;
+            return ret(reds);
         }
-        let packet = {
-            let dep = node_tables::port_dist_entry(runtime, port_id);
-            let mut entry = dep.as_ref().map(|dep| dep.lock());
-            let Some(state) = entry
-                .as_mut()
-                .and_then(|entry| entry.dist.as_mut())
-                .filter(|state| state.port_id == Some(port_id))
-            else {
-                return 0;
+        (
+            std::mem::take(&mut state.output),
+            std::mem::take(&mut state.finalized_out_queue),
+            state.flags,
+            state.handle,
+            state.port_busy,
+        )
+    };
+    // `obufsize`: bytes removed from the queues (add_obuf_sizes / subtract_obuf_sizes
+    // around a finalize that changes a buffer's size), subtracted from the queue size at
+    // the end.
+    let mut obufsize = 0i64;
+    let mut exited = false;
+    // Finalizes one buffer with the connection's output cache; `false` when finalize needs to
+    // be restarted (`reds < 0`).
+    let finalize = |ob: &mut ErtsDistOutputBuf, reds: &mut i64| -> bool {
+        let result = {
+            let mut entry = dep.lock();
+            let Some(state) = entry.dist.as_mut() else {
+                return true;
             };
-            if state.port_busy || state.output.is_empty() {
-                state.flushing_output = false;
-                None
-            } else {
-                // erts_dist_command: erts_encode_ext_dist_header_finalize on the buffer it
-                // is about to write.
-                state.output.pop_front().map(|mut packet| {
-                    let queued = packet.size();
-                    // dist_cmd counts its reductions per packet, not erts_dist_command's.
-                    let finalize = erts_encode_ext_dist_header_finalize(
-                        &mut packet,
-                        &mut state.outgoing_cache,
-                        state.flags,
-                        &mut 0,
-                    );
-                    (packet, queued, finalize, state.handle)
-                })
-            }
+            erts_encode_ext_dist_header_finalize(ob, &mut state.outgoing_cache, flags, reds)
         };
-        let Some((packet, queued, finalize, conn_handle)) = packet else {
-            break;
-        };
-        if let DistHeaderFinalize::SpawnNotSupported(ctl) = finalize {
+        if let DistHeaderFinalize::SpawnNotSupported(ctl) = result {
             transcode_spawn_notsup(runtime, conn_handle, &ctl);
         }
-        let sock = {
-            runtime
-                .ports
-                .get(port_id)
-                .and_then(|handle| handle.tcp_driver_data())
-        };
-        // dist_port_commandv: the buffer's I/O vector, its binaries referenced.
-        let (header, iov) = packet.into_iov();
-        let mut eiov = arinsal_drv::CommandVector::new();
-        if !header.is_empty() {
-            eiov.push(arinsal_drv::CommandPiece::Bytes(header));
+        *reds >= 0
+    };
+    let mut preempted = reds < 0;
+    if !preempted && !port_busy && !foq.is_empty() {
+        let mut preempt = false;
+        while let Some(fob) = foq.pop_front() {
+            obufsize += fob.size() as i64;
+            let (size, busy, gone) = dist_port_commandv(runtime, port_id, fob);
+            reds -= erts_port_reds_dist_cmd_data(size);
+            port_busy = busy;
+            exited = gone;
+            preempt = reds < 0 || exited;
+            if port_busy || preempt {
+                break;
+            }
         }
-        eiov.extend(iov.into_iter().map(|iov| {
-            let (bin, offset, len) = iov.into_parts();
-            arinsal_drv::CommandPiece::Refc(
-                arinsal_drv::RefcSegment::new(bin, offset, len)
-                    .expect("an I/O vector element lies inside its Binary"),
-            )
-        }));
-        let port_busy = sock
-            .and_then(|sock| crate::inet_drv::dist_outputv(&sock, eiov).ok())
-            .unwrap_or_default();
-        written += 1;
-        let resumed = {
-            let dep = node_tables::port_dist_entry(runtime, port_id);
-            let mut entry = dep.as_ref().map(|dep| dep.lock());
-            let Some(state) = entry
-                .as_mut()
-                .and_then(|entry| entry.dist.as_mut())
-                .filter(|state| state.port_id == Some(port_id))
-            else {
-                return 0;
-            };
-            state.pending_bytes = state.pending_bytes.saturating_sub(queued as u64);
-            state.port_busy = port_busy;
-            if port_busy {
-                state.flushing_output = false;
+        preempted = preempt;
+    }
+    let mut resume = None;
+    if !preempted {
+        let mut finalize_only = port_busy;
+        if !port_busy {
+            let mut preempt = false;
+            while !preempt && let Some(mut ob) = oq.pop_front() {
+                let queued = ob.size() as i64;
+                if !finalize(&mut ob, &mut reds) {
+                    // Finalize needs to be restarted.
+                    oq.push_front(ob);
+                    preempt = true;
+                    break;
+                }
+                obufsize += queued;
+                let (size, busy, gone) = dist_port_commandv(runtime, port_id, ob);
+                reds -= erts_port_reds_dist_cmd_data(size);
+                port_busy = busy;
+                exited = gone;
+                preempt = reds <= 0 || exited;
+                if port_busy && !oq.is_empty() && !preempt {
+                    finalize_only = true;
+                    break;
+                }
             }
-            if state.busy && !state.port_busy && state.pending_bytes < state.busy_limit {
-                state.busy = false;
-                std::mem::take(&mut state.suspended_senders)
-            } else {
-                Vec::new()
+            if !finalize_only {
+                // Preempt if not all buffers have been handled.
+                if preempt && !oq.is_empty() {
+                    preempted = true;
+                } else {
+                    resume = Some(());
+                }
             }
-        };
-        resume_dist_senders(runtime, resumed);
-        if port_busy {
-            break;
+        }
+        if finalize_only && !oq.is_empty() {
+            // finalize_only: the buffers are finalized now and written when the port is no
+            // longer busy.
+            while let Some(mut ob) = oq.pop_front() {
+                obufsize += ob.size() as i64;
+                let restart = !finalize(&mut ob, &mut reds);
+                obufsize -= ob.size() as i64;
+                if restart {
+                    oq.push_front(ob);
+                    break;
+                }
+                foq.push_back(ob);
+            }
+            if reds <= 0 {
+                preempted = true;
+            }
         }
     }
-    i32::try_from(written * 40).unwrap_or(i32::MAX).min(4000)
+    let mut again = false;
+    let resumed = {
+        let mut entry = dep.lock();
+        match entry
+            .dist
+            .as_mut()
+            .filter(|state| state.port_id == Some(port_id))
+        {
+            None => Vec::new(),
+            Some(state) => {
+                state.pending_bytes = state.pending_bytes.saturating_add_signed(-obufsize);
+                state.port_busy = port_busy;
+                if preempted && exited {
+                    // The port died during the port command: the buffers taken go.
+                    oq.clear();
+                    foq.clear();
+                } else if preempted {
+                    // Unhandled buffers go back first in the out queue.
+                    while let Some(ob) = oq.pop_back() {
+                        state.output.push_front(ob);
+                    }
+                    again = true;
+                }
+                debug_assert!(state.finalized_out_queue.is_empty());
+                state.finalized_out_queue = std::mem::take(&mut foq);
+                // Everything that was buffered has been written: resume the senders of a
+                // busy entry once the queue is below the busy limit.
+                if resume.is_some()
+                    && state.busy
+                    && !port_busy
+                    && state.pending_bytes < state.busy_limit
+                {
+                    state.busy = false;
+                    std::mem::take(&mut state.suspended_senders)
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    };
+    let resumed = resume_dist_senders(runtime, resumed);
+    reds -= resumed as i64 * ERTS_PORT_REDS_DIST_CMD_RESUMED;
+    if again {
+        let _ = flush_port_output(runtime, port_id);
+    }
+    ret(reds)
 }
 
 /// Suspends a dist sender: the running process takes it on itself, another process receives it as a

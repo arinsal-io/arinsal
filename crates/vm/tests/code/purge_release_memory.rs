@@ -5,7 +5,7 @@ use arinsal_etf::OwnedTerm;
 
 const PROBE: &str = r#"
 -module(purge_release_probe).
--export([measure/2, measure_workers/2]).
+-export([measure/2, measure_workers/2, yield_workers/2]).
 
 measure(Bin, Count) ->
     ensure_purger(),
@@ -64,6 +64,38 @@ measure_workers(Bin, Count) ->
     wait_literal_collector(),
     settle_once(),
     {Before, memory_binary()}.
+
+yield_workers(Bin, NumRefs) ->
+    ensure_purger(),
+    settle_once(),
+    {module, purge_release_target} = erlang:load_module(purge_release_target, Bin),
+    Parent = self(),
+    Worker = spawn(fun() -> hold_yield_literal(Parent, NumRefs) end),
+    receive {yield_started, Worker} -> ok after 30000 -> exit(yield_worker_start_timeout) end,
+    Check = erlang:check_process_code(Worker, purge_release_target),
+    true = erlang:delete_module(purge_release_target),
+    Purge = erlang:purge_module(purge_release_target),
+    Ref = monitor(process, Worker),
+    Worker ! purged,
+    Result = receive
+                 {yield_finished, Worker, NumRefs, Hash} -> {NumRefs, Hash}
+             after 30000 -> exit(yield_worker_finish_timeout)
+             end,
+    receive {'DOWN', Ref, process, Worker, normal} -> ok
+    after 30000 -> exit(yield_worker_down_timeout)
+    end,
+    {Check, Purge, Result}.
+
+hold_yield_literal(Parent, NumRefs) ->
+    Bin = purge_release_target:binary(),
+    Refs = lists:duplicate(NumRefs, Bin),
+    Hash = erlang:md5(Bin),
+    Parent ! {yield_started, self()},
+    receive
+        purged ->
+            true = lists:all(fun(Ref) -> Ref =:= Bin end, Refs),
+            Parent ! {yield_finished, self(), length(Refs), Hash}
+    end.
 
 %% code_SUITE waits once; a second wait must not be needed to see the frees.
 settle_once() ->
@@ -290,7 +322,7 @@ fn literal_binaries_held_by_processes_are_released_after_purge() {
         let OwnedTerm::Tuple(fields) = term else {
             panic!("expected binary memory pair, got {term:?}");
         };
-        assert_eq!(fields.len(), 2);
+        similar_asserts::assert_eq!(fields.len(), 2);
         let [OwnedTerm::Int(before), OwnedTerm::Int(after)] = fields.as_slice() else {
             panic!("expected integer binary memory pair, got {fields:?}");
         };
@@ -307,4 +339,57 @@ fn literal_binaries_held_by_processes_are_released_after_purge() {
         actual_growth <= expected_growth + 64 * 1024,
         "binary growth exceeds OTP after worker-held purges: OTP {expected_growth} bytes, Arinsal {actual_growth} bytes"
     );
+}
+
+#[test]
+fn literal_yield_branch_matches_erts_purge_results_and_messages() {
+    let reference = RefErl::start().expect("OTP 29.1.1 erl is required");
+    let target_source =
+        include_str!("../../../../tests/otp/erts/emulator/test/code_SUITE_data/literals.erl");
+    let source_path =
+        std::env::temp_dir().join(format!("arinsal-purge-yield-{}.erl", std::process::id()));
+    std::fs::write(&source_path, target_source).expect("write literal module source");
+    let compiled = reference.eval(&format!(
+        "{{ok, literals, Beam}} = compile:file(\"{}\", [binary]), Beam",
+        source_path.display()
+    ));
+    let _ = std::fs::remove_file(&source_path);
+    let target = match compiled.expect("compile large literal module") {
+        OwnedTerm::Binary(ref binary) => binary.clone(),
+        other => panic!("expected compiled BEAM binary, got {other:?}"),
+    };
+    let probe_source = PROBE.replace("purge_release_target", "literals");
+    let probe = reference
+        .compile_named("purge_release_probe", &probe_source, &[])
+        .expect("compile purge probe");
+    reference.load("purge_release_probe", &probe).unwrap();
+
+    // 200,000 binary references occupy enough heap words for max_reds * 4 to exceed
+    // ERTS's minimum CLA adjustment limit while remaining below CONTEXT_REDS.
+    let args = [OwnedTerm::Binary(target.clone()), OwnedTerm::Int(200_000)];
+    let expected = reference.call_opts(
+        "purge_release_probe",
+        "yield_workers",
+        &args,
+        &CallOptions {
+            timeout_ms: Some(60_000),
+            ..CallOptions::default()
+        },
+    );
+    let CallResult::Ok(expected) = expected.result else {
+        panic!("OTP yield-branch purge probe failed: {:?}", expected.result);
+    };
+    let peer_dir =
+        std::env::temp_dir().join(format!("arinsal-purge-yield-peer-{}", std::process::id()));
+    std::fs::create_dir_all(&peer_dir).unwrap();
+    std::fs::write(peer_dir.join("literals.beam"), &target).unwrap();
+    std::fs::write(peer_dir.join("purge_release_probe.beam"), &probe).unwrap();
+    let target_path = peer_dir.join("literals.beam");
+    let expr = format!(
+        "begin {{ok,Bin}}=file:read_file(\"{}\"),purge_release_probe:yield_workers(Bin,200000) end",
+        target_path.display()
+    );
+    let actual = crate::common::peer_eval_dir(&["+S", "1:1"], &peer_dir, &expr);
+    let _ = std::fs::remove_dir_all(&peer_dir);
+    similar_asserts::assert_eq!(actual, expected);
 }

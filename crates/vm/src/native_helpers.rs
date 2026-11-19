@@ -220,7 +220,7 @@ pub extern "C" fn arinsal_beamasm_static_nif(
     // Port of erts/emulator/beam/jit/beam_jit_common.cpp:635 (beam_jit_call_nif): `current` is
     // set "to please handle_error" before the NIF runs.
     if let Some(export) =
-        crate::beamasm_integration::bif_mfa_export(&nif.module, &nif.function, nif.arity)
+        crate::beamasm_integration::bif_mfa_export(&nif.module, &nif.function, u32::from(nif.arity))
     {
         process.heap.abi.current = std::ptr::from_ref(export.mfa()).cast();
     }
@@ -316,7 +316,7 @@ pub(crate) extern "C" fn arinsal_beamasm_export_trampoline(
         && process.heap.gc_after_bif_desired()
     {
         let live_hf_end = process.heap.bif_live_hf_end();
-        let arity = usize::from(export.arity);
+        let arity = export.arity as usize;
         return crate::erl_gc::erts_gc_after_bif_call_lhf(
             process,
             live_hf_end,
@@ -346,7 +346,7 @@ pub(crate) extern "C" fn arinsal_beamasm_call_error_handler(
     let Ok(undefined_function) = arinsal_term::global_atoms().intern("undefined_function") else {
         return 0;
     };
-    let mfa_pointer = process.heap.abi.current.cast();
+    let mfa_pointer = std::ptr::from_ref(stub.mfa());
     crate::beam_common::call_error_handler_core(
         process,
         registers,
@@ -610,21 +610,22 @@ pub extern "C" fn arinsal_beamasm_line_breakpoint_cleanup(
 /// has one function pointer, chosen when the export is created. Calls enter that pointer
 /// directly; trace and save_calls dispatch it through the export path.
 pub(crate) fn light_entry(export: ExportDispatch) -> Option<usize> {
-    if let Some(func) = crate::bif_table::special(&export.module, &export.function, export.arity) {
+    let arity = u8::try_from(export.arity).ok()?;
+    if let Some(func) = crate::bif_table::special(&export.module, &export.function, arity) {
         return Some(func);
     }
     // The kind is fixed when the export is created (`bif_table[].f`). The call
     // fragment branches to that pointer; it does not walk `invoke_dispatch_bif`.
     if export.light_process_bif.is_some() {
         return Some(
-            crate::natives::thin_entry(&export.module, &export.function, export.arity)
+            crate::natives::thin_entry(&export.module, &export.function, arity)
                 .unwrap_or(crate::bif_table::bif!(process_bif_light)),
         );
     }
     if export.runs_in_executor() {
         return Some(crate::bif_table::bif!(yield_executor_bif));
     }
-    if let Some(entry) = crate::bif_table::entry(&export.module, &export.function, export.arity) {
+    if let Some(entry) = crate::bif_table::entry(&export.module, &export.function, arity) {
         return Some(entry.plain);
     }
     let bif = export.is_bif_export()
@@ -673,7 +674,7 @@ fn park_executor(
     light_call: bool,
 ) -> u64 {
     process.native_light_bif_call = light_call;
-    process.heap.abi.arity = export.arity;
+    process.heap.abi.arity = export.arity as u8;
     process.heap.abi.i = identity as *const u8 as *const _;
     process.heap.abi.exc.freason = 1 << 10;
     0
@@ -924,7 +925,7 @@ fn invoke_dispatch_bif_slow(
         if export_call && !bif_traced {
             charge_bif_reductions(process, 1);
         }
-        process.heap.abi.arity = export.arity;
+        process.heap.abi.arity = export.arity as u8;
         process.heap.abi.i = identity as *const u8 as *const _;
         process.heap.abi.exc.freason = 1 << 10;
         process.native_light_bif_call = !export_call;
@@ -948,7 +949,7 @@ fn plain_bif_slow(
     export: ExportDispatch,
     result: Result<Term, arinsal_bifs::BifError>,
 ) -> u64 {
-    let arity = usize::from(export.arity);
+    let arity = export.arity as usize;
     plain_bif_result(process, registers, export, arity, result)
 }
 
@@ -964,7 +965,7 @@ fn call_plain_bif_word(
     export: ExportDispatch,
     bif: impl Fn(&mut arinsal_bifs::Ctx<'_>, &[Term]) -> u64,
 ) -> u64 {
-    let arity = usize::from(export.arity);
+    let arity = export.arity as usize;
     let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let mut call = arinsal_bifs::BifCall::default();
     let mut ctx = arinsal_bifs::Ctx::with_failure(&mut fragment, &mut call);
@@ -1086,7 +1087,7 @@ fn call_process_bif(
     if export_call {
         charge_bif_reductions(process, 1);
     }
-    let arity = usize::from(export.arity);
+    let arity = export.arity as usize;
     // `garbage_collect` moves the heap. The light fragment reloads heap bounds from the
     // process header on the way out (`RUNTIME_UPDATE`).
     let collects =
@@ -1304,12 +1305,12 @@ fn process_bif_error(
             != (
                 export.module_atom,
                 export.function_atom,
-                usize::from(export.arity),
+                export.arity as usize,
             )
     {
         let atoms = arinsal_term::global_atoms();
         if let (Some(m), Some(f)) = (atoms.text(*module), atoms.text(*function))
-            && let Some(bif) = crate::beamasm_integration::bif_mfa_export(m, f, terms.len() as u8)
+            && let Some(bif) = crate::beamasm_integration::bif_mfa_export(m, f, terms.len() as u32)
         {
             if let Ok(reg) = (crate::Vm {}).x_regs() {
                 reg[..terms.len()].copy_from_slice(terms);
@@ -1422,7 +1423,7 @@ fn plain_bif_error(
     export: ExportDispatch,
     error: arinsal_bifs::BifError,
 ) -> u64 {
-    let args = registers.x_reg_array[..usize::from(export.arity)].to_vec();
+    let args = registers.x_reg_array[..export.arity as usize].to_vec();
     set_native_bif_export_error(process, export, &args, error);
     0
 }
@@ -1616,8 +1617,8 @@ fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifEr
 /// handler executes `build_stacktrace`.
 pub extern "C" fn arinsal_beamasm_exception_resolver(
     header: *mut ProcessHeader,
+    pc: u64,
     reg: *mut u64,
-    _stack: *mut u64,
     bif_info: u64,
 ) -> usize {
     let Some(process) = crate::native_hooks::process_from_header(header) else {
@@ -1631,7 +1632,7 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     };
     crate::beam_common::handle_error_core(
         process,
-        registers.tmp_mem[6] as usize,
+        pc as usize,
         &mut registers.x_reg_array,
         bif_info,
     )
@@ -1752,7 +1753,7 @@ pub(crate) fn native_bif_top(
     Some(TopFrame::BifRegisters {
         module,
         function,
-        arity: usize::from(arity),
+        arity: arity as usize,
         info,
     })
 }
@@ -1854,7 +1855,7 @@ pub extern "C" fn arinsal_beamasm_fun_resolver(
             crate::raw::jit_ffi::export_entry(export).address(code_ix)
         }
         Some(arinsal_term::FunRef::Export { entry }) => {
-            if u32::from(entry.arity()) != arity {
+            if fun.fun_arity().map(u32::from) != Some(arity) {
                 set_call_fun_error(process, registers, fun, arity);
                 return 0;
             }
@@ -1898,7 +1899,7 @@ pub extern "C" fn arinsal_beamasm_fun_resolver(
 fn apply_bif_error_adjustment(
     process: &mut crate::Process,
     registers: &mut arinsal_beamasm::SchedulerRegisters,
-    mfa: (arinsal_term::Atom, arinsal_term::Atom, u8),
+    mfa: (arinsal_term::Atom, arinsal_term::Atom, u32),
     return_ip: u64,
     stack_offset: u64,
 ) -> bool {
@@ -1917,7 +1918,7 @@ fn apply_bif_error_adjustment(
     let apply_only = stack_offset == 0;
     let need = (stack_offset as usize / std::mem::size_of::<u64>()).max(1);
     if process
-        .ensure_objv(need, &mut registers.x_reg_array[..usize::from(mfa.2) + 2])
+        .ensure_objv(need, &mut registers.x_reg_array[..mfa.2 as usize + 2])
         .is_err()
     {
         crate::native_hooks::set_error(process, "system_limit");
@@ -1968,7 +1969,7 @@ fn apply_error(
 
 fn lookup_apply_export(
     process: &crate::Process,
-    mfa: (arinsal_term::Atom, arinsal_term::Atom, u8),
+    mfa: (arinsal_term::Atom, arinsal_term::Atom, u32),
     code_ix: usize,
 ) -> Option<ApplyTarget> {
     process
@@ -2057,7 +2058,7 @@ pub(crate) fn resolve_fixed_apply(
     {
         return resolve_apply(process, registers, return_ip, stack_offset);
     }
-    let mfa = (module_atom, function_atom, arity as u8);
+    let mfa = (module_atom, function_atom, arity as u32);
     let code_ix = registers.active_code_ix as usize;
     let Some(target) = lookup_apply_export(process, mfa, code_ix) else {
         return apply_error(
@@ -2143,17 +2144,7 @@ pub(crate) fn resolve_apply(
             arinsal_bifs::BifError::Badarg { cause: None },
         );
     }
-    let Ok(arity) = u8::try_from(arity) else {
-        return apply_error(
-            process,
-            registers,
-            module,
-            function,
-            args,
-            arinsal_bifs::BifError::SystemLimit,
-        );
-    };
-    let mfa = (module_atom, function_atom, arity);
+    let mfa = (module_atom, function_atom, arity as u32);
     let code_ix = registers.active_code_ix as usize;
     let Some(target) = lookup_apply_export(process, mfa, code_ix) else {
         return apply_error(

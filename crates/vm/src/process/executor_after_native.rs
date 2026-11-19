@@ -438,7 +438,7 @@ pub(super) fn context_switch(
                     export.module, export.function, export.arity, export.class
                 );
             }
-            process.gc_live = usize::from(export.arity);
+            process.gc_live = export.arity as usize;
             if matches!(
                 export.class,
                 arinsal_loader::ImportClass::Native
@@ -451,7 +451,7 @@ pub(super) fn context_switch(
                 // `Export.is_bif_traced`; a BIF is never re-decided, the breakpoint
                 // matching below records what its flags select.
                 let saved_arguments: smallvec::SmallVec<[Term; 8]> =
-                    smallvec::SmallVec::from_slice(&reg.x_reg_array[..usize::from(export.arity)]);
+                    smallvec::SmallVec::from_slice(&reg.x_reg_array[..export.arity as usize]);
                 let collections_before = process.stats.gc.collections;
                 // erlang:make_fun/3 is implemented by the VM's call path (funs.rs), not
                 // by the native BIF table; handle it here like the interpreter does.
@@ -506,7 +506,7 @@ pub(super) fn context_switch(
                             ctx,
                             &export.module,
                             &export.function,
-                            usize::from(export.arity),
+                            export.arity as usize,
                             (usize::MAX, call_site_pc),
                             // The trampoline pushed the CP: a tail apply's is a trace
                             // frame of its caller (fixup_cp_before_trace).
@@ -535,7 +535,7 @@ pub(super) fn context_switch(
                         ctx,
                         &export.module,
                         &export.function,
-                        usize::from(export.arity),
+                        export.arity as usize,
                         (export.class, export.native_bits),
                     );
                     process.heap.set_bif_hidden_words(0);
@@ -742,12 +742,12 @@ pub(super) fn context_switch(
                     match loaded {
                         Ok(module_id) => module_id,
                         Err(_) => {
-                            let saved = reg.x_reg_array[..usize::from(export.arity)].to_vec();
+                            let saved = reg.x_reg_array[..export.arity as usize].to_vec();
                             let called = (Vm {}).call_undefined_function(
                                 process,
                                 &export.module,
                                 &export.function,
-                                usize::from(export.arity),
+                                export.arity as usize,
                             );
                             let outcome = match called {
                                 Ok(outcome) => outcome,
@@ -802,7 +802,9 @@ pub(super) fn context_switch(
                 let function = module
                     .exports
                     .iter()
-                    .position(|slot| slot.function == export.function && slot.arity == export.arity)
+                    .position(|slot| {
+                        slot.function == export.function && u32::from(slot.arity) == export.arity
+                    })
                     .and_then(|index| module.export_entry_targets.get(index))
                     .and_then(|&entry| {
                         crate::beamasm_integration::erts_code_hdr_function(module_id, entry)
@@ -821,7 +823,7 @@ pub(super) fn context_switch(
                         &actions,
                         &mut reg.x_reg_array[..usize::from(function.arity)],
                     )?;
-                    process.gc_live = usize::from(export.arity);
+                    process.gc_live = export.arity as usize;
                     process.set_native_pc(Some(function.start));
                     // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp
                     // (emit_export_trampoline), OTP-29.1.1: the call's reduction is the
@@ -834,18 +836,18 @@ pub(super) fn context_switch(
                 .export_slot(&export.function, export.arity)
                 .map(arinsal_loader::ExportSlot::target);
             if let Some(target_ip) = target_ip {
-                process.gc_live = usize::from(export.arity);
+                process.gc_live = export.arity as usize;
                 (Vm {}).set_position(process, module_id, target_ip)?;
                 // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp
                 // (emit_export_trampoline), OTP-29.1.1: the call's reduction is the
                 // callee's own `i_test_yield` at its native entry.
             } else {
-                let saved = reg.x_reg_array[..usize::from(export.arity)].to_vec();
+                let saved = reg.x_reg_array[..export.arity as usize].to_vec();
                 let called = (Vm {}).call_undefined_function(
                     process,
                     &export.module,
                     &export.function,
-                    usize::from(export.arity),
+                    export.arity as usize,
                 );
                 let outcome = match called {
                     Ok(outcome) => outcome,

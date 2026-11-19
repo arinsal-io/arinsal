@@ -480,10 +480,10 @@ fn module_info(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
                 // OTP-29.1.1. The export index is walked from 0 and consed, which is
                 // reverse insertion order. Entries that only exist because something
                 // imported them (error-handler trampoline) are not in the export table.
-                let exported: std::collections::HashSet<(arinsal_term::Atom, u8)> = module
+                let exported: std::collections::HashSet<(arinsal_term::Atom, u32)> = module
                     .exports
                     .iter()
-                    .map(|export| (export.function_atom, export.arity))
+                    .map(|export| (export.function_atom, u32::from(export.arity)))
                     .collect();
                 let Some(name_atom) = args[0].as_atom() else {
                     return Err(badarg());
@@ -644,7 +644,7 @@ pub(crate) fn function_exported_light(
     };
     let module = module.as_atom()?;
     let function = function.as_atom()?;
-    let arity = u8::try_from(arity.as_small().filter(|n| (0..=255).contains(n))?).ok()?;
+    let arity = arity.as_small()? as u32;
     let code = process.runtime.as_ref()?.code_indexes();
     let code_ix = code.active();
     let exported = code.with_active_tables(|tables| {
@@ -750,7 +750,7 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
         }
     };
     vm.intern_prepared_fun_entries(&mut module);
-    if let Some(cause) = vm.compile_native(&mut module, &mut meta) {
+    if let Some(cause) = crate::beam_load::load_code(&mut module, &mut meta) {
         if matches!(
             &cause,
             arinsal_beamjit::CompileError::Parse(message)
@@ -1674,6 +1674,7 @@ fn send_copy_request(
                 request,
                 how,
                 requester: ctx.pid(),
+                yield_data: None,
             })),
         )
         .is_ok()
@@ -1821,17 +1822,17 @@ fn call_values(
         ("erlang", "function_exported", 3) => Some((|| {
             let name = module_name(args[0]).ok_or_else(badarg)?;
             let function = module_name(args[1]).ok_or_else(badarg)?;
-            let arity = args[2]
-                .as_small()
-                .filter(|n| (0..=255).contains(n))
-                .ok_or_else(badarg)? as u8;
+            let arity = args[2].as_small().ok_or_else(badarg)? as u32;
             let result = code_tables(erts_active_code_ix())
                 .loaded
                 .get(&name)
                 .is_some_and(|id| {
                     code_tables(erts_active_code_ix()).modules[*id]
-                        .export_slot(&function, arity)
-                        .is_some()
+                        .exports
+                        .iter()
+                        .any(|export| {
+                            export.function == function && u32::from(export.arity) == arity
+                        })
                 });
             Ok(Term::atom(if result { atoms::TRUE } else { atoms::FALSE }))
         })()),
@@ -1966,7 +1967,7 @@ fn call_values(
                 return Some(Err(badarg()));
             };
             let Some(target) = code_tables(erts_active_code_ix()).modules[id]
-                .export(&function, arity)
+                .export(&function, u32::from(arity))
                 .or_else(|| {
                     code_tables(erts_active_code_ix()).modules[id]
                         .functions

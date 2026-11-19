@@ -871,13 +871,140 @@ fn off_heap_node_overhead_words(node: usize) -> u64 {
 }
 
 impl ProcessHeap {
-    /// Maximum heap, stack, and fragment words inspected by literal GC checks.
+    /// Maximum stack, heap, and process fragment words in the CLA slice estimate.
     // Port of erts/emulator/beam/beam_bif_load.c:976 (`erts_check_copy_literals_gc_need_max_reds`), OTP-29.1.1.
     pub fn literal_scan_words(&self) -> usize {
-        self.htop_index()
-            .saturating_add(self.stack_words())
+        let abandoned = self.abandoned_heap().map_or(0, |heap| heap.block_words);
+        let heap_fragments = self
+            .mbufs()
+            .map(|(_, used)| used)
+            .chain(self.msg_frag.iter().map(crate::heap::MsgFrag::len))
+            .fold(0_usize, usize::saturating_add);
+        self.stack_words()
+            .saturating_add(self.htop_index())
+            .saturating_add(abandoned)
             .saturating_add(self.old_htop)
-            .saturating_add(self.heap_frag_areas().map(|(_, used)| used).sum::<usize>())
+            .saturating_add(heap_fragments)
+    }
+
+    /// Scan the stack range used by `erts_check_copy_literals_gc_need`.
+    // Port of erts/emulator/beam/beam_bif_load.c:1033-1034, OTP-29.1.1.
+    pub fn copy_literal_stack_reference(
+        &self,
+        is_area_pointer: impl FnMut(Term) -> bool,
+    ) -> (bool, usize) {
+        let words = self.stack_words();
+        (
+            Self::any_heap_reference_words(
+                self.words.as_ptr().cast::<u64>(),
+                self.stop_index(),
+                words,
+                false,
+                &mut { is_area_pointer },
+            ),
+            words,
+        )
+    }
+
+    /// Scan the new heap range used by `erts_check_copy_literals_gc_need`.
+    // Port of erts/emulator/beam/beam_bif_load.c:1036-1037, OTP-29.1.1.
+    pub fn copy_literal_young_heap_reference(
+        &self,
+        is_area_pointer: impl FnMut(Term) -> bool,
+    ) -> (bool, usize) {
+        let words = self.htop_index();
+        (
+            Self::any_heap_reference_words(
+                self.words.as_ptr().cast::<u64>(),
+                0,
+                words,
+                true,
+                &mut { is_area_pointer },
+            ),
+            words,
+        )
+    }
+
+    /// Scan an abandoned heap allocation, including its heap filler, as erts does.
+    // Port of erts/emulator/beam/beam_bif_load.c:1039-1044, OTP-29.1.1.
+    pub fn copy_literal_abandoned_heap_reference(
+        &self,
+        is_area_pointer: impl FnMut(Term) -> bool,
+    ) -> (bool, usize) {
+        let Some(abandoned) = self.abandoned_heap() else {
+            return (false, 0);
+        };
+        let words = abandoned.block_words;
+        (
+            Self::any_heap_reference_words(abandoned.start as *const u64, 0, words, true, &mut {
+                is_area_pointer
+            }),
+            words,
+        )
+    }
+
+    /// Scan the old heap range used by `erts_check_copy_literals_gc_need`.
+    // Port of erts/emulator/beam/beam_bif_load.c:1045-1046, OTP-29.1.1.
+    pub fn copy_literal_old_heap_reference(
+        &self,
+        is_area_pointer: impl FnMut(Term) -> bool,
+    ) -> (bool, usize) {
+        let words = self.old_htop;
+        (
+            Self::any_heap_reference_words(
+                self.old_words.as_ptr().cast::<u64>(),
+                0,
+                words,
+                true,
+                &mut { is_area_pointer },
+            ),
+            words,
+        )
+    }
+
+    /// Scan the `mbuf` fragments in their list order.
+    // Port of erts/emulator/beam/beam_bif_load.c:1055-1068, OTP-29.1.1.
+    pub fn copy_literal_heap_fragments_reference(
+        &self,
+        mut is_area_pointer: impl FnMut(Term) -> bool,
+    ) -> (bool, usize) {
+        let mut scanned = 0_usize;
+        for (start, words) in self.mbufs() {
+            scanned = scanned.saturating_add(words);
+            if Self::any_heap_reference_words(
+                start as *const u64,
+                0,
+                words,
+                true,
+                &mut is_area_pointer,
+            ) {
+                return (true, scanned);
+            }
+        }
+        (false, scanned)
+    }
+
+    /// Scan `msg_frag` heap fragments in their list order.
+    // Port of erts/emulator/beam/beam_bif_load.c:1078-1094, OTP-29.1.1.
+    pub fn copy_literal_message_fragments_reference(
+        &self,
+        mut is_area_pointer: impl FnMut(Term) -> bool,
+    ) -> (bool, usize) {
+        let mut scanned = 0_usize;
+        for fragment in &self.msg_frag {
+            let words = fragment.len();
+            scanned = scanned.saturating_add(words);
+            if Self::any_heap_reference_words(
+                fragment.as_ptr(),
+                0,
+                words,
+                true,
+                &mut is_area_pointer,
+            ) {
+                return (true, scanned);
+            }
+        }
+        (false, scanned)
     }
 
     /// Return whether initialized process storage contains a direct pointer into an area.

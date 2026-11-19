@@ -27,3 +27,4 @@ arinsal-beamops = { path = "../beamops" }
 [dev-dependencies]
 arinsal-spec.workspace = true
 similar-asserts = "2"
+arinsal-beamasm = { path = "../beamasm", features = ["test-runtime-stubs"] }

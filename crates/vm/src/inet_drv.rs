@@ -371,16 +371,6 @@ pub(crate) fn attach(runtime: &'static Runtime, handle: &Arc<PortHandle>, port: 
 /// OTP-29.1.1: the port terminates; waiters receive `{error, closed}`.
 fn tcp_inet_stop(sock: &Arc<Sock>) {
     sock.stopped.store(true, Ordering::Release);
-    // The port closed while owning a dist connection (its controller exited, e.g. through
-    // `net_kernel:disconnect/1`): tear the connection down and deliver nodedown.
-    // Port of erts/emulator/beam/dist.c (erts_do_net_exits via the dist port's exit), OTP-29.1.1.
-    if let Some(handle) = sock
-        .handle
-        .upgrade()
-        .filter(|handle| crate::node_tables::is_dist_port(handle))
-    {
-        let _ = crate::dist::port_connection_closed(sock.runtime, &handle);
-    }
     let pending = {
         let mut inner = sock.inner.lock();
         // Port of erts/emulator/drivers/common/inet_drv.c:12718-12725 (tcp_inet_flush)
@@ -4127,15 +4117,6 @@ fn output_message(sock: &Sock, out: Out) -> Option<(Pid, MessageNode)> {
     {
         let _ = crate::dist::ingest_port_data(sock.runtime(), &dep, sock.id, bytes);
         return None;
-    }
-    if let Out::TcpClosed { .. } = &out
-        && let Some(handle) = sock
-            .handle
-            .upgrade()
-            .filter(|handle| crate::node_tables::is_dist_port(handle))
-    {
-        let _ = crate::dist::port_connection_closed(sock.runtime(), &handle);
-        // Still deliver tcp_closed to the connection ticker so it shuts down.
     }
     let out = match out {
         Out::TcpMessage { to, message } => return Some((to, message)),

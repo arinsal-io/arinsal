@@ -770,9 +770,10 @@ pub(crate) fn register_managed_thread(progress: &Arc<ThrProgress>, id: usize) ->
     managed
 }
 
-/// Drop the calling thread's registration when its scheduler loop ends. Later operations it
-/// still holds move to the shared queue, where another managed thread, or
+/// Drop the calling test thread's registration (a scheduler never ends its loop). Later
+/// operations it still holds move to the shared queue, where another managed thread, or
 /// [`run_remaining_later_ops`] once every managed thread stopped, runs them.
+#[cfg(test)]
 pub(crate) fn unregister_managed_thread() {
     MANAGED_OF.with(|of| of.set(0));
     let Some(managed) = TPD.with(|tpd| tpd.borrow_mut().take()) else {

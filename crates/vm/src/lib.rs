@@ -9,6 +9,7 @@ mod big;
 mod fun_dispatch;
 // c_boot: Launcher entry point for the preloaded OTP boot process.
 mod beam_common;
+mod beam_load;
 mod bif_dispatch;
 mod bif_table;
 pub mod boot;

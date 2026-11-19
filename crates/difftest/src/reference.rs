@@ -76,7 +76,8 @@ pub fn erl() -> Option<Command> {
     Some(command)
 }
 
-fn program(name: &str) -> String {
+/// Return the executable name for this platform.
+pub fn program(name: &str) -> String {
     if cfg!(windows) {
         format!("{name}.exe")
     } else {

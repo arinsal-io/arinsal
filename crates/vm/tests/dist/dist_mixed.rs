@@ -709,6 +709,8 @@ fn dist_mixed_process_controller_large_send() {
     // Both nodes run the gen_tcp_dist carrier: Arinsal's connection is controlled by a process
     // that takes the encoded fragments with dist_ctrl_get_data (erts_dsig_send PHASE_SEND for
     // a process controller, dist_data notification, refc binaries in the returned I/O vector).
+    // Killing the controller takes the connection down (erts_do_net_exits from the controller's
+    // exit, dist.c), reported to the nodes monitors with reason `killed`.
     let _serial = serial_test();
     let dir = gen_tcp_dist_dir();
     let dir = dir.to_str().expect("UTF-8 temp path");
@@ -731,6 +733,13 @@ fn dist_mixed_process_controller_large_send() {
                 "after 30000 -> exit(no_big) end, ",
                 "[{{_,Ctrl}}]=[{{Nd,C}} || {{Nd,C}} <- erlang:system_info(dist_ctrl), Nd=:=N], ",
                 "true=is_pid(Ctrl), ",
+                // The controller has F_DISTRIBUTION and the dist entry: its exit runs
+                // erts_do_net_exits (kill -> killed), the nodes monitors get nodedown.
+                "ok=net_kernel:monitor_nodes(true,[nodedown_reason]), exit(Ctrl,kill), ",
+                "receive {{nodedown,N,[{{nodedown_reason,killed}}]}} -> ok; ",
+                "{{nodedown,N,Info}} -> exit({{nodedown_info,Info}}) ",
+                "after 20000 -> exit(no_nodedown) end, ",
+                "false=lists:member(N,nodes()), ",
                 "io:format(\"DIST_MIXED_OK process controller~n\")"
             ),
             n = n

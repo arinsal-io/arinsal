@@ -11,7 +11,7 @@ use std::cell::Cell;
 
 use arinsal_term::{Atom, Term, global_atoms};
 
-use crate::{ByteOutput, EncodeError, EncodeOpts, TtbContext};
+use crate::{ByteOutput, EncodeError, EncodeOpts, TtbContext, raw};
 
 /// `ERTS_ATOM_CACHE_SIZE`.
 pub const ERTS_ATOM_CACHE_SIZE: usize = 2048;
@@ -273,8 +273,16 @@ fn erts_encode_dist_ext_size(
     if !done {
         return ErtsExtSzRes::Yield;
     }
+    let output = walk.output_size().expect("size pass done");
+    // The bytes after the last referenced binary are one more element of the I/O vector.
+    // Port of erts/emulator/beam/external.c (encode_size_struct_int, the end of the walk:
+    // `vlen += csz/MAX_SYSIOVEC_IOVLEN + 1`), OTP-29.1.1.
+    let csz = output - ctx.iov.last_result;
+    if csz != 0 {
+        ctx.iov.vlen += (csz / crate::MAX_SYSIOVEC_IOVLEN + 1) as isize;
+    }
     // The walk counts the VERSION_MAGIC of a term_to_binary; the dist encode counted its own.
-    sz += walk.output_size().expect("size pass done") - 1;
+    sz += output - 1;
     ctx.walk = None;
     // Each fragment uses one element for the driver header, one for the fragment header
     // and (at least) one for data.
@@ -286,49 +294,88 @@ fn erts_encode_dist_ext_size(
     ErtsExtSzRes::Ok
 }
 
-/// One data element of a fragment's I/O vector while the signal is encoded: a range of the
-/// signal's own buffer (`ctx->result_bin`, referenced once the buffer is complete) or a
-/// range of a referenced binary.
-enum EncIov {
-    Common(std::ops::Range<usize>),
-    Binary(DistIov),
+/// Byte sizes of the records `alloc_dist_obufs` places in front of the data of a signal's
+/// driver Binary (64-bit layout of the C structs).
+// Port of erts/emulator/beam/erl_node_tables.h (ErtsDistOutputBuf), erl_driver.h (SysIOVec,
+// ErlIOVec, ErlDrvBinary *), OTP-29.1.1.
+const OBUF_SZ: usize = 8; // ErtsDistOutputBuf: eiov (`next`/`bin` are the queue and the handle)
+use raw::{BINV_SZ, SYSIOVEC_SZ};
+const ERLIOVEC_PTR_SZ: usize = 8; // ErlIOVec *
+const ERLIOVEC_SZ: usize = 32; // ErlIOVec: vsize, size, iov, binv
+
+/// `erts_ttb_iov_size(0, vlen, fragments)`.
+// Port of erts/emulator/beam/external.c (erts_ttb_iov_size), OTP-29.1.1.
+fn erts_ttb_iov_size(vlen: usize, fragments: usize) -> usize {
+    debug_assert!(vlen > 0 && fragments > 0);
+    SYSIOVEC_SZ * vlen + BINV_SZ * vlen + ERLIOVEC_PTR_SZ * fragments + ERLIOVEC_SZ * fragments
 }
 
-/// One `fragment_eiovs[ix]`: the data the fragment carries (`iov[2..]`; `iov[0]` and
-/// `iov[1]` are the driver and dist headers).
-#[derive(Default)]
-struct FragmentEiov {
-    size: usize,
-    iov: Vec<EncIov>,
-}
+/// Field offsets inside an `ErlIOVec` record.
+const EIOV_VSIZE: usize = 0;
+const EIOV_SIZE: usize = 8;
+const EIOV_IOV: usize = 16;
+const EIOV_BINV: usize = 24;
 
-/// `TTBEncodeContext` of a dist encode.
+/// `TTBEncodeContext` of a dist encode. The I/O vector (`iov`, `binv`) and the fragments'
+/// `ErlIOVec`s are records in the signal's driver Binary in front of the data
+/// (`erts_ttb_iov_init` on the memory `alloc_dist_obufs` allocated); the context keeps
+/// their offsets and the address of the data.
 // Port of erts/emulator/beam/dist.h (TTBEncodeContext, ERTS_INIT_TTBEncodeContext,
 // erts_ttb_iov_init), OTP-29.1.1.
 pub(crate) struct TtbDistEncodeContext {
     /// `wstack.wstart != NULL`: the walk of the term being encoded.
     walk: Option<Box<TtbContext>>,
-    /// `cptr`: the start of the bytes not yet stored in the I/O vector.
+    /// `cptr`: the start of the bytes not yet stored in the I/O vector (a data offset).
     cptr: usize,
     /// `vlen`: I/O vector elements used so far.
     vlen: usize,
     /// `frag_ix`, -1 before the first fragment.
     frag_ix: isize,
     fragment_size: usize,
-    fragment_eiovs: Vec<FragmentEiov>,
+    /// `debug_vlen`: the elements the arrays have room for (the size pass's `vlen`).
+    debug_vlen: usize,
+    /// `ctx->iov`, `ctx->binv`, `ctx->fragment_eiovs`: payload offsets of the arrays.
+    iov: usize,
+    binv: usize,
+    fragment_eiovs: usize,
+    /// The address of the first data byte (data offsets are relative to it).
+    data_base: usize,
     /// `payload_ixp` of a pending-connection encode.
     payload_ixp: Option<usize>,
-    /// Where the flattened output buffer starts (`dhdrp`): the payload ix of a
-    /// pending-connection encode is the payload's offset from there.
-    dhdrp: usize,
-    /// Bytes of referenced binaries stored so far: the flattened buffer holds them too.
-    referenced: usize,
     node_source: fn() -> (Atom, u32),
 }
 
+/// The I/O vector records of a dist encode as the encoder reaches them: the context and the
+/// part of the Binary in front of the data (`meta`).
+pub(crate) struct DistIovSink<'a> {
+    pub(crate) ctx: &'a mut TtbDistEncodeContext,
+    pub(crate) meta: raw::ObufMeta<'a>,
+}
+
+impl DistIovSink<'_> {
+    /// `store_in_vec` at the encoder's position `ep`.
+    pub(crate) fn store_in_vec(
+        &mut self,
+        ep: usize,
+        refc_binary: Option<(arinsal_alloc::raw::OwnedBinaryRef, usize, usize)>,
+    ) {
+        self.ctx.store_in_vec(&mut self.meta, ep, refc_binary);
+    }
+}
+
 impl TtbDistEncodeContext {
-    /// `ERTS_INIT_TTBEncodeContext` + `erts_ttb_iov_init`.
-    fn new(fragments: usize, fragment_size: usize, node_source: fn() -> (Atom, u32)) -> Self {
+    /// `ERTS_INIT_TTBEncodeContext` + `erts_ttb_iov_init` at payload offset `ptr`.
+    fn new(
+        ptr: usize,
+        vlen: usize,
+        fragment_size: usize,
+        data_base: usize,
+        node_source: fn() -> (Atom, u32),
+    ) -> Self {
+        let iov = ptr;
+        let binv = iov + SYSIOVEC_SZ * vlen;
+        // `sizeof(ErlIOVec *) * fragments` of erts_ttb_iov_size stays unused here, as in erts.
+        let fragment_eiovs = binv + BINV_SZ * vlen;
         Self {
             node_source,
             walk: None,
@@ -336,10 +383,12 @@ impl TtbDistEncodeContext {
             vlen: 0,
             frag_ix: -1,
             fragment_size,
-            fragment_eiovs: (0..fragments).map(|_| FragmentEiov::default()).collect(),
+            debug_vlen: vlen,
+            iov,
+            binv,
+            fragment_eiovs,
+            data_base,
             payload_ixp: None,
-            dhdrp: 0,
-            referenced: 0,
         }
     }
 
@@ -347,75 +396,93 @@ impl TtbDistEncodeContext {
     /// referenced binary `refc_binary` (`len` bytes at `offset`), go into the fragments' I/O
     /// vectors.
     // Port of erts/emulator/beam/external.c (store_in_vec), OTP-29.1.1.
-    pub(crate) fn store_in_vec(
+    fn store_in_vec(
         &mut self,
+        meta: &mut raw::ObufMeta<'_>,
         ep: usize,
         refc_binary: Option<(arinsal_alloc::raw::OwnedBinaryRef, usize, usize)>,
     ) {
         let cp = self.cptr;
         if cp != ep {
             // Save data in the common binary.
-            self.store_in_vec_aux(None, cp, ep - cp);
+            self.store_in_vec_aux(meta, None, self.data_base + cp, ep - cp);
             self.cptr = ep;
         }
         if let Some((bin, offset, len)) = refc_binary {
             // Save the off-heap binary.
-            self.referenced += len;
-            self.store_in_vec_aux(Some(&bin), offset, len);
+            let base = bin.payload_ptr() as usize + offset;
+            self.store_in_vec_aux(meta, Some(&bin), base, len);
         }
     }
 
-    /// `store_in_vec_aux`: `len` bytes at `ptr` of `bin` (`None`: the signal's buffer) go
-    /// into the current fragment, a new fragment starting whenever one reaches
+    /// `store_in_vec_aux`: `len` bytes at address `ptr` of `bin` (`None`: the signal's
+    /// buffer) go into the current fragment, a new fragment starting whenever one reaches
     /// `fragment_size`; each element is at most `MAX_SYSIOVEC_IOVLEN` long and holds its own
-    /// reference to its binary (`erts_refc_inc`).
+    /// reference to its binary (`erts_refc_inc`). The references to the signal's own buffer
+    /// are taken in `FIN`, when the buffer is complete (their `binv` slot is null until
+    /// then).
     // Port of erts/emulator/beam/external.c (store_in_vec_aux), OTP-29.1.1.
     fn store_in_vec_aux(
         &mut self,
+        meta: &mut raw::ObufMeta<'_>,
         bin: Option<&arinsal_alloc::raw::OwnedBinaryRef>,
         mut ptr: usize,
         mut len: usize,
     ) {
         let mut iov_len;
         if self.frag_ix >= 0 {
-            let feiov = &self.fragment_eiovs[self.frag_ix as usize];
-            if feiov.size != self.fragment_size {
+            let feiovp = self.fragment_eiovs + ERLIOVEC_SZ * self.frag_ix as usize;
+            let size = meta.word(feiovp + EIOV_SIZE);
+            debug_assert!(0 < size && size <= self.fragment_size);
+            if size != self.fragment_size {
                 // Current fragment not full yet.
-                iov_len = (self.fragment_size - feiov.size).min(len);
-                self.store_iov_data(bin, &mut ptr, &mut len, iov_len);
+                iov_len = (self.fragment_size - size).min(len);
+                self.store_iov_data(meta, bin, &mut ptr, &mut len, iov_len);
             }
         }
         while len != 0 {
-            // Start a new fragment: entries for the driver and dist headers.
+            // Start a new fragment.
             self.frag_ix += 1;
-            self.vlen += 2;
+            let feiovp = self.fragment_eiovs + ERLIOVEC_SZ * self.frag_ix as usize;
+            meta.set_word(feiovp + EIOV_VSIZE, 2);
+            meta.set_word(feiovp + EIOV_SIZE, 0);
+            meta.set_word(feiovp + EIOV_IOV, self.iov + SYSIOVEC_SZ * self.vlen);
+            meta.set_word(feiovp + EIOV_BINV, self.binv + BINV_SZ * self.vlen);
+            // Entries for the driver header and the dist header.
+            for _ in 0..2 {
+                debug_assert!(self.vlen < self.debug_vlen);
+                meta.set_own(self.vlen, 0, 0);
+                self.vlen += 1;
+            }
             iov_len = len.min(self.fragment_size);
-            self.store_iov_data(bin, &mut ptr, &mut len, iov_len);
+            self.store_iov_data(meta, bin, &mut ptr, &mut len, iov_len);
         }
     }
 
     fn store_iov_data(
         &mut self,
+        meta: &mut raw::ObufMeta<'_>,
         bin: Option<&arinsal_alloc::raw::OwnedBinaryRef>,
         ptr: &mut usize,
         len: &mut usize,
         mut iov_len: usize,
     ) {
-        let feiov = &mut self.fragment_eiovs[self.frag_ix as usize];
+        let feiovp = self.fragment_eiovs + ERLIOVEC_SZ * self.frag_ix as usize;
         loop {
             let iov_len_left = iov_len.saturating_sub(crate::MAX_SYSIOVEC_IOVLEN);
             iov_len -= iov_len_left;
-            let range = *ptr..*ptr + iov_len;
-            feiov.iov.push(match bin {
-                None => EncIov::Common(range),
-                Some(bin) => EncIov::Binary(DistIov {
-                    bin: bin
-                        .try_clone()
-                        .expect("a referenced Binary is live while it is referenced"),
-                    range,
-                }),
-            });
-            feiov.size += iov_len;
+            debug_assert!(self.vlen < self.debug_vlen);
+            match bin {
+                None => meta.set_own(self.vlen, *ptr, iov_len),
+                // The slot keeps the count (released by free_dist_obuf).
+                Some(bin) => {
+                    meta.set_ref(self.vlen, bin, *ptr - bin.payload_ptr() as usize, iov_len)
+                }
+            }
+            let vsize = meta.word(feiovp + EIOV_VSIZE);
+            meta.set_word(feiovp + EIOV_VSIZE, vsize + 1);
+            let size = meta.word(feiovp + EIOV_SIZE);
+            meta.set_word(feiovp + EIOV_SIZE, size + iov_len);
             self.vlen += 1;
             *ptr += iov_len;
             *len -= iov_len;
@@ -434,6 +501,7 @@ impl TtbDistEncodeContext {
 #[allow(clippy::too_many_arguments)]
 fn erts_encode_dist_ext(
     term: Term,
+    meta: &mut raw::ObufMeta<'_>,
     buf: &mut [u8],
     ext: &mut usize,
     flags: u64,
@@ -448,14 +516,16 @@ fn erts_encode_dist_ext(
             buf[*ext] = VERSION_MAGIC;
             *ext += 1;
         }
-        if flags & DFLAG_PENDING_CONNECT != 0 && ctx.vlen != 0 {
-            // We potentially need a version magic on the payload... erts leaves the byte out
-            // of the I/O vector (`cptr` moves past it); the flattened buffer of the transcode
-            // keeps it, so the payload ix is the payload's offset in that buffer.
-            *ext += 1;
-            let payload_ix = (*ext - ctx.dhdrp + ctx.referenced) as u32;
-            let at = ctx.payload_ixp.expect("pending header set up");
-            buf[at..at + 4].copy_from_slice(&payload_ix.to_be_bytes());
+        if flags & DFLAG_PENDING_CONNECT != 0 {
+            let payload_ix = ctx.vlen;
+            if payload_ix != 0 {
+                // We potentially need a version magic on the payload: the byte stays out of
+                // the I/O vector until transcode_dist_obuf prepends it.
+                *ext += 1;
+                ctx.cptr = *ext;
+                let at = ctx.payload_ixp.expect("pending header set up");
+                buf[at..at + 4].copy_from_slice(&(payload_ix as u32).to_be_bytes());
+            }
         }
         let mut walk = Box::new(TtbContext::start(term, dist_opts()));
         // The size pass ran in erts_encode_dist_ext_size.
@@ -470,7 +540,10 @@ fn erts_encode_dist_ext(
     walk.set_local_node_source(ctx.node_source);
     let budget = (*reds).max(1) as usize;
     let mut out = crate::OutputSlice::new(buf, *ext);
-    out.iov = Some(&mut *ctx);
+    out.iov = Some(DistIovSink {
+        ctx: &mut *ctx,
+        meta: meta.reborrow(),
+    });
     let (done, consumed) = crate::enc_term_int(&mut walk, acmp, budget, &mut out, 0)?;
     if out.failed() {
         return Err(EncodeError::SystemLimit);
@@ -478,7 +551,7 @@ fn erts_encode_dist_ext(
     *ext = out.len();
     *reds -= consumed as i64;
     if done {
-        ctx.store_in_vec(*ext, None);
+        ctx.store_in_vec(meta, *ext, None);
     } else {
         ctx.walk = Some(walk);
     }
@@ -669,9 +742,9 @@ const ERTS_DOP_ALTACT_SIG_FLG_ALIAS: u8 = 1 << 2;
 const ERTS_DOP_ALTACT_SIG_FLG_NAME: u8 = 1 << 3;
 const ERTS_DOP_ALTACT_SIG_FLG_EXIT: u8 = 1 << 4;
 
-/// One element of an output buffer's I/O vector, `iov[i]` with its `binv[i]`: `range` of
-/// the payload of a Binary this element holds one reference to (the signal's own buffer or
-/// a refc binary of the encoded term).
+/// One element of an output buffer's I/O vector taken out of it, `iov[i]` with its
+/// `binv[i]`: `range` of the payload of a Binary this element holds one reference to (the
+/// signal's own buffer or a refc binary of the encoded term).
 // Port of erts/emulator/beam/erl_driver.h (ErlIOVec iov/binv), OTP-29.1.1.
 pub struct DistIov {
     bin: arinsal_alloc::raw::OwnedBinaryRef,
@@ -699,55 +772,127 @@ impl std::fmt::Debug for DistIov {
 }
 
 /// `ErtsDistOutputBuf`: one fragment of an encoded signal in a distribution output queue.
-/// All fragments of a signal reference the signal's buffer (the `erts_bin_drv_alloc` of
-/// `alloc_dist_obufs`); `hdr` is `eiov->iov[1]`, the dist header, and `iov` the data
-/// (`eiov->iov[2..]`), which also references the refc binaries of the encoded term.
-// Port of erts/emulator/beam/dist.h (ErtsDistOutputBuf), OTP-29.1.1.
-#[derive(Debug)]
+/// The buffer record, its `ErlIOVec` and the `iov`/`binv` arrays are in the signal's driver
+/// Binary (`alloc_dist_obufs`), which every fragment holds one reference to (`obuf->bin`);
+/// this handle is that reference and the record's offset. `eiov->iov[0]` is reserved for the
+/// driver, `iov[1]` is the dist header and `iov[2..vsize]` the data; every element with a
+/// `binv` slot holds a reference to its Binary.
+// Port of erts/emulator/beam/erl_node_tables.h (ErtsDistOutputBuf), OTP-29.1.1.
 pub struct ErtsDistOutputBuf {
-    hdr: DistIov,
-    /// The header as `erts_encode_ext_dist_header_finalize` rewrote it for the wire. The
-    /// shared buffer is immutable, so the rewritten header is kept here instead of in place.
-    wire_hdr: Option<Vec<u8>>,
-    iov: Vec<DistIov>,
+    bin: raw::ObufBin,
+    obuf: usize,
+}
+
+impl std::fmt::Debug for ErtsDistOutputBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ErtsDistOutputBuf")
+            .field("size", &self.size())
+            .finish()
+    }
 }
 
 impl ErtsDistOutputBuf {
-    /// `size_obuf`: the bytes this buffer puts on the wire.
-    pub fn size(&self) -> usize {
-        self.header().len() + self.iov.iter().map(|iov| iov.range.len()).sum::<usize>()
+    fn record(&self, at: usize) -> usize {
+        self.bin.word(at)
     }
 
-    fn header(&self) -> &[u8] {
-        match &self.wire_hdr {
-            Some(hdr) => hdr,
-            None => self.hdr.bytes(),
+    fn set_record(&mut self, at: usize, value: usize) {
+        self.bin.set_word(at, value);
+    }
+
+    /// `obuf->eiov`: the payload offset of the buffer's `ErlIOVec`.
+    fn eiov(&self) -> usize {
+        self.record(self.obuf)
+    }
+
+    fn vsize(&self) -> usize {
+        self.record(self.eiov() + EIOV_VSIZE)
+    }
+
+    /// The index in the signal's `iov`/`binv` arrays of `eiov->iov[ix]`.
+    fn slot(&self, ix: usize) -> usize {
+        (self.record(self.eiov() + EIOV_IOV) - self.bin.iov_offset()) / SYSIOVEC_SZ + ix
+    }
+
+    /// The bytes of `eiov->iov[ix]`.
+    fn iov(&self, ix: usize) -> &[u8] {
+        self.bin.iov_bytes(self.slot(ix))
+    }
+
+    /// `eiov->iov[ix]` with the reference `binv[ix]` holds, taken out of the slot.
+    fn take_binv(
+        &mut self,
+        ix: usize,
+    ) -> Option<(arinsal_alloc::raw::OwnedBinaryRef, usize, usize)> {
+        let slot = self.slot(ix);
+        self.bin.take_ref(slot)
+    }
+
+    /// The signal dropped by `transcode_dist_obuf`: the `binv` references of `iov[1..]`
+    /// released, the buffer a tick (`vsize = 1`, `size = 0`).
+    fn free_to_tick(&mut self) {
+        for ix in 1..self.vsize() {
+            drop(self.take_binv(ix));
         }
+        let eiov = self.eiov();
+        self.set_record(eiov + EIOV_VSIZE, 1);
+        self.set_record(eiov + EIOV_SIZE, 0);
     }
 
-    /// The I/O vector the buffer is output as (`eiov->iov[1..]`): the header, then the data.
-    /// An empty vector is a tick (a signal transcoded away).
+    /// `size_obuf`: the bytes this buffer puts on the wire (`eiov->size`).
+    pub fn size(&self) -> usize {
+        self.record(self.eiov() + EIOV_SIZE)
+    }
+
+    /// The I/O vector the buffer is output as (`eiov->iov[1..vsize]`): the header, then the
+    /// data. An empty vector is a tick (a signal transcoded away).
     pub fn iovec(&self) -> Vec<&[u8]> {
-        let header = self.header();
-        std::iter::once(header)
-            .chain(self.iov.iter().map(DistIov::bytes))
+        (1..self.vsize())
+            .map(|ix| self.iov(ix))
             .filter(|part| !part.is_empty())
             .collect()
     }
 
-    /// The I/O vector for output: the wire header and the data elements, each holding its
-    /// Binary reference. An empty header and no data is a tick.
-    pub fn into_iov(self) -> (Vec<u8>, Vec<DistIov>) {
-        let header = match self.wire_hdr {
-            Some(hdr) => hdr,
-            None => self.hdr.bytes().to_vec(),
-        };
-        (header, self.iov)
+    /// The I/O vector for output, `eiov->iov[1..vsize]` with the references of `binv`
+    /// handed over to the elements (dist_port_commandv / dist_ctrl_get_data, then
+    /// `free_dist_obuf(obuf, 0)`). An empty vector is a tick.
+    pub fn into_iov(mut self) -> Vec<DistIov> {
+        let mut iov = Vec::with_capacity(self.vsize());
+        for ix in 1..self.vsize() {
+            if let Some((bin, start, len)) = self.take_binv(ix)
+                && len != 0
+            {
+                iov.push(DistIov {
+                    bin,
+                    range: start..start + len,
+                });
+            }
+        }
+        iov
     }
 
     /// The bytes of [`Self::iovec`] in one buffer.
     pub fn to_vec(&self) -> Vec<u8> {
         self.iovec().concat()
+    }
+
+    /// The data elements (`iov[2..vsize]`): the Binary each references (header address),
+    /// the payload offset in it and the length.
+    #[cfg(test)]
+    fn data_elements(&self) -> Vec<(usize, std::ops::Range<usize>)> {
+        (2..self.vsize())
+            .map(|ix| self.bin.slot_parts(self.slot(ix)))
+            .collect()
+    }
+}
+
+impl Drop for ErtsDistOutputBuf {
+    /// `free_dist_obuf(obuf, !0)`: the `binv` references, then `erts_bin_release(obuf->bin)`.
+    // Port of erts/emulator/beam/dist.c (free_dist_obuf), OTP-29.1.1.
+    fn drop(&mut self) {
+        for ix in 0..self.vsize() {
+            drop(self.take_binv(ix));
+        }
     }
 }
 
@@ -764,9 +909,9 @@ pub enum DistHeaderFinalize {
 
 /// Finalize an output buffer for the connection when it is taken for output: a signal
 /// encoded toward a pending connection is transcoded for the connection's `dflags`; the
-/// internal atom cache instructions of a dist header are turned into the wire header,
-/// updating the connection's output atom `cache`. `reds` is decremented by the reductions
-/// the transcoding uses.
+/// internal atom cache instructions of a dist header are rewritten in place as the wire
+/// header (`iov[1]` grows backwards into the room the encode reserved), updating the
+/// connection's output atom `cache`. `reds` is decremented by the reductions used.
 // Port of erts/emulator/beam/external.c (erts_encode_ext_dist_header_finalize), OTP-29.1.1.
 pub fn erts_encode_ext_dist_header_finalize(
     ob: &mut ErtsDistOutputBuf,
@@ -774,93 +919,155 @@ pub fn erts_encode_ext_dist_header_finalize(
     dflags: u64,
     reds: &mut i64,
 ) -> DistHeaderFinalize {
-    let ep = ob.hdr.bytes();
-    if ob.wire_hdr.is_some() || ep.is_empty() {
+    let ep = ob.iov(1);
+    let hdr_len = ep.len();
+    let hdr_base = ep.as_ptr() as usize;
+    if ep.is_empty() {
         return DistHeaderFinalize::Done;
     }
     if ep[0] == HOPEFUL_DATA {
-        let mut flat = ob.to_vec();
-        let result = transcode_dist_obuf(&mut flat, dflags, reds);
-        ob.wire_hdr = Some(flat);
-        ob.iov.clear();
-        return result;
+        return transcode_dist_obuf(ob, dflags, reds);
     }
-    if ep[0] == PASS_THROUGH || ep[1] == DIST_FRAG_CONT {
+    if ep[0] == PASS_THROUGH {
+        debug_assert_eq!(hdr_len, 1);
+        return DistHeaderFinalize::Done;
+    }
+    if ep[1] == DIST_FRAG_CONT {
+        debug_assert_eq!(ep[0], VERSION_MAGIC);
+        debug_assert_eq!(hdr_len, ERTS_DIST_FRAGMENT_HEADER_SIZE);
         return DistHeaderFinalize::Done;
     }
     let mut ip = 2;
-    let frag = (ep[1] == DIST_FRAG_HEADER).then(|| {
-        let ids = (&ep[2..10], &ep[10..18]);
+    let mut frag = None;
+    if ep[1] == DIST_FRAG_HEADER {
+        // Skip the seq id and frag id.
+        frag = Some((get_int64(&ep[2..10]), get_int64(&ep[10..18])));
         ip += 16;
-        ids
-    });
+    }
     let dist_hdr_flags = ep[ip];
     let long_atoms = dist_hdr_flags & ERTS_DIST_HDR_LONG_ATOMS_FLG != 0;
     let ci = ep[ip + 1] as usize;
     ip += 2;
+    // `instr_buf`: the cache update instructions, copied before the header is rewritten
+    // over them.
+    let mut instr_buf = [0u8; (2 + 4) * ERTS_MAX_INTERNAL_ATOM_CACHE_ENTRIES];
+    let sz = (2 + 4) * ci;
+    instr_buf[..sz].copy_from_slice(&ep[ip..ip + sz]);
+    debug_assert_eq!(ip + sz, hdr_len);
+    // The header is written backwards, ending where the internal header ends: the encode
+    // reserved `erts_encode_ext_dist_header_size` bytes (every atom a new entry) in front.
+    let end = ob.bin.data_offset(hdr_base) + hdr_len;
+    let mut wire_len = 1 + 1 + 1 + if frag.is_some() { 16 } else { 0 };
     let table = global_atoms();
-    let mut wire = Vec::with_capacity(ob.hdr.range.len());
-    wire.push(VERSION_MAGIC);
-    match frag {
-        Some((seq_id, frag_id)) => {
-            wire.push(DIST_FRAG_HEADER);
-            wire.extend_from_slice(seq_id);
-            wire.extend_from_slice(frag_id);
-        }
-        None => wire.push(DIST_HEADER),
-    }
-    wire.push(ci as u8);
     if ci > 0 {
-        let flags_at = wire.len();
-        wire.resize(flags_at + erts_dist_hdr_atom_cache_flag_bytes(ci), 0);
-        let mut refs = Vec::with_capacity(ci * 2);
+        wire_len += erts_dist_hdr_atom_cache_flag_bytes(ci);
         for iix in 0..ci {
-            let instr = &ep[ip + 6 * iix..ip + 6 * iix + 6];
+            let instr = &instr_buf[6 * iix..6 * iix + 6];
+            let cix = u16::from_be_bytes([instr[0], instr[1]]) as usize;
+            let atom = Atom(u32::from_be_bytes([instr[2], instr[3], instr[4], instr[5]]));
+            wire_len += 1;
+            if cache.out_arr[cix] != Some(atom) {
+                let len = table.text(atom).map_or(0, str::len);
+                wire_len += if long_atoms { 2 } else { 1 } + len;
+            }
+        }
+    }
+    let start = end - wire_len;
+    let wire = ob.bin.bytes_mut(start, wire_len);
+    let mut ep = wire_len;
+    if ci > 0 {
+        let flgs_bytes = erts_dist_hdr_atom_cache_flag_bytes(ci);
+        let mut flags = vec![0u8; flgs_bytes];
+        for iix in (0..ci).rev() {
+            let instr = &instr_buf[6 * iix..6 * iix + 6];
             let cix = u16::from_be_bytes([instr[0], instr[1]]) as usize;
             let atom = Atom(u32::from_be_bytes([instr[2], instr[3], instr[4], instr[5]]));
             let new = cache.out_arr[cix] != Some(atom);
-            refs.push(cix as u8);
             if new {
                 cache.out_arr[cix] = Some(atom);
                 let name = table.text(atom).unwrap_or_default();
+                ep -= name.len();
+                wire[ep..ep + name.len()].copy_from_slice(name.as_bytes());
                 if long_atoms {
-                    refs.extend_from_slice(&(name.len() as u16).to_be_bytes());
+                    ep -= 2;
+                    wire[ep..ep + 2].copy_from_slice(&(name.len() as u16).to_be_bytes());
                 } else {
-                    refs.push(name.len() as u8);
+                    ep -= 1;
+                    wire[ep] = name.len() as u8;
                 }
-                refs.extend_from_slice(name.as_bytes());
             }
+            ep -= 1;
+            wire[ep] = cix as u8;
             let nibble = (u8::from(new) << 3) | ((cix >> 8) as u8 & 7);
-            wire[flags_at + iix / 2] |= nibble << ((iix % 2) * 4);
+            flags[iix / 2] |= nibble << ((iix % 2) * 4);
         }
-        wire[flags_at + ci / 2] |= dist_hdr_flags << ((ci % 2) * 4);
-        wire.extend_from_slice(&refs);
+        flags[ci / 2] |= dist_hdr_flags << ((ci % 2) * 4);
+        ep -= flgs_bytes;
+        wire[ep..ep + flgs_bytes].copy_from_slice(&flags);
+        // Was ERTS_PORT_REDS_DIST_CMD_FINALIZE.
+        *reds -= 3;
     }
-    ob.wire_hdr = Some(wire);
+    ep -= 1;
+    wire[ep] = ci as u8;
+    match frag {
+        Some((seq_id, frag_id)) => {
+            ep -= 8;
+            wire[ep..ep + 8].copy_from_slice(&frag_id.to_be_bytes());
+            ep -= 8;
+            wire[ep..ep + 8].copy_from_slice(&seq_id.to_be_bytes());
+            ep -= 1;
+            wire[ep] = DIST_FRAG_HEADER;
+        }
+        None => {
+            ep -= 1;
+            wire[ep] = DIST_HEADER;
+        }
+    }
+    ep -= 1;
+    wire[ep] = VERSION_MAGIC;
+    debug_assert_eq!(ep, 0);
+    let eiov = ob.eiov();
+    let size = ob.size();
+    ob.set_record(eiov + EIOV_SIZE, size - hdr_len + wire_len);
+    let slot = ob.slot(1);
+    ob.bin.set_own(slot, start, wire_len);
+    *reds = (*reds).max(0);
     DistHeaderFinalize::Done
 }
 
-/// Rewrite a signal encoded toward a pending connection for the flags the connection got:
-/// drop what the peer cannot take, rewrite `DOP_ALTACT_SIG_SEND` as the plain operation, and
-/// replace the hopeful header by the real one. `ob` is the flattened buffer; its payload ix
-/// is the payload's offset in it (erts: the payload's I/O vector index).
+fn get_int64(bytes: &[u8]) -> u64 {
+    u64::from_be_bytes(bytes.try_into().expect("8 bytes"))
+}
+
+/// `ERTS_TRANSCODE_REDS_FACT` (external.c).
+const ERTS_TRANSCODE_REDS_FACT: i64 = 4;
+
+/// Rewrite, in place, a signal encoded toward a pending connection for the flags the
+/// connection got: drop what the peer cannot take (the buffer becomes a tick), rewrite
+/// `DOP_ALTACT_SIG_SEND` as the plain operation inside `iov[2]`, prepend the version magic
+/// on the payload (`iov[payload_ix]`) and replace the hopeful header in `iov[1]` by the real
+/// one. `reds` is decremented by the reductions used.
 // Port of erts/emulator/beam/external.c (transcode_dist_obuf), OTP-29.1.1.
-fn transcode_dist_obuf(ob: &mut Vec<u8>, dflags: u64, reds: &mut i64) -> DistHeaderFinalize {
-    debug_assert!(ob.len() > HOPEFUL_HDR_SZ);
-    let payload_ix = u32::from_be_bytes(ob[13..HOPEFUL_HDR_SZ].try_into().unwrap()) as usize;
-    // Control message always begins after the hopeful header.
-    let mut ep = HOPEFUL_HDR_SZ;
-    let ctl_end = if payload_ix != 0 {
-        payload_ix - 1
-    } else {
-        ob.len()
-    };
-    let b = |ob: &Vec<u8>, i: usize| ob.get(ep + i).copied().unwrap_or(0);
-    debug_assert!(b(ob, 0) == SMALL_TUPLE_EXT || b(ob, 0) == LARGE_TUPLE_EXT);
-    let small_op = |ob: &Vec<u8>| {
-        (b(ob, 0) == SMALL_TUPLE_EXT && b(ob, 2) == SMALL_INTEGER_EXT).then(|| (b(ob, 1), b(ob, 3)))
-    };
-    let op = small_op(ob);
+fn transcode_dist_obuf(
+    ob: &mut ErtsDistOutputBuf,
+    dflags: u64,
+    reds: &mut i64,
+) -> DistHeaderFinalize {
+    if *reds < 0 {
+        return DistHeaderFinalize::Done;
+    }
+    // HOPEFUL_DATA header always present in io vector element 1:
+    // 'H', hopeful flags (8), hopeful ix (4), payload ix (4).
+    let hdr = ob.iov(1);
+    debug_assert_eq!(hdr[0], HOPEFUL_DATA);
+    debug_assert_eq!(hdr.len(), HOPEFUL_HDR_SZ);
+    // Currently, the hopeful flags and IX are not used.
+    let payload_ix = u32::from_be_bytes(hdr[13..17].try_into().expect("4 bytes")) as usize;
+    // Control message always begins in vector element 2.
+    let ep = ob.iov(2);
+    let b = |i: usize| ep.get(i).copied().unwrap_or(0);
+    debug_assert!(b(0) == SMALL_TUPLE_EXT || b(0) == LARGE_TUPLE_EXT);
+    let op = (b(0) == SMALL_TUPLE_EXT && b(2) == SMALL_INTEGER_EXT).then(|| (b(1), b(3)));
     let drop_monitor = !dflags & (DFLAG_DIST_MONITOR | DFLAG_DIST_MONITOR_NAME) != 0
         && matches!(
             op,
@@ -870,7 +1077,7 @@ fn transcode_dist_obuf(ob: &mut Vec<u8>, dflags: u64, reds: &mut i64) -> DistHea
         && matches!(op, Some((3 | 4, DOP_ALIAS_SEND | DOP_ALIAS_SEND_TT)));
     if drop_monitor || drop_alias {
         // Drop the packet by converting it to an empty (tick) packet.
-        ob.clear();
+        ob.free_to_tick();
         return DistHeaderFinalize::Done;
     }
     if dflags & DFLAG_SPAWN == 0
@@ -880,10 +1087,12 @@ fn transcode_dist_obuf(ob: &mut Vec<u8>, dflags: u64, reds: &mut i64) -> DistHea
         )
     {
         // The receiver does not support distributed spawn: a tick, and the spawning process
-        // is told `notsup`.
-        let ctl = ob[ep..ctl_end].to_vec();
-        ob.clear();
-        *reds -= 4;
+        // is told `notsup` by the caller, which decodes the control message
+        // (transcode_decode_ctl_msg: iov[2..payload_ix]).
+        debug_assert!(payload_ix >= 3);
+        let ctl: Vec<u8> = (2..payload_ix).flat_map(|ix| ob.iov(ix).to_vec()).collect();
+        ob.free_to_tick();
+        *reds = (*reds - 4).max(0);
         return DistHeaderFinalize::SpawnNotSupported(ctl);
     }
     let mut payload_moved_to_control = false;
@@ -891,11 +1100,9 @@ fn transcode_dist_obuf(ob: &mut Vec<u8>, dflags: u64, reds: &mut i64) -> DistHea
         && let Some((tuple_size @ (4 | 5), DOP_ALTACT_SIG_SEND)) = op
     {
         let mut tuple_size = tuple_size;
-        // The flags were encoded as a SMALL_INTEGER_EXT; `ptr` is the last byte before
-        // SenderPid.
-        assert_eq!(b(ob, 4), SMALL_INTEGER_EXT, "Invalid altact msg flags");
-        let flags = b(ob, 5);
-        let mut ptr = ep + 5;
+        // The flags were encoded as a SMALL_INTEGER_EXT.
+        assert_eq!(b(4), SMALL_INTEGER_EXT, "Invalid altact msg flags");
+        let flags = b(5);
         let token = flags & ERTS_DOP_ALTACT_SIG_FLG_TOKEN != 0;
         let pick = |tt: u8, plain: u8| if token { tt } else { plain };
         let dist_op = if flags & ERTS_DOP_ALTACT_SIG_FLG_EXIT != 0 {
@@ -919,33 +1126,40 @@ fn transcode_dist_obuf(ob: &mut Vec<u8>, dflags: u64, reds: &mut i64) -> DistHea
         } else {
             pick(DOP_SEND_TT, DOP_SEND)
         };
-        match dist_op {
+        if dist_op == 0 {
             // Drop the signal and send a tick instead.
-            0 => {
-                ob.clear();
-                return DistHeaderFinalize::Done;
-            }
+            ob.free_to_tick();
+            *reds = (*reds - 1).max(0);
+            return DistHeaderFinalize::Done;
+        }
+        let ep_len = ep.len();
+        let slot2 = ob.slot(2);
+        let ep_off = ob.bin.data_offset(ep.as_ptr() as usize);
+        let ctl = ob.bin.bytes_mut(ep_off, ep_len);
+        // `ptr`: the last byte before SenderPid.
+        let mut ptr = 5;
+        match dist_op {
             // Drop the flags element, write the new operation, one element less.
             DOP_ALIAS_SEND | DOP_ALIAS_SEND_TT | DOP_SEND_SENDER | DOP_SEND_SENDER_TT
             | DOP_PAYLOAD_EXIT2 | DOP_PAYLOAD_EXIT2_TT => tuple_size -= 1,
             // Reason follows the control message as its last element: same tuple size, and
-            // no VERSION_MAGIC before it.
+            // no version magic before it.
             DOP_EXIT2 | DOP_EXIT2_TT => payload_moved_to_control = true,
             DOP_REG_SEND | DOP_REG_SEND_TT | DOP_SEND | DOP_SEND_TT => {
                 ptr += 1;
                 let sender_start = ptr;
-                assert_eq!(ob[sender_start], NEW_PID_EXT, "Unexpected pid encoding");
+                assert_eq!(ctl[sender_start], NEW_PID_EXT, "Unexpected pid encoding");
                 ptr += 1;
-                let tag = ob[ptr];
+                let tag = ctl[ptr];
                 ptr += 1;
                 let n = match tag {
                     ATOM_UTF8_EXT => {
-                        let n = u16::from_be_bytes([ob[ptr], ob[ptr + 1]]) as usize;
+                        let n = u16::from_be_bytes([ctl[ptr], ctl[ptr + 1]]) as usize;
                         ptr += 2;
                         n
                     }
                     SMALL_ATOM_UTF8_EXT => {
-                        let n = ob[ptr] as usize;
+                        let n = ctl[ptr] as usize;
                         ptr += 1;
                         n
                     }
@@ -954,54 +1168,76 @@ fn transcode_dist_obuf(ob: &mut Vec<u8>, dflags: u64, reds: &mut i64) -> DistHea
                 ptr += n + 4 /* ID */ + 4 /* serial */ + 4 /* creation */;
                 // `ptr` is the first byte of ToPid / ToName.
                 if dist_op == DOP_SEND || dist_op == DOP_SEND_TT {
-                    // Replace SenderPid by the empty atom.
-                    ob[ptr - 1] = 0;
-                    ob[ptr - 2] = SMALL_ATOM_UTF8_EXT;
+                    // Write the empty atom over the end of SenderPid.
+                    ptr -= 1;
+                    ctl[ptr] = 0;
+                    ptr -= 1;
+                    ctl[ptr] = SMALL_ATOM_UTF8_EXT;
                     tuple_size -= 1;
-                    ptr -= 3;
+                    ptr -= 1;
+                    *reds -= 1;
                 } else {
-                    // Move SenderPid two bytes earlier and put the empty atom between it and
-                    // ToName.
+                    // Move SenderPid two bytes earlier to make room for the empty atom
+                    // between it and ToName.
                     let new_sender_start = sender_start - 2;
-                    ob.copy_within(sender_start..ptr, new_sender_start);
-                    ob[ptr - 1] = 0;
-                    ob[ptr - 2] = SMALL_ATOM_UTF8_EXT;
+                    ctl.copy_within(sender_start..ptr, new_sender_start);
+                    ptr -= 1;
+                    ctl[ptr] = 0;
+                    ptr -= 1;
+                    ctl[ptr] = SMALL_ATOM_UTF8_EXT;
                     ptr = new_sender_start - 1;
+                    *reds -= 2;
                 }
             }
             _ => panic!("Unexpected fallback dist operation"),
         }
         // altact_sig_fallback_common: write the operation and tuple header backwards.
-        ob[ptr] = dist_op;
-        ob[ptr - 1] = SMALL_INTEGER_EXT;
-        ob[ptr - 2] = tuple_size;
-        ob[ptr - 3] = SMALL_TUPLE_EXT;
-        *reds -= 1;
+        ctl[ptr] = dist_op;
+        ctl[ptr - 1] = SMALL_INTEGER_EXT;
+        ctl[ptr - 2] = tuple_size;
         ptr -= 3;
-        debug_assert!(ptr >= ep);
-        ep = ptr;
+        ctl[ptr] = SMALL_TUPLE_EXT;
+        *reds -= 1;
+        ob.bin.set_own(slot2, ep_off + ptr, ep_len - ptr);
+        let eiov = ob.eiov();
+        let size = ob.size();
+        ob.set_record(eiov + EIOV_SIZE, size - ptr);
     }
+    let start_r = *reds * ERTS_TRANSCODE_REDS_FACT;
+    let mut r = start_r;
     // Replace the hopeful data header with the actual header.
-    let mut out = Vec::with_capacity(ob.len());
-    if dflags & (DFLAG_DIST_HDR_ATOM_CACHE | DFLAG_FRAGMENTS) != 0 {
-        // Encoded without atom caching but the receiver expects a dist header: an empty one.
-        out.extend_from_slice(&[VERSION_MAGIC, DIST_HEADER, 0]);
-        out.extend_from_slice(&ob[ep..ctl_end]);
-        if payload_ix != 0 {
-            out.extend_from_slice(&ob[payload_ix..]);
-        }
+    let eiov = ob.eiov();
+    let hdr = ob.iov(1);
+    let hdr_off = ob.bin.data_offset(hdr.as_ptr() as usize);
+    let mut size = ob.size() - hdr.len();
+    let header: &[u8] = if dflags & (DFLAG_DIST_HDR_ATOM_CACHE | DFLAG_FRAGMENTS) != 0 {
+        // Encoded without atom caching but the receiver expects a dist header: an empty
+        // one is prepended.
+        &[VERSION_MAGIC, DIST_HEADER, 0]
     } else {
-        out.extend_from_slice(&[PASS_THROUGH, VERSION_MAGIC]);
-        out.extend_from_slice(&ob[ep..ctl_end]);
-        if payload_ix != 0 {
-            if !payload_moved_to_control {
-                // Prepend version magic on payload.
-                out.push(VERSION_MAGIC);
-            }
-            out.extend_from_slice(&ob[payload_ix..]);
+        if payload_ix != 0 && !payload_moved_to_control {
+            debug_assert!(0 < payload_ix && payload_ix < ob.vsize());
+            // Prepend version magic on payload: the encode left the byte before it free.
+            let payload = ob.iov(payload_ix);
+            let len = payload.len();
+            let off = ob.bin.data_offset(payload.as_ptr() as usize) - 1;
+            ob.bin.bytes_mut(off, 1)[0] = VERSION_MAGIC;
+            let slot = ob.slot(payload_ix);
+            ob.bin.set_own(slot, off, len + 1);
+            size += 1;
+            r -= 1;
         }
-    }
-    *ob = out;
+        &[PASS_THROUGH, VERSION_MAGIC]
+    };
+    ob.bin
+        .bytes_mut(hdr_off, header.len())
+        .copy_from_slice(header);
+    let slot1 = ob.slot(1);
+    ob.bin.set_own(slot1, hdr_off, header.len());
+    size += header.len();
+    ob.set_record(eiov + EIOV_SIZE, size);
+    r -= 1;
+    *reds = (*reds - ((start_r - r) / ERTS_TRANSCODE_REDS_FACT + 1)).max(0);
     DistHeaderFinalize::Done
 }
 /// `enum erts_dsig_send_phase` up to `ERTS_DSIG_SEND_PHASE_FIN`: the encode part of
@@ -1056,13 +1292,15 @@ pub struct DsigEncode {
     dhdr_ext_size: usize,
     dhdrp: usize,
     extp: usize,
+    /// The payload offset of the data: the output buffers and their I/O vectors come first.
+    data_off: usize,
     alloced_fragments: usize,
     fragments: usize,
     vlen: isize,
     sc: TtbDistSizeContext,
     ec: Option<TtbDistEncodeContext>,
     /// `ctx->obuf->bin`: the signal's buffer, uniquely owned until `FIN`.
-    bin: Option<arinsal_alloc::typed::BinaryBlock>,
+    bin: Option<raw::ObufBlock>,
     obufs: Vec<ErtsDistOutputBuf>,
     node_source: fn() -> (Atom, u32),
 }
@@ -1102,6 +1340,7 @@ impl DsigEncode {
             dhdr_ext_size: 0,
             dhdrp: 0,
             extp: 0,
+            data_off: 0,
             alloced_fragments: 0,
             fragments: 0,
             vlen: 0,
@@ -1240,21 +1479,35 @@ impl DsigEncode {
                     }
                     self.dhdr_ext_size =
                         erts_encode_ext_dist_header_size(self.dflags, acmp, self.fragments);
-                    // alloc_dist_obufs: one buffer of the exact size for every fragment.
-                    let size = self.dhdr_ext_size
+                    // alloc_dist_obufs: one driver Binary of the exact size for the output
+                    // buffers of every fragment, their I/O vectors and the data.
+                    let data_size = self.dhdr_ext_size
                         + self.data_size
                         + (self.fragments - 1) * ERTS_DIST_FRAGMENT_HEADER_SIZE;
-                    // erts_bin_drv_alloc never fails (it aborts on out of memory).
-                    let mut block = arinsal_alloc::typed::BinaryBlock::new(size, 0, size)
-                        .expect("dist output buffer allocation");
-                    let bin = block.bytes_mut_unique().expect("a fresh Binary is unique");
+                    let vlen = usize::try_from(self.vlen).expect("the size pass set vlen");
+                    let obsz = OBUF_SZ * self.fragments;
+                    let iov_sz = erts_ttb_iov_size(vlen, self.fragments);
+                    let size = obsz + iov_sz + data_size;
+                    self.data_off = obsz + iov_sz;
+                    let mut block = raw::ObufBlock::alloc(size, obsz, vlen, self.data_off);
+                    let (mut meta, bin) = block.split();
                     let fragment_size = if self.fragments > 1 {
                         ERTS_DIST_FRAGMENT_SIZE
                     } else {
                         usize::MAX
                     };
-                    let mut ec =
-                        TtbDistEncodeContext::new(self.fragments, fragment_size, self.node_source);
+                    let data_base = meta.data_base();
+                    let mut ec = TtbDistEncodeContext::new(
+                        obsz,
+                        vlen,
+                        fragment_size,
+                        data_base,
+                        self.node_source,
+                    );
+                    for ix in 0..self.fragments {
+                        // obuf[ix].eiov = &ctx->fragment_eiovs[ix].
+                        meta.set_word(OBUF_SZ * ix, ec.fragment_eiovs + ERLIOVEC_SZ * ix);
+                    }
                     self.alloced_fragments = self.fragments;
                     // Encode the internal version of the dist header.
                     self.extp = self.dhdr_ext_size;
@@ -1267,21 +1520,29 @@ impl DsigEncode {
                         self.from,
                         &mut ec,
                     );
-                    ec.dhdrp = self.dhdrp;
                     self.dhdr_ext_size = self.extp - self.dhdrp;
                     loop {
                         let mut reds = CONTEXT_REDS;
                         // Encode the control message.
-                        let done = erts_encode_dist_ext(
+                        let done = match erts_encode_dist_ext(
                             self.ctl,
-                            bin,
+                            &mut meta,
+                            &mut *bin,
                             &mut self.extp,
                             self.dflags,
                             acmp,
                             &mut ec,
                             &mut self.fragments,
                             &mut reds,
-                        )?;
+                        ) {
+                            Ok(done) => done,
+                            Err(error) => {
+                                // The references stored so far go with the buffer
+                                // (erts_dsend_context_dtor).
+                                meta.release_slots();
+                                return Err(error);
+                            }
+                        };
                         *ctx_reds -= CONTEXT_REDS - reds;
                         if done {
                             break;
@@ -1297,18 +1558,19 @@ impl DsigEncode {
                 }
                 DsigSendPhase::MsgEncode => {
                     let msg = self.msg.expect("MSG_ENCODE has a payload");
-                    let bin = self
+                    let (mut meta, bin) = self
                         .bin
                         .as_mut()
-                        .and_then(|block| block.bytes_mut_unique())
-                        .expect("buffer allocated in ALLOC and unique until FIN");
+                        .expect("buffer allocated in ALLOC")
+                        .split();
                     let ec = self.ec.as_mut().expect("encode context set up in ALLOC");
                     loop {
                         let mut local = CONTEXT_REDS;
                         let redsp = if no_trap { &mut local } else { &mut *ctx_reds };
                         let done = erts_encode_dist_ext(
                             msg,
-                            bin,
+                            &mut meta,
+                            &mut *bin,
                             &mut self.extp,
                             self.dflags,
                             acmp,
@@ -1342,11 +1604,16 @@ impl DsigEncode {
     }
 
     /// `ERTS_DSIG_SEND_PHASE_FIN`: the fragment count in the `DIST_FRAG_HEADER`, the
-    /// `DIST_FRAG_CONT` headers after the data, and one output buffer per fragment.
+    /// `DIST_FRAG_CONT` headers after the data in `iov[1]` of each fragment's `ErlIOVec`,
+    /// and the references the elements of the signal's own buffer hold (`binv`), taken now
+    /// that the buffer is complete. One output buffer per fragment, each holding a
+    /// reference to the Binary.
+    // Port of erts/emulator/beam/dist.c (erts_dsig_send, ERTS_DSIG_SEND_PHASE_FIN), OTP-29.1.1.
     fn fin(&mut self) {
         let mut block = self.bin.take().expect("buffer allocated in ALLOC");
-        let bin = block.bytes_mut_unique().expect("buffer unique until FIN");
         let ec = self.ec.take().expect("encode context set up in ALLOC");
+        let (mut meta, bin) = block.split();
+        let data_base = meta.data_base();
         let mut fid = self.fragments as u64;
         debug_assert!(fid >= 1);
         debug_assert!(self.alloced_fragments >= self.fragments);
@@ -1355,36 +1622,42 @@ impl DsigEncode {
             let at = self.dhdrp + 1 + 1 + 8;
             bin[at..at + 8].copy_from_slice(&(self.fragments as u64).to_be_bytes());
         }
-        let mut headers = Vec::with_capacity(self.fragments);
-        headers.push(self.dhdrp..self.dhdrp + self.dhdr_ext_size);
-        for _ in 1..self.fragments {
-            fid -= 1;
-            let hdr = erts_encode_ext_dist_header_fragment(bin, &mut self.extp, fid, self.from);
-            headers.push(hdr..self.extp);
+        for fix in 0..self.fragments {
+            let (hdr, sz) = if fix == 0 {
+                (self.dhdrp, self.dhdr_ext_size)
+            } else {
+                fid -= 1;
+                let hdr = erts_encode_ext_dist_header_fragment(bin, &mut self.extp, fid, self.from);
+                (hdr, self.extp - hdr)
+            };
+            let eiov = ec.fragment_eiovs + ERLIOVEC_SZ * fix;
+            debug_assert!(meta.word(eiov + EIOV_VSIZE) >= 3);
+            let size = meta.word(eiov + EIOV_SIZE);
+            meta.set_word(eiov + EIOV_SIZE, size + sz);
+            let slot = (meta.word(eiov + EIOV_IOV) - ec.iov) / SYSIOVEC_SZ + 1;
+            debug_assert_eq!(meta.iov_len(slot), 0);
+            meta.set_own(slot, data_base + hdr, sz);
         }
         debug_assert!(fid == 1);
-        let bin = block.into_reference();
-        let common = |range| DistIov {
-            bin: bin
-                .try_clone()
-                .expect("the signal's buffer is live while referenced"),
-            range,
-        };
-        // A size pass that over-counted leaves allocated fragments unused; they are dropped.
-        self.obufs = headers
-            .into_iter()
-            .zip(ec.fragment_eiovs)
-            .map(|(hdr, feiov)| ErtsDistOutputBuf {
-                hdr: common(hdr),
-                wire_hdr: None,
-                iov: feiov
-                    .iov
-                    .into_iter()
-                    .map(|iov| match iov {
-                        EncIov::Common(range) => common(range),
-                        EncIov::Binary(iov) => iov,
-                    })
-                    .collect(),
+        // binv[1] and the data elements of the signal's own buffer get their references
+        // now that the buffer is complete.
+        let bin = block.into_shared();
+        // A size pass that over-counted leaves allocated fragments unused; they are dropped
+        // (free_dist_obuf(&ctx->obuf[fix], 0)).
+        let mut bin = Some(bin);
+        self.obufs = (0..self.fragments)
+            .map(|fix| {
+                let bin = if fix + 1 == self.fragments {
+                    bin.take().expect("one reference per fragment")
+                } else {
+                    bin.as_ref()
+                        .and_then(|bin| bin.try_clone())
+                        .expect("the signal's buffer is live while referenced")
+                };
+                ErtsDistOutputBuf {
+                    bin,
+                    obuf: OBUF_SZ * fix,
+                }
             })
             .collect();
     }
@@ -1658,6 +1931,36 @@ mod tests {
     }
 
     #[test]
+    fn pending_signals_are_transcoded_in_place() {
+        // transcode_dist_obuf rewrites the buffer's own I/O vector: the data elements keep
+        // referencing the signal's Binary and the refc binary of the payload, and the
+        // payload gets its version magic in the byte the encode left in front of it.
+        let mut heap = VecHeap::new();
+        let data: Vec<u8> = (0..4096).map(|i| (i * 3) as u8).collect();
+        let mut builder = TermBuilder::new(&mut heap);
+        let bin = builder.binary(&data).unwrap();
+        let msg = builder.tuple(&[bin, Term::small(5).unwrap()]).unwrap();
+        let (owner, _) = crate::raw::refc_payload(bin).expect("a refc binary");
+        let refs = owner.ref_count().unwrap();
+        let me = Term::pid_from_data((1 << arinsal_term::ptab::PID_NUM_SIZE) | 5);
+        let to = Term::pid_from_data((2 << arinsal_term::ptab::PID_NUM_SIZE) | 9);
+        let altact = tuple(&mut heap, &[small(37), small(1), me, to]);
+        let mut ob = pending(altact, Some(msg));
+        let before: Vec<usize> = ob.data_elements().iter().map(|(h, _)| *h).collect();
+        assert!(before.contains(&(owner.header_ptr() as usize)));
+        let result =
+            erts_encode_ext_dist_header_finalize(&mut ob, &mut ErtsAtomCache::default(), 0, &mut 0);
+        assert_eq!(result, DistHeaderFinalize::Done);
+        let after: Vec<usize> = ob.data_elements().iter().map(|(h, _)| *h).collect();
+        assert_eq!(before, after);
+        let plain = tuple(&mut heap, &[small(2), atom(""), to]);
+        assert_eq!(ob.to_vec(), direct(plain, Some(msg), 0));
+        assert_eq!(ob.size(), ob.to_vec().len());
+        drop(ob);
+        assert_eq!(owner.ref_count().unwrap(), refs);
+    }
+
+    #[test]
     fn unsupported_signals_become_ticks() {
         let mut heap = VecHeap::new();
         let me = Term::pid_from_data((1 << arinsal_term::ptab::PID_NUM_SIZE) | 5);
@@ -1741,11 +2044,11 @@ mod tests {
         assert_eq!(obufs.len(), 2);
         let referenced: usize = obufs
             .iter()
-            .flat_map(|ob| ob.iov.iter())
-            .filter(|iov| iov.bin.header_ptr() == owner.header_ptr())
-            .map(|iov| {
-                assert!(iov.range.start >= offset);
-                iov.range.len()
+            .flat_map(|ob| ob.data_elements())
+            .filter(|(header, _)| *header == owner.header_ptr() as usize)
+            .map(|(_, range)| {
+                assert!(range.start >= offset);
+                range.len()
             })
             .sum();
         assert_eq!(referenced, data.len());
@@ -1793,8 +2096,9 @@ mod tests {
             "pinned by the encode"
         );
         // The control message and binary header, then the binary itself.
-        assert_eq!(obufs[0].iov.len(), 3);
-        assert_eq!(obufs[0].iov[2].range.len(), data.len());
+        let elements = obufs[0].data_elements();
+        assert_eq!(elements.len(), 3);
+        assert_eq!(elements[2].1.len(), data.len());
         let mut cache = ErtsAtomCache::default();
         erts_encode_ext_dist_header_finalize(&mut obufs[0], &mut cache, DFLAGS, &mut 0);
         let bytes = obufs[0].to_vec();
@@ -1822,9 +2126,10 @@ mod tests {
         if referenced {
             // The control message, the payload up to the trailing-bits byte, the binary,
             // then that byte.
-            assert_eq!(obufs[0].iov.len(), 4);
-            assert_eq!(obufs[0].iov[2].range.len(), 1000);
-            assert_eq!(obufs[0].iov[3].range.len(), 1);
+            let elements = obufs[0].data_elements();
+            assert_eq!(elements.len(), 4);
+            assert_eq!(elements[2].1.len(), 1000);
+            assert_eq!(elements[3].1.len(), 1);
         }
         let mut cache = ErtsAtomCache::default();
         erts_encode_ext_dist_header_finalize(&mut obufs[0], &mut cache, DFLAGS, &mut 0);

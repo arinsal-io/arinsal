@@ -3,6 +3,26 @@
 use crate::{ExitReason, NativeEntry, ProcessHeader, SchedulerRegisters};
 use core::ffi::c_void;
 
+// Port of erts/emulator/beam/jit/beam_jit_common.cpp:679-704, OTP-29.1.1.
+unsafe extern "C" {
+    /// `beam_jit_load_nif(Process *, ErtsCodePtr, Eterm *)`.
+    pub safe fn beam_jit_load_nif(
+        c_p: *mut ProcessHeader,
+        instruction: usize,
+        registers: *mut u64,
+    ) -> i32;
+}
+
+#[cfg(any(test, feature = "test-runtime-stubs"))]
+mod test_stubs {
+    use super::ProcessHeader;
+
+    #[unsafe(no_mangle)]
+    extern "C" fn beam_jit_load_nif(_: *mut ProcessHeader, _: usize, _: *mut u64) -> i32 {
+        unreachable!("byte-test fixture")
+    }
+}
+
 /// Returns the tagged word for a test-owned term whose heap remains live.
 pub fn term_bits(term: arinsal_term::Term) -> u64 {
     term.tagged_word()

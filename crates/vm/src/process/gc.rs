@@ -10,7 +10,7 @@ pub(crate) struct HibernateCont {
     pub resume_in_place: bool,
     /// `Process.current` survives `i_hibernate/0` in erts; retain that MFA across the scheduler
     /// handoff because Arinsal's interpreter position can point at its spawn trampoline.
-    pub current_mfa: Option<(String, String, u8)>,
+    pub current_mfa: Option<(String, String, u32)>,
 }
 
 /// Records the live arguments and scheduler handoff for `erts_hibernate`.
@@ -19,7 +19,7 @@ pub(crate) fn begin_hibernate(
     process: &mut Process,
     live_registers: &[arinsal_term::Term],
     resume_in_place: bool,
-    current_mfa: Option<(String, String, u8)>,
+    current_mfa: Option<(String, String, u32)>,
 ) {
     process.gc_live = live_registers.len();
     process.heap.abi.arity = live_registers.len() as u8;

@@ -86,7 +86,7 @@ pub use ptab_slot::{Progress, ProgressSlot};
 pub use sig_queue::{
     MessageQueueList, NextField, OwnedSignal, RECV_MARKER_TYPE_PRIO_Q_CONT,
     RECV_MARKER_TYPE_PRIO_Q_END, RECV_MARKER_TYPE_RECV, RECV_MARKER_TYPE_YIELD, RecvMarker,
-    SignalQueue,
+    SignalQueue, YieldAdjMsgQ,
 };
 pub use timer::{TimerId, TimerRef};
 
@@ -894,6 +894,8 @@ pub struct LiteralAreaCopyRequest<M: SignalMessage> {
     pub request: M,
     pub how: LiteralCopyHow,
     pub requester: Pid,
+    /// `ErtsCLAData.yield`, allocated only after a normal signal-handler yield.
+    pub yield_data: Option<Box<YieldAdjMsgQ<Event<M>>>>,
 }
 
 /// Phase of a literal-area copy request.
@@ -1174,6 +1176,26 @@ pub trait Task: Send + 'static {
     fn run(c_p: &mut CP<'_, Self>, esdp: &ErtsSchedulerData<Self>, budget: u32, calls: &mut u32)
     where
         Self: Sized;
+    /// The rest of `erts_schedule`'s schedule-in of the selected process `c_p`, after
+    /// `p->scheduler_data = esdp` and [`Task::trace_schedule_in`]: `p->fcalls = reds` and the
+    /// per-scheduler state the process runs with until its schedule-out.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:10232-10440 (erts_schedule), OTP-29.1.1.
+    fn schedule_in(_c_p: &mut CP<'_, Self>, _esdp: &ErtsSchedulerData<Self>, _reds: u32)
+    where
+        Self: Sized,
+    {
+    }
+    /// The task half of `erts_schedule`'s schedule-out of `c_p`, whose slice used `calls`
+    /// reductions, before [`Task::trace_schedule_out`]: `p->reds += actual_reds` and the
+    /// release of what [`Task::schedule_in`] set up.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:9660-9700 (erts_schedule), OTP-29.1.1.
+    fn schedule_out(_c_p: &mut CP<'_, Self>, _esdp: &ErtsSchedulerData<Self>, _calls: u32)
+    where
+        Self: Sized,
+    {
+    }
     /// `copy_in_registers(c_p, reg)`: load the saved argument registers into this scheduler's
     /// register array (`esdp->registers`) before the slice runs.
     ///
@@ -2915,6 +2937,11 @@ struct Inner<T: Task> {
     cpu_bind_targets: RwLock<Vec<Option<usize>>>,
     cpu_bind_actual: RwLock<Vec<Option<usize>>>,
     stopped: AtomicBool,
+    /// Schedulers suspended for good after the runtime stopped, and the condition the owner
+    /// waits on until all of them are (`schdlr_sspnd.mtx` / `schdlr_sspnd.cnd`).
+    // Port of erts/emulator/beam/erl_process.c (schdlr_sspnd: mtx, cnd and the suspended
+    // scheduler counts suspend_scheduler maintains), OTP-29.1.1.
+    stop_suspended: (Mutex<usize>, Condvar),
     halt_started: AtomicBool,
     halt_requested: AtomicBool,
     runq_halting: Arc<[AtomicBool]>,
@@ -3004,7 +3031,11 @@ struct DirtyPool<T: Task> {
     /// `rq->procs` of the dirty run queue.
     procs: run_queue::ProcQueues<T>,
     queue: Mutex<DirtyQueue>,
+    /// Requested online prefix from `schdlr_sspnd.online`.
     online: AtomicUsize,
+    /// Scheduler threads which have reached the requested online state.
+    /// Port of erts/emulator/beam/erl_process.c (`schdlr_sspnd.curr_online`), OTP-29.1.1.
+    current_online: Mutex<usize>,
     threads: Vec<DirtyThread>,
 }
 
@@ -3024,8 +3055,13 @@ struct DirtyThread {
     /// Set by whoever wakes this scheduler; the spinning wait polls it.
     /// Port of erts/emulator/beam/erl_process.h (`ERTS_SSI_FLG_WAITING`), OTP-29.1.1.
     wake: AtomicBool,
+    /// `ssi->flags`, including `ERTS_SSI_FLG_SUSPENDED`.
+    // Port of erts/emulator/beam/erl_process.h:270, OTP-29.1.1.
+    ssi_flags: AtomicU32,
     stats: Mutex<DirtyStats>,
 }
+
+const ERTS_SSI_FLG_SUSPENDED: u32 = 1 << 4;
 
 /// Wall-time and microstate counters measured on one dirty scheduler thread.
 struct DirtyStats {
@@ -3135,6 +3171,8 @@ impl<T: Task> DirtyPool<T> {
         }
     }
 
+    /// Wake a dirty scheduler through its sticky thread event.
+    // Port of erts/emulator/beam/erl_process.c (`ssi_wake`, `erts_sched_finish_poke`), OTP-29.1.1.
     fn wake_thread(&self, index: usize) {
         let thread = &self.threads[index];
         thread.wake.store(true, Ordering::SeqCst);
@@ -3143,17 +3181,25 @@ impl<T: Task> DirtyPool<T> {
         }
     }
 
-    fn new(threads: usize) -> Self {
+    fn new(threads: usize, online: usize) -> Self {
         Self {
             procs: run_queue::ProcQueues::new(None),
             queue: Mutex::new(DirtyQueue {
                 sleepers: VecDeque::new(),
             }),
-            online: AtomicUsize::new(threads),
+            online: AtomicUsize::new(online),
+            // erts initializes curr_online to the scheduler total and lets each
+            // suspended scheduler account for itself before the boot change completes.
+            current_online: Mutex::new(threads),
             threads: (0..threads)
-                .map(|_| DirtyThread {
+                .map(|index| DirtyThread {
                     handle: OnceLock::new(),
                     wake: AtomicBool::new(false),
+                    ssi_flags: AtomicU32::new(if index >= online {
+                        ERTS_SSI_FLG_SUSPENDED
+                    } else {
+                        0
+                    }),
                     stats: Mutex::new(DirtyStats::new()),
                 })
                 .collect(),
@@ -7087,21 +7133,32 @@ pub struct SchedulerStats {
 impl<T: Task> Scheduler<T> {
     /// Start real worker threads.
     pub fn new(config: Config) -> Self {
+        let dirty_cpu_online = config.dirty_cpu_schedulers.max(1);
+        Self::new_with_dirty_cpu_online(config, dirty_cpu_online)
+    }
+
+    /// Start real worker threads with the boot dirty CPU online prefix.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:6380-6395 (scheduler online counts),
+    /// OTP-29.1.1: the requested count is installed before threads start, while current online
+    /// begins at the scheduler total and each suspended scheduler updates it.
+    pub fn new_with_dirty_cpu_online(config: Config, dirty_cpu_online: usize) -> Self {
         arinsal_term::set_reader_groups(config.workers);
         mailbox::set_lock_spin_count(config.workers);
         // Port of erts/emulator/beam/erl_alloc.c (erts_alloc_init sizes the instances from
         // erts_no_schedulers), OTP-29.1.1. A launcher that already configured the allocators
         // (with `+Mdai`) or an earlier runtime in this process keeps its counts.
         let _ = arinsal_alloc::typed::configure(config.workers.max(1), 0);
-        Self::build(config, RealClock(monotonic_base()))
+        Self::build(config, RealClock(monotonic_base()), dirty_cpu_online)
     }
 
-    fn build(mut config: Config, clock: RealClock) -> Self {
+    fn build(mut config: Config, clock: RealClock, dirty_cpu_online: usize) -> Self {
         assert!(config.max_processes > 0 && config.max_processes <= PID_LIMIT);
         assert!(config.reductions > 0);
         config.workers = config.workers.max(1);
         let dirty_cpu = config.dirty_cpu_schedulers.max(1);
         let dirty_io = config.dirty_io_schedulers.max(1);
+        assert!((1..=dirty_cpu).contains(&dirty_cpu_online));
         let workers = config.workers;
         let parked: Arc<[AtomicBool]> = (0..workers).map(|_| AtomicBool::new(false)).collect();
         let sleepers: Arc<[OnceLock<thread::Thread>]> =
@@ -7160,6 +7217,7 @@ impl<T: Task> Scheduler<T> {
             cpu_bind_targets: RwLock::new(vec![None; workers]),
             cpu_bind_actual: RwLock::new(vec![None; workers]),
             stopped: AtomicBool::new(false),
+            stop_suspended: (Mutex::new(0), Condvar::new()),
             halt_started: AtomicBool::new(false),
             halt_requested: AtomicBool::new(false),
             runq_halting: (0..workers)
@@ -7196,7 +7254,10 @@ impl<T: Task> Scheduler<T> {
             fanin_delivered: AtomicU64::new(0),
             progress_domain: Progress(Arc::clone(&progress)),
             progress,
-            dirty: [DirtyPool::new(dirty_cpu), DirtyPool::new(dirty_io)],
+            dirty: [
+                DirtyPool::new(dirty_cpu, dirty_cpu_online),
+                DirtyPool::new(dirty_io, dirty_io),
+            ],
             msb_exec: Mutex::new(MsbExec {
                 current: SchedulerType::Normal,
                 last_dirty: SchedulerType::DirtyIo,
@@ -7754,16 +7815,47 @@ impl<T: Task> Scheduler<T> {
     }
     /// Set how many dirty CPU scheduler threads may execute dirty jobs.
     ///
-    /// Port of erts/emulator/beam/erl_process.c:7266 (erts_set_schedulers_online, dirty CPU
-    /// part), OTP-29.1.1: offline dirty CPU schedulers stop picking jobs from the shared queue.
+    /// Port of erts/emulator/beam/erl_process.c:erts_set_schedulers_online,
+    /// dcpu_sched_ix_resume_wake, dcpu_sched_ix_suspend_wake, and dcpu_sched_ix_wake,
+    /// OTP-29.1.1: only
+    /// schedulers crossing the online boundary are woken, and scheduler 1 is woken after a
+    /// decrease so it can take work left by a newly suspended scheduler.
     pub fn set_dirty_cpu_online(&self, online: usize) -> bool {
         let pool = &self.inner.dirty[0];
         if online == 0 || online > pool.threads.len() {
             return false;
         }
+        let state = pool.current_online.lock().unwrap();
+        let previous = pool.online.load(Ordering::Acquire);
+        if online == previous {
+            return true;
+        }
         pool.online.store(online, Ordering::Release);
-        pool.wake_all();
+        if online > previous {
+            for index in previous..online {
+                pool.threads[index]
+                    .ssi_flags
+                    .fetch_and(!ERTS_SSI_FLG_SUSPENDED, Ordering::AcqRel);
+                pool.wake_thread(index);
+            }
+        } else {
+            for index in online..previous {
+                pool.threads[index]
+                    .ssi_flags
+                    .fetch_or(ERTS_SSI_FLG_SUSPENDED, Ordering::AcqRel);
+                pool.wake_thread(index);
+            }
+            pool.wake_thread(0);
+        }
+        drop(state);
         true
+    }
+    /// Number of dirty CPU schedulers that have reached their requested online state.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:8147-8149 (`erts_schedulers_state`),
+    /// OTP-29.1.1: this is `schdlr_sspnd.curr_online`, which can lag the requested count.
+    pub fn dirty_cpu_schedulers_online(&self) -> usize {
+        *self.inner.dirty[0].current_online.lock().unwrap()
     }
     /// Whether a pid currently identifies a live task.
     pub fn lookup(&self, pid: Pid) -> bool {
@@ -8570,7 +8662,7 @@ mod dirty_state_tests {
 
     #[test]
     fn dirty_wake_takes_the_most_recent_eligible_sleeper() {
-        let pool = DirtyPool::<Idle>::new(4);
+        let pool = DirtyPool::<Idle>::new(4, 4);
         pool.online.store(3, Ordering::Release);
         let mut queue = pool.queue.lock().unwrap();
         queue.sleepers.extend([0, 1, 2, 3]);
@@ -9190,45 +9282,58 @@ mod rq_double_enqueue_tests {
 }
 
 impl<T: Task> Drop for Scheduler<T> {
+    // A scheduler never returns from process_main: a stopped one suspends inside
+    // erts_schedule for good (`stop_suspended_scheduler`), so the threads are not joined. The
+    // owner waits until every scheduler has suspended before it shuts the table down.
+    // Port of erts/emulator/beam/erl_process.c (suspend_scheduler; erts_exit leaves the
+    // scheduler threads suspended), OTP-29.1.1.
     fn drop(&mut self) {
         self.inner.stopped.store(true, Ordering::Release);
         for pool in &self.inner.dirty {
             pool.wake_all();
         }
+        let current = std::thread::current().id();
+        let mut on_worker = false;
         for (id, handle) in self.threads.iter().enumerate() {
             if let Some(flag) = self.inner.parked.get(id) {
                 flag.store(false, Ordering::SeqCst);
             }
             handle.thread().unpark();
             interrupt_if_poll_sleeper(handle.thread());
+            on_worker |= handle.thread().id() == current;
         }
-        // The last handle may drop on a worker (e.g. a process exiting while the owner already
-        // released its handle); that worker cannot join itself and stops on its own.
-        let current = std::thread::current().id();
-        let mut on_worker = false;
-        for handle in self.threads.drain(..) {
-            if handle.thread().id() != current {
-                let _ = handle.join();
-            } else {
-                on_worker = true;
+        // Dropping the handles detaches the threads.
+        self.threads.clear();
+        let schedulers = self.inner.config.workers
+            + self
+                .inner
+                .dirty
+                .iter()
+                .map(|pool| pool.threads.len())
+                .sum::<usize>();
+        let shutdown = move |inner: &Inner<T>| {
+            let (count, all_suspended) = &inner.stop_suspended;
+            let mut count = count.lock().unwrap_or_else(|e| e.into_inner());
+            while *count < schedulers {
+                count = all_suspended.wait(count).unwrap_or_else(|e| e.into_inner());
             }
-        }
+            drop(count);
+            inner.table.scheduler_shutdown();
+            // No scheduler runs any more: release what the table and the suspended
+            // schedulers left for thread progress.
+            thr_progress::run_remaining_later_ops(&inner.progress);
+        };
         if on_worker {
-            // This worker still holds the cell of the exiting process; shutting down inline would
-            // lock that cell again and self-deadlock. A helper thread waits for the worker to
-            // release it (it holds its own `Inner` reference, so the table stays alive).
+            // The last handle dropped on a worker (a process exiting while the owner already
+            // released its handle): that worker suspends only after this slice, and still
+            // holds the cell of the exiting process. A helper thread waits for it (it holds its
+            // own `Inner` reference, so the table stays alive).
             let inner = Arc::clone(&self.inner);
             let _ = std::thread::Builder::new()
                 .name("sched-shutdown".into())
-                .spawn(move || {
-                    inner.table.scheduler_shutdown();
-                    thr_progress::run_remaining_later_ops(&inner.progress);
-                });
+                .spawn(move || shutdown(&inner));
         } else {
-            self.inner.table.scheduler_shutdown();
-            // No managed thread runs any more: release what the table and the stopped
-            // threads left for thread progress.
-            thr_progress::run_remaining_later_ops(&self.inner.progress);
+            shutdown(&self.inner);
         }
     }
 }
@@ -9237,7 +9342,7 @@ impl<T: Task> Scheduler<T> {
     /// Stop the workers and detach the table's processes without joining. The runtime keeps
     /// the scheduler for the VM lifetime, so its owner calls this at VM shutdown to break the
     /// runtime -> scheduler -> process -> runtime cycle; a worker blocked in a driver call
-    /// cannot hold the caller up. The final `Drop` joins the threads.
+    /// cannot hold the caller up. The final `Drop` waits until the schedulers have suspended.
     pub fn release(&self) {
         self.inner.stopped.store(true, Ordering::Release);
         for pool in &self.inner.dirty {
@@ -9581,10 +9686,12 @@ fn run_slice<T: Task>(esdp: &ErtsSchedulerData<T>, process: &ProcRef<T>) -> u32 
         // copy_in_registers after erts_schedule, copy_out_registers before the next),
         // OTP-29.1.1.
         T::trace_schedule_in(&mut c_p, esdp);
+        T::schedule_in(&mut c_p, esdp, budget);
         T::copy_in_registers(&mut c_p, &esdp.registers);
         let mut calls = 0;
         T::run(&mut c_p, esdp, budget, &mut calls);
         T::copy_out_registers(&mut c_p, &esdp.registers);
+        T::schedule_out(&mut c_p, esdp, calls);
         T::trace_schedule_out(&mut c_p, esdp);
         if let Some(thread_type) = thread_type {
             SCHEDULER_TYPE.with(|current| current.set(thread_type));
@@ -9633,6 +9740,7 @@ fn schedule_in<T: Task>(esdp: &ErtsSchedulerData<T>, process: &ProcRef<T>) -> He
             slot.set_scheduler(Some(esdp));
         }
         T::trace_schedule_in(&mut c_p, esdp);
+        T::schedule_in(&mut c_p, esdp, esdp.run_queue.config.reductions);
     }
     cell.keep_locked()
 }
@@ -9647,10 +9755,12 @@ fn schedule_out_trace<'p, T: Task>(
     esdp: &ErtsSchedulerData<T>,
     process: &'p ProcRef<T>,
     held: HeldMainLock,
+    calls: u32,
 ) -> ProcLockGuard<'p, TaskCell<T>> {
     let mut cell = process.cell.resume_locked(held);
     {
         let mut c_p = CP::new(process, &mut cell);
+        T::schedule_out(&mut c_p, esdp, calls);
         T::trace_schedule_out(&mut c_p, esdp);
         if esdp.msacc_enabled.get() {
             let gc_ns = c_p.task().gc_nanoseconds();
@@ -9994,10 +10104,6 @@ mod native_sender {
         CURRENT.with(|current| *current.borrow_mut() = Some(Box::new(slot)));
     }
 
-    pub(super) fn clear() {
-        CURRENT.with(|current| current.borrow_mut().take());
-    }
-
     pub(super) fn with<M: SignalMessage, R>(
         f: impl FnOnce(&Rc<dyn NativeSend<M>>) -> R,
     ) -> Option<R> {
@@ -10318,11 +10424,28 @@ impl Drop for AllocOwnerWaker {
     }
 }
 
+/// A scheduler of a stopped runtime suspends here for good: it stops holding back thread
+/// progress, counts itself suspended for the owner waiting in `Scheduler::drop`, and sleeps.
+// Port of erts/emulator/beam/erl_process.c (suspend_scheduler: erts_thr_progress_active(esdp,
+// 0), erts_thr_progress_prepare_wait, the schdlr_sspnd counts and the wait on the
+// scheduler's sleep event; erts_exit never wakes it), OTP-29.1.1.
+fn stop_suspended_scheduler<T: Task>(esdp: &ErtsSchedulerData<T>) -> ! {
+    if esdp.thr_progress_data.is_some() {
+        thr_progress::scheduler_prepare_wait();
+    }
+    let (count, all_suspended) = &esdp.run_queue.stop_suspended;
+    *count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+    all_suspended.notify_all();
+    loop {
+        thread::park();
+    }
+}
+
 /// `erts_schedule(esdp, p, calls)` of a normal scheduler: schedules out `p` (the process
 /// that ran last, its main lock held, `calls` its reductions), then repeats
 /// `check_activities_to_run` (CPU binding, aux work, timers, balance, ports, the dequeue) until
-/// a process is selected, and returns it with its main lock held. It returns `None` only when
-/// the scheduler is stopped (see the stop protocol in the report: erts schedulers never stop).
+/// a process is selected, and returns it with its main lock held. It never returns without
+/// one: on a stopped runtime the scheduler suspends inside it for good.
 // Port of erts/emulator/beam/erl_process.c:9607 (erts_schedule) and :9853-9866
 // (continue_check_activities_to_run: ERTS_RUNQ_FLG_CHK_CPU_BIND -> erts_sched_check_cpu_bind;
 // every path without a process to run goes back to check_activities_to_run), OTP-29.1.1.
@@ -10330,13 +10453,13 @@ fn erts_schedule<T: Task>(
     esdp: &ErtsSchedulerData<T>,
     mut p: Option<(ProcRef<T>, HeldMainLock)>,
     mut calls: u32,
-) -> Option<(ProcRef<T>, HeldMainLock)> {
+) -> (ProcRef<T>, HeldMainLock) {
     loop {
         if esdp.run_queue.stopped.load(Ordering::Acquire) {
             // A stop never drops a finished slice.
             if let Some((p, held)) = p.take() {
                 let id = esdp.worker.expect("a normal scheduler has its number");
-                let cell = schedule_out_trace(esdp, &p, held);
+                let cell = schedule_out_trace(esdp, &p, held, calls);
                 let local_cell = esdp
                     .local
                     .as_ref()
@@ -10349,12 +10472,12 @@ fn erts_schedule<T: Task>(
                 drop(local);
                 schedule_out_unlock(esdp, &p, cell);
             }
-            return None;
+            stop_suspended_scheduler(esdp);
         }
         #[cfg(target_os = "linux")]
         erts_sched_check_cpu_bind(esdp);
         if let Some(next) = check_activities_to_run(esdp, p.take(), calls) {
-            return Some(next);
+            return next;
         }
         calls = 0;
     }
@@ -10364,7 +10487,7 @@ fn erts_schedule<T: Task>(
 /// `process_main` calls it: `esdp` is NULL (a normal scheduler, found with
 /// `erts_get_scheduler_data()`), `p` the process whose slice just ended with its main lock
 /// held (NULL in the first call), `calls` its reductions. Returns the next process with its
-/// main lock held; NULL only when the scheduler is stopped.
+/// main lock held; never NULL.
 // Port of erts/emulator/beam/erl_process.c:9607-9660 (erts_schedule: `is_normal_sched =
 // !esdp`, `esdp = p->scheduler_data` or erts_get_scheduler_data(), `ASSERT(esdp->current_process
 // == p)`), OTP-29.1.1.
@@ -10372,16 +10495,12 @@ pub fn erts_schedule_c_abi<T: Task>(p: *mut T, calls: i32) -> *mut T {
     sched_data_key::erts_get_scheduler_data::<T, _>(|esdp| {
         let previous = (!p.is_null()).then(|| proc_ref::raw::current_process_held(esdp, p));
         let calls = u32::try_from(calls).expect("erts_schedule: calls >= 0");
-        match erts_schedule(esdp, previous, calls) {
-            Some((next, held)) => {
-                let mut cell = next.cell.resume_locked(held);
-                let task: *mut T = CP::new(&next, &mut cell).task();
-                // `esdp->current_process` keeps the process; its main lock stays held.
-                let _ = cell.keep_locked();
-                task
-            }
-            None => std::ptr::null_mut(),
-        }
+        let (next, held) = erts_schedule(esdp, previous, calls);
+        let mut cell = next.cell.resume_locked(held);
+        let task: *mut T = CP::new(&next, &mut cell).task();
+        // `esdp->current_process` keeps the process; its main lock stays held.
+        let _ = cell.keep_locked();
+        task
     })
     .expect("erts_schedule runs on a normal scheduler thread")
 }
@@ -10409,7 +10528,7 @@ fn check_activities_to_run<T: Task>(
     let p = p
         .as_ref()
         .zip(held)
-        .map(|(p, held)| (p, schedule_out_trace(esdp, p, held)));
+        .map(|(p, held)| (p, schedule_out_trace(esdp, p, held, calls)));
     let inner = &esdp.run_queue;
     let id = esdp.worker.expect("a normal scheduler has its number");
     let local_cell = esdp
@@ -10959,25 +11078,19 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
     arinsal_term::initialize_scheduler_random(std::ptr::from_ref(&esdp).cast());
     let _ref_unique_binding = esdp.ref_unique.bind();
     let _sched_data_key = sched_data_key::SchedDataKey::set(&esdp);
-    process_main(&esdp);
-    native_sender::clear();
-    // A stopped scheduler waits forever: it must not hold back blockers.
-    thr_progress::scheduler_prepare_wait();
-    thr_progress::unregister_managed_thread();
-    OWNER_TIMER_SERVICES.with(|services| {
-        services.borrow_mut().remove(&inner_id);
-    });
+    process_main(&esdp)
 }
 
 /// The scheduling loop of a normal scheduler: each turn hands the slice that just ended to
 /// [`erts_schedule`] and runs the process it returns.
 // Port of erts/emulator/beam/beam_emu.c:375 (process_main: `c_p = erts_schedule(NULL, c_p,
 // reds_used)`, then the slice) and jit/x86/process_main.cpp (schedule_next), OTP-29.1.1.
-fn process_main<T: Task>(esdp: &ErtsSchedulerData<T>) {
+fn process_main<T: Task>(esdp: &ErtsSchedulerData<T>) -> ! {
     // `c_p` and `reds_used` of process_main: the process that ran last and its reductions.
     let mut c_p: Option<(ProcRef<T>, HeldMainLock)> = None;
     let mut reds_used = 0;
-    while let Some((item, held)) = erts_schedule(esdp, c_p.take(), reds_used) {
+    loop {
+        let (item, held) = erts_schedule(esdp, c_p.take(), reds_used);
         // A managed thread runs its later operations at its progress point
         // (`scheduler_progress`), so the unmanaged-runtime pass of `run_one` is not needed.
         let (held, calls) = run_process(esdp, &item, held);
@@ -11223,18 +11336,20 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
 /// The scheduling loop of a dirty scheduler: each turn hands the job that just ended to
 /// [`erts_schedule`] and runs the process it returns.
 // Port of erts/emulator/beam/beam_common.c:179 (erts_dirty_process_main), OTP-29.1.1.
-fn erts_dirty_process_main<T: Task>(esdp: &ErtsSchedulerData<T>) {
+fn erts_dirty_process_main<T: Task>(esdp: &ErtsSchedulerData<T>) -> ! {
     let mut c_p: Option<ProcRef<T>> = None;
     let mut reds_used = 0;
     let (kind, index) = esdp.dirty_no.expect("a dirty scheduler has its pool");
-    while let Some(item) = erts_schedule_dirty(esdp, kind, index, c_p.take(), reds_used) {
+    loop {
+        let item = erts_schedule_dirty(esdp, kind, index, c_p.take(), reds_used);
         reds_used = run_slice(esdp, &item);
         c_p = Some(item);
     }
 }
 
 /// The dirty-scheduler half of [`erts_schedule`]: schedule-out of the job that ended, then the
-/// dequeue from the dirty run queue, waiting while it is empty. `None` when the runtime stops.
+/// dequeue from the dirty run queue, waiting while it is empty. A stopped or halting runtime
+/// suspends the scheduler inside it for good.
 // Port of erts/emulator/beam/erl_process.c:9607 (erts_schedule, `!is_normal_sched`
 // branches) and :3404 (scheduler_wait on a dirty run queue), OTP-29.1.1.
 fn erts_schedule_dirty<T: Task>(
@@ -11243,7 +11358,7 @@ fn erts_schedule_dirty<T: Task>(
     index: usize,
     p: Option<ProcRef<T>>,
     calls: u32,
-) -> Option<ProcRef<T>> {
+) -> ProcRef<T> {
     let inner = &esdp.run_queue;
     let pool = &inner.dirty[kind.index()];
     let thread = &pool.threads[index];
@@ -11267,12 +11382,50 @@ fn erts_schedule_dirty<T: Task>(
         loop {
             if inner.stopped.load(Ordering::Acquire) || inner.halt_requested.load(Ordering::Acquire)
             {
-                return None;
+                drop(queue);
+                stop_suspended_scheduler(esdp);
+            }
+            if thread.ssi_flags.load(Ordering::Acquire) & ERTS_SSI_FLG_SUSPENDED != 0 {
+                drop(queue);
+                // `suspend_scheduler` updates `schdlr_sspnd.curr_online` at the scheduler
+                // boundary, then waits on this scheduler's SSI until its online flag clears.
+                // This state belongs to the scheduler sleep info, not to a scheduling-loop
+                // local: `erts_schedule_dirty` is entered once per job.
+                // Port of erts/emulator/beam/erl_process.c (`suspend_scheduler`), OTP-29.1.1.
+                {
+                    let mut current = pool.current_online.lock().unwrap();
+                    assert!(*current > 0);
+                    *current -= 1;
+                }
+                thread.stats.lock().unwrap().set_state(MsaccState::Sleep);
+                loop {
+                    if thread.ssi_flags.load(Ordering::Acquire) & ERTS_SSI_FLG_SUSPENDED == 0
+                        || inner.stopped.load(Ordering::Acquire)
+                        || inner.halt_requested.load(Ordering::Acquire)
+                    {
+                        break;
+                    }
+                    thread.wake.store(false, Ordering::SeqCst);
+                    if thread.ssi_flags.load(Ordering::Acquire) & ERTS_SSI_FLG_SUSPENDED != 0
+                        && !inner.stopped.load(Ordering::Acquire)
+                        && !inner.halt_requested.load(Ordering::Acquire)
+                    {
+                        thread::park();
+                    }
+                }
+                thread.stats.lock().unwrap().set_state(MsaccState::Other);
+                if !inner.stopped.load(Ordering::Acquire)
+                    && !inner.halt_requested.load(Ordering::Acquire)
+                {
+                    let mut current = pool.current_online.lock().unwrap();
+                    *current += 1;
+                }
+                queue = pool.queue.lock().unwrap();
+                continue;
             }
             // Port of erts/emulator/beam/erl_process.c:9988-10030 (pick_next_process and
             // dequeue_process on the dirty run queue), OTP-29.1.1.
-            if index < pool.online.load(Ordering::Acquire)
-                && !pool.procs.is_empty()
+            if !pool.procs.is_empty()
                 && inner.dirty_may_execute(kind, index)
                 && let Some(item) = pool.procs.pop_next()
             {
@@ -11306,12 +11459,9 @@ fn erts_schedule_dirty<T: Task>(
                 // Port of erts/emulator/beam/erl_process.c (scheduler_wait): dirty
                 // schedulers sleep on their TSE event after the configured spin threshold.
                 thread.stats.lock().unwrap().set_state(MsaccState::Sleep);
-                while !thread.wake.load(Ordering::SeqCst)
-                    && !inner.stopped.load(Ordering::Acquire)
-                    && !inner.halt_requested.load(Ordering::Acquire)
-                {
-                    thread::park();
-                }
+                // `unpark` retains one permit if the wake races with this call. Recheck the
+                // SSI and scheduler stop state in the outer loop after the thread event.
+                thread::park();
                 thread.stats.lock().unwrap().set_state(MsaccState::Other);
             }
             queue = pool.queue.lock().unwrap();
@@ -11322,7 +11472,7 @@ fn erts_schedule_dirty<T: Task>(
     };
     thread.stats.lock().unwrap().begin_active();
     *esdp.current_process.borrow_mut() = Some(item.process.clone());
-    Some(item.process)
+    item.process
 }
 
 /// Return the erts spin count for `+sbwt`, `+sbwtdcpu`, or `+sbwtdio`.

@@ -42,7 +42,7 @@ fn arb_term() -> impl Strategy<Value = OwnedTerm> {
                 ids,
             }
         }),
-        ("[a-z]{1,8}", "[a-z]{1,8}", any::<u8>()).prop_map(|(module, function, arity)| {
+        ("[a-z]{1,8}", "[a-z]{1,8}", any::<u32>()).prop_map(|(module, function, arity)| {
             OwnedTerm::Export {
                 module,
                 function,

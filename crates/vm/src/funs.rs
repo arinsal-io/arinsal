@@ -168,8 +168,7 @@ impl Vm {
         // SAFETY: The fun is held in an X register while this process is live.
         let view = unsafe { fun.fun_ref() };
         let actual = match &view {
-            Some(FunRef::Local { entry, .. }) => Some(entry.arity as usize),
-            Some(FunRef::Export { entry }) => Some(entry.arity() as usize),
+            Some(FunRef::Local { .. } | FunRef::Export { .. }) => fun.fun_arity().map(usize::from),
             None => None,
         };
         if actual != Some(arity) {
@@ -390,7 +389,7 @@ impl Vm {
             && !self.unloaded_on_load(p, module)
             && let Some(&module_id) = code_tables(erts_active_code_ix()).loaded.get(&module_atom)
             && let Some(target) = code_tables(erts_active_code_ix()).modules[module_id]
-                .export_slot_atom(function_atom, arity as u8)
+                .export_slot_atom(function_atom, arity as u32)
                 .map(arinsal_loader::ExportSlot::target)
         {
             // Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*: set `c_p->i`
@@ -406,7 +405,10 @@ impl Vm {
         self.x_regs()?[..arity].copy_from_slice(&trap.args);
         // A BIF traps to its `bif_trap_export` entry (erl_bif_table.c, erts_init_trap_export),
         // which has no breakpoint: the continuation is not a traced call of its own.
-        if arinsal_spec::bif_lookup(module, function, arity as u8).is_some() {
+        if u8::try_from(arity)
+            .ok()
+            .is_some_and(|arity| arinsal_spec::bif_lookup(module, function, arity).is_some())
+        {
             let atoms = Some((module_atom, function_atom));
             return self.call_named_untraced(p, atoms, module, function, arity, ctx);
         }
@@ -477,7 +479,7 @@ impl Vm {
         let traced = match ctx.as_deref_mut() {
             Some(run)
                 if arity <= usize::from(u8::MAX)
-                    && crate::export::is_bif_traced(module, function, arity as u8) =>
+                    && crate::export::is_bif_traced(module, function, arity as u32) =>
             {
                 // The apply's return address names its native call site.
                 let site = (
@@ -572,12 +574,7 @@ impl Vm {
         mut ctx: Option<&mut RunCtx<'_, crate::Process>>,
     ) -> Result<ImportOutcome, VmError> {
         p.gc_live = arity;
-        if arity > u8::MAX as usize {
-            return Err(VmError::Exception {
-                reason: "undef".into(),
-                frame: format!("{module}:{function}/{arity}"),
-            });
-        }
+        let arity8 = u8::try_from(arity).ok();
         if module == "erts_internal" {
             match (function, arity) {
                 ("dirty_bif_result", 1) => {
@@ -676,7 +673,8 @@ impl Vm {
             }
         }
         // Apply enters the active BIF export through its bif_table index, as a static call does.
-        if arinsal_spec::bif_lookup(module, function, arity as u8).is_some()
+        if let Some(arity8) = arity8
+            && arinsal_spec::bif_lookup(module, function, arity8).is_some()
             && let Some(run) = ctx.as_deref_mut()
         {
             let native_function = if module == "erlang" && function == "!" && arity == 2 {
@@ -690,7 +688,7 @@ impl Vm {
                 module,
                 native_function,
                 arity,
-                crate::natives::native_entry(module, native_function, arity as u8),
+                crate::natives::native_entry(module, native_function, arity8),
             ) {
                 return self.finish_apply_native_result(p, module, function, arity, atoms, result);
             }
@@ -698,48 +696,46 @@ impl Vm {
         // Apply carries atom identities, so resolve the same process-aware BIF
         // entry as a static import without re-matching its module or function.
         let mut resolved_entry = false;
-        if let (Some((module_atom, function_atom)), Some(run)) = (atoms, ctx.as_deref_mut()) {
-            let entry = crate::signals::handler_atoms(module_atom, function_atom, arity as u8);
-            if let Some(entry) = entry {
-                resolved_entry = true;
-                if let Some(result) = self.dispatch_resolved_entry(
-                    p,
-                    run,
-                    crate::natives::NativeArgs::registers(self.x_regs()?, arity),
-                    entry,
-                ) {
-                    let result = match result {
-                        // Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*), OTP-29.1.1: an
-                        // applied BIF that traps (demonitor_2 to flush_monitor_messages/3)
-                        // continues in the trap's export, as the same BIF called statically.
-                        Err(VmError::TrapExport(trap)) => {
-                            return self.bif_trap_from_executor(p, trap);
-                        }
-                        // Port of erts/emulator/beam/beam_common.c:880-930 (save_stacktrace),
-                        // OTP-29.1.1: BIF_ERROR names the applied BIF as the top frame.
-                        Err(VmError::Trap(mut trap))
-                            if trap.class == arinsal_bifs::Class::Error
-                                && trap.top.is_none()
-                                && trap.trace.is_none() =>
-                        {
-                            trap.top = Some(crate::stacktrace::TopFrame::Bif {
-                                module: module_atom,
-                                function: function_atom,
-                                args: crate::stacktrace::BifArgs::from_terms(
-                                    &self.x_regs()?[..arity],
-                                )?,
-                                info: crate::stacktrace::BifErrorInfo::Plain,
-                            });
-                            Err(VmError::Trap(trap))
-                        }
-                        result => result,
-                    };
-                    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:730-776
-                    // (call_bif_shared, ERTS_IS_GC_AFTER_BIF_DESIRED), OTP-29.1.1: the export
-                    // trampoline an apply reaches collects after the BIF as a static call does.
-                    self.x_regs()?[0] = p.gc_after_bif(result?)?;
-                    return Ok(Self::return_value_after_dirty(p, self.x_regs()?[0]));
-                }
+        if let (Some((module_atom, function_atom)), Some(run), Some(arity8)) =
+            (atoms, ctx.as_deref_mut(), arity8)
+            && let Some(entry) = crate::signals::handler_atoms(module_atom, function_atom, arity8)
+        {
+            resolved_entry = true;
+            if let Some(result) = self.dispatch_resolved_entry(
+                p,
+                run,
+                crate::natives::NativeArgs::registers(self.x_regs()?, arity),
+                entry,
+            ) {
+                let result = match result {
+                    // Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*), OTP-29.1.1: an
+                    // applied BIF that traps (demonitor_2 to flush_monitor_messages/3)
+                    // continues in the trap's export, as the same BIF called statically.
+                    Err(VmError::TrapExport(trap)) => {
+                        return self.bif_trap_from_executor(p, trap);
+                    }
+                    // Port of erts/emulator/beam/beam_common.c:880-930 (save_stacktrace),
+                    // OTP-29.1.1: BIF_ERROR names the applied BIF as the top frame.
+                    Err(VmError::Trap(mut trap))
+                        if trap.class == arinsal_bifs::Class::Error
+                            && trap.top.is_none()
+                            && trap.trace.is_none() =>
+                    {
+                        trap.top = Some(crate::stacktrace::TopFrame::Bif {
+                            module: module_atom,
+                            function: function_atom,
+                            args: crate::stacktrace::BifArgs::from_terms(&self.x_regs()?[..arity])?,
+                            info: crate::stacktrace::BifErrorInfo::Plain,
+                        });
+                        Err(VmError::Trap(trap))
+                    }
+                    result => result,
+                };
+                // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:730-776
+                // (call_bif_shared, ERTS_IS_GC_AFTER_BIF_DESIRED), OTP-29.1.1: the export
+                // trampoline an apply reaches collects after the BIF as a static call does.
+                self.x_regs()?[0] = p.gc_after_bif(result?)?;
+                return Ok(Self::return_value_after_dirty(p, self.x_regs()?[0]));
             }
         }
         // `!` is an export alias for the process-aware `send/2` BIF.
@@ -750,13 +746,14 @@ impl Vm {
         };
         if !resolved_entry
             && let Some(run) = ctx.as_deref_mut()
+            && let Some(arity8) = arity8
             && let Some(result) = self.dispatch_native(
                 p,
                 run,
                 module,
                 native_function,
                 arity,
-                crate::natives::native_entry(module, native_function, arity as u8),
+                crate::natives::native_entry(module, native_function, arity8),
             )
         {
             let result = match result {
@@ -814,10 +811,12 @@ impl Vm {
             return Ok(Self::return_value(p, self.x_regs()?[0]));
         }
         // elixir_loop1: dynamic apply must see static NIFs such as re:import/1.
-        if let Some(bif) = crate::natives::plain_static_nif_lookup(module, function, arity as u8) {
+        if let Some(bif) = arity8
+            .and_then(|arity| crate::natives::plain_static_nif_lookup(module, function, arity))
+        {
             return self.run_apply_bif(p, module, function, arity, bif);
         }
-        if arinsal_spec::bif_lookup(module, function, arity as u8).is_some() {
+        if arity8.is_some_and(|arity| arinsal_spec::bif_lookup(module, function, arity).is_some()) {
             return Err(VmError::Unsupported(format!(
                 "BIF {module}:{function}/{arity}"
             )));
@@ -846,7 +845,7 @@ impl Vm {
             }
         };
         let Some(target) =
-            code_tables(erts_active_code_ix()).modules[module_id].export(function, arity as u8)
+            code_tables(erts_active_code_ix()).modules[module_id].export(function, arity as u32)
         else {
             // Port of erts/emulator/beam/beam_common.c (call_error_handler).
             if self.should_autoload(p, module) {
@@ -863,7 +862,8 @@ impl Vm {
         // scheduler-interpreted apply must preserve that event when the module has no
         // interpreter export-breakpoint entry.
         if let Some(run) = ctx
-            && crate::trace_bp::breakpoint_kinds(p, module, function, arity as u8).1
+            && let Some(arity8) = arity8
+            && crate::trace_bp::breakpoint_kinds(p, module, function, arity8).1
             && let Some(native) =
                 crate::beamasm_integration::erts_code_hdr_function(module_id, target)
         {
@@ -1098,7 +1098,7 @@ impl Vm {
         if crate::trace::saves_calls(p) {
             crate::trace::save_call(
                 p,
-                crate::trace::SavedCall::Mfa(module_atom, function_atom, arity as u8),
+                crate::trace::SavedCall::Mfa(module_atom, function_atom, arity as u32),
             );
         }
         if module == "erlang" && function == "apply" && arity == 3 {
@@ -1282,7 +1282,11 @@ impl Vm {
             return None;
         };
         let (module, function) = (module.as_atom()?, function.as_atom()?);
-        let arity = u8::try_from(arity.as_small()?).ok()?;
+        let arity = arity.as_small()?;
+        if !(0..=255).contains(&arity) {
+            return None;
+        }
+        let arity = arity as u32;
         process.runtime?;
         let entry = crate::export::export_get_or_make_stub((module, function, arity))?;
         TermBuilder::new(&mut process.heap)
@@ -1305,7 +1309,7 @@ impl Vm {
         let arity = args[2]
             .as_small()
             .filter(|n| (0..=255).contains(n))
-            .ok_or_else(|| self.exception(p, "badarg"))? as u8;
+            .ok_or_else(|| self.exception(p, "badarg"))? as u32;
         // Port of erts/emulator/beam/bif.c (erlang:make_fun/3: erts_export_get_or_make_stub,
         // the fun is the export's lambda), OTP-29.1.1.
         let entry = crate::export::export_get_or_make_stub((module, function, arity))
@@ -1322,16 +1326,11 @@ impl Vm {
         // SAFETY: X0 retains the fun throughout this BIF; tuple construction cannot collect.
         let view =
             unsafe { self.x_regs()?[0].fun_ref() }.ok_or_else(|| self.exception(p, "badarg"))?;
-        let (module, name, arity) = match view {
-            FunRef::Local { entry, .. } => {
-                (entry.module, self.fun_function_name(entry), entry.arity)
-            }
-            FunRef::Export { entry } => (
-                entry.module(),
-                atom_name(Term::atom(entry.function())),
-                entry.arity(),
-            ),
+        let (module, name) = match view {
+            FunRef::Local { entry, .. } => (entry.module, self.fun_function_name(entry)),
+            FunRef::Export { entry } => (entry.module(), atom_name(Term::atom(entry.function()))),
         };
+        let arity = u32::from(self.x_regs()?[0].fun_arity().unwrap());
         let name = match name {
             Some(name) => Term::atom(
                 global_atoms()
@@ -1447,11 +1446,8 @@ impl Vm {
                     }
                 }
                 (FunRef::Export { entry }, "name") => Term::atom(entry.function()),
-                (FunRef::Local { entry, .. }, "arity") => {
-                    Term::small(i64::from(entry.arity)).unwrap()
-                }
-                (FunRef::Export { entry }, "arity") => {
-                    Term::small(i64::from(entry.arity())).unwrap()
+                (FunRef::Local { .. } | FunRef::Export { .. }, "arity") => {
+                    Term::small(i64::from(fun.fun_arity().unwrap())).unwrap()
                 }
                 (FunRef::Local { free_vars, .. }, "env") => {
                     let mut list = Term::NIL;

@@ -2897,7 +2897,10 @@ impl BeamModuleAssembler {
         self.store_operand(acc_slot, Gpr::x(9))?;
         self.code.emit(|e| e.mov_const(Gpr::x(22), 0))?;
         self.code.adr(Gpr::x(8), entry)?;
-        self.code.emit(|e| e.str_uoff(Gpr::x(8), Gpr::x(21), 72))?;
+        self.code.emit(|e| {
+            e.str_uoff(Gpr::x(8), Gpr::x(21), 72)?;
+            e.mov_reg(Gpr::x(2), Gpr::x(8))
+        })?;
         self.emit_yield_live((live + if fail == 0 { 3 } else { 2 }) as u8)?;
         self.code.b(self.yield_label)?;
         self.code.bind(finished)?;

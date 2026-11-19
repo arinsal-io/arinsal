@@ -163,17 +163,17 @@ fn request_address(serial: u32, op: u8, protocol: u8, address: &[u8]) -> Vec<u8>
 }
 
 fn reference_inet_gethost() -> PathBuf {
-    if let Some(root) = std::env::var_os("ERLANG_ROOT") {
-        let path = PathBuf::from(root).join("erts-17.1/bin/inet_gethost");
-        if path.is_file() {
-            return path;
-        }
-    }
-    std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(".asdf/installs/erlang/29.1.1"))
-        .map(|root| root.join("erts-17.1/bin/inet_gethost"))
-        .filter(|path| path.is_file())
-        .expect("OTP 29.1.1 erts-17.1/bin/inet_gethost is required for differential tests")
+    let root = arinsal_difftest::reference::otp_root()
+        .expect("reference OTP is required; set ARINSAL_OTP_ROOT or put erl on PATH");
+    let path = root
+        .join("erts-17.1/bin")
+        .join(arinsal_difftest::reference::program("inet_gethost"));
+    assert!(
+        path.is_file(),
+        "reference OTP binary is missing: {}",
+        path.display()
+    );
+    path
 }
 
 fn temporary_directory() -> PathBuf {

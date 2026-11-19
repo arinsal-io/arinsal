@@ -258,7 +258,7 @@ pub struct ErtsCodeMfa {
     /// Tagged function atom.
     pub function: u64,
     /// Word-sized arity.
-    pub arity: u64,
+    pub arity: usize,
 }
 
 /// `ErtsCodeInfo` of the JIT: the metadata word (`raise_function_clause` bytes and the
@@ -377,7 +377,7 @@ impl ExportEntry {
     /// Calls through it enter `beam_unloaded_fun`, whose resolver finds the caller's node
     /// export; [`export_get_or_make_stub`] replaces it with the node's own entry whenever the
     /// node is known.
-    pub fn new(module: Atom, function: Atom, arity: u8) -> Self {
+    pub fn new(module: Atom, function: Atom, arity: u32) -> Self {
         let unloaded = BEAM_UNLOADED_FUN.load(Ordering::Acquire);
         Self::with_addresses(module, function, arity, unloaded, unloaded)
     }
@@ -388,7 +388,7 @@ impl ExportEntry {
     pub const fn with_addresses(
         module: Atom,
         function: Atom,
-        arity: u8,
+        arity: u32,
         address: usize,
         save_calls: usize,
     ) -> Self {
@@ -403,7 +403,7 @@ impl ExportEntry {
                 mfa: ErtsCodeMfa {
                     module: Term::atom(module).0,
                     function: Term::atom(function).0,
-                    arity: arity as u64,
+                    arity: arity as usize,
                 },
             },
             // Port of erts/emulator/beam/export.c:85-87 (export_init: op_call_error_handler
@@ -427,8 +427,8 @@ impl ExportEntry {
     }
 
     /// `info.mfa.arity`.
-    pub const fn arity(&self) -> u8 {
-        self.info.mfa.arity as u8
+    pub const fn arity(&self) -> u32 {
+        self.info.mfa.arity as u32
     }
 
     /// `Export.info.mfa`.
@@ -606,10 +606,10 @@ pub(crate) fn fun_entry_get_or_make_stub(candidate: Arc<FunEntry>) -> Arc<FunEnt
 
 /// Node hook resolving `module:function/arity` to its export entry
 /// (`erts_export_get_or_make_stub`).
-pub type ExportStubFn = fn(Atom, Atom, u8) -> Option<Arc<ExportEntry>>;
+pub type ExportStubFn = fn(Atom, Atom, u32) -> Option<Arc<ExportEntry>>;
 
 static EXPORT_STUB: std::sync::OnceLock<ExportStubFn> = std::sync::OnceLock::new();
-type FallbackExports = HashMap<(Atom, Atom, u8), Arc<ExportEntry>>;
+type FallbackExports = HashMap<(Atom, Atom, u32), Arc<ExportEntry>>;
 
 /// Installs the runtime's export table lookup used by terms built outside a process
 /// (literals, `binary_to_term`).
@@ -619,7 +619,7 @@ pub fn set_export_stub_hook(hook: ExportStubFn) {
 
 /// The export entry of `module:function/arity`, creating a stub when it has none.
 // Port of erts/emulator/beam/export.c:200-245 (erts_export_get_or_make_stub), OTP-29.1.1.
-pub fn export_get_or_make_stub(module: Atom, function: Atom, arity: u8) -> Arc<ExportEntry> {
+pub fn export_get_or_make_stub(module: Atom, function: Atom, arity: u32) -> Arc<ExportEntry> {
     if let Some(entry) = EXPORT_STUB
         .get()
         .and_then(|hook| hook(module, function, arity))
@@ -666,6 +666,15 @@ impl FunRef<'_> {
     }
 }
 impl Term {
+    /// The arity byte stored in a fun header.
+    ///
+    /// Export entries retain their full MFA arity separately; the fun header remains an
+    /// eight-bit field, as in `MAKE_FUN_HEADER`.
+    pub fn fun_arity(self) -> Option<u8> {
+        let header = self.header()?;
+        (header & 63 == FUN).then_some(((header >> 8) & 255) as u8)
+    }
+
     /// Borrow a fun entry and its captured variables.
     ///
     /// # Safety
@@ -701,6 +710,6 @@ pub(crate) fn local_header(arity: u8, free: usize) -> Option<u64> {
     }
 }
 /// Build an export fun header.
-pub(crate) fn export_header(arity: u8) -> u64 {
-    FUN | ((arity as u64) << 8) | (1 << 24)
+pub(crate) fn export_header(arity: u32) -> u64 {
+    FUN | (u64::from(arity as u8) << 8) | (1 << 24)
 }

@@ -121,19 +121,14 @@ fn free_port() -> u16 {
 }
 
 fn otp_root() -> PathBuf {
-    let output = Command::new("asdf")
-        .args(["where", "erlang", "29.1.1"])
-        .output()
-        .expect("run asdf to locate OTP 29.1.1");
-    assert!(
-        output.status.success(),
-        "asdf could not locate Erlang 29.1.1"
-    );
-    PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
+    arinsal_difftest::reference::otp_root()
+        .expect("reference OTP is required; set ARINSAL_OTP_ROOT or put erl on PATH")
 }
 
 fn otp_epmd() -> PathBuf {
-    let path = otp_root().join("erts-17.1/bin/epmd");
+    let path = otp_root()
+        .join("erts-17.1/bin")
+        .join(arinsal_difftest::reference::program("epmd"));
     assert!(path.is_file(), "OTP epmd is missing at {}", path.display());
     path
 }

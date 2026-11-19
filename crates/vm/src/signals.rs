@@ -1401,6 +1401,22 @@ fn run_request(
             .save_gc_task(index, pending);
         return Ok(());
     }
+    // `ERTS_PSTT_CLA` with the check flag is only queued when the signal handler
+    // already estimated that a normal-scheduler scan is too expensive. erts moves it
+    // directly to dirty system execution, where `F_DIRTY_CHECK_CLA` scans without a
+    // second maximum-reductions check.
+    if matches!(
+        pending.op,
+        RemoteOp::CopyLiteralArea {
+            how: arinsal_sched::LiteralCopyHow::CheckGc,
+            ..
+        }
+    ) && !ctx.scheduler_type().is_dirty()
+    {
+        process.cold_mut().dirty_sys_tasks.push(pending);
+        process.slice_mut().dirty_sys_gc = true;
+        return Err(VmError::Dirty(arinsal_sched::DirtyKind::Cpu));
+    }
     // Port of erts/emulator/beam/erl_gc.c:688-715 (check_for_possibly_long_gc) as called for
     // the ERTS_PSTT_GC system task (erl_process.c:11018-11040), OTP-29.1.1: a potentially
     // long collection runs on a dirty CPU scheduler (`save_dirty_task`), so it cannot hold
@@ -1531,8 +1547,9 @@ pub(crate) fn reply_request(
     if matches!(pending.op, RemoteOp::PrioSig) {
         return Ok(());
     }
-    // Port of erts/emulator/beam/erl_process.c:10878-10920 (ERTS_PSTT_CLA in execute_sys_tasks):
-    // the process is switched out, so `erts_copy_literals_gc` roots `c_p->arity` registers.
+    // Port of erts/emulator/beam/erl_process.c:11144-11170 (F_DIRTY_CHECK_CLA): the dirty
+    // system task performs the root scan unconditionally, then copies the live switched-out
+    // registers if a literal reference remains.
     if let RemoteOp::CopyLiteralArea {
         area_id,
         request,

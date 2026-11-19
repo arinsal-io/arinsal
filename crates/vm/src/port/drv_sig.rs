@@ -624,28 +624,9 @@ fn deliver_exit(
         signal_badsig(handle, id);
         return true;
     }
-    let Ok(scheduler) = runtime.scheduler() else {
-        return false;
-    };
     // io.c:3841 (erts_deliver_port_exit): links and monitors first, then
     // terminate_port runs `stop`, whose output still reaches the connected process.
-    crate::trace::emit_port_event(runtime, id, crate::trace::PORTS, "closed", &[reason]);
-    if remove_and_notify(runtime, id, scheduler, from, reason).is_none() {
-        return false;
-    }
-    release_io_flushing(handle, reason != Term::atom(arinsal_term::atoms::KILL));
-    if let Some(to) = closed_to {
-        event_message(
-            scheduler,
-            to,
-            id,
-            handle.trace_scope(),
-            Term::atom(arinsal_term::atoms::CLOSED),
-        );
-    }
-    // The port's trace state goes last: `{Port, closed}` above is still traced.
-    crate::trace::port_closed(runtime, id);
-    true
+    erts_deliver_port_exit(runtime, id, from, reason, closed_to)
 }
 
 /// `trace_port_receive(prt, from, am_close)` (io.c:2196).

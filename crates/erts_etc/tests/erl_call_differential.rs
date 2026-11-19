@@ -211,21 +211,14 @@ fn loopback_hostname_preload(directory: &Path) -> (&'static str, OsString) {
 }
 
 fn reference_root() -> PathBuf {
-    let mut roots = Vec::new();
-    if let Some(root) = std::env::var_os("ARINSAL_OTP_ROOT") {
-        roots.push(PathBuf::from(root));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        roots.push(PathBuf::from(home).join(".asdf/installs/erlang/29.1.1"));
-    }
-    roots
-        .into_iter()
-        .find(|root| root.join("erts-17.1/bin/erl").is_file())
-        .expect("OTP-29.1.1 reference install missing")
+    arinsal_difftest::reference::otp_root()
+        .expect("reference OTP is required; set ARINSAL_OTP_ROOT or put erl on PATH")
 }
 
 fn reference_binary(name: &str) -> PathBuf {
-    reference_root().join("erts-17.1/bin").join(name)
+    reference_root()
+        .join("erts-17.1/bin")
+        .join(arinsal_difftest::reference::program(name))
 }
 
 fn reference_erl_call() -> PathBuf {
@@ -233,7 +226,12 @@ fn reference_erl_call() -> PathBuf {
     fs::read_dir(root)
         .unwrap()
         .filter_map(Result::ok)
-        .map(|entry| entry.path().join("bin/erl_call"))
+        .map(|entry| {
+            entry
+                .path()
+                .join("bin")
+                .join(arinsal_difftest::reference::program("erl_call"))
+        })
         .find(|path| path.is_file())
         .expect("OTP-29.1.1 erl_call executable missing")
 }

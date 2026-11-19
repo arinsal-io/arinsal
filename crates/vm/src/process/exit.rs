@@ -343,7 +343,9 @@ impl Process {
         }
         // Port of erts/emulator/beam/erl_process.c:14470-14504
         // (ERTS_CONTINUE_EXIT_CLEAN_SYS_TASKS_AFTER), OTP-29.1.1: after the name is gone,
-        // the exit of the F_DISTRIBUTION process (net_kernel) runs erts_do_net_exits.
+        // the exit of an F_DISTRIBUTION process runs erts_do_net_exits on its dist entry
+        // (`ERTS_PROC_SET_DIST_ENTRY(p, NULL)`): a distribution controller's connection, or
+        // net_kernel's `erts_this_dist_entry`.
         if self.heap.has_flag(arinsal_term::pflags::F_DISTRIBUTION)
             && let Some(runtime) = self.runtime
         {
@@ -352,7 +354,13 @@ impl Process {
             } else {
                 reason
             };
-            let _ = crate::dist::net_kernel_exited(self, runtime, reason);
+            let dep = self
+                .cold
+                .as_deref_mut()
+                .and_then(|cold| cold.psd_dist_entry.take());
+            if let Some(dep) = dep {
+                let _ = crate::dist::erts_do_net_exits(self, runtime, &dep, ctx.pid(), reason);
+            }
         }
         // Port of erts/emulator/beam/erl_process.c:14438-14456
         // (ERTS_CONTINUE_EXIT_FREE), OTP-29.1.1: unregister the name, then mark the pid
@@ -371,12 +379,9 @@ impl Process {
                 continue;
             }
             if node.view().kind() == crate::monitor_link::node_type::LINK_PORT {
-                if let Some(runtime) = self.runtime
-                    && let Ok(scheduler) = runtime.scheduler()
-                {
+                if let Some(runtime) = self.runtime {
                     crate::port::owner_exit(
                         runtime,
-                        scheduler,
                         ctx.pid(),
                         reason,
                         &[crate::proc_create::port_of_link_key(node.view().other())],

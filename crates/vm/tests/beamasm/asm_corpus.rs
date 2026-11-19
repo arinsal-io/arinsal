@@ -1,11 +1,14 @@
 use arinsal_beam::BeamFile;
-use arinsal_beamasm::ProcessHeader;
+use arinsal_beamasm::{ProcessHeader, raise_frag::RaiseFragments, yield_frag::YieldFragments};
 use arinsal_beamjit::{ModuleEnv, compile_module_with_env};
 use arinsal_term::{FunEntry, Term, TermBuilder, VecHeap, from_owned, global_atoms};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+static YIELD_FRAGMENTS: OnceLock<YieldFragments> = OnceLock::new();
+static RAISE_FRAGMENTS: OnceLock<RaiseFragments> = OnceLock::new();
 
 extern "C" fn bs_create_bin_append(
     _header: *mut ProcessHeader,
@@ -131,7 +134,33 @@ extern "C" fn raw_raise_for_compile(
     1
 }
 
+extern "C" fn raise_class_for_compile(_: *mut ProcessHeader, _: u64) {}
+
 impl ModuleEnv for CorpusEnv {
+    fn yield_fragments(&self) -> (usize, usize, usize) {
+        let fragments = YIELD_FRAGMENTS.get_or_init(|| YieldFragments::new().unwrap());
+        (
+            fragments.dispatch_return(),
+            fragments.i_test_yield_shared(),
+            fragments.context_switch(),
+        )
+    }
+
+    fn raise_fragments(&self) -> (usize, usize, usize) {
+        let fragments = RAISE_FRAGMENTS.get_or_init(|| {
+            RaiseFragments::new(
+                exception as *const () as usize,
+                raise_class_for_compile as *const () as usize,
+            )
+            .unwrap()
+        });
+        (
+            fragments.raise_shared(),
+            fragments.raise_exception_shared(),
+            fragments.func_info_shared(),
+        )
+    }
+
     fn integer_literal(&self, _value: i64) -> Result<i64, String> {
         // Dynamic literals are complemented indices; the corpus only compiles, so every one maps to NIL below.
         Ok(!0)
@@ -410,7 +439,7 @@ extern "C" fn map_many(
 ) -> u64 {
     0
 }
-extern "C" fn exception(_: *mut ProcessHeader, _: *mut u64, _: *mut u64, _: u64) -> usize {
+extern "C" fn exception(_: *mut ProcessHeader, _: u64, _: *mut u64, _: u64) -> usize {
     0
 }
 extern "C" fn fun(_: *mut ProcessHeader, _: u64, _: u32, _: *mut u64) -> usize {

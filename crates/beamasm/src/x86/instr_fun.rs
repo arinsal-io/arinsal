@@ -28,7 +28,7 @@ const TAG_PRIMARY_MASK_I64: i64 = 0x3;
 const NIL: i64 = 0x3b;
 
 // Port of the `apply_mfa` initializer in instr_fun.cpp:290, OTP-29.1.1.
-const fn mfa(function: arinsal_term::Atom, arity: u64) -> ErtsCodeMfa {
+const fn mfa(function: arinsal_term::Atom, arity: usize) -> ErtsCodeMfa {
     ErtsCodeMfa {
         module: Term::atom(atoms::ERLANG).word(),
         function: Term::atom(function).word(),

@@ -6,6 +6,29 @@ value(Fun) ->
 
 print(Key, Value) -> io:format("~p=~w~n", [Key, Value]).
 
+dirty_target_after_normal_change(New, OldNormal) ->
+    DirtyBefore = erlang:system_info(dirty_cpu_schedulers_online),
+    DirtyTotal = erlang:system_info(dirty_cpu_schedulers),
+    NormalTotal = erlang:system_info(schedulers),
+    TotalPct = DirtyTotal * 100 div NormalTotal,
+    OnlinePct = New * TotalPct div OldNormal,
+    max(1, DirtyBefore * OnlinePct div 100).
+
+await_dirty_online(Target) ->
+    await_dirty_online(Target, erlang:monotonic_time(millisecond) + 5000).
+
+await_dirty_online(Target, Deadline) ->
+    Current = erlang:system_info(dirty_cpu_schedulers_online),
+    case Current =:= Target of
+        true -> Current;
+        false ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true -> {timeout, Current};
+                false ->
+                    receive after 1 -> await_dirty_online(Target, Deadline) end
+            end
+    end.
+
 run() ->
     Keys = [schedulers, schedulers_online, dirty_cpu_schedulers,
             dirty_cpu_schedulers_online, dirty_io_schedulers, thread_pool_size,
@@ -41,10 +64,21 @@ run() ->
 round_trips() ->
     lists:foreach(fun({Key, New}) ->
         Before = erlang:system_info(Key),
+        DirtyTarget = case Key of
+            schedulers_online -> dirty_target_after_normal_change(New, Before);
+            dirty_cpu_schedulers_online -> New;
+            _ -> none
+        end,
         Previous = value(fun() -> erlang:system_flag(Key, New) end),
+        Settled = case {DirtyTarget, Previous} of
+            {Target, Old} when is_integer(Target), is_integer(Old) ->
+                await_dirty_online(Target);
+            _ -> not_applicable
+        end,
         After = erlang:system_info(Key),
         print({system_flag_before, Key}, Before),
         print({system_flag_previous, Key}, Previous),
+        print({system_flag_settled_dirty_cpu_schedulers_online, Key}, Settled),
         print({system_flag_after, Key}, After)
     end, [{fullsweep_after, 42}, {min_heap_size, 377},
           {min_bin_vheap_size, 46422}, {max_heap_size, 100000},

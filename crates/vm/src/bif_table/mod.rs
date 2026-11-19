@@ -98,7 +98,7 @@ pub(crate) fn call_from_executor(
     };
     // The executor calls the BIF as its export entry does: the trampoline stores
     // `&exp->info.mfa` in `c_p->current` first, which BIF_ERROR and BIF_TRAP* name.
-    let export = crate::beamasm_integration::bif_mfa_export(module, function, arity8)?;
+    let export = crate::beamasm_integration::bif_mfa_export(module, function, u32::from(arity8))?;
     process.heap.abi.current = std::ptr::from_ref(export.mfa()).cast();
     let reg_ptr = reg.as_mut_ptr().cast::<u64>();
     // The call fragment keeps `I` in TMP_MEM1q for the BIF (call_light_bif_shared); the executor
@@ -119,11 +119,7 @@ pub(crate) fn call_from_executor(
     let named = crate::raw::beam_common_ffi::code_mfa(process.heap.abi.current as usize as u64)
         .and_then(|(module, function, arity)| {
             let atoms = arinsal_term::global_atoms();
-            Some((
-                atoms.text(module)?,
-                atoms.text(function)?,
-                usize::from(arity),
-            ))
+            Some((atoms.text(module)?, atoms.text(function)?, arity as usize))
         });
     let (module, function, arity) = named.unwrap_or((module, function, arity));
     let args = reg[..arity].to_vec();

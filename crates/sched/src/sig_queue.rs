@@ -22,7 +22,7 @@ mod msgq;
 mod raw;
 pub use msgq::{
     MessageQueueList, NextField, RECV_MARKER_TYPE_PRIO_Q_CONT, RECV_MARKER_TYPE_PRIO_Q_END,
-    RECV_MARKER_TYPE_RECV, RECV_MARKER_TYPE_YIELD, RecvMarker,
+    RECV_MARKER_TYPE_RECV, RECV_MARKER_TYPE_YIELD, RecvMarker, YieldAdjMsgQ,
 };
 pub(crate) use raw::HeldNode;
 
@@ -162,6 +162,12 @@ impl<T: InSignal> SignalQueue<T> {
         self.last = Some(node);
         self.len += 1;
         self.non_messages += usize::from(non_message);
+    }
+
+    /// Restore a delayed non-message signal at the front of the middle queue.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:367-382 (`save_delayed_nm_signal`), OTP-29.1.1.
+    pub fn push_front_node(&mut self, signal: OwnedSignal<T>) {
+        raw::push_front(self, signal);
     }
 
     /// Allocate a node for `value` and link it at the end.

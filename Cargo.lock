@@ -488,6 +488,7 @@ dependencies = [
 name = "arinsal_erts_etc"
 version = "0.0.1"
 dependencies = [
+ "arinsal-difftest",
  "cc",
  "libc",
  "rustix",

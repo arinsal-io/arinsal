@@ -122,10 +122,10 @@ impl LoaderEnv for X86LoaderEnv<'_> {
                 .ok_or_else(|| format!("dynamic literal index {index} is out of range"));
         }
         let index = index as usize;
-        if let Some(word) = self.literals.get(index as usize) {
+        if let Some(word) = self.literals.get(index) {
             return Ok(*word);
         }
-        let at = (index as usize).wrapping_sub(self.literals.len());
+        let at = index.wrapping_sub(self.literals.len());
         self.added_literals
             .borrow()
             .get(at)
@@ -194,7 +194,7 @@ impl LoaderEnv for X86LoaderEnv<'_> {
     // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:912 (emit_call_bif_mfa), OTP-29.1.1:
     // the active export of M:F/A, then its `bif_table[e->bif_number].f`.
     fn bif_mfa_function(&self, module: &str, function: &str, arity: u8) -> Result<u64, String> {
-        let entry = bif_mfa_entry(module, function, arity)
+        let entry = bif_mfa_entry(module, function, u32::from(arity))
             .ok_or_else(|| format!("no BIF export for {module}:{function}/{arity}"))?;
         let bif = export_dispatch(entry).map_or(0, |export| export.bif_table_function());
         (bif != 0)
@@ -886,9 +886,9 @@ pub(crate) fn compile(
             continue;
         }
         let atom = global_atoms().get(name)?;
-        module.export_slot_atom(atom, arity)?;
+        module.export_slot_atom(atom, u32::from(arity))?;
         export_addresses.push((
-            (module.name_atom, atom, arity),
+            (module.name_atom, atom, u32::from(arity)),
             arinsal_beamjit::beamasm_get_code(&ba, export.label)?,
         ));
     }

@@ -137,7 +137,7 @@ impl super::beam_asm_global::BeamGlobalAssembler {
             ArgVal::Word(1),
             ArgVal::Immediate(info.mfa.module),
             ArgVal::Immediate(info.mfa.function),
-            ArgVal::Word(info.mfa.arity),
+            ArgVal::Word(info.mfa.arity as u64),
         )?;
         ba.emit_aligned_label(
             ArgVal::Label(2),
@@ -1191,7 +1191,7 @@ impl BeamModuleAssembler {
         let mfa = arinsal_term::ErtsCodeMfa {
             module: atom(module)?,
             function: atom(function)?,
-            arity: arg_word(arity)?,
+            arity: arg_word(arity)? as usize,
         };
         let fragment = self.ga_get(GlobalLabels::IFuncInfoShared)?;
         let target = self.resolve_fragment(fragment);
@@ -1211,7 +1211,7 @@ impl BeamModuleAssembler {
         self.asm.a.embed_u64(0)?;
         self.asm.a.embed_u64(mfa.module)?;
         self.asm.a.embed_u64(mfa.function)?;
-        self.asm.a.embed_u64(mfa.arity)?;
+        self.asm.a.embed_u64(mfa.arity as u64)?;
         Ok(())
     }
 

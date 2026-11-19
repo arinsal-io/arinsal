@@ -1024,7 +1024,7 @@ fn schedule(
                 .map_or(0, |word| word.tagged_word() as usize);
             let mfa = c_p.heap.abi.current.cast::<arinsal_term::ErtsCodeMfa>();
             crate::bif_traps::vbump_all_reds(c_p);
-            let arity = crate::natives::raw::code_mfa(mfa as usize).arity as usize;
+            let arity = crate::natives::raw::code_mfa(mfa as usize).arity;
             let nep = crate::erl_nfunc_sched::erts_get_proc_nfunc(c_p, arity).as_ptr();
             let abi = &mut c_p.heap.abi;
             let nep_ref = crate::erl_nfunc_sched::nfunc_at(nep);
@@ -1286,7 +1286,7 @@ impl DirtyNifJob {
         let i = process.heap.abi.i as usize;
         let nep = crate::erl_nfunc_sched::i_beam_op_to_nfunc(i);
         let ep = crate::erl_nfunc_sched::nfunc_at(nep);
-        let arity = ep.trampoline.info.mfa.arity as usize;
+        let arity = ep.trampoline.info.mfa.arity;
         let lib = crate::natives::raw::nif_mod(ep.m);
         let args = process.x.get(..arity)?.to_vec();
         // erts_atomic32_read_band_mb(&c_p->state, ~(DIRTY_CPU_PROC | DIRTY_IO_PROC)).

@@ -1070,17 +1070,21 @@ impl ModuleEnv for VmModuleEnv<'_> {
     fn line_breakpoint_fragment(&self) -> usize {
         self.line_breakpoint_fragment
     }
-    fn yield_fragments(&self) -> Option<(usize, usize, usize)> {
-        yield_fragments().map(|fragments| {
-            (
-                fragments.dispatch_return(),
-                fragments.i_test_yield_shared(),
-                fragments.context_switch(),
-            )
-        })
+    fn yield_fragments(&self) -> (usize, usize, usize) {
+        let fragments = yield_fragments().expect("VM yield fragments are initialized");
+        (
+            fragments.dispatch_return(),
+            fragments.i_test_yield_shared(),
+            fragments.context_switch(),
+        )
     }
-    fn raise_fragments(&self) -> Option<(usize, usize)> {
-        raise_fragments().map(|fragments| (fragments.raise_shared(), fragments.raise_exception()))
+    fn raise_fragments(&self) -> (usize, usize, usize) {
+        let fragments = raise_fragments().expect("VM raise fragments are initialized");
+        (
+            fragments.raise_shared(),
+            fragments.raise_exception_shared(),
+            fragments.func_info_shared(),
+        )
     }
     fn map_error_fragments(&self) -> Option<(usize, usize, usize)> {
         raise_fragments().map(|fragments| {
@@ -1128,7 +1132,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
     }
 
     fn bif_mfa_entry(&self, module: &str, function: &str, arity: u8) -> Result<usize, String> {
-        bif_mfa_entry(module, function, arity)
+        bif_mfa_entry(module, function, u32::from(arity))
             .ok_or_else(|| format!("no BIF dispatch slot for {module}:{function}/{arity}"))
     }
     fn bs_match_helper(&self) -> arinsal_beamasm::bs_match::BsMatchHelper {
@@ -1433,10 +1437,10 @@ pub(crate) fn compile(
                 return None;
             }
             let name = arinsal_term::Atom(function.atom);
-            module.export_slot_atom(name, function.arity)?;
+            module.export_slot_atom(name, u32::from(function.arity))?;
             let entry = compiled.native.entries.get(&function.label)?;
             Some((
-                (module.name_atom, name, function.arity),
+                (module.name_atom, name, u32::from(function.arity)),
                 *entry as usize + arinsal_beamasm::common::beam_asm_h::FUNC_INFO_BYTES,
             ))
         })

@@ -2512,17 +2512,15 @@ pub(crate) fn install_hooks() {
     });
 }
 
-/// Port of erts/emulator/beam/io.c:3841 (erts_deliver_port_exit) for a driver that
-/// fails: the port terminates (`stop`), then links and monitors see `reason`.
-fn driver_port_exit(runtime: &crate::process::Runtime, id: u64, reason: Term) {
-    crate::trace::emit_port_event(runtime, id, crate::trace::PORTS, "closed", &[reason]);
-    let Some(handle) = remove_port(runtime, id) else {
+/// A driver that fails (`driver_failure*`, `driver_exit`): the port exits with `reason`
+/// from itself.
+// Port of erts/emulator/beam/io.c (driver_failure_term → erts_deliver_port_exit(prt,
+// prt->common.id, reason, 0, 0)), OTP-29.1.1.
+pub(crate) fn driver_port_exit(runtime: &crate::process::Runtime, id: u64, reason: Term) {
+    let Some(owner) = runtime.ports.get(id).map(|handle| handle.owner_pid()) else {
         return;
     };
-    let owner = handle.owner_pid();
-    let scheduler = Arc::clone(&handle.scheduler);
-    release_io(&handle);
-    notify_exit(&handle, id, &scheduler, owner, reason);
+    erts_deliver_port_exit(runtime, id, owner, reason, None);
 }
 
 fn erl_launcher(name: &str, executable: bool) -> bool {
@@ -2594,16 +2592,6 @@ pub(crate) fn alloc_inet_port(
     crate::trace::port_opened(runtime, port_id);
     reservation.commit();
     Ok((port_id, handle, drv_port))
-}
-
-fn notify_exit(
-    handle: &PortHandle,
-    id: u64,
-    scheduler: &Scheduler<Process>,
-    from: Pid,
-    reason: Term,
-) {
-    notify_links_monitors(handle, id, scheduler, from, false, reason);
 }
 
 fn notify_links_monitors(
@@ -3714,20 +3702,55 @@ pub(crate) fn release_io_flushing(handle: &PortHandle, flush: bool) {
     handle.finish_halt();
 }
 
-fn remove_and_notify(
+/// Deliver an exit to port `id`: the port goes away (a second exit finds it gone, as erts'
+/// `DEAD | EXITING | CLOSING` check), its name is unregistered, a distribution port runs
+/// `erts_do_net_exits(dep, modified_reason)` and drops its `ERTS_PRTSD_DIST_ENTRY`, links and
+/// monitors get `modified_reason` (`kill` → `killed`) from `from`, then the port is flushed
+/// (reason other than `kill`) or terminated; `send_closed` gets `{Port, closed}` from
+/// terminate_port. Returns whether the exit was delivered.
+// Port of erts/emulator/beam/io.c:3841 (erts_deliver_port_exit), OTP-29.1.1.
+pub(crate) fn erts_deliver_port_exit(
     runtime: &crate::process::Runtime,
     id: u64,
-    scheduler: &Scheduler<Process>,
     from: Pid,
     reason: Term,
-) -> Option<Arc<PortHandle>> {
+    send_closed: Option<Pid>,
+) -> bool {
+    let modified_reason = if reason == Term::atom(arinsal_term::atoms::KILL) {
+        Term::atom(arinsal_term::atoms::KILLED)
+    } else {
+        reason
+    };
     let ports = runtime.ports.lock();
-    let handle = runtime.ports.remove_locked(id)?;
+    let Some(handle) = runtime.ports.remove_locked(id) else {
+        return false;
+    };
     runtime.port_ids.release(id);
     drop(ports);
+    crate::trace::emit_port_event(runtime, id, crate::trace::PORTS, "closed", &[reason]);
     release_port_name(runtime, &handle);
-    notify_links_monitors(&handle, id, scheduler, from, false, reason);
-    Some(handle)
+    if let Some(dep) = handle.set_dist_entry(None) {
+        let _ = crate::dist::erts_do_net_exits_ctrl(
+            runtime,
+            &dep,
+            crate::natives::erts_debug::DistCid::Port(id),
+            modified_reason,
+        );
+    }
+    notify_links_monitors(&handle, id, &handle.scheduler, from, false, modified_reason);
+    release_io_flushing(&handle, reason != Term::atom(arinsal_term::atoms::KILL));
+    if let Some(to) = send_closed {
+        event_message(
+            &handle.scheduler,
+            to,
+            id,
+            handle.trace_scope(),
+            Term::atom(arinsal_term::atoms::CLOSED),
+        );
+    }
+    // The port's trace state goes last: `{Port, closed}` above is still traced.
+    crate::trace::port_closed(runtime, id);
+    true
 }
 
 fn close(process: &Process, term: Term) -> Result<Term, VmError> {
@@ -3737,7 +3760,6 @@ fn close(process: &Process, term: Term) -> Result<Term, VmError> {
 fn close_inner(process: &Process, term: Term, trace_receive: bool) -> Result<Term, VmError> {
     let sender = process.self_pid.ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let scheduler = runtime.scheduler().map_err(|_| badarg())?;
     let id = port_id(process, term).ok_or_else(badarg)?;
     if trace_receive && let Some(caller) = sender.to_term() {
         let mut heap = VecHeap::new();
@@ -3747,26 +3769,13 @@ fn close_inner(process: &Process, term: Term, trace_receive: bool) -> Result<Ter
             crate::trace::emit_port_event(runtime, id, crate::trace::RECEIVE, "receive", &[event]);
         }
     }
-    crate::trace::emit_port_event(
+    if erts_deliver_port_exit(
         runtime,
         id,
-        crate::trace::PORTS,
-        "closed",
-        &[Term::atom(arinsal_term::atoms::NORMAL)],
-    );
-    // Port of erts/emulator/beam/io.c:3698 (terminate_port): links get a port exit signal,
-    // monitors a DOWN, both with the port as origin. Removal and notification share one
-    // critical section of the port table so `demonitor` cannot slip between them.
-    let removed = remove_and_notify(
-        runtime,
-        id,
-        scheduler,
         sender,
         Term::atom(arinsal_term::atoms::NORMAL),
-    );
-    if let Some(handle) = removed {
-        crate::trace::port_closed(runtime, id);
-        release_io(&handle);
+        None,
+    ) {
         Ok(Term::atom(arinsal_term::atoms::TRUE))
     } else {
         Err(badarg())
@@ -3804,25 +3813,10 @@ fn port_close(
     close(process, port)
 }
 
-/// Close a runtime port selected by its internal id.
-pub(crate) fn close_by_id(
-    process: &Process,
-    _ctx: &mut RunCtx<'_, crate::Process>,
-    id: u64,
-) -> Result<bool, VmError> {
-    let term = Term::port(id).ok_or_else(badarg)?;
-    close(process, term).map(|result| result == Term::atom(arinsal_term::atoms::TRUE))
-}
-
 /// Apply an exit signal to a port and deliver its reason to linked processes.
 pub(crate) fn exit_port(process: &mut Process, port: Term, reason: Term) -> Result<(), VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
-    // Port of erts/emulator/beam/io.c:3854 (deliver_port_exit): `kill` reaches links as `killed`.
-    let reason = if reason == Term::atom(arinsal_term::atoms::KILL) {
-        Term::atom(arinsal_term::atoms::KILLED)
-    } else {
-        reason
-    };
+    // `kill` reaches links as `killed` in erts_deliver_port_exit (io.c:3854).
     let Some(runtime) = process.runtime.as_ref() else {
         return Ok(());
     };
@@ -3836,14 +3830,8 @@ pub(crate) fn exit_port(process: &mut Process, port: Term, reason: Term) -> Resu
         let _ = drv_sig::exit(process, None, pid, &handle, &drv, false, pid, reason, false);
         return Ok(());
     }
-    crate::trace::emit_port_event(runtime, id, crate::trace::PORTS, "closed", &[reason]);
-    let scheduler = runtime.scheduler()?;
     let caller = process.self_pid.ok_or_else(badarg)?;
-    let Some(removed) = remove_and_notify(runtime, id, scheduler, caller, reason) else {
-        return Ok(());
-    };
-    crate::trace::port_closed(runtime, id);
-    release_io(&removed);
+    erts_deliver_port_exit(runtime, id, caller, reason, None);
     Ok(())
 }
 
@@ -3867,24 +3855,13 @@ pub(crate) fn halt_reap_ports(runtime: &'static crate::process::Runtime, progres
             );
             continue;
         }
-        crate::trace::emit_port_event(
+        erts_deliver_port_exit(
             runtime,
             handle.id,
-            crate::trace::PORTS,
-            "closed",
-            &[Term::atom(arinsal_term::atoms::KILLED)],
-        );
-        let scheduler = Arc::clone(&handle.scheduler);
-        if let Some(removed) = remove_and_notify(
-            runtime,
-            handle.id,
-            &scheduler,
             handle.owner_pid(),
             Term::atom(arinsal_term::atoms::KILLED),
-        ) {
-            crate::trace::port_closed(runtime, handle.id);
-            release_io(&removed);
-        }
+            None,
+        );
     }
 }
 
@@ -3964,7 +3941,6 @@ fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Res
 /// case, OTP-29.1.1.
 pub(crate) fn owner_exit(
     runtime: &'static crate::process::Runtime,
-    scheduler: &Scheduler<Process>,
     owner: Pid,
     reason: Term,
     port_links: &[u64],
@@ -3992,12 +3968,7 @@ pub(crate) fn owner_exit(
             drv_sig::exit_for_process_termination(runtime, handle, owner, exit_reason);
             continue;
         }
-        let Some(handle) = remove_and_notify(runtime, port_id, scheduler, owner, reason) else {
-            continue;
-        };
-        crate::trace::emit_port_event(runtime, port_id, crate::trace::PORTS, "closed", &[reason]);
-        crate::trace::port_closed(runtime, port_id);
-        release_io(&handle);
+        erts_deliver_port_exit(runtime, port_id, owner, reason, None);
     }
 }
 
@@ -4113,7 +4084,7 @@ pub(crate) fn link(
         return Ok(done || !linked);
     }
     // Termination removes the port from the table and drains `links` in one critical section
-    // of the table lock (`remove_and_notify`); taking the locks in the same order makes this
+    // of the table lock (`erts_deliver_port_exit`); taking the locks in the same order makes this
     // registration either visible to it or refused.
     let ports = runtime.ports.read().unwrap();
     if linked && !runtime.ports.contains(id) {

@@ -368,7 +368,7 @@ fn dec_rare<H: HeapAlloc + ?Sized>(
             if arity < 0 {
                 return Err(BifError::BADARG);
             }
-            let arity = u8::try_from(arity).map_err(|_| BifError::BADARG)?;
+            let arity = arity as u32;
             let mfa = (module, name, arity);
             if flags.safe && crate::export::active_export_entry(mfa).is_none() {
                 return Err(BifError::BADARG);

@@ -1092,24 +1092,28 @@ fn native_exit(
         process.heap.abi.exc.freason = 0;
     } else if process.heap.abi.exc.freason == arinsal_term::exc::EXC_FUNCTION_CLAUSE {
         // Port of erts/emulator/beam/beam_common.c (save_stacktrace, EXC_FUNCTION_CLAUSE):
-        // the top frame carries the current function's MFA and arguments. Keep the native pc
-        // through the initial save; raw_raise marks its serialized trace locationless on rethrow.
-        let function = native_function_at(registers.tmp_mem[6] as usize)
-            .ok_or_else(|| VmError::Unsupported("function_clause current MFA".into()))?;
-        let module = arinsal_term::global_atoms()
-            .get(function.module)
-            .ok_or_else(|| VmError::Unsupported("function_clause module atom".into()))?;
-        let function_atom = arinsal_term::global_atoms()
-            .get(function.function)
-            .ok_or_else(|| VmError::Unsupported("function_clause function atom".into()))?;
-        let arity = usize::from(function.arity);
-        let args = registers.x_reg_array[..arity].to_vec();
+        // the top frame carries c_p->current and the argument registers; the pc is ignored.
+        // raw_raise marks its serialized trace locationless on rethrow.
+        let (module, function, arity) =
+            crate::raw::beam_common_ffi::code_mfa(process.heap.abi.current as usize as u64)
+                .ok_or_else(|| {
+                    VmError::Unsupported(format!(
+                        "function_clause current MFA at {:#x}",
+                        process.heap.abi.current as usize
+                    ))
+                })?;
+        let arity = u8::try_from(arity)
+            .map_err(|_| VmError::Unsupported("function_clause arity exceeds u8".into()))?;
+        let arity_usize = usize::from(arity);
+        let args = registers.x_reg_array[..arity_usize].to_vec();
         if exception_trace {
             eprintln!(
                 "native function_clause in {:?} args={:?}",
                 Some(format!(
                     "{}:{}/{}",
-                    function.module, function.function, function.arity
+                    arinsal_term::global_atoms().text(module).unwrap_or("?"),
+                    arinsal_term::global_atoms().text(function).unwrap_or("?"),
+                    arity_usize
                 )),
                 args.iter()
                     .map(|arg| format!("{:#x}", arg.tagged_word()))
@@ -1119,12 +1123,16 @@ fn native_exit(
         let args = arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
             .list_from_iter(args)
             .map_err(|error| VmError::Unsupported(format!("function_clause args {error:?}")))?;
-        let mut trap =
-            exceptions::native_trap(arinsal_beamasm::exc::EXC_ERROR, process.heap.abi.exc.fvalue)?;
+        let reason = crate::native_helpers::expand_error_value(process)
+            .ok_or_else(|| VmError::Unsupported("function_clause reason".into()))?;
+        let mut trap = exceptions::native_trap(
+            arinsal_beamasm::exc::EXC_ERROR,
+            crate::native_hooks::raw(reason),
+        )?;
         trap.top = Some(crate::stacktrace::TopFrame::CurrentArgsNoLocation {
             module,
-            function: function_atom,
-            arity: function.arity,
+            function,
+            arity,
             args,
         });
         return Err(VmError::Trap(trap));

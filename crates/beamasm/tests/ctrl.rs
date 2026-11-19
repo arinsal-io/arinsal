@@ -5,6 +5,7 @@ use arinsal_beamasm::{
     ExitReason, ProcessHeader, SchedulerRegisters, enter_native,
     module::{ArgVal, BeamModuleAssembler},
 };
+use similar_asserts::assert_eq;
 
 fn finish(
     asm: BeamModuleAssembler,
@@ -170,6 +171,7 @@ fn function_entries_are_eight_byte_aligned_behind_a_forty_byte_info_slot() {
     use arinsal_beamasm::common::beam_asm_h::FUNC_INFO_BYTES;
 
     let mut asm = BeamModuleAssembler::new();
+    asm.set_raise_fragments(0, 0, 0x1234_5678);
     for label in [1u32, 2, 3] {
         asm.emit_i_func_label(label).unwrap();
         asm.emit_i_func_info(label, 0xa, 0xb, 1).unwrap();

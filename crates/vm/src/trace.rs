@@ -614,7 +614,7 @@ fn is_sensitive_scoped(owner: usize, pid: Pid) -> bool {
 // Port of erts/emulator/beam/erl_trace.c:70 (exp_send, exp_receive, exp_timeout), OTP-29.1.1.
 #[derive(Clone, Copy)]
 pub(crate) enum SavedCall {
-    Mfa(arinsal_term::Atom, arinsal_term::Atom, u8),
+    Mfa(arinsal_term::Atom, arinsal_term::Atom, u32),
     Export(usize),
     Send,
     Receive,
@@ -710,7 +710,7 @@ pub extern "C" fn save_calls(c_p: *mut ProcessHeader, export: usize) {
 /// Reads the MFA stored in a stable export entry.
 pub(crate) fn saved_export_mfa(
     export: usize,
-) -> Option<(arinsal_term::Atom, arinsal_term::Atom, u8)> {
+) -> Option<(arinsal_term::Atom, arinsal_term::Atom, u32)> {
     crate::raw::beam_common_ffi::export_mfa(export)
 }
 
@@ -897,7 +897,7 @@ pub(crate) fn emit_dirty_running(
     event_name: &str,
     module: &str,
     function: &str,
-    arity: u8,
+    arity: u32,
 ) {
     let (Ok(module), Ok(function), Some(arity)) = (
         global_atoms().intern(module),
@@ -3956,7 +3956,9 @@ pub extern "C" fn erts_call_trace_return(
         let (Some(module), Some(function)) = (names.text(module), names.text(function)) else {
             return;
         };
-        Some(crate::trace_bp::func_id(module, function, arity))
+        u8::try_from(arity)
+            .ok()
+            .map(|arity| crate::trace_bp::func_id(module, function, arity))
     };
     call_acc_return(process, pid, session, flags, previous);
 }
@@ -4113,11 +4115,11 @@ pub(crate) fn running_mfa(process: &mut Process, subject: Pid) -> Result<Option<
     let (module, function, arity) = if let Some(finalizer) = dirty_finalizer {
         finalizer
     } else if let Some(bif) = dirty_bif {
-        bif
+        (bif.0, bif.1, u32::from(bif.2))
     } else if let Some(continuation) = continuation {
-        continuation
+        (continuation.0, continuation.1, u32::from(continuation.2))
     } else if let Some(native) = native.as_ref() {
-        (native.module, native.function, native.arity)
+        (native.module, native.function, u32::from(native.arity))
     } else {
         return Ok(None);
     };

@@ -152,16 +152,10 @@ pub trait ModuleEnv {
     fn breakpoint_fragment(&self) -> usize {
         self.light_bif_fragment()
     }
-    /// Process-wide `(dispatch_return, i_test_yield_shared, context_switch_simplified)`
-    /// fragments, or `None` when the environment has none (each module then keeps its own).
-    fn yield_fragments(&self) -> Option<(usize, usize, usize)> {
-        None
-    }
-    /// Process-wide `(raise_shared, raise_exception)` fragments, or `None` when the
-    /// environment has none (each `raise` then carries the exception transfer inline).
-    fn raise_fragments(&self) -> Option<(usize, usize)> {
-        None
-    }
+    /// Process-wide `(dispatch_return, i_test_yield_shared, context_switch_simplified)` fragments.
+    fn yield_fragments(&self) -> (usize, usize, usize);
+    /// Process-wide `(raise_shared, raise_exception_shared, i_func_info_shared)` fragments.
+    fn raise_fragments(&self) -> (usize, usize, usize);
     /// Process-wide `(handle_map_get_badmap, handle_map_get_badkey, handle_map_size_error)`
     /// fragments, or `None` when the environment has none (each failing `map_get/2` and
     /// `map_size/1` then carries its error path inline).
@@ -517,6 +511,7 @@ enum EmitterKind {
     Heap,
     Fused,
     CallExternal,
+    LoadNif,
     GuardBif,
     SelectVal,
     SelectTupleArity,
@@ -966,7 +961,7 @@ pub static PORTED_OPS: &[PortedOp] = &[
     },
     PortedOp {
         name: "i_load_nif",
-        emitter: EmitterKind::CallExternal,
+        emitter: EmitterKind::LoadNif,
     },
     PortedOp {
         name: "i_call_on_load_function",
@@ -1821,9 +1816,8 @@ fn compile_parsed_module_with_options_in_arena(
         assembler.set_beam_literal(index, word);
     }
     assembler.set_exception_resolver(env.exception_resolver() as usize);
-    if let Some((dispatch_return, test_yield, context_switch)) = env.yield_fragments() {
-        assembler.set_yield_fragments(dispatch_return, test_yield, context_switch);
-    }
+    let (dispatch_return, test_yield, context_switch) = env.yield_fragments();
+    assembler.set_yield_fragments(dispatch_return, test_yield, context_switch);
     let shared = env.compare_shared();
     if shared.arith != 0 {
         assembler.set_arith_compare_shared(shared.arith);
@@ -1834,9 +1828,8 @@ fn compile_parsed_module_with_options_in_arena(
     if shared.element_guard != 0 {
         assembler.set_element_guard_shared(shared.element_guard);
     }
-    if let Some((raise_shared, raise_exception)) = env.raise_fragments() {
-        assembler.set_raise_fragments(raise_shared, raise_exception);
-    }
+    let (raise_shared, raise_exception, func_info_shared) = env.raise_fragments();
+    assembler.set_raise_fragments(raise_shared, raise_exception, func_info_shared);
     if let Some((badmap, badkey, size_error)) = env.map_error_fragments() {
         assembler.set_map_error_fragments(badmap, badkey, size_error);
     }
@@ -3902,6 +3895,10 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
             }
             _ => return Err(EmitError::Operand(format!("unknown op {}", op.name()))),
         },
+        EmitterKind::LoadNif => {
+            count(0)?;
+            assembler.emit_i_load_nif()
+        }
         EmitterKind::CallExternal => match GENERIC {
             erts_tables::GENOP_I_CALL_EXT_1 => {
                 count(1)?;
@@ -3923,17 +3920,13 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 count(0)?;
                 assembler.emit_i_perf_counter(env.sys_perf_counter(), env.gc_hook())
             }
-            erts_tables::GENOP_I_HIBERNATE_0
-            | erts_tables::GENOP_I_LOAD_NIF_0
-            | erts_tables::GENOP_I_CALL_ON_LOAD_FUNCTION_0 => {
-                // Port of erts/emulator/beam/jit/arm/ops.tab:660-680, 612-641, OTP-29.1.1: the
-                // loader turns these BIF calls into instructions. They keep their
-                // scheduler-visible behaviour by calling the BIF's export, whose import the
-                // module still carries.
+            erts_tables::GENOP_I_HIBERNATE_0 | erts_tables::GENOP_I_CALL_ON_LOAD_FUNCTION_0 => {
+                // Port of erts/emulator/beam/jit/arm/ops.tab:612-641, OTP-29.1.1: the loader
+                // turns these BIF calls into instructions. They keep their scheduler-visible
+                // behaviour by calling the BIF's export, whose import the module still carries.
                 count(0)?;
                 let (module, function, arity) = match GENERIC {
                     erts_tables::GENOP_I_HIBERNATE_0 => ("erlang", "hibernate", 0),
-                    erts_tables::GENOP_I_LOAD_NIF_0 => ("erlang", "load_nif", 2),
                     _ => ("erlang", "call_on_load_function", 1),
                 };
                 // The export of these BIFs names their own stub body in `erlang` once

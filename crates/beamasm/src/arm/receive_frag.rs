@@ -153,6 +153,7 @@ impl ReceiveFragments {
         code.emit(|e| {
             e.mov_const(TMP2, 0)?;
             e.strb_uoff(TMP2, C_P, PROCESS_ARITY)?;
+            e.ldr_uoff(ARG3, C_P, PROCESS_I)?;
             e.mov_const(SUPER_TMP, context_switch as u64)?;
             e.br(SUPER_TMP)
         })
@@ -204,6 +205,7 @@ impl ReceiveFragments {
             code.emit(|e| {
                 e.and_imm(TMP1, XREG2, !1)?;
                 e.str_uoff(TMP1, C_P, PROCESS_I)?;
+                e.mov_reg(ARG3, TMP1)?;
                 e.mov_const(TMP2, 0)?;
                 e.strb_uoff(TMP2, C_P, PROCESS_ARITY)?;
                 e.mov_const(SUPER_TMP, context_switch as u64)?;

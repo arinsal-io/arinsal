@@ -7,6 +7,7 @@ use arinsal_beamasm::{
     enter_native,
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
 };
+use similar_asserts::assert_eq;
 
 extern "C" fn raise_class_for_test(_header: *mut ProcessHeader, trace: u64, _value: u64) -> u64 {
     trace
@@ -21,27 +22,34 @@ extern "C" fn add_stacktrace_stub(_: *mut ProcessHeader, reason: u64, _: u64) ->
     reason
 }
 
-extern "C" fn uncaught(_: *mut ProcessHeader, _: *mut u64, _: *mut u64, _: u64) -> usize {
+extern "C" fn uncaught(_: *mut ProcessHeader, _: u64, _: *mut u64, _: u64) -> usize {
     0
 }
 
 extern "C" fn route_to_header_handler(
     process: *mut ProcessHeader,
-    _: *mut u64,
-    _: *mut u64,
     _: u64,
-) -> usize {
-    arinsal_beamasm::rt::process_header_mut(process, |header| header.self_pid as usize)
-}
-
-extern "C" fn unwind_and_route_to_header_handler(
-    process: *mut ProcessHeader,
-    _: *mut u64,
     _: *mut u64,
     _: u64,
 ) -> usize {
     arinsal_beamasm::rt::process_header_mut(process, |header| {
-        header.stop = header.stop.wrapping_add(arinsal_term::CP_WORDS);
+        // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:295-330:
+        // handle_error discards the fake CP before transferring to a catch handler.
+        header.stop = header.stop.wrapping_add(1);
+        header.self_pid as usize
+    })
+}
+
+extern "C" fn unwind_and_route_to_header_handler(
+    process: *mut ProcessHeader,
+    _: u64,
+    _: *mut u64,
+    _: u64,
+) -> usize {
+    arinsal_beamasm::rt::process_header_mut(process, |header| {
+        // The shared raise fragment pushed a fake CP; handle_error discards it before
+        // next_catch advances over the callee's saved frame.
+        header.stop = header.stop.wrapping_add(arinsal_term::CP_WORDS + 1);
         header.self_pid as usize
     })
 }
@@ -472,7 +480,7 @@ fn error_test(
     emit(&mut asm).unwrap();
     finish(&mut asm);
     let (_, header, _, _) = execute(asm, 1);
-    assert_ne!(header.exc.freason, 0);
+    assert_eq!(header.exc.freason != 0, true);
 }
 
 // Compile-time use also pins the resolver ABI for fixtures that catch errors in a caller.

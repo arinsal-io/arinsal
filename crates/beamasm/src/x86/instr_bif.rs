@@ -52,7 +52,7 @@ const F_HIBERNATE_SCHED: i64 = 1;
 const RET_NIF_SUCCESS: i64 = 0;
 const RET_NIF_YIELD: i64 = 2;
 
-const fn mfa(function: arinsal_term::Atom, arity: u64) -> ErtsCodeMfa {
+const fn mfa(function: arinsal_term::Atom, arity: usize) -> ErtsCodeMfa {
     ErtsCodeMfa {
         module: Term::atom(atoms::ERLANG).word(),
         function: Term::atom(function).word(),

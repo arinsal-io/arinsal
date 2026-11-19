@@ -88,8 +88,88 @@ pub(crate) fn after_collection(process: &mut Process, collections: u64, words_re
     flags.gc_words.fetch_add(words_reclaimed, Ordering::Relaxed);
 }
 
-/// Handle one phase of a literal-copy request after earlier signals have drained.
+/// The next action of `handle_cla`; a yield keeps the signal and its resume markers alive.
+pub(crate) enum HandleClaResult {
+    Yield { cnt: i32 },
+    Complete { result: Term, cnt: i32 },
+}
+
+/// Handle `ERTS_SIG_Q_OP_CLA` while retaining its signal-owned resume markers.
 // Port of erts/emulator/beam/erl_proc_sig_queue.c:8128 (`handle_cla`), OTP-29.1.1.
+pub(crate) fn handle_cla(
+    process: &mut Process,
+    request: &mut arinsal_sched::LiteralAreaCopyRequest<Message>,
+    limit: i32,
+) -> Result<HandleClaResult, VmError> {
+    let store = process.persistent_terms;
+    let Some(area) = store.retired_area(request.area_id) else {
+        return Ok(HandleClaResult::Complete {
+            result: Term::atom(arinsal_term::atoms::OK),
+            cnt: 1,
+        });
+    };
+
+    let resumed_after_root_yield = request.yield_data.is_some();
+    let mut cnt = 1_i32;
+    if !resumed_after_root_yield {
+        // `handle_cla` first makes the messages before this signal self-contained.
+        let work = process
+            .inbox
+            .copy_literal_area_references(&mut process.heap, &area)?;
+        cnt = cnt.saturating_add(
+            (work.messages_scanned / 25)
+                .saturating_add(work.words_scanned / 128)
+                .min(i32::MAX as usize) as i32,
+        );
+        if work.messages_copied != 0 {
+            cnt = cnt.saturating_add(
+                (work.words_scanned / 128)
+                    .saturating_add(work.words_copied / 16)
+                    .min(i32::MAX as usize) as i32,
+            );
+        }
+    }
+
+    cnt = cnt.saturating_add(1);
+    let reds = erts_check_copy_literals_gc_need_max_reds(process);
+    if reds > crate::process::CONTEXT_REDS {
+        return Ok(HandleClaResult::Complete {
+            result: Term::atom(arinsal_term::atoms::CHECK_GC),
+            cnt,
+        });
+    }
+    if !resumed_after_root_yield && cnt.saturating_add(reds.saturating_mul(4)) > limit {
+        request
+            .yield_data
+            .get_or_insert_with(|| Box::new(arinsal_sched::YieldAdjMsgQ::default()));
+        return Ok(HandleClaResult::Yield { cnt });
+    }
+
+    // `erts_check_copy_literals_gc_need` defers its scan while GC is disabled.
+    if !process.heap.gc_enabled() {
+        return Ok(HandleClaResult::Complete {
+            result: Term::atom(arinsal_term::atoms::NEED_GC),
+            cnt: cnt.saturating_add(crate::process::CONTEXT_REDS * 4),
+        });
+    }
+
+    let (has_roots, scan_reds) = check_copy_literal_area_gc_need(process, &area);
+    if has_roots {
+        Ok(HandleClaResult::Complete {
+            result: Term::atom(arinsal_term::atoms::NEED_GC),
+            cnt: cnt.saturating_add(scan_reds.saturating_mul(4)),
+        })
+    } else {
+        store.acknowledge_copied(request.area_id, 0);
+        Ok(HandleClaResult::Complete {
+            result: Term::atom(arinsal_term::atoms::OK),
+            cnt: cnt.saturating_add(scan_reds.saturating_mul(4)),
+        })
+    }
+}
+
+/// Handle a dirty literal-copy system task.
+// Port of erts/emulator/beam/erl_process.c:11144-11170 (`F_DIRTY_CHECK_CLA`), OTP-29.1.1.
 pub(crate) fn copy_literal_area(
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
@@ -99,135 +179,144 @@ pub(crate) fn copy_literal_area(
     requester: arinsal_sched::Pid,
 ) -> Result<(), VmError> {
     let store = process.persistent_terms;
-    let area = store.retired_area(area_id);
-    let Some(area) = area else {
+    let Some(area) = store.retired_area(area_id) else {
         reply_literal_area_copy(ctx, request, requester, Term::atom(arinsal_term::atoms::OK))?;
         return Ok(());
     };
 
-    if how == arinsal_sched::LiteralCopyHow::Init {
-        // Port of erl_proc_sig_queue.c:8167-8278: earlier queued messages are
-        // made self-contained before process-heap references are considered.
-        process
-            .inbox
-            .copy_literal_area_references(&mut process.heap, &area)?;
-        // Port of beam_bif_load.c:1012 (erts_check_copy_literals_gc_need), OTP-29.1.1:
-        // the heap may be inconsistent while GC is disabled, so do not scan it;
-        // the collection is requested and delayed until GC is enabled.
-        if !process.heap.gc_enabled() {
-            reply_literal_area_copy(
-                ctx,
-                request,
-                requester,
-                Term::atom(arinsal_term::atoms::NEED_GC),
-            )?;
-            return Ok(());
+    // `check_gc` always reaches the dirty-scheduler scan; `need_gc` already scanned in `handle_cla`.
+    let has_roots = how == arinsal_sched::LiteralCopyHow::NeedGc
+        || check_copy_literal_area_gc_need(process, &area).0;
+    if has_roots {
+        let live_x = crate::process::switched_out_live(process);
+        let hibernated = process.hibernated();
+        let copied = rewrite_roots(process, live_x, std::slice::from_ref(&area))?;
+        process.heap.request_full_sweep();
+        process.force_gc_live(live_x)?;
+        if hibernated {
+            // Port of erts/emulator/beam/erl_gc.c:1387 (`erts_garbage_collect_literals`), OTP-29.1.1.
+            process.garbage_collect_hibernate(live_x)?;
         }
-        // Port of erts/emulator/beam/erl_proc_sig_queue.c:8312-8314 (handle_cla:
-        // `erts_check_copy_literals_gc_need_max_reds(c_p) > CONTEXT_REDS` replies `check_gc`),
-        // OTP-29.1.1, with ERTS_CLA_SCAN_WORDS_PER_RED words per reduction.
-        if literal_scan_words(process) > crate::process::CONTEXT_REDS as usize * 512 {
-            reply_literal_area_copy(
-                ctx,
-                request,
-                requester,
-                Term::atom(arinsal_term::atoms::CHECK_GC),
-            )?;
-            return Ok(());
-        }
-        let has_roots = has_literal_area_roots(process, &area);
-        if has_roots {
-            reply_literal_area_copy(
-                ctx,
-                request,
-                requester,
-                Term::atom(arinsal_term::atoms::NEED_GC),
-            )?;
-            return Ok(());
-        }
-        store.acknowledge_copied(area_id, 0);
+        store.acknowledge_copied(area_id, u64::from(copied));
     } else {
-        // `check_gc` repeats the root scan after signal-queue work; `need_gc`
-        // performs the collection requested by the initial signal phase.
-        let has_roots =
-            how == arinsal_sched::LiteralCopyHow::NeedGc || has_literal_area_roots(process, &area);
-        if has_roots {
-            // erts_garbage_collect_literals roots `c_p->arg_reg` up to `c_p->arity`, the live
-            // X registers of the point where the process switched out (erl_gc.c:1243).
-            let live_x = crate::process::switched_out_live(process);
-            let hibernated = process.hibernated();
-            let copied = rewrite_roots(process, live_x, std::slice::from_ref(&area))?;
-            process.heap.request_full_sweep();
-            process.force_gc_live(live_x)?;
-            if hibernated {
-                // Port of erts/emulator/beam/erl_gc.c:1387 (erts_garbage_collect_literals
-                // restores the hibernated heap), OTP-29.1.1.
-                process.garbage_collect_hibernate(live_x)?;
-            }
-            store.acknowledge_copied(area_id, u64::from(copied));
-        } else {
-            store.acknowledge_copied(area_id, 0);
-        }
+        store.acknowledge_copied(area_id, 0);
     }
     reply_literal_area_copy(ctx, request, requester, Term::atom(arinsal_term::atoms::OK))?;
     Ok(())
 }
 
-fn has_literal_area_roots(process: &Process, area: &RetiredArea) -> bool {
-    let heap = process.heap.has_heap_reference(|term| area.contains(term));
-    // Only the live X registers are roots; dead ones may hold stale pointers.
-    // Port of erts/emulator/beam/beam_bif_load.c:1100-1106 (`c_p->arg_reg` up to
-    // `c_p->arity`), OTP-29.1.1.
-    let live = crate::process::switched_out_live(process);
-    let roots = process.x[..live]
-        .iter()
-        .copied()
-        .chain((0..process.heap.stack_words()).filter_map(|index| process.heap.stack_get(index)))
-        // A finished dirty job's result also waits in those registers in erts.
-        .chain(process.dirty_result_roots());
-    let mut frag_index = FragmentIndex::default();
-    let x_and_stack =
-        references_retired_from_roots(process, roots, std::slice::from_ref(area), &mut frag_index);
-    let inbox = process.inbox.has_literal_area_reference(area);
-    let dictionary = process.dictionary.as_ref().is_some_and(|dictionary| {
-        dictionary
+// Return whether the scan found a literal root and the reductions charged by erts.
+// Port of erts/emulator/beam/beam_bif_load.c:1012-1113 (`erts_check_copy_literals_gc_need`), OTP-29.1.1.
+fn check_copy_literal_area_gc_need(process: &mut Process, area: &RetiredArea) -> (bool, i32) {
+    let exception_value = crate::native_hooks::from_raw(process.heap.abi.exc.fvalue);
+    if area.contains(exception_value) {
+        process.heap.abi.exc.freason = arinsal_beamasm::exc::EXC_NULL;
+        process.heap.abi.exc.fvalue = 0;
+        process.heap.abi.exc.ftrace = 0;
+    }
+    let mut scanned = 1_usize;
+    let (found, words) = process
+        .heap
+        .copy_literal_stack_reference(|term| area.contains(term));
+    scanned = scanned.saturating_add(words);
+    if found {
+        return (true, literal_scan_reds(scanned));
+    }
+    let (found, words) = process
+        .heap
+        .copy_literal_young_heap_reference(|term| area.contains(term));
+    scanned = scanned.saturating_add(words);
+    if found {
+        return (true, literal_scan_reds(scanned));
+    }
+    let (found, words) = process
+        .heap
+        .copy_literal_abandoned_heap_reference(|term| area.contains(term));
+    scanned = scanned.saturating_add(words);
+    if found {
+        return (true, literal_scan_reds(scanned));
+    }
+    let (found, words) = process
+        .heap
+        .copy_literal_old_heap_reference(|term| area.contains(term));
+    scanned = scanned.saturating_add(words);
+    if found {
+        return (true, literal_scan_reds(scanned));
+    }
+    if let Some(dictionary) = process.dictionary.as_ref() {
+        let words = dictionary.literal_scan_words();
+        scanned = scanned.saturating_add(words);
+        if dictionary
             .entries()
             .any(|(key, value)| area.contains(key) || area.contains(value))
-    });
-    let continuation = process
+        {
+            return (true, literal_scan_reds(scanned));
+        }
+    }
+    let (found, words) = process
+        .heap
+        .copy_literal_heap_fragments_reference(|term| area.contains(term));
+    scanned = scanned.saturating_add(words);
+    if found {
+        return (true, literal_scan_reds(scanned));
+    }
+    let (found, words) = process
+        .heap
+        .copy_literal_message_fragments_reference(|term| area.contains(term));
+    scanned = scanned.saturating_add(words);
+    if found {
+        return (true, literal_scan_reds(scanned));
+    }
+    let live = crate::process::switched_out_live(process);
+    scanned = scanned.saturating_add(live);
+    if process.x[..live]
+        .iter()
+        .copied()
+        .any(|term| area.contains(term))
+    {
+        return (true, literal_scan_reds(scanned));
+    }
+    let dirty_results = process.dirty_result_roots();
+    scanned = scanned.saturating_add(dirty_results.len());
+    if dirty_results.into_iter().any(|term| area.contains(term)) {
+        return (true, literal_scan_reds(scanned));
+    }
+    if let Some(result) = process
         .cold
         .as_ref()
         .and_then(|cold| cold.persistent_get_all.as_ref())
-        .is_some_and(|state| {
-            references_retired(
-                process,
-                state.result,
-                std::slice::from_ref(area),
-                &mut frag_index,
-            )
-        });
-    heap || x_and_stack || inbox || dictionary || continuation
+        .map(|state| state.result)
+    {
+        scanned = scanned.saturating_add(1);
+        if area.contains(result) {
+            return (true, literal_scan_reds(scanned));
+        }
+    }
+    (false, literal_scan_reds(scanned))
 }
 
-fn literal_scan_words(process: &Process) -> usize {
-    process
-        .heap
-        .literal_scan_words()
-        .saturating_add(process.inbox.literal_scan_words())
-        .saturating_add(crate::process::switched_out_live(process))
-        .saturating_add(usize::from(
-            process
-                .cold
-                .as_ref()
-                .is_some_and(|cold| cold.persistent_get_all.is_some()),
-        ))
-        .saturating_add(process.dirty_result_roots().len())
+fn literal_scan_reds(scanned: usize) -> i32 {
+    scanned
+        .saturating_sub(1)
+        .div_euclid(512)
+        .saturating_add(1)
+        .min(crate::process::CONTEXT_REDS as usize) as i32
+}
+
+/// Estimate the root scan in `ERTS_CLA_SCAN_WORDS_PER_RED`, capped at one over the slice limit.
+// Port of erts/emulator/beam/beam_bif_load.c:976 (`erts_check_copy_literals_gc_need_max_reds`), OTP-29.1.1.
+fn erts_check_copy_literals_gc_need_max_reds(process: &Process) -> i32 {
+    let words = 1_usize
+        .saturating_add(process.heap.literal_scan_words())
         .saturating_add(
             process
                 .dictionary
                 .as_ref()
-                .map_or(0, |dictionary| dictionary.len() * 2),
-        )
+                .map_or(0, |dictionary| dictionary.literal_scan_words()),
+        );
+    words
+        .div_ceil(512)
+        .min((crate::process::CONTEXT_REDS + 1) as usize) as i32
 }
 
 /// Complete a collector request for a process that has already started exiting.
@@ -255,7 +344,7 @@ pub(crate) fn reply_failed_literal_area_request(
     reply_literal_area_copy(ctx, request, requester, Term::atom(arinsal_term::atoms::OK))
 }
 
-fn reply_literal_area_copy(
+pub(crate) fn reply_literal_area_copy(
     ctx: &mut RunCtx<'_, crate::Process>,
     request: Message,
     requester: arinsal_sched::Pid,
@@ -1325,9 +1414,10 @@ pub(crate) fn system_info_process_item(
         Some("dirty_cpu_schedulers") => Some(read_flags(process, |process, flags| {
             non_neg(process, flags.dirty_cpu_total as u64)
         })),
-        Some("dirty_cpu_schedulers_online") => Some(read_flags(process, |process, flags| {
-            non_neg(process, flags.dirty_cpu_online as u64)
-        })),
+        Some("dirty_cpu_schedulers_online") => Some(non_neg(
+            process,
+            dirty_cpu_schedulers_online(process) as u64,
+        )),
         Some("dirty_io_schedulers") => Some(read_flags(process, |process, flags| {
             non_neg(process, flags.dirty_io_total as u64)
         })),
@@ -5136,15 +5226,15 @@ pub(crate) fn normal_schedulers_active(process: &Process) -> usize {
 }
 
 fn all_schedulers_state(process: &mut Process) -> Result<Term, VmError> {
-    let (normal, online, dirty_cpu, dirty_online, dirty_io) = with_flags(process, |flags| {
+    let (normal, online, dirty_cpu, dirty_io) = with_flags(process, |flags| {
         (
             flags.schedulers_total,
             flags.schedulers_online,
             flags.dirty_cpu_total,
-            flags.dirty_cpu_online,
             flags.dirty_io_total,
         )
     });
+    let dirty_online = dirty_cpu_schedulers_online(process);
     // Port of erts/emulator/beam/erl_process.c:8130-8152 (`erts_schedulers_state`), OTP-29.1.1.
     // These are scheduler suspend counts, not workers currently executing tasks.
     let (any_blocked, blocked) = multi_scheduling_state(process, |state| {
@@ -5181,6 +5271,21 @@ fn all_schedulers_state(process: &mut Process) -> Result<Term, VmError> {
             tail: Box::new(arinsal_etf::OwnedTerm::Nil),
         },
     )
+}
+
+/// Current dirty CPU schedulers online, as reported by `erts_schedulers_state`.
+///
+/// Port of erts/emulator/beam/erl_process.c:8147-8149, OTP-29.1.1: online system information
+/// reads `curr_online`, which changes when each dirty scheduler reaches its suspend boundary.
+fn dirty_cpu_schedulers_online(process: &Process) -> usize {
+    process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.scheduler().ok())
+        .map_or_else(
+            || with_flags(process, |flags| flags.dirty_cpu_online),
+            |scheduler| scheduler.dirty_cpu_schedulers_online(),
+        )
 }
 
 fn scheduler_state_owned(kind: &str, [total, online, active]: [u64; 3]) -> arinsal_etf::OwnedTerm {

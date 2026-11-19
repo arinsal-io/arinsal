@@ -316,11 +316,11 @@ impl CodeMeta {
 pub(crate) struct ExportIndex {
     /// Insertion order of export entries. Atoms, as in erts' export table
     /// (`export.c` / `index.c`), so staging copies the index without cloning MFA strings.
-    pub(crate) order: Vec<(Atom, Atom, u8)>,
-    seen: HashSet<(Atom, Atom, u8)>,
+    pub(crate) order: Vec<(Atom, Atom, u32)>,
+    seen: HashSet<(Atom, Atom, u32)>,
     /// Atom-keyed erts exports, including each JIT dispatch address vector.
     // Port of erts/emulator/beam/export.c:38-58, OTP-29.1.1.
-    entries: HashMap<(Atom, Atom, u8), ExportIndexEntry, crate::beamasm_integration::ExportHasher>,
+    entries: HashMap<(Atom, Atom, u32), ExportIndexEntry, crate::beamasm_integration::ExportHasher>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -341,7 +341,7 @@ impl ExportIndex {
         };
         for line in include_str!("../../../spec/otp-29.1.1/bif.tab").lines() {
             if let Some((module, function, arity)) = parse_bif_mfa(line) {
-                index.put_builtin(&module, &function, arity);
+                index.put_builtin(&module, &function, u32::from(arity));
             }
         }
         // Port of erts/emulator/beam/bif.c (dirty_bif_result, dirty_bif_exception,
@@ -376,7 +376,7 @@ impl ExportIndex {
     // erts/emulator/beam/index.c (index_put_entry), OTP-29.1.1.
     // An MFA already in the index keeps its original position. Keys are atoms,
     // the same layout as erts' export entries, not owned MFA strings.
-    fn put(&mut self, module: &str, function: &str, arity: u8) {
+    fn put(&mut self, module: &str, function: &str, arity: u32) {
         let (Ok(module_atom), Ok(function_atom)) = (
             global_atoms().intern(module),
             global_atoms().intern(function),
@@ -386,7 +386,7 @@ impl ExportIndex {
         self.put_atoms(module_atom, function_atom, arity);
     }
 
-    fn put_atoms(&mut self, module: Atom, function: Atom, arity: u8) {
+    fn put_atoms(&mut self, module: Atom, function: Atom, arity: u32) {
         // Port of erts/emulator/beam/export.c (erts_export_put): one entry per MFA.
         self.entries.entry((module, function, arity)).or_default();
         if self.seen.insert((module, function, arity)) {
@@ -394,7 +394,7 @@ impl ExportIndex {
         }
     }
 
-    fn put_builtin(&mut self, module: &str, function: &str, arity: u8) {
+    fn put_builtin(&mut self, module: &str, function: &str, arity: u32) {
         let (Ok(module), Ok(function)) = (
             global_atoms().intern(module),
             global_atoms().intern(function),
@@ -412,7 +412,7 @@ impl ExportIndex {
     // Port of erts/emulator/beam/export.c:181-198 (erts_find_function) and
     // beam_common.c:2359-2381 (erts_is_builtin), OTP-29.1.1.
     #[inline]
-    pub(crate) fn function_exported(&self, key: (Atom, Atom, u8), code_ix: usize) -> bool {
+    pub(crate) fn function_exported(&self, key: (Atom, Atom, u32), code_ix: usize) -> bool {
         self.find_arc(key).is_some_and(|export| {
             !(crate::export::is_export_trampoline_active(export, code_ix)
                 && !crate::export::has_export_breakpoint(export))
@@ -422,10 +422,18 @@ impl ExportIndex {
 
     fn note_module(&mut self, module: &Module) {
         for export in &module.exports {
-            self.put_atoms(export.module_atom, export.function_atom, export.arity);
+            self.put_atoms(
+                export.module_atom,
+                export.function_atom,
+                u32::from(export.arity),
+            );
         }
         for import in &module.imports {
-            self.put_atoms(import.module_atom, import.function_atom, import.arity);
+            self.put_atoms(
+                import.module_atom,
+                import.function_atom,
+                u32::from(import.arity),
+            );
         }
     }
 
@@ -434,7 +442,7 @@ impl ExportIndex {
             let Some(function) = beam.atom(export.function_atom) else {
                 continue;
             };
-            self.put(&beam.module, function, export.arity as u8);
+            self.put(&beam.module, function, export.arity);
         }
         for import in &beam.imports {
             let (Some(module), Some(function)) = (
@@ -443,7 +451,7 @@ impl ExportIndex {
             ) else {
                 continue;
             };
-            self.put(module, function, import.arity as u8);
+            self.put(module, function, import.arity);
         }
     }
 
@@ -454,7 +462,7 @@ impl ExportIndex {
     // (put: an entry of an object already in another index reuses that object), OTP-29.1.1.
     pub(crate) fn put_export(
         &mut self,
-        key: (Atom, Atom, u8),
+        key: (Atom, Atom, u32),
         export: &'static Arc<arinsal_term::ExportEntry>,
     ) {
         self.entries.entry(key).or_default().dispatch = Some(export);
@@ -464,7 +472,7 @@ impl ExportIndex {
     // Port of erts/emulator/beam/export.c:154-169 (erts_find_export_entry), OTP-29.1.1.
     pub(crate) fn dispatch(
         &self,
-        key: (Atom, Atom, u8),
+        key: (Atom, Atom, u32),
     ) -> Option<&'static arinsal_term::ExportEntry> {
         self.find_arc(key).map(|export| &**export)
     }
@@ -491,7 +499,7 @@ impl ExportIndex {
     /// The shared owner of the entry of `key`, for export funs (`Export.lambda`).
     pub(crate) fn find_arc(
         &self,
-        key: (Atom, Atom, u8),
+        key: (Atom, Atom, u32),
     ) -> Option<&'static Arc<arinsal_term::ExportEntry>> {
         self.entries.get(&key)?.dispatch
     }
@@ -585,7 +593,7 @@ impl CodeTables {
         use std::mem::size_of;
         // One `Arc` header: strong and weak counts.
         const ARC: usize = 2 * size_of::<usize>();
-        let export_key = size_of::<(Atom, Atom, u8)>();
+        let export_key = size_of::<(Atom, Atom, u32)>();
         let exports = &self.exports;
         let module_table = self.modules.capacity() * size_of::<Arc<Module>>()
             + self.modules.len() * (ARC + size_of::<Module>());
@@ -954,34 +962,6 @@ impl Vm {
         crate::code_ix::global().intern_module_fun_entries(module);
     }
 
-    /// Compiles `module` with BeamAsm into `meta`.
-    // Like `beam_load.c:417` and `asm_load.c:1177-1198` (OTP-29.1.1), compile after the module
-    // body and its exported entries are resolved.
-    pub(crate) fn compile_native(
-        &self,
-        module: &mut Module,
-        meta: &mut CodeMeta,
-    ) -> Option<arinsal_beamjit::CompileError> {
-        // The BEAM was parsed in prepare_loading. erts does not parse it again here.
-        let mut failure = None;
-        if let Some(native) = beamasm_integration::compile(
-            &meta.beam,
-            module,
-            meta.md5,
-            crate::trace_bp::line_breakpoints_instrumented(),
-            crate::code_ix::global(),
-            &mut failure,
-        ) {
-            // Port of erts/emulator/beam/jit/asm_load.c:1020 (stp->on_load = beamasm_get_on_load):
-            // the emitter found the function.
-            if meta.on_load.is_none() {
-                meta.on_load = native.on_load.clone();
-            }
-            meta.beamasm = Some(native);
-        }
-        failure
-    }
-
     /// Port of beam_load.c (beam_load_finalize): the decoded ops and tables are freed once the
     /// code is in the code area.
     pub(crate) fn release_loaded_tables(&self, meta: &mut CodeMeta) {
@@ -1034,7 +1014,7 @@ impl Vm {
             native.unpublish();
         }
         let mut module = module;
-        let compile_error = self.compile_native(&mut module, &mut meta);
+        let compile_error = crate::beam_load::load_code(&mut module, &mut meta);
         if meta.beamasm.is_none() {
             staging.abort();
             return Err(VmError::Load(format!(
@@ -1064,9 +1044,6 @@ impl Vm {
 
     /// Load bytes without executing module-level code.
     pub fn load_bytes(&mut self, bytes: &[u8]) -> Result<usize, VmError> {
-        self.load_bytes_internal(bytes)
-    }
-    pub(crate) fn load_bytes_internal(&mut self, bytes: &[u8]) -> Result<usize, VmError> {
         // Port of erts/emulator/beam/beam_file.c (beamfile_read): the tables, not the
         // instructions, which BeamAsm emits from the code chunk.
         let beam = arinsal_beam::read(bytes).map_err(|e| VmError::Load(e.to_string()))?;
@@ -1106,7 +1083,7 @@ impl Vm {
         staging.with(|tables| {
             tables.intern_fun_entries(&mut module);
         });
-        let compile_error = self.compile_native(&mut module, &mut meta);
+        let compile_error = crate::beam_load::load_code(&mut module, &mut meta);
         if meta.beamasm.is_none() {
             // Port of erts/emulator/beam/beam_load.c:417 (load_code failing): the JIT
             // flavor has no other way to run the module.
@@ -1262,7 +1239,11 @@ impl Vm {
             {
                 exports_retargeted = true;
                 crate::export::set_export_breakpoint(
-                    (module.name_atom, export.function_atom, export.arity),
+                    (
+                        module.name_atom,
+                        export.function_atom,
+                        u32::from(export.arity),
+                    ),
                     global,
                     bif_traced,
                 );

@@ -19,6 +19,7 @@ libc = "0.2.189"
 cc = "1.2.38"
 
 [dev-dependencies]
+arinsal-difftest.workspace = true
 similar-asserts = "2"
 
 [[bin]]

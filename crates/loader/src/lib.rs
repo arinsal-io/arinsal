@@ -156,7 +156,7 @@ pub struct Module {
     /// Replaceable exports.
     pub exports: Vec<Arc<ExportSlot>>,
     /// Export slots indexed by stable atom identities and arity.
-    pub export_atoms: HashMap<(Atom, u8), usize>,
+    pub export_atoms: HashMap<(Atom, u32), usize>,
     /// Module string table used by bit syntax string segments.
     pub strings: Box<[u8]>,
     /// Literal file-name lists indexed by source filename.
@@ -434,19 +434,19 @@ impl Module {
     }
 
     /// Find an exported function and arity.
-    pub fn export(&self, function: &str, arity: u8) -> Option<usize> {
+    pub fn export(&self, function: &str, arity: u32) -> Option<usize> {
         self.export_slot(function, arity).map(ExportSlot::target)
     }
     /// Find the atomic export entry for a function and arity.
-    pub fn export_slot(&self, function: &str, arity: u8) -> Option<&ExportSlot> {
+    pub fn export_slot(&self, function: &str, arity: u32) -> Option<&ExportSlot> {
         self.exports
             .iter()
-            .find(|e| e.function == function && e.arity == arity)
+            .find(|e| e.function == function && u32::from(e.arity) == arity)
             .map(Arc::as_ref)
     }
     /// Find an export using stable atom identities.
     #[inline]
-    pub fn export_slot_atom(&self, function: Atom, arity: u8) -> Option<&ExportSlot> {
+    pub fn export_slot_atom(&self, function: Atom, arity: u32) -> Option<&ExportSlot> {
         self.export_atoms
             .get(&(function, arity))
             .and_then(|index| self.exports.get(*index))
@@ -918,7 +918,7 @@ impl Module {
         self.export_atoms = exports
             .iter()
             .enumerate()
-            .map(|(index, export)| ((export.function_atom, export.arity), index))
+            .map(|(index, export)| ((export.function_atom, u32::from(export.arity)), index))
             .collect();
         self.export_entry_targets = exports
             .iter()

@@ -90,6 +90,11 @@ pub enum SigOp {
 /// `ErtsProc2PortSigCallback`: runs the operation or its abort; returns reductions.
 pub type SigCallback = Box<dyn FnOnce(SigOp) -> i32 + Send>;
 
+/// The `ERTS_PORT_TASK_DIST_CMD` task: `erts_dist_command(pp, initial_reds)` with the
+/// reductions left in the port's run (`CONTEXT_REDS - pp->reds`), or its abort; returns the
+/// reductions used.
+pub type DistCmdCallback = Box<dyn FnOnce(SigOp, i32) -> i32 + Send>;
+
 /// A process to port signal to schedule (`ErtsProc2PortSigData`).
 pub struct ProcSig {
     /// Process data of the sending process, or [`INVALID_CALLER`].
@@ -122,7 +127,7 @@ enum TaskKind {
     },
     /// `ERTS_PORT_TASK_DIST_CMD`: the port drains the distribution output queue of its
     /// connection.
-    DistCmd(Mutex<Option<SigCallback>>),
+    DistCmd(Mutex<Option<DistCmdCallback>>),
 }
 
 /// `ErtsPortTask`.
@@ -176,10 +181,15 @@ impl PortTask {
 
     fn take_callback(&self) -> Option<SigCallback> {
         match &self.kind {
-            TaskKind::ProcSig { callback, .. } | TaskKind::DistCmd(callback) => {
-                callback.lock().take()
-            }
-            TaskKind::Timeout(_) | TaskKind::Io { .. } => None,
+            TaskKind::ProcSig { callback, .. } => callback.lock().take(),
+            TaskKind::Timeout(_) | TaskKind::Io { .. } | TaskKind::DistCmd(_) => None,
+        }
+    }
+
+    fn take_dist_cmd(&self) -> Option<DistCmdCallback> {
+        match &self.kind {
+            TaskKind::DistCmd(callback) => callback.lock().take(),
+            _ => None,
         }
     }
 
@@ -196,6 +206,21 @@ impl PortTask {
 
 /// `ErtsPortTaskHandle` of a scheduled signal.
 pub struct TaskHandle(Arc<PortTask>);
+
+impl TaskHandle {
+    /// Port of erts/emulator/beam/erl_port_task.h (erts_port_task_is_scheduled), OTP-29.1.1.
+    pub fn is_scheduled(&self) -> bool {
+        self.0.is_scheduled()
+    }
+}
+
+impl std::fmt::Debug for TaskHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskHandle")
+            .field("scheduled", &self.is_scheduled())
+            .finish()
+    }
+}
 
 /// Why an immediate driver call was refused (`ErtsTryImmDrvCallResult`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -444,6 +469,9 @@ impl DriverPort {
         if let Some(callback) = task.take_callback() {
             callback(op);
         }
+        if let Some(callback) = task.take_dist_cmd() {
+            callback(op, 0);
+        }
         if bpq_data {
             self.aborted_proc2port_data(task.size());
         }
@@ -574,7 +602,9 @@ impl DriverPort {
     /// Queue a distribution command task (`ERTS_PORT_TASK_DIST_CMD`, dist.c
     /// erts_schedule_dist_command). The callback runs with the port locked on a scheduler;
     /// it is called in an abort mode when the port closes first.
-    pub fn schedule_dist_cmd(&self, callback: SigCallback) {
+    /// Returns the task's handle (`dep->dist_cmd`), `None` when the port accepts no more
+    /// tasks (the callback has run in the abort mode).
+    pub fn schedule_dist_cmd(&self, callback: DistCmdCallback) -> Option<TaskHandle> {
         let task = Arc::new(PortTask {
             state: AtomicU32::new(STATE_SCHEDULED),
             flags: 0,
@@ -583,10 +613,14 @@ impl DriverPort {
             nosuspend_link: Link::default(),
         });
         match self.enqueue_task(&task, false) {
-            Ok(act) => self.activate(act),
+            Ok(act) => {
+                self.activate(act);
+                Some(TaskHandle(task))
+            }
             Err(_) => {
                 task.state.store(STATE_ABORTED, Ordering::Release);
                 self.abort_signal_task(&task, SigOp::Abort, false);
+                None
             }
         }
     }
@@ -1108,9 +1142,11 @@ fn execute(port: &DriverPort, scheduler_id: usize) -> PortExecution {
             // The I/O callback reports its own long schedule (select.rs run_io).
             TaskKind::Io { fd, dir, reg } => (crate::select::ready(port, *fd, *dir, *reg), None),
             TaskKind::DistCmd(_) => {
+                // erl_port_task.c:1822-1825: erts_dist_command(pp, CONTEXT_REDS - pp->reds).
+                let initial_reds = CONTEXT_REDS - port.reds.load(Ordering::Acquire);
                 let reds = task
-                    .take_callback()
-                    .map_or(0, |callback| callback(SigOp::Exec));
+                    .take_dist_cmd()
+                    .map_or(0, |callback| callback(SigOp::Exec, initial_reds));
                 (reds, Some("dist_cmd"))
             }
             TaskKind::ProcSig { size, .. } => {

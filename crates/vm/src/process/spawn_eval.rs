@@ -305,7 +305,7 @@ impl Vm {
             let _ = self.load_named("erts_internal");
         }
         if code_tables(erts_active_code_ix()).modules[module_id]
-            .export(function, args.len() as u8)
+            .export(function, args.len() as u32)
             .is_none()
         {
             return Err(VmError::Trap(crate::exceptions::Trap::error(Term::atom(
@@ -330,6 +330,7 @@ impl Vm {
                 system_processes: Mutex::new(std::collections::HashSet::new()),
                 dirty_signal_handlers: Mutex::new(std::collections::HashSet::new()),
                 literal_collector: Mutex::new(None),
+                init_process_id: OnceLock::new(),
                 scheduler: OnceLock::new(),
                 reg: crate::register::RegisterTable::new(),
                 next_trace_weak_id: AtomicU64::new(0),
@@ -392,10 +393,12 @@ impl Vm {
                         .workers
                         .min(arinsal_alloc::cpuinfo::cpu_info().configured.max(1)),
                 );
-                let scheduler = Arc::new(Scheduler::new(config));
+                let scheduler = Arc::new(Scheduler::new_with_dirty_cpu_online(
+                    config,
+                    dirty_cpu_online,
+                ));
                 let online = crate::natives::sys::scheduler_online_default(runtime);
                 let _ = scheduler.set_online_schedulers(online.min(workers.max(1)));
-                let _ = scheduler.set_dirty_cpu_online(dirty_cpu_online);
                 runtime.ports.attach(scheduler.progress());
                 runtime
                     .scheduler
@@ -453,6 +456,7 @@ impl Vm {
             let entry_pid: Pid = scheduler
                 .spawn_unscheduled(process)
                 .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
+            let _ = runtime.init_process_id.set(entry_pid);
             // Port of erts/emulator/beam/erl_init.c system-process startup: every
             // VM needs the preloaded owner of the literal-area release protocol.
             if first_runtime {

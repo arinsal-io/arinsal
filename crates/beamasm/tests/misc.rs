@@ -304,6 +304,7 @@ fn call_nif_stub_layout() {
     let word = |offset: usize| u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
     let insn = |offset: usize| u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap());
     // ErtsCodeInfo: flag word clear, MFA at 16/24/32.
+    assert_eq!(insn(0), 0xF1F0);
     assert_eq!(insn(4), 0);
     assert_eq!((word(16), word(24), word(32)), (0x11, 0x22, 3));
     let code = FUNC_INFO_BYTES;

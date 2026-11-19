@@ -114,10 +114,32 @@ fn system_flag_round_trips_match_otp() {
         return;
     }
     let dir = probe_dir();
-    let expected = run("erl", &dir, "round_trips", ["", "", ""]);
-    let actual = run("arinsal", &dir, "round_trips", ["", "", ""]);
-    for (key, value) in expected {
-        assert_eq!(actual.get(&key), Some(&value), "{key}");
+    for flags in [
+        ["", "", ""],
+        ["+S 8:8 +SDcpu 4:4", "", ""],
+        ["+S 8:8 +SDcpu 1:1", "", ""],
+        ["+S 6:3 +SDcpu 4:3", "", ""],
+    ] {
+        let expected = run("erl", &dir, "round_trips", flags);
+        let actual = run("arinsal", &dir, "round_trips", flags);
+        for key in [
+            "{system_flag_settled_dirty_cpu_schedulers_online,schedulers_online}",
+            "{system_flag_settled_dirty_cpu_schedulers_online,dirty_cpu_schedulers_online}",
+        ] {
+            let otp = expected.get(key).expect("OTP settled dirty count");
+            let arinsal = actual.get(key).expect("Arinsal settled dirty count");
+            assert!(
+                !otp.starts_with("{timeout,"),
+                "OTP did not settle {key}: {otp}"
+            );
+            assert!(
+                !arinsal.starts_with("{timeout,"),
+                "Arinsal did not settle {key}: {arinsal} with {flags:?}"
+            );
+        }
+        for (key, value) in expected {
+            assert_eq!(actual.get(&key), Some(&value), "{key} with {flags:?}");
+        }
     }
 }
 

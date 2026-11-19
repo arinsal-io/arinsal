@@ -43,10 +43,23 @@ def compile_helpers(build: pathlib.Path) -> None:
 
 
 def otp_root() -> pathlib.Path:
-    proc = run(["erl", "-noshell", "-eval", "io:format(\"~s\",[code:root_dir()]),halt()."], 30)
+    configured = os.environ.get("ARINSAL_OTP_ROOT")
+    if configured:
+        root = pathlib.Path(configured)
+        if root.is_dir():
+            return root
+        raise RuntimeError(f"ARINSAL_OTP_ROOT is not a directory: {root}")
+
+    erl = shutil.which("erl")
+    if erl is None:
+        raise RuntimeError("cannot locate OTP root: set ARINSAL_OTP_ROOT or put erl on PATH")
+    proc = run([erl, "-noshell", "-eval", "io:format(\"~s\",[code:root_dir()]),halt()."], 30)
     if proc.returncode:
-        raise RuntimeError(f"cannot locate OTP root: {proc.stdout}")
-    return pathlib.Path(proc.stdout.strip())
+        raise RuntimeError(f"cannot locate OTP root using {erl}: {proc.stdout}")
+    root = pathlib.Path(proc.stdout.strip())
+    if not root.is_dir():
+        raise RuntimeError(f"erl reported a missing OTP root: {root}")
+    return root
 
 
 def build_native(name: str, source_dir: pathlib.Path) -> None:

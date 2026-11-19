@@ -1,6 +1,6 @@
 //! BIF, export, and apply call emission for BeamAsm modules.
 
-use arinsal_a64::enc::Gpr;
+use arinsal_a64::enc::{Cond, Gpr};
 use std::sync::OnceLock;
 
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
@@ -10,6 +10,14 @@ use crate::{Update, emit_enter_runtime, emit_leave_runtime};
 pub type BifTarget = extern "C" fn(*mut crate::ProcessHeader, u64, u64, u64, u32) -> u64;
 
 pub use arinsal_term::ErtsCodeMfa;
+
+/// `erlang:load_nif/2`, passed to `raise_exception_shared` when the loader returns an error.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:1033-1060, OTP-29.1.1.
+pub(crate) static LOAD_NIF_MFA: ErtsCodeMfa = ErtsCodeMfa {
+    module: arinsal_term::Term::atom(arinsal_term::atoms::ERLANG).word(),
+    function: arinsal_term::Term::atom(arinsal_term::atoms::LOAD_NIF).word(),
+    arity: 2,
+};
 
 /// Static BIF descriptor stored by `emit_int_div_rem_body_shared` before calling its helper.
 // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:740-875, OTP-29.1.1.
@@ -225,6 +233,53 @@ const E: Gpr = Gpr::x(20);
 const ACTIVE_CODE_IX: Gpr = Gpr::x(24);
 
 impl BeamModuleAssembler {
+    /// Loads the current module's NIF library and resumes this instruction after a permission
+    /// yield.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:1033-1060 (emit_i_load_nif), OTP-29.1.1.
+    pub fn emit_i_load_nif(&mut self) -> Result<(), ModuleError> {
+        let entry = self.code.new_label();
+        let current = self.code.new_label();
+        self.code.bind(entry)?;
+        self.code.bind(current)?;
+
+        let update = Update::HEAP_ALLOC.union(Update::X_REGS);
+        emit_enter_runtime(&mut self.code, 2, update)?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(0), Gpr::x(21)))?;
+        self.code.adr(Gpr::x(1), current)?;
+        self.code
+            .emit(|e| crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(2)))?;
+        self.fragment_call(crate::arm::rt::beam_jit_load_nif as *const () as usize)?;
+        emit_leave_runtime(&mut self.code, 2, update)?;
+
+        let schedule = self.code.new_label();
+        let next = self.code.new_label();
+        self.code.emit(|e| e.cmp_imm(Gpr::x(0), 2, false))?;
+        self.code.b_cond(Cond::Eq, schedule)?;
+        self.code.emit(|e| e.cmp_imm(Gpr::x(0), 0, false))?;
+        self.code.b_cond(Cond::Eq, next)?;
+        self.emit_raise_exception(current, &LOAD_NIF_MFA)?;
+
+        self.code.bind(schedule)?;
+        self.code.adr(Gpr::x(2), entry)?;
+        self.fragment_branch(self.yield_fragments.2)?;
+        self.code.bind(next)?;
+        Ok(())
+    }
+
+    /// Passes a BEAM instruction PC and MFA to the shared exception fragment.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:256-268
+    // (emit_raise_exception(Label, const ErtsCodeMFA *)), OTP-29.1.1.
+    fn emit_raise_exception(
+        &mut self,
+        instruction: arinsal_a64::buf::Label,
+        mfa: &'static ErtsCodeMfa,
+    ) -> Result<(), ModuleError> {
+        self.code.adr(Gpr::x(1), instruction)?;
+        self.code
+            .emit(|e| e.mov_const(Gpr::x(3), mfa as *const ErtsCodeMfa as u64))?;
+        self.fragment_branch(self.raise_fragments.1)
+    }
+
     /// Calls a lightweight BIF with the supplied X-register arguments.
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:595-610, OTP-29.1.1
     pub fn emit_call_light_bif(

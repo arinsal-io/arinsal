@@ -13,7 +13,7 @@ use std::sync::Arc;
 use arinsal_term::ExportEntry;
 use arinsal_term::{Atom, OP_CALL_ERROR_HANDLER, OP_I_GENERIC_BREAKPOINT, TRAMPOLINE_NONE};
 
-type Mfa = (Atom, Atom, u8);
+type Mfa = (Atom, Atom, u32);
 
 /// `erts_export_put` for a batch of exports already allocated for this node: each becomes the
 /// entry of its MFA in the staging export table (every table when no staging area is open).
@@ -57,7 +57,7 @@ pub(crate) fn active_export_entry(mfa: Mfa) -> Option<&'static Arc<ExportEntry>>
 /// `Export.is_bif_traced` of `module:function/arity` in the active export table: the one
 /// decision whether a BIF call enters the export's breakpoint.
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:391 (call_light_bif_shared), OTP-29.1.1.
-pub(crate) fn is_bif_traced(module: &str, function: &str, arity: u8) -> bool {
+pub(crate) fn is_bif_traced(module: &str, function: &str, arity: u32) -> bool {
     let atoms = arinsal_term::global_atoms();
     let (Some(module), Some(function)) = (atoms.get(module), atoms.get(function)) else {
         return false;

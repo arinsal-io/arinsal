@@ -13,6 +13,9 @@ pub(crate) struct Runtime {
     pub(crate) dirty_signal_handlers: Mutex<std::collections::HashSet<Pid>>,
     /// Pid of `erts_literal_area_collector` (an unregistered system process).
     pub(crate) literal_collector: Mutex<Option<Pid>>,
+    /// `erts_init_process_id` (erl_init.c): the first process, sender of the `kill` that
+    /// takes down a process distribution controller (dist.c kill_dist_ctrl_proc).
+    pub(crate) init_process_id: OnceLock<Pid>,
     // Set once when the scheduler starts; read without a lock like erts' scheduler data.
     /// Held for the VM lifetime (erts reads its scheduler data through globals / `esdp`, with no
     /// per-process runtime refcount).
@@ -175,7 +178,7 @@ impl Process {
                 Arc::new(arinsal_term::ExportEntry::new(
                     target.module_atom,
                     target.function_atom,
-                    target.arity as u8,
+                    target.arity as u32,
                 ))
             },
             |runtime| runtime.trap_export_entry(target),
@@ -189,7 +192,11 @@ impl Runtime {
         &self,
         target: &'static crate::bif_traps::ContinuationTarget,
     ) -> Arc<arinsal_term::ExportEntry> {
-        let mfa = (target.module_atom, target.function_atom, target.arity as u8);
+        let mfa = (
+            target.module_atom,
+            target.function_atom,
+            target.arity as u32,
+        );
         let export = self
             .trap_exports
             .get(target.trap_export_id)
@@ -228,7 +235,7 @@ impl Runtime {
     /// Export slot selected by the process-visible code index.
     pub(crate) fn export_entry(
         &self,
-        mfa: (arinsal_term::Atom, arinsal_term::Atom, u8),
+        mfa: (arinsal_term::Atom, arinsal_term::Atom, u32),
         code_ix: usize,
     ) -> Option<&'static arinsal_term::ExportEntry> {
         crate::export::find_export_entry(&self.code, mfa, code_ix)
