@@ -11,7 +11,7 @@ build = "build.rs"
 workspace = true
 
 [dependencies]
-rustix = { version = "1.1.5", features = ["fs"] }
+rustix = { version = "1.1.5", features = ["event", "fs", "process"] }
 
 [build-dependencies]
 cc = "1.2.38"
@@ -38,3 +38,7 @@ path = "src/bin/dialyzer.rs"
 [[bin]]
 name = "arinsal_typer"
 path = "src/bin/typer.rs"
+
+[[bin]]
+name = "arinsal_erl_call"
+path = "src/bin/erl_call.rs"

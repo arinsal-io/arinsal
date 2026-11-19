@@ -14,7 +14,7 @@
     "bits": 5,
     "cli": 0,
     "difftest": 0,
-    "erts_etc": 23,
+    "erts_etc": 73,
     "etf": 0,
     "ets": 47,
     "float": 0,
