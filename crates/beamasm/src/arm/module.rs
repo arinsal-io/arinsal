@@ -378,8 +378,6 @@ pub fn beamasm_emit_call_nif(
 type BsColdEmit = Box<dyn FnOnce(&mut BeamModuleAssembler) -> Result<(), ModuleError>>;
 /// `tmp_mem[6]`: the native pc an exception is attributed to.
 const NATIVE_ERROR_PC_SLOT: u32 = crate::arm::beam_asm::tmp_mem_ref(6);
-/// Low bit of a recorded native error pc that is a call's return address (code is 4-aligned).
-pub const RETURN_SITE_TAG: usize = 1;
 
 /// erts `EXC_FUNCTION_CLAUSE` (error.h: `(6 << EXC_OFFSET) | EXC_ERROR`), OTP-29.1.1.
 pub use crate::exc::EXC_FUNCTION_CLAUSE;
@@ -1062,16 +1060,14 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
-    /// Records the return address `ret` of a non-tail call as its call site, tagged with
-    /// [`RETURN_SITE_TAG`]: erts attributes a raising BIF to the call's return address, which
-    /// also hides that same continuation from the stacktrace (beam_common.c:792-835,
+    /// Records the return address `ret` of a non-tail call as its error pc: erts attributes a
+    /// raising BIF to the call's return address (`erts_printable_return_address`), which also
+    /// hides that same continuation from the stacktrace (beam_common.c:413-437 and 792-835,
     /// OTP-29.1.1).
     pub(crate) fn record_return_site(&mut self, ret: Label) -> Result<(), ModuleError> {
         self.code.adr(Gpr::x(9), ret)?;
-        self.code.emit(|e| {
-            e.orr_imm(Gpr::x(9), Gpr::x(9), RETURN_SITE_TAG as u64)?;
-            e.str_uoff(Gpr::x(9), SCHEDULER_REGS, NATIVE_ERROR_PC_SLOT)
-        })?;
+        self.code
+            .emit(|e| e.str_uoff(Gpr::x(9), SCHEDULER_REGS, NATIVE_ERROR_PC_SLOT))?;
         Ok(())
     }
 

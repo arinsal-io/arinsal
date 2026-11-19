@@ -1017,9 +1017,10 @@ fn schedule(
                 return Term::NON_VALUE;
             };
             // erts_inspect_frame(c_p->stop, &caller): the continuation on top of the stack.
-            let caller = c_p.heap.stack_get(0).map_or(0, |word| {
-                crate::beamasm_integration::return_address_pc(word.tagged_word() as usize)
-            });
+            let caller = c_p
+                .heap
+                .stack_get(0)
+                .map_or(0, |word| word.tagged_word() as usize);
             let mfa = c_p.heap.abi.current.cast::<arinsal_term::ErtsCodeMfa>();
             crate::bif_traps::vbump_all_reds(c_p);
             let arity = crate::natives::raw::code_mfa(mfa as usize).arity as usize;

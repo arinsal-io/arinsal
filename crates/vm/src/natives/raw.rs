@@ -50,6 +50,15 @@ pub(crate) fn code_info(ci: usize) -> &'static arinsal_beamasm::common::beam_asm
     unsafe { &*(ci as *const arinsal_beamasm::common::beam_asm_h::ErtsCodeInfo) }
 }
 
+/// The export entry whose `info` is at `ci` (`ErtsContainerStruct(ci, Export, info)`).
+pub(crate) fn export_of_info(ci: usize) -> &'static arinsal_term::ExportEntry {
+    // SAFETY: callers pass the address of an `Export.info`, the field at `EXPORT_INFO_OFFSET`
+    // of an export entry, which the export table never frees.
+    unsafe {
+        &*((ci - arinsal_term::EXPORT_INFO_OFFSET as usize) as *const arinsal_term::ExportEntry)
+    }
+}
+
 /// The NIF function signature of `ErlNifFunc.fptr`.
 pub(crate) type NifFptr = arinsal_nif::NifFn;
 

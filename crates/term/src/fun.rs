@@ -327,6 +327,12 @@ pub const OP_CALL_ERROR_HANDLER: usize = 31;
 /// `op_i_generic_breakpoint`.
 #[cfg(target_arch = "x86_64")]
 pub const OP_I_GENERIC_BREAKPOINT: usize = 111;
+/// `op_i_debug_breakpoint`: what `erts_generic_breakpoint` returns for a debug breakpoint.
+#[cfg(target_arch = "x86_64")]
+pub const OP_I_DEBUG_BREAKPOINT: usize = 101;
+/// `op_i_debug_breakpoint`: what `erts_generic_breakpoint` returns for a debug breakpoint.
+#[cfg(not(target_arch = "x86_64"))]
+pub const OP_I_DEBUG_BREAKPOINT: usize = 104;
 /// `op_call_bif_W`: a BIF (or a native the runtime implements) the trampoline calls.
 #[cfg(target_arch = "x86_64")]
 pub const OP_CALL_BIF_W: usize = 29;

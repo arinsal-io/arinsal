@@ -1999,7 +1999,6 @@ pub(crate) fn native_call_site(
     if pc == 0 {
         return None;
     }
-    let pc = crate::beamasm_integration::native_return_site(pc).map_or(pc, |address| address - 1);
     crate::native_function_at(pc).map(|function| (function, pc))
 }
 
@@ -2141,8 +2140,6 @@ fn backtrace_with(process: &Process) -> Vec<u8> {
         .filter(|pc| crate::native_bridge::is_native_function_at(*pc))
         .or_else(|| {
             let pc = process.native_call_pc;
-            let pc = crate::beamasm_integration::native_return_site(pc)
-                .map_or(pc, |address| address - 1);
             (pc != 0 && crate::native_bridge::is_native_function_at(pc)).then_some(pc)
         });
     let dirty_continuation = process

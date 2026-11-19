@@ -983,11 +983,10 @@ fn emit_export_fragment(
     }
     code.emit(|encoder| {
         // The call site loaded the export into ARG1 (x0) and called through its address, so the
-        // pc a raising BIF is attributed to is the return address in x30, tagged as a return
-        // site. A tail call site's x30 is the caller's continuation, which is also where erts
-        // attributes it.
-        encoder.orr_imm(Gpr::x(9), Gpr::x(30), crate::module::RETURN_SITE_TAG as u64)?;
-        encoder.str_uoff(Gpr::x(9), Gpr::x(19), tmp_mem_offset(6))?;
+        // pc a raising BIF is attributed to is the return address in x30
+        // (erts_printable_return_address). A tail call site's x30 is the caller's
+        // continuation, which is also where erts attributes it.
+        encoder.str_uoff(Gpr::x(30), Gpr::x(19), tmp_mem_offset(6))?;
         // Interpreted targets have no native prologue to save this continuation.
         encoder.str_pre(Gpr::x(30), Gpr::x(20), -8)?;
         encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -32)?;
@@ -1759,11 +1758,10 @@ fn emit_nif_fragments(
     })?;
     code.bind(error)?;
     // raise_exception_shared with bif_mfa = c_p->current (set by beam_jit_call_nif); the
-    // exception pc is the continuation on E, which the raise fragment reads behind its host
-    // frame, tagged as a return site like the export fragment's.
+    // exception pc is the continuation on E (erts_printable_return_address), which the raise
+    // fragment reads behind its host frame.
     code.emit(|encoder| {
         encoder.ldr_uoff(Gpr::x(9), Gpr::x(20), 0)?;
-        encoder.orr_imm(Gpr::x(9), Gpr::x(9), crate::module::RETURN_SITE_TAG as u64)?;
         encoder.str_uoff(Gpr::x(9), Gpr::x(19), tmp_mem_offset(6))?;
         encoder.ldr_uoff(Gpr::x(30), Gpr::x(20), 0)?;
         encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -32)?;

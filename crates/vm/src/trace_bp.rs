@@ -1173,6 +1173,91 @@ fn site_breakpoints(process: &Process, site: usize) -> Option<Arc<SiteBreakpoint
     Some(entry)
 }
 
+/// `erts_generic_breakpoint` after the code info is resolved: runs every session breakpoint
+/// of the call (events, counters, call time and memory), pushes the return frames below the
+/// caller's return address and tells whether a debug breakpoint takes the call.
+/// `function_pc` is the traced function's code, which the return frames name.
+// Port of erts/emulator/beam/beam_bp.c:994-1014 (erts_generic_breakpoint) and :1016-1157
+// (do_session_breakpoint), OTP-29.1.1.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generic_breakpoint(
+    vm: &mut crate::Vm,
+    process: &mut Process,
+    ctx: &mut arinsal_sched::RunCtx<'_, crate::process::Message>,
+    module: &str,
+    function: &str,
+    reg: &mut [arinsal_term::Term],
+    local: bool,
+    function_pc: usize,
+) -> Result<bool, crate::VmError> {
+    let actions =
+        crate::trace::generic_breakpoint_actions(vm, process, ctx, module, function, reg, local)?;
+    crate::trace::push_native_trace_frame(process, function_pc, &actions, reg)?;
+    Ok(DEBUG_BREAKPOINTS_USED.load(Ordering::Relaxed)
+        && debug_breakpoint_enabled(process, module, function, reg.len() as u8))
+}
+
+/// `BeamInstr erts_generic_breakpoint(Process *c_p, ErtsCodeInfo *info, Eterm *reg)`, called
+/// by the breakpoint fragments of both targets with the code info of the traced function or
+/// of its export entry: `op_i_debug_breakpoint` when a debug breakpoint takes the call, else
+/// `gen_bp->orig_instr` (for an export entry the code the global breakpoint continues to,
+/// `trampoline.breakpoint.address`).
+// Port of erts/emulator/beam/beam_bp.c:994-1014 (erts_generic_breakpoint) and :2176-2186
+// (orig_instr is `instr_word[2]`, the trampoline's address word), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn erts_generic_breakpoint(
+    c_p: *mut arinsal_beamasm::ProcessHeader,
+    info: *mut arinsal_term::ErtsCodeInfo,
+    reg: *mut u64,
+) -> usize {
+    let ci = info as usize;
+    let code = ci + std::mem::size_of::<arinsal_term::ErtsCodeInfo>();
+    // The function's own code info sits in front of its native code; an export entry's is
+    // followed by its trampoline. Arinsal keeps both sites' breakpoints in one chain per
+    // function, so the site selects which flags apply.
+    let (local, function_pc) = if crate::native_bridge::is_native_function_at(code) {
+        (true, code)
+    } else {
+        let export = crate::natives::raw::export_of_info(ci);
+        (false, export.trampoline.address.load(Ordering::Acquire))
+    };
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(c_p, reg) else {
+        return function_pc;
+    };
+    let mfa = &crate::natives::raw::code_info(ci).mfa;
+    let atoms = arinsal_term::global_atoms();
+    let name = |word: u64| {
+        crate::native_hooks::from_raw(word)
+            .as_atom()
+            .and_then(|atom| atoms.text(atom))
+            .unwrap_or("")
+    };
+    let (module, function) = (name(mfa.module), name(mfa.function));
+    let arity = (mfa.arity as usize).min(registers.x_reg_array.len());
+    let debug = crate::process::sched_data::with_sched_data(process, |vm, process, ctx| {
+        let debug = generic_breakpoint(
+            vm,
+            process,
+            ctx,
+            module,
+            function,
+            &mut registers.x_reg_array[..arity],
+            local,
+            function_pc,
+        );
+        debug.unwrap_or_else(|_| {
+            crate::native_hooks::set_error(process, "system_limit");
+            false
+        })
+    })
+    .expect("native code runs inside an executor slice, which publishes its scheduler data");
+    if debug {
+        arinsal_term::OP_I_DEBUG_BREAKPOINT
+    } else {
+        function_pc
+    }
+}
+
 /// What a native trampoline hit did when it needs no trace event: the counters are
 /// incremented and the call time or memory accounted. `actions` are the return frames to push.
 pub(crate) struct NativeBreakpointHit {

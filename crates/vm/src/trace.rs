@@ -2908,7 +2908,7 @@ pub(crate) fn executor_native_call_event(
     local: bool,
 ) -> Result<Vec<NativeTraceAction>, VmError> {
     let args = vm.x_regs()?[..usize::from(function.arity)].to_vec();
-    let actions = call_event(
+    generic_breakpoint_actions(
         vm,
         process,
         ctx,
@@ -2916,7 +2916,24 @@ pub(crate) fn executor_native_call_event(
         function.function,
         &args,
         local,
-    )?;
+    )
+}
+
+/// The session breakpoints of a call of `module:function(args...)` through the code info of
+/// the function (`local`) or of its export entry: the trace events are sent and the return
+/// frames to push are returned.
+// Port of erts/emulator/beam/beam_bp.c:1004-1008 (erts_generic_breakpoint: the
+// do_session_breakpoint loop), OTP-29.1.1.
+pub(crate) fn generic_breakpoint_actions(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    module: &str,
+    function: &str,
+    args: &[Term],
+    local: bool,
+) -> Result<Vec<NativeTraceAction>, VmError> {
+    let actions = call_event(vm, process, ctx, module, function, args, local)?;
     let actions = dedupe_return_frames(process, actions, StackScan::Top);
     Ok(actions
         .into_iter()

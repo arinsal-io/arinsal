@@ -90,8 +90,7 @@ impl BeamGlobalAssembler {
         a.runtime_call(erts_generic_breakpoint as *const () as usize)?;
         a.emit_leave_runtime(spec)?;
         a.emit_leave_frame()?;
-        // `BeamOpCodeAddr` is the BEAMASM opcode index from jit/x86/ops.tab.
-        a.emit(|e| e.cmp_ri(RET, 101))?;
+        a.emit(|e| e.cmp_ri(RET, arinsal_term::OP_I_DEBUG_BREAKPOINT as i64))?;
         a.jcc(CondCode::E, debug_bp)?;
         #[cfg(not(target_os = "openbsd"))]
         {

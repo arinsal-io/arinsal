@@ -481,19 +481,12 @@ pub(super) fn capture(
     // erts' single `prev`: the raising pc, compared with each return address.
     let mut previous_native: Option<usize> = None;
     if let Some(pc) = native_pc {
-        if let Some(address) = crate::beamasm_integration::native_return_site(pc) {
-            // Port of erts/emulator/beam/beam_common.c:791-835 (gather_stacktrace), OTP-29.1.1:
-            // the raising pc is the call's return address and seeds `prev`, so the identical
-            // continuation is skipped before it can take a `max_depth` slot; the pc's line is
-            // looked up inside the call instruction.
-            raw.native_top = Some(address - 1);
-            previous_native = Some(address);
-        } else {
-            raw.native_top = Some(pc);
-            // Port of erts/emulator/beam/beam_common.c:791-835 (`gather_stacktrace`),
-            // OTP-29.1.1: the current native PC seeds the same duplicate check as `rp->i`.
-            previous_native = Some(pc);
-        }
+        // Port of erts/emulator/beam/beam_common.c:791-835 (`gather_stacktrace`) and :1229-1230
+        // (`erts_lookup_function_info(&fi, s->pc, 1)`), OTP-29.1.1: the raising pc, a call
+        // site or a call's return address, names the current line as it is and seeds `prev`,
+        // so a continuation identical to it is skipped.
+        raw.native_top = Some(pc);
+        previous_native = Some(pc);
     }
     let mut index = 0;
     while index < heap.stack_words() {
@@ -666,15 +659,9 @@ pub(super) fn save_stacktrace(
     if let Some(cold) = p.cold.as_mut() {
         cold.apply_frame_released = 0;
     }
-    let (native_top, previous_native) = match native_pc {
-        Some(pc) if let Some(address) = crate::beamasm_integration::native_return_site(pc) => {
-            (Some(address.wrapping_sub(1)), Some(address))
-        }
-        // Port of erts/emulator/beam/beam_common.c:791-835 (`gather_stacktrace`),
-        // OTP-29.1.1: the raw `pc` seeds the duplicate check before the stack walk.
-        Some(pc) => (Some(pc), Some(pc)),
-        None => (None, None),
-    };
+    // Port of erts/emulator/beam/beam_common.c:791-835 (`gather_stacktrace`), OTP-29.1.1:
+    // the raw `pc` seeds the duplicate check before the stack walk.
+    let (native_top, previous_native) = (native_pc, native_pc);
     // Port of erts/emulator/beam/beam_common.c:880-930 (`save_stacktrace`), OTP-29.1.1:
     // `StackTrace` is the bignum itself and ftrace is its three-element tuple. The current
     // frame and continuations remain code addresses until `build_stacktrace` resolves them.
