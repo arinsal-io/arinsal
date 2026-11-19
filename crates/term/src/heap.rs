@@ -1792,8 +1792,27 @@ impl ProcessHeap {
         // The off-heap lists link objects in the heap and its fragments: release them first.
         self.owners = LazyOwners::default();
         // erl_gc.c erts_deallocate_young_generation: `free_message_buffer(c_p->mbuf)`,
-        // `erts_cleanup_messages(c_p->msg_frag)`, then the heaps.
-        self.abi = NativeAbi::default();
+        // `erts_cleanup_messages(c_p->msg_frag)`, then the heaps. delete_process frees the
+        // heap part only: `c_p->fcalls`, `i`, `arity`, `current`, `flags` and the id keep
+        // their values (the context switch after the exit reads FCALLS).
+        let NativeAbi {
+            fcalls,
+            i,
+            arity,
+            current,
+            flags,
+            self_pid,
+            ..
+        } = self.abi;
+        self.abi = NativeAbi {
+            fcalls,
+            i,
+            arity,
+            current,
+            flags,
+            self_pid,
+            ..NativeAbi::default()
+        };
         self.msg_frag = Vec::new();
         self.abandoned_heap = WordBlock::default();
         self.abandoned_used = 0;

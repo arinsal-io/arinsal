@@ -189,7 +189,8 @@ impl LoaderEnv for X86LoaderEnv<'_> {
     }
 
     // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:691-705 (emit_send), OTP-29.1.1:
-    // `BIF_TRAP_EXPORT(BIF_send_2)` and `send_2` for `call_light_bif_shared`.
+    // `BIF_TRAP_EXPORT(BIF_send_2)` and `send_2`, which the emitted call passes to the shared
+    // BIF call fragment.
     fn send_target(&self) -> Result<(u64, u64), String> {
         let export = Arc::as_ptr(
             make_export((arinsal_term::atoms::ERLANG, arinsal_term::atoms::SEND, 2))
