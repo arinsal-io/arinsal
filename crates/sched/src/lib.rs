@@ -9762,7 +9762,6 @@ trait NativeSend<M: SignalMessage> {
 /// and the scheduler it belongs to.
 struct WorkerSender<T: Task> {
     inner: Arc<Inner<T>>,
-    local: std::rc::Weak<RefCell<Local<T>>>,
 }
 
 impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
@@ -9780,50 +9779,56 @@ impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
         to: Pid,
         prepare: &mut dyn FnMut(&mut dyn std::any::Any) -> Option<T::Message>,
     ) -> Option<OnHeapSend> {
-        let local = self.local.upgrade()?;
-        let mut local = local.try_borrow_mut().ok()?;
-        let outcome = self.inner.table.with_live_managed(to, |process| {
-            if receiver_off_heap_msgq(process) {
-                return OnHeapSend::OffHeapMsgq;
-            }
-            let Some(mut cell) = process.cell.try_lock() else {
-                return OnHeapSend::Unavailable;
-            };
-            if !receiver_heap_stable(process) {
-                return OnHeapSend::Unavailable;
-            }
-            let Some(message) = prepare(cell.task_mut()) else {
-                return OnHeapSend::Declined;
-            };
-            let mut local = process.bound_worker().is_none().then_some(&mut *local);
-            self.inner
-                .publish_held_monitor_for(to, local.as_deref_mut());
-            match self
-                .inner
-                .deliver_live(process, from, Payload::Message(message), local)
-            {
-                Ok(()) | Err(Error::NoProcess) => OnHeapSend::Queued,
-                Err(error) => OnHeapSend::Failed(error),
-            }
-        });
-        Some(outcome.unwrap_or(OnHeapSend::Unavailable))
+        // Port of erts/emulator/beam/erl_process.h (erts_get_scheduler_data), OTP-29.1.1: the
+        // sending scheduler's data, from the thread.
+        erts_get_scheduler_data::<T, _>(|esdp| {
+            let mut local = esdp.local.as_deref()?.try_borrow_mut().ok()?;
+            let outcome = self.inner.table.with_live_managed(to, |process| {
+                if receiver_off_heap_msgq(process) {
+                    return OnHeapSend::OffHeapMsgq;
+                }
+                let Some(mut cell) = process.cell.try_lock() else {
+                    return OnHeapSend::Unavailable;
+                };
+                if !receiver_heap_stable(process) {
+                    return OnHeapSend::Unavailable;
+                }
+                let Some(message) = prepare(cell.task_mut()) else {
+                    return OnHeapSend::Declined;
+                };
+                let mut local = process.bound_worker().is_none().then_some(&mut *local);
+                self.inner
+                    .publish_held_monitor_for(to, local.as_deref_mut());
+                match self
+                    .inner
+                    .deliver_live(process, from, Payload::Message(message), local)
+                {
+                    Ok(()) | Err(Error::NoProcess) => OnHeapSend::Queued,
+                    Err(error) => OnHeapSend::Failed(error),
+                }
+            });
+            Some(outcome.unwrap_or(OnHeapSend::Unavailable))
+        })
+        .flatten()
     }
 
     fn send(&self, from: Pid, to: Pid, msg: T::Message) -> Result<Result<(), Error>, T::Message> {
-        let Some(local) = self.local.upgrade() else {
-            return Err(msg);
-        };
-        let Ok(mut local) = local.try_borrow_mut() else {
-            return Err(msg);
-        };
         // Port of erts/emulator/beam/erl_message.c:698 (erts_send_message) and
         // erl_proc_sig_queue.h:2080 (erts_proc_notify_new_message -> erts_schedule_process),
         // OTP-29.1.1: the sender enqueues the woken receiver itself, on the run queue of the
-        // scheduler it runs on when that is the receiver's run queue.
-        self.inner.publish_held_monitor_for(to, Some(&mut local));
-        Ok(self
-            .inner
-            .deliver(from, to, Payload::Message(msg), Some(&mut local)))
+        // scheduler it runs on (`erts_get_scheduler_data()`) when that is the receiver's.
+        let mut msg = Some(msg);
+        erts_get_scheduler_data::<T, _>(|esdp| {
+            let mut local = esdp.local.as_deref()?.try_borrow_mut().ok()?;
+            let msg = msg.take().expect("taken once");
+            self.inner.publish_held_monitor_for(to, Some(&mut local));
+            Some(
+                self.inner
+                    .deliver(from, to, Payload::Message(msg), Some(&mut local)),
+            )
+        })
+        .flatten()
+        .ok_or_else(|| msg.take().expect("not taken"))
     }
 
     // Port of erts/emulator/beam/erl_process.c:12525-12531 (erl_create_process: add2runq on the
@@ -9852,14 +9857,15 @@ impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
         to: Pid,
         signal: OwnedSignal<Event<T::Message>>,
     ) -> Result<Result<(), Error>, OwnedSignal<Event<T::Message>>> {
-        let Some(local) = self.local.upgrade() else {
-            return Err(signal);
-        };
-        let Ok(mut local) = local.try_borrow_mut() else {
-            return Err(signal);
-        };
-        self.inner.publish_held_monitor_for(to, Some(&mut local));
-        Ok(self.inner.deliver_node(to, signal, Some(&mut local)))
+        let mut signal = Some(signal);
+        erts_get_scheduler_data::<T, _>(|esdp| {
+            let mut local = esdp.local.as_deref()?.try_borrow_mut().ok()?;
+            let signal = signal.take().expect("taken once");
+            self.inner.publish_held_monitor_for(to, Some(&mut local));
+            Some(self.inner.deliver_node(to, signal, Some(&mut local)))
+        })
+        .flatten()
+        .ok_or_else(|| signal.take().expect("not taken"))
     }
 
     fn start_timer(
@@ -9870,35 +9876,33 @@ impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
         msg: T::Message,
         wrapped: bool,
     ) -> Result<Result<TimerRef, Error>, T::Message> {
-        let Some(local) = self.local.upgrade() else {
-            return Err(msg);
-        };
-        let Ok(mut local) = local.try_borrow_mut() else {
-            return Err(msg);
-        };
         // Port of erts/emulator/beam/erl_hl_timer.c (erts_create_bif_timer on the calling
-        // scheduler's timer wheel), OTP-29.1.1.
-        Ok(self.inner.start_timer(
-            owner,
-            ms,
-            TimerPayload::Message(target, msg, wrapped),
-            Some(&mut local),
-            None,
-        ))
+        // scheduler's timer wheel, `esdp` from the thread), OTP-29.1.1.
+        let mut msg = Some(msg);
+        erts_get_scheduler_data::<T, _>(|esdp| {
+            let mut local = esdp.local.as_deref()?.try_borrow_mut().ok()?;
+            let msg = msg.take().expect("taken once");
+            Some(self.inner.start_timer(
+                owner,
+                ms,
+                TimerPayload::Message(target, msg, wrapped),
+                Some(&mut local),
+                None,
+            ))
+        })
+        .flatten()
+        .ok_or_else(|| msg.take().expect("not taken"))
     }
 
     // Port of erts/emulator/beam/erl_hl_timer.c:2237 (access_bif_timer): the reference carries
     // the scheduler id; when it is the calling scheduler, its own btm tree answers.
     fn access_bif_timer(&self, key: u64, cancel: bool) -> Option<Option<u64>> {
         let reference = TimerRef::from_ref_key(key, self.inner.timer_commands.len());
-        let local = self.local.upgrade()?;
-        let service = {
-            let local = local.try_borrow().ok()?;
-            if local.worker_id != reference.worker {
-                return None;
-            }
-            Rc::clone(&local.timer_service)
-        };
+        let service = erts_get_scheduler_data::<T, _>(|esdp| {
+            let local = esdp.local.as_deref()?.try_borrow().ok()?;
+            (local.worker_id == reference.worker).then(|| Rc::clone(&local.timer_service))
+        })
+        .flatten()?;
         if let Ok(mut borrowed) = service.try_borrow_mut() {
             self.inner.run_timer_commands(&mut borrowed);
         }
@@ -9913,15 +9917,21 @@ impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
         msg: T::Message,
         wrapped: bool,
     ) -> Result<Result<TimerRef, Error>, T::Message> {
-        let Some(local) = self.local.upgrade() else {
-            return Err(msg);
-        };
-        let Ok(mut local) = local.try_borrow_mut() else {
-            return Err(msg);
-        };
-        Ok(self
-            .inner
-            .start_resolved_timer(owner, ms, resolve, msg, wrapped, Some(&mut local)))
+        let mut msg = Some(msg);
+        erts_get_scheduler_data::<T, _>(|esdp| {
+            let mut local = esdp.local.as_deref()?.try_borrow_mut().ok()?;
+            let msg = msg.take().expect("taken once");
+            Some(self.inner.start_resolved_timer(
+                owner,
+                ms,
+                Arc::clone(&resolve),
+                msg,
+                wrapped,
+                Some(&mut local),
+            ))
+        })
+        .flatten()
+        .ok_or_else(|| msg.take().expect("not taken"))
     }
 }
 
@@ -10798,7 +10808,6 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
     let local_cell = Rc::new(RefCell::new(local));
     native_sender::install(Rc::new(WorkerSender {
         inner: Arc::clone(&inner),
-        local: Rc::downgrade(&local_cell),
     }) as Rc<dyn NativeSend<T::Message>>);
     let ssi_spin_count = scheduler_spin_count(&inner.config.busy_wait_thresholds, 0, "medium");
     let esdp = ErtsSchedulerData {
