@@ -103,6 +103,8 @@ pub(crate) fn initialize_spawned(
         std::ptr::addr_of_mut!((*process).native_arity_set).write(false);
         std::ptr::addr_of_mut!((*process).native_error_pc).write(0);
         std::ptr::addr_of_mut!((*process).native_exit_kind).write(NativeExit::None);
+        // erl_process.c:12604 (erl_create_process: `p->return_trace_frames = 0`).
+        std::ptr::addr_of_mut!((*process).return_trace_frames).write(0);
 
         #[cfg(feature = "pf-mem-counters")]
         if min_heap == 233 {
