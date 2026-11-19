@@ -31,28 +31,132 @@ use arinsal_beamops::{self as beamops, NewLiteral, OpSink, SpecificOperand};
 pub use arinsal_x64::exec::CodeMemory;
 
 /// erts' process-wide JIT state after `beamasm_init`: the global assembler `bga`, whose
-/// fragments live in `global_code` for as long as the emulator runs. The VM owns it; erts
-/// keeps it in a static.
+/// fragments live in `global_code`, and the `erts_beamasm` stub module in `stub_code`, both
+/// for as long as the emulator runs. The VM owns it; erts keeps it in statics.
 pub struct BeamAsm {
     /// `bga`.
     pub bga: BeamGlobalAssembler,
     /// The executable memory of the global fragments.
     pub global_code: CodeMemory,
+    /// The executable memory of the `erts_beamasm` module (`bma`'s code).
+    pub stub_code: CodeMemory,
+    /// The code pointers of the `erts_beamasm` module.
+    pub stubs: BeamAsmStubs,
+}
+
+/// The `ErtsCodePtr` globals `beamasm_init` takes from the `erts_beamasm` module
+/// (`*op.target = bma->getCode(op.operand)`).
+// Port of erts/emulator/beam/jit/beam_jit_main.cpp:256-269 (the `operands` table) and
+// beam_common.h:280-289 (the globals), OTP-29.1.1.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BeamAsmStubs {
+    /// `beam_run_process`.
+    pub run_process: usize,
+    /// `beam_normal_exit`.
+    pub normal_exit: usize,
+    /// `beam_continue_exit`.
+    pub continue_exit: usize,
+    /// `beam_exception_trace`.
+    pub exception_trace: usize,
+    /// `beam_return_trace`.
+    pub return_trace: usize,
+    /// `beam_return_to_trace`.
+    pub return_to_trace: usize,
+    /// `beam_call_trace_return`.
+    pub call_trace_return: usize,
 }
 
 /// `beamasm_init()`: the global assembler first, its code generated into executable memory,
-/// as every module assembler resolves its fragment calls against it. The `erts_beamasm`
-/// module of stubs erts emits next (`normal_exit`, `continue_exit`, the trace returns, ...)
-/// waits for their emitters.
-// Port of erts/emulator/beam/jit/beam_jit_main.cpp:243-325 (beamasm_init, up to `bga`),
-// OTP-29.1.1.
+/// then the `erts_beamasm` module of stubs (`run_process`, `normal_exit`, `continue_exit`,
+/// the trace returns), each a function of its own whose entry label is the stub's address.
+// Port of erts/emulator/beam/jit/beam_jit_main.cpp:243-381 (beamasm_init), OTP-29.1.1.
 ///
 /// `offsets` are the VM's `offsetof(Process, ...)` values the fragments compile in
 /// (`arinsal_vm::PROCESS_STATE_OFFSET`, `PROCESS_SIGQ_SAVE_OFFSET`, `ERTS_MESSAGE_TERM_OFFSET`).
 pub fn beamasm_init(offsets: ProcessOffsets) -> Result<BeamAsm, AsmError> {
+    use arinsal_beamops::beam_opcodes::{
+        op_continue_exit, op_i_apply_only, op_i_call_trace_return, op_i_return_to_trace,
+        op_normal_exit, op_return_trace,
+    };
+    use arinsal_term::{Term, atoms};
     let mut bga = BeamGlobalAssembler::new(offsets)?;
     let global_code = bga.codegen()?;
-    Ok(BeamAsm { bga, global_code })
+    let operands = [
+        (atoms::RUN_PROCESS, 3, op_i_apply_only),
+        (atoms::NORMAL_EXIT, 0, op_normal_exit),
+        (atoms::CONTINUE_EXIT, 0, op_continue_exit),
+        (atoms::EXCEPTION_TRACE, 0, op_return_trace),
+        (atoms::RETURN_TRACE, 0, op_return_trace),
+        (atoms::RETURN_TO_TRACE, 0, op_i_return_to_trace),
+        (atoms::CALL_TRACE_RETURN, 0, op_i_call_trace_return),
+    ];
+    // `ERTS_DECL_AM(erts_beamasm)`.
+    let mod_name = arinsal_term::global_atoms()
+        .intern("erts_beamasm")
+        .map_err(|_| AsmError::Operand("erts_beamasm atom"))?;
+    let mut bma = BeamModuleAssembler::new_module_with_module(
+        &bga,
+        1 + operands.len() as u32 * 2,
+        operands.len(),
+        vec![ArgType::ANY],
+        [],
+        Some(mod_name),
+    )?;
+    let word = core::mem::size_of::<u64>() as u64;
+    let mut label = 1;
+    let mut entries = [0_u32; 7];
+    for (entry, &(name, arity, op)) in entries.iter_mut().zip(&operands) {
+        let func_label = label;
+        let entry_label = label + 1;
+        label += 2;
+        beamasm_emit(
+            &mut bma,
+            usize::from(op_aligned_label_Lt),
+            &[ArgVal::Label(func_label), ArgVal::Word(word)],
+        )?;
+        beamasm_emit(
+            &mut bma,
+            usize::from(op_i_func_info_IaaI),
+            &[
+                ArgVal::Word(u64::from(func_label)),
+                ArgVal::Immediate(Term::atom(mod_name).word()),
+                ArgVal::Immediate(Term::atom(name).word()),
+                ArgVal::Word(arity),
+            ],
+        )?;
+        beamasm_emit(
+            &mut bma,
+            usize::from(op_aligned_label_Lt),
+            &[ArgVal::Label(entry_label), ArgVal::Word(word)],
+        )?;
+        beamasm_emit(&mut bma, usize::from(op), &[])?;
+        *entry = entry_label;
+    }
+    beamasm_emit(&mut bma, usize::from(op_int_code_end), &[])?;
+    let load_header = BeamCodeHeader {
+        num_functions: operands.len() as u64,
+        ..BeamCodeHeader::default()
+    };
+    let (stub_code, _code_hdr_ro) = bma.codegen(&load_header)?;
+    let code = |index: usize| {
+        bma.get_code(entries[index])
+            .ok_or(AsmError::Operand("erts_beamasm entry label"))
+    };
+    let stubs = BeamAsmStubs {
+        run_process: code(0)?,
+        normal_exit: code(1)?,
+        continue_exit: code(2)?,
+        exception_trace: code(3)?,
+        return_trace: code(4)?,
+        return_to_trace: code(5)?,
+        call_trace_return: code(6)?,
+    };
+    Ok(BeamAsm {
+        bga,
+        global_code,
+        stub_code,
+        stubs,
+    })
 }
 
 /// `beamasm_new_assembler(mod, num_labels, num_functions, file)`: the module assembler the

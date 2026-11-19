@@ -730,8 +730,13 @@ pub(crate) fn compile(
         }
     }
     // Literals: Arinsal's loader built them in the literal area already, so every literal
-    // patch writes the word the emitter recorded.
-    for word in env.literal_words() {
+    // patch writes the word the emitter recorded. erts patches each literal index once
+    // (beam_load.c, `beamasm_patch_literal` per index); the patches here are keyed by the
+    // word, so each distinct word is one key, patched once.
+    let mut words = env.literal_words();
+    words.sort_unstable();
+    words.dedup();
+    for word in words {
         arinsal_beamjit::beamasm_patch_literal(&ba, &mut memory, word, word).ok()?;
     }
     if !beam.strings.is_empty() {

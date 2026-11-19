@@ -422,19 +422,39 @@ pub(crate) fn bsm_init(commands: &[BsmCommand]) -> Vec<Segment> {
         .collect()
 }
 
+/// `BSF_LITTLE`, `BSF_SIGNED` (erl_bits.h).
+#[cfg(target_arch = "x86_64")]
+const BSF_LITTLE: u64 = 2;
+#[cfg(target_arch = "x86_64")]
+const BSF_SIGNED: u64 = 4;
+
 /// `bs_get_flags(beam, val)`: the flags of a `bs_match` segment, NIL, a flag list literal
 /// or a word (from `bs_get_integer2`).
 // Port of erts/emulator/beam/jit/beam_jit_bs.cpp:255-285 (bs_get_flags), OTP-29.1.1.
 #[cfg(target_arch = "x86_64")]
 fn bs_get_flags(val: ArgVal) -> Result<u64, &'static str> {
+    use arinsal_term::raw::Cons;
     if val.is_nil() {
         Ok(0)
+    } else if let ArgVal::Literal(word) = val {
+        // `beamfile_get_literal(beam, idx)`: the loader resolved the literal to its term in
+        // the module's literal area (see `ArgVal::Literal`).
+        let mut term = arinsal_term::raw::term_from_bits(word);
+        let mut flags = 0;
+        while let Ok(cell) = Cons::try_from(term) {
+            let elem = cell.head();
+            if elem == Term::atom(atoms::LITTLE) || elem == Term::atom(atoms::NATIVE) {
+                flags |= BSF_LITTLE;
+            } else if elem == Term::atom(atoms::SIGNED) {
+                flags |= BSF_SIGNED;
+            }
+            term = cell.tail();
+        }
+        debug_assert!(term == Term::NIL);
+        Ok(flags)
     } else if let Some(word) = val.word() {
+        // Originates from the bs_get_integer2 instruction.
         Ok(word)
-    } else if val.is_literal() {
-        // Walking the flag list (`am_little`/`am_native` -> BSF_LITTLE, `am_signed` ->
-        // BSF_SIGNED) needs a safe cons view in `arinsal_term::raw`, which it lacks.
-        Err("bs_match flag list literal (no safe cons view in arinsal_term::raw)")
     } else {
         Err("bs_match flags")
     }

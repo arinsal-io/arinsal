@@ -154,8 +154,8 @@ mod x86 {
         let get = |label| jit.bga.get_ptr(label).unwrap_or(0);
         super::publish(&super::BeamCodePtrs {
             // `beam_run_process` is code of the `erts_beamasm` stub module, which
-            // beamasm_init emits after `bga` (beam_jit_main.cpp:327-371).
-            run_process: 0,
+            // beamasm_init emits after `bga` (beam_jit_main.cpp:327-381).
+            run_process: jit.stubs.run_process,
             export_trampoline: get(GlobalLabels::ExportTrampoline),
             save_calls_export: get(GlobalLabels::DispatchSaveCallsExport),
             save_calls_fun: get(GlobalLabels::DispatchSaveCallsFun),
