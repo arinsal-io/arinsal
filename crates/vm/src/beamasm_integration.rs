@@ -17,88 +17,27 @@ fn existing_mfa(module: &str, function: &str, arity: u8) -> Option<Mfa> {
     Some((atoms.get(module)?, atoms.get(function)?, arity))
 }
 
-/// Function-indexed BeamAsm target cache, invalidated when native code is published.
-pub(crate) struct NativeTargetCache {
-    /// The start address of the native code of each function, or 0.
-    targets: Vec<Vec<usize>>,
-    generations: Vec<u64>,
-    module_identities: Vec<usize>,
-    /// Native code range each cached module instance was resolved against.
-    ranges: Vec<Option<(usize, usize)>>,
-}
-
-impl NativeTargetCache {
-    pub(crate) fn new() -> Self {
-        Self {
-            targets: Vec::new(),
-            generations: Vec::new(),
-            module_identities: Vec::new(),
-            ranges: Vec::new(),
-        }
-    }
-
-    pub(crate) fn register_module(&mut self, module_id: usize, module: &arinsal_loader::Module) {
-        let targets = vec![0; module.functions.len()];
-        if module_id == self.targets.len() {
-            self.targets.push(targets);
-            self.generations.push(u64::MAX);
-            self.module_identities
-                .push(std::ptr::from_ref(module) as usize);
-        } else if module_id < self.targets.len() {
-            self.targets[module_id] = targets;
-            self.generations[module_id] = u64::MAX;
-            self.module_identities[module_id] = std::ptr::from_ref(module) as usize;
-        } else {
-            self.targets.resize_with(module_id, Vec::new);
-            self.targets.push(targets);
-            self.generations.resize(module_id, u64::MAX);
-            self.generations.push(u64::MAX);
-            self.module_identities.resize(module_id, 0);
-            self.module_identities
-                .push(std::ptr::from_ref(module) as usize);
-        }
-    }
-
-    /// The native function entered at interpreted `target` of module instance `module_id`,
-    /// whose native code (when it has a version of its own) spans `range`.
-    pub(crate) fn function_for_target(
-        &mut self,
-        module_id: usize,
-        module: &arinsal_loader::Module,
-        range: Option<(usize, usize)>,
-        target: usize,
-    ) -> Option<crate::NativeFunction> {
-        // Only a function entry enters native code at the function's start; any other
-        // target (an export breakpoint stub, a label inside a function) stays interpreted.
-        let index = module.function_by_entry(target)?;
-        let identity = std::ptr::from_ref(module) as usize;
-        if self.module_identities.get(module_id).copied() != Some(identity) {
-            self.register_module(module_id, module);
-        }
-        let generation = crate::native_bridge::native_registry_generation();
-        if self.generations.get(module_id).copied()? != generation
-            || self.ranges.get(module_id).copied().flatten() != range
-        {
-            // One registry pass per module: a lookup per function would be quadratic. An old
-            // instance of the module may still be registered (a reused module id can even
-            // reuse the `Module` address), so only this instance's own code counts.
-            let mut natives = crate::native_bridge::native_functions_of(&module.name, range);
-            let cache = self.targets.get_mut(module_id)?;
-            cache.clear();
-            cache.extend(module.functions.iter().map(|(_, function, arity)| {
-                natives
-                    .remove(&((*function).to_owned(), *arity))
-                    .map_or(0, |native| native.start)
-            }));
-            self.generations[module_id] = generation;
-            if self.ranges.len() <= module_id {
-                self.ranges.resize(module_id + 1, None);
-            }
-            self.ranges[module_id] = range;
-        }
-        let start = *self.targets.get(module_id)?.get(index)?;
-        crate::native_function_at(start)
-    }
+/// `code_hdr->functions[index]` of the module in slot `module_id` of the active code index, as
+/// the native function entered at its interpreted entry `target`: erts reaches a function's
+/// code through the module's loaded code header, with no cache of its own. Only a function
+/// entry enters native code; any other target (an export breakpoint stub, a label inside a
+/// function) has no native function.
+// Port of erts/emulator/beam/module.h (erl_module_instance.code_hdr) and beam_code.h
+// (BeamCodeHeader.functions), OTP-29.1.1.
+pub(crate) fn erts_code_hdr_function(
+    module_id: usize,
+    target: usize,
+) -> Option<crate::NativeFunction> {
+    let tables = crate::code_ix::code_tables(crate::code_ix::erts_active_code_ix());
+    let module = tables.modules.get(module_id)?;
+    let index = module.function_by_entry(target)?;
+    let (_, function, arity) = module.functions.get(index)?;
+    let native = crate::load::native_code_version(&tables.code_meta, module_id)?.function(index)?;
+    debug_assert!(
+        native.function == *function && native.arity == *arity,
+        "BeamCodeHeader.functions is in function order"
+    );
+    Some(native.clone())
 }
 
 #[derive(Clone)]

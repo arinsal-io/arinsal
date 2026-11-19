@@ -50,7 +50,8 @@ pub(super) fn process_main(
     // one X register array (copy_in_registers), which is the process's file for the slice.
     let saved_len = process.x.saved_arity();
     // `esdp->registers` of this scheduler: the VM paths the slice runs reach `reg` here.
-    lend_vm(esdp).esdp_registers = std::ptr::from_mut(&mut *reg) as usize;
+    data.registers_addr
+        .set(std::ptr::from_mut(&mut *reg) as usize);
     if crate::xreg_poison_enabled() {
         process.x[saved_len..].fill(crate::XREG_POISON);
     }

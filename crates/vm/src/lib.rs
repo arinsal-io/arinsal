@@ -156,7 +156,7 @@ mod boot_loop1_shared_tests {
                 &[],
             )
             .unwrap();
-        let mut vm = Vm::shared_replica(&[]);
+        let mut vm = Vm::shared_replica();
         let id = vm.load_bytes(&beam).unwrap();
         let code = crate::code_ix::code_tables(crate::code_ix::erts_active_code_ix());
         assert_eq!(code.modules[id].name, "boot_loop1_shared");
@@ -279,18 +279,7 @@ pub struct EvalResult {
 }
 
 /// Lazy module loader and single-process execution engine.
-pub struct Vm {
-    paths: Vec<PathBuf>,
-    pub(crate) statistics_origins: crate::natives::sys::StatisticsOrigins,
-    pub(crate) otp_root: Option<PathBuf>,
-    beamasm_targets: beamasm_integration::NativeTargetCache,
-    /// A scheduler's VM; the node's own VM owns the child setup.
-    replica: bool,
-    /// `esdp->registers`: the address of the scheduler's register file while this scheduler's
-    /// executor runs a process, zero otherwise. An address so `Vm` stays `Send`.
-    // Port of erts/emulator/beam/erl_process.h (ErtsSchedulerData.registers), OTP-29.1.1.
-    pub(crate) esdp_registers: usize,
-}
+pub struct Vm {}
 
 #[test]
 fn cli_help_non_pollable_registration_fires_once() {
@@ -324,24 +313,6 @@ pub fn erts_exit(status: i32) -> ! {
     std::process::exit(status)
 }
 
-impl Drop for Vm {
-    fn drop(&mut self) {
-        // Port of erts/emulator/beam/erl_init.c (erts_exit), OTP-29.1.1.
-        if !self.replica
-            && let Some(runtime) = crate::erl_init::erts_runtime()
-            && let Ok(scheduler) = runtime.scheduler()
-        {
-            scheduler.release();
-        }
-        // erts_exit ends the OS process and with it the forker socket: erl_child_setup reads
-        // end of file and exits.
-        if !self.replica
-            && let Some(runtime) = crate::erl_init::erts_runtime()
-        {
-            crate::spawn_drv::shutdown_forker(runtime);
-        }
-    }
-}
 impl Vm {
     /// Registers a native function for this VM and removes it when its code is purged.
     pub fn register_native_function(
@@ -351,9 +322,9 @@ impl Vm {
         native_bridge::register_native_function(function)
     }
 
-    /// Paths currently searched for lazy module loading.
-    pub fn paths(&self) -> &[PathBuf] {
-        &self.paths
+    /// Paths currently searched for lazy module loading: the boot code path.
+    pub fn paths(&self) -> Vec<PathBuf> {
+        crate::erl_init::erts_boot_paths()
     }
     /// Parse and load every BEAM file beneath a directory, reporting errors.
     pub fn load_file(&mut self, path: &Path) -> Result<usize, VmError> {

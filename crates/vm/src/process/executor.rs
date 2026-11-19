@@ -95,6 +95,11 @@ pub struct SchedulerData {
     /// `esdp->registers`: the scheduler's X and F register file, which `copy_in_registers`
     /// loads the scheduled process's live registers into.
     pub(super) registers: super::registers::RegisterBlock,
+    /// `esdp->registers` as the running slice's native code and the C helpers it calls reach
+    /// it: the address of the file the slice borrowed from [`Self::registers`], zero while no
+    /// slice runs. An address derived from the slice's own borrow, as erts' `reg` is the
+    /// pointer process_main hands down.
+    pub(crate) registers_addr: std::cell::Cell<usize>,
     /// The scheduler's code view, created on its first process turn. Lent out for each use
     /// ([`lend_vm`]), so no borrow of it outlives the statement that needs it.
     vm: std::cell::Cell<Option<Box<Vm>>>,
@@ -119,6 +124,7 @@ impl Default for SchedulerData {
         registers.with(crate::beamasm_integration::set_trace_return_hook);
         Self {
             registers,
+            registers_addr: std::cell::Cell::new(0),
             vm: std::cell::Cell::new(None),
             current_process: Default::default(),
             hub_bound: std::cell::Cell::new(false),
@@ -175,9 +181,9 @@ pub(super) fn init_scheduler_vm(esdp: &ErtsSchedulerData, runtime: &'static Runt
 
 #[cold]
 #[inline(never)]
-fn new_scheduler_vm(runtime: &'static Runtime) -> Box<Vm> {
+fn new_scheduler_vm(_runtime: &'static Runtime) -> Box<Vm> {
     arinsal_nif_zlib::set_scheduler_caller(crate::natives::nif::scheduler_caller);
-    Box::new(Vm::shared_replica(&runtime.paths))
+    Box::new(Vm::shared_replica())
 }
 
 /// How the entry loop goes on after a native call's exit was dispatched.

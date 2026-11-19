@@ -875,4 +875,4 @@ fn fd_outputv(port: &DriverPort, buf: &[u8]) {
 mod forker;
 mod sys;
 
-pub(crate) use forker::{open_forker, request_start, shutdown_forker};
+pub(crate) use forker::{open_forker, request_start};

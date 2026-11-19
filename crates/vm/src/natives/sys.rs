@@ -53,16 +53,32 @@ impl StatisticsOrigins {
     }
 }
 
-/// Initialize clock origins before a VM can execute code.
-pub(crate) fn initialize_statistics_origins() -> StatisticsOrigins {
-    arinsal_sched::erl_time_sup::initialize_time_origin();
-    // erts_late_init_external: the node hash of LOCAL_EXT reads the time offset and clock here.
-    arinsal_external::erts_late_init_external(
-        arinsal_sched::erl_time_sup::time_offset_nanos_value()
-            .expect("the system time offset is available") as i64,
-        arinsal_sched::erl_time_sup::monotonic_time_raw_nanos() as u32,
-    );
-    StatisticsOrigins::now()
+/// The origins `statistics(runtime)` and `statistics(wall_clock)` count from: erts takes them
+/// once at start (erl_time_sup.c erts_init_time_sup / erl_bif_info.c `erts_runtime_elapsed_both`
+/// and `wall_clock` start values) and keeps them as globals.
+static ERTS_STATISTICS_ORIGINS: std::sync::OnceLock<StatisticsOrigins> = std::sync::OnceLock::new();
+
+/// The statistics origins [`initialize_statistics_origins`] took at start.
+pub(crate) fn erts_statistics_origins() -> StatisticsOrigins {
+    *ERTS_STATISTICS_ORIGINS
+        .get()
+        .expect("erl_start took the statistics origins")
+}
+
+/// Initialize clock origins before a VM can execute code: once per OS process, as erts'
+/// erl_start does (erts_init_time_sup, erts_late_init_external).
+pub(crate) fn initialize_statistics_origins() {
+    ERTS_STATISTICS_ORIGINS.get_or_init(|| {
+        arinsal_sched::erl_time_sup::initialize_time_origin();
+        // erts_late_init_external: the node hash of LOCAL_EXT reads the time offset and clock
+        // here.
+        arinsal_external::erts_late_init_external(
+            arinsal_sched::erl_time_sup::time_offset_nanos_value()
+                .expect("the system time offset is available") as i64,
+            arinsal_sched::erl_time_sup::monotonic_time_raw_nanos() as u32,
+        );
+        StatisticsOrigins::now()
+    });
 }
 
 /// Record a collection in the runtime statistics.

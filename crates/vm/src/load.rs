@@ -254,6 +254,11 @@ pub(crate) struct CodeMeta {
     // erts keeps it in the code header (`BeamCodeHeader::debug`) after the file is freed.
     pub(crate) debug_table: Option<Vec<arinsal_etf::OwnedTerm>>,
 }
+/// Generation of the active code tables; interpreter caches are valid only within it.
+pub(crate) fn code_generation() -> u64 {
+    code_tables(erts_active_code_ix()).generation
+}
+
 /// Native code range of the module version in slot `id`, when it was compiled by BeamAsm.
 pub(crate) fn native_code_range(
     code_meta: &[Option<Arc<CodeMeta>>],
@@ -834,29 +839,21 @@ impl Vm {
             paths.extend(dirs);
         }
         paths.push(otp.join("lib/erts-17.1/ebin"));
-        Self::for_node(paths, Some(otp), false)
+        Self::for_node(paths, Some(otp))
     }
 
-    fn for_node(paths: Vec<PathBuf>, otp_root: Option<PathBuf>, replica: bool) -> Self {
+    fn for_node(paths: Vec<PathBuf>, otp_root: Option<PathBuf>) -> Self {
         // erts_code_ix_init runs before the first module is loaded.
         crate::code_ix::global();
-        Self {
-            paths,
-            statistics_origins: if replica {
-                crate::natives::sys::StatisticsOrigins::now()
-            } else {
-                crate::natives::sys::initialize_statistics_origins()
-            },
-            otp_root,
-            beamasm_targets: beamasm_integration::NativeTargetCache::new(),
-            replica,
-            esdp_registers: 0,
-        }
+        crate::natives::sys::initialize_statistics_origins();
+        crate::erl_init::erts_set_boot_args(paths, otp_root);
+        Self {}
     }
 
-    /// A scheduler's VM over the node's code.
-    pub(crate) fn shared_replica(paths: &[PathBuf]) -> Self {
-        Self::for_node(paths.to_vec(), None, true)
+    /// A scheduler's handle on the node's code: the code tables and the boot arguments are
+    /// erts globals, so it holds nothing.
+    pub(crate) fn shared_replica() -> Self {
+        Self {}
     }
 
     /// Construct a VM with OTP's debugger startup flags applied before any module is loaded.
@@ -1060,22 +1057,14 @@ impl Vm {
             )));
         }
         let module = Arc::new(module);
-        let id = staging.with(|tables| {
+        staging.with(|tables| {
             let id = tables.alloc(module, Some(meta));
             if let Some(previous) = tables.make_current(&name, id) {
                 tables.old.insert(name.clone(), previous);
             }
-            id
         });
         drop(staging);
-        self.register_native_targets(id);
         Ok(())
-    }
-
-    fn register_native_targets(&mut self, id: usize) {
-        if let Some(module) = code_tables(erts_active_code_ix()).modules.get(id) {
-            self.beamasm_targets.register_module(id, module);
-        }
     }
 
     /// Load bytes without executing module-level code.
@@ -1162,7 +1151,6 @@ impl Vm {
             id
         });
         drop(staging);
-        self.register_native_targets(id);
         Ok(id)
     }
 
@@ -1236,11 +1224,6 @@ impl Vm {
         })
     }
 
-    /// Generation of the active code tables; interpreter caches are valid only within it.
-    pub(crate) fn code_generation(&self) -> u64 {
-        code_tables(erts_active_code_ix()).generation
-    }
-
     /// Patch the breakpoints of several functions of one module, publishing the module once:
     /// a per-function publication made `return_to` (which touches every loaded function) take
     /// minutes.
@@ -1262,16 +1245,7 @@ impl Vm {
         for (entry, function, arity) in targets {
             let (local, global) =
                 crate::trace_bp::breakpoint_kinds(process, &module.name, function, *arity);
-            if self
-                .beamasm_targets
-                .function_for_target(
-                    module_id,
-                    &module,
-                    native_code_range(&code_tables(erts_active_code_ix()).code_meta, module_id),
-                    *entry,
-                )
-                .is_some()
-            {
+            if crate::beamasm_integration::erts_code_hdr_function(module_id, *entry).is_some() {
                 native_patches.push((*function, *arity, local));
             }
             global_patches.push((
@@ -1305,7 +1279,6 @@ impl Vm {
         // The new table generation makes import caches holding the old export target resolve
         // again.
         crate::code_ix::global().patch_all(|_| {});
-        self.register_native_targets(module_id);
     }
 
     /// Patch the code of exactly these functions after their breakpoints changed.
@@ -1406,7 +1379,7 @@ impl Vm {
             return false;
         }
         let file = format!("{name}.beam");
-        for dir in &self.paths {
+        for dir in &crate::erl_init::erts_boot_paths() {
             let path = dir.join(&file);
             if !path.is_file() {
                 continue;
@@ -1457,12 +1430,13 @@ impl Vm {
             return Err(VmError::Load(format!("module {name} not found")));
         }
         let file = format!("{name}.beam");
-        let path = self
-            .paths
-            .iter()
-            .map(|dir| dir.join(&file))
-            .find(|path| path.is_file())
-            .ok_or_else(|| VmError::Load(format!("module {name} not found")))?;
+        let path = crate::erl_init::with_erts_boot_paths(|paths| {
+            paths
+                .iter()
+                .map(|dir| dir.join(&file))
+                .find(|path| path.is_file())
+        })
+        .ok_or_else(|| VmError::Load(format!("module {name} not found")))?;
         if crate::calls::trace_boot_enabled() {
             eprintln!("arinsal boot: load {}", path.display());
         }

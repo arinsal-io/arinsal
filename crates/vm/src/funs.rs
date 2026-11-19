@@ -119,11 +119,15 @@ impl Vm {
     // Port of erts/emulator/beam/erl_process.h (erts_proc_sched_data(c_p)->registers),
     // OTP-29.1.1.
     pub(crate) fn reg_prefix<'a>(&self, live: usize) -> Result<&'a mut [Term], VmError> {
-        crate::native_hooks::registers_at(
-            self.esdp_registers as *mut arinsal_beamasm::SchedulerRegisters,
-        )
-        .and_then(|registers| registers.x_reg_array.get_mut(..live))
-        .ok_or_else(|| VmError::Unsupported("no scheduler registers".into()))
+        let registers = arinsal_sched::erts_get_scheduler_data::<crate::Process, _>(|esdp| {
+            arinsal_sched::erts_sched_registers(esdp)
+                .registers_addr
+                .get()
+        })
+        .unwrap_or(0);
+        crate::native_hooks::registers_at(registers as *mut arinsal_beamasm::SchedulerRegisters)
+            .and_then(|registers| registers.x_reg_array.get_mut(..live))
+            .ok_or_else(|| VmError::Unsupported("no scheduler registers".into()))
     }
 
     /// `reg`, the whole register array of `esdp->registers`.
@@ -138,57 +142,10 @@ impl Vm {
     ) -> Option<Result<EvalResult, VmError>> {
         let arity = args.len();
         let result = match (function, arity) {
+            // erts runs every call in a process: these BIFs read and write the scheduler's
+            // `reg`, which only a scheduled process has.
             ("apply", 2 | 3) | ("make_fun", 3) | ("fun_info", 1 | 2) | ("fun_info_mfa", 1) => {
-                // elixir_loop1
-                let mut p = Process::new();
-                // This VM runs the call itself, as a scheduler does: its register file is
-                // `esdp->registers` for the call.
-                let mut registers = Box::<arinsal_beamasm::SchedulerRegisters>::default();
-                registers.x_reg_array[..arity].copy_from_slice(args);
-                let previous = std::mem::replace(
-                    &mut self.esdp_registers,
-                    std::ptr::from_mut(registers.as_mut()) as usize,
-                );
-                p.gc_live = arity;
-                let value = match function {
-                    "apply" => match self.apply_bif(&mut p, arity, None) {
-                        Ok(ImportOutcome::Returned(value)) => Ok(value),
-                        Ok(ImportOutcome::Dispatch) | Ok(ImportOutcome::Yield) => {
-                            // The apply resolved to Erlang code: erts runs it in the calling
-                            // process's native code, which here is a scheduled process.
-                            self.esdp_registers = previous;
-                            return Some(self.eval_in_scheduled_process("erlang", function, args));
-                        }
-                        Err(error) => Err(error),
-                    },
-                    "make_fun" => self.make_export_fun(&mut p, args),
-                    "fun_info" => self.fun_info(&mut p, arity == 2),
-                    "fun_info_mfa" => self.fun_info_mfa(&mut p), // elixir_loop1
-                    _ => unreachable!(),
-                };
-                // An exception raised here has no BEAM frame to unwind into: turn it
-                // into an uncaught `Raised` while its reason still lives on `p`'s heap.
-                let value = match value {
-                    Err(VmError::Trap(trap)) => {
-                        match exceptions::resume(self, &mut p, None, trap) {
-                            Ok(Some(error)) | Err(error) => Err(error),
-                            Ok(None) => Err(VmError::Unsupported(
-                                "exception resumed without a handler".into(),
-                            )),
-                        }
-                    }
-                    other => other,
-                };
-                self.esdp_registers = previous;
-                drop(registers);
-                value.map(|term| {
-                    p.stats.heap_words = p.heap.capacity_words();
-                    EvalResult {
-                        term,
-                        stats: p.stats.snapshot(),
-                        _process: p,
-                    }
-                })
+                self.eval_in_scheduled_process("erlang", function, args)
             }
             _ => return None,
         };
@@ -223,7 +180,7 @@ impl Vm {
             FunRef::Local { entry, free_vars } => {
                 // Port of erts/emulator/beam/beam_common.c:1621-1624 (call_fun), OTP-29.1.1.
                 let cached = entry.get_dispatch(0).and_then(|(id, target, generation)| {
-                    if generation == self.code_generation() {
+                    if generation == crate::load::code_generation() {
                         return Some((id, target));
                     }
                     (code_tables(erts_active_code_ix()).module_live.get(id) == Some(&true))
@@ -390,7 +347,7 @@ impl Vm {
             }
             return Ok(None);
         };
-        entry.set_dispatch(0, module_id, target, self.code_generation());
+        entry.set_dispatch(0, module_id, target, crate::load::code_generation());
         Ok(Some((module_id, target)))
     }
 
@@ -907,15 +864,8 @@ impl Vm {
         // interpreter export-breakpoint entry.
         if let Some(run) = ctx
             && crate::trace_bp::breakpoint_kinds(p, module, function, arity as u8).1
-            && let Some(native) = self.beamasm_targets.function_for_target(
-                module_id,
-                &code_tables(erts_active_code_ix()).modules[module_id],
-                crate::load::native_code_range(
-                    &code_tables(erts_active_code_ix()).code_meta,
-                    module_id,
-                ),
-                target,
-            )
+            && let Some(native) =
+                crate::beamasm_integration::erts_code_hdr_function(module_id, target)
         {
             let actions = crate::trace::executor_native_call_event(self, p, run, &native, false)?;
             crate::trace::push_native_trace_frame(

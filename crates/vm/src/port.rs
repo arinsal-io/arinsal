@@ -1585,10 +1585,7 @@ fn start(
     let mut child_env = crate::erl_osenv::port_env(&env);
     // Keep `erl` child launchers on this VM's selected installation when the port changes cwd.
     if erl_launcher(&name, executable)
-        && let Some(root) = process
-            .runtime
-            .as_ref()
-            .and_then(|runtime| runtime.otp_root())
+        && let Some(root) = crate::erl_init::erts_root_dir()
     {
         let mut paths = vec![root.join("bin")];
         if let Some(path) = child_env.get(b"PATH") {

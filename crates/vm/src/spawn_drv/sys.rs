@@ -112,10 +112,3 @@ pub(crate) fn uds_write(fd: RawFd, buf: &[u8], fds: &[RawFd]) -> Result<usize, i
     )
     .map_err(|errno| errno.raw_os_error())
 }
-
-/// `shutdown(fd, SHUT_WR)`: the peer reads end of file.
-pub(crate) fn shutdown_write(fd: RawFd) {
-    if let Some(fd) = borrow(fd) {
-        let _ = rustix::net::shutdown(fd, rustix::net::Shutdown::Write);
-    }
-}

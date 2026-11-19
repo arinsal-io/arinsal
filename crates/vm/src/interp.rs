@@ -1,7 +1,6 @@
 //! VM interp implementation.
 
 use super::*;
-use crate::code_ix::{code_tables, erts_active_code_ix};
 
 pub(crate) fn gc_stress_enabled() -> bool {
     static GC_STRESS: OnceLock<bool> = OnceLock::new();
@@ -116,20 +115,7 @@ impl Vm {
         module_id: usize,
         target: usize,
     ) -> Result<(), VmError> {
-        let native = code_tables(erts_active_code_ix())
-            .modules
-            .get(module_id)
-            .and_then(|module| {
-                self.beamasm_targets.function_for_target(
-                    module_id,
-                    module,
-                    crate::load::native_code_range(
-                        &code_tables(erts_active_code_ix()).code_meta,
-                        module_id,
-                    ),
-                    target,
-                )
-            });
+        let native = crate::beamasm_integration::erts_code_hdr_function(module_id, target);
         let Some(native) = native else {
             return Err(VmError::Unsupported(format!(
                 "position {target} of module {module_id} is not a native function entry"

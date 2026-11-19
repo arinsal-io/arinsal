@@ -30,12 +30,6 @@ pub(crate) fn set_erts_backtrace_depth(n: usize) -> usize {
 static ERTS_RUNTIME: std::sync::OnceLock<&'static crate::process::Runtime> =
     std::sync::OnceLock::new();
 
-/// The runtime-system tables once `erl_start` created them.
-#[inline]
-pub(crate) fn erts_runtime() -> Option<&'static crate::process::Runtime> {
-    ERTS_RUNTIME.get().copied()
-}
-
 /// `erl_start` (erl_init.c): creates the runtime-system tables on the first call; later calls
 /// return the ones that exist.
 // Port of erts/emulator/beam/erl_init.c (erl_start: erts_init_process, erts_init_port,
@@ -44,4 +38,61 @@ pub(crate) fn erl_start(
     create: impl FnOnce() -> &'static crate::process::Runtime,
 ) -> &'static crate::process::Runtime {
     ERTS_RUNTIME.get_or_init(create)
+}
+
+/// The boot arguments `erl_start` reads from `argv` (erl_init.c): `-root` (what
+/// `init:get_argument(root)` returns) and the boot code path the primitive loader searches
+/// (`-pa` plus the release's `lib/*/ebin`). A `Vm` constructor sets them before the node
+/// loads its first module.
+struct BootArgs {
+    paths: Vec<std::path::PathBuf>,
+    root: Option<std::path::PathBuf>,
+}
+
+/// `argv` of erl_init.c (erl_start): set by the node's start, read by the module loader and
+/// by `open_port({spawn, ...})` children that need the release root.
+static ERTS_BOOT_ARGS: std::sync::RwLock<BootArgs> = std::sync::RwLock::new(BootArgs {
+    paths: Vec::new(),
+    root: None,
+});
+
+/// Records the node's boot arguments (erl_init.c erl_start parsing `argv`).
+pub(crate) fn erts_set_boot_args(paths: Vec<std::path::PathBuf>, root: Option<std::path::PathBuf>) {
+    let mut args = ERTS_BOOT_ARGS.write().unwrap_or_else(|e| e.into_inner());
+    args.paths = paths;
+    args.root = root;
+}
+
+/// The boot code path, searched in order for a module's `.beam` file.
+pub(crate) fn erts_boot_paths() -> Vec<std::path::PathBuf> {
+    ERTS_BOOT_ARGS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .paths
+        .clone()
+}
+
+/// Runs `f` over the boot code path without copying it.
+pub(crate) fn with_erts_boot_paths<R>(f: impl FnOnce(&[std::path::PathBuf]) -> R) -> R {
+    f(&ERTS_BOOT_ARGS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .paths)
+}
+
+/// `-root`: the release root, or the one the loaded erts ebin directory implies.
+pub(crate) fn erts_root_dir() -> Option<std::path::PathBuf> {
+    let args = ERTS_BOOT_ARGS.read().unwrap_or_else(|e| e.into_inner());
+    args.root.clone().or_else(|| {
+        args.paths.iter().find_map(|path| {
+            if path.ends_with(std::path::Path::new("lib/erts-17.1/ebin")) {
+                path.parent()?
+                    .parent()?
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+            } else {
+                None
+            }
+        })
+    })
 }

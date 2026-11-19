@@ -10,11 +10,9 @@ pub(crate) struct Runtime {
     pub(super) trap_exports:
         [OnceLock<Arc<arinsal_term::ExportEntry>>; crate::bif_traps::TRAP_EXPORT_CAPACITY],
     pub(crate) system_processes: Mutex<std::collections::HashSet<Pid>>,
-    pub(super) otp_root: Option<std::path::PathBuf>,
     pub(crate) dirty_signal_handlers: Mutex<std::collections::HashSet<Pid>>,
     /// Pid of `erts_literal_area_collector` (an unregistered system process).
     pub(crate) literal_collector: Mutex<Option<Pid>>,
-    pub(super) paths: Vec<std::path::PathBuf>,
     // Set once when the scheduler starts; read without a lock like erts' scheduler data.
     /// Held for the VM lifetime (erts reads its scheduler data through globals / `esdp`, with no
     /// per-process runtime refcount).
@@ -257,22 +255,6 @@ pub struct ScheduledResult {
 }
 
 impl Runtime {
-    /// OTP root used by child Arinsal launchers, recovered from the loaded erts path.
-    pub(crate) fn otp_root(&self) -> Option<std::path::PathBuf> {
-        self.otp_root.clone().or_else(|| {
-            self.paths.iter().find_map(|path| {
-                if path.ends_with(std::path::Path::new("lib/erts-17.1/ebin")) {
-                    path.parent()?
-                        .parent()?
-                        .parent()
-                        .map(std::path::Path::to_path_buf)
-                } else {
-                    None
-                }
-            })
-        })
-    }
-
     #[inline]
     pub(crate) fn next_ref(&self) -> u64 {
         arinsal_sched::unique::next_ref_id()

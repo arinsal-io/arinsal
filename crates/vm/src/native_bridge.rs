@@ -264,7 +264,6 @@ pub(crate) struct ModuleRange {
     start: usize,
     /// Shared across code-index snapshots so purge invalidates copies made during staging.
     end: Arc<AtomicUsize>,
-    module_atom: arinsal_term::Atom,
     /// The code header's function table. `erts_lookup_function_info` binary-searches the
     /// function start addresses (beam_ranges.c:262-278), OTP-29.1.1.
     functions: FunctionTable,
@@ -299,18 +298,12 @@ pub(crate) fn code_ranges() -> Arc<Vec<ModuleRange>> {
 }
 
 /// The range entry of a module version whose functions are `functions`.
-fn module_range(
-    start: usize,
-    end: usize,
-    module_atom: arinsal_term::Atom,
-    functions: FunctionTable,
-) -> ModuleRange {
+fn module_range(start: usize, end: usize, functions: FunctionTable) -> ModuleRange {
     let fragment = functions.first().is_some_and(|function| function.fragment);
     ModuleRange {
         fragment,
         start,
         end: Arc::new(AtomicUsize::new(end)),
-        module_atom,
         function_starts: functions
             .iter()
             .map(|function| function.start)
@@ -770,7 +763,7 @@ pub fn register_native_function(info: NativeFunction) -> Result<(), &'static str
     let (start, end) = (info.start, info.end);
     arinsal_term::register_native_code_range(start, end)?;
     update_perf_map(&info);
-    let range = module_range(start, end, info.module_atom, Arc::from(vec![info]));
+    let range = module_range(start, end, Arc::from(vec![info]));
     if let Err(error) = insert_global_range(&range) {
         arinsal_term::unregister_native_code_range(start, end);
         return Err(error);
@@ -811,12 +804,7 @@ pub(crate) fn register_native_module(
         return Err("native functions must belong to one module code range");
     }
     arinsal_term::register_native_code_range(code_start, code_end)?;
-    let range = module_range(
-        code_start,
-        code_end,
-        first.module_atom,
-        Arc::clone(functions),
-    );
+    let range = module_range(code_start, code_end, Arc::clone(functions));
     if let Err(error) = insert_global_range(&range) {
         arinsal_term::unregister_native_code_range(code_start, code_end);
         return Err(error);
@@ -835,24 +823,6 @@ pub(crate) fn unregister_native_module(code_start: usize, code_end: usize) {
     remove_global_ranges(|range| range.start == code_start && range.end() == code_end);
     arinsal_term::unregister_native_code_range(code_start, code_end);
     unpublish_native_module_range(code_start, code_end);
-    native_generation().fetch_add(1, Ordering::Release);
-}
-
-/// Unregisters native function entries when their owning module version is purged.
-#[cfg(test)]
-pub(crate) fn unregister_native_functions(entries: &[NativeFunction]) {
-    let mut removed = 0;
-    for entry in entries {
-        let ranges = remove_global_ranges(|range| range.start == entry.start);
-        for &(start, end) in &ranges {
-            arinsal_term::unregister_native_code_range(start, end);
-            unpublish_native_module_range(start, end);
-        }
-        removed += ranges.len();
-    }
-    if removed == 0 {
-        return;
-    }
     native_generation().fetch_add(1, Ordering::Release);
 }
 
@@ -924,35 +894,6 @@ fn native_frame_at(address: usize) -> Option<NativeStackFrame> {
         return None;
     }
     frame_in(&all_ranges().load(), address, &HINT)
-}
-
-/// Every registered native function of `module`, keyed by name and arity, restricted to the
-/// module version whose native code spans `range` when one is given.
-// The ranges hold every loaded version (current and old) ordered by address, so the version
-// must be selected before the entries collapse into one per name and arity: a newer version
-// placed below the old one in memory would otherwise lose its entries to the old ones.
-pub(crate) fn native_functions_of(
-    module: &str,
-    range: Option<(usize, usize)>,
-) -> std::collections::HashMap<(String, u8), NativeFunction> {
-    let Some(module_atom) = arinsal_term::global_atoms().get(module) else {
-        return std::collections::HashMap::new();
-    };
-    let ranges = all_ranges().load();
-    ranges
-        .iter()
-        .filter(|entry| entry.module_atom == module_atom)
-        .flat_map(|entry| entry.functions.iter())
-        .filter(|function| {
-            range.is_none_or(|(start, end)| start <= function.start && function.start < end)
-        })
-        .map(|function| {
-            (
-                (function.function.to_owned(), function.arity),
-                function.clone(),
-            )
-        })
-        .collect()
 }
 
 /// Enter one native function and commit its ABI state before returning to the scheduler.
@@ -1648,16 +1589,11 @@ mod version_selection_tests {
 
     #[test]
     fn function_lookup_uses_function_boundaries_with_end_sentinel() {
-        let atoms = arinsal_term::global_atoms();
-        let module_atom = atoms
-            .intern("native_bridge_compact_functions")
-            .expect("module atom");
         let first = function(0x1000, "native_bridge_compact_functions");
         let second = function(0x1020, "native_bridge_compact_functions");
         let range = module_range(
             0x1000,
             0x1040,
-            module_atom,
             Arc::from(vec![first.clone(), second.clone()]),
         );
 
@@ -1676,25 +1612,6 @@ mod version_selection_tests {
             function_in(&range, 0x1020).map(|f| f.start),
             Some(second.start)
         );
-    }
-
-    // An old and a current version of one module are registered at once; the current one
-    // may be placed below the old one in memory. Each version must still find its own code.
-    #[test]
-    fn native_functions_of_selects_the_requested_version() {
-        let memory: &'static [u8] = Box::leak(vec![0_u8; 256].into_boxed_slice());
-        let base = memory.as_ptr() as usize;
-        let module = "native_bridge_version_selection";
-        let old = function(base + 128, module);
-        let current = function(base, module);
-        register_native_function(old.clone()).expect("register old version");
-        register_native_function(current.clone()).expect("register current version");
-        let key = ("spin".to_owned(), 0);
-        let selected = native_functions_of(module, Some((base, base + 64)));
-        similar_asserts::assert_eq!(selected.get(&key), Some(&current));
-        let selected = native_functions_of(module, Some((base + 128, base + 192)));
-        similar_asserts::assert_eq!(selected.get(&key), Some(&old));
-        unregister_native_functions(&[old, current]);
     }
 
     // A load can snapshot the active range while purge retires that version. The next load
@@ -1724,7 +1641,7 @@ mod version_selection_tests {
             file_term: None,
             line_table: NativeLines::default(),
         };
-        let range = || module_range(start, end, module_atom, Arc::from(vec![function.clone()]));
+        let range = || module_range(start, end, Arc::from(vec![function.clone()]));
         indexes.store_code_ranges(Arc::new(vec![range()]));
 
         for _ in 0..32 {

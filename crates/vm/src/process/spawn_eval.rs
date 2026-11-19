@@ -322,14 +322,14 @@ impl Vm {
             let port_ids = PtabIdRing::new(port_layout.max());
             let named_ets = Arc::new(arinsal_ets::NamedTableIndex::new());
             Box::leak(Box::new(Runtime {
-                statistics: crate::natives::sys::StatisticsState::new(self.statistics_origins),
+                statistics: crate::natives::sys::StatisticsState::new(
+                    crate::natives::sys::erts_statistics_origins(),
+                ),
                 code: Arc::clone(&code),
                 trap_exports: std::array::from_fn(|_| OnceLock::new()),
                 system_processes: Mutex::new(std::collections::HashSet::new()),
-                otp_root: self.otp_root.clone(),
                 dirty_signal_handlers: Mutex::new(std::collections::HashSet::new()),
                 literal_collector: Mutex::new(None),
-                paths: self.paths.clone(),
                 scheduler: OnceLock::new(),
                 reg: crate::register::RegisterTable::new(),
                 next_trace_weak_id: AtomicU64::new(0),

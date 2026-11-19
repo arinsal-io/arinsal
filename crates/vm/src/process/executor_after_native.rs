@@ -813,18 +813,7 @@ pub(super) fn context_switch(
                     .position(|slot| slot.function == export.function && slot.arity == export.arity)
                     .and_then(|index| module.export_entry_targets.get(index))
                     .and_then(|&entry| {
-                        let mut vm = lend_vm(esdp);
-                        let vm = &mut *vm;
-                        vm.beamasm_targets.function_for_target(
-                            module_id,
-                            &module,
-                            crate::load::native_code_range(
-                                &crate::code_ix::code_tables(crate::code_ix::erts_active_code_ix())
-                                    .code_meta,
-                                module_id,
-                            ),
-                            entry,
-                        )
+                        crate::beamasm_integration::erts_code_hdr_function(module_id, entry)
                     });
                 if let Some(function) = function {
                     let actions = crate::trace::executor_native_call_event(

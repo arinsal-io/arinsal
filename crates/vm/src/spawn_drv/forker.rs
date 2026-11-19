@@ -8,12 +8,10 @@
 //! input, handed to the spawn port they name as an asynchronous control.
 
 use std::os::fd::{IntoRawFd, RawFd};
-use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use arinsal_drv::{DriverPort, NativeDriver, SELECT_READ, SELECT_USE, SELECT_WRITE};
-use parking_lot::Mutex;
 
 use super::sys;
 use crate::VmError;
@@ -33,8 +31,6 @@ fn driver() -> Arc<arinsal_drv::Driver> {
 /// The forker port's driver data: `forker_fd` and the `first_call` of forker_control.
 struct ForkerData {
     fd: RawFd,
-    /// The `erl_child_setup` process, waited for when the node shuts down.
-    helper: Mutex<Option<Child>>,
     first_call: AtomicBool,
     runtime: &'static crate::process::Runtime,
 }
@@ -44,13 +40,14 @@ struct ForkerData {
 pub(crate) fn open_forker(runtime: &'static crate::process::Runtime) -> Result<(), VmError> {
     let id = crate::port::open_sys_driver_port(runtime, driver(), "forker", |port| {
         // Port of sys_drivers.c:1589 (forker_start).
-        let (fd, helper) = crate::child_setup::start()
+        // erts never waits for erl_child_setup: it exits on end of file of its socket when
+        // the node's OS process ends.
+        let (fd, _helper) = crate::child_setup::start()
             .map_err(|error| VmError::Load(format!("cannot start erl_child_setup: {error}")))?;
         let fd = fd.into_raw_fd();
         sys::set_nonblocking(fd);
         port.start_native(Arc::new(ForkerData {
             fd,
-            helper: Mutex::new(Some(helper)),
             first_call: AtomicBool::new(true),
             runtime,
         }));
@@ -60,28 +57,6 @@ pub(crate) fn open_forker(runtime: &'static crate::process::Runtime) -> Result<(
         .forker_port
         .set(id)
         .map_err(|_| VmError::Unsupported("forker port already open".into()))
-}
-
-/// The node ends: `erl_child_setup` reads end of file on its socket and exits. erts leaves
-/// that to the OS closing `forker_fd` at `exit`; a node that ends inside a longer-lived OS
-/// process stops polling the socket, shuts it down and waits for the forker here.
-pub(crate) fn shutdown_forker(runtime: &crate::process::Runtime) {
-    let Some(port) = runtime
-        .forker_port
-        .get()
-        .and_then(|&id| runtime.ports.get(id))
-        .and_then(|handle| handle.drv_port())
-    else {
-        return;
-    };
-    let Some(data) = port.native_data::<ForkerData>() else {
-        return;
-    };
-    port.serialized(|| port.select(data.fd, SELECT_READ | SELECT_WRITE, false));
-    sys::shutdown_write(data.fd);
-    if let Some(mut helper) = data.helper.lock().take() {
-        let _ = helper.wait();
-    }
 }
 
 /// `erl_drv_port_control(forker_port, ERTS_FORKER_DRV_CONTROL_MAGIC_NUMBER, proto)` of

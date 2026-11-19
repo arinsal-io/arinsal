@@ -413,6 +413,13 @@ impl CompiledVersion {
         (self.code_start..self.code_end).contains(&address)
     }
 
+    /// `code_hdr->functions[index]`: the function with number `index` of this version.
+    // Port of erts/emulator/beam/beam_code.h (BeamCodeHeader.functions), OTP-29.1.1: the code
+    // is emitted in function order, so the address order is the function order.
+    pub(crate) fn function(&self, index: usize) -> Option<&crate::NativeFunction> {
+        self.native_functions.get(index)
+    }
+
     /// Resolves a native PC to its function in this compiled module version.
     // Port of erts/emulator/beam/beam_ranges.c:245-289 (erts_lookup_function_info), OTP-29.1.1.
     pub(crate) fn native_function_for_pc(&self, pc: usize) -> Option<&crate::NativeFunction> {
