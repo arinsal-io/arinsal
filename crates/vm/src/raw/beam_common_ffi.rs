@@ -35,6 +35,20 @@ pub(crate) fn printable_return_address(p: *const ProcessHeader, e: *const u64) -
     0
 }
 
+/// `void copy_out_registers(Process *c_p, Eterm *reg)`: process_main's schedule-out save of
+/// the `c_p->arity` live registers (`context_switch_simplified`).
+// Port of erts/emulator/beam/beam_common.c:306-334 (copy_out_registers), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn copy_out_registers(c_p: *mut ProcessHeader, reg: *mut u64) {
+    let (Some(process), Some(registers)) = (
+        crate::native_hooks::process_from_header(c_p),
+        crate::native_hooks::registers_at(arinsal_beamasm::SchedulerRegisters::from_reg(reg)),
+    ) else {
+        return;
+    };
+    crate::beam_common::copy_out_registers(process, &registers.x_reg_array);
+}
+
 /// Starts the hibernate scheduler handoff for the live register range.
 // Port of erts/emulator/beam/beam_common.c:1568-1600 (`erts_hibernate`), OTP-29.1.1.
 #[unsafe(no_mangle)]

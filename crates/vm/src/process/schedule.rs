@@ -47,10 +47,13 @@ impl Task for Process {
         }
     }
 
-    fn copy_out_registers(c_p: &mut CP<'_>, _esdp: &mut ErtsSchedulerData) {
+    fn copy_out_registers(c_p: &mut CP<'_>, esdp: &mut ErtsSchedulerData) {
         let process = c_p.task();
         if process.runtime.is_some() {
-            crate::beam_common::copy_out_registers(process);
+            crate::beam_common::copy_out_registers(
+                process,
+                &esdp.registers().registers.x_reg_array,
+            );
         }
     }
 

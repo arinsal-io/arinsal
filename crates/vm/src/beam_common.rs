@@ -15,12 +15,12 @@ pub(crate) fn copy_in_registers(c_p: &mut Process, reg: &mut arinsal_beamasm::Sc
     crate::raw::beam_common_ffi::attach_process_registers(c_p, reg);
 }
 
-/// Save the `c_p->arity` live registers from the scheduler's register array into the process
-/// (`arg_reg`, growing it past `def_arg_reg` when needed) and give the array back.
+/// Save the `c_p->arity` live registers from `reg` (the scheduler's `x_reg_array`) into the
+/// process (`arg_reg`, growing it past `def_arg_reg` when needed) and give the array back.
 // Port of erts/emulator/beam/beam_common.c:306 (copy_out_registers), OTP-29.1.1.
-pub(crate) fn copy_out_registers(c_p: &mut Process) {
+pub(crate) fn copy_out_registers(c_p: &mut Process, reg: &[Term]) {
     let arity = usize::from(c_p.heap.abi.arity);
-    c_p.x.detach_save(arity);
+    c_p.x.copy_out(reg, arity);
 }
 
 fn term(raw: u64) -> Term {

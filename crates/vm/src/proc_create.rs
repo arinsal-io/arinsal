@@ -188,33 +188,37 @@ impl ArgRegs {
         self.f_attached = registers.f_reg_array.as_mut_ptr() as usize;
     }
 
-    /// Schedule-out (`copy_out_registers`): copy the first `arity` array registers into the
-    /// owned file, growing it past six like `arg_reg`, record `arity`, and drop the
-    /// attachment.
-    pub fn detach_save(&mut self, arity: usize) {
+    /// Schedule-out (`copy_out_registers`): copy the first `arity` registers of `reg` (the
+    /// scheduler's `x_reg_array`) into the owned file, growing it past six like `arg_reg`,
+    /// record `arity`, and drop the attachment. A pure copy as erts': a second call with the
+    /// same `reg` stores the same words.
+    // Port of erts/emulator/beam/beam_common.c:306-334 (copy_out_registers), OTP-29.1.1.
+    pub fn copy_out(&mut self, reg: &[Term], arity: usize) {
         assert!(
-            arity <= ATTACHED_X_REGS,
+            arity <= ATTACHED_X_REGS && arity <= reg.len(),
             "arity {arity} exceeds the X array"
         );
-        assert!(self.attached != 0, "X registers are not attached");
         if arity <= 6 {
-            // Port of erts/emulator/beam/jit/arm/process_main.cpp (copy_out_registers):
-            // only the `arity` live registers move; zero live registers is a length store.
-            for index in 0..arity {
-                let term = self[index];
-                self.inline[index] = term;
-            }
+            // Only the `arity` live registers move; zero live registers is a length store.
+            self.inline[..arity].copy_from_slice(&reg[..arity]);
         } else {
             let mut block = std::mem::take(&mut self.extra);
             if block.len() < arity {
                 block = vec![Term::NIL; arity].into_boxed_slice();
             }
-            block[..arity].copy_from_slice(&self[..arity]);
+            block[..arity].copy_from_slice(&reg[..arity]);
             self.extra = block;
         }
         self.len = arity;
         self.attached = 0;
         self.f_attached = 0;
+    }
+
+    /// [`Self::copy_out`] from the attached array itself (`reg` = the array `attach` took).
+    pub fn detach_save(&mut self, arity: usize) {
+        assert!(self.attached != 0, "X registers are not attached");
+        let saved = self[..arity].to_vec();
+        self.copy_out(&saved, arity);
     }
 
     /// `REDS_IN` (`c_p->def_arg_reg[5]`): FCALLS at the start of the running slice. The slot
