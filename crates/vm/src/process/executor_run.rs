@@ -68,13 +68,9 @@ impl Executor {
             process.set_run_process_entry()?;
         }
         process.replace_entry_started(true);
-        // Port of erts/emulator/beam/jit/arm/process_main.cpp (copy_in_registers) and
-        // erl_process.c (erts_schedule), OTP-29.1.1: the scheduler's one X register array is
-        // the process's file for the slice, loaded with the `c_p->arity` saved registers.
+        // The scheduler loop has loaded the `c_p->arity` saved registers into the scheduler's
+        // one X register array (copy_in_registers), which is the process's file for the slice.
         let saved_len = process.x.saved_arity();
-        // SAFETY: `self.native_registers` lives in this boxed `Executor`, which is not moved
-        // or dropped during the call, and the epilogue below detaches before `run` returns.
-        unsafe { process.x.attach(&mut self.native_registers) };
         // `esdp->registers` of this scheduler: the VM paths the slice runs reach `reg` here.
         self.vm.esdp_registers = std::ptr::from_mut(&mut self.native_registers) as usize;
         if crate::xreg_poison_enabled() {
@@ -631,7 +627,6 @@ impl Executor {
             };
             process.heap.abi.arity = live_x.min(usize::from(u8::MAX)) as u8;
             process.gc_live = live_x;
-            let save_x = live_x;
             if crate::native_bridge::return_trace_enabled() && process.native_pc().is_some() {
                 eprintln!(
                     "[sched-save-native] live_x={live_x} x0={:#x} native_pc={:?}",
@@ -639,13 +634,11 @@ impl Executor {
                     process.native_pc()
                 );
             }
-            // Port of erts/emulator/beam/jit/arm/process_main.cpp (copy_out_registers),
-            // OTP-29.1.1: the `c_p->arity` registers go from the scheduler array into the
-            // process, six of them inline (`def_arg_reg`) so switching out allocates nothing.
-            process.x.detach_save(save_x);
+            // The scheduler loop's copy_out_registers saves these `c_p->arity` registers.
         } else {
-            process.x.detach_save(0);
-            process.x = crate::proc_create::ArgRegs::empty();
+            // Port of erts/emulator/beam/jit/arm/process_main.cpp:140-144 (process_exit:
+            // `c_p->arity = 0`), OTP-29.1.1: an exiting or finished process saves no register.
+            process.heap.abi.arity = 0;
         }
         // Port of erts/emulator/beam/erl_process.c:10415 (erts_schedule), OTP-29.1.1: erts has no
         // collection at schedule-out. ERTS_IS_GC_DESIRED is tested once, when the process is

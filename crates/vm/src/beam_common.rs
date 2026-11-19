@@ -7,6 +7,25 @@ use arinsal_beamasm::ProcessHeader;
 use arinsal_maps::MapError;
 use arinsal_term::{Term, TermBuilder, exc};
 
+/// Load the `c_p->arity` saved argument registers into the scheduler's register array and make
+/// it the process's X file for the slice.
+// Port of erts/emulator/beam/beam_common.c:336 (copy_in_registers), OTP-29.1.1: `reg` is
+// `esdp->registers`; the X file stays the array until copy_out_registers.
+pub(crate) fn copy_in_registers(c_p: &mut Process, reg: &mut arinsal_beamasm::SchedulerRegisters) {
+    // SAFETY: `reg` is the scheduler's register file in its `SchedulerData`, which outlives
+    // the slice and is not moved while it runs; `copy_out_registers` detaches before the
+    // scheduler loop schedules the process out.
+    unsafe { c_p.x.attach(reg) };
+}
+
+/// Save the `c_p->arity` live registers from the scheduler's register array into the process
+/// (`arg_reg`, growing it past `def_arg_reg` when needed) and give the array back.
+// Port of erts/emulator/beam/beam_common.c:306 (copy_out_registers), OTP-29.1.1.
+pub(crate) fn copy_out_registers(c_p: &mut Process) {
+    let arity = usize::from(c_p.heap.abi.arity);
+    c_p.x.detach_save(arity);
+}
+
 fn term(raw: u64) -> Term {
     crate::native_hooks::from_raw(raw)
 }

@@ -39,6 +39,21 @@ impl Task for Process {
         self.inbox.init_in_place();
     }
 
+    // A process without a runtime exits at once in `run_task` and never reaches Erlang code.
+    fn copy_in_registers(&mut self, data: &mut SchedulerData) {
+        let Some(runtime) = self.runtime else {
+            return;
+        };
+        let executor = data.executor.get_or_insert_with(|| new_executor(runtime));
+        crate::beam_common::copy_in_registers(self, &mut executor.native_registers);
+    }
+
+    fn copy_out_registers(&mut self, _data: &mut SchedulerData) {
+        if self.runtime.is_some() {
+            crate::beam_common::copy_out_registers(self);
+        }
+    }
+
     fn gc_nanoseconds(&self) -> u64 {
         self.stats.gc.nanoseconds
     }
