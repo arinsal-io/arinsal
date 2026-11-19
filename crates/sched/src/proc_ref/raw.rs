@@ -79,6 +79,39 @@ impl<C> ProcLock<C> {
     }
 }
 
+/// The main lock of a process held past its guard: `erts_schedule` returns the process with
+/// `ERTS_PROC_LOCK_MAIN` held, `process_main` runs the slice under it, and the next
+/// `erts_schedule` releases it. Not `Send` (the raw pointer), so the lock is resumed on the
+/// thread that holds it; dropping it without [`ProcLock::resume_locked`] leaves the lock held.
+///
+/// Port of erts/emulator/beam/erl_process.c:9607 (erts_schedule takes `p` and returns the next
+/// process with ERTS_PROC_LOCK_MAIN held), OTP-29.1.1.
+#[must_use = "the main lock stays held until it is resumed"]
+pub(crate) struct HeldMainLock {
+    lock: *const (),
+}
+
+impl<C> ProcLockGuard<'_, C> {
+    /// Keep the lock held after this guard ends.
+    pub(crate) fn keep_locked(self) -> HeldMainLock {
+        let lock = std::ptr::from_ref(self.lock).cast::<()>();
+        std::mem::forget(self);
+        HeldMainLock { lock }
+    }
+}
+
+impl<C> ProcLock<C> {
+    /// The guard of this lock, which `held` (from [`ProcLockGuard::keep_locked`] of a guard of
+    /// this lock) proves is held.
+    pub(crate) fn resume_locked(&self, held: HeldMainLock) -> ProcLockGuard<'_, C> {
+        assert!(
+            std::ptr::eq(held.lock, std::ptr::from_ref(self).cast::<()>()),
+            "a held main lock resumes on its own process"
+        );
+        ProcLockGuard { lock: self }
+    }
+}
+
 impl<C> std::ops::Deref for ProcLockGuard<'_, C> {
     type Target = C;
     fn deref(&self) -> &C {

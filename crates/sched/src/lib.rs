@@ -91,7 +91,7 @@ pub use sig_queue::{
 pub use timer::{TimerId, TimerRef};
 
 use arinsal_term::ptab::{PTAB_ID_DATA_MASK, PtabIdRing};
-use proc_ref::raw::{ProcLock, ProcLockGuard};
+use proc_ref::raw::{HeldMainLock, ProcLock, ProcLockGuard};
 pub use proc_ref::{CP, SignalProbe};
 use proc_ref::{ErasedProcRef, ProcRef, TaskCell};
 pub use sched_data_key::{ProcSchedData, erts_get_scheduler_data, erts_proc_sched_data};
@@ -9607,40 +9607,47 @@ fn run_slice<T: Task>(esdp: &ErtsSchedulerData<T>, process: &ProcRef<T>) -> u32 
     calls
 }
 
-/// Run one slice of a process on a normal scheduler and return the reductions it used
-/// (`calls`). Its outcome is in `p->state`: the next `erts_schedule(esdp, p, calls)` schedules
-/// it out under its single borrow of the scheduler state, as erts' `process_main` hands `c_p`
-/// and `reds_used` back to erts_schedule.
-// Port of erts/emulator/beam/erl_process.c (erts_schedule: schedule-in half) and
-// jit/arm/process_main.cpp (process_main), OTP-29.1.1.
-fn run_process<T: Task>(esdp: &ErtsSchedulerData<T>, process: &ProcRef<T>) -> u32 {
-    debug_assert!(
-        esdp.local.is_some(),
-        "a normal scheduler has its local state"
-    );
-    let budget = esdp.run_queue.config.reductions;
+/// The schedule-in half of a normal `erts_schedule`: take the main lock of the selected
+/// process, refresh the accounting caches, set `p->scheduler_data` and emit the schedule-in
+/// trace events. Returns with the main lock held, which `process_main` keeps for the slice.
+// Port of erts/emulator/beam/erl_process.c:10208-10450 (erts_schedule: `erts_proc_lock(p,
+// ERTS_PROC_LOCK_MAIN)`, `p->scheduler_data = esdp`, trace_schedule_in, then `return p` with
+// the main lock held), OTP-29.1.1.
+fn schedule_in<T: Task>(esdp: &ErtsSchedulerData<T>, process: &ProcRef<T>) -> HeldMainLock {
     // `schedule_next` has synchronized the scheduler's accounting state with these flags.
     let accounting_flags = esdp.run_queue.accounting_flags.load(Ordering::Relaxed);
     let mut cell = lock_cell(process);
-    let calls = {
+    {
         let mut c_p = CP::new(process, &mut cell);
         schedule_in_accounting(esdp, accounting_flags, || c_p.task().gc_nanoseconds());
         if esdp.msacc_enabled.get() {
             esdp.with_ctx(&mut c_p, |_, ctx| ctx.set_msacc_state(MsaccState::Emulator));
         }
-        // Port of erts/emulator/beam/jit/x86/process_main.cpp:200,277 and beam_emu.c:395,496
-        // (process_main: copy_in_registers after erts_schedule returns, copy_out_registers
-        // when the slice switches out), OTP-29.1.1.
         // Port of erts/emulator/beam/erl_process.c:10232 (erts_schedule: `p->scheduler_data =
         // esdp` for a normal scheduler, before trace_schedule_in), OTP-29.1.1.
         if let Some(slot) = c_p.task().scheduler_data() {
             slot.set_scheduler(Some(esdp));
         }
         T::trace_schedule_in(&mut c_p, esdp);
-        T::copy_in_registers(&mut c_p, &esdp.registers);
-        let mut calls = 0;
-        T::run(&mut c_p, esdp, budget, &mut calls);
-        T::copy_out_registers(&mut c_p, &esdp.registers);
+    }
+    cell.keep_locked()
+}
+
+/// The schedule-out half of a normal `erts_schedule` for the process `p` that just ran,
+/// whose main lock `held` the slice kept: the schedule-out trace events, `p->scheduler_data
+/// = NULL`, the accounting, the pending signal, and the main lock released. The state
+/// transition (`schedule_out`) follows.
+// Port of erts/emulator/beam/erl_process.c:9660-9760 (erts_schedule: erts_proc_sig_send_pending,
+// trace_schedule_out, `p->scheduler_data = NULL`, `erts_proc_unlock(p, ERTS_PROC_LOCK_MAIN)`),
+// OTP-29.1.1.
+fn schedule_out_locked<T: Task>(
+    esdp: &ErtsSchedulerData<T>,
+    process: &ProcRef<T>,
+    held: HeldMainLock,
+) {
+    let mut cell = process.cell.resume_locked(held);
+    {
+        let mut c_p = CP::new(process, &mut cell);
         T::trace_schedule_out(&mut c_p, esdp);
         // Port of erts/emulator/beam/erl_process.c:9756 (erts_schedule: `p->scheduler_data =
         // NULL` at the schedule-out of a normal scheduler), OTP-29.1.1.
@@ -9654,11 +9661,32 @@ fn run_process<T: Task>(esdp: &ErtsSchedulerData<T>, process: &ProcRef<T>) -> u3
                 ctx.account_gc_total(gc_ns);
             });
         }
-        calls
-    };
+    }
     erts_proc_sig_send_pending(esdp);
     drop(cell);
-    calls
+}
+
+/// One slice of `c_p` on a normal scheduler, its main lock `held` by `erts_schedule`; returns
+/// the lock still held and the reductions the slice used (`calls`). Its outcome is in
+/// `p->state` for the next `erts_schedule(esdp, p, calls)`.
+// Port of erts/emulator/beam/jit/x86/process_main.cpp:200,277 and beam_emu.c:395,496
+// (process_main: copy_in_registers after erts_schedule returns, copy_out_registers when the
+// slice switches out), OTP-29.1.1.
+fn run_process<T: Task>(
+    esdp: &ErtsSchedulerData<T>,
+    process: &ProcRef<T>,
+    held: HeldMainLock,
+) -> (HeldMainLock, u32) {
+    let budget = esdp.run_queue.config.reductions;
+    let mut cell = process.cell.resume_locked(held);
+    let mut calls = 0;
+    {
+        let mut c_p = CP::new(process, &mut cell);
+        T::copy_in_registers(&mut c_p, &esdp.registers);
+        T::run(&mut c_p, esdp, budget, &mut calls);
+        T::copy_out_registers(&mut c_p, &esdp.registers);
+    }
+    (cell.keep_locked(), calls)
 }
 
 /// The `execute_process:` step of `erts_schedule`: the state transition that starts running
@@ -10280,12 +10308,19 @@ impl Drop for AllocOwnerWaker {
 // Port of erts/emulator/beam/erl_process.c:9607 (erts_schedule), OTP-29.1.1.
 fn erts_schedule<T: Task>(
     esdp: &ErtsSchedulerData<T>,
-    p: Option<ProcRef<T>>,
+    p: Option<(ProcRef<T>, HeldMainLock)>,
     calls: u32,
-) -> Option<ProcRef<T>> {
-    if let Some((kind, index)) = esdp.dirty_no {
-        return erts_schedule_dirty(esdp, kind, index, p, calls);
-    }
+) -> Option<(ProcRef<T>, HeldMainLock)> {
+    debug_assert!(
+        esdp.dirty_no.is_none(),
+        "erts_schedule_dirty serves dirty schedulers"
+    );
+    // The schedule-out half runs before this pass borrows the scheduler's local state: the
+    // trace and signal work it does may reach that state itself.
+    let p = p.map(|(p, held)| {
+        schedule_out_locked(esdp, &p, held);
+        p
+    });
     let inner = &esdp.run_queue;
     let id = esdp.worker.expect("a normal scheduler has its number");
     let local_cell = esdp
@@ -10636,7 +10671,8 @@ fn erts_schedule<T: Task>(
         local.last_process = Some(process.pid);
         drop(local_guard);
         *esdp.current_process.borrow_mut() = Some(process.clone());
-        return Some(process);
+        let held = schedule_in(esdp, &process);
+        return Some((process, held));
     }
     if ran_port {
         // erl_process.c:10047 (no process to run after a port: check activities again).
@@ -10847,7 +10883,7 @@ fn process_main<T: Task>(esdp: &ErtsSchedulerData<T>) {
     #[cfg(target_os = "linux")]
     let mut applied_binding = None;
     // `c_p` and `reds_used` of process_main: the process that ran last and its reductions.
-    let mut c_p: Option<ProcRef<T>> = None;
+    let mut c_p: Option<(ProcRef<T>, HeldMainLock)> = None;
     let mut reds_used = 0;
     while !esdp.run_queue.stopped.load(Ordering::Acquire) {
         #[cfg(target_os = "linux")]
@@ -10857,16 +10893,18 @@ fn process_main<T: Task>(esdp: &ErtsSchedulerData<T>) {
             &mut applied_binding,
             inherited_affinity.as_ref(),
         );
-        let Some(item) = erts_schedule(esdp, c_p.take(), reds_used) else {
+        let Some((item, held)) = erts_schedule(esdp, c_p.take(), reds_used) else {
             continue;
         };
         // A managed thread runs its later operations at its progress point
         // (`scheduler_progress`), so the unmanaged-runtime pass of `run_one` is not needed.
-        reds_used = run_process(esdp, &item);
-        c_p = Some(item);
+        let (held, calls) = run_process(esdp, &item, held);
+        reds_used = calls;
+        c_p = Some((item, held));
     }
     // A stop never drops a finished slice.
-    if let Some(p) = c_p.take() {
+    if let Some((p, held)) = c_p.take() {
+        schedule_out_locked(esdp, &p, held);
         let inner = &esdp.run_queue;
         let local_cell = esdp
             .local
@@ -11108,7 +11146,8 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
 fn erts_dirty_process_main<T: Task>(esdp: &ErtsSchedulerData<T>) {
     let mut c_p: Option<ProcRef<T>> = None;
     let mut reds_used = 0;
-    while let Some(item) = erts_schedule(esdp, c_p.take(), reds_used) {
+    let (kind, index) = esdp.dirty_no.expect("a dirty scheduler has its pool");
+    while let Some(item) = erts_schedule_dirty(esdp, kind, index, c_p.take(), reds_used) {
         reds_used = run_slice(esdp, &item);
         c_p = Some(item);
     }
