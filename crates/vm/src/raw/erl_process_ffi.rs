@@ -1,9 +1,31 @@
-//! The process exit entry points of erl_process.c with their C signatures, called by the
-//! generated `normal_exit`, `continue_exit` and `handle_error` code of process_main.
-// Port of erts/emulator/beam/erl_process.c (erts_do_exit_process,
+//! The entry points of erl_process.c with their C signatures that generated code calls: the
+//! scheduler call of process_main and the process exit of its `normal_exit`, `continue_exit`
+//! and `handle_error` code.
+// Port of erts/emulator/beam/erl_process.c (erts_schedule, erts_do_exit_process,
 // erts_continue_exit_process), OTP-29.1.1.
 
 use arinsal_beamasm::ProcessHeader;
+
+/// `Process *erts_schedule(ErtsSchedulerData *esdp, Process *p, int calls)`: schedule out `p`
+/// (its slice used `calls` reductions; NULL in the first call) and return the next process to
+/// run, its main lock held. process_main passes `esdp = NULL` (a normal scheduler). Returns
+/// NULL only when the scheduler is stopped.
+// Port of erts/emulator/beam/erl_process.c:9607 (erts_schedule), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn erts_schedule(
+    esdp: *mut core::ffi::c_void,
+    p: *mut ProcessHeader,
+    calls: i32,
+) -> *mut ProcessHeader {
+    // jit/x86/process_main.cpp (schedule_next: `mov_imm(ARG1, 0)`): the generated loop runs on
+    // normal schedulers only; dirty schedulers run erts_dirty_process_main.
+    assert!(
+        esdp.is_null(),
+        "erts_schedule: process_main passes esdp = NULL"
+    );
+    // ProcessHeader is the first repr(C) field of the VM Process: the two addresses are one.
+    arinsal_sched::erts_schedule_c_abi::<crate::proc_create::Process>(p.cast(), calls).cast()
+}
 
 /// `void erts_do_exit_process(Process *p, Eterm reason)`: terminate `c_p` with `reason`. On
 /// return the process is FREE in `p->state`, or its exit yielded with `p->u.terminate` set;

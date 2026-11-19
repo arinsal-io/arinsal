@@ -134,3 +134,36 @@ impl<C> Drop for ProcLockGuard<'_, C> {
         unsafe { self.lock.raw.unlock() };
     }
 }
+
+/// `esdp->current_process` of a normal scheduler with the main lock its slice keeps: the `p`
+/// a C call of `erts_schedule` passes (the generated process_main carries only the
+/// `Process *` from one call to the next). Asserts that `p` is that process.
+// Port of erts/emulator/beam/erl_process.c:9667 (erts_schedule: `ASSERT(esdp->current_process
+// == p)` with ERTS_PROC_LOCK_MAIN held), OTP-29.1.1.
+pub(crate) fn current_process_held<T: Task>(
+    esdp: &crate::ErtsSchedulerData<T>,
+    p: *mut T,
+) -> (crate::ProcRef<T>, HeldMainLock) {
+    assert!(esdp.worker.is_some(), "erts_schedule: a normal scheduler");
+    let current = esdp
+        .current_process
+        .borrow()
+        .clone()
+        .expect("erts_schedule: p is esdp->current_process");
+    let cell = current.cell.data_ptr();
+    // SAFETY: `cell` addresses the live task cell of `current` (the reference above keeps the
+    // block); the projection reads no data.
+    let task = unsafe { (&raw mut (*cell).task).cast::<T>() };
+    assert!(
+        std::ptr::eq(task, p),
+        "erts_schedule: p is esdp->current_process"
+    );
+    // `esdp` is the scheduler data of the calling thread (a reference to it cannot leave the
+    // thread: it is not `Sync`). On a normal scheduler `current_process` is set just before the
+    // schedule-in takes the main lock and cleared just before the schedule-out releases it, both
+    // on this thread, so the lock is held here.
+    let held = HeldMainLock {
+        lock: std::ptr::from_ref(&current.cell).cast::<()>(),
+    };
+    (current, held)
+}

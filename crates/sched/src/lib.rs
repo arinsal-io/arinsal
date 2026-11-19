@@ -10360,6 +10360,32 @@ fn erts_schedule<T: Task>(
     }
 }
 
+/// `Process *erts_schedule(ErtsSchedulerData *esdp, Process *p, int calls)` as the generated
+/// `process_main` calls it: `esdp` is NULL (a normal scheduler, found with
+/// `erts_get_scheduler_data()`), `p` the process whose slice just ended with its main lock
+/// held (NULL in the first call), `calls` its reductions. Returns the next process with its
+/// main lock held; NULL only when the scheduler is stopped.
+// Port of erts/emulator/beam/erl_process.c:9607-9660 (erts_schedule: `is_normal_sched =
+// !esdp`, `esdp = p->scheduler_data` or erts_get_scheduler_data(), `ASSERT(esdp->current_process
+// == p)`), OTP-29.1.1.
+pub fn erts_schedule_c_abi<T: Task>(p: *mut T, calls: i32) -> *mut T {
+    sched_data_key::erts_get_scheduler_data::<T, _>(|esdp| {
+        let previous = (!p.is_null()).then(|| proc_ref::raw::current_process_held(esdp, p));
+        let calls = u32::try_from(calls).expect("erts_schedule: calls >= 0");
+        match erts_schedule(esdp, previous, calls) {
+            Some((next, held)) => {
+                let mut cell = next.cell.resume_locked(held);
+                let task: *mut T = CP::new(&next, &mut cell).task();
+                // `esdp->current_process` keeps the process; its main lock stays held.
+                let _ = cell.keep_locked();
+                task
+            }
+            None => std::ptr::null_mut(),
+        }
+    })
+    .expect("erts_schedule runs on a normal scheduler thread")
+}
+
 /// One pass of `erts_schedule`: the schedule-out of `p` when there is one, then on a normal
 /// scheduler the progress point, aux work, timers, balance, ports and the dequeue. `Some` is
 /// the process to run; `None` means the pass ran a port, slept, stole nothing, or must be
