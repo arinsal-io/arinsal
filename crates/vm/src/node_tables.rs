@@ -419,9 +419,9 @@ pub(crate) fn dec_no_nodes(runtime: &crate::process::Runtime) {
     let Ok(scheduler) = runtime.scheduler() else {
         return;
     };
-    let ix = scheduler.current_run_queue();
+    let ix = scheduler.current_run_queue() + 1;
     let scheduler = Arc::clone(scheduler);
-    scheduler.request_aux_work(ix, {
+    scheduler.erts_schedule_misc_aux_work(ix, {
         let scheduler = Arc::clone(&scheduler);
         move || set_node_not_alive(&scheduler)
     });

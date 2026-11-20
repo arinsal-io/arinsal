@@ -176,14 +176,19 @@ pub(crate) fn node() -> std::sync::MutexGuard<'static, arinsal_vm::Vm> {
         let root = arinsal_difftest::reference::otp_root().expect("OTP root (erl on PATH)");
         let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
         env.insert("ERL_ROOTDIR".into(), root.display().to_string());
-        let launch = arinsal_args::parse(&["arinsal", "-noshell", "-noinput"], &env)
+        let mut argv = vec!["arinsal".to_owned(), "-noshell".into(), "-noinput".into()];
+        let carrier = concat!(env!("CARGO_MANIFEST_DIR"), "/eval_carrier");
+        argv.extend(
+            arinsal_vm::boot::eval_carrier_args(std::path::Path::new(carrier))
+                .expect("eval carrier"),
+        );
+        let launch = arinsal_args::parse(&argv, &env)
             .unwrap_or_else(|error| panic!("test node arguments: {error:?}"));
         arinsal_args::configure_emulator_flags(launch.emulator.clone());
         let workers = arinsal_alloc::cpuinfo::default_schedulers().0.max(1);
         let mut vm = arinsal_vm::boot::erl_start(
             std::path::Path::new(&launch.root_dir),
             &launch.boot_args,
-            &[],
             workers,
             false,
             true,

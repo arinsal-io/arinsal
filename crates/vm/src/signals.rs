@@ -1666,10 +1666,10 @@ pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, crate:
         cold.persistent_get_all = None;
     }
     // Port of erts/emulator/beam/erl_process.c:13485 (set_self_exiting: ERTS_PSFLG_EXITING
-    // set in `c_p->state` by change_proc_schedule_state), OTP-29.1.1. The process is running,
-    // so ERTS_PSFLG_ACTIVE is already set.
+    // and ERTS_PSFLG_ACTIVE set in `c_p->state` by change_proc_schedule_state), OTP-29.1.1:
+    // a receive's wait in this slice may have cleared ACTIVE already.
     ctx.proc_state().fetch_or(
-        arinsal_sched::psflg::EXITING,
+        arinsal_sched::psflg::EXITING | arinsal_sched::psflg::ACTIVE,
         std::sync::atomic::Ordering::AcqRel,
     );
     // Port of erts/emulator/beam/erl_process.c:11039 (cleanup_sys_tasks), OTP-29.1.1: the
@@ -2032,7 +2032,7 @@ fn trace_delivered(
     let refc = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
         ctx.scheduler_count().max(1),
     ));
-    ctx.request_aux_work_all(move |_| {
+    ctx.erts_schedule_multi_misc_aux_work(move |_| {
         if refc.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) != 1 {
             return;
         }

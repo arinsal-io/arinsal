@@ -79,7 +79,7 @@ impl BeamModuleAssembler {
         dst: ArgVal,
         hooks: ReceiveHooks,
     ) -> Result<(), ModuleError> {
-        self.emit_runtime_hook_with(
+        self.emit_runtime_hook(
             hooks.recv_marker_reserve as usize,
             &[],
             6,
@@ -100,7 +100,7 @@ impl BeamModuleAssembler {
         self.code.emit(|e| e.mov_reg(Gpr::x(12), marker))?;
         let reference = self.source_reg_into(reference, Gpr::x(17))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(10), reference))?;
-        self.emit_runtime_hook_with(
+        self.emit_runtime_hook(
             hooks.recv_marker_bind as usize,
             &[Gpr::x(12), Gpr::x(10)],
             6,
@@ -116,7 +116,7 @@ impl BeamModuleAssembler {
         hooks: ReceiveHooks,
     ) -> Result<(), ModuleError> {
         let reference = self.source_reg(reference)?;
-        self.emit_runtime_hook_with(
+        self.emit_runtime_hook(
             hooks.recv_marker_clear as usize,
             &[reference],
             6,
@@ -132,7 +132,7 @@ impl BeamModuleAssembler {
         hooks: ReceiveHooks,
     ) -> Result<(), ModuleError> {
         let reference = self.source_reg(reference)?;
-        self.emit_runtime_hook_with(
+        self.emit_runtime_hook(
             hooks.recv_marker_use as usize,
             &[reference],
             6,
@@ -156,7 +156,7 @@ impl BeamModuleAssembler {
     /// Removes the current message and updates the reduction count.
     // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:135-149, OTP-29.1.1
     pub fn emit_remove_message(&mut self, hooks: ReceiveHooks) -> Result<(), ModuleError> {
-        self.emit_runtime_hook_with(
+        self.emit_runtime_hook(
             hooks.remove_message as usize,
             // `beam_jit_remove_message(c_p, FCALLS, HTOP, E, active_code_ix)`
             &[Gpr::x(22), Gpr::x(23), Gpr::x(20), Gpr::x(24)],
@@ -172,7 +172,7 @@ impl BeamModuleAssembler {
     /// Advances the saved position and branches to the next receive loop pass.
     // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:151-164, OTP-29.1.1
     pub fn emit_loop_rec_end(&mut self, dest: u32, hooks: ReceiveHooks) -> Result<(), ModuleError> {
-        self.emit_runtime_hook_with(hooks.set_save_next as usize, &[], 0, crate::Update::NONE)?;
+        self.emit_runtime_hook(hooks.set_save_next as usize, &[], 0, crate::Update::NONE)?;
         self.code.emit(|e| e.sub_imm(FCALLS, FCALLS, 1, false))?;
         let dest = self.label(dest);
         self.code.b(dest)?;

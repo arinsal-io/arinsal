@@ -130,7 +130,7 @@ Each kernel is implemented with equivalent semantics across Erlang and Go:
     - **Single scheduler (`1`)**:
       - ERTS: `erl +S 1:1` (1 scheduler thread, 1 online scheduler).
       - Go: `GOMAXPROCS=1` (single OS thread executing goroutines).
-      - Arinsal: `+S 1` / `--schedulers 1` flag on `arinsal eval` (configures 1 scheduler worker in `arinsal-sched`).
+      - Arinsal: `arinsal +S 1:1`, the same command line as ERTS.
     - **Default schedulers (`default`)**:
       - ERTS: default 10 schedulers on Apple Silicon (10 logical cores).
       - Go: default `GOMAXPROCS=10` on Apple Silicon.
@@ -193,12 +193,6 @@ target/release/arinsal -noshell -pa tmp/bench_matrix/ebin -eval 'spawn_probe:mai
 
 # On Arinsal full boot (single scheduler):
 target/release/arinsal +S 1 -noshell -pa tmp/bench_matrix/ebin -eval 'spawn_probe:main([]), halt().'
-
-# On Arinsal bare eval (no OTP boot, default schedulers):
-target/release/arinsal eval -pa tmp/bench_matrix/ebin spawn_probe run
-
-# On Arinsal bare eval (no OTP boot, single scheduler):
-target/release/arinsal eval +S 1 -pa tmp/bench_matrix/ebin spawn_probe run
 ```
 
 ### Probe Results (Apple Silicon, median of 5 repeats, in-process timer:tc)

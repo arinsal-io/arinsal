@@ -2,7 +2,7 @@
 
 use crate::{Vm, VmError};
 use arinsal_term::{Term, TermBuilder, VecHeap, global_atoms};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Starts the node ([`erl_start`]) and turns the calling (main) thread into
 /// `erts_sys_main_thread`: it returns only when the node could not be started. The node ends
@@ -10,10 +10,18 @@ use std::path::{Path, PathBuf};
 pub fn run(
     root: &Path,
     boot_args: &[String],
-    extra_paths: &[PathBuf],
     workers: usize,
 ) -> Result<std::convert::Infallible, VmError> {
-    run_with_debugger_flags(root, boot_args, extra_paths, workers, false, true, None)
+    run_with_debugger_flags(root, boot_args, workers, false, true, None)
+}
+
+/// Creates the eval carrier's pipes and returns the boot arguments that start it on the node
+/// (`-pa <code_dir> -run arinsal_eval_carrier start R W`, `code_dir` holding
+/// `arinsal_eval_carrier.beam`): an embedder appends them to the command line before
+/// [`erl_start`], and [`Vm::eval_scheduled`] then evaluates in processes of the node and
+/// receives results over that port. Callable once per OS process.
+pub fn eval_carrier_args(code_dir: &Path) -> Result<Vec<String>, VmError> {
+    crate::process::eval_carrier_args(code_dir)
 }
 
 /// Seed the VM's OS environment table (erlexec `set_env` for PATH and `-env`).
@@ -27,7 +35,6 @@ pub fn seed_environment(vars: &[(String, String)]) {
 pub fn run_with_debugger_flags(
     root: &Path,
     boot_args: &[String],
-    extra_paths: &[PathBuf],
     workers: usize,
     debugger_support: bool,
     line_breakpoints: bool,
@@ -36,7 +43,6 @@ pub fn run_with_debugger_flags(
     let _vm = erl_start(
         root,
         boot_args,
-        extra_paths,
         workers,
         debugger_support,
         line_breakpoints,
@@ -54,7 +60,6 @@ pub fn run_with_debugger_flags(
 pub fn erl_start(
     root: &Path,
     boot_args: &[String],
-    extra_paths: &[PathBuf],
     workers: usize,
     debugger_support: bool,
     line_breakpoints: bool,
@@ -87,56 +92,15 @@ pub fn erl_start(
     if flags.replace_intr {
         crate::natives::tty::replace_intr();
     }
-    // g_erl_flags: -pa / -pz / -path and ERL_LIBS. boot_loop2 should keep this
-    // block; it only chooses the loader path before preloaded modules load.
-    // Port of erts/preloaded/src/init.erl:1259 (path_flags) and
-    // lib/kernel/src/code_server.erl:127 (get_user_lib_dirs), OTP-29.1.1.
-    let code_path = arinsal_args::arguments_from_boot(boot_args).code_path();
     crate::node_tables::lock().set_distribution_buffer_busy_limit(
         distribution_buffer_busy_limit_kb
             .unwrap_or(1024)
             .saturating_mul(1024),
     );
-    let mut paths = Vec::new();
-    if let Some(replace) = code_path.replace {
-        paths.extend(replace.into_iter().map(PathBuf::from));
-    } else {
-        paths.extend(code_path.prepend.into_iter().map(PathBuf::from));
-        if code_path.interactive {
-            paths.extend(user_lib_dirs());
-        }
-        paths.extend(extra_paths.iter().cloned());
-        // elixir_loop1: Elixir's start/2 later adds these to code_server, but
-        // the VM loader must see them in every scheduler replica as well.
-        if let Some(root) = boot_args
-            .windows(2)
-            .find(|pair| pair[0] == "-elixir_root")
-            .map(|pair| PathBuf::from(&pair[1]))
-        {
-            // Port of Elixir 1.20.4 lib/elixir/src/elixir.erl:68 (start/2).
-            for app in ["elixir", "mix", "logger", "iex", "ex_unit", "eex"] {
-                let path = root.join(app).join("ebin");
-                if path.is_dir() {
-                    paths.push(path);
-                }
-            }
-        }
-        let lib = root.join("lib");
-        if let Ok(entries) = std::fs::read_dir(&lib) {
-            let mut app_paths: Vec<_> = entries
-                .filter_map(Result::ok)
-                .map(|entry| entry.path().join("ebin"))
-                .filter(|path| path.is_dir())
-                .collect();
-            app_paths.sort();
-            paths.extend(app_paths);
-        }
-        paths.extend(code_path.append.into_iter().map(PathBuf::from));
-    }
+    // `load_preloaded` is the VM's only file-based loading step; init and code_server handle
+    // the boot path after the first process starts.
     let erts_ebin = root.join("lib/erts-17.1/ebin");
-    paths.push(erts_ebin.clone());
     let (mut vm, runtime) = crate::erl_init::erl_init(
-        paths,
         root.to_path_buf(),
         workers,
         debugger_support,
@@ -193,31 +157,6 @@ fn load_preloaded(vm: &mut Vm, erts_ebin: &Path) -> Result<(), VmError> {
         .ok_or_else(|| VmError::Load("load_preloaded: staging area not open".into()))?
         .commit();
     Ok(())
-}
-
-// Port of lib/kernel/src/code_server.erl:127 (get_user_lib_dirs), OTP-29.1.1.
-fn user_lib_dirs() -> Vec<PathBuf> {
-    let Ok(raw) = std::env::var("ERL_LIBS") else {
-        return Vec::new();
-    };
-    let mut paths = Vec::new();
-    for dir in raw.split(':') {
-        if dir.is_empty() {
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        let mut found = Vec::new();
-        for entry in entries.filter_map(Result::ok) {
-            let ebin = entry.path().join("ebin");
-            if ebin.is_dir() {
-                found.insert(0, ebin);
-            }
-        }
-        paths.extend(found);
-    }
-    paths
 }
 
 /// The beam a preloaded module is compiled into: only the chunks the loader needs, in chunk-id
@@ -466,14 +405,16 @@ pub(crate) fn test_node() -> std::sync::MutexGuard<'static, Vm> {
         let root = arinsal_difftest::reference::otp_root().expect("OTP root (erl on PATH)");
         let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
         env.insert("ERL_ROOTDIR".into(), root.display().to_string());
-        let launch = arinsal_args::parse(&["arinsal", "-noshell", "-noinput"], &env)
+        let mut argv = vec!["arinsal".to_owned(), "-noshell".into(), "-noinput".into()];
+        let carrier = concat!(env!("CARGO_MANIFEST_DIR"), "/eval_carrier");
+        argv.extend(eval_carrier_args(Path::new(carrier)).expect("eval carrier"));
+        let launch = arinsal_args::parse(&argv, &env)
             .unwrap_or_else(|error| panic!("test node arguments: {error:?}"));
         arinsal_args::configure_emulator_flags(launch.emulator.clone());
         let workers = arinsal_alloc::cpuinfo::default_schedulers().0.max(1);
         let mut vm = erl_start(
             Path::new(&launch.root_dir),
             &launch.boot_args,
-            &[],
             workers,
             false,
             true,

@@ -43,10 +43,8 @@ def sample(
         ])
     else:
         output = run([
-            str(binary), "eval", "--schedulers", str(SCHEDULERS), "-pa", str(ebin),
-            "-pa", str(ROOT / "tmp" / "stdlib_ebin"),
-            "-pa", str(ROOT / "tmp" / "kernel_ebin"),
-            "timers_cost_bench", "run", op, str(n), str(run_index),
+            str(binary), "+S", f"{SCHEDULERS}:{SCHEDULERS}", "-noshell", "-noinput",
+            "-pa", str(ebin), "-eval", expression,
         ])
     match = re.search(rf"\{{{op},\s*{n},\s*(\d+),\s*(\d+)\}}", output)
     if not match:
@@ -64,10 +62,9 @@ def sample_lateness(runtime: str, kind: str, ebin: Path, binary: Path) -> tuple[
         ])
     else:
         output = run([
-            str(binary), "eval", "--schedulers", str(SCHEDULERS), "-pa", str(ebin),
-            "-pa", str(ROOT / "tmp" / "stdlib_ebin"),
-            "-pa", str(ROOT / "tmp" / "kernel_ebin"),
-            "timers_cost_bench", "lateness", kind, str(n),
+            str(binary), "+S", f"{SCHEDULERS}:{SCHEDULERS}", "-noshell", "-noinput",
+            "-pa", str(ebin), "-eval",
+            f"io:format(\"~p\",[timers_cost_bench:lateness({kind},{n})]),halt().",
         ])
     match = re.search(rf"\{{{kind},\s*{n},\s*(\d+),\s*(\d+)\}}", output)
     if not match:
@@ -80,13 +77,6 @@ def main() -> None:
         "erlc", "-Werror", "-o", str(ROOT / "tmp"),
         str(ROOT / "tools/bench/timers_cost/timers_cost_bench.erl"),
     ], cwd=ROOT, check=True, timeout=30)
-    otp_root = Path(run(["erl", "-noshell", "-noinput", "-eval", "io:format(\"~s\",[code:root_dir()]),halt()."]).strip())
-    lib = otp_root / "lib"
-    stdlib = next(lib.glob("stdlib-*/ebin"))
-    kernel = next(lib.glob("kernel-*/ebin"))
-    for link, target in ((ROOT / "tmp/stdlib_ebin", stdlib), (ROOT / "tmp/kernel_ebin", kernel)):
-        if not link.exists():
-            link.symlink_to(target, target_is_directory=True)
     binary = ROOT / "target/release/arinsal"
     results: dict[tuple[str, str], list[float]] = {}
     for op, n in OPS.items():

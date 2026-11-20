@@ -5,17 +5,6 @@ use arinsal_alloc::typed::FixAllocBox;
 
 pub(crate) mod raw;
 
-/// Why native code left for the scheduler. One byte of the process, set by the helper that
-/// requests the exit, so the exit path is one load and one match.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-#[repr(u8)]
-pub(crate) enum NativeExit {
-    #[default]
-    None,
-    /// `wait` or `wait_timeout` (`ColdState::native_wait`).
-    Wait,
-}
-
 #[derive(Default)]
 pub(crate) struct ProcessStats {
     pub(crate) instructions: u64,
@@ -437,19 +426,12 @@ pub struct Process {
     pub(crate) exec_key: u64,
     /// The process's outer signal queue: native `loop_rec` probes it and fetches messages.
     signal_probe: Option<arinsal_sched::SignalProbe<crate::process::Message>>,
-    /// A native `wait`/`wait_timeout` asked the scheduler to sleep (receive timer position, `None` for
-    /// `infinity`); the process resumes at the native `loop_rec` label.
-    pub(crate) native_wait: Option<Option<u64>>,
     /// Export dispatch to redo after the process wakes from a parked native BIF call.
     native_retry: Option<usize>,
     /// The current apply comes from native code, whose call site names the caller frame.
     pub(crate) native_apply: bool,
     /// Native call site of the BIF being executed (erts `c_p->i`), 0 outside such a call.
     pub(crate) native_call_pc: usize,
-    /// Receive timer position set by a native `wait_timeout`, consumed by the following wait.
-    pub(crate) native_wait_timeout: Option<u64>,
-    /// The pending native wait belongs to a receive without clauses.
-    pub(crate) native_wait_self: bool,
     /// Return address and call site of the native call that `native_retry` redoes.
     native_retry_site: Option<(usize, usize)>,
     /// The BIF the scheduler runs for native code was called through `call_light_bif_shared`,
@@ -499,9 +481,6 @@ pub struct Process {
     /// this after an `after` block, because that block may clobber X registers.
     /// mix_loop1. Port of the freason kept across `i_raise` (beam_emu), OTP-29.1.1.
     pub(crate) exc_class: Option<arinsal_bifs::Class>,
-    pub(crate) entry: bool,
-    /// `p->static_flags` (erl_process.h `ERTS_STC_FLG_*`), set once by erl_create_process.
-    pub(crate) static_flags: u8,
     /// The next native entry resumes a raw continuation already on the stack.
     pub(crate) native_continuation_resume: bool,
     /// `header.arity` already holds the live X register count of the resumed native
@@ -509,9 +488,6 @@ pub struct Process {
     pub(crate) native_arity_set: bool,
     /// Pc of the native instruction that raised the exception being dispatched (0 if none).
     pub(crate) native_error_pc: usize,
-    /// The request native code left for the scheduler. `None` means no request is pending, so
-    /// an ordinary yield reads this one byte instead of cold fields.
-    pub(crate) native_exit_kind: NativeExit,
 }
 // SAFETY: ProcessHeader pointers refer only to this process's stable heap/code allocations.
 // The scheduler transfers exclusive ownership of each Process between workers.
@@ -1567,10 +1543,6 @@ impl SliceWork {
 
 #[derive(Default)]
 pub(crate) struct ProcessCold {
-    /// Result the runner's entry process reports when its exit completes (Arinsal's
-    /// embedding harness; erts has no entry process). Set where the process finishes,
-    /// before `erts_do_exit_process`, and sent at the end of `erts_continue_exit_process`.
-    pub(crate) entry_result: Option<Box<Result<crate::ScheduledResult, crate::VmError>>>,
     /// The outcome of a BIF called from native code that only the scheduler completes
     /// (ERTS_BIF_YIELD, dirty scheduling, a busy port, hibernation): the BIF returned
     /// THE_NON_VALUE with TRAP to its call, and the scheduler finishes the call with this
@@ -2305,9 +2277,6 @@ impl Process {
             run_key: 0,
             exec_key: 0,
             signal_probe: None,
-            native_wait: None,
-            native_wait_timeout: None,
-            native_wait_self: false,
             native_light_bif_call: false,
             native_retry: None,
             native_transfer: false,
@@ -2331,12 +2300,9 @@ impl Process {
             apply_inline_len: 0,
             persistent_terms: arinsal_pterm::global_store(),
             exc_class: None,
-            entry: false,
-            static_flags: 0,
             native_continuation_resume: false,
             native_arity_set: false,
             native_error_pc: 0,
-            native_exit_kind: NativeExit::None,
         };
         process.clear_native_resume();
         #[cfg(feature = "pf-mem-counters")]
@@ -2976,10 +2942,6 @@ mod layout_report {
             size_of_val(&process.signal_probe)
         );
         eprintln!(
-            "  Process.native_wait {}",
-            size_of_val(&process.native_wait)
-        );
-        eprintln!(
             "  Process.native_retry {}",
             size_of_val(&process.native_retry)
         );
@@ -2990,14 +2952,6 @@ mod layout_report {
         eprintln!(
             "  Process.native_call_pc {}",
             size_of_val(&process.native_call_pc)
-        );
-        eprintln!(
-            "  Process.native_wait_timeout {}",
-            size_of_val(&process.native_wait_timeout)
-        );
-        eprintln!(
-            "  Process.native_wait_self {}",
-            size_of_val(&process.native_wait_self)
         );
         eprintln!(
             "  Process.native_retry_site {}",
@@ -3041,11 +2995,6 @@ mod layout_report {
             size_of_val(&process.apply_inline_len)
         );
         eprintln!("  Process.exc_class {}", size_of_val(&process.exc_class));
-        eprintln!("  Process.entry {}", size_of_val(&process.entry));
-        eprintln!(
-            "  Process.static_flags {}",
-            size_of_val(&process.static_flags)
-        );
         eprintln!(
             "  Process.native_continuation_resume {}",
             size_of_val(&process.native_continuation_resume)
@@ -3057,10 +3006,6 @@ mod layout_report {
         eprintln!(
             "  Process.native_error_pc {}",
             size_of_val(&process.native_error_pc)
-        );
-        eprintln!(
-            "  Process.native_exit_kind {}",
-            size_of_val(&process.native_exit_kind)
         );
         eprintln!("ProcessHeader {}", size_of::<ProcessHeader>());
         eprintln!("ArgRegs {}", size_of::<ArgRegs>());

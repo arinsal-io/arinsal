@@ -3001,14 +3001,16 @@ fn call_values(
             ("group_leader", [leader, pid, reference]) if module == "erts_internal" => {
                 group_leader_3(process, ctx, *leader, *pid, *reference)
             }
-            // Port of erts/emulator/beam/erl_bif_info.c:4932-4945,
-            // OTP-29.1.1. System processes are tracked when the VM creates them.
+            // Port of erts/emulator/beam/erl_bif_info.c:4932-4945
+            // (erts_internal_is_system_process_1), OTP-29.1.1: `erts_proc_lookup(pid)` and its
+            // immutable `static_flags`, without the process lock.
             ("is_system_process", [target]) if module == "erts_internal" => {
                 let pid = Pid::from_term(*target).ok_or_else(badarg)?;
                 let is_system = process
                     .runtime
-                    .as_ref()
-                    .is_some_and(|runtime| runtime.system_processes.lock().unwrap().contains(&pid));
+                    .and_then(|runtime| runtime.scheduler().ok())
+                    .and_then(|scheduler| scheduler.static_flags(pid))
+                    .is_some_and(|flags| flags & crate::proc_create::ERTS_STC_FLG_SYSTEM_PROC != 0);
                 Ok(Term::atom(if is_system {
                     arinsal_term::atoms::TRUE
                 } else {

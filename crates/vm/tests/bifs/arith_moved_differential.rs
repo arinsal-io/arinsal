@@ -1,12 +1,11 @@
 //! Arithmetic BIF exports and edge cases compared with OTP 29.1.1.
 
 use arinsal_difftest::{CallResult, RefErl};
-use arinsal_term::ProcessHeap;
 
 const MODULE: &str = "arith_moved_differential";
 const SOURCE: &str = r#"
 -module(arith_moved_differential).
--export([run/0, large_integer_text/0, overflow/0, special_mul/2, static_div/2]).
+-export([run/0, large_integer_text/0, overflow/0, static_div/2]).
 
 top([{M, F, Args, Location} | _]) ->
     {M, F, frame_arity(Args), proplists:get_value(error_info, Location)};
@@ -57,9 +56,19 @@ run() ->
      static_attempt(fun() -> Big * (Big + 3) end),
      static_div(1, 0)].
 
-overflow() -> attempt(erlang, '*', [1.0e308, 1.0e308]).
-
-special_mul(A, B) -> attempt(erlang, '*', [A, B]).
+%% A float result that is not finite raises badarith (erl_arith.c, ERTS_FP_ERROR): no
+%% infinity or NaN can be made inside a node.
+overflow() ->
+    Huge = 1.0e308,
+    [attempt(erlang, '*', [Huge, Huge]),
+     attempt(erlang, '+', [Huge, Huge]),
+     attempt(erlang, '-', [-Huge, Huge]),
+     attempt(erlang, '/', [Huge, 1.0e-308]),
+     attempt(erlang, '*', [Huge, 1 bsl 64]),
+     attempt(math, exp, [1000.0]),
+     attempt(math, pow, [10.0, 400]),
+     static_attempt(fun() -> Huge * Huge end),
+     static_attempt(fun() -> Huge + Huge end)].
 
 static_div(A, B) -> static_attempt(fun() -> A / B end).
 
@@ -106,30 +115,6 @@ fn bignum_integer_text_matches_otp_for_each_base() {
 }
 
 #[test]
-fn nonfinite_float_operands_raise_badarith() {
-    let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
-    let beam = reference
-        .compile_named(MODULE, SOURCE, &[])
-        .expect("compile arithmetic fixture");
-    reference
-        .load(MODULE, &beam)
-        .expect("load reference fixture");
-
-    let mut vm = crate::common::node();
-    vm.load_bytes(&beam).expect("load VM fixture");
-    for value in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
-        let expected = reference.call(MODULE, "overflow", &[]);
-        let mut heap = ProcessHeap::default();
-        let operands = {
-            let mut builder = arinsal_term::TermBuilder::new(&mut heap);
-            [
-                builder.float(value).expect("box nonfinite operand"),
-                builder.float(1.0).expect("box finite operand"),
-            ]
-        };
-        let actual = vm
-            .eval_scheduled(MODULE, "special_mul", &operands, 1)
-            .expect("run special float arithmetic");
-        similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
-    }
+fn float_overflow_raises_badarith() {
+    compare("overflow");
 }

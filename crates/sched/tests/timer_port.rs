@@ -34,7 +34,7 @@ impl Task for Sink {
 }
 
 fn sink() -> (Scheduler<Sink>, arinsal_sched::Pid, Arc<Mutex<Vec<u64>>>) {
-    let scheduler = Scheduler::new(Config {
+    let scheduler = start_scheduler(Config {
         workers: 1,
         max_processes: 1,
         ..Config::default()
@@ -65,9 +65,9 @@ fn soon_wheel_expiry_order() {
 fn cancel_returns_remaining_ms_like_erts() {
     let (scheduler, pid, _) = sink();
     let timer = scheduler.start_timer(pid, 60_000, 1).unwrap();
-    assert!(matches!(scheduler.read_timer(timer), Some(ms) if (59_000..=60_000).contains(&ms)));
-    assert!(matches!(scheduler.cancel_timer(timer), Some(ms) if (59_000..=60_000).contains(&ms)));
-    assert_eq!(scheduler.read_timer(timer), None);
+    assert!(matches!(read_timer(&scheduler, timer), Some(ms) if (59_000..=60_000).contains(&ms)));
+    assert!(matches!(cancel_timer(&scheduler, timer), Some(ms) if (59_000..=60_000).contains(&ms)));
+    assert_eq!(read_timer(&scheduler, timer), None);
 }
 
 #[test]
@@ -86,7 +86,7 @@ fn one_million_timers_insert_cancel() {
     let start = Instant::now();
     for _ in 0..1_000_000 {
         let timer = scheduler.start_timer(pid, 60_000, 1).unwrap();
-        assert!(matches!(scheduler.cancel_timer(timer), Some(ms) if ms <= 60_000));
+        assert!(matches!(cancel_timer(&scheduler, timer), Some(ms) if ms <= 60_000));
     }
     let ns_per_op = start.elapsed().as_nanos() / 1_000_000;
     println!("timer set+cancel: {ns_per_op} ns/op");
@@ -97,7 +97,7 @@ fn one_million_timers_insert_cancel() {
 
 #[test]
 fn cross_scheduler_cancel_via_owner_queue() {
-    let scheduler = Scheduler::new(Config {
+    let scheduler = start_scheduler(Config {
         workers: 2,
         max_processes: 4,
         ..Config::default()
@@ -111,10 +111,10 @@ fn cross_scheduler_cancel_via_owner_queue() {
     let timer = scheduler.start_timer(owner_one_pid, 30_000, 17).unwrap();
 
     thread::scope(|scope| {
-        let canceler = scope.spawn(|| scheduler.cancel_timer(timer));
+        let canceler = scope.spawn(|| cancel_timer(&scheduler, timer));
         assert!(matches!(canceler.join().unwrap(), Some(remaining) if remaining <= 30_000));
     });
-    assert_eq!(scheduler.read_timer(timer), None);
+    assert_eq!(read_timer(&scheduler, timer), None);
 }
 
 struct ReentrantTimerTask {
@@ -143,9 +143,10 @@ impl Task for ReentrantTimerTask {
                     ctx.erts_proc_exit_free(this);
                 };
             };
-            let remaining = scheduler.read_timer(timer);
-            let canceled = scheduler.cancel_timer(timer);
-            let after_cancel = scheduler.read_timer(timer);
+            // The owner accesses its own wheel at once (access_sched_local_btm).
+            let remaining = read_timer(&scheduler, timer);
+            let canceled = cancel_timer(&scheduler, timer);
+            let after_cancel = read_timer(&scheduler, timer);
             let _ = this.result.send((remaining, canceled, after_cancel));
             {
                 ctx.erts_proc_exit_free(this);
@@ -157,7 +158,7 @@ impl Task for ReentrantTimerTask {
 #[test]
 fn owner_worker_timer_facade_is_reentrant() {
     let scheduler_ref = Arc::new(OnceLock::new());
-    let scheduler = Arc::new(Scheduler::new(Config {
+    let scheduler = Arc::new(start_scheduler(Config {
         workers: 1,
         max_processes: 4,
         ..Config::default()
@@ -183,7 +184,7 @@ struct CrossCancelTask {
     scheduler: Arc<OnceLock<Weak<Scheduler<CrossCancelTask>>>>,
     slots: TimerSlots,
     me: usize,
-    result: mpsc::Sender<(usize, Option<u64>, Option<u64>)>,
+    result: mpsc::Sender<(usize, bool, Option<u64>)>,
 }
 
 impl Task for CrossCancelTask {
@@ -221,10 +222,16 @@ impl Task for CrossCancelTask {
                 thread::yield_now();
             };
             // Both workers now ask each other at the same time; erts serves such requests as
-            // aux work, so neither may block the other.
-            let read = scheduler.read_timer(other);
-            let canceled = scheduler.cancel_timer(other);
-            let _ = this.result.send((this.me, read, canceled));
+            // misc aux work (bif_timer_access_request) and the requester never waits on them.
+            let me = this.me;
+            let read = this.result.clone();
+            scheduler.read_timer_async(other, move |remaining| {
+                let _ = read.send((me, false, remaining));
+            });
+            let canceled = this.result.clone();
+            scheduler.cancel_timer_async(other, move |remaining| {
+                let _ = canceled.send((me, true, remaining));
+            });
             {
                 ctx.erts_proc_exit_free(this);
             }
@@ -235,7 +242,7 @@ impl Task for CrossCancelTask {
 #[test]
 fn cross_scheduler_requests_do_not_deadlock() {
     let scheduler_ref = Arc::new(OnceLock::new());
-    let scheduler = Arc::new(Scheduler::new(Config {
+    let scheduler = Arc::new(start_scheduler(Config {
         workers: 2,
         max_processes: 8,
         ..Config::default()
@@ -257,18 +264,17 @@ fn cross_scheduler_requests_do_not_deadlock() {
             .unwrap();
         scheduler.schedule_unscheduled(pid).unwrap();
     }
-    for _ in 0..2 {
-        let (_, read, canceled) = receiver
+    for _ in 0..4 {
+        let (_, _, remaining) = receiver
             .recv_timeout(Duration::from_secs(5))
             .expect("cross-scheduler timer request deadlocked");
-        assert!(matches!(read, Some(ms) if ms <= 60_000));
-        assert!(matches!(canceled, Some(ms) if ms <= 60_000));
+        assert!(matches!(remaining, Some(ms) if ms <= 60_000));
     }
 }
 
 #[test]
 fn foreign_thread_insert_is_visible_to_later_requests() {
-    let scheduler = Scheduler::new(Config {
+    let scheduler = start_scheduler(Config {
         workers: 2,
         max_processes: 4,
         ..Config::default()
@@ -279,9 +285,9 @@ fn foreign_thread_insert_is_visible_to_later_requests() {
     // Inserted asynchronously on the owning worker; the queued request order keeps
     // the following read and cancel behind the insertion.
     let timer = scheduler.start_timer(pid, 30_000, 5).unwrap();
-    assert!(matches!(scheduler.read_timer(timer), Some(ms) if ms <= 30_000));
-    assert!(matches!(scheduler.cancel_timer(timer), Some(ms) if ms <= 30_000));
-    assert_eq!(scheduler.cancel_timer(timer), None);
+    assert!(matches!(read_timer(&scheduler, timer), Some(ms) if ms <= 30_000));
+    assert!(matches!(cancel_timer(&scheduler, timer), Some(ms) if ms <= 30_000));
+    assert_eq!(cancel_timer(&scheduler, timer), None);
 }
 
 /// Starts a timer to itself, then on a message cancels the timers aimed at it and exits,
@@ -328,7 +334,7 @@ impl Task for Victim {
 // cancels the receiver's timers on its own wheel and on other schedulers' wheels.
 #[test]
 fn exit_cancels_target_timers_on_every_wheel() {
-    let scheduler = Scheduler::<Victim>::new(Config {
+    let scheduler = start_scheduler::<Victim>(Config {
         workers: 4,
         max_processes: 16,
         ..Config::default()
@@ -344,13 +350,43 @@ fn exit_cancels_target_timers_on_every_wheel() {
         .unwrap();
     let own = own_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     let remote = scheduler.start_timer(pid, 60_000, 2).unwrap();
-    assert!(scheduler.read_timer(own).is_some());
-    assert!(scheduler.read_timer(remote).is_some());
+    assert!(read_timer(&scheduler, own).is_some());
+    assert!(read_timer(&scheduler, remote).is_some());
     scheduler.send(pid, pid, 0).unwrap();
     done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while scheduler.read_timer(own).is_some() || scheduler.read_timer(remote).is_some() {
+    while read_timer(&scheduler, own).is_some() || read_timer(&scheduler, remote).is_some() {
         assert!(Instant::now() < deadline, "timers survived their receiver");
         thread::sleep(Duration::from_millis(1));
     }
+}
+
+/// The answer of an asynchronous read: a thread outside the owner gets it from the owner's
+/// misc aux work (bif_timer_access_request).
+fn read_timer<T: Task>(scheduler: &Scheduler<T>, timer: arinsal_sched::TimerRef) -> Option<u64> {
+    let (reply, answer) = mpsc::channel();
+    scheduler.read_timer_async(timer, move |remaining| {
+        let _ = reply.send(remaining);
+    });
+    answer.recv_timeout(Duration::from_secs(10)).unwrap()
+}
+
+/// The answer of an asynchronous cancel, as [`read_timer`].
+fn cancel_timer<T: Task>(scheduler: &Scheduler<T>, timer: arinsal_sched::TimerRef) -> Option<u64> {
+    let (reply, answer) = mpsc::channel();
+    scheduler.cancel_timer_async(timer, move |remaining| {
+        let _ = reply.send(remaining);
+    });
+    answer.recv_timeout(Duration::from_secs(10)).unwrap()
+}
+
+/// A scheduler started the way `erl_start` starts one: erl_process.c:6090
+/// (erts_init_scheduling), then erl_process.c:8909 (erts_start_schedulers).
+fn start_scheduler<T: arinsal_sched::Task>(
+    config: arinsal_sched::Config,
+) -> arinsal_sched::Scheduler<T> {
+    let dirty_cpu_online = config.dirty_cpu_schedulers.max(1);
+    let scheduler = arinsal_sched::Scheduler::erts_init_scheduling(config, dirty_cpu_online);
+    scheduler.erts_start_schedulers();
+    scheduler
 }

@@ -118,7 +118,7 @@ fn config(workers: usize, capacity: u32) -> Config {
 
 fn pingpong(workers: usize) {
     let count = Arc::new(AtomicUsize::new(0));
-    let sched = Scheduler::new(config(workers, 2));
+    let sched = start_scheduler(config(workers, 2));
     let limit = 2_000_000;
     let a = Pid::new(0, 0);
     let b = Pid::new(1, 0);
@@ -158,7 +158,7 @@ fn pingpong(workers: usize) {
 
 fn ring(workers: usize) {
     let count = Arc::new(AtomicUsize::new(0));
-    let sched = Scheduler::new(config(workers, 1_000));
+    let sched = start_scheduler(config(workers, 1_000));
     let limit = 2_000_000;
     for i in 0..1_000 {
         let next = Pid::new((i + 1) % 1_000, 0);
@@ -186,7 +186,7 @@ fn ring(workers: usize) {
 
 fn fanin(workers: usize) {
     let count = Arc::new(AtomicUsize::new(0));
-    let sched = Scheduler::new(config(workers, 1_001));
+    let sched = start_scheduler(config(workers, 1_001));
     let sink = sched
         .spawn(Dummy {
             mode: Mode::Sink,
@@ -217,7 +217,7 @@ fn fanin(workers: usize) {
 
 fn fanout(workers: usize) {
     let count = Arc::new(AtomicUsize::new(0));
-    let sched = Scheduler::new(config(workers, 1_001));
+    let sched = start_scheduler(config(workers, 1_001));
     let receivers: Vec<_> = (0..1_000)
         .map(|_| {
             sched
@@ -254,7 +254,7 @@ fn fanout(workers: usize) {
 
 fn startup(workers: usize) {
     let before = usage().1;
-    let scheduler = Scheduler::<Dummy>::new(config(workers, 1_048_576));
+    let scheduler = start_scheduler::<Dummy>(config(workers, 1_048_576));
     std::thread::sleep(Duration::from_millis(10));
     let after = usage().1;
     println!(
@@ -278,7 +278,7 @@ fn usage() -> (f64, u64) {
 fn idle() {
     let count = Arc::new(AtomicUsize::new(0));
     let baseline_rss = usage().1;
-    let sched = Scheduler::new(config(8, 1_000_000));
+    let sched = start_scheduler(config(8, 1_000_000));
     let start = Instant::now();
     for _ in 0..1_000_000 {
         sched
@@ -328,4 +328,15 @@ fn main() {
         }
         _ => panic!("unknown benchmark: {name}"),
     }
+}
+
+/// A scheduler started the way `erl_start` starts one: erl_process.c:6090
+/// (erts_init_scheduling), then erl_process.c:8909 (erts_start_schedulers).
+fn start_scheduler<T: arinsal_sched::Task>(
+    config: arinsal_sched::Config,
+) -> arinsal_sched::Scheduler<T> {
+    let dirty_cpu_online = config.dirty_cpu_schedulers.max(1);
+    let scheduler = Scheduler::erts_init_scheduling(config, dirty_cpu_online);
+    scheduler.erts_start_schedulers();
+    scheduler
 }

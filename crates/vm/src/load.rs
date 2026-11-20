@@ -798,33 +798,17 @@ impl Vm {
     /// The node's code-loading handle, built once by `erl_init` (erl_init.c) after the global
     /// literals exist: the boot code path is `paths`, the current directory and the release's
     /// `lib/*/ebin`.
-    pub(crate) fn new_with_otp_root(
-        paths: impl IntoIterator<Item = PathBuf>,
-        otp: PathBuf,
-    ) -> Self {
+    pub(crate) fn new_with_otp_root(otp: PathBuf) -> Self {
         #[cfg(target_os = "linux")]
         crate::raw::sys_time::init();
-        let mut paths: Vec<PathBuf> = paths.into_iter().collect();
-        paths.push(PathBuf::from("."));
-        paths.push(PathBuf::from("tools/bench/out/ebin"));
-        if let Ok(entries) = std::fs::read_dir(otp.join("lib")) {
-            let mut dirs: Vec<_> = entries
-                .filter_map(Result::ok)
-                .map(|entry| entry.path().join("ebin"))
-                .filter(|p| p.is_dir())
-                .collect();
-            dirs.sort();
-            paths.extend(dirs);
-        }
-        paths.push(otp.join("lib/erts-17.1/ebin"));
-        Self::for_node(paths, Some(otp))
+        Self::for_node(otp)
     }
 
-    fn for_node(paths: Vec<PathBuf>, otp_root: Option<PathBuf>) -> Self {
+    fn for_node(otp_root: PathBuf) -> Self {
         // erts_code_ix_init runs before the first module is loaded.
         crate::code_ix::global();
         crate::natives::sys::initialize_statistics_origins();
-        crate::erl_init::erts_set_boot_args(paths, otp_root);
+        crate::erl_init::erts_set_root_dir(otp_root);
         arinsal_nif_zlib::set_scheduler_caller(crate::natives::nif::scheduler_caller);
         Self {}
     }
@@ -1305,87 +1289,6 @@ impl Vm {
         for (module_id, functions) in targets {
             self.patch_trace_functions(module_id, &functions, process);
         }
-    }
-
-    /// The module is not current, `code_server` is up, and its beam has `-on_load`.
-    pub(crate) fn unloaded_on_load(&self, process: &Process, name: &str) -> bool {
-        if code_tables(erts_active_code_ix()).loaded.contains_key(name)
-            || !self.should_autoload(process, name)
-        {
-            return false;
-        }
-        let file = format!("{name}.beam");
-        for dir in &crate::erl_init::erts_boot_paths() {
-            let path = dir.join(&file);
-            if !path.is_file() {
-                continue;
-            }
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-            let Ok(beam) = arinsal_beam::read(&bytes) else {
-                continue;
-            };
-            return arinsal_beam::scan(&beam.code.bytes, beam.code.max_opcode)
-                .is_ok_and(|found| found.on_load);
-        }
-        false
-    }
-    /// `load_named` for a call that loads a missing module: the `trace_pattern(on_load, ...)`
-    /// patterns of the calling process's runtime apply to a module this call loaded.
-    // Port of erts/emulator/beam/beam_bif_load.c:944-975 (set_on_load_trace_pattern), OTP-29.1.1.
-    pub(crate) fn load_named_traced(
-        &mut self,
-        process: &Process,
-        name: &str,
-    ) -> Result<usize, VmError> {
-        let was_loaded = code_tables(erts_active_code_ix()).loaded.contains_key(name);
-        // Port of erts/emulator/beam/beam_common.c (call_error_handler), OTP-29.1.1: once the
-        // code server runs, a call into a module that is not loaded goes through
-        // error_handler:undefined_function/3, and the code server loads it with the staging and
-        // code barrier protocol. The scheduler thread never loads it inline.
-        if !was_loaded && self.should_autoload(process, name) {
-            return Err(VmError::Load(format!("module {name} not found")));
-        }
-        let id = self.load_named(name)?;
-        if !was_loaded && crate::trace_bp::any_on_load_pattern(process) {
-            crate::natives::code::apply_on_load_patterns(self, process, name);
-        }
-        Ok(id)
-    }
-
-    pub(crate) fn load_named(&mut self, name: &str) -> Result<usize, VmError> {
-        if let Some(&id) = code_tables(erts_active_code_ix()).loaded.get(name) {
-            return Ok(id);
-        }
-        if code_tables(erts_active_code_ix()).deleted.contains(name)
-            || code_tables(erts_active_code_ix())
-                .pending_on_load
-                .contains_key(name)
-        {
-            return Err(VmError::Load(format!("module {name} not found")));
-        }
-        let file = format!("{name}.beam");
-        let path = crate::erl_init::with_erts_boot_paths(|paths| {
-            paths
-                .iter()
-                .map(|dir| dir.join(&file))
-                .find(|path| path.is_file())
-        })
-        .ok_or_else(|| VmError::Load(format!("module {name} not found")))?;
-        if crate::calls::trace_boot_enabled() {
-            eprintln!("arinsal boot: load {}", path.display());
-        }
-        let bytes = std::fs::read(&path).map_err(|e| VmError::Load(e.to_string()))?;
-        // Port of erts/emulator/beam/beam_file.c:beamfile_read: the tables, not the instructions,
-        // which a module that runs natively never needs decoded.
-        let beam = arinsal_beam::read(&bytes).map_err(|e| VmError::Load(e.to_string()))?;
-        self.load_current(beam, &bytes, Some((name, &path)))?;
-        code_tables(erts_active_code_ix())
-            .loaded
-            .get(name)
-            .copied()
-            .ok_or_else(|| VmError::Load(format!("module {name} not found")))
     }
 }
 

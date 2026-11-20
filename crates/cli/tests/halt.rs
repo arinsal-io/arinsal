@@ -60,23 +60,6 @@ fn fixture() -> std::path::PathBuf {
     dir
 }
 
-fn arinsal(dir: &std::path::Path, function: &str) -> Output {
-    Command::new("timeout")
-        .args([
-            "30",
-            env!("CARGO_BIN_EXE_arinsal"),
-            "eval",
-            "--schedulers",
-            "3",
-            "-pa",
-        ])
-        .arg(dir)
-        .args(["halt_fixture", function])
-        .current_dir(dir)
-        .output()
-        .expect("run arinsal under timeout")
-}
-
 fn arinsal_boot(
     dir: &std::path::Path,
     function: &str,
@@ -144,7 +127,7 @@ fn halt_exit_status_output_and_port_timeout_match_otp_29() {
     ] {
         let dir = fixture();
         let expected = reference_eval(&dir, function);
-        let actual = arinsal(&dir, function);
+        let actual = arinsal_boot(&dir, function, None);
         assert_output_matches(&expected, &actual, function);
         let _ = fs::remove_dir_all(dir);
     }
@@ -190,7 +173,7 @@ fn halt_abort_signal_and_output_match_otp_29() {
 
     let dir = fixture();
     let expected = reference_eval(&dir, "abort");
-    let actual = arinsal(&dir, "abort");
+    let actual = arinsal_boot(&dir, "abort", None);
     assert_eq!(actual.status.signal(), expected.status.signal());
     assert_eq!(actual.stdout, expected.stdout);
     assert_eq!(actual.stderr, expected.stderr);

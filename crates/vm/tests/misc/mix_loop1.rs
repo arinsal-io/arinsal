@@ -95,8 +95,8 @@ fn os_env_pairs_match_otp() {
 }
 
 /// A module added with `code:add_pathz/1` after boot is visible to the code
-/// server, and the first call must autoload it. `-pa` at startup is a different
-/// path, already copied into the VM loader.
+/// server, and the first call must autoload it. A startup `-pa` path is applied
+/// by `init`, the same way `code:add_pathz/1` updates the running code server.
 #[test]
 fn code_path_autoload_matches_otp() {
     let dir = std::env::temp_dir().join(format!("mix_loop1_autoload_{}", std::process::id()));

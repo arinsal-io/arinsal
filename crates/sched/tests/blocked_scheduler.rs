@@ -45,7 +45,7 @@ impl Task for Probe {
 
 /// Queue `queued` tasks on the run queue of a scheduler whose thread is blocked.
 fn run_case(workers: usize, queued: usize, supervision_ms: Option<u64>) -> usize {
-    let sched = Scheduler::new(Config {
+    let sched = start_scheduler(Config {
         workers,
         forced_wakeup_interval: supervision_ms,
         max_processes: 1024,
@@ -66,6 +66,7 @@ fn run_case(workers: usize, queued: usize, supervision_ms: Option<u64>) -> usize
             },
             Priority::Normal,
             0,
+            0,
         )
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -77,7 +78,7 @@ fn run_case(workers: usize, queued: usize, supervision_ms: Option<u64>) -> usize
     std::thread::sleep(Duration::from_millis(200));
     for _ in 0..queued {
         sched
-            .spawn_priority_on(Probe::Quick(done.clone()), Priority::Normal, 0)
+            .spawn_priority_on(Probe::Quick(done.clone()), Priority::Normal, 0, 0)
             .unwrap();
     }
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -104,4 +105,15 @@ fn supervisor_makes_idle_schedulers_take_over_blocked_run_queue() {
 #[test]
 fn supervisor_makes_idle_schedulers_take_over_a_longer_blocked_run_queue() {
     assert_eq!(run_case(4, 8, Some(20)), 8);
+}
+
+/// A scheduler started the way `erl_start` starts one: erl_process.c:6090
+/// (erts_init_scheduling), then erl_process.c:8909 (erts_start_schedulers).
+fn start_scheduler<T: arinsal_sched::Task>(
+    config: arinsal_sched::Config,
+) -> arinsal_sched::Scheduler<T> {
+    let dirty_cpu_online = config.dirty_cpu_schedulers.max(1);
+    let scheduler = Scheduler::erts_init_scheduling(config, dirty_cpu_online);
+    scheduler.erts_start_schedulers();
+    scheduler
 }

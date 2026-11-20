@@ -108,7 +108,7 @@ fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
 
 #[test]
 fn active_port_runs_until_out_of_tasks_and_counts_reductions() {
-    let scheduler = Scheduler::<Idle>::new(Config {
+    let scheduler = start_scheduler::<Idle>(Config {
         workers: 2,
         ..Config::default()
     });
@@ -125,7 +125,7 @@ fn active_port_runs_until_out_of_tasks_and_counts_reductions() {
 
 #[test]
 fn idle_scheduler_steals_a_port() {
-    let scheduler = Scheduler::<Idle>::new(Config {
+    let scheduler = start_scheduler::<Idle>(Config {
         workers: 2,
         ..Config::default()
     });
@@ -154,7 +154,7 @@ fn idle_scheduler_steals_a_port() {
 
 #[test]
 fn offline_run_queue_evacuates_its_ports() {
-    let scheduler = Scheduler::<Busy>::new(Config {
+    let scheduler = start_scheduler::<Busy>(Config {
         workers: 2,
         ..Config::default()
     });
@@ -171,4 +171,15 @@ fn offline_run_queue_evacuates_its_ports() {
     });
     stop.store(true, Ordering::Relaxed);
     assert!(port.schedulers.lock().unwrap().iter().all(|&ix| ix == 0));
+}
+
+/// A scheduler started the way `erl_start` starts one: erl_process.c:6090
+/// (erts_init_scheduling), then erl_process.c:8909 (erts_start_schedulers).
+fn start_scheduler<T: arinsal_sched::Task>(
+    config: arinsal_sched::Config,
+) -> arinsal_sched::Scheduler<T> {
+    let dirty_cpu_online = config.dirty_cpu_schedulers.max(1);
+    let scheduler = Scheduler::erts_init_scheduling(config, dirty_cpu_online);
+    scheduler.erts_start_schedulers();
+    scheduler
 }

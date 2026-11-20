@@ -49,6 +49,8 @@ pub(crate) const FLG_HALFTIME_OUT_OF_WORK: u32 = 1 << (FLG_BASE2 + 1);
 pub(crate) const FLG_INACTIVE: u32 = 1 << (FLG_BASE2 + 4);
 /// The scheduler of the run queue has not declared itself out of work (`ERTS_RUNQ_FLG_NONEMPTY`).
 pub(crate) const FLG_NONEMPTY: u32 = 1 << (FLG_BASE2 + 5);
+/// The scheduler of this run queue is executing (`ERTS_RUNQ_FLG_EXEC`).
+pub(crate) const FLG_EXEC: u32 = 1 << (FLG_BASE2 + 6);
 const MIGRATION_QMASKS: u32 = EMIGRATE_QMASK | IMMIGRATE_QMASK | EVACUATE_QMASK;
 const MIGRATION_INFO: u32 =
     MIGRATION_QMASKS | FLG_INACTIVE | FLG_OUT_OF_WORK | FLG_HALFTIME_OUT_OF_WORK;
@@ -148,6 +150,20 @@ impl RunQueueBalance {
     /// OTP-29.1.1.
     pub(crate) fn total_len(&self) -> i32 {
         self.total_len.load(Ordering::Relaxed)
+    }
+
+    /// Whether the scheduler of this run queue is executing (`ERTS_RUNQ_FLG_EXEC`).
+    pub(crate) fn is_executing(&self) -> bool {
+        self.flags.load(Ordering::Relaxed) & FLG_EXEC != 0
+    }
+
+    /// Set or clear `ERTS_RUNQ_FLG_EXEC` as the scheduler enters or leaves execution.
+    pub(crate) fn set_executing(&self, executing: bool) {
+        if executing {
+            self.flags.fetch_or(FLG_EXEC, Ordering::AcqRel);
+        } else {
+            self.flags.fetch_and(!FLG_EXEC, Ordering::AcqRel);
+        }
     }
 
     /// Port of erts/emulator/beam/erl_process.h:879 (RUNQ_READ_LEN), OTP-29.1.1.

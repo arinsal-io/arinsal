@@ -273,41 +273,23 @@ pub(super) fn process_main_dispatch(
                 Err(error) => return Some(Err(error)),
             }
         }
-        match process.native_exit_kind {
-            crate::proc_create::NativeExit::None => {
-                #[cfg(target_arch = "aarch64")]
-                crate::beamasm_integration::count_native_yield();
-                process.native_exit_kind = crate::proc_create::NativeExit::None;
-                // Port of erts/emulator/beam/erl_process.c (erts_schedule: schedule-out of
-                // a process whose ERTS_PSFLG_DIRTY_*_PROC flag static_schedule_dirty_nif
-                // or enif_schedule_nif set), OTP-29.1.1.
-                if !ctx.scheduler_type().is_dirty()
-                    && let Some(kind) = super::executor_run::dirty_proc_kind(ctx.proc_state())
-                {
-                    return Some(Err(VmError::Dirty(kind)));
-                }
-                return Some(Ok(RunState::Yield));
-            }
-            crate::proc_create::NativeExit::Wait if process.native_wait.is_some() => {
-                #[cfg(target_arch = "aarch64")]
-                crate::beamasm_integration::count_native_yield();
-                process.native_exit_kind = crate::proc_create::NativeExit::None;
-                let timeout_pos = process.native_wait.take().expect("checked above");
-                // A native receive found no matching message; see the full path.
-                process.gc_live = 0;
-                process.set_native_resume_arity(0);
-                let self_wait = std::mem::take(&mut process.native_wait_self);
-                if self_wait && let Err(error) = process.fetch_signals(ctx) {
-                    return Some(Err(error));
-                }
-                return Some(Ok(RunState::Wait { timeout_pos }));
-            }
-            _ => match context_switch(process, ctx, reg, outcome, code_ptr) {
-                Ok(Flow::Continue) => continue,
-                Ok(Flow::Break(result)) => return Some(result),
-                Err(error) => return Some(Err(error)),
-            },
+        #[cfg(target_arch = "aarch64")]
+        crate::beamasm_integration::count_native_yield();
+        // Port of erts/emulator/beam/jit/arm/process_main.cpp and x86/process_main.cpp
+        // (do_schedule), OTP-29.1.1: the slice ends from what it left in `p->state`. A
+        // receive's wait cleared ERTS_PSFLG_ACTIVE (beam_jit_wait_locked); dirty work set
+        // ERTS_PSFLG_DIRTY_*_PROC (static_schedule_dirty_nif / enif_schedule_nif); anything
+        // else is a context switch.
+        let state = ctx.proc_state().load(std::sync::atomic::Ordering::Acquire);
+        if state & arinsal_sched::psflg::ACTIVE == 0 {
+            return Some(Ok(RunState::Wait));
         }
+        if !ctx.scheduler_type().is_dirty()
+            && let Some(kind) = super::executor_run::dirty_proc_kind(ctx.proc_state())
+        {
+            return Some(Err(VmError::Dirty(kind)));
+        }
+        return Some(Ok(RunState::Yield));
     }
 }
 
@@ -341,7 +323,7 @@ pub(super) fn schedule_suspend_hibernate(
     if process.hibernate_sched() {
         process.drain(ctx)?;
         if process.inbox.is_empty() {
-            return Ok(Some(RunState::Wait { timeout_pos: None }));
+            return Ok(Some(RunState::Wait));
         }
         // elixir_loop1: unlike hibernate/3, hibernate/0 keeps its stack.
         let resume_in_place = process

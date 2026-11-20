@@ -15,10 +15,7 @@
 run(Runtime, K, Round) when is_atom(Runtime), is_integer(K), K > 0,
                             is_integer(Round), Round >= 0 ->
     Rows = run_ops(operations(), 1, K, Round, []),
-    case Runtime of
-        erts -> print_rows(Rows, Runtime, K, Round), ok;
-        _ -> Rows
-    end.
+    print_rows(Rows, Runtime, K, Round).
 
 run_ops([], _Index, _K, _Round, Rows) ->
     lists:reverse(Rows);

@@ -27,7 +27,7 @@ pub(super) fn park_suspended(
         return Ok(RunState::Yield);
     }
     process.slice_mut().suspend_parked = true;
-    Ok(RunState::Wait { timeout_pos: None })
+    Ok(RunState::Wait)
 }
 
 impl Task for Process {
@@ -547,25 +547,18 @@ impl Process {
     // OTP-29.1.1.
     fn exit_outcome(&self, ctx: &RunCtx<'_, crate::Process>) {
         if self.exit_waits() {
-            self.wait_locked(ctx, None);
+            self.wait_locked(ctx);
         }
     }
 
-    /// The slice ends waiting for a message: the receive timer at `timeout_pos` is set while
-    /// the process still runs (beam_jit_wait_timeout -> erts_set_proc_timer_term), a wait
-    /// without one leaves no timer behind, then `ERTS_PSFLG_ACTIVE` is cleared in `p->state`
-    /// for schedule_out_process.
-    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1180-1206 (beam_jit_wait_locked:
+    /// A slice that ends waiting outside a receive (hibernate, suspend, an exit pending on
+    /// spawn monitors, a debugger wait) clears `ERTS_PSFLG_ACTIVE` in `p->state` for
+    /// schedule_out_process, as the receive's own wait does in beam_jit_wait_locked. Receive
+    /// timers are set in the slice (beam_jit_wait_timeout) and cancelled where the receive
+    /// ends (remove_message / timeout / exit), never here.
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1192-1196 (beam_jit_wait_locked:
     // `erts_atomic32_read_band_relb(&c_p->state, ~ERTS_PSFLG_ACTIVE)`), OTP-29.1.1.
-    fn wait_locked(&self, ctx: &RunCtx<'_, crate::Process>, timeout_pos: Option<u64>) {
-        match timeout_pos {
-            Some(pos) => arinsal_sched::erts_set_proc_timer_term(ctx.esdp(), pos),
-            None => {
-                if let Some(probe) = self.signal_probe() {
-                    probe.receive_timer().cancel();
-                }
-            }
-        }
+    fn wait_locked(&self, ctx: &RunCtx<'_, crate::Process>) {
         ctx.proc_state()
             .fetch_and(!arinsal_sched::psflg::ACTIVE, Ordering::Release);
     }
@@ -583,17 +576,8 @@ impl Process {
         ctx.proc_state().fetch_or(set, Ordering::AcqRel);
     }
 
-    /// The process ends with `reason`: the entry process's result is kept for the end of the
-    /// exit, then `erts_do_exit_process` runs on this scheduler's VM view.
-    fn exit_with(
-        &mut self,
-        ctx: &mut RunCtx<'_, crate::Process>,
-        reason: Term,
-        entry_result: Option<Box<Result<ScheduledResult, VmError>>>,
-    ) {
-        if entry_result.is_some() {
-            self.cold_mut().entry_result = entry_result;
-        }
+    /// The process ends with `reason`: `erts_do_exit_process` runs on this scheduler's VM view.
+    fn exit_with(&mut self, ctx: &mut RunCtx<'_, crate::Process>, reason: Term) {
         self.erts_do_exit_process(&mut Vm {}, ctx, reason);
         self.exit_outcome(ctx)
     }
@@ -616,7 +600,7 @@ impl Process {
         if matches!(result, Ok(RunState::Yield)) && crate::suspend::ctx_suspended(ctx) {
             result = park_suspended(self, ctx);
         }
-        if matches!(result, Ok(RunState::Yield | RunState::Wait { .. }))
+        if matches!(result, Ok(RunState::Yield | RunState::Wait))
             && let Err(error) = crate::signals::reschedule_deferred_sys_tasks(self, ctx)
         {
             result = Err(error);
@@ -627,7 +611,7 @@ impl Process {
             .and_then(|cold| cold.debug_wait_completion.as_ref())
             .is_some_and(|completed| !completed.load(Ordering::Acquire))
         {
-            Ok(RunState::Wait { timeout_pos: None })
+            Ok(RunState::Wait)
         } else {
             result
         }
@@ -638,7 +622,7 @@ impl Process {
         ctx: &mut RunCtx<'_, crate::Process>,
         result: Result<RunState, VmError>,
     ) {
-        if matches!(&result, Ok(RunState::Wait { .. } | RunState::Done(_)))
+        if matches!(&result, Ok(RunState::Wait | RunState::Done(_)))
             && self.slice().is_some_and(|work| work.profile_active)
         {
             crate::natives::misc::profile_process_event(self, ctx, false);
@@ -646,10 +630,7 @@ impl Process {
         }
         // g_proc_sched. Port of erts/emulator/beam/erl_gc.c:1197 (max_heap_size kill), OTP-29.1.1.
         if heap_limit_kills(self, ctx) {
-            let entry_result = self
-                .entry
-                .then(|| Box::new(Err(VmError::Unsupported("max_heap_size".into()))));
-            return self.exit_with(ctx, Term::atom(arinsal_term::atoms::KILLED), entry_result);
+            return self.exit_with(ctx, Term::atom(arinsal_term::atoms::KILLED));
         }
         // Port of erts/emulator/beam/erl_process.c:6747-6763 (schedule_out_process), OTP-29.1.1:
         // with GC disabled the dirty collection is dropped; the next collection does it.
@@ -678,7 +659,7 @@ impl Process {
             Ok(RunState::Yield) => {
                 ctx.set_active(true);
             }
-            Ok(RunState::Wait { timeout_pos }) => {
+            Ok(RunState::Wait) => {
                 // Port of erts/emulator/beam/erl_process.c:9304 (erts_process_state2status),
                 // OTP-29.1.1: suspension keeps ERTS_PSFLG_ACTIVE, so a process resumed while
                 // this slice ended is runnable, not waiting.
@@ -686,7 +667,7 @@ impl Process {
                     .take_work(|work| std::mem::take(&mut work.suspend_parked).then_some(()))
                     .is_some();
                 ctx.set_active(parked);
-                self.wait_locked(ctx, timeout_pos);
+                self.wait_locked(ctx);
             }
             Ok(RunState::Done(term)) => {
                 if trace_boot_enabled() {
@@ -698,7 +679,7 @@ impl Process {
                     );
                 }
                 #[cfg(feature = "pf-mem-counters")]
-                if self.entry {
+                {
                     eprintln!(
                         "PF_MEM entry_done markers={} monitors={} spawn_constructs={} spawn_construct_ns={} spawn_fun_load_ns={} spawn_fun_setup_ns={} spawn_fun_sched_ns={}",
                         self.cold
@@ -714,22 +695,10 @@ impl Process {
                     );
                 }
                 crate::signals::process_exiting(self, ctx);
-                let entry_result = self.entry.then(|| {
-                    self.stats.heap_words = self.heap.capacity_words();
-                    let owned = arinsal_term::to_owned(term).map_err(|error| {
-                        VmError::Unsupported(format!("result conversion: {error:?}"))
-                    });
-                    Box::new(owned.map(|term_owned| ScheduledResult {
-                        text: format!("{term_owned}"),
-                        term: term_owned,
-                        stats: self.stats.snapshot(),
-                    }))
-                });
                 self.exit_with(
                     ctx,
                     // erts passes `am_normal` (beam_common.c, `erts_do_exit_process(c_p, am_normal)`).
                     Term::atom(arinsal_term::atoms::NORMAL),
-                    entry_result,
                 )
             }
             Err(error) => {
@@ -752,8 +721,7 @@ impl Process {
                 if trace_boot_enabled() {
                     eprintln!("arinsal boot: process {:?} exited: {error}", ctx.pid());
                 }
-                let entry_result = self.entry.then(|| Box::new(Err(error)));
-                self.exit_with(ctx, reason, entry_result)
+                self.exit_with(ctx, reason)
             }
         }
     }

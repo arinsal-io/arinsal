@@ -2249,7 +2249,7 @@ impl arinsal_drv::PortHost for DrvHost {
     // Port of erts/emulator/beam/erl_process.c:9413 (erts_resume_processes), OTP-29.1.1.
     fn schedule_async_ready(&self, sched_id: usize, ready: Box<dyn FnOnce() + Send>) {
         match self.runtime.scheduler() {
-            Ok(scheduler) => scheduler.request_aux_work(sched_id, ready),
+            Ok(scheduler) => scheduler.erts_schedule_misc_aux_work(sched_id + 1, ready),
             // Without schedulers the job is completed here so its data is released.
             _ => ready(),
         }

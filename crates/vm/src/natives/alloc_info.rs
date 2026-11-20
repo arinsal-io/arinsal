@@ -91,26 +91,28 @@ fn request_allocators(
         .map(|name| (*name).to_owned())
         .collect::<Vec<_>>();
     let reference = reference.clone();
-    runtime.scheduler()?.request_aux_work_all(move |worker| {
-        // Port of erts/emulator/beam/erl_alloc.c (reply_alloc_info), OTP-29.1.1: the counts
-        // are read when this scheduler executes the request, not when it was issued.
-        let timer_count = runtime
-            .scheduler()
-            .map_or(0, |scheduler| scheduler.bif_timer_count(worker))
-            as u64;
-        let data = allocator_data_owned(&names, &sources, worker, timer_count);
-        let reply = OwnedTerm::Tuple(vec![
-            reference.clone(),
-            OwnedTerm::Int(worker as i64 + 1),
-            data,
-        ]);
-        let Ok(message) = super::Message::from_owned(&reply) else {
-            return;
-        };
-        if let Ok(scheduler) = runtime.scheduler() {
-            let _ = scheduler.send(target, target, message);
-        }
-    });
+    runtime
+        .scheduler()?
+        .erts_schedule_multi_misc_aux_work(move |worker| {
+            // Port of erts/emulator/beam/erl_alloc.c (reply_alloc_info), OTP-29.1.1: the counts
+            // are read when this scheduler executes the request, not when it was issued.
+            let timer_count = runtime
+                .scheduler()
+                .map_or(0, |scheduler| scheduler.bif_timer_count(worker))
+                as u64;
+            let data = allocator_data_owned(&names, &sources, worker, timer_count);
+            let reply = OwnedTerm::Tuple(vec![
+                reference.clone(),
+                OwnedTerm::Int(worker as i64 + 1),
+                data,
+            ]);
+            let Ok(message) = super::Message::from_owned(&reply) else {
+                return;
+            };
+            if let Ok(scheduler) = runtime.scheduler() {
+                let _ = scheduler.send(target, target, message);
+            }
+        });
     Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
 

@@ -9,6 +9,7 @@
 
 use arinsal_alloc::typed::{AllocBlock, ErtsAlcType};
 use arinsal_sched::{Config, Scheduler, Task};
+use similar_asserts::assert_eq;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -32,7 +33,7 @@ impl Task for Idle {
 #[test]
 #[ignore = "stress: DDQ_STRESS_SECS=20 cargo test -p arinsal-sched --test ddq_cross_thread -- --ignored"]
 fn managed_and_unmanaged_frees_reach_the_owner() {
-    let scheduler = Scheduler::<Idle>::new(Config {
+    let scheduler = start_scheduler::<Idle>(Config {
         workers: 2,
         ..Config::default()
     });
@@ -45,7 +46,7 @@ fn managed_and_unmanaged_frees_reach_the_owner() {
     while Instant::now() < deadline {
         for owner in 0..2 {
             let (sender, receiver) = mpsc::channel();
-            scheduler.request_aux_work(owner, move || {
+            scheduler.erts_schedule_misc_aux_work(owner + 1, move || {
                 let blocks: Vec<_> = (0..256)
                     .map(|_| AllocBlock::new(ErtsAlcType::HEAP, 4).unwrap())
                     .collect();
@@ -62,7 +63,7 @@ fn managed_and_unmanaged_frees_reach_the_owner() {
                 .enumerate()
                 .partition(|(i, _)| i % 2 == 0);
             let (done, finished) = mpsc::channel();
-            scheduler.request_aux_work(1 - owner, move || {
+            scheduler.erts_schedule_misc_aux_work(2 - owner, move || {
                 drop(managed);
                 done.send(()).unwrap();
             });
@@ -73,4 +74,15 @@ fn managed_and_unmanaged_frees_reach_the_owner() {
         rounds += 1;
     }
     eprintln!("{rounds} rounds");
+}
+
+/// A scheduler started the way `erl_start` starts one: erl_process.c:6090
+/// (erts_init_scheduling), then erl_process.c:8909 (erts_start_schedulers).
+fn start_scheduler<T: arinsal_sched::Task>(
+    config: arinsal_sched::Config,
+) -> arinsal_sched::Scheduler<T> {
+    let dirty_cpu_online = config.dirty_cpu_schedulers.max(1);
+    let scheduler = Scheduler::erts_init_scheduling(config, dirty_cpu_online);
+    scheduler.erts_start_schedulers();
+    scheduler
 }

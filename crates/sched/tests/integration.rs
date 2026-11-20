@@ -40,7 +40,7 @@ impl Task for Collector {
 #[test]
 fn per_pair_ordering_across_messages_and_signals() {
     // One runtime per OS process, as erts: every seed spawns its own twelve processes.
-    let sched = Scheduler::new(Config {
+    let sched = start_scheduler(Config {
         workers: 2,
         max_processes: 128,
         ..Config::default()
@@ -132,7 +132,7 @@ impl Task for CountTask {
 #[test]
 fn million_tasks_ten_workers_no_lost_wakeup() {
     let counter = Arc::new(AtomicUsize::new(0));
-    let sched = Scheduler::new(Config {
+    let sched = start_scheduler(Config {
         workers: 10,
         max_processes: 1_000_000,
         ..Config::default()
@@ -219,7 +219,7 @@ impl Task for PriorityCounter {
 
 #[test]
 fn block_normal_limits_execution_to_one_normal_scheduler() {
-    let scheduler = Scheduler::new(Config {
+    let scheduler = start_scheduler(Config {
         workers: 2,
         max_processes: 16,
         ..Config::default()
@@ -271,7 +271,7 @@ fn block_normal_limits_execution_to_one_normal_scheduler() {
 
 #[test]
 fn low_priority_gets_one_quantum_per_eight_normal_quanta() {
-    let scheduler = Scheduler::new(Config {
+    let scheduler = start_scheduler(Config {
         workers: 2,
         max_processes: 16,
         ..Config::default()
@@ -337,7 +337,7 @@ fn hot_mailbox_repeated_waits_do_not_lose_wakes() {
         }
     }
     let count = Arc::new(AtomicUsize::new(0));
-    let sched = Scheduler::new(Config {
+    let sched = start_scheduler(Config {
         workers: 4,
         max_processes: 1,
         ..Config::default()
@@ -408,7 +408,7 @@ fn worker_blocks_preserve_sender_message_signal_order() {
         }
     }
     let output = Arc::new(Mutex::new(Vec::new()));
-    let sched = Scheduler::new(Config {
+    let sched = start_scheduler(Config {
         workers: 4,
         max_processes: 5,
         ..Config::default()
@@ -475,7 +475,7 @@ fn ping_pong_gives_external_work_a_turn() {
     }
     let count = Arc::new(AtomicUsize::new(0));
     let observed = Arc::new(AtomicUsize::new(usize::MAX));
-    let sched = Scheduler::new(Config {
+    let sched = start_scheduler(Config {
         workers: 1,
         max_processes: 3,
         ..Config::default()
@@ -522,7 +522,7 @@ fn pid_generation() {
             })
         }
     }
-    let sched = Scheduler::new(Config {
+    let sched = start_scheduler(Config {
         workers: 1,
         max_processes: 1,
         ..Config::default()
@@ -542,14 +542,19 @@ fn pid_generation() {
 #[test]
 fn timer_firing() {
     let counter = Arc::new(AtomicUsize::new(0));
-    let sched = Scheduler::new(Config {
+    let sched = start_scheduler(Config {
         workers: 1,
         max_processes: 2,
         ..Config::default()
     });
     let pid = sched.spawn(CountTask(counter.clone())).unwrap();
     let cancelled = sched.start_timer(pid, 60_000, ()).unwrap();
-    assert!(matches!(sched.cancel_timer(cancelled), Some(ms) if ms <= 60_000));
+    let (reply, answer) = std::sync::mpsc::channel();
+    sched.cancel_timer_async(cancelled, move |remaining| {
+        let _ = reply.send(remaining);
+    });
+    let remaining = answer.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(matches!(remaining, Some(ms) if ms <= 60_000));
     sched.start_timer(pid, 10, ()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while counter.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
@@ -561,7 +566,7 @@ fn timer_firing() {
 #[test]
 fn threaded_timer_wakes_its_assigned_worker() {
     let count = Arc::new(AtomicUsize::new(0));
-    let sched = Scheduler::new(Config {
+    let sched = start_scheduler(Config {
         workers: 4,
         max_processes: 4,
         ..Config::default()
@@ -617,7 +622,7 @@ impl Task for ProgressRacer {
 
 #[test]
 fn thread_progress_block_and_statistics_do_not_deadlock() {
-    let sched = Scheduler::new(Config {
+    let sched = start_scheduler(Config {
         workers: 2,
         max_processes: 16,
         ..Config::default()
@@ -699,7 +704,7 @@ impl Task for LaterWaiter {
 
 #[test]
 fn thread_progress_later_waits_for_running_slices_without_blocking() {
-    let sched = Scheduler::new(Config {
+    let sched = start_scheduler(Config {
         workers: 2,
         max_processes: 16,
         ..Config::default()
@@ -764,7 +769,7 @@ impl Task for Idle {
 #[test]
 fn progress_slot_releases_after_thread_progress() {
     use arinsal_sched::ProgressSlot;
-    let sched = Scheduler::<Idle>::new(Config {
+    let sched = start_scheduler::<Idle>(Config {
         workers: 2,
         max_processes: 16,
         ..Config::default()
@@ -836,7 +841,7 @@ fn wait_timer_keeps_its_position_across_reentry() {
             })
         }
     }
-    let sched = Scheduler::new(Config {
+    let sched = start_scheduler(Config {
         workers: 1,
         max_processes: 1,
         ..Config::default()
@@ -864,4 +869,15 @@ fn wait_timer_keeps_its_position_across_reentry() {
         elapsed >= Duration::from_millis(199) && elapsed < Duration::from_millis(295),
         "timer fired after {elapsed:?}, not at its first position"
     );
+}
+
+/// A scheduler started the way `erl_start` starts one: erl_process.c:6090
+/// (erts_init_scheduling), then erl_process.c:8909 (erts_start_schedulers).
+fn start_scheduler<T: arinsal_sched::Task>(
+    config: arinsal_sched::Config,
+) -> arinsal_sched::Scheduler<T> {
+    let dirty_cpu_online = config.dirty_cpu_schedulers.max(1);
+    let scheduler = Scheduler::erts_init_scheduling(config, dirty_cpu_online);
+    scheduler.erts_start_schedulers();
+    scheduler
 }

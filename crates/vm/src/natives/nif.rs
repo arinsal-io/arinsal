@@ -202,8 +202,8 @@ fn close_dynlib(lib: Arc<ModuleNif>) {
         lib.library.close();
         return;
     };
-    let sched_ix = arinsal_sched::current_normal_scheduler().unwrap_or(0);
-    scheduler.request_aux_work(sched_ix, move || lib.library.close());
+    let sched_ix = arinsal_sched::current_normal_scheduler().map_or(0, |ix| ix + 1);
+    scheduler.erts_schedule_misc_aux_work(sched_ix, move || lib.library.close());
 }
 
 /// `erts_nif_call_tab` with `erts_nif_call_tab_lock`: the stub of every function of a library

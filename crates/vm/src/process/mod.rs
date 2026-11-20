@@ -18,7 +18,7 @@ use arinsal_term::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock};
 
 mod executor;
 mod executor_after_native;
@@ -39,6 +39,7 @@ mod schedule;
 mod send;
 mod sig_queue;
 mod spawn_eval;
+pub(crate) use self::spawn_eval::eval_carrier_args;
 
 pub(crate) use self::executor::*;
 #[cfg(target_arch = "aarch64")]

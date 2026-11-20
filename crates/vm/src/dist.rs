@@ -2029,10 +2029,11 @@ fn schedule_kill_dist_ctrl_proc(
         arinsal_sched::SchedulerType::Normal => arinsal_sched::current_normal_scheduler(),
         _ => None,
     }
-    .unwrap_or(0);
+    .map_or(0, |ix| ix + 1);
     let scheduler = Arc::clone(runtime.scheduler()?);
     let target = Arc::clone(&scheduler);
-    scheduler.request_aux_work(sched_ix, move || kill_dist_ctrl_proc(&target, init, pid));
+    scheduler
+        .erts_schedule_misc_aux_work(sched_ix, move || kill_dist_ctrl_proc(&target, init, pid));
     Ok(())
 }
 

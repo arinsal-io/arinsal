@@ -1,5 +1,4 @@
 use super::*;
-use crate::code_ix::{code_tables, erts_active_code_ix};
 
 impl Runtime {
     /// Create a distributed child with its remote monitor (and optional link) installed before
@@ -136,9 +135,6 @@ impl Vm {
         args: &[Term],
         priority: arinsal_sched::Priority,
     ) -> Result<Pid, VmError> {
-        // erl_spawn_system_process: `erts_find_function(mod, func, arity)` must succeed; the
-        // module is preloaded.
-        self.load_named(module)?;
         let mut process = Process::with_spawn_registers(args.len().max(3));
         // erl_create_process: copy_struct of the arguments into the new heap.
         let literals = arinsal_term::LiteralAreas::current();
@@ -161,7 +157,6 @@ impl Vm {
         process.set_runtime(Some(runtime));
         // erl_create_process starts every MFA at beam_run_process.
         process.start_at_run_process(module_atom, function_atom, args, arity)?;
-        process.static_flags |= crate::proc_create::ERTS_STC_FLG_SYSTEM_PROC;
         if priority != arinsal_sched::Priority::Normal {
             let name = match priority {
                 arinsal_sched::Priority::Max => "max",
@@ -175,38 +170,15 @@ impl Vm {
         // creating (boot) scheduler's run queue, before the other schedulers exist.
         let pid = runtime
             .scheduler()?
-            .spawn_priority_on(process, priority, 0)
+            .spawn_priority_on(
+                process,
+                priority,
+                0,
+                // erl_system_process_otp: `so.flags |= SPO_SYSTEM_PROC`.
+                crate::proc_create::ERTS_STC_FLG_SYSTEM_PROC,
+            )
             .map_err(|error| VmError::Unsupported(format!("system process {module}: {error}")))?;
-        runtime.system_processes.lock().unwrap().insert(pid);
         Ok(pid)
-    }
-
-    /// Finishes a module whose `-on_load` is pending the way `code_server` does it: the
-    /// on_load function runs in its own process, and only after `finish_after_on_load/2`
-    /// the caller's call runs.
-    // Port of lib/kernel/src/code_server.erl (handle_on_load, finish_on_load_1) and
-    // erts/emulator/beam/beam_bif_load.c (call_on_load_function_1,
-    // erts_internal_finish_after_on_load_2), OTP-29.1.1.
-    fn run_pending_on_load(
-        &mut self,
-        module: &str,
-        workers: usize,
-        reductions: u32,
-    ) -> Result<(), VmError> {
-        let name = Term::atom(
-            arinsal_term::global_atoms()
-                .intern(module)
-                .map_err(|error| VmError::Load(format!("on_load module name: {error:?}")))?,
-        );
-        let result = self.eval_scheduled_reductions(
-            "erlang",
-            "call_on_load_function",
-            &[name],
-            workers,
-            reductions,
-        );
-        let keep = matches!(&result, Ok(done) if done.text == "ok");
-        crate::natives::code::finish_after_on_load(module, keep)
     }
 
     /// Run an exported function with schedulable BEAM processes.
@@ -273,11 +245,10 @@ impl Vm {
         module: &str,
         function: &str,
         args: &[Term],
-        workers: usize,
-        reductions: u32,
+        _workers: usize,
+        _reductions: u32,
     ) -> Result<ScheduledResult, VmError> {
-        self.spawn_entry(module, function, args, workers, reductions)?
-            .wait()
+        self.spawn_entry(module, function, args)?.wait()
     }
 
     /// Spawns `module:function(args)` as an entry process in the running node and returns
@@ -288,49 +259,13 @@ impl Vm {
         module: &str,
         function: &str,
         args: &[Term],
-        workers: usize,
-        reductions: u32,
     ) -> Result<EntryProcess, VmError> {
         let runtime = crate::erl_init::erts_runtime().ok_or_else(|| {
             VmError::Unsupported("the node is not started (boot::erl_start)".into())
         })?;
-        if !code_tables(erts_active_code_ix())
-            .loaded
-            .contains_key(module)
-            && !code_tables(erts_active_code_ix())
-                .pending_on_load
-                .contains_key(module)
-            && let Err(error) = self.load_named(module)
-            && !code_tables(erts_active_code_ix())
-                .pending_on_load
-                .contains_key(module)
-        {
-            return Err(error);
-        }
-        if code_tables(erts_active_code_ix())
-            .pending_on_load
-            .contains_key(module)
-        {
-            self.run_pending_on_load(module, workers, reductions)?;
-        }
-        let module_id = self.load_named(module)?;
-        if code_tables(erts_active_code_ix()).modules[module_id]
-            .export(function, args.len() as u32)
-            .is_none()
-        {
-            return Err(VmError::Trap(crate::exceptions::Trap::error(Term::atom(
-                arinsal_term::atoms::UNDEF,
-            ))));
-        }
-        let (process, receiver) = entry_process(runtime, module, function, args)?;
-        let scheduler = runtime.scheduler()?;
-        let pid = scheduler
-            .spawn_unscheduled(process)
-            .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
-        scheduler
-            .schedule_unscheduled(pid)
-            .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
-        Ok(EntryProcess(receiver))
+        // The evaluated call runs in an ordinary process the carrier spawns on the node.
+        let _ = runtime;
+        eval_carrier_request(module, function, args)
     }
 
     /// Spawns `erl_init:start(Modname, Argv)` as the node's first process, before any
@@ -406,42 +341,6 @@ impl Vm {
     }
 }
 
-/// An entry process applying `module:function(args)`: its arguments copied into its own heap
-/// and its result sent to the returned receiver when it exits.
-fn entry_process(
-    runtime: &'static Runtime,
-    module: &str,
-    function: &str,
-    args: &[Term],
-) -> Result<(Process, mpsc::Receiver<Result<ScheduledResult, VmError>>), VmError> {
-    let mut process = Process::with_spawn_registers(3);
-    // Port of erts/emulator/beam/erl_process.c (erl_create_process: copy_struct of the
-    // arguments into the new heap), OTP-29.1.1: the process owns its arguments, so a
-    // collection never meets a term outside its heap and the literal areas.
-    let literals = arinsal_term::LiteralAreas::current();
-    let mut copied = Vec::with_capacity(args.len());
-    for &arg in args {
-        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        copied.push(
-            arinsal_term::copy_term_litopt(arg, &mut heap, &literals)
-                .map_err(|error| VmError::Load(format!("entry process arguments: {error:?}")))?,
-        );
-    }
-    let arity =
-        u8::try_from(args.len()).map_err(|_| VmError::Load("entry process arguments".into()))?;
-    let (module_atom, function_atom, _) = mfa_atoms(module, function, arity)
-        .ok_or_else(|| VmError::Load(format!("{module}:{function} name")))?;
-    let args = arinsal_term::TermBuilder::new(&mut process.heap)
-        .list_from_slice(&copied)
-        .map_err(|error| VmError::Load(format!("entry process arguments: {error:?}")))?;
-    process.set_runtime(Some(runtime));
-    process.start_at_run_process(module_atom, function_atom, args, arity)?;
-    process.entry = true;
-    let (sender, receiver) = mpsc::channel();
-    *runtime.result.lock().unwrap() = sender;
-    Ok((process, receiver))
-}
-
 impl Runtime {
     /// The node's runtime-system tables, built once by `erl_init` before the preloaded
     /// modules load: the process and port tables, the registered-name table, ETS, the trap
@@ -454,15 +353,12 @@ impl Runtime {
         let port_layout = arinsal_term::ptab::port_table_layout();
         let port_ids = PtabIdRing::new(port_layout.max());
         let named_ets = Arc::new(arinsal_ets::NamedTableIndex::new());
-        // No entry process yet: the first one installs its own result channel.
-        let (result, _) = mpsc::channel();
         Box::leak(Box::new(Runtime {
             statistics: crate::natives::sys::StatisticsState::new(
                 crate::natives::sys::erts_statistics_origins(),
             ),
             code,
             trap_exports: std::array::from_fn(|_| OnceLock::new()),
-            system_processes: Mutex::new(std::collections::HashSet::new()),
             dirty_signal_handlers: Mutex::new(std::collections::HashSet::new()),
             literal_collector: Mutex::new(None),
             init_process_id: OnceLock::new(),
@@ -478,7 +374,6 @@ impl Runtime {
             port_ids,
             named_ets: Arc::clone(&named_ets),
             ets: std::sync::RwLock::new(arinsal_ets::Registry::new_with_named_index(named_ets)),
-            result: Mutex::new(result),
             code_mod_permission: Mutex::new(crate::natives::code::CodeModPermission::default()),
             breakpoints: Arc::new(crate::trace_bp::BpNode::new()),
             debug_wait_active: AtomicBool::new(false),
@@ -560,21 +455,202 @@ impl Runtime {
     }
 }
 
-/// A running evaluation of [`Vm::eval_scheduled`] in a started node.
-pub struct EntryProcess(mpsc::Receiver<Result<ScheduledResult, VmError>>);
+/// An evaluation sent to the eval carrier: [`EntryProcess::wait`] receives its result.
+pub struct EntryProcess(u64);
 
 impl EntryProcess {
-    /// Blocks until the entry process exits and returns its result.
+    /// Blocks until the carrier reports the evaluation's result or exception.
     pub fn wait(self) -> Result<ScheduledResult, VmError> {
-        let result = self
-            .0
-            .recv()
-            .map_err(|_| VmError::Unsupported("entry process disappeared".into()))?;
-        while arinsal_pterm::global_store().has_retired() {
-            std::thread::park_timeout(std::time::Duration::from_millis(1));
-        }
-        result
+        let carrier = EVAL_CARRIER
+            .get()
+            .ok_or_else(|| VmError::Unsupported("no eval carrier on this node".into()))?;
+        decode_carrier_reply(carrier.wait(self.0)?)
     }
+}
+
+/// The host ends of the eval carrier's pipes: requests go to the node's `{fd,R,W}` port and
+/// replies come back from it, `{packet, 4}` framed external term format.
+///
+/// Test harness of [`Vm::eval_scheduled`], not an erts structure: erts evaluates code only in
+/// processes, and a host talks to a node through a port, as `arinsal_difftest::RefErl` does
+/// with a real erl. The carrier (`eval_carrier/arinsal_eval_carrier.erl`) is started by
+/// init's `-run`.
+struct EvalCarrier {
+    requests: Mutex<std::io::PipeWriter>,
+    replies: Mutex<CarrierReplies>,
+    arrived: std::sync::Condvar,
+    next_id: AtomicU64,
+}
+
+struct CarrierReplies {
+    /// `None` while one waiter reads a frame outside the lock.
+    reader: Option<std::io::PipeReader>,
+    done: std::collections::HashMap<u64, arinsal_etf::OwnedTerm>,
+}
+
+static EVAL_CARRIER: OnceLock<EvalCarrier> = OnceLock::new();
+
+/// Creates the carrier's pipes and returns the boot arguments that start it:
+/// `-pa <code_dir> -run arinsal_eval_carrier start R W`, `R`/`W` being the node's pipe ends and
+/// `code_dir` the directory holding `arinsal_eval_carrier.beam`.
+pub(crate) fn eval_carrier_args(code_dir: &std::path::Path) -> Result<Vec<String>, VmError> {
+    use std::os::fd::IntoRawFd;
+    let pipe_error =
+        |error: std::io::Error| VmError::Unsupported(format!("eval carrier pipe: {error}"));
+    let (node_reader, host_writer) = std::io::pipe().map_err(pipe_error)?;
+    let (host_reader, node_writer) = std::io::pipe().map_err(pipe_error)?;
+    EVAL_CARRIER
+        .set(EvalCarrier {
+            requests: Mutex::new(host_writer),
+            replies: Mutex::new(CarrierReplies {
+                reader: Some(host_reader),
+                done: std::collections::HashMap::new(),
+            }),
+            arrived: std::sync::Condvar::new(),
+            next_id: AtomicU64::new(0),
+        })
+        .map_err(|_| VmError::Unsupported("eval carrier already started".into()))?;
+    // The node's fd port owns these ends from now on.
+    let read_fd = node_reader.into_raw_fd();
+    let write_fd = node_writer.into_raw_fd();
+    Ok(vec![
+        "-pa".into(),
+        code_dir.display().to_string(),
+        "-run".into(),
+        "arinsal_eval_carrier".into(),
+        "start".into(),
+        read_fd.to_string(),
+        write_fd.to_string(),
+    ])
+}
+
+/// Sends `{Id, Module, Function, Args}` to the carrier.
+fn eval_carrier_request(
+    module: &str,
+    function: &str,
+    args: &[Term],
+) -> Result<EntryProcess, VmError> {
+    use std::io::Write;
+    let carrier = EVAL_CARRIER
+        .get()
+        .ok_or_else(|| VmError::Unsupported("no eval carrier on this node".into()))?;
+    let mut owned_args = Vec::with_capacity(args.len());
+    for &arg in args {
+        owned_args.push(
+            arinsal_term::to_owned(arg)
+                .map_err(|error| VmError::Unsupported(format!("eval argument: {error:?}")))?,
+        );
+    }
+    let id = carrier.next_id.fetch_add(1, Ordering::Relaxed);
+    // The arguments travel as their own external term, decoded apart by the carrier.
+    let args_ext = arinsal_etf::encode(
+        &arinsal_etf::OwnedTerm::List {
+            elems: owned_args,
+            tail: Box::new(arinsal_etf::OwnedTerm::Nil),
+        },
+        arinsal_etf::EncodeOptions::default(),
+    );
+    let request = arinsal_etf::OwnedTerm::Tuple(vec![
+        arinsal_etf::OwnedTerm::Int(id as i64),
+        arinsal_etf::OwnedTerm::Atom(module.into()),
+        arinsal_etf::OwnedTerm::Atom(function.into()),
+        arinsal_etf::OwnedTerm::Binary(args_ext),
+    ]);
+    let bytes = arinsal_etf::encode(&request, arinsal_etf::EncodeOptions::default());
+    let length = u32::try_from(bytes.len())
+        .map_err(|_| VmError::Unsupported("eval request too large".into()))?;
+    let mut writer = carrier.requests.lock().unwrap();
+    writer
+        .write_all(&length.to_be_bytes())
+        .and_then(|()| writer.write_all(&bytes))
+        .map_err(|error| VmError::Unsupported(format!("eval carrier write: {error}")))?;
+    Ok(EntryProcess(id))
+}
+
+impl EvalCarrier {
+    /// The reply to request `id`. One waiter at a time reads frames; replies to other requests
+    /// are kept for their waiters.
+    fn wait(&self, id: u64) -> Result<arinsal_etf::OwnedTerm, VmError> {
+        use std::io::Read;
+        let mut replies = self.replies.lock().unwrap();
+        loop {
+            if let Some(reply) = replies.done.remove(&id) {
+                return Ok(reply);
+            }
+            let Some(mut reader) = replies.reader.take() else {
+                replies = self.arrived.wait(replies).unwrap();
+                continue;
+            };
+            drop(replies);
+            let mut frame = || -> Result<arinsal_etf::OwnedTerm, VmError> {
+                let read_error = |error: std::io::Error| {
+                    VmError::Unsupported(format!("eval carrier read: {error}"))
+                };
+                let mut length = [0u8; 4];
+                reader.read_exact(&mut length).map_err(read_error)?;
+                let mut bytes = vec![0u8; u32::from_be_bytes(length) as usize];
+                reader.read_exact(&mut bytes).map_err(read_error)?;
+                arinsal_etf::decode(&bytes)
+                    .map_err(|error| VmError::Unsupported(format!("eval carrier reply: {error}")))
+            };
+            let result = frame();
+            replies = self.replies.lock().unwrap();
+            replies.reader = Some(reader);
+            self.arrived.notify_all();
+            let reply = result?;
+            let arinsal_etf::OwnedTerm::Tuple(parts) = &reply else {
+                return Err(VmError::Unsupported("eval carrier reply shape".into()));
+            };
+            let [arinsal_etf::OwnedTerm::Int(reply_id), body] = parts.as_slice() else {
+                return Err(VmError::Unsupported("eval carrier reply shape".into()));
+            };
+            replies.done.insert(*reply_id as u64, body.clone());
+        }
+    }
+}
+
+/// `{ok, Value, TotalHeapSize, MinorGcs}` or `{Class, Reason, Stack}`.
+fn decode_carrier_reply(reply: arinsal_etf::OwnedTerm) -> Result<ScheduledResult, VmError> {
+    use arinsal_etf::OwnedTerm;
+    let shape = || VmError::Unsupported("eval carrier result shape".into());
+    let OwnedTerm::Tuple(parts) = &reply else {
+        return Err(shape());
+    };
+    let (tag, first, rest) = match parts.as_slice() {
+        [OwnedTerm::Atom(tag), first, rest @ ..] => (tag.as_str(), first.clone(), rest),
+        _ => return Err(shape()),
+    };
+    let class = match tag {
+        "ok" => {
+            let [OwnedTerm::Int(heap), OwnedTerm::Int(gcs)] = rest else {
+                return Err(shape());
+            };
+            let mut stats = crate::Stats {
+                heap_words: *heap as usize,
+                ..crate::Stats::default()
+            };
+            stats.gc.collections = *gcs as u64;
+            stats.gc.minor_collections = *gcs as u64;
+            return Ok(ScheduledResult {
+                text: format!("{first}"),
+                term: first,
+                stats,
+            });
+        }
+        "error" => arinsal_bifs::Class::Error,
+        "exit" => arinsal_bifs::Class::Exit,
+        "throw" => arinsal_bifs::Class::Throw,
+        _ => return Err(shape()),
+    };
+    let [stack] = rest else {
+        return Err(shape());
+    };
+    let stack = stack.clone();
+    Err(VmError::Raised(Box::new(crate::exceptions::Raised {
+        class,
+        reason: first,
+        stack,
+    })))
 }
 
 /// Scheduler class of a scheduler type, for matching rescheduled NIF calls.

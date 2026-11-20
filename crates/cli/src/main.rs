@@ -4,7 +4,6 @@
 
 use arinsal_beam::{BeamFile, Operand};
 mod disasm;
-mod eval;
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -76,20 +75,6 @@ fn main() {
             if let Err(error) = disasm::command(&args[1..]) {
                 eprintln!("disasm: {error}");
                 std::process::exit(1);
-            }
-        }
-        Some("eval") => {
-            if let Err(error) = eval::command(&args[1..]) {
-                match error {
-                    arinsal_vm::VmError::Unsupported(message) => {
-                        println!("unsupported: {message}");
-                        std::process::exit(3);
-                    }
-                    other => {
-                        eprintln!("{other}");
-                        std::process::exit(1);
-                    }
-                }
             }
         }
         _ if args.first().is_some_and(|arg| arg == "erl") => erl_launch(&args[1..], detached_child),
@@ -243,7 +228,6 @@ fn erl_launch(args: &[String], detached_child: bool) -> ! {
     let Err(error) = arinsal_vm::boot::run_with_debugger_flags(
         &root,
         &launch.boot_args,
-        &[],
         workers,
         launch.emulator.debugger_support,
         launch.emulator.debugger_line_breakpoints.unwrap_or(true),
@@ -255,7 +239,7 @@ fn erl_launch(args: &[String], detached_child: bool) -> ! {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: arinsal --version | beam-info [--code] <file.beam> | disasm <file.beam> [--format erl] | disasm --check-all <dirs...> | eval [-pa DIR]... <module> <function> [ARG]..."
+        "usage: arinsal --version | beam-info [--code] <file.beam> | disasm <file.beam> [--format erl] | disasm --check-all <dirs...>"
     );
     std::process::exit(2)
 }

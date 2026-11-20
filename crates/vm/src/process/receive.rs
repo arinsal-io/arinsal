@@ -141,6 +141,20 @@ impl Process {
         }
     }
 
+    /// The fetch a clause-less receive's wait does before it sleeps; `true` when it made the
+    /// process exiting instead (erts' fetch cannot fail; a handler failure takes the same
+    /// erts_set_self_exiting path as in [`Self::receive_helper`]).
+    pub(crate) fn wait_fetch_signals(&mut self, ctx: &mut RunCtx<'_, crate::Process>) -> bool {
+        match self.fetch_signals(ctx) {
+            Ok(()) => false,
+            Err(error) => {
+                let reason = super::exit::exit_reason_from(self, &error);
+                self.erts_set_self_exiting(ctx, reason);
+                true
+            }
+        }
+    }
+
     fn receive_helper_signals(
         &mut self,
         ctx: &mut RunCtx<'_, crate::Process>,

@@ -74,9 +74,9 @@ def command_for(runtime, name, arguments):
         return [str(RUST / "target/release/bench"), *suffix]
     if runtime == "go":
         return [str(OUT / "gob"), *suffix]
-    if runtime == "erts":
-        return ["erl", "-noshell", "+S", "4:4", "+P", "2000000", "-pa", str(OUT / "ebin"), "-run", "bench", "main", *suffix]
-    return [str(ROOT / "target/release/arinsal"), "eval", "bench", *suffix]
+    # The same `erl -noshell -run bench main ...` command line for erts and Arinsal.
+    node = "erl" if runtime == "erts" else str(ROOT / "target/release/arinsal")
+    return [node, "-noshell", "+S", "4:4", "+P", "2000000", "-pa", str(OUT / "ebin"), "-run", "bench", "main", *suffix]
 
 
 def parse_output(output, name):

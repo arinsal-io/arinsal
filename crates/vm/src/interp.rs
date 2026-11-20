@@ -33,7 +33,9 @@ static PF_SPAWN_CONSTRUCT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::
 pub(crate) enum RunState {
     Done(Term),
     Yield,
-    Wait { timeout_pos: Option<u64> },
+    /// The slice ended with `ERTS_PSFLG_ACTIVE` cleared in `p->state`: the process waits. A
+    /// receive timer, if any, was set during the slice (beam_jit_wait_timeout).
+    Wait,
 }
 
 impl Vm {

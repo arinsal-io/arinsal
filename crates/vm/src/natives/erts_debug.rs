@@ -2567,9 +2567,11 @@ fn internal_state_get(
                 .runtime
                 .as_ref()
                 .map(|runtime| {
-                    let mut pids = runtime.process_pids();
-                    pids.extend(runtime.system_processes.lock().unwrap().iter().copied());
-                    pids.iter()
+                    // Port of erts/emulator/beam/erl_ptab.c (erts_debug_ptab_list), OTP-29.1.1:
+                    // every element of the process table.
+                    runtime
+                        .process_pids()
+                        .iter()
                         .filter_map(|pid| pid.to_term())
                         .collect::<Vec<_>>()
                 })
@@ -2674,7 +2676,7 @@ fn debug_wait_round(
                     let Ok(scheduler) = owner.scheduler() else {
                         return;
                     };
-                    scheduler.request_aux_work_all(work);
+                    scheduler.erts_schedule_multi_misc_aux_work(work);
                 },
             );
             return;
@@ -2692,7 +2694,7 @@ fn debug_wait_round(
                 completion.clone(),
                 rounds_left - 1,
                 drain_owned,
-                &mut |work| next.request_aux_work_all(work),
+                &mut |work| next.erts_schedule_multi_misc_aux_work(work),
             );
             return;
         }
@@ -2848,7 +2850,7 @@ fn internal_state_set(
             completion,
             rounds,
             drain_owned,
-            &mut |work| ctx.request_aux_work_all(work),
+            &mut |work| ctx.erts_schedule_multi_misc_aux_work(work),
         );
         // erl_bif_info.c:5260-5261: ERTS_BIF_YIELD_RETURN (ERTS_VBUMP_ALL_REDS).
         crate::bif_traps::vbump_all_reds(process);

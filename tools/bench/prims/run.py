@@ -84,64 +84,32 @@ def sample_command(
     binary: str,
     erl: str,
     ebin: Path,
-    stdlib: str,
-    kernel: str,
     k: int,
     run: int,
     timeout: int,
 ) -> dict[str, dict[str, int]]:
     schedulers = 2 * k
-    if runtime == "erts":
-        expression = f"prims_bench:run(erts,{k},{run}), halt()."
-        command = [
-            erl,
-            "+S",
-            f"{schedulers}:{schedulers}",
-            "-noshell",
-            "-noinput",
-            "-pa",
-            str(ebin),
-            "-eval",
-            expression,
-        ]
-    else:
-        command = [
-            binary,
-            "eval",
-            "--schedulers",
-            str(schedulers),
-            "-pa",
-            str(ebin),
-            "-pa",
-            stdlib,
-            "-pa",
-            kernel,
-            "prims_bench",
-            "run",
-            "arinsal",
-            str(k),
-            str(run),
-        ]
+    # The same `erl -noshell -eval` command line for both runtimes.
+    expression = f"prims_bench:run({runtime},{k},{run}), halt()."
+    command = [
+        erl if runtime == "erts" else binary,
+        "+S",
+        f"{schedulers}:{schedulers}",
+        "-noshell",
+        "-noinput",
+        "-pa",
+        str(ebin),
+        "-eval",
+        expression,
+    ]
     result = checked_run(command, timeout)
     parsed: dict[str, dict[str, int]] = {}
-    if runtime == "erts":
-        for line in result.stdout.splitlines():
-            fields = line.split("|")
-            if len(fields) == 8 and fields[0] == "PRIMS":
-                _, found_runtime, found_k, found_run, op, n, empty_ns, work_ns = fields
-                if found_runtime != runtime or int(found_k) != k or int(found_run) != run:
-                    raise RuntimeError(f"sample identity mismatch: {line}")
-                parsed[op] = {
-                    "iterations": int(n),
-                    "empty_loop_ns": int(empty_ns),
-                    "operation_ns": int(work_ns),
-                }
-    else:
-        for match in re.finditer(
-            r"\{\s*([a-z][a-zA-Z0-9_]*)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\}",
-            result.stdout,
-        ):
-            op, n, empty_ns, work_ns = match.groups()
+    for line in result.stdout.splitlines():
+        fields = line.split("|")
+        if len(fields) == 8 and fields[0] == "PRIMS":
+            _, found_runtime, found_k, found_run, op, n, empty_ns, work_ns = fields
+            if found_runtime != runtime or int(found_k) != k or int(found_run) != run:
+                raise RuntimeError(f"sample identity mismatch: {line}")
             parsed[op] = {
                 "iterations": int(n),
                 "empty_loop_ns": int(empty_ns),
@@ -261,7 +229,7 @@ def main() -> int:
     if not Path(binary).is_file():
         parser.error(f"Arinsal executable does not exist: {binary}")
     args.arinsal = binary
-    _root, stdlib, kernel, otp_version = otp_paths(args.erl, args.timeout)
+    _root, _stdlib, _kernel, otp_version = otp_paths(args.erl, args.timeout)
     ebin = args.output_dir.resolve() / "ebin"
     compile_beam(args.erlc, ebin, args.timeout)
     raw = {
@@ -281,8 +249,6 @@ def main() -> int:
                     binary,
                     args.erl,
                     ebin,
-                    stdlib,
-                    kernel,
                     k,
                     run,
                     args.timeout,

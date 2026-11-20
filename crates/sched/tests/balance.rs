@@ -66,7 +66,7 @@ fn total(runs: &[Arc<AtomicU64>]) -> u64 {
 /// One mix per test: erts has one runtime per OS process.
 fn low_priority_gets_an_eighth_of_normal_turns(normal: usize, low: usize) {
     {
-        let scheduler = Scheduler::new(Config {
+        let scheduler = start_scheduler(Config {
             workers: 1,
             ..Config::default()
         });
@@ -106,7 +106,7 @@ fn low_priority_gets_an_eighth_of_normal_turns_many_normal() {
 /// Busy schedulers complete the reductions-triggered balance checks counted by `nbalance`.
 #[test]
 fn busy_schedulers_check_balance() {
-    let scheduler = Scheduler::new(Config {
+    let scheduler = start_scheduler(Config {
         workers: 4,
         ..Config::default()
     });
@@ -127,7 +127,7 @@ fn busy_schedulers_check_balance() {
 /// A single online run queue never balances (check_balance with one balanced run queue).
 #[test]
 fn one_online_scheduler_does_not_balance() {
-    let scheduler = Scheduler::new(Config {
+    let scheduler = start_scheduler(Config {
         workers: 2,
         ..Config::default()
     });
@@ -140,4 +140,15 @@ fn one_online_scheduler_does_not_balance() {
     }
     stop.store(true, Ordering::Relaxed);
     similar_asserts::assert_eq!(scheduler.balance_checks(), 0);
+}
+
+/// A scheduler started the way `erl_start` starts one: erl_process.c:6090
+/// (erts_init_scheduling), then erl_process.c:8909 (erts_start_schedulers).
+fn start_scheduler<T: arinsal_sched::Task>(
+    config: arinsal_sched::Config,
+) -> arinsal_sched::Scheduler<T> {
+    let dirty_cpu_online = config.dirty_cpu_schedulers.max(1);
+    let scheduler = arinsal_sched::Scheduler::erts_init_scheduling(config, dirty_cpu_online);
+    scheduler.erts_start_schedulers();
+    scheduler
 }

@@ -9,7 +9,6 @@ pub(crate) struct Runtime {
     /// The entry remains the indirection when a module replaces code, as in erts' export table.
     pub(super) trap_exports:
         [OnceLock<Arc<arinsal_term::ExportEntry>>; crate::bif_traps::TRAP_EXPORT_CAPACITY],
-    pub(crate) system_processes: Mutex<std::collections::HashSet<Pid>>,
     pub(crate) dirty_signal_handlers: Mutex<std::collections::HashSet<Pid>>,
     /// Pid of `erts_literal_area_collector` (an unregistered system process).
     pub(crate) literal_collector: Mutex<Option<Pid>>,
@@ -37,7 +36,6 @@ pub(crate) struct Runtime {
     /// `meta_name_tab`, read without taking the global ETS registry lock.
     pub(crate) named_ets: Arc<arinsal_ets::NamedTableIndex>,
     pub(crate) ets: std::sync::RwLock<arinsal_ets::Registry>,
-    pub(super) result: Mutex<mpsc::Sender<Result<ScheduledResult, VmError>>>,
     // g_proc_sched: suspend counts and the status other processes can observe.
     /// Asynchronous suspends of a running process that it has not yet acted on.
     // Port of erts/emulator/beam/erl_process.c:9013 (`erts_internal_suspend_process_2` pending suspend), OTP-29.1.1.
@@ -325,7 +323,7 @@ impl Runtime {
                 // nothing to time out. `receive_timeout_pos` stays set, as erts keeps
                 // `common.timer` non-NONE (the paused timer) and the wait does not set it again.
                 if let Some(probe) = process.signal_probe() {
-                    probe.receive_timer().cancel();
+                    arinsal_sched::erts_cancel_proc_timer::<crate::Process>(probe.receive_timer());
                 }
                 Some(pos.saturating_sub(now))
             }

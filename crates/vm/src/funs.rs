@@ -303,7 +303,9 @@ impl Vm {
         let function_atom = trap.entry.function();
         if !crate::trace_bp::any_pattern()
             && !crate::trace::saves_calls(p)
-            && !self.unloaded_on_load(p, module)
+            && !code_tables(erts_active_code_ix())
+                .pending_on_load
+                .contains_key(module)
             && let Some(&module_id) = code_tables(erts_active_code_ix()).loaded.get(&module_atom)
             && let Some(target) = code_tables(erts_active_code_ix()).modules[module_id]
                 .export_slot_atom(function_atom, arity as u32)
@@ -728,9 +730,8 @@ impl Vm {
                 "BIF {module}:{function}/{arity}"
             )));
         }
-        // Same as `call_import`: a not-yet-loaded `-on_load` module has to go
-        // through `code_server` or its NIF stubs run.
-        if self.unloaded_on_load(p, module) {
+        let Some(&module_id) = code_tables(erts_active_code_ix()).loaded.get(module) else {
+            // Port of erts/emulator/beam/beam_common.c:1294 (call_error_handler), OTP-29.1.1.
             return crate::beam_common::call_error_handler(
                 p,
                 (module, function, arity),
@@ -739,50 +740,19 @@ impl Vm {
                 self,
                 ctx,
             );
-        }
-        let module_id = match self.load_named_traced(p, module) {
-            Ok(id) => id,
-            Err(_) if self.should_autoload(p, module) => {
-                // mix_loop1: OTP calls error_handler:undefined_function/3, which
-                // code:ensure_loaded's from the code server path. Vm paths do
-                // not include Mix archives added with code:add_pathz/1.
-                if crate::calls::trace_boot_enabled() {
-                    eprintln!("arinsal boot: autoload {module}:{function}/{arity}");
-                }
-                return crate::beam_common::call_error_handler(
-                    p,
-                    (module, function, arity),
-                    self.x_regs()?,
-                    "undefined_function",
-                    self,
-                    ctx,
-                );
-            }
-            Err(_) => {
-                return Err(VmError::Exception {
-                    reason: "undef".into(),
-                    frame: format!("{module}:{function}/{arity}"),
-                });
-            }
         };
         let Some(target) =
             code_tables(erts_active_code_ix()).modules[module_id].export(function, arity as u32)
         else {
             // Port of erts/emulator/beam/beam_common.c (call_error_handler).
-            if self.should_autoload(p, module) {
-                return crate::beam_common::call_error_handler(
-                    p,
-                    (module, function, arity),
-                    self.x_regs()?,
-                    "undefined_function",
-                    self,
-                    ctx,
-                );
-            }
-            return Err(VmError::Exception {
-                reason: "undef".into(),
-                frame: format!("{module}:{function}/{arity}"),
-            });
+            return crate::beam_common::call_error_handler(
+                p,
+                (module, function, arity),
+                self.x_regs()?,
+                "undefined_function",
+                self,
+                ctx,
+            );
         };
         // Port of erts/emulator/beam/beam_bp.c:1181-1250 (do_call_trace), OTP-29.1.1:
         // apply resolves an export through its global breakpoint before entering native code.
@@ -857,24 +827,6 @@ impl Vm {
                 Ok(Self::return_value_after_dirty(p, value))
             }
         }
-    }
-
-    /// `code_server` is up, so a missing module must go through `error_handler`
-    /// instead of becoming `undef` immediately. A `code:delete`d module is
-    /// missing too: Mix purges and deletes a protocol, then the next call
-    /// autoloads the consolidated beam. Port of
-    /// `error_handler:undefined_function/3`, OTP-29.1.1.
-    pub(super) fn should_autoload(&self, p: &Process, module: &str) -> bool {
-        if module == "error_handler"
-            || code_tables(erts_active_code_ix())
-                .pending_on_load
-                .contains_key(module)
-        {
-            return false;
-        }
-        p.runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.reg.whereis_proc_str("code_server").is_some())
     }
 
     /// `fun_info/1` is the OTP-level list wrapper around the keyed `fun_info/2` BIF.

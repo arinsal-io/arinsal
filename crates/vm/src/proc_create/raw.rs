@@ -315,12 +315,9 @@ pub(crate) fn initialize_spawned(
         std::ptr::addr_of_mut!((*process).run_key).write(0);
         std::ptr::addr_of_mut!((*process).exec_key).write(0);
         std::ptr::addr_of_mut!((*process).signal_probe).write(None);
-        std::ptr::addr_of_mut!((*process).native_wait).write(None);
         std::ptr::addr_of_mut!((*process).native_retry).write(None);
         std::ptr::addr_of_mut!((*process).native_apply).write(false);
         std::ptr::addr_of_mut!((*process).native_call_pc).write(0);
-        std::ptr::addr_of_mut!((*process).native_wait_timeout).write(None);
-        std::ptr::addr_of_mut!((*process).native_wait_self).write(false);
         std::ptr::addr_of_mut!((*process).native_retry_site).write(None);
         std::ptr::addr_of_mut!((*process).native_light_bif_call).write(false);
         std::ptr::addr_of_mut!((*process).native_transfer).write(false);
@@ -341,11 +338,9 @@ pub(crate) fn initialize_spawned(
         std::ptr::addr_of_mut!((*process).apply_inline_len).write(0);
         std::ptr::addr_of_mut!((*process).persistent_terms).write(persistent_terms);
         std::ptr::addr_of_mut!((*process).exc_class).write(None);
-        std::ptr::addr_of_mut!((*process).entry).write(false);
         std::ptr::addr_of_mut!((*process).native_continuation_resume).write(false);
         std::ptr::addr_of_mut!((*process).native_arity_set).write(false);
         std::ptr::addr_of_mut!((*process).native_error_pc).write(0);
-        std::ptr::addr_of_mut!((*process).native_exit_kind).write(NativeExit::None);
         // erl_process.c:12604 (erl_create_process: `p->return_trace_frames = 0`).
         std::ptr::addr_of_mut!((*process).return_trace_frames).write(0);
 

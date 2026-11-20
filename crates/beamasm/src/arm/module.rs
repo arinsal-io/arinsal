@@ -2255,20 +2255,11 @@ impl BeamModuleAssembler {
         label
     }
 
-    pub(super) fn emit_runtime_hook_with(
-        &mut self,
-        helper: usize,
-        args: &[Gpr],
-        live: usize,
-        update: crate::Update,
-    ) -> Result<(), ModuleError> {
-        self.emit_runtime_fragment_with(helper, args, live, update)
-            .map(|_| ())
-    }
-
-    /// [`Self::emit_runtime_hook_with`] for a helper whose caller tests its result for a
-    /// raise itself (erts `apply`/`fixed_apply`: a zero export, raised with its own MFA).
-    pub(super) fn emit_runtime_hook_unchecked(
+    /// `emit_enter_runtime; runtime_call(helper, c_p, args...); emit_leave_runtime`: the
+    /// caller tests the helper's result itself, as each erts emitter does (THE_NON_VALUE,
+    /// a zero export); a runtime call never signals failure through `c_p->freason`.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp (runtime_call), OTP-29.1.1.
+    pub(super) fn emit_runtime_hook(
         &mut self,
         helper: usize,
         args: &[Gpr],
@@ -2291,35 +2282,6 @@ impl BeamModuleAssembler {
         self.fragment_call(helper)?;
         crate::emit_leave_runtime(&mut self.code, live, update)?;
         Ok(())
-    }
-
-    /// Returns the code offset of the fragment call's return address.
-    pub(super) fn emit_runtime_fragment_with(
-        &mut self,
-        fragment: usize,
-        args: &[Gpr],
-        live: usize,
-        update: crate::Update,
-    ) -> Result<usize, ModuleError> {
-        if args.len() > 5 {
-            return Err(ModuleError::InvalidOperand(
-                "runtime hook has too many arguments",
-            ));
-        }
-        crate::emit_enter_runtime(&mut self.code, live, update)?;
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(0), C_P)?;
-            for (index, arg) in args.iter().copied().enumerate() {
-                move_hook_arg(e, Gpr::x(index as u8 + 1), arg)?;
-            }
-            Ok(())
-        })?;
-        self.fragment_call(fragment)?;
-        let return_address = self.code.offset();
-        crate::emit_leave_runtime(&mut self.code, live, update)?;
-        self.code.emit(|e| e.ldr_uoff(Gpr::x(9), C_P, 40))?;
-        self.error_if_nonzero(Gpr::x(9))?;
-        Ok(return_address)
     }
 
     /// Calls a loader-patched static NIF body through the process runtime.

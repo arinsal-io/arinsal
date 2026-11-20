@@ -33,7 +33,7 @@ impl Task for Slice {
 }
 
 fn reductions_of(consumed: u32, virtual_reds: u32) -> u64 {
-    let scheduler = Scheduler::<Slice>::new(Config {
+    let scheduler = start_scheduler::<Slice>(Config {
         workers: 1,
         ..Config::default()
     });
@@ -66,4 +66,15 @@ fn virtual_reductions_are_not_counted() {
 #[test]
 fn consumed_reductions_are_counted() {
     assert_eq!(reductions_of(3000, 0), 3000);
+}
+
+/// A scheduler started the way `erl_start` starts one: erl_process.c:6090
+/// (erts_init_scheduling), then erl_process.c:8909 (erts_start_schedulers).
+fn start_scheduler<T: arinsal_sched::Task>(
+    config: arinsal_sched::Config,
+) -> arinsal_sched::Scheduler<T> {
+    let dirty_cpu_online = config.dirty_cpu_schedulers.max(1);
+    let scheduler = Scheduler::erts_init_scheduling(config, dirty_cpu_online);
+    scheduler.erts_start_schedulers();
+    scheduler
 }

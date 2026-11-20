@@ -16,25 +16,12 @@ pub(super) fn context_switch(
         arinsal_beamasm::ExitReason::Yield => {
             #[cfg(target_arch = "aarch64")]
             crate::beamasm_integration::count_native_yield();
-            let exit_kind = std::mem::take(&mut process.native_exit_kind);
-            if exit_kind == crate::proc_create::NativeExit::Wait
-                && let Some(timeout_pos) = process.native_wait.take()
+            // do_schedule: a receive's wait cleared ERTS_PSFLG_ACTIVE (beam_jit_wait_locked).
+            if ctx.proc_state().load(std::sync::atomic::Ordering::Acquire)
+                & arinsal_sched::psflg::ACTIVE
+                == 0
             {
-                // A native receive found no matching message. Like the
-                // interpreter's `wait`, sleep only if nothing arrived since the
-                // slice began; the process resumes at the `loop_rec` label with
-                // no live X registers.
-                process.gc_live = 0;
-                process.set_native_resume_arity(0);
-                // A receive without clauses blocks even with messages queued,
-                // like the interpreter's self-targeting `wait`.
-                let self_wait = std::mem::take(&mut process.native_wait_self);
-                if self_wait {
-                    // Queued messages never match; fetch them so the outer
-                    // queue does not keep waking the process.
-                    process.fetch_signals(ctx)?;
-                }
-                return Ok(Flow::Break(Ok(RunState::Wait { timeout_pos })));
+                return Ok(Flow::Break(Ok(RunState::Wait)));
             }
             return Ok(Flow::Break(Ok(RunState::Yield)));
         }
@@ -122,12 +109,16 @@ pub(super) fn context_switch(
                     process.heap.release_stack(1);
                 }
                 let live = usize::from(live);
-                let handler = (Vm {}).load_named("erts_internal").is_ok_and(|id| {
-                    crate::code_ix::code_tables(crate::code_ix::erts_active_code_ix()).modules[id]
-                        .functions
-                        .iter()
-                        .any(|(_, name, arity)| *name == "breakpoint" && *arity == 4)
-                });
+                let handler = crate::code_ix::code_tables(crate::code_ix::erts_active_code_ix())
+                    .loaded
+                    .get("erts_internal")
+                    .is_some_and(|id| {
+                        crate::code_ix::code_tables(crate::code_ix::erts_active_code_ix()).modules
+                            [*id]
+                            .functions
+                            .iter()
+                            .any(|(_, name, arity)| *name == "breakpoint" && *arity == 4)
+                    });
                 // The handler's own breakpoints are not reported.
                 let cycle = function.module == "erts_internal"
                     && function.function == "breakpoint"
@@ -689,7 +680,7 @@ pub(super) fn context_switch(
                                 hibernate_fetch_collect(process, ctx)?;
                                 process.set_native_retry(Some(target_pc));
                                 process.set_native_pc(Some(code_ptr));
-                                return Ok(Flow::Break(Ok(RunState::Wait { timeout_pos: None })));
+                                return Ok(Flow::Break(Ok(RunState::Wait)));
                             }
                             process.set_native_pc(None);
                             process.native_continuation_resume = false;
@@ -698,7 +689,7 @@ pub(super) fn context_switch(
                                     // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
                                     process.set_hibernate_sched(true);
                                 }
-                                return Ok(Flow::Break(Ok(RunState::Wait { timeout_pos: None })));
+                                return Ok(Flow::Break(Ok(RunState::Wait)));
                             }
                             hibernate_wakeup(process, reg)?;
                             return Ok(Flow::Continue);
@@ -723,71 +714,48 @@ pub(super) fn context_switch(
                 .copied();
             let module_id = match loaded {
                 Some(module_id) => module_id,
-                // Like call_import: a module with -on_load is loaded through
-                // the error handler and code server, which run its on_load.
+                // Port of erts/emulator/beam/beam_common.c:1294 (call_error_handler), OTP-29.1.1:
+                // unresolved exports delegate module loading to Erlang code.
                 None => {
-                    // Port of beam_common.c (call_error_handler): with the code
-                    // server up, the error handler loads the module.
-                    let loaded = {
-                        let mut vm = Vm {};
-                        if vm.unloaded_on_load(process, &export.module)
-                            || vm.should_autoload(process, &export.module)
-                        {
-                            Err(VmError::Load("module has -on_load".into()))
-                        } else {
-                            vm.load_named(&export.module)
-                        }
-                    };
-                    match loaded {
-                        Ok(module_id) => module_id,
-                        Err(_) => {
-                            let saved = reg.x_reg_array[..export.arity as usize].to_vec();
-                            let called = crate::beam_common::call_error_handler(
-                                process,
-                                (&export.module, &export.function, export.arity as usize),
-                                &mut reg.x_reg_array,
-                                "undefined_function",
-                                &mut Vm {},
-                                None,
-                            );
-                            let outcome = match called {
-                                Ok(outcome) => outcome,
-                                Err(error) => {
-                                    if let Some(error) = raise_undefined_call(
-                                        &mut Vm {},
-                                        process,
-                                        ctx,
-                                        &saved,
-                                        error,
-                                    )? {
-                                        return Ok(Flow::Break(Err(error)));
-                                    }
-                                    return Ok(Flow::Continue);
-                                }
-                            };
-                            match outcome {
-                                crate::ImportOutcome::Dispatch => {}
-                                crate::ImportOutcome::Yield => {
-                                    if process.native_pc().is_some()
-                                        && native_transfer_continues(process)
-                                    {
-                                        return Ok(Flow::Continue);
-                                    }
-                                    return Ok(Flow::Break(Ok(RunState::Yield)));
-                                }
-                                crate::ImportOutcome::Returned(value) => {
-                                    reg.x_reg_array[0] = value;
-                                    if process.native_pc().is_none() {
-                                        return Ok(Flow::Break(Ok(RunState::Done(value))));
-                                    }
-                                    if ctx.scheduler_type().is_dirty() {
-                                        return Ok(Flow::Break(Ok(RunState::Yield)));
-                                    }
-                                }
+                    let saved = reg.x_reg_array[..export.arity as usize].to_vec();
+                    let called = crate::beam_common::call_error_handler(
+                        process,
+                        (&export.module, &export.function, export.arity as usize),
+                        &mut reg.x_reg_array,
+                        "undefined_function",
+                        &mut Vm {},
+                        None,
+                    );
+                    let outcome = match called {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            if let Some(error) =
+                                raise_undefined_call(&mut Vm {}, process, ctx, &saved, error)?
+                            {
+                                return Ok(Flow::Break(Err(error)));
                             }
                             return Ok(Flow::Continue);
                         }
+                    };
+                    match outcome {
+                        crate::ImportOutcome::Dispatch => {}
+                        crate::ImportOutcome::Yield => {
+                            if process.native_pc().is_some() && native_transfer_continues(process) {
+                                return Ok(Flow::Continue);
+                            }
+                            return Ok(Flow::Break(Ok(RunState::Yield)));
+                        }
+                        crate::ImportOutcome::Returned(value) => {
+                            reg.x_reg_array[0] = value;
+                            if process.native_pc().is_none() {
+                                return Ok(Flow::Break(Ok(RunState::Done(value))));
+                            }
+                            if ctx.scheduler_type().is_dirty() {
+                                return Ok(Flow::Break(Ok(RunState::Yield)));
+                            }
+                        }
                     }
+                    return Ok(Flow::Continue);
                 }
             };
             // Port of erts/emulator/beam/beam_bp.c (erts_generic_breakpoint

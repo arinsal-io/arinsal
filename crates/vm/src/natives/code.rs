@@ -1936,9 +1936,8 @@ fn call_values(
             Ok(Term::atom(arinsal_term::atoms::NORMAL))
         })()),
         ("erlang", "call_on_load_function", 1) => {
-            // A module still waiting on `finish_loading` runs here, on the caller.
-            // Anything else is the nif family's loader (it `load_named`s and enters
-            // `on_load/0`), which is how `crypto` is brought up.
+            // Port of erts/emulator/beam/beam_bif_load.c (call_on_load_function_1), OTP-29.1.1:
+            // the code server stages the module before invoking its on_load function.
             let Some(name) = module_name(args[0]) else {
                 return Some(Err(badarg()));
             };
@@ -1953,12 +1952,7 @@ fn call_values(
                         .copied()
                 }) {
                 Some(id) => id,
-                // The NIF family's loader calls this after `load_named`,
-                // before the module's on_load entry has been entered.
-                None => match vm.load_named(&name) {
-                    Ok(id) => id,
-                    Err(_) => return Some(Err(badarg())),
-                },
+                None => return Some(Err(badarg())),
             };
             let Some((function, arity)) = code_tables(erts_active_code_ix()).code_meta[id]
                 .as_ref()
@@ -2489,7 +2483,13 @@ mod tests {
         reference.load("arinsal_hot_info", &bytes).unwrap();
         let mut vm = crate::boot::test_node();
         vm.load_bytes(&bytes).unwrap();
-        vm.load_named("lists").unwrap();
+        let lists = Term::atom(arinsal_term::global_atoms().intern("lists").unwrap());
+        similar_asserts::assert_eq!(
+            vm.eval_scheduled("code", "ensure_loaded", &[lists], 1)
+                .unwrap()
+                .text,
+            "{module,lists}"
+        );
         for module in ["arinsal_hot_info", "lists"] {
             for field in [
                 None,

@@ -62,6 +62,8 @@ const LFLG_ACTIVE_MASK: u32 = !(LFLG_NO_LEADER | LFLG_BLOCK | LFLG_WAITING_UM);
 const BC_FLG_NOT_BLOCKING: u32 = 1 << 31;
 /// `ERTS_THR_PRGR_WAKEUP_DATA_SIZE`.
 const WAKEUP_DATA_SIZE: usize = 4;
+/// `ERTS_THR_PRGR_BM_BITS` / `ERTS_THR_PRGR_BM_SHIFT`.
+const UNMANAGED_WAKEUP_BM_BITS: usize = 32;
 /// `ERTS_MIN_THR_PRGR_LATER_OPS`: later operations run per pass at least.
 const MIN_THR_PRGR_LATER_OPS: usize = 50;
 /// `thr_prgr_later_cleanup_op_threshold` at its default
@@ -97,9 +99,15 @@ fn has_passed(val1: u64, val0: u64) -> bool {
     val1 > val0
 }
 
+/// Whether `val1` has passed `val0` in the wrapped thread-progress sequence.
+// Port of erl_thr_progress.h (erts_thr_progress_has_passed), OTP-29.1.1.
+pub(crate) fn erts_thr_progress_has_passed(val1: u64, val0: u64) -> bool {
+    has_passed(val1, val0)
+}
+
 // Port of erl_thr_progress.h (erts_thr_progress_has_reached_this), OTP-29.1.1.
 fn has_reached_this(this: u64, val: u64) -> bool {
-    this == val || has_passed(this, val)
+    this == val || erts_thr_progress_has_passed(this, val)
 }
 
 // Port of erl_thr_progress.h (erts_thr_progress_cmp), OTP-29.1.1.
@@ -124,6 +132,69 @@ struct WakeupData {
     id: Box<[AtomicUsize]>,
 }
 
+/// Two-level unmanaged wakeup bitmap from `ErtsThrPrgrUnmanagedWakeupData`.
+struct UnmanagedWakeupData {
+    len: AtomicU32,
+    high: Box<[AtomicU32]>,
+    low: Box<[AtomicU32]>,
+}
+
+struct UnmanagedTpd {
+    progress: Arc<ThrProgress>,
+    id: usize,
+    wakeup_request: [u64; WAKEUP_DATA_SIZE],
+}
+
+type UnmanagedWakeupCallback = Arc<dyn Fn() + Send + Sync>;
+type UnmanagedWakeupCallbackSlot = Mutex<Option<UnmanagedWakeupCallback>>;
+
+/// The per-thread event erts exposes as `erts_tse_t`: reset before publishing a sleep, and
+/// retain a signal that races with the wait.
+#[derive(Debug)]
+pub(crate) struct ThreadEvent {
+    signaled: Mutex<bool>,
+    event: Condvar,
+}
+
+impl ThreadEvent {
+    pub(crate) fn new() -> Self {
+        Self {
+            signaled: Mutex::new(false),
+            event: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn reset(&self) {
+        *self
+            .signaled
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = false;
+    }
+
+    pub(crate) fn signal(&self) {
+        let mut signaled = self
+            .signaled
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *signaled = true;
+        self.event.notify_one();
+    }
+
+    pub(crate) fn wait(&self) {
+        let mut signaled = self
+            .signaled
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while !*signaled {
+            signaled = self
+                .event
+                .wait(signaled)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        *signaled = false;
+    }
+}
+
 /// Shared thread progress state (erts `ErtsThrPrgrInternalData` and `erts_thr_prgr__`).
 pub(crate) struct ThrProgress {
     current: AtomicU64,
@@ -134,10 +205,15 @@ pub(crate) struct ThrProgress {
     /// unblock.
     event: (Mutex<()>, Condvar),
     wakeup: [WakeupData; WAKEUP_DATA_SIZE],
+    unmanaged_wakeup: [UnmanagedWakeupData; WAKEUP_DATA_SIZE],
+    unmanaged_callbacks: Box<[UnmanagedWakeupCallbackSlot]>,
+    unmanaged_next: AtomicUsize,
     /// Worker sleep state shared with the scheduler: waking a managed thread ends its
     /// spin and unparks it (the managed `wakeup` callback, erl_process.c ssi_wake).
     parked: Arc<[AtomicBool]>,
     sleepers: Arc<[OnceLock<Thread>]>,
+    /// TID 0's managed aux thread is in the same thread-progress set but has no run queue.
+    aux_event: OnceLock<Arc<ThreadEvent>>,
     /// Later operations scheduled from unmanaged threads, run by any managed thread.
     unmanaged_later: Mutex<VecDeque<(u64, LaterOp)>>,
     unmanaged_later_len: AtomicUsize,
@@ -163,8 +239,11 @@ static INTRNL: OnceLock<Arc<ThrProgress>> = OnceLock::new();
 pub(crate) fn init(
     parked: Arc<[AtomicBool]>,
     sleepers: Arc<[OnceLock<Thread>]>,
+    unmanaged: usize,
 ) -> Arc<ThrProgress> {
-    let progress = Arc::new(ThrProgress::new(parked, sleepers));
+    let progress = Arc::new(ThrProgress::new_with_managed_extra(
+        parked, sleepers, 1, unmanaged,
+    ));
     assert!(
         INTRNL.set(Arc::clone(&progress)).is_ok(),
         "thread progress is initialized once per OS process (erts_thr_progress_init): \
@@ -220,8 +299,7 @@ fn sspa_is_managed() -> bool {
     MANAGED_OF.with(|of| of.get() != 0)
 }
 
-/// Per thread data of a managed thread (erts `ErtsThrPrgrData`) and its later operations
-/// (erts `ErtsAuxWorkData.later_op`).
+/// Per thread data of a managed thread (erts `ErtsThrPrgrData`).
 struct ThrPrgrData {
     progress: Arc<ThrProgress>,
     id: usize,
@@ -233,24 +311,35 @@ struct ThrPrgrData {
     leader_next: u64,
     chk_next_ix: usize,
     wakeup_request: [u64; WAKEUP_DATA_SIZE],
-    /// `aux_work_data.later_op` first..last and `list_len`.
-    later_ops: VecDeque<(u64, LaterOp)>,
-    /// `aux_work_data.later_op.size`: bytes of cleanup operations still allowed before one
-    /// requests a wakeup.
-    later_op_size: usize,
-    /// `aux_work_data.later_op.thr_prgr`: the value the last cleanup operation waits for.
-    later_op_thr_prgr: u64,
-    /// `aux_work_data.latest_wakeup`.
-    latest_wakeup: u64,
+    /// The queue is owned by `esdp->aux_work_data.later_op`.
+    later_ops: std::rc::Rc<RefCell<LaterOpState>>,
     /// `leader_state.umrefc_ix.waiting`: the slot this leader waits to drain, `-1` for none.
     leader_umrefc_waiting: i32,
     /// `leader_state.umrefc_ix.current`.
     leader_umrefc_current: usize,
 }
 
+/// `ErtsAuxWorkData.later_op` first..last, size and cleanup progress counters.
+// Port of erts/emulator/beam/erl_process.h (ErtsAuxWorkData.later_op), OTP-29.1.1.
+#[derive(Default)]
+pub(crate) struct LaterOpState {
+    later_ops: VecDeque<(u64, LaterOp)>,
+    size: usize,
+    thr_prgr: u64,
+    latest_wakeup: u64,
+}
+
+impl LaterOpState {
+    pub(crate) fn shared() -> std::rc::Rc<RefCell<Self>> {
+        std::rc::Rc::new(RefCell::new(Self::default()))
+    }
+}
+
 thread_local! {
     /// erts `erts_thr_prgr_data_key__`.
     static TPD: RefCell<Option<ManagedThread>> = const { RefCell::new(None) };
+    /// `intrnl->unmanaged.callbacks` entry of the registered thread.
+    static UNMANAGED_TPD: RefCell<Option<UnmanagedTpd>> = const { RefCell::new(None) };
     /// Block nesting of an unmanaged thread (erts temporary `ErtsThrPrgrData`).
     static UNMANAGED_BLOCKING: Cell<u32> = const { Cell::new(0) };
     /// The thread progress this thread is a managed thread of, compared by address only
@@ -287,11 +376,28 @@ impl ThrProgress {
     /// The state `erts_thr_progress_init` (erl_thr_progress.c:396, OTP-29.1.1) allocates. The
     /// runtime gets the one of the process through [`init`]; unit tests of the algorithm build
     /// their own.
+    #[cfg(test)]
     pub(crate) fn new(parked: Arc<[AtomicBool]>, sleepers: Arc<[OnceLock<Thread>]>) -> Self {
-        let managed = parked.len();
+        Self::new_with_managed_extra(parked, sleepers, 0, 0)
+    }
+
+    fn new_with_managed_extra(
+        parked: Arc<[AtomicBool]>,
+        sleepers: Arc<[OnceLock<Thread>]>,
+        managed_extra: usize,
+        unmanaged: usize,
+    ) -> Self {
+        let managed = parked.len() + managed_extra;
         let wakeup = std::array::from_fn(|_| WakeupData {
             len: AtomicU32::new(0),
             id: (0..managed).map(|_| AtomicUsize::new(0)).collect(),
+        });
+        let low = unmanaged.div_ceil(UNMANAGED_WAKEUP_BM_BITS);
+        let high = low.div_ceil(UNMANAGED_WAKEUP_BM_BITS);
+        let unmanaged_wakeup = std::array::from_fn(|_| UnmanagedWakeupData {
+            len: AtomicU32::new(0),
+            high: (0..high).map(|_| AtomicU32::new(0)).collect(),
+            low: (0..low).map(|_| AtomicU32::new(0)).collect(),
         });
         Self {
             current: AtomicU64::new(0),
@@ -300,8 +406,12 @@ impl ThrProgress {
             block_count: AtomicU32::new(BC_FLG_NOT_BLOCKING | managed as u32),
             event: (Mutex::new(()), Condvar::new()),
             wakeup,
+            unmanaged_wakeup,
+            unmanaged_callbacks: (0..unmanaged).map(|_| Mutex::new(None)).collect(),
+            unmanaged_next: AtomicUsize::new(0),
             parked,
             sleepers,
+            aux_event: OnceLock::new(),
             unmanaged_later: Mutex::new(VecDeque::new()),
             unmanaged_later_len: AtomicUsize::new(0),
             umrefc: [AtomicUsize::new(0), AtomicUsize::new(0)],
@@ -316,11 +426,34 @@ impl ThrProgress {
 
     /// The managed `wakeup` callback (erts wakeup_managed).
     fn wakeup_managed(&self, id: usize) {
-        self.parked[id].store(false, Ordering::SeqCst);
-        if let Some(thread) = self.sleepers[id].get() {
+        let thread = if id < self.parked.len() {
+            self.parked[id].store(false, Ordering::SeqCst);
+            self.sleepers[id].get()
+        } else {
+            if let Some(event) = self.aux_event.get() {
+                event.signal();
+            }
+            None
+        };
+        if let Some(thread) = thread {
             thread.unpark();
             crate::interrupt_if_poll_sleeper(thread);
         }
+    }
+
+    // Port of erl_thr_progress.c:276 (wakeup_unmanaged), OTP-29.1.1.
+    fn wakeup_unmanaged(&self, id: usize) {
+        let callback = self.unmanaged_callbacks[id]
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
+
+    pub(crate) fn register_aux_event(&self, event: Arc<ThreadEvent>) {
+        self.aux_event.set(event).expect("aux event registers once");
     }
 
     fn notify_event(&self) {
@@ -351,11 +484,34 @@ impl ThrProgress {
 
     // Port of erl_thr_progress.c:1268 (handle_wakeup_requests), OTP-29.1.1.
     fn handle_wakeup_requests(&self, current: u64) {
-        let data = &self.wakeup[(current as usize) & (WAKEUP_DATA_SIZE - 1)];
+        let wix = (current as usize) & (WAKEUP_DATA_SIZE - 1);
+        let data = &self.wakeup[wix];
         let len = data.len.load(Ordering::Acquire) as usize;
         if len != 0 {
             for id in &data.id[..len] {
                 self.wakeup_managed(id.load(Ordering::Acquire));
+            }
+            data.len.store(0, Ordering::Relaxed);
+        }
+        let data = &self.unmanaged_wakeup[wix];
+        if data.len.load(Ordering::Acquire) != 0 {
+            for (hix, high) in data.high.iter().enumerate() {
+                let mut hmask = high.load(Ordering::Relaxed);
+                while hmask != 0 {
+                    let hbit = hmask.trailing_zeros() as usize;
+                    hmask &= hmask - 1;
+                    let lix = hix * UNMANAGED_WAKEUP_BM_BITS + hbit;
+                    if let Some(low) = data.low.get(lix) {
+                        let mut lmask = low.load(Ordering::Relaxed);
+                        while lmask != 0 {
+                            let lbit = lmask.trailing_zeros() as usize;
+                            lmask &= lmask - 1;
+                            self.wakeup_unmanaged(lix * UNMANAGED_WAKEUP_BM_BITS + lbit);
+                        }
+                        low.store(0, Ordering::Relaxed);
+                    }
+                }
+                high.store(0, Ordering::Relaxed);
             }
             data.len.store(0, Ordering::Relaxed);
         }
@@ -367,6 +523,10 @@ impl ThrProgress {
         self.wakeup
             .iter()
             .any(|data| data.len.load(Ordering::Relaxed) != 0)
+            || self
+                .unmanaged_wakeup
+                .iter()
+                .any(|data| data.len.load(Ordering::Relaxed) != 0)
     }
 
     /// Whether the global value has reached `val` (erts erts_thr_progress_has_reached).
@@ -636,6 +796,32 @@ fn request_wakeup_managed(tpd: &mut ThrPrgrData, mut value: u64) {
     data.id[ix].store(tpd.id, Ordering::Release);
 }
 
+// Port of erl_thr_progress.c:1172 (request_wakeup_unmanaged), OTP-29.1.1.
+fn request_wakeup_unmanaged(tpd: &mut UnmanagedTpd, value: u64) {
+    let progress = Arc::clone(&tpd.progress);
+    if progress.has_reached_wakeup(value) {
+        progress.wakeup_unmanaged(tpd.id);
+        return;
+    }
+    let wix = (value as usize) & (WAKEUP_DATA_SIZE - 1);
+    if tpd.wakeup_request[wix] == value {
+        return;
+    }
+    let data = &progress.unmanaged_wakeup[wix];
+    let low_ix = tpd.id >> 5;
+    let low_bit = tpd.id & 0x1f;
+    let high_ix = low_ix >> 5;
+    let high_bit = low_ix & 0x1f;
+    data.low[low_ix].fetch_or(1 << low_bit, Ordering::Relaxed);
+    data.high[high_ix].fetch_or(1 << high_bit, Ordering::Relaxed);
+    data.len.fetch_add(1, Ordering::SeqCst);
+    if progress.has_reached_wakeup(value) {
+        progress.wakeup_unmanaged(tpd.id);
+    } else {
+        tpd.wakeup_request[wix] = value;
+    }
+}
+
 // Port of erl_thr_progress.c:1337 (thr_progress_block), OTP-29.1.1.
 fn thr_progress_block(progress: &ThrProgress, tpd: Option<&mut ThrPrgrData>) {
     let managed = tpd.is_some();
@@ -742,7 +928,16 @@ pub(crate) struct ManagedThread(std::rc::Rc<RefCell<ThrPrgrData>>);
 
 /// Register the calling thread as managed thread `id` of `progress`.
 // Port of erl_thr_progress.c:576 (erts_thr_progress_register_managed_thread), OTP-29.1.1.
+#[cfg(test)]
 pub(crate) fn register_managed_thread(progress: &Arc<ThrProgress>, id: usize) -> ManagedThread {
+    register_managed_thread_with_later_ops(progress, id, LaterOpState::shared())
+}
+
+pub(crate) fn register_managed_thread_with_later_ops(
+    progress: &Arc<ThrProgress>,
+    id: usize,
+    later_ops: std::rc::Rc<RefCell<LaterOpState>>,
+) -> ManagedThread {
     progress.lflgs.fetch_add(1, Ordering::Relaxed);
     let managed = ManagedThread(std::rc::Rc::new(RefCell::new(ThrPrgrData {
         progress: Arc::clone(progress),
@@ -756,18 +951,62 @@ pub(crate) fn register_managed_thread(progress: &Arc<ThrProgress>, id: usize) ->
         chk_next_ix: 0,
         // erl_thr_progress.c:499 (init_wakeup_request_array): no slot matches its index.
         wakeup_request: std::array::from_fn(|ix| (ix as u64).wrapping_sub(1)),
-        later_ops: VecDeque::new(),
-        // erl_process.c (init_aux_work_data): the aux work data starts zeroed and
-        // `latest_wakeup` is ERTS_THR_PRGR_VAL_FIRST.
-        later_op_size: 0,
-        later_op_thr_prgr: 0,
-        latest_wakeup: 0,
+        later_ops,
         leader_umrefc_waiting: -1,
         leader_umrefc_current: 0,
     })));
     TPD.with(|tpd| *tpd.borrow_mut() = Some(managed.clone()));
     MANAGED_OF.with(|of| of.set(Arc::as_ptr(progress) as usize));
     managed
+}
+
+/// Register a dirty scheduler as an unmanaged thread with its SSI poke callback.
+// Port of erl_thr_progress.c:517 (erts_thr_progress_register_unmanaged_thread), OTP-29.1.1.
+pub(crate) fn register_unmanaged_thread(
+    progress: &Arc<ThrProgress>,
+    wakeup: impl Fn() + Send + Sync + 'static,
+) -> UnmanagedRegistration {
+    assert!(TPD.with(|tpd| tpd.borrow().is_none()));
+    assert!(UNMANAGED_TPD.with(|tpd| tpd.borrow().is_none()));
+    let id = progress.unmanaged_next.fetch_add(1, Ordering::Relaxed);
+    let callback = progress
+        .unmanaged_callbacks
+        .get(id)
+        .expect("unmanaged thread count matches scheduler configuration");
+    *callback.lock().unwrap_or_else(|error| error.into_inner()) = Some(Arc::new(wakeup));
+    UNMANAGED_TPD.with(|tpd| {
+        *tpd.borrow_mut() = Some(UnmanagedTpd {
+            progress: Arc::clone(progress),
+            id,
+            wakeup_request: std::array::from_fn(|ix| (ix as u64).wrapping_sub(1)),
+        });
+    });
+    UnmanagedRegistration {
+        progress: Arc::clone(progress),
+        id,
+        _same_thread: std::marker::PhantomData,
+    }
+}
+
+/// The dirty scheduler's process-local thread-progress registration.
+pub(crate) struct UnmanagedRegistration {
+    progress: Arc<ThrProgress>,
+    id: usize,
+    _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for UnmanagedRegistration {
+    fn drop(&mut self) {
+        UNMANAGED_TPD.with(|tpd| {
+            let mut tpd = tpd.borrow_mut();
+            if tpd.as_ref().is_some_and(|tpd| tpd.id == self.id) {
+                tpd.take();
+            }
+        });
+        *self.progress.unmanaged_callbacks[self.id]
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
 }
 
 /// Drop the calling test thread's registration (a scheduler never ends its loop). Later
@@ -780,12 +1019,13 @@ pub(crate) fn unregister_managed_thread() {
         return;
     };
     let tpd = &mut *managed.0.borrow_mut();
-    if tpd.later_ops.is_empty() {
+    let mut later_ops = tpd.later_ops.borrow_mut();
+    if later_ops.later_ops.is_empty() {
         return;
     }
     let progress = Arc::clone(&tpd.progress);
     let mut shared = progress.unmanaged_later.lock().unwrap();
-    shared.extend(tpd.later_ops.drain(..));
+    shared.extend(later_ops.later_ops.drain(..));
     progress
         .unmanaged_later_len
         .store(shared.len(), Ordering::Release);
@@ -869,10 +1109,9 @@ pub(crate) fn run_remaining_later_ops(progress: &ThrProgress) {
     }
 }
 
-/// The scheduler's progress point: update, lead, block if requested, then run the
-/// later operations that became ready.
+/// The scheduler's progress point: update, lead and block if requested.
 // Port of erl_process.c:9857-9866 (schedule: erts_thr_progress_update and
-// erts_thr_progress_leader_update) and :2281 (handle_thr_prgr_later_op), OTP-29.1.1.
+// erts_thr_progress_leader_update), OTP-29.1.1.
 ///
 /// `run_queue_held` is the scheduler's run queue lock analogue. Port of
 /// erts/emulator/beam/erl_process.c:9857-9866 (schedule), OTP-29.1.1: `erts_thr_progress_update`
@@ -890,24 +1129,25 @@ pub(crate) fn scheduler_progress(managed: &ManagedThread, run_queue: &mut dyn Ru
             leader_update(tpd);
         }
     }
-    // Port of erts/emulator/beam/erl_process.c (handle_thr_prgr_later_op): the loop limit
-    // grows with the queue so the thread keeps up. Each operation runs with the thread data
-    // released: releasing a process can schedule another later operation.
-    let limit = managed.0.borrow().later_ops.len() / 8 + MIN_THR_PRGR_LATER_OPS;
+    if released && held {
+        run_queue.reacquire();
+    }
+}
+
+/// Drain ready scheduler-owned later operations from `handle_aux_work`.
+// Port of erts/emulator/beam/erl_process.c:2281 (handle_thr_prgr_later_op), OTP-29.1.1.
+pub(crate) fn handle_thr_prgr_later_op(managed: &ManagedThread) -> bool {
+    let limit = managed.0.borrow().later_ops.borrow().later_ops.len() / 8 + MIN_THR_PRGR_LATER_OPS;
     for _ in 0..limit {
         let op = next_ready_later_op(&mut managed.0.borrow_mut());
         let Some(op) = op else {
             break;
         };
-        if !released {
-            run_queue.release();
-            released = true;
-        }
         op.run();
     }
-    if released && held {
-        run_queue.reacquire();
-    }
+    let tpd = managed.0.borrow();
+    tpd.later_ops.borrow().later_ops.is_empty()
+        && tpd.progress.unmanaged_later_len.load(Ordering::Acquire) == 0
 }
 
 /// The scheduler's hold on its run queue lock across `erts_schedule`.
@@ -935,20 +1175,28 @@ impl RunQueueHold for () {
 // ERTS_SSI_AUX_WORK_THR_PRGR_LATER_OP is set, that is, later operations exist), OTP-29.1.1.
 fn next_ready_later_op(tpd: &mut ThrPrgrData) -> Option<LaterOp> {
     let shared_len = tpd.progress.unmanaged_later_len.load(Ordering::Acquire);
-    if tpd.later_ops.is_empty() && shared_len == 0 {
+    if tpd.later_ops.borrow().later_ops.is_empty() && shared_len == 0 {
         return None;
     }
     let current = tpd.progress.current.load(Ordering::Acquire);
-    if tpd
-        .later_ops
-        .front()
-        .is_some_and(|(later, _)| has_reached_this(current, *later))
-    {
-        let op = tpd.later_ops.pop_front().map(|(_, op)| op);
-        if tpd.later_ops.is_empty() {
-            tpd.later_op_size = LATER_CLEANUP_OP_THRESHOLD;
+    let local_op = {
+        let mut state = tpd.later_ops.borrow_mut();
+        if state
+            .later_ops
+            .front()
+            .is_some_and(|(later, _)| has_reached_this(current, *later))
+        {
+            let op = state.later_ops.pop_front().map(|(_, op)| op);
+            if state.later_ops.is_empty() {
+                state.size = LATER_CLEANUP_OP_THRESHOLD;
+            }
+            op
+        } else {
+            None
         }
-        return op;
+    };
+    if local_op.is_some() {
+        return local_op;
     }
     if shared_len == 0 {
         return None;
@@ -1020,17 +1268,18 @@ pub(crate) fn unblock(progress: &ThrProgress) {
 
 // Port of erts/emulator/beam/erl_process.c (haw_chk_later_cleanup_op_wakeup), OTP-29.1.1.
 fn haw_chk_later_cleanup_op_wakeup(tpd: &mut ThrPrgrData, val: u64) {
-    if !tpd.later_ops.is_empty() && cmp(val, tpd.later_op_thr_prgr) != std::cmp::Ordering::Less {
-        tpd.later_op_size = LATER_CLEANUP_OP_THRESHOLD;
+    let mut state = tpd.later_ops.borrow_mut();
+    if !state.later_ops.is_empty() && cmp(val, state.thr_prgr) != std::cmp::Ordering::Less {
+        state.size = LATER_CLEANUP_OP_THRESHOLD;
     }
 }
 
 // Port of erts/emulator/beam/erl_process.c (haw_thr_prgr_wakeup), OTP-29.1.1.
 fn haw_thr_prgr_wakeup(tpd: &mut ThrPrgrData, val: u64) {
-    let order = cmp(val, tpd.latest_wakeup);
+    let order = cmp(val, tpd.later_ops.borrow().latest_wakeup);
     if order != std::cmp::Ordering::Equal {
         if order == std::cmp::Ordering::Greater {
-            tpd.latest_wakeup = val;
+            tpd.later_ops.borrow_mut().latest_wakeup = val;
             haw_chk_later_cleanup_op_wakeup(tpd, val);
         }
         request_wakeup_managed(tpd, val);
@@ -1041,15 +1290,24 @@ fn haw_thr_prgr_wakeup(tpd: &mut ThrPrgrData, val: u64) {
 // cleanup operations ask for a wakeup only once their bytes passed the threshold; until then
 // they run when the thread passes its progress points anyway.
 fn haw_thr_prgr_later_cleanup_op_wakeup(tpd: &mut ThrPrgrData, val: u64, size: usize) {
-    if cmp(val, tpd.latest_wakeup) == std::cmp::Ordering::Greater {
-        tpd.later_op_thr_prgr = val;
-        if tpd.later_op_size > size {
-            tpd.later_op_size -= size;
+    let request = {
+        let mut state = tpd.later_ops.borrow_mut();
+        if cmp(val, state.latest_wakeup) == std::cmp::Ordering::Greater {
+            state.thr_prgr = val;
+            if state.size > size {
+                state.size -= size;
+                false
+            } else {
+                state.latest_wakeup = val;
+                state.size = LATER_CLEANUP_OP_THRESHOLD;
+                true
+            }
         } else {
-            tpd.latest_wakeup = val;
-            tpd.later_op_size = LATER_CLEANUP_OP_THRESHOLD;
-            request_wakeup_managed(tpd, val);
+            false
         }
+    };
+    if request {
+        request_wakeup_managed(tpd, val);
     }
 }
 
@@ -1076,7 +1334,7 @@ pub(crate) fn schedule_later_op(progress: &ThrProgress, op: LaterOp) {
             LaterOp::Cleanup { size, .. } => Some(size),
             LaterOp::Boxed(_) => None,
         };
-        tpd.later_ops.push_back((later, op));
+        tpd.later_ops.borrow_mut().later_ops.push_back((later, op));
         match cleanup_size {
             Some(size) => haw_thr_prgr_later_cleanup_op_wakeup(tpd, later, size),
             None => haw_thr_prgr_wakeup(tpd, later),
@@ -1092,6 +1350,15 @@ pub(crate) fn schedule_later_op(progress: &ThrProgress, op: LaterOp) {
             .unmanaged_later_len
             .store(shared.len(), Ordering::Release);
         drop(shared);
+        UNMANAGED_TPD.with(|unmanaged| {
+            let mut unmanaged = unmanaged.borrow_mut();
+            if let Some(tpd) = unmanaged
+                .as_mut()
+                .filter(|tpd| std::ptr::eq(Arc::as_ptr(&tpd.progress), progress))
+            {
+                request_wakeup_unmanaged(tpd, later);
+            }
+        });
         progress.wakeup_managed(0);
     }
 }
@@ -1114,10 +1381,51 @@ pub(crate) fn scheduler_later_op_ready() -> bool {
         tpd.is_some_and(|tpd| {
             let current = tpd.progress.current.load(Ordering::Acquire);
             tpd.later_ops
+                .borrow()
+                .later_ops
                 .front()
                 .is_some_and(|(later, _)| has_reached_this(current, *later))
+                || tpd
+                    .progress
+                    .unmanaged_later
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .front()
+                    .is_some_and(|(later, _)| has_reached_this(current, *later))
         })
     })
+}
+
+/// Whether this scheduler's first later operation is ready for its aux-work handler.
+pub(crate) fn later_op_ready(managed: &ManagedThread) -> bool {
+    let tpd = managed.0.borrow();
+    let current = tpd.progress.current.load(Ordering::Acquire);
+    tpd.later_ops
+        .borrow()
+        .later_ops
+        .front()
+        .is_some_and(|(later, _)| has_reached_this(current, *later))
+        || tpd
+            .progress
+            .unmanaged_later
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .front()
+            .is_some_and(|(later, _)| has_reached_this(current, *later))
+}
+
+/// The next thread-progress value for work scheduled by the calling managed thread.
+pub(crate) fn erts_thr_progress_later(managed: &ManagedThread) -> u64 {
+    let mut tpd = managed.0.borrow_mut();
+    fence(Ordering::SeqCst);
+    let later = current_to_later(tpd.confirmed);
+    request_wakeup_managed(&mut tpd, later);
+    later
+}
+
+/// Whether the global thread-progress value reached `value`.
+pub(crate) fn erts_thr_progress_has_reached(progress: &ThrProgress, value: u64) -> bool {
+    has_reached_this(progress.current.load(Ordering::Acquire), value)
 }
 
 /// Run a blocking wait without holding back thread progress: a waiting managed thread
@@ -1197,6 +1505,7 @@ mod tests {
                 for _ in 0..8 {
                     scheduler_progress(&managed, &mut ());
                 }
+                handle_thr_prgr_later_op(&managed);
                 assert!(ran.load(Ordering::SeqCst));
                 assert!(reached(&progress, 2));
                 unregister_managed_thread();
@@ -1226,8 +1535,11 @@ mod tests {
                     size,
                 };
                 schedule_later_op(&progress, cleanup(1024));
-                let first = managed.0.borrow().latest_wakeup;
-                assert_eq!(managed.0.borrow().later_op_size, LATER_CLEANUP_OP_THRESHOLD);
+                let first = managed.0.borrow().later_ops.borrow().latest_wakeup;
+                assert_eq!(
+                    managed.0.borrow().later_ops.borrow().size,
+                    LATER_CLEANUP_OP_THRESHOLD
+                );
                 // Move progress on so later operations get a later value.
                 for _ in 0..4 {
                     let tpd = &mut *managed.0.borrow_mut();
@@ -1238,19 +1550,27 @@ mod tests {
                 schedule_later_op(&progress, cleanup(1024));
                 {
                     let tpd = managed.0.borrow();
-                    assert_eq!(tpd.latest_wakeup, first, "small cleanup requests no wakeup");
-                    assert_eq!(tpd.later_op_size, LATER_CLEANUP_OP_THRESHOLD - 1024);
+                    let state = tpd.later_ops.borrow();
+                    assert_eq!(
+                        state.latest_wakeup, first,
+                        "small cleanup requests no wakeup"
+                    );
+                    assert_eq!(state.size, LATER_CLEANUP_OP_THRESHOLD - 1024);
                 }
                 schedule_later_op(&progress, cleanup(LATER_CLEANUP_OP_THRESHOLD));
                 {
                     let tpd = managed.0.borrow();
-                    assert_ne!(tpd.latest_wakeup, first, "the threshold requests a wakeup");
-                    assert_eq!(tpd.later_op_size, LATER_CLEANUP_OP_THRESHOLD);
+                    let state = tpd.later_ops.borrow();
+                    assert_ne!(
+                        state.latest_wakeup, first,
+                        "the threshold requests a wakeup"
+                    );
+                    assert_eq!(state.size, LATER_CLEANUP_OP_THRESHOLD);
                 }
                 for _ in 0..400 {
                     schedule_later_op(&progress, cleanup(8));
                 }
-                let queued = managed.0.borrow().later_ops.len();
+                let queued = managed.0.borrow().later_ops.borrow().later_ops.len();
                 CLEANED.store(0, Ordering::SeqCst);
                 for _ in 0..4 {
                     let tpd = &mut *managed.0.borrow_mut();
@@ -1258,13 +1578,13 @@ mod tests {
                         leader_update(tpd);
                     }
                 }
-                scheduler_progress(&managed, &mut ());
+                handle_thr_prgr_later_op(&managed);
                 assert_eq!(
                     CLEANED.load(Ordering::SeqCst),
                     queued / 8 + MIN_THR_PRGR_LATER_OPS
                 );
-                while !managed.0.borrow().later_ops.is_empty() {
-                    scheduler_progress(&managed, &mut ());
+                while !managed.0.borrow().later_ops.borrow().later_ops.is_empty() {
+                    handle_thr_prgr_later_op(&managed);
                 }
                 assert_eq!(CLEANED.load(Ordering::SeqCst), queued);
                 unregister_managed_thread();
@@ -1291,6 +1611,7 @@ mod tests {
                 for _ in 0..8 {
                     scheduler_progress(&managed, &mut ());
                 }
+                handle_thr_prgr_later_op(&managed);
                 assert!(
                     !ran.load(Ordering::SeqCst),
                     "progress passed an unmanaged delay"
@@ -1299,6 +1620,7 @@ mod tests {
                 for _ in 0..8 {
                     scheduler_progress(&managed, &mut ());
                 }
+                handle_thr_prgr_later_op(&managed);
                 assert!(ran.load(Ordering::SeqCst));
                 unregister_managed_thread();
             });
@@ -1332,6 +1654,38 @@ mod tests {
         assert!(!ran.load(Ordering::SeqCst));
         run_remaining_later_ops(&progress);
         assert!(ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn unmanaged_registration_uses_erts_wakeup_bitmap() {
+        let parked: Arc<[AtomicBool]> = vec![AtomicBool::new(false)].into();
+        let sleepers: Arc<[OnceLock<Thread>]> = vec![OnceLock::new()].into();
+        let progress = Arc::new(ThrProgress::new_with_managed_extra(
+            Arc::clone(&parked),
+            Arc::clone(&sleepers),
+            0,
+            1,
+        ));
+        let woke = Arc::new(AtomicBool::new(false));
+        let callback_woke = Arc::clone(&woke);
+        let registration = register_unmanaged_thread(&progress, move || {
+            callback_woke.store(true, Ordering::SeqCst)
+        });
+        UNMANAGED_TPD.with(|tpd| {
+            request_wakeup_unmanaged(tpd.borrow_mut().as_mut().unwrap(), 2);
+        });
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                progress.sleepers[0].set(std::thread::current()).unwrap();
+                let managed = register_managed_thread(&progress, 0);
+                for _ in 0..8 {
+                    scheduler_progress(&managed, &mut ());
+                }
+                unregister_managed_thread();
+            });
+        });
+        assert!(woke.load(Ordering::SeqCst));
+        drop(registration);
     }
 
     #[test]

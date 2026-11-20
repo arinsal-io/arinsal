@@ -303,16 +303,40 @@ fn remove_message_leave_reds(process: &mut crate::Process, fcalls: i32) -> i32 {
     fcalls
 }
 
-/// Records that the process waits for a message; the scheduler puts it to sleep.
+/// The process waits for a message: no live X registers (`c_p->arity = 0`), and
+/// `ERTS_PSFLG_ACTIVE` cleared in `p->state` unless its receive timer already fired, so
+/// schedule_out_process leaves it out of the run queues. The generated code then jumps to
+/// do_schedule; the process resumes at `cp`.
+// Port of erts/emulator/beam/jit/beam_jit_common.cpp:1192-1201 (beam_jit_wait_locked) and
+// emu/msg_instrs.tab:110 (wait clears F_DELAY_GC), OTP-29.1.1.
 #[unsafe(no_mangle)]
 pub extern "C" fn beam_jit_wait_locked(header: *mut ProcessHeader, resume: usize) {
-    if let Some(process) = crate::native_hooks::enter_runtime(header) {
-        // Port of erts/emulator/beam/emu/msg_instrs.tab:110 (wait clears F_DELAY_GC), OTP-29.1.1.
-        process.set_delay_gc(false);
-        let timeout = process.native_wait_timeout.take();
-        process.native_wait = Some(timeout);
-        process.native_wait_self = resume & 1 != 0;
-        process.native_exit_kind = crate::proc_create::NativeExit::Wait;
+    let Some(process) = crate::native_hooks::enter_runtime(header) else {
+        return;
+    };
+    process.set_delay_gc(false);
+    process.gc_live = 0;
+    process.set_native_resume_arity(0);
+    // A receive without clauses (the arm emitter tags its self-targeting wait with bit 0)
+    // never matches the messages queued so far; they are fetched so the outer queue's
+    // ERTS_PSFLG_SIG_IN_Q does not wake the process again at schedule-out.
+    if resume & 1 != 0 {
+        let exiting = arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
+            arinsal_sched::RunCtx::with_current(esdp, |ctx| process.wait_fetch_signals(ctx))
+        })
+        .flatten()
+        .expect("native code runs inside an executor slice, which publishes its scheduler data");
+        if exiting {
+            return;
+        }
+    }
+    if !process.receive_timer_timed_out()
+        && let Some(probe) = process.signal_probe()
+    {
+        probe.proc_state().fetch_and(
+            !arinsal_sched::psflg::ACTIVE,
+            std::sync::atomic::Ordering::Release,
+        );
     }
 }
 
@@ -344,12 +368,19 @@ pub extern "C" fn beam_jit_wait_timeout(
     match process.wait_timeout(crate::native_hooks::from_raw(timeout)) {
         Ok(Some(0)) => 0,
         Ok(remaining) => {
-            if remaining.is_some() {
+            if let Some(pos) = remaining {
                 // `c_p->def_arg_reg[0] = next`: the timeout label a timed-out schedule-in
                 // continues at.
                 process.receive_timeout_next = next;
+                // erts_set_proc_timer_term(c_p, timeout_value) while the process runs; a
+                // timer already set for this receive stays as it is.
+                arinsal_sched::erts_proc_sched_data(process, |_, esdp| {
+                    arinsal_sched::erts_set_proc_timer_term(esdp, pos);
+                })
+                .expect(
+                    "native code runs inside an executor slice, which publishes its scheduler data",
+                );
             }
-            process.native_wait_timeout = remaining;
             1
         }
         Err(_) => {

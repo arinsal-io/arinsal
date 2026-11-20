@@ -1102,7 +1102,7 @@ impl Process {
         if self.receive_timeout_pos.take().is_some() {
             self.receive_timeout_next = 0;
             if let Some(probe) = self.signal_probe() {
-                probe.receive_timer().cancel();
+                arinsal_sched::erts_cancel_proc_timer::<crate::Process>(probe.receive_timer());
             }
         }
     }
@@ -1131,7 +1131,7 @@ impl Process {
         }
         // ERTS_PTMR_CLEAR; F_INSLPQUEUE becomes F_TIMO (`receive_timeout_pos` stays set until
         // `timeout` runs).
-        probe.receive_timer().cancel();
+        probe.receive_timer().clear();
         self.set_native_pc(Some(next));
     }
 

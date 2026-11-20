@@ -3062,8 +3062,17 @@ fn statistics(
             pair(process, total, delta)
         }
         "context_switches" => {
-            let total =
-                scheduler_stats(process, ctx.as_deref()).map_or(0, |stats| stats.context_switches);
+            let total = ctx
+                .as_deref()
+                .map(|ctx| ctx.statistics_counters().2)
+                .or_else(|| {
+                    process
+                        .runtime
+                        .as_ref()
+                        .and_then(|runtime| runtime.scheduler().ok())
+                        .map(|scheduler| scheduler.statistics_counters().2)
+                })
+                .unwrap_or(0);
             // Port of erts/emulator/beam/erl_bif_info.c:4230, OTP-29.1.1.
             pair(process, total, 0)
         }
@@ -5308,18 +5317,15 @@ fn queue_counts(
     let schedulers = with_flags(process, |flags| flags.schedulers_total);
     // erts exposes one aggregated run queue for each dirty scheduler class.
     let slots = schedulers + 1 + usize::from(include_dirty_io);
-    let mut values = vec![0; slots];
-    if let Some(stats) = scheduler_stats(process, ctx) {
-        let source = if active {
-            &stats.active_tasks
-        } else {
-            &stats.run_queue_lengths
-        };
-        for (target, value) in values.iter_mut().take(schedulers).zip(source) {
-            *target = *value;
-        }
-    }
-    values
+    ctx.map(|ctx| ctx.erts_run_queues_len(active, include_dirty_io))
+        .or_else(|| {
+            process
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.scheduler().ok())
+                .map(|scheduler| scheduler.erts_run_queues_len(active, include_dirty_io))
+        })
+        .unwrap_or_else(|| vec![0; slots])
 }
 
 /// Active nanoseconds of the normal, then dirty CPU, then dirty I/O scheduler threads.

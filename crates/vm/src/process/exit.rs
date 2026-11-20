@@ -644,7 +644,7 @@ impl Process {
         debug_assert!(reason.is_pointer() || (reason.is_immed() && !reason.is_non_value()));
         // erl_process.c:14186: a system process (the first process and the
         // erl_system_process_otp ones) that terminates brings the node down.
-        if self.static_flags & crate::proc_create::ERTS_STC_FLG_SYSTEM_PROC != 0 {
+        if ctx.static_flags() & crate::proc_create::ERTS_STC_FLG_SYSTEM_PROC != 0 {
             let show = |term: Option<Term>| {
                 term.and_then(|term| arinsal_term::to_owned(term).ok())
                     .map_or_else(|| "?".to_owned(), |owned| owned.to_string())
@@ -787,9 +787,6 @@ impl Process {
         }
         if let Some(waiter) = state.waiter.take() {
             waiter.cancel();
-        }
-        if let Some(result) = self.cold.as_mut().and_then(|cold| cold.entry_result.take()) {
-            let _ = runtime.result.lock().unwrap().send(*result);
         }
         // erts finishes a suspended updater's table_updater even when the process is killed,
         // which releases the permission; the update is already published here.

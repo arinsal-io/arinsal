@@ -232,8 +232,9 @@ def run_cmd(cmd, env=None, timeout_sec=300):
         return f"CRASH: {e}", ""
 
 
-def run_erts(kernel_id: str, expected: int, op_count: int, warmup: int, repeats: int, sched: str = "default"):
-    cmd = ["erl", "-noshell"]
+def node_cmd(binary: str, kernel_id: str, warmup: int, repeats: int, sched: str):
+    """The same `erl -noshell -run kernels main ...` command line for erts and Arinsal."""
+    cmd = [binary, "-noshell"]
     if sched == "1":
         cmd.extend(["+S", "1:1"])
     cmd.extend([
@@ -248,6 +249,11 @@ def run_erts(kernel_id: str, expected: int, op_count: int, warmup: int, repeats:
         str(warmup),
         str(repeats),
     ])
+    return cmd
+
+
+def run_erts(kernel_id: str, expected: int, op_count: int, warmup: int, repeats: int, sched: str = "default"):
+    cmd = node_cmd("erl", kernel_id, warmup, repeats, sched)
     stdout, stderr = run_cmd(cmd, timeout_sec=300)
     if stdout == "TIMEOUT":
         return {"status": "TIMEOUT"}
@@ -256,18 +262,7 @@ def run_erts(kernel_id: str, expected: int, op_count: int, warmup: int, repeats:
 
 
 def run_arinsal(kernel_id: str, expected: int, op_count: int, warmup: int, repeats: int, beamasm: bool, sched: str = "default"):
-    cmd = [str(ARINSAL_BIN), "eval"]
-    if sched == "1":
-        cmd.extend(["+S", "1"])
-    cmd.extend([
-        "-pa",
-        str(EBIN_DIR),
-        "kernels",
-        "run_bench",
-        kernel_id,
-        str(warmup),
-        str(repeats),
-    ])
+    cmd = node_cmd(str(ARINSAL_BIN), kernel_id, warmup, repeats, sched)
     env = os.environ.copy()
 
     stdout, stderr = run_cmd(cmd, env=env, timeout_sec=300)

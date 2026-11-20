@@ -3,6 +3,7 @@
 
 use arinsal_alloc::typed::{AllocBlock, ErtsAlcType, instance_count};
 use arinsal_sched::{Config, Scheduler, Task};
+use similar_asserts::assert_eq;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -29,7 +30,7 @@ fn block_instance() -> usize {
 
 #[test]
 fn scheduler_threads_own_their_instance() {
-    let scheduler = Scheduler::<Idle>::new(Config {
+    let scheduler = start_scheduler::<Idle>(Config {
         workers: 3,
         dirty_cpu_schedulers: 2,
         dirty_io_schedulers: 1,
@@ -40,7 +41,7 @@ fn scheduler_threads_own_their_instance() {
 
     let (sender, receiver) = mpsc::channel();
     let sender = std::sync::Mutex::new(sender);
-    scheduler.request_aux_work_all(move |worker| {
+    scheduler.erts_schedule_multi_misc_aux_work(move |worker| {
         let instance = block_instance();
         sender.lock().unwrap().send((worker, instance)).unwrap();
     });
@@ -58,7 +59,7 @@ fn scheduler_threads_own_their_instance() {
 
     let block = arinsal_alloc::typed::AllocBlock::new(ErtsAlcType::HEAP, 4).unwrap();
     let (sender, receiver) = mpsc::channel();
-    scheduler.request_aux_work(1, move || {
+    scheduler.erts_schedule_misc_aux_work(2, move || {
         let owned = AllocBlock::new(ErtsAlcType::HEAP, 4).unwrap();
         sender.send(owned).unwrap();
     });
@@ -75,4 +76,15 @@ fn scheduler_threads_own_their_instance() {
         finished.recv_timeout(Duration::from_secs(30)).is_ok(),
         "the owner of instance 2 answers a drain request from this thread"
     );
+}
+
+/// A scheduler started the way `erl_start` starts one: erl_process.c:6090
+/// (erts_init_scheduling), then erl_process.c:8909 (erts_start_schedulers).
+fn start_scheduler<T: arinsal_sched::Task>(
+    config: arinsal_sched::Config,
+) -> arinsal_sched::Scheduler<T> {
+    let dirty_cpu_online = config.dirty_cpu_schedulers.max(1);
+    let scheduler = Scheduler::erts_init_scheduling(config, dirty_cpu_online);
+    scheduler.erts_start_schedulers();
+    scheduler
 }

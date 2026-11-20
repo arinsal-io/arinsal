@@ -1213,11 +1213,6 @@ impl Process {
             crate::signals::process_exiting(self, ctx);
             let reason = exit_reason_from(self, &error);
             self.notify_exit(vm, ctx, reason);
-            if self.entry
-                && let Some(runtime) = self.runtime.as_ref()
-            {
-                let _ = runtime.result.lock().unwrap().send(Err(error));
-            }
             // `notify_exit` released the cold state; the process stays marked exited.
             self.slice_mut().dirty_exited = true;
         }

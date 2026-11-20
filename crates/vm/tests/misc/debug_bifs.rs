@@ -29,7 +29,11 @@ map_layout() ->
               37 => 74, 38 => 76, 39 => 78, 40 => 80},
     {erts_internal:term_type(Flat), erts_internal:map_to_tuple_keys(Flat),
      erts_internal:term_type(Large), erts_debug:map_info(Large)}.
-hash_children() -> erts_internal:map_hashmap_children(#{1 => 2, 2 => 4, 3 => 6, 4 => 8,
+%% The HAMT sub-nodes are classified inside the node: term_to_binary of a sub-node does not
+%% round-trip in erts (it is not a whole map), so they cannot leave the node as terms.
+hash_children() ->
+    [case is_map(C) of true -> $M; false -> $L end || C <- hash_children_raw()].
+hash_children_raw() -> erts_internal:map_hashmap_children(#{1 => 2, 2 => 4, 3 => 6, 4 => 8,
                                          5 => 10, 6 => 12, 7 => 14, 8 => 16, 9 => 18, 10 => 20,
                                          11 => 22, 12 => 24, 13 => 26, 14 => 28, 15 => 30,
                                          16 => 32, 17 => 34, 18 => 36, 19 => 38, 20 => 40,
@@ -420,15 +424,14 @@ fn debug_bifs_hashmap_children_match_one_shot_otp() {
     let expected = output.stdout;
     let actual = run_vm(&beam, "hash_children");
     let OwnedTerm::List { elems, tail } = &actual else {
-        panic!("expected hashmap child list, got {actual:?}");
+        panic!("expected hashmap child kind string, got {actual:?}");
     };
     assert_eq!(**tail, OwnedTerm::Nil);
     let actual_kinds: Vec<_> = elems
         .iter()
-        .map(|child| match child {
-            OwnedTerm::Map(_) => b'M',
-            OwnedTerm::List { .. } => b'L',
-            other => panic!("unexpected HAMT child {other:?}"),
+        .map(|kind| match kind {
+            OwnedTerm::Int(kind) => u8::try_from(*kind).expect("kind character"),
+            other => panic!("unexpected HAMT child kind {other:?}"),
         })
         .collect();
     assert_eq!(expected, actual_kinds);

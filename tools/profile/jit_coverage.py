@@ -268,19 +268,7 @@ def kernels(runs: int) -> None:
                 env = os.environ.copy()
                 env.update(extra)
                 completed = run(
-                    [
-                        "timeout",
-                        "120",
-                        str(cli),
-                        "eval",
-                        "--schedulers",
-                        "1",
-                        "-pa",
-                        str(beam),
-                        "kernels",
-                        name,
-                        str(n),
-                    ],
+                    ["timeout", "120", *node_eval(cli, ["-pa", str(beam)], "kernels", name, [n])],
                     ROOT,
                     env,
                     timeout=130,
@@ -323,7 +311,7 @@ def kernels(runs: int) -> None:
         env["ARINSAL_JIT_THRESHOLD"] = "1"
         env["ARINSAL_JIT_STATS"] = "1"
         completed = run(
-            ["timeout", "120", str(cli), "eval", "--schedulers", "1", "-pa", str(beam), "kernels", name, str(n)],
+            ["timeout", "120", *node_eval(cli, ["-pa", str(beam)], "kernels", name, [n])],
             ROOT,
             env,
             timeout=130,
@@ -332,6 +320,18 @@ def kernels(runs: int) -> None:
         write_parsed(OUT / f"kernel-{name}.stats", parsed)
         print(f"  stats {name} {fmt_summary(parsed)}", flush=True)
     (OUT / "kernels.csv").write_text("\n".join(rows) + "\n")
+
+
+def node_eval(cli: Path, pa: list[str], module: str, function: str, args: list[int]) -> list[str]:
+    """`arinsal +S 1:1 -noshell -pa ... -eval` calling `module:function(args)` and printing the
+    result and `function <ms>ms`, the same command line an erts bench uses."""
+    call = f"{module}:{function}({','.join(map(str, args))})"
+    expr = (
+        f"T0=erlang:monotonic_time(microsecond),R={call},"
+        f"T1=erlang:monotonic_time(microsecond),"
+        f"io:format(\"~p~n~s ~.3fms~n\",[R,\"{function}\",(T1-T0)/1000]),halt()."
+    )
+    return [str(cli), "+S", "1:1", "-noshell", *pa, "-eval", expr]
 
 
 def code_paths() -> list[str]:
@@ -389,10 +389,7 @@ def attribute(reps: int) -> None:
                 env = os.environ.copy()
                 env["ARINSAL_JIT_THRESHOLD"] = "1"
                 env[instrument] = "1"
-                cmd = [
-                    "timeout", "180", str(cli), "eval", "--schedulers", "1",
-                    *pa, "jit_attrib", function, str(count),
-                ]
+                cmd = ["timeout", "180", *node_eval(cli, pa, "jit_attrib", function, [count])]
                 print(f"attrib {label} {tag} {measure} n={count}", flush=True)
                 completed = run(cmd, ROOT, env, timeout=190)
                 output = completed.stdout.splitlines()
@@ -418,8 +415,7 @@ def sample_scenarios() -> None:
         env["ARINSAL_JIT_THRESHOLD"] = "1"
         process = subprocess.Popen(
             ["timeout", "12", "sh", "-c", 'printf "PID=%s\\n" "$$"; exec "$@"',
-             "sh", str(cli), "eval", "--schedulers", "1", *pa,
-             "jit_attrib", function, "100000"],
+             "sh", *node_eval(cli, pa, "jit_attrib", function, [100000])],
             cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True,
         )

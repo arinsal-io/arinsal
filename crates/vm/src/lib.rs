@@ -327,10 +327,6 @@ impl Vm {
         native_bridge::register_native_function(function)
     }
 
-    /// Paths currently searched for lazy module loading: the boot code path.
-    pub fn paths(&self) -> Vec<PathBuf> {
-        crate::erl_init::erts_boot_paths()
-    }
     /// Parse and load every BEAM file beneath a directory, reporting errors.
     pub fn load_file(&mut self, path: &Path) -> Result<usize, VmError> {
         let bytes = std::fs::read(path).map_err(|e| VmError::Load(e.to_string()))?;

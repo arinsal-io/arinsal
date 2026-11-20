@@ -502,27 +502,8 @@ pub(crate) enum TimerPayload<M> {
     Port(Box<dyn FnOnce() + Send>),
 }
 
-pub(crate) enum TimerCommand<M> {
-    Insert {
-        id: u64,
-        deadline: u64,
-        payload: TimerPayload<M>,
-    },
-    Read {
-        id: u64,
-        callback: Box<dyn FnOnce(Option<u64>) + Send>,
-    },
-    Cancel {
-        id: u64,
-        callback: Box<dyn FnOnce(Option<u64>) + Send>,
-    },
-    /// Cancel the timers of `ids` (this wheel's entries of the receiver's bif-timer tree).
-    CancelTarget { ids: Vec<u64> },
-    /// Hold the BIF timers aimed at `pid` (a suspended process).
-    PauseTarget { pid: Pid, ids: Vec<u64> },
-}
-
-/// A receive timeout cancelled by another thread (erts canceled-timer queue).
+/// A timer cancelled by a thread that does not own its wheel, queued for the owner
+/// (`ErtsHLTCncldTmrQ` entry, erl_hl_timer.c queue_canceled_timer).
 pub(crate) struct CanceledTimer {
     pub(crate) id: u64,
 }
@@ -541,18 +522,21 @@ struct Entry<M> {
     tree_next: u32,
     /// `None` while the slab entry is free.
     payload: Option<TimerPayload<M>>,
+    /// The wheel triggered the timer in the current bump; its timeout is running, so it can
+    /// no longer be cancelled or read (erts runs the callback inside the bump).
+    triggered: bool,
 }
 
 /// The `arg` of the service timer (`srv->service_timer`); timer slab indices are below it.
 const SERVICE_TIMER_ARG: usize = u32::MAX as usize;
 
 /// Timeouts the wheel triggered during one bump, in trigger order: slab indices, or
-/// [`SERVICE_TIMER_ARG`] for the service timer.
+/// [`SERVICE_TIMER_ARG`] for the service timer. The buffer is reused across bumps.
 struct Triggered(Vec<usize>);
 
 // Port of erts/emulator/beam/erl_hl_timer.c (tw_proc_timeout, tw_bif_timer_timeout,
 // tw_callback_timeout, hlt_service_timeout), OTP-29.1.1: the wheel hands the timeout to the
-// service, which runs it once the bump returns.
+// service, which runs the timeouts in trigger order through `Wheel::next_timeout`.
 fn timer_timeout(_wheel: &mut TimerWheel, esdp: &mut dyn Any, arg: *mut ()) {
     esdp.downcast_mut::<Triggered>()
         .expect("timer service bump context")
@@ -576,6 +560,8 @@ pub(crate) struct Wheel<M> {
     free_entries: Vec<u32>,
     entry_count: usize,
     triggered: Triggered,
+    /// The next [`Wheel::triggered`] entry whose timeout has not run yet.
+    triggered_at: usize,
     /// The time of the latest bump; timeouts are measured from it to pick wheel or tree.
     now: u64,
     /// Link and unlink events for the receivers' bif-timer trees, applied by the scheduler
@@ -599,6 +585,7 @@ impl<M> Wheel<M> {
             free_entries: Vec::new(),
             entry_count: 0,
             triggered: Triggered(Vec::new()),
+            triggered_at: 0,
             now,
             link_events: std::collections::VecDeque::new(),
             worker: 0,
@@ -614,9 +601,11 @@ impl<M> Wheel<M> {
         self.worker
     }
 
+    /// The slab entry of a timer still set: a triggered timer is already timing out.
     fn index_for_id(&self, id: u64) -> Option<u32> {
         let node = self.id_index.find(id)?;
-        Some(self.id_index.node(node).head)
+        let index = self.id_index.node(node).head;
+        (!self.entries[index as usize].triggered).then_some(index)
     }
 
     // Port of erts/emulator/beam/erl_hl_timer.c (create_tw_timer, create_hl_timer), OTP-29.1.1:
@@ -638,6 +627,7 @@ impl<M> Wheel<M> {
                     tree_prev: NIL,
                     tree_next: NIL,
                     payload: None,
+                    triggered: false,
                 });
                 index
             }
@@ -649,6 +639,7 @@ impl<M> Wheel<M> {
             entry.deadline = deadline;
             entry.hlt = hlt;
             entry.payload = Some(payload);
+            entry.triggered = false;
         }
         let id_node = self.id_index.insert_node(id);
         assert_eq!(self.id_index.node(id_node).head, NIL, "duplicate timer id");
@@ -855,40 +846,53 @@ impl<M> Wheel<M> {
             .max(0) as u64
     }
 
-    /// Port of erts/emulator/beam/time.c (erts_bump_timers) with the service's timeout
-    /// callbacks, OTP-29.1.1: the timers due at `now` in trigger order. A bump that reached
-    /// its yield limit leaves the next timeout time at `now`, so the scheduler bumps again.
-    pub(crate) fn bump_timers(&mut self, now: u64) -> Vec<(u64, TimerPayload<M>)> {
-        let mut due = Vec::new();
+    /// Port of erts/emulator/beam/time.c:784 (erts_bump_timers), OTP-29.1.1: advances the
+    /// wheel to `now`; the timers it triggers time out, in trigger order, through
+    /// [`Wheel::next_timeout`], which the scheduler calls until it returns `None`. A bump that
+    /// reached its yield limit leaves the next timeout time at `now`, so the scheduler bumps
+    /// again.
+    pub(crate) fn bump_timers(&mut self, now: u64) {
+        debug_assert_eq!(self.triggered_at, self.triggered.0.len());
         self.now = self.now.max(now);
+        self.triggered.0.clear();
+        self.triggered_at = 0;
         let mut triggered = std::mem::replace(&mut self.triggered, Triggered(Vec::new()));
         self.tw
             .bump_timers(now.min(i64::MAX as u64) as i64, &mut triggered);
-        for arg in triggered.0.drain(..) {
-            if arg == SERVICE_TIMER_ARG {
-                self.hlt_service_timeout(now, &mut due);
-            } else {
-                let (id, _, payload) = self.free(arg as u32);
-                self.remove_target_entry(id, &payload);
-                due.push((id, payload));
+        for &arg in &triggered.0 {
+            if arg != SERVICE_TIMER_ARG {
+                self.entries[arg].triggered = true;
             }
         }
         self.triggered = triggered;
-        due
     }
 
-    // Port of erts/emulator/beam/erl_hl_timer.c (hlt_service_timeout), OTP-29.1.1: every
-    // time-tree timer due at `now` times out in timeout order; the service timer moves to the
-    // next one.
-    fn hlt_service_timeout(&mut self, now: u64, due: &mut Vec<(u64, TimerPayload<M>)>) {
-        while let Some(node) = self.high_level.first_at_or_before(now) {
-            let index = self.high_level.node(node).head;
-            self.remove_hl_timer(index);
-            let (id, _, payload) = self.free(index);
-            self.remove_target_entry(id, &payload);
-            due.push((id, payload));
+    /// The next timeout of the latest bump: the timer leaves the service and its payload is
+    /// returned for the scheduler to run (tw_proc_timeout, tw_bif_timer_timeout,
+    /// tw_callback_timeout). The service timer expands to every time-tree timer due at the
+    /// bump time (hlt_service_timeout).
+    pub(crate) fn next_timeout(&mut self) -> Option<(u64, TimerPayload<M>)> {
+        loop {
+            let &arg = self.triggered.0.get(self.triggered_at)?;
+            if arg != SERVICE_TIMER_ARG {
+                self.triggered_at += 1;
+                let (id, _, payload) = self.free(arg as u32);
+                self.remove_target_entry(id, &payload);
+                return Some((id, payload));
+            }
+            // Port of erts/emulator/beam/erl_hl_timer.c (hlt_service_timeout), OTP-29.1.1:
+            // every time-tree timer due at the bump time times out in timeout order; the
+            // service timer moves to the next one.
+            if let Some(node) = self.high_level.first_at_or_before(self.now) {
+                let index = self.high_level.node(node).head;
+                self.remove_hl_timer(index);
+                let (id, _, payload) = self.free(index);
+                self.remove_target_entry(id, &payload);
+                return Some((id, payload));
+            }
+            self.triggered_at += 1;
+            self.set_service_timer();
         }
-        self.set_service_timer();
     }
 }
 
@@ -960,11 +964,15 @@ mod tests {
         assert_eq!(tree.root, NIL);
     }
 
+    fn drain(wheel: &mut Wheel<u8>, now: u64) -> Vec<u64> {
+        wheel.bump_timers(now);
+        std::iter::from_fn(|| wheel.next_timeout().map(|(id, _)| id)).collect()
+    }
+
     fn bump(wheel: &mut Wheel<u8>, now: u64) -> Vec<u64> {
         let mut ids = Vec::new();
         loop {
-            let due = wheel.bump_timers(now);
-            ids.extend(due.into_iter().map(|(id, _)| id));
+            ids.extend(drain(wheel, now));
             if wheel.next_timeout_time() > now || !wheel.has_timers() {
                 return ids;
             }
@@ -1030,12 +1038,28 @@ mod tests {
         for id in 1..=20_050 {
             wheel.insert(id, deadline, TimerPayload::Message(pid, 1, true));
         }
-        let first = wheel.bump_timers(deadline);
-        assert!(first.len() < 20_050);
+        let mut ids = drain(&mut wheel, deadline);
+        assert!(ids.len() < 20_050);
         assert!(wheel.next_timeout_time() <= deadline);
-        let mut ids: Vec<u64> = first.into_iter().map(|(id, _)| id).collect();
         ids.extend(bump(&mut wheel, deadline));
         assert_eq!(ids, (1..=20_050).collect::<Vec<_>>());
+    }
+
+    // Port of erts/emulator/beam/erl_hl_timer.c (access_btm), OTP-29.1.1: a timer whose
+    // timeout started cannot be canceled or read, even before its timeout has run.
+    #[test]
+    fn a_triggered_timer_is_no_longer_cancelable() {
+        let pid = Pid::new(0, 0);
+        let mut wheel = Wheel::<u8>::new(0);
+        wheel.insert(1, 5, TimerPayload::Message(pid, 1, true));
+        wheel.insert(2, 5, TimerPayload::Message(pid, 2, true));
+        wheel.bump_timers(5);
+        assert_eq!(wheel.next_timeout().map(|(id, _)| id), Some(1));
+        assert!(wheel.cancel(2).is_none());
+        assert_eq!(wheel.remaining(2), None);
+        assert_eq!(wheel.next_timeout().map(|(id, _)| id), Some(2));
+        assert!(wheel.next_timeout().is_none());
+        assert!(!wheel.has_timers());
     }
 
     #[test]

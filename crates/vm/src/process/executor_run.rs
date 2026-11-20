@@ -493,7 +493,7 @@ pub(super) fn process_main(
                                 // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
                                 process.set_hibernate_sched(true);
                             }
-                            break Ok(RunState::Wait { timeout_pos: None });
+                            break Ok(RunState::Wait);
                         }
                         hibernate_wakeup(process, reg)?;
                         continue;
@@ -583,11 +583,18 @@ pub(super) fn process_main(
     // new input, so the rest is handled before it sleeps. Messages it produces end the
     // wait like a new message would.
     let result = match result {
-        Ok(RunState::Wait { timeout_pos }) if !process.sig_cont_empty() => {
+        Ok(RunState::Wait) if !process.sig_cont_empty() => {
             let queued = process.inbox.len();
             match process.handle_local_signals(ctx) {
-                Ok(()) if process.inbox.len() == queued => Ok(RunState::Wait { timeout_pos }),
-                Ok(()) => Ok(RunState::Yield),
+                Ok(()) if process.inbox.len() == queued => Ok(RunState::Wait),
+                // A message reached the queue after the wait cleared ERTS_PSFLG_ACTIVE: it
+                // makes the process active again, as erts_proc_notify_new_message does for a
+                // process that is not active (erl_proc_sig_queue.h:2080).
+                Ok(()) => {
+                    ctx.proc_state()
+                        .fetch_or(arinsal_sched::psflg::ACTIVE, Ordering::AcqRel);
+                    Ok(RunState::Yield)
+                }
                 Err(error) => Err(error),
             }
         }
@@ -595,7 +602,7 @@ pub(super) fn process_main(
     };
     if matches!(
         result,
-        Ok(RunState::Yield | RunState::Wait { .. }) | Err(VmError::Yield | VmError::Dirty(_))
+        Ok(RunState::Yield | RunState::Wait) | Err(VmError::Yield | VmError::Dirty(_))
     ) {
         // Port of erts/emulator/beam/erl_process.c:10550 and beam_common.c (the yield or
         // wait site stores its live X register count in `c_p->arity`, and only those are

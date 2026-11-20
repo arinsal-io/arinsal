@@ -1813,16 +1813,6 @@ pub(crate) fn change_on_load(
     }
 }
 
-/// Whether any session of this runtime has an active on_load pattern.
-pub(crate) fn any_on_load_pattern(process: &Process) -> bool {
-    let runtime = runtime_id(process);
-    on_load_patterns()
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|((owner, _), pattern)| *owner == runtime && pattern.is_on)
-}
-
 pub(crate) fn on_load_pattern(process: &Process, session: u64) -> Option<OnLoadPattern> {
     on_load_patterns()
         .lock()
