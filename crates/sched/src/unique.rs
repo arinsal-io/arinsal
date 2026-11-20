@@ -2,11 +2,7 @@
 //!
 //! Port of erts/emulator/beam/erl_bif_unique.c and erl_bif_unique.h, OTP-29.1.1.
 
-#[path = "unique/raw.rs"]
-mod raw;
-
 use std::cell::Cell;
-use std::rc::Rc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,10 +20,8 @@ const MIN_SMALL: i128 = -(1_i128 << 59);
 
 /// The `thr_id`, `unique` and `ref` fields of a scheduler's `SchedRefUnique`.
 ///
-/// They are part of the scheduler's one data block (`crate::SchedRefUnique`). The
-/// thread-local binding is erts' `erts_get_scheduler_data()` for code that has no `esdp`
-/// at hand (VM and NIF calls); it holds a counted handle so the scheduler loop keeps
-/// its `&mut esdp`.
+/// They are fields of the scheduler's data (`ErtsSchedulerData`), which code without an
+/// `esdp` at hand (VM and NIF calls) reaches through `erts_get_scheduler_data()`.
 // Port of erts/emulator/beam/erl_process.h:718-720 (`SchedRefUnique.thr_id`, `.unique`,
 // `.ref`) and erl_process.c (`init_scheduler_data`), OTP-29.1.1.
 pub struct SchedRefUnique {
@@ -63,14 +57,6 @@ impl SchedRefUnique {
         }
     }
 
-    /// Bind these scheduler-owned counters for the lifetime of its worker thread.
-    pub fn bind(self: &Rc<Self>) -> SchedulerDataGuard {
-        SchedulerDataGuard {
-            previous: raw::replace(self),
-            _data: Rc::clone(self),
-        }
-    }
-
     fn bump_ref_words(&self) -> [u32; 3] {
         let value = self.ref_n.get();
         self.ref_n.set(value.wrapping_add(1));
@@ -86,19 +72,6 @@ impl SchedRefUnique {
             positive,
             unique_layout(),
         )
-    }
-}
-
-/// Restores the previous scheduler binding when a task turn returns.
-pub struct SchedulerDataGuard {
-    previous: *const SchedRefUnique,
-    /// Keeps the bound counters alive; `Rc` also keeps the guard on its thread.
-    _data: Rc<SchedRefUnique>,
-}
-
-impl Drop for SchedulerDataGuard {
-    fn drop(&mut self) {
-        raw::restore(self.previous);
     }
 }
 
@@ -156,7 +129,8 @@ fn set_ref_numbers(thr_id: u32, value: u64) -> [u32; 3] {
 // (`erts_sched_make_ref_in_array`), OTP-29.1.1.
 #[inline]
 pub fn next_ref_words() -> [u32; 3] {
-    raw::with_current(SchedRefUnique::bump_ref_words).unwrap_or_else(global_ref_words)
+    crate::sched_data_key::with_head(|esdp| esdp.ref_unique.bump_ref_words())
+        .unwrap_or_else(global_ref_words)
 }
 
 /// Next ordinary-reference identifier.
@@ -225,12 +199,14 @@ fn layout_for(bits: u64) -> UniqueLayout {
 // `bld_unique_integer_term`), OTP-29.1.1.
 #[inline]
 pub fn next_unique_integer(positive: bool) -> i128 {
-    raw::with_current(|data| data.bump_unique(positive)).unwrap_or_else(|| {
-        let unique = GLOBAL_UNIQUE
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
-        combine_unique(0, unique, positive, unique_layout())
-    })
+    crate::sched_data_key::with_head(|esdp| esdp.ref_unique.bump_unique(positive)).unwrap_or_else(
+        || {
+            let unique = GLOBAL_UNIQUE
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
+            combine_unique(0, unique, positive, unique_layout())
+        },
+    )
 }
 
 fn combine_unique(thr_id: u64, unique: u64, positive: bool, layout: UniqueLayout) -> i128 {
@@ -300,14 +276,13 @@ mod tests {
 
     #[test]
     fn scheduler_data_keeps_its_reference_counter() {
-        let data = Rc::new(SchedRefUnique {
+        let data = SchedRefUnique {
             thr_id: Cell::new(7),
             ref_n: Cell::new(9),
             unique_n: Cell::new(0),
-        });
-        let _guard = data.bind();
-        let first = next_ref_words();
-        let second = next_ref_words();
+        };
+        let first = data.bump_ref_words();
+        let second = data.bump_ref_words();
         assert_eq!(first, set_ref_numbers(7, 9));
         assert_eq!(second, set_ref_numbers(7, 10));
     }

@@ -852,7 +852,7 @@ fixed_badargs() ->
             .compile_named("vm_exc_apply", source, &[])
             .unwrap();
         reference.load("vm_exc_apply", &beam).unwrap();
-        let mut vm = crate::Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
 
         for type_name in ["apply_last", "double_apply_last", "multi_apply_last"] {

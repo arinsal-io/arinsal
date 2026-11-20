@@ -22,15 +22,20 @@ extern "C" fn add_stacktrace_stub(_: *mut ProcessHeader, reason: u64, _: u64) ->
     reason
 }
 
-extern "C" fn uncaught(_: *mut ProcessHeader, _: u64, _: *mut u64, _: u64) -> usize {
+extern "C" fn uncaught(
+    _: *mut ProcessHeader,
+    _: usize,
+    _: *mut u64,
+    _: *const arinsal_term::ErtsCodeMfa,
+) -> usize {
     0
 }
 
 extern "C" fn route_to_header_handler(
     process: *mut ProcessHeader,
-    _: u64,
+    _: usize,
     _: *mut u64,
-    _: u64,
+    _: *const arinsal_term::ErtsCodeMfa,
 ) -> usize {
     arinsal_beamasm::rt::process_header_mut(process, |header| {
         // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:295-330:
@@ -42,9 +47,9 @@ extern "C" fn route_to_header_handler(
 
 extern "C" fn unwind_and_route_to_header_handler(
     process: *mut ProcessHeader,
-    _: u64,
+    _: usize,
     _: *mut u64,
-    _: u64,
+    _: *const arinsal_term::ErtsCodeMfa,
 ) -> usize {
     arinsal_beamasm::rt::process_header_mut(process, |header| {
         // The shared raise fragment pushed a fake CP; handle_error discards it before

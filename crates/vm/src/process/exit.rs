@@ -642,6 +642,19 @@ impl Process {
         reason: Term,
     ) {
         debug_assert!(reason.is_pointer() || (reason.is_immed() && !reason.is_non_value()));
+        // erl_process.c:14186: a system process (the first process and the
+        // erl_system_process_otp ones) that terminates brings the node down.
+        if self.static_flags & crate::proc_create::ERTS_STC_FLG_SYSTEM_PROC != 0 {
+            let show = |term: Option<Term>| {
+                term.and_then(|term| arinsal_term::to_owned(term).ok())
+                    .map_or_else(|| "?".to_owned(), |owned| owned.to_string())
+            };
+            crate::natives::node::erts_exit_dump(&format!(
+                "System process {} terminated: {}",
+                show(ctx.pid().to_term()),
+                show(Some(reason)),
+            ));
+        }
         // erl_process.c:14173: `p->arity = 0`, no live registers.
         self.heap.abi.arity = 0;
         // erts finishes a parked fragmented send in ERTS_CONTINUE_EXIT_DIST_SEND, before the

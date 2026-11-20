@@ -106,7 +106,8 @@ owner_exit() ->
     after 1000 -> 0
     end.
 detached_child_survives() ->
-    Path = filename:join("/private/tmp", "port_life_detached_" ++ os:getpid()),
+    %% /private/tmp exists only on macOS; TMPDIR or /tmp exists on every host erl runs on.
+    Path = filename:join(os:getenv("TMPDIR", "/tmp"), "port_life_detached_" ++ os:getpid()),
     P = open_port({spawn_executable, "/bin/sh"},
                   [{args, ["-c", "sleep 0.2; /usr/bin/touch " ++ Path]}]),
     true = port_close(P),

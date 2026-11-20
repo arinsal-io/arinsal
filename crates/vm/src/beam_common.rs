@@ -454,7 +454,9 @@ fn ensure_x_roots(
     process.ensure_objv(need, roots).is_ok()
 }
 
-/// Resolves a native exception to a catch address, or zero when the scheduler must exit it.
+/// Resolves the exception of `c_p` to its catch handler, or returns zero when the scheduler
+/// must exit it. The one entry of generated code on both targets (x86 `raise_exception_shared`
+/// / `process_exit`, the arm raise fragments).
 // Port of erts/emulator/beam/beam_common.c:449-570 (handle_error), OTP-29.1.1.
 #[unsafe(no_mangle)]
 pub extern "C" fn handle_error(
@@ -472,23 +474,8 @@ pub extern "C" fn handle_error(
     ) else {
         return 0;
     };
-    handle_error_core(
-        process,
-        pc,
-        &mut registers.x_reg_array,
-        bif_mfa as usize as u64,
-    )
-}
-
-/// Shared `handle_error` body for the x86 ABI symbol and the existing ARM call site.
-// Port of erts/emulator/beam/beam_common.c:449-570 (handle_error), OTP-29.1.1.
-pub(crate) fn handle_error_core(
-    process: &mut Process,
-    pc: usize,
-    registers: &mut [Term],
-    bif_info: u64,
-) -> usize {
-    let (mut pc, mut bif_info) = (pc, bif_info);
+    let registers = &mut registers.x_reg_array[..];
+    let (mut pc, mut bif_info) = (pc, bif_mfa as usize as u64);
     // Port of erts/emulator/beam/beam_common.c:458-459 (handle_error), OTP-29.1.1.
     if process.heap.abi.exc.freason & arinsal_term::exc::EXF_RESTORE_NFUNC != 0 {
         crate::erl_nfunc_sched::erts_nfunc_restore_error(

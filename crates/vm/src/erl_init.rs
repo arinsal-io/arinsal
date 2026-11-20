@@ -22,22 +22,58 @@ pub(crate) fn set_erts_backtrace_depth(n: usize) -> usize {
     ERTS_BACKTRACE_DEPTH.swap(n, Ordering::Relaxed)
 }
 
-/// The node's runtime-system tables that `erl_start` (erl_init.c) initialises once per OS
-/// process: the process and port tables (`erts_proc`, `erts_port`), `erts_schedulers`, the
+/// The node's runtime-system tables that `erl_init` (erl_init.c) creates once per OS process:
+/// the process and port tables (`erts_proc`, `erts_port`), `erts_schedulers`, the
 /// registered-name table (register.c `process_reg`), the trap exports and the statistics
 /// state. erts keeps each as its own global; here they are still fields of one
-/// [`crate::process::Runtime`] that `erl_start` creates and that lives until `erts_exit`.
+/// [`crate::process::Runtime`] that lives until `erts_exit`.
 static ERTS_RUNTIME: std::sync::OnceLock<&'static crate::process::Runtime> =
     std::sync::OnceLock::new();
 
-/// `erl_start` (erl_init.c): creates the runtime-system tables on the first call; later calls
-/// return the ones that exist.
-// Port of erts/emulator/beam/erl_init.c (erl_start: erts_init_process, erts_init_port,
-// erts_init_scheduling, init_register_table, ...), OTP-29.1.1.
-pub(crate) fn erl_start(
-    create: impl FnOnce() -> &'static crate::process::Runtime,
-) -> &'static crate::process::Runtime {
-    ERTS_RUNTIME.get_or_init(create)
+/// The runtime-system tables, once `erl_init` built them.
+pub(crate) fn erts_runtime() -> Option<&'static crate::process::Runtime> {
+    ERTS_RUNTIME.get().copied()
+}
+
+/// `erl_init` (erl_init.c): initialises the runtime system in one ordered sequence on the
+/// main thread, before any module is loaded and before any scheduler thread exists. Returns
+/// the `Vm` handle that loads code and the runtime-system tables.
+// Port of erts/emulator/beam/erl_init.c:248 (erl_init), OTP-29.1.1.
+pub(crate) fn erl_init(
+    paths: Vec<std::path::PathBuf>,
+    root: std::path::PathBuf,
+    workers: usize,
+    debugger_support: bool,
+    line_breakpoints: bool,
+) -> Result<(crate::Vm, &'static crate::process::Runtime), crate::VmError> {
+    use crate::VmError;
+    if ERTS_RUNTIME.get().is_some() {
+        return Err(VmError::Unsupported(
+            "erl_init: the runtime system is already initialised".into(),
+        ));
+    }
+    // The atoms the C initialisers create, in erl_init call order, so that they get the
+    // indices erts gives them (flatmap key order, HAMT hash of atom keys).
+    crate::boot::erl_init_atoms()?;
+    // os_info_init, init_dist, beamfile_init.
+    crate::boot::erl_init_global_literals();
+    crate::trace_bp::configure_debugger(debugger_support, line_breakpoints);
+    // erts_code_ix_init and the time/statistics origins, then argv.
+    let vm = crate::Vm::new_with_otp_root(paths, root);
+    // erts_init_trace -> init_sys_msg_dispatcher: the dispatcher thread exists from node start.
+    crate::erl_trace::init_sys_msg_dispatcher();
+    // erts_init_process, erts_ptab_init, init_register_table, init_db, erts_init_io.
+    let runtime = crate::process::Runtime::erl_init_tables();
+    ERTS_RUNTIME
+        .set(runtime)
+        .map_err(|_| VmError::Unsupported("erl_init: runtime set twice".into()))?;
+    // erts_init_scheduling: run queues and scheduler data; the threads start in erl_start.
+    runtime.erts_init_scheduling(workers.max(1))?;
+    // Port of erts/emulator/sys/unix/sys_drivers.c:170 (erl_sys_late_init): the forker is the
+    // node's first port.
+    crate::spawn_drv::open_forker(runtime)?;
+    crate::erl_trace::set_node(runtime);
+    Ok((vm, runtime))
 }
 
 /// The boot arguments `erl_start` reads from `argv` (erl_init.c): `-root` (what

@@ -154,6 +154,69 @@ pub fn rejected(slot: &mut SelSlot) -> c_int {
     mask
 }
 
+/// The poller reported `ERTS_POLL_EV_NVAL` alone for a selected descriptor: report it and
+/// unmap the selection, without calling any callback.
+///
+/// Port of erts/emulator/sys/common/erl_check_io.c:2274 (bad_fd_in_pollset), OTP-29.1.1.
+pub fn bad_fd_in_pollset(slot: &mut SelSlot, fd: i32) {
+    let Some(state) = slot.as_deref() else {
+        return;
+    };
+    let events = state.events & (READ | WRITE);
+    let [inport, outport] = [&state.dirs[0].owner, &state.dirs[1].owner];
+    let port_text = |port: &DriverPort| {
+        let name = port.command_name();
+        let name = if name.is_empty() { "<unknown>" } else { &name };
+        (
+            format!("#Port<0.{}>", port.id),
+            port.driver.name().to_owned(),
+            name.to_owned(),
+        )
+    };
+    let text = if events != 0 {
+        let (io_str, port) = if events == READ | WRITE {
+            let same = matches!((inport, outport), (Some(a), Some(b)) if a.id == b.id);
+            ("input/output", if same { inport.as_ref() } else { None })
+        } else if events & READ != 0 {
+            ("input", inport.as_ref())
+        } else {
+            ("output", outport.as_ref())
+        };
+        let mut text = format!("Bad {io_str} fd in erts_poll()! fd={fd}, ");
+        if let Some(nif) = &state.nif {
+            text.push_str(&format!("resource={}\n", nif.resource.type_name()));
+        } else if let Some(port) = port {
+            let (id, driver, name) = port_text(port);
+            text.push_str(&format!("port={id}, driver={driver}, name={name}\n"));
+        } else {
+            let part = |port: &Option<PortRef>| {
+                port.as_ref().map_or(
+                    (
+                        "undefined".to_owned(),
+                        "<unknown>".to_owned(),
+                        "<unknown>".to_owned(),
+                    ),
+                    |port| port_text(port),
+                )
+            };
+            let ((i, di, ni), (o, d_o, no)) = (part(inport), part(outport));
+            text.push_str(&format!(
+                "ports={i}/{o}, drivers={di}/{d_o}, names={ni}/{no}\n"
+            ));
+        }
+        text
+    } else {
+        format!("Bad fd in erts_poll()! fd={fd}\n")
+    };
+    if let Some(nif) = &state.nif {
+        nif.resource.log_error(&text);
+    } else if let Some(port) = inport.as_ref().or(outport.as_ref()) {
+        port.host.log_error(&text);
+    }
+    // "unmap entry"
+    deselect(&mut Table(slot), 0);
+}
+
 /// The slot with the fd lock held, as the erl_check_io.c functions see `ErtsDrvEventState`.
 struct Table<'a>(&'a mut SelSlot);
 

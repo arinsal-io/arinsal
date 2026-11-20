@@ -1024,7 +1024,6 @@ fn print(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Vm;
     use arinsal_difftest::{CallResult, RefErl};
     fn test_lock() -> &'static Mutex<()> {
         static LOCK: Mutex<()> = Mutex::new(());
@@ -1100,7 +1099,7 @@ msg_tag(Tag) -> Tag."#;
             .unwrap();
         reference.load("seq_trace_chain", &beam).unwrap();
         let expected = reference.call("seq_trace_chain", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm.eval_scheduled("seq_trace_chain", "run", &[], 2).unwrap();
         similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
@@ -1136,7 +1135,7 @@ msg_tag(Tag) -> Tag."#;
             .unwrap();
         reference.load("seq_trace_sensitive_exit", &beam).unwrap();
         let expected = reference.call("seq_trace_sensitive_exit", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("seq_trace_sensitive_exit", "run", &[], 2)

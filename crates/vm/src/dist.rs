@@ -4603,7 +4603,7 @@ run() ->
             .unwrap();
         reference.load("dist_missing_send_diff", &beam).unwrap();
         let expected = reference.call("dist_missing_send_diff", "run", &[]);
-        let mut vm = crate::Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("dist_missing_send_diff", "run", &[], 2)

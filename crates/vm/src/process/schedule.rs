@@ -189,18 +189,9 @@ impl Task for Process {
                 process.heap.abi.self_pid = ctx.pid().to_term().expect("valid pid").tagged_word();
                 process.self_pid = Some(ctx.pid());
             }
-            // Port of erts/emulator/beam/erl_process.c:10180 (erts_schedule:
-            // `esdp->current_process = p`), OTP-29.1.1: the NIF hub of this scheduler reads it.
-            let data = arinsal_sched::erts_sched_registers(esdp);
-            if data.hub_bound.get() {
-                data.current_process
-                    .store(ctx.pid().data(), Ordering::Relaxed);
-            } else {
-                data.hub_bound.set(crate::natives::nif::bind_scheduler_hub(
-                    process,
-                    &data.current_process,
-                ));
-            }
+            // The NIF hub of this scheduler reads `esdp->current_process`, which erts_schedule
+            // set (erl_process.c:10180, OTP-29.1.1).
+            crate::natives::nif::bind_scheduler_hub(process);
             // Port of erts/emulator/beam/erl_process.c:10232 (`p->scheduler_data = esdp`; the
             // scheduler number process_info reports is `esdp->no`), OTP-29.1.1.
             if !cached {
@@ -244,6 +235,7 @@ impl Task for Process {
             // Port of erts/emulator/beam/erl_alloc.c (erts_alloc passes `esdp->no` to the
             // thread-specific allocators), OTP-29.1.1: the process heap allocates on this scheduler's
             // instance without looking the thread up, while it is scheduled in.
+            let data = arinsal_sched::erts_sched_registers(esdp);
             let alloc_ix = data.alloc_ix.get().unwrap_or_else(|| {
                 let ix = arinsal_alloc::thread_alloc_ix();
                 data.alloc_ix.set(Some(ix));

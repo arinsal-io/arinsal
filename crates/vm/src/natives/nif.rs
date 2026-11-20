@@ -338,15 +338,30 @@ struct DirtyNifCall {
     pid: Option<Pid>,
 }
 
-thread_local! {
-    static CURRENT_NIF: std::cell::Cell<Option<CurrentNif>> = const { std::cell::Cell::new(None) };
+/// `erts_get_scheduler_data()->current_nif`; `None` off a scheduler thread.
+fn current_nif() -> Option<CurrentNif> {
+    arinsal_sched::erts_get_scheduler_data::<Process, _>(|esdp| {
+        arinsal_sched::erts_sched_registers(esdp).current_nif.get()
+    })
+    .flatten()
 }
 
-/// Run `call` with `current` as `esdp->current_nif`.
+/// Run `call` with `current` as `esdp->current_nif`, restoring the previous value after it
+/// (erts_pre_nif / erts_post_nif, erl_nif.c).
 fn with_current_nif<R>(current: CurrentNif, call: impl FnOnce() -> R) -> R {
-    let saved = CURRENT_NIF.with(|slot| slot.replace(Some(current)));
+    let saved = arinsal_sched::erts_get_scheduler_data::<Process, _>(|esdp| {
+        arinsal_sched::erts_sched_registers(esdp)
+            .current_nif
+            .replace(Some(current))
+    });
     let result = call();
-    CURRENT_NIF.with(|slot| slot.set(saved));
+    if let Some(saved) = saved {
+        arinsal_sched::erts_get_scheduler_data::<Process, _>(|esdp| {
+            arinsal_sched::erts_sched_registers(esdp)
+                .current_nif
+                .set(saved);
+        });
+    }
     result
 }
 
@@ -471,39 +486,36 @@ struct Hub {
     scheduler: Weak<Scheduler<Process>>,
     pid: Pid,
     runtime: &'static crate::process::Runtime,
-    /// The scheduler's current-process slot, on the hub a scheduler thread installed for
-    /// itself; copies handed out carry the resolved `pid` instead.
-    current: Option<CurrentProcess>,
+    /// The hub a scheduler thread installed for itself: it acts for that scheduler's
+    /// `esdp->current_process`; copies handed out carry the resolved `pid` instead.
+    current: bool,
 }
 
-/// A scheduler's `esdp->current_process`: written by the scheduler when it schedules a
-/// process in, read by the NIF services running on that scheduler thread.
-// Port of erts/emulator/beam/erl_process.h:687 (ErtsSchedulerData_::current_process) and
-// erl_process.c:10180 (erts_schedule sets it), OTP-29.1.1.
-pub(crate) type CurrentProcess = Arc<std::sync::atomic::AtomicU64>;
-
 impl Hub {
-    /// The process this hub acts for: the scheduler's current process when bound to one.
+    /// The process this hub acts for: `esdp->current_process` (erts_schedule sets it,
+    /// erl_process.c:10180) on the hub of a scheduler thread that runs a process.
     fn current_pid(&self) -> Pid {
-        self.current.as_ref().map_or(self.pid, |current| {
-            Pid::from_data(current.load(std::sync::atomic::Ordering::Relaxed))
+        if !self.current {
+            return self.pid;
+        }
+        arinsal_sched::erts_get_scheduler_data::<Process, _>(|esdp| {
+            arinsal_sched::RunCtx::with_current(esdp, |ctx| ctx.pid())
         })
+        .flatten()
+        .unwrap_or(self.pid)
     }
 
     /// A copy that keeps the current process as of now, like the hub value it replaces.
     fn resolved(&self) -> Hub {
         Hub {
             pid: self.current_pid(),
-            current: None,
+            current: false,
             ..self.clone()
         }
     }
 
     fn set_pid(&mut self, pid: Pid) {
-        match &self.current {
-            Some(current) => current.store(pid.data(), std::sync::atomic::Ordering::Relaxed),
-            None => self.pid = pid,
-        }
+        self.pid = pid;
     }
 }
 
@@ -544,7 +556,7 @@ fn hub_for_pid(pid: Pid) -> Option<Hub> {
     if let Some(hub) = current.as_ref().filter(|hub| owns(hub)) {
         return Some(Hub {
             pid,
-            current: None,
+            current: false,
             ..hub.clone()
         });
     }
@@ -556,7 +568,7 @@ fn hub_for_pid(pid: Pid) -> Option<Hub> {
         .cloned();
     registered.or(current).map(|hub| Hub {
         pid,
-        current: None,
+        current: false,
         ..hub
     })
 }
@@ -962,7 +974,7 @@ fn current_nfunc(c_p: &Process) -> *mut crate::erl_nfunc_sched::ErtsNativeFunc {
 
 /// `execution_state(env, &c_p, NULL)` on a normal scheduler: the process of the running NIF.
 fn current_proc<'a>() -> Option<&'a mut Process> {
-    let current = CURRENT_NIF.with(std::cell::Cell::get)?;
+    let current = current_nif()?;
     crate::natives::raw::current_nif_proc(current.c_p)
 }
 
@@ -1007,7 +1019,7 @@ fn schedule(
     (module, func_name): (Term, Term),
     argv: &[Term],
 ) -> Term {
-    let Some(current) = CURRENT_NIF.with(std::cell::Cell::get) else {
+    let Some(current) = current_nif() else {
         return Term::NON_VALUE;
     };
     let instr = arinsal_term::OP_CALL_NIF_WWW;
@@ -1204,7 +1216,7 @@ pub extern "C" fn enif_schedule_nif(
     if arinsal_nif::enif_is_exception(env, fun_name_atom) != 0 {
         return fun_name_atom;
     }
-    let Some(current) = CURRENT_NIF.with(std::cell::Cell::get) else {
+    let Some(current) = current_nif() else {
         // `scheduler == 0`: not called from a NIF of a process.
         return arinsal_nif::enif_make_badarg(env);
     };
@@ -2296,22 +2308,21 @@ pub(crate) fn refresh_hub_native(process: &Process) {
     install_hub_for(process, *pid);
 }
 
-/// Install this scheduler thread's hub for `process`'s runtime and bind it to the
-/// scheduler's current-process slot, so scheduling a process in is a plain store.
-/// Returns whether the hub is bound.
-#[inline(never)] // Once per scheduler thread; inlined, its thread-locals load on every slice.
-pub(crate) fn bind_scheduler_hub(process: &Process, current: &CurrentProcess) -> bool {
-    let Some(pid) = process.self_pid else {
-        return false;
-    };
-    current.store(pid.data(), std::sync::atomic::Ordering::Relaxed);
-    install_hub_for(process, pid);
-    HUB.with(|hub| {
-        hub.borrow_mut().as_mut().is_some_and(|hub| {
-            hub.current = Some(Arc::clone(current));
-            true
-        })
-    })
+/// Install this scheduler thread's hub for `process`'s runtime, once per scheduler thread: the
+/// installed hub reads the scheduler's `esdp->current_process`, so scheduling a process in
+/// stores nothing here.
+#[inline]
+pub(crate) fn bind_scheduler_hub(process: &Process) {
+    let runtime = process
+        .runtime
+        .as_ref()
+        .map_or(0, |rt| *rt as *const crate::process::Runtime as usize);
+    if runtime == 0 || HUB_RUNTIME.get() == runtime {
+        return;
+    }
+    if let Some(pid) = process.self_pid {
+        install_hub_for(process, pid);
+    }
 }
 
 fn install_hub_for(process: &Process, pid: Pid) {
@@ -2338,9 +2349,17 @@ fn install_hub_for(process: &Process, pid: Pid) {
         scheduler: Arc::downgrade(scheduler),
         pid,
         runtime,
-        current: None,
+        current: false,
     };
-    HUB.with(|current| *current.borrow_mut() = Some(hub.clone()));
+    // A scheduler thread's own hub acts for its `esdp->current_process`; the copies published
+    // to other threads keep `pid`.
+    let on_scheduler = arinsal_sched::erts_get_scheduler_data::<Process, _>(|_| ()).is_some();
+    HUB.with(|current| {
+        *current.borrow_mut() = Some(Hub {
+            current: on_scheduler,
+            ..hub.clone()
+        });
+    });
     HUB_RUNTIME.set(runtime_id);
     *GLOBAL_HUB.lock().unwrap() = Some(hub.clone());
     {

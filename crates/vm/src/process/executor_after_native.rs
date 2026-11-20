@@ -17,35 +17,24 @@ pub(super) fn context_switch(
             #[cfg(target_arch = "aarch64")]
             crate::beamasm_integration::count_native_yield();
             let exit_kind = std::mem::take(&mut process.native_exit_kind);
-            if exit_kind != crate::proc_create::NativeExit::None {
-                if exit_kind == crate::proc_create::NativeExit::Exiting
-                    && let Some(error) = process
-                        .cold
-                        .as_mut()
-                        .and_then(|cold| cold.native_exiting.take())
-                {
-                    // The native receive helper handled a signal that ends the process.
-                    return Ok(Flow::Break(Err(*error)));
+            if exit_kind == crate::proc_create::NativeExit::Wait
+                && let Some(timeout_pos) = process.native_wait.take()
+            {
+                // A native receive found no matching message. Like the
+                // interpreter's `wait`, sleep only if nothing arrived since the
+                // slice began; the process resumes at the `loop_rec` label with
+                // no live X registers.
+                process.gc_live = 0;
+                process.set_native_resume_arity(0);
+                // A receive without clauses blocks even with messages queued,
+                // like the interpreter's self-targeting `wait`.
+                let self_wait = std::mem::take(&mut process.native_wait_self);
+                if self_wait {
+                    // Queued messages never match; fetch them so the outer
+                    // queue does not keep waking the process.
+                    process.fetch_signals(ctx)?;
                 }
-                if exit_kind == crate::proc_create::NativeExit::Wait
-                    && let Some(timeout_pos) = process.native_wait.take()
-                {
-                    // A native receive found no matching message. Like the
-                    // interpreter's `wait`, sleep only if nothing arrived since the
-                    // slice began; the process resumes at the `loop_rec` label with
-                    // no live X registers.
-                    process.gc_live = 0;
-                    process.set_native_resume_arity(0);
-                    // A receive without clauses blocks even with messages queued,
-                    // like the interpreter's self-targeting `wait`.
-                    let self_wait = std::mem::take(&mut process.native_wait_self);
-                    if self_wait {
-                        // Queued messages never match; fetch them so the outer
-                        // queue does not keep waking the process.
-                        process.fetch_signals(ctx)?;
-                    }
-                    return Ok(Flow::Break(Ok(RunState::Wait { timeout_pos })));
-                }
+                return Ok(Flow::Break(Ok(RunState::Wait { timeout_pos })));
             }
             return Ok(Flow::Break(Ok(RunState::Yield)));
         }

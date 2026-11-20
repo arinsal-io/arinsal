@@ -147,3 +147,25 @@ fn signal_notify_requested(runtime: &Runtime, signal: &str) {
         let _ = scheduler.send(pid, pid, message);
     }
 }
+
+/// The main thread after `erl_start` has started the schedulers: it never returns. On Darwin it
+/// serves `erl_drv_steal_main_thread` requests from its pipe; then, as on every Unix, it waits
+/// forever, since signals are dispatched by the signal dispatcher thread and the node ends only
+/// through `erts_exit`.
+// Port of erts/emulator/sys/unix/sys.c:1230 (erts_sys_main_thread), OTP-29.1.1.
+pub(crate) fn erts_sys_main_thread() -> ! {
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(error) = arinsal_drv::darwin_main_thread_init() {
+            crate::natives::node::erts_exit_dump(&format!(
+                "Failed to initialize the Darwin main thread pipes: {error}"
+            ));
+        }
+        arinsal_drv::darwin_main_thread_park();
+    }
+    #[cfg(not(target_os = "macos"))]
+    loop {
+        // `select(0, NULL, NULL, NULL, NULL)`: sleep until the process ends.
+        std::thread::park();
+    }
+}

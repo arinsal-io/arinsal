@@ -70,8 +70,8 @@ use linebuf::LineBuf;
 use lock::{ReentrantGuard, ReentrantLock};
 pub use native::{NativeDriver, SELECT_READ, SELECT_USE, SELECT_USE_NO_CALLBACK, SELECT_WRITE};
 pub use select::{
-    Action, FdSel, FdTable, NifSelectMessage, NifSelectResource, SelSlot, is_driver_selection,
-    nif_select, poll_event, rejected, selection_counts, set_fd_table, wanted,
+    Action, FdSel, FdTable, NifSelectMessage, NifSelectResource, SelSlot, bad_fd_in_pollset,
+    is_driver_selection, nif_select, poll_event, rejected, selection_counts, set_fd_table, wanted,
 };
 
 // Port of erts/emulator/beam/global.h:172-181 (ERL_DE_* load error codes), OTP-29.1.1.

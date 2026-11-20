@@ -180,7 +180,7 @@ pub(crate) fn node() -> std::sync::MutexGuard<'static, arinsal_vm::Vm> {
             .unwrap_or_else(|error| panic!("test node arguments: {error:?}"));
         arinsal_args::configure_emulator_flags(launch.emulator.clone());
         let workers = arinsal_alloc::cpuinfo::default_schedulers().0.max(1);
-        let (mut vm, first) = arinsal_vm::boot::erl_start(
+        let mut vm = arinsal_vm::boot::erl_start(
             std::path::Path::new(&launch.root_dir),
             &launch.boot_args,
             &[],
@@ -190,8 +190,6 @@ pub(crate) fn node() -> std::sync::MutexGuard<'static, arinsal_vm::Vm> {
             None,
         )
         .expect("start test node");
-        // `init` runs for the life of the node; its result is never awaited.
-        drop(first);
         // `init:get_status/0` calls the registered `init`, which `init:boot/1` registers first.
         let init = arinsal_term::Term::atom(
             arinsal_term::global_atoms()

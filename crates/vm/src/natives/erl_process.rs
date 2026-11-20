@@ -37,6 +37,8 @@ pub(crate) struct ErlSpawnOpts {
     pub off_heap_msgq: Option<bool>,
     /// `SPO_ASYNC_DIST`.
     pub async_dist: bool,
+    /// `SPO_SYSTEM_PROC`, set by `erl_spawn_system_process` (erl_init.c).
+    pub system_proc: bool,
     /// `SPO_ASYNC`: a `spawn_request`, which replies and records `mfa` as the initial call.
     pub r#async: bool,
     /// `SPO_NO_SMSG` / `SPO_NO_EMSG`.
@@ -106,6 +108,7 @@ impl ErlSpawnOpts {
             scheduler: 0,
             off_heap_msgq: None,
             async_dist: defaults.async_dist(),
+            system_proc: false,
             r#async: false,
             no_smsg: false,
             no_emsg: false,
@@ -546,8 +549,15 @@ fn create_child(
     // Port of erts/emulator/beam/erl_process.c (erl_create_process), OTP-29.1.1: alloc_process
     // takes the process struct and its table entry first, and the fields are then initialized
     // in place.
+    let system_proc = so.system_proc;
     let init_child = |child_pid: Pid, child: &mut Process| -> Result<(), VmError> {
         child.set_runtime_with_min_bin_vheap_size(Some(runtime), min_bin_vheap as u64);
+        // erl_process.c:12559: `if (so->flags & SPO_SYSTEM_PROC) p->static_flags |=
+        // ERTS_STC_FLG_SYSTEM_PROC`.
+        if system_proc {
+            child.static_flags |= crate::proc_create::ERTS_STC_FLG_SYSTEM_PROC;
+            runtime.system_processes.lock().unwrap().insert(child_pid);
+        }
         // Both active and user priority come from so->priority; a normal priority is the
         // absent flag (process_info reports `normal` for it).
         if priority != Priority::Normal {

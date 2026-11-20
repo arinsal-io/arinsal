@@ -329,9 +329,9 @@ extern "C" fn bs_create_bin_put(
 
 extern "C" fn exception_resolver(
     _process: *mut ProcessHeader,
-    _pc: u64,
+    _pc: usize,
     _registers: *mut u64,
-    _bif_info: u64,
+    _bif_mfa: *const arinsal_term::ErtsCodeMfa,
 ) -> usize {
     0
 }

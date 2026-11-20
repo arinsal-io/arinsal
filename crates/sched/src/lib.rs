@@ -179,35 +179,7 @@ fn clear_sys_scheduling() {
     DOING_SYS_SCHEDULE.store(false, Ordering::SeqCst);
 }
 
-type ErasedTimerService = (usize, Box<dyn Any>);
-
-/// The timer service of each scheduler this thread owns, by scheduler set. A thread owns one
-/// in practice, so a scan of a few entries beats hashing; erts reaches the service straight
-/// from `esdp`.
-struct OwnerServices(Vec<(usize, ErasedTimerService)>);
-
-impl OwnerServices {
-    fn get(&self, inner_id: &usize) -> Option<&ErasedTimerService> {
-        self.0
-            .iter()
-            .find(|(id, _)| id == inner_id)
-            .map(|(_, service)| service)
-    }
-
-    fn insert(&mut self, inner_id: usize, service: ErasedTimerService) {
-        self.remove(&inner_id);
-        self.0.push((inner_id, service));
-    }
-
-    fn remove(&mut self, inner_id: &usize) {
-        self.0.retain(|(id, _)| id != inner_id);
-    }
-}
 type SchedulerAuxWork = Arc<dyn Fn(usize) + Send + Sync + 'static>;
-
-thread_local! {
-    static OWNER_TIMER_SERVICES: RefCell<OwnerServices> = const { RefCell::new(OwnerServices(Vec::new())) };
-}
 
 const QUEUED: u8 = 0;
 /// `ERTS_PTMR_TIMEDOUT`: the receive timer fired; the receiver takes the timeout branch.
@@ -1084,37 +1056,54 @@ fn restore_held_monitor<M: SignalMessage>(held: PendingProcMonitor) -> OwnedSign
     held.node.into_signal::<Event<M>>()
 }
 
-thread_local! {
-    /// This scheduler's pending signal (`esdp->pending_signal`): its receiver is readable
-    /// without borrowing the held monitor, so the check every send makes is one load.
-    static PENDING_PROC_MONITOR: PendingSlot = const {
-        PendingSlot {
-            to: std::cell::Cell::new(None),
-            held: std::cell::RefCell::new(None),
-        }
-    };
-    static SCHEDULER_TYPE: std::cell::Cell<SchedulerType> =
-        const { std::cell::Cell::new(SchedulerType::Normal) };
-    static NORMAL_SCHEDULER_ID: std::cell::Cell<Option<usize>> =
-        const { std::cell::Cell::new(None) };
-    static NORMAL_SCHEDULER_COUNT: std::cell::Cell<Option<usize>> =
-        const { std::cell::Cell::new(None) };
-}
-
 /// Zero-based index of the normal scheduler running on the calling thread, like
-/// `erts_get_scheduler_id() - 1`; `None` on other threads.
+/// `erts_get_scheduler_id() - 1` (`esdp->no - 1`); `None` on other threads.
 pub fn current_normal_scheduler() -> Option<usize> {
-    NORMAL_SCHEDULER_ID.with(std::cell::Cell::get)
+    sched_data_key::with_head(|esdp| esdp.worker).flatten()
 }
 
-/// Number of normal schedulers in the calling scheduler thread's runtime.
+/// `erts_no_schedulers` as seen from a scheduler thread; `None` on other threads.
 pub fn current_normal_scheduler_count() -> Option<usize> {
-    NORMAL_SCHEDULER_COUNT.with(std::cell::Cell::get)
+    sched_data_key::with_head(|_| unique::normal_scheduler_count() as usize)
 }
 
-/// Scheduler type of the calling thread, like `erts_get_scheduler_data()->type`.
+/// `esdp->match_pseudo_process`: the pseudo process (heap, stack, variables) match
+/// specifications run on, created on first use and kept by its scheduler. Its type belongs
+/// to the ETS crate above this one, so the slot holds it type-erased.
+// Port of erts/emulator/beam/erl_process.h (ErtsSchedulerData_.match_pseudo_process),
+// OTP-29.1.1.
+#[derive(Default)]
+pub(crate) struct MatchPseudoProcess(Cell<Option<Box<dyn Any>>>);
+
+/// The match pseudo process of the calling scheduler (`esdp->match_pseudo_process`), taken
+/// out of its slot for one match run: `None` on a thread that is no scheduler (erts keeps that
+/// thread's one under `match_pseudo_process_key`), `Some(None)` before the first run here.
+// Port of erts/emulator/beam/erl_db_util.c:498 (get_match_pseudo_process), OTP-29.1.1.
+pub fn erts_take_match_pseudo_process<P: Any>() -> Option<Option<Box<P>>> {
+    sched_data_key::with_head(|esdp| {
+        esdp.match_pseudo_process
+            .0
+            .take()
+            .and_then(|mpsp| mpsp.downcast::<P>().ok())
+    })
+}
+
+/// Put back the match pseudo process taken by [`erts_take_match_pseudo_process`]; gives it
+/// back on a thread that is no scheduler.
+pub fn erts_put_match_pseudo_process<P: Any>(mpsp: Box<P>) -> Result<(), Box<P>> {
+    let mut mpsp = Some(mpsp);
+    sched_data_key::with_head(|esdp| {
+        esdp.match_pseudo_process
+            .0
+            .set(mpsp.take().map(|mpsp| mpsp as Box<dyn Any>));
+    });
+    mpsp.map_or(Ok(()), Err)
+}
+
+/// Scheduler type of the calling thread, `erts_get_scheduler_data()->type`; a thread that is
+/// no scheduler reports [`SchedulerType::Normal`].
 pub fn current_scheduler_type() -> SchedulerType {
-    SCHEDULER_TYPE.with(std::cell::Cell::get)
+    sched_data_key::with_head(|esdp| esdp.sched_type).unwrap_or(SchedulerType::Normal)
 }
 
 /// Take the held process monitor of this scheduler when it is for `to`, so the signal to `to`
@@ -1122,31 +1111,36 @@ pub fn current_scheduler_type() -> SchedulerType {
 fn take_held_monitor_for(to: Pid) -> Option<PendingProcMonitor> {
     // Every send asks, as erts tests `esdp->pending_signal.to` (erl_proc_sig_queue.c:1146,
     // erl_message.c:469 prepend_pending_sig_maybe).
-    PENDING_PROC_MONITOR.with(|slot| {
+    sched_data_key::with_head(|esdp| {
+        let slot = &esdp.pending_signal;
         if slot.to.get() != Some(to) {
             return None;
         }
         slot.to.set(None);
-        slot.held.borrow_mut().take()
+        slot.held.take()
     })
+    .flatten()
 }
 
-/// The pending signal slot of one scheduler thread; `to` is `Some` exactly while `held` is.
-struct PendingSlot {
-    to: std::cell::Cell<Option<Pid>>,
-    held: std::cell::RefCell<Option<PendingProcMonitor>>,
+/// `esdp->pending_signal`: `to` is `Some` exactly while `held` is; the receiver is readable
+/// without touching the held monitor, so the check every send makes is one load.
+// Port of erts/emulator/beam/erl_process.h (ErtsSchedulerData_.pending_signal), OTP-29.1.1.
+#[derive(Default)]
+pub(crate) struct PendingSlot {
+    to: Cell<Option<Pid>>,
+    held: Cell<Option<PendingProcMonitor>>,
 }
 
 impl PendingSlot {
     fn take(&self) -> Option<PendingProcMonitor> {
         self.to.get()?;
         self.to.set(None);
-        self.held.borrow_mut().take()
+        self.held.take()
     }
 
     fn replace(&self, held: PendingProcMonitor) -> Option<PendingProcMonitor> {
         self.to.set(Some(held.to));
-        self.held.borrow_mut().replace(held)
+        self.held.replace(Some(held))
     }
 }
 
@@ -3607,13 +3601,15 @@ impl<T: Task> Inner<T> {
         if home < online { home } else { home % online }
     }
 
-    /// Normal scheduler running on the current thread, if any.
+    /// Normal scheduler running on the current thread, if any: `esdp->no - 1` of
+    /// `erts_get_scheduler_data()` when that scheduler belongs to this runtime.
+    // Port of erts/emulator/beam/erl_process.h (erts_get_scheduler_data), OTP-29.1.1.
     fn current_worker(&self) -> Option<usize> {
-        let inner_id = self as *const Self as usize;
-        OWNER_TIMER_SERVICES
-            .try_with(|services| services.borrow().get(&inner_id).map(|(id, _)| *id))
-            .ok()
-            .flatten()
+        erts_get_scheduler_data::<T, _>(|esdp| {
+            esdp.worker
+                .filter(|_| std::ptr::eq(Arc::as_ptr(&esdp.run_queue), self))
+        })
+        .flatten()
     }
 
     /// Port of erts/emulator/beam/erl_process.c:6868 (add2runq) and 6631
@@ -4452,18 +4448,17 @@ impl<T: Task> Inner<T> {
         }
     }
 
+    /// `esdp->timer_wheel` of the calling thread when it is scheduler `worker` of this
+    /// runtime.
+    // Port of erts/emulator/beam/erl_hl_timer.c (the owner reaches its wheel through
+    // `erts_get_scheduler_data()->timer_wheel`), OTP-29.1.1.
     fn owner_timer_service(&self, worker: usize) -> Option<Rc<RefCell<TimerService<T::Message>>>> {
-        let inner_id = self as *const Self as usize;
-        OWNER_TIMER_SERVICES.with(|services| {
-            let services = services.borrow();
-            let (owner, service) = services.get(&inner_id)?;
-            if *owner != worker {
-                return None;
-            }
-            service
-                .downcast_ref::<Rc<RefCell<TimerService<T::Message>>>>()
-                .cloned()
+        erts_get_scheduler_data::<T, _>(|esdp| {
+            (esdp.worker == Some(worker) && std::ptr::eq(Arc::as_ptr(&esdp.run_queue), self))
+                .then(|| esdp.timer_wheel.clone())
+                .flatten()
         })
+        .flatten()
     }
 
     // Port of erts/emulator/beam/erl_process.c:7028 (active_sys_enqueue), OTP-29.1.1:
@@ -5666,14 +5661,22 @@ pub struct RunCtx<'a, T: Task> {
 /// `process_main` / `erts_dirty_process_main` hand it to every [`erts_schedule`] call for the
 /// thread's lifetime.
 // Port of erts/emulator/beam/erl_process.h:687 (struct ErtsSchedulerData_), OTP-29.1.1, in
-// its field order where Arinsal has the field.
+// its field order where Arinsal has the field, except that the fields code without the task
+// type reads (`sched_data_key::Head`) come first.
+#[repr(C)]
 pub struct ErtsSchedulerData<T: Task> {
     /// `no - 1` of a normal scheduler; `None` on a dirty scheduler.
     worker: Option<usize>,
-    /// `erts_no_schedulers`.
-    worker_count: usize,
     /// `type`.
     sched_type: SchedulerType,
+    /// `pending_signal`.
+    pending_signal: PendingSlot,
+    /// `thr_id`, `unique`, `ref`.
+    ref_unique: unique::SchedRefUnique,
+    /// `match_pseudo_process`.
+    match_pseudo_process: MatchPseudoProcess,
+    /// `erts_no_schedulers`.
+    worker_count: usize,
     /// `virtual_reds`: part of the consumed budget that is not work. `erts_schedule` reads it
     /// at schedule-out and resets it.
     virtual_reds: Cell<u32>,
@@ -5683,7 +5686,10 @@ pub struct ErtsSchedulerData<T: Task> {
     wall_enabled: Cell<bool>,
     /// Collection time already moved into the GC microstate, for this slice's process.
     gc_accounted_total: Cell<u64>,
-    /// `timer_wheel`, `next_tmo_ref`, `timer_service` and `aux_work_data` of a normal
+    /// `timer_wheel` of a normal scheduler, shared with its `local` state; `None` on a dirty
+    /// scheduler.
+    timer_wheel: Option<Rc<RefCell<TimerService<T::Message>>>>,
+    /// `next_tmo_ref`, `timer_service` and `aux_work_data` of a normal
     /// scheduler: its local state, which this thread's signal sends also reach
     /// (`WorkerSender`). `None` on a dirty scheduler.
     local: Option<Rc<RefCell<Local<T>>>>,
@@ -5698,8 +5704,6 @@ pub struct ErtsSchedulerData<T: Task> {
     dirty_no: Option<(DirtyKind, usize)>,
     /// `run_queue`, with the schedulers' shared state it points into.
     run_queue: Arc<Inner<T>>,
-    /// `thr_id`, `unique`, `ref`.
-    ref_unique: Rc<unique::SchedRefUnique>,
     /// `registers`: the scheduler's register block, allocated with the scheduler data
     /// (init_scheduler_data) and read by the slice through `esdp`.
     registers: T::SchedulerData,
@@ -6432,7 +6436,7 @@ pub(crate) fn erts_proc_lookup_raw<T: Task>(
 
 /// Publish the held monitor of this scheduler, if any.
 pub(crate) fn send_pending_signal<T: Task>(rq: &Inner<T>, esdp: Option<&ErtsSchedulerData<T>>) {
-    if let Some(held) = PENDING_PROC_MONITOR.with(PendingSlot::take) {
+    if let Some(held) = sched_data_key::with_head(|esdp| esdp.pending_signal.take()).flatten() {
         send_held_monitor(rq, esdp, held);
     }
 }
@@ -6455,7 +6459,8 @@ pub(crate) fn hold_pending_signal<T: Task>(
     esdp: Option<&ErtsSchedulerData<T>>,
     held: PendingProcMonitor,
 ) {
-    let previous = PENDING_PROC_MONITOR.with(|slot| slot.replace(held));
+    let previous = sched_data_key::with_head(|esdp| esdp.pending_signal.replace(held))
+        .expect("a process monitor is held only on a scheduler thread");
     if let Some(previous) = previous {
         send_held_monitor(rq, esdp, previous);
     }
@@ -7033,7 +7038,10 @@ pub fn setup_bif_timer_self<T: Task>(
 /// Scheduler facade. Dropping it stops and joins worker threads.
 pub struct Scheduler<T: Task> {
     inner: Arc<Inner<T>>,
-    threads: Vec<JoinHandle<()>>,
+    /// `erts_aligned_scheduler_data` as `erts_init_scheduling` (erl_process.c) builds it: one
+    /// entry per normal scheduler, handed to its thread by [`Scheduler::erts_start_schedulers`].
+    sched_data: Mutex<Option<Vec<LocalInit<T>>>>,
+    threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
 /// A table-list invocation that reconciles removals between 1000-slot scan chunks.
@@ -7131,18 +7139,30 @@ pub struct SchedulerStats {
 }
 
 impl<T: Task> Scheduler<T> {
-    /// Start real worker threads.
+    /// [`Scheduler::erts_init_scheduling`] followed by [`Scheduler::erts_start_schedulers`].
     pub fn new(config: Config) -> Self {
         let dirty_cpu_online = config.dirty_cpu_schedulers.max(1);
         Self::new_with_dirty_cpu_online(config, dirty_cpu_online)
     }
 
-    /// Start real worker threads with the boot dirty CPU online prefix.
-    ///
-    /// Port of erts/emulator/beam/erl_process.c:6380-6395 (scheduler online counts),
-    /// OTP-29.1.1: the requested count is installed before threads start, while current online
-    /// begins at the scheduler total and each suspended scheduler updates it.
+    /// [`Scheduler::erts_init_scheduling`] followed by [`Scheduler::erts_start_schedulers`]
+    /// with the boot dirty CPU online prefix.
     pub fn new_with_dirty_cpu_online(config: Config, dirty_cpu_online: usize) -> Self {
+        let scheduler = Self::erts_init_scheduling(config, dirty_cpu_online);
+        scheduler.erts_start_schedulers();
+        scheduler
+    }
+
+    /// Builds the run queues, the per-scheduler data and the dirty pools without starting a
+    /// thread: processes spawned before [`Scheduler::erts_start_schedulers`] wait in the run
+    /// queues, as erl_start creates the first process and the system processes before any
+    /// scheduler thread exists.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:6090 (erts_init_scheduling) and :6380-6395
+    /// (scheduler online counts), OTP-29.1.1: the requested count is installed before threads
+    /// start, while current online begins at the scheduler total and each suspended scheduler
+    /// updates it.
+    pub fn erts_init_scheduling(config: Config, dirty_cpu_online: usize) -> Self {
         arinsal_term::set_reader_groups(config.workers);
         mailbox::set_lock_spin_count(config.workers);
         // Port of erts/emulator/beam/erl_alloc.c (erts_alloc_init sizes the instances from
@@ -7267,64 +7287,84 @@ impl<T: Task> Scheduler<T> {
             balance,
             port_queues: (0..workers).map(|_| ports::PortQueue::default()).collect(),
         });
-        let mut threads = Vec::new();
-        {
-            for (id, local) in locals.into_iter().enumerate() {
-                let inner = inner.clone();
-                // Port of erts/emulator/beam/erl_process.c (erts_start_schedulers,
-                // opts.suggested_stack_size = erts_sched_thread_suggested_stack_size),
-                // OTP-29.1.1.
-                let stack_size = inner.config.sched_thread_stack_sizes[0];
-                threads.push(
-                    arinsal_alloc::ethr::ethr_thr_create(
-                        Some(format!("erts_sched_{}", id + 1)),
-                        Some(stack_size),
-                        move || {
-                            let now = inner.clock.now_ms();
-                            worker_loop(inner, id, local.into_local(now))
-                        },
-                    )
-                    .expect("spawn scheduler thread"),
-                );
-            }
-            // Port of erts/emulator/beam/erl_process.c:8890 (erts_start_schedulers, dirty
-            // scheduler threads), OTP-29.1.1.
-            for (kind, count) in [(DirtyKind::Cpu, dirty_cpu), (DirtyKind::Io, dirty_io)] {
-                for index in 0..count {
-                    let inner = inner.clone();
-                    let name = match kind {
-                        DirtyKind::Cpu => format!("{}_dirty_cpu_scheduler", index + 1),
-                        DirtyKind::Io => format!("{}_dirty_io_scheduler", index + 1),
-                    };
-                    let stack_size = match kind {
-                        DirtyKind::Cpu => inner.config.sched_thread_stack_sizes[1],
-                        DirtyKind::Io => inner.config.sched_thread_stack_sizes[2],
-                    };
-                    let handle = arinsal_alloc::ethr::ethr_thr_create(
-                        Some(name),
-                        Some(stack_size),
-                        move || dirty_scheduler_loop(inner, kind, index),
-                    )
-                    .expect("spawn dirty scheduler thread");
-                    threads.push(handle);
-                }
-            }
+        Self {
+            inner,
+            sched_data: Mutex::new(Some(locals)),
+            threads: Mutex::new(Vec::new()),
         }
-        // Port of erts/emulator/beam/erl_process.c:8921 (erts_start_schedulers, runq_supervisor
-        // thread): only when `+sfwi` (`erts_runq_supervision_interval`) is non-zero.
+    }
+
+    /// Starts the normal scheduler threads with the data [`Scheduler::erts_init_scheduling`]
+    /// built, then the dirty CPU and dirty I/O schedulers and the run queue supervisor. A
+    /// second call does nothing.
+    // Port of erts/emulator/beam/erl_process.c:8909 (erts_start_schedulers), OTP-29.1.1.
+    pub fn erts_start_schedulers(&self) {
+        let Some(locals) = self
+            .sched_data
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        else {
+            return;
+        };
+        let inner = &self.inner;
+        let dirty_cpu = inner.dirty[0].threads.len();
+        let dirty_io = inner.dirty[1].threads.len();
+        let mut threads = self.threads.lock().unwrap_or_else(|e| e.into_inner());
+        // Port of erts/emulator/beam/erl_process.c:8909 (erts_start_schedulers), OTP-29.1.1,
+        // in its order: the run-queue supervisor, the normal schedulers, the dirty CPU and
+        // dirty I/O schedulers.
+        //
+        // The run-queue supervisor exists only when `+sfwi` (`erts_runq_supervision_interval`)
+        // is non-zero; erl_process.c gives it a 16 kilo word stack.
         if let Some(interval) = inner.config.forced_wakeup_interval.filter(|&ms| ms > 0) {
             let inner = inner.clone();
             threads.push(
-                // erl_process.c gives the supervisor a 16 kilo word stack.
                 arinsal_alloc::ethr::ethr_thr_create(
-                    Some("runq_supervisor".to_owned()),
+                    Some("erts_runq_sup".to_owned()),
                     Some(16),
                     move || runq_supervisor(inner, interval),
                 )
                 .expect("spawn run queue supervisor thread"),
             );
         }
-        Self { inner, threads }
+        for (id, local) in locals.into_iter().enumerate() {
+            let inner = inner.clone();
+            // `opts.suggested_stack_size = erts_sched_thread_suggested_stack_size`.
+            let stack_size = inner.config.sched_thread_stack_sizes[0];
+            threads.push(
+                arinsal_alloc::ethr::ethr_thr_create(
+                    Some(format!("erts_sched_{}", id + 1)),
+                    Some(stack_size),
+                    move || {
+                        let now = inner.clock.now_ms();
+                        worker_loop(inner, id, local.into_local(now))
+                    },
+                )
+                .expect("spawn scheduler thread"),
+            );
+        }
+        for (kind, count) in [(DirtyKind::Cpu, dirty_cpu), (DirtyKind::Io, dirty_io)] {
+            for index in 0..count {
+                let inner = inner.clone();
+                let (name, stack_size) = match kind {
+                    DirtyKind::Cpu => (
+                        format!("erts_dcpus_{}", index + 1),
+                        inner.config.sched_thread_stack_sizes[1],
+                    ),
+                    DirtyKind::Io => (
+                        format!("erts_dios_{}", index + 1),
+                        inner.config.sched_thread_stack_sizes[2],
+                    ),
+                };
+                threads.push(
+                    arinsal_alloc::ethr::ethr_thr_create(Some(name), Some(stack_size), move || {
+                        dirty_scheduler_loop(inner, kind, index)
+                    })
+                    .expect("spawn dirty scheduler thread"),
+                );
+            }
+        }
     }
 
     /// Run `f` on the process-local exit words of `pid`.
@@ -9294,7 +9334,10 @@ impl<T: Task> Drop for Scheduler<T> {
         }
         let current = std::thread::current().id();
         let mut on_worker = false;
-        for (id, handle) in self.threads.iter().enumerate() {
+        let threads = self.threads.get_mut().unwrap_or_else(|e| e.into_inner());
+        // Schedulers that never started have nothing to suspend.
+        let started = !threads.is_empty();
+        for (id, handle) in threads.iter().enumerate() {
             if let Some(flag) = self.inner.parked.get(id) {
                 flag.store(false, Ordering::SeqCst);
             }
@@ -9303,14 +9346,18 @@ impl<T: Task> Drop for Scheduler<T> {
             on_worker |= handle.thread().id() == current;
         }
         // Dropping the handles detaches the threads.
-        self.threads.clear();
-        let schedulers = self.inner.config.workers
-            + self
-                .inner
-                .dirty
-                .iter()
-                .map(|pool| pool.threads.len())
-                .sum::<usize>();
+        threads.clear();
+        let schedulers = if started {
+            self.inner.config.workers
+                + self
+                    .inner
+                    .dirty
+                    .iter()
+                    .map(|pool| pool.threads.len())
+                    .sum::<usize>()
+        } else {
+            0
+        };
         let shutdown = move |inner: &Inner<T>| {
             let (count, all_suspended) = &inner.stop_suspended;
             let mut count = count.lock().unwrap_or_else(|e| e.into_inner());
@@ -9348,7 +9395,13 @@ impl<T: Task> Scheduler<T> {
         for pool in &self.inner.dirty {
             pool.wake_all();
         }
-        for (id, handle) in self.threads.iter().enumerate() {
+        for (id, handle) in self
+            .threads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .enumerate()
+        {
             if let Some(flag) = self.inner.parked.get(id) {
                 flag.store(false, Ordering::SeqCst);
             }
@@ -9666,9 +9719,7 @@ fn run_slice<T: Task>(esdp: &ErtsSchedulerData<T>, process: &ProcRef<T>) -> u32 
         // Port of erts/emulator/beam/erl_nif.c:468-499 (erts_call_dirty_nif), OTP-29.1.1:
         // the job runs without the main lock, so a dirty signal handler can take it.
         drop(cell);
-        let thread_type = SCHEDULER_TYPE.with(|current| current.replace(kind.into()));
         let result = job();
-        SCHEDULER_TYPE.with(|current| current.set(thread_type));
         cell = lock_cell(process);
         cell.task_mut().finish_dirty_job(result);
     }
@@ -9678,10 +9729,6 @@ fn run_slice<T: Task>(esdp: &ErtsSchedulerData<T>, process: &ProcRef<T>) -> u32 
         if esdp.msacc_enabled.get() {
             esdp.with_ctx(&mut c_p, |_, ctx| ctx.set_msacc_state(MsaccState::Emulator));
         }
-        // A normal scheduler thread already has its type, like `esdp->type`.
-        let thread_type = worker
-            .is_none()
-            .then(|| SCHEDULER_TYPE.with(|current| current.replace(esdp.sched_type)));
         // Port of erts/emulator/beam/beam_common.c:179-300 (erts_dirty_process_main:
         // copy_in_registers after erts_schedule, copy_out_registers before the next),
         // OTP-29.1.1.
@@ -9693,9 +9740,6 @@ fn run_slice<T: Task>(esdp: &ErtsSchedulerData<T>, process: &ProcRef<T>) -> u32 
         T::copy_out_registers(&mut c_p, &esdp.registers);
         T::schedule_out(&mut c_p, esdp, calls);
         T::trace_schedule_out(&mut c_p, esdp);
-        if let Some(thread_type) = thread_type {
-            SCHEDULER_TYPE.with(|current| current.set(thread_type));
-        }
         if esdp.msacc_enabled.get() {
             let gc_ns = c_p.task().gc_nanoseconds();
             esdp.with_ctx(&mut c_p, |_, ctx| {
@@ -11027,8 +11071,6 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
     inner.sleepers[id]
         .set(thread::current())
         .expect("worker registers once");
-    NORMAL_SCHEDULER_ID.with(|current| current.set(Some(id)));
-    NORMAL_SCHEDULER_COUNT.with(|current| current.set(Some(inner.config.workers)));
     // Port of erts/emulator/beam/erl_alloc.c (erts_alloc_register_scheduler), OTP-29.1.1:
     // scheduler `no` owns allocator instance `no`. A refused registration leaves the thread on
     // instance 0, which is correct for a second runtime in the same process.
@@ -11041,12 +11083,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
     // Port of erts/emulator/beam/erl_process.c:8861 (sched_thread_func registers the
     // scheduler as a managed thread), OTP-29.1.1.
     let managed_thread = thr_progress::register_managed_thread(&inner.progress, id);
-    let inner_id = Arc::as_ptr(&inner) as usize;
-    OWNER_TIMER_SERVICES.with(|services| {
-        services
-            .borrow_mut()
-            .insert(inner_id, (id, Box::new(local.timer_service.clone())));
-    });
+    let timer_wheel = Rc::clone(&local.timer_service);
     let local_cell = Rc::new(RefCell::new(local));
     native_sender::install(Rc::new(WorkerSender {
         inner: Arc::clone(&inner),
@@ -11054,19 +11091,22 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
     let ssi_spin_count = scheduler_spin_count(&inner.config.busy_wait_thresholds, 0, "medium");
     let esdp = ErtsSchedulerData {
         worker: Some(id),
-        worker_count: inner.config.workers,
         sched_type: SchedulerType::Normal,
+        pending_signal: PendingSlot::default(),
+        ref_unique: unique::SchedRefUnique::new_normal(id as u32 + 1),
+        match_pseudo_process: MatchPseudoProcess::default(),
+        worker_count: inner.config.workers,
         virtual_reds: Cell::new(0),
         msacc_enabled: Cell::new(false),
         wall_enabled: Cell::new(false),
         gc_accounted_total: Cell::new(0),
+        timer_wheel: Some(timer_wheel),
         local: Some(local_cell),
         thr_progress_data: Some(managed_thread),
         current_process: RefCell::new(None),
         ssi_spin_count,
         dirty_no: None,
         run_queue: inner,
-        ref_unique: Rc::new(unique::SchedRefUnique::new_normal(id as u32 + 1)),
         registers: T::SchedulerData::default(),
         #[cfg(target_os = "linux")]
         cpu_id: Cell::new(None),
@@ -11076,7 +11116,6 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
     CPUINFO_AFFINITY.get_or_init(|| rustix::thread::sched_getaffinity(None).ok());
     // erts seeds the scheduler-local random state from the `esdp` address.
     arinsal_term::initialize_scheduler_random(std::ptr::from_ref(&esdp).cast());
-    let _ref_unique_binding = esdp.ref_unique.bind();
     let _sched_data_key = sched_data_key::SchedDataKey::set(&esdp);
     process_main(&esdp)
 }
@@ -11289,7 +11328,6 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
             DirtyKind::Cpu => index as u32 + 1,
             DirtyKind::Io => inner.config.dirty_cpu_schedulers as u32 + index as u32 + 1,
         };
-    SCHEDULER_TYPE.with(|current| current.set(kind.into()));
     // Port of erts/emulator/beam/erl_alloc.c (erts_alloc_register_scheduler), OTP-29.1.1: a dirty
     // scheduler uses instance 0 unless dirty allocator instances are configured.
     let _ = arinsal_alloc::register_thread(match kind {
@@ -11306,25 +11344,27 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
     );
     let esdp = ErtsSchedulerData {
         worker: None,
-        worker_count: inner.config.workers,
         sched_type: kind.into(),
+        pending_signal: PendingSlot::default(),
+        ref_unique: unique::SchedRefUnique::new_dirty(thr_id),
+        match_pseudo_process: MatchPseudoProcess::default(),
+        worker_count: inner.config.workers,
         virtual_reds: Cell::new(0),
         msacc_enabled: Cell::new(false),
         wall_enabled: Cell::new(false),
         gc_accounted_total: Cell::new(0),
+        timer_wheel: None,
         local: None,
         thr_progress_data: None,
         current_process: RefCell::new(None),
         ssi_spin_count,
         dirty_no: Some((kind, index)),
         run_queue: inner,
-        ref_unique: Rc::new(unique::SchedRefUnique::new_dirty(thr_id)),
         registers: T::SchedulerData::default(),
         #[cfg(target_os = "linux")]
         cpu_id: Cell::new(None),
     };
     arinsal_term::initialize_scheduler_random(std::ptr::from_ref(&esdp).cast());
-    let _ref_unique_binding = esdp.ref_unique.bind();
     let pool = &esdp.run_queue.dirty[kind.index()];
     let thread = &pool.threads[index];
     let _ = thread.handle.set(thread::current());

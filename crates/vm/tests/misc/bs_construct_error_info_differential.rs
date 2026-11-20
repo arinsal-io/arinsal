@@ -3,7 +3,6 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
-use arinsal_vm::Vm;
 use std::process::Command;
 
 const CHILD: &str = "ARINSAL_BS_ERROR_INFO_CHILD";
@@ -32,7 +31,7 @@ fn bit_sized_binary_construct_errors_match_otp() {
             .expect("child bit size")
             .parse()
             .expect("integer bit size");
-        let mut vm = Vm::new([]);
+        let mut vm = crate::common::node();
         vm.load_bytes(&std::fs::read(beam_path).expect("test BEAM"))
             .expect("load test module");
         let actual = vm

@@ -10,6 +10,7 @@
 mod raw;
 
 pub use raw::ProcSchedData;
+pub(crate) use raw::with_head;
 
 use crate::{ErtsSchedulerData, Task};
 

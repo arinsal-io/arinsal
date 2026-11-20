@@ -827,6 +827,12 @@ impl DriverPort {
         })
     }
 
+    /// Port of erts/emulator/beam/erl_port_task.h:223 (erts_port_task_sched_enter_exiting_state):
+    /// an exit is being delivered; operations on the port are scheduled from now on.
+    pub fn sched_enter_exiting_state(&self) {
+        self.sched.or(PTS_FLG_EXITING);
+    }
+
     /// Port of erts/emulator/beam/erl_port_task.c:1643 (erts_port_task_free_port): the
     /// port terminated; abort its tasks unless a scheduler executing the port does that.
     pub(crate) fn sched_free(&self) {

@@ -173,6 +173,7 @@ name = "arinsal-difftest"
 version = "0.0.1"
 dependencies = [
  "arinsal-etf",
+ "libc",
  "num-bigint",
  "num-traits",
  "proptest",
@@ -214,6 +215,7 @@ dependencies = [
  "arinsal-difftest",
  "arinsal-etf",
  "arinsal-maps",
+ "arinsal-sched",
  "arinsal-term",
  "num-bigint",
  "num-traits",

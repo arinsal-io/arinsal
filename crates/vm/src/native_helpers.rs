@@ -1614,36 +1614,6 @@ fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifEr
     process.heap.abi.exc.ftrace = ftrace;
 }
 
-/// Resolves a native exception to the innermost catch handler, or 0 to let the scheduler exit.
-///
-/// Port of erts/emulator/beam/beam_common.c:449 (`handle_error`) and
-/// jit/arm/beam_asm_global.cpp:300 (`raise_exception_shared`), OTP-29.1.1.
-/// A caught error stays in native code: save a raw stacktrace, scan for the catch
-/// tag, and return the handler. The symbolic list is built later, only if the
-/// handler executes `build_stacktrace`.
-pub extern "C" fn arinsal_beamasm_exception_resolver(
-    header: *mut ProcessHeader,
-    pc: u64,
-    reg: *mut u64,
-    bif_info: u64,
-) -> usize {
-    let Some(process) = crate::native_hooks::process_from_header(header) else {
-        return 0;
-    };
-    let Some((process, registers)) = crate::native_hooks::scheduler_registers_at(
-        process,
-        arinsal_beamasm::SchedulerRegisters::from_reg(reg),
-    ) else {
-        return 0;
-    };
-    crate::beam_common::handle_error_core(
-        process,
-        pc as usize,
-        &mut registers.x_reg_array,
-        bif_info,
-    )
-}
-
 /// `GET_EXC_CLASS(freason)` for a failure `handle_error` completes in native code, or `None`
 /// for one the scheduler completes.
 ///

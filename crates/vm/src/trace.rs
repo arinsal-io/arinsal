@@ -4690,7 +4690,6 @@ fn destroy_session_key(runtime: usize, session: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Vm;
     use arinsal_difftest::{CallResult, RefErl};
 
     fn trace_pattern_diff(name: &str, source: &str) {
@@ -4701,7 +4700,7 @@ mod tests {
         let beam = reference.compile_named(name, source, &[]).unwrap();
         reference.load(name, &beam).unwrap();
         let expected = reference.call(name, "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm.eval_scheduled(name, "run", &[], 1).unwrap();
         assert_eq!(expected, CallResult::Ok(actual.term));
@@ -4723,7 +4722,7 @@ mod tests {
         let beam = reference
             .compile_named("trace_refresh_bench", source, &[])
             .unwrap();
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let start = std::time::Instant::now();
         vm.eval_scheduled("trace_refresh_bench", "run", &[], 1)
@@ -4960,7 +4959,7 @@ mod tests {
         let module = "trace_t3a_return_to_stack";
         let beam = reference.compile_named(module, source, &[]).unwrap();
         reference.load(module, &beam).unwrap();
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let expected = reference.call(module, "run", &[]);
         let actual = vm.eval_scheduled(module, "run", &[], 1).unwrap();
@@ -5026,7 +5025,7 @@ mod tests {
         let beam = reference.compile_named("trace_t1_shape", "-module(trace_t1_shape). -export([run/0]). run() -> Parent=self(), Child=spawn(fun() -> receive ping -> ok end end), erlang:trace(Child,true,['receive']), Child ! ping, receive {trace,Child,'receive',ping} -> {trace,is_pid(Child),'receive',ping} after 1000 -> timeout end.", &[]).unwrap();
         reference.load("trace_t1_shape", &beam).unwrap();
         let expected = reference.call("trace_t1_shape", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm.eval_scheduled("trace_t1_shape", "run", &[], 2).unwrap();
         assert_eq!(expected, CallResult::Ok(actual.term));
@@ -5044,7 +5043,7 @@ mod tests {
             .unwrap();
         reference.load("trace_t1_send", &beam).unwrap();
         let expected = reference.call("trace_t1_send", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm.eval_scheduled("trace_t1_send", "run", &[], 2).unwrap();
         assert_eq!(expected, CallResult::Ok(actual.term));
@@ -5062,7 +5061,7 @@ mod tests {
             .unwrap();
         reference.load("trace_t1_timestamp", &beam).unwrap();
         let expected = reference.call("trace_t1_timestamp", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("trace_t1_timestamp", "run", &[], 2)
@@ -5082,7 +5081,7 @@ mod tests {
             .unwrap();
         reference.load("trace_t1_info", &beam).unwrap();
         let expected = reference.call("trace_t1_info", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm.eval_scheduled("trace_t1_info", "run", &[], 2).unwrap();
         assert_eq!(expected, CallResult::Ok(actual.term));
@@ -5100,7 +5099,7 @@ mod tests {
             .unwrap();
         reference.load("trace_t4_sessions", &beam).unwrap();
         let expected = reference.call("trace_t4_sessions", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("trace_t4_sessions", "run", &[], 2)
@@ -5177,7 +5176,7 @@ mod tests {
             .unwrap();
         reference.load("trace_t4_session_info", &beam).unwrap();
         let expected = reference.call("trace_t4_session_info", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("trace_t4_session_info", "run", &[], 2)
@@ -5197,7 +5196,7 @@ mod tests {
             .unwrap();
         reference.load("trace_t4_tracee_info", &beam).unwrap();
         let expected = reference.call("trace_t4_tracee_info", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("trace_t4_tracee_info", "run", &[], 2)
@@ -5217,7 +5216,7 @@ mod tests {
             .unwrap();
         reference.load("trace_t4_destroy_info", &beam).unwrap();
         let expected = reference.call("trace_t4_destroy_info", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("trace_t4_destroy_info", "run", &[], 2)
@@ -5237,7 +5236,7 @@ mod tests {
             .unwrap();
         reference.load("trace_t4_session_gc", &beam).unwrap();
         let expected = reference.call("trace_t4_session_gc", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("trace_t4_session_gc", "run", &[], 2)
@@ -5259,7 +5258,7 @@ mod tests {
             .unwrap();
         reference.load("trace_t8_dict_gc", &beam).unwrap();
         let expected = reference.call("trace_t8_dict_gc", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("trace_t8_dict_gc", "run", &[], 2)
@@ -5279,7 +5278,7 @@ mod tests {
             .unwrap();
         reference.load("trace_t4_weak_handle", &beam).unwrap();
         let expected = reference.call("trace_t4_weak_handle", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("trace_t4_weak_handle", "run", &[], 2)

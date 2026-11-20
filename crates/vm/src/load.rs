@@ -795,43 +795,13 @@ impl Vm {
             .find(|record| record.name == name)
     }
 
-    /// Construct a VM. Explicit paths precede the current directory and OTP libraries.
-    pub fn new(paths: impl IntoIterator<Item = PathBuf>) -> Self {
-        let otp = std::env::var_os("ARINSAL_OTP_ROOT")
-            .filter(|root| !root.is_empty())
-            .map(PathBuf::from)
-            .or_else(arinsal_args::bundled_otp_root)
-            .or_else(|| {
-                std::env::var_os("ERL_ROOTDIR")
-                    .filter(|root| !root.is_empty())
-                    .map(PathBuf::from)
-            })
-            .or_else(|| {
-                std::env::var_os("ROOTDIR")
-                    .filter(|root| !root.is_empty())
-                    .map(PathBuf::from)
-            })
-            .or_else(|| {
-                // Discovery runs the `erl` launcher (~100 ms); every VM of a process shares it.
-                static DISCOVERED: std::sync::OnceLock<Option<PathBuf>> =
-                    std::sync::OnceLock::new();
-                DISCOVERED
-                    .get_or_init(|| {
-                        arinsal_args::discover_otp_root(&arinsal_args::ProcessEnv)
-                            .map(PathBuf::from)
-                    })
-                    .clone()
-            })
-            .unwrap_or_default();
-        Self::new_with_otp_root(paths, otp)
-    }
-
-    /// Construct a VM with a known OTP root, without querying the `erl` launcher.
+    /// The node's code-loading handle, built once by `erl_init` (erl_init.c) after the global
+    /// literals exist: the boot code path is `paths`, the current directory and the release's
+    /// `lib/*/ebin`.
     pub(crate) fn new_with_otp_root(
         paths: impl IntoIterator<Item = PathBuf>,
         otp: PathBuf,
     ) -> Self {
-        crate::boot::erl_init_global_literals();
         #[cfg(target_os = "linux")]
         crate::raw::sys_time::init();
         let mut paths: Vec<PathBuf> = paths.into_iter().collect();
@@ -857,16 +827,6 @@ impl Vm {
         crate::erl_init::erts_set_boot_args(paths, otp_root);
         arinsal_nif_zlib::set_scheduler_caller(crate::natives::nif::scheduler_caller);
         Self {}
-    }
-
-    /// Construct a VM with OTP's debugger startup flags applied before any module is loaded.
-    pub fn new_with_debugger_flags(
-        paths: impl IntoIterator<Item = PathBuf>,
-        debugger_support: bool,
-        line_breakpoints: bool,
-    ) -> Self {
-        crate::trace_bp::configure_debugger(debugger_support, line_breakpoints);
-        Self::new(paths)
     }
 
     /// Record a BEAM file's exports then imports in global export-index order
@@ -1431,7 +1391,6 @@ impl Vm {
 
 #[cfg(test)]
 mod purge_free_tests {
-    use crate::Vm;
     use crate::code_ix::{code_tables, erts_active_code_ix};
     use std::process::Command;
 
@@ -1461,7 +1420,7 @@ mod purge_free_tests {
             eprintln!("erlc unavailable; skipping purge free test");
             return;
         };
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         // A module whose load did not make it current (a failed on_load) stays published, so
         // freeing it has to unpublish its exports.
         let id = vm.load_bytes(&beam).unwrap();
@@ -1482,7 +1441,7 @@ mod purge_free_tests {
             eprintln!("erlc unavailable; skipping purge free test");
             return;
         };
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         let id = vm.load_bytes(&beam).unwrap();
         let store = arinsal_pterm::global_store();
         let released = crate::code_ix::global().update_active(|tables| tables.release(id));
@@ -1502,7 +1461,7 @@ mod purge_free_tests {
             eprintln!("erlc unavailable; skipping purge free test");
             return;
         };
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         let id = vm.load_bytes(&beam).unwrap();
         assert!(
             !code_tables(erts_active_code_ix()).modules[id]

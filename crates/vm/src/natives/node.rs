@@ -646,7 +646,6 @@ fn badopt() -> VmError {
 
 #[cfg(test)]
 mod tests {
-    use crate::Vm;
     use arinsal_difftest::{CallResult, RefErl};
 
     const SOURCE: &str = r#"
@@ -700,7 +699,7 @@ badarg(F) -> try F() of _ -> unexpected catch error:badarg -> badarg end.
             .unwrap();
         reference.load("node_native_diff", &beam).unwrap();
         let expected = reference.call("node_native_diff", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("node_native_diff", "run", &[], 2)

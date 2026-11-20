@@ -81,7 +81,8 @@ pub use hamt::{
     swizzle_map_hash,
 };
 pub use hamt_yield::{
-    HashmapBuild, MapNodeChildren, MapReverseIter, hashmap_leaf_pair, initialize_scheduler_random,
+    HashmapBuild, MapNodeChildren, MapReverseIter, erts_sched_local_random, hashmap_leaf_pair,
+    initialize_scheduler_random,
 };
 pub use hash::{
     HASH2_ITERATIONS_PER_RED, Hash2Progress, Hash2Run, hash2_immediate, make_hash, make_hash2,

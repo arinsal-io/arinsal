@@ -420,16 +420,9 @@ pub(super) fn process_main(
                                 reg.active_code_ix = crate::code_ix::global()
                                     .process_code_ix(crate::trace::saves_calls(process))
                                     as u64;
-                                let native = crate::native_bridge::run_native_resume(
+                                crate::native_bridge::run_native_resume(
                                     process, &mut *reg, code_ptr,
-                                );
-                                // Native `timeout` has no scheduler context to send its trace event.
-                                if process.native_exit_kind != crate::proc_create::NativeExit::None
-                                    && process.take_native_timeout_trace()
-                                {
-                                    crate::trace::timeout_event(Some(&mut Vm {}), process, ctx);
-                                }
-                                native
+                                )
                             };
                             match native {
                                 Ok(outcome) => outcome,

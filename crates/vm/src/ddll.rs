@@ -1303,37 +1303,23 @@ pub(crate) fn port_opened_for(driver: &Arc<Driver>, port: &DriverPort) {
     }
 }
 
-/// Port of io.c:3753 (erts_ddll_decrement_port_count) at `terminate_port` and of
-/// io.c:489 (the port-free dereference). erts frees a port after thread progress;
-/// here the dereference runs once every scheduler has reached a scheduling point.
-pub(crate) fn port_closed(scheduler: &Arc<Scheduler<Process>>, driver: &Arc<Driver>) {
-    {
-        let mut table = table().lock().unwrap();
-        let Some(handle) = table.handles.values_mut().find(|handle| {
-            handle
-                .driver
-                .as_ref()
-                .is_some_and(|d| Arc::ptr_eq(d, driver))
-        }) else {
-            return;
-        };
+/// Port of io.c:3753 (erts_ddll_decrement_port_count) at `terminate_port`. The port's
+/// reference to the handle is dropped later, when the port is freed ([`port_freed`]).
+pub(crate) fn port_closed(driver: &Arc<Driver>) {
+    let mut table = table().lock().unwrap();
+    if let Some(handle) = table.handles.values_mut().find(|handle| {
+        handle
+            .driver
+            .as_ref()
+            .is_some_and(|d| Arc::ptr_eq(d, driver))
+    }) {
         handle.port_count = handle.port_count.saturating_sub(1);
     }
-    // Like erts thread progress: every scheduler, including the one running the
-    // closing process, passes a scheduling point before the port is freed.
-    let remaining = Arc::new(std::sync::atomic::AtomicUsize::new(
-        scheduler.worker_count().max(1),
-    ));
-    let target = Arc::clone(scheduler);
-    let driver = Arc::clone(driver);
-    scheduler.request_aux_work_all(move |_| {
-        if remaining.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
-            port_freed(&target, &driver);
-        }
-    });
 }
 
-fn port_freed(scheduler: &Scheduler<Process>, driver: &Arc<Driver>) {
+/// Port of io.c:489 (erts_port_free, erts_ddll_dereference_driver): the freed port's
+/// reference to the driver handle ends.
+pub(crate) fn port_freed(scheduler: &Scheduler<Process>, driver: &Arc<Driver>) {
     let mut notices = Vec::new();
     {
         let mut guard = table().lock().unwrap();

@@ -120,6 +120,31 @@ impl Process {
         &mut self,
         ctx: &mut RunCtx<'_, crate::Process>,
         fcalls: i32,
+    ) -> (i32, ReceiveHelper) {
+        match self.receive_helper_signals(ctx, fcalls) {
+            Ok(result) => result,
+            // erts' signal handling cannot fail; here a handler's failure (a heap term it
+            // could not build) is the reason the process exits with, through the one exit
+            // path an incoming signal takes: erts_set_self_exiting, then `jmp c_p->i`
+            // (beam_exit) once the process schedules out.
+            // A dirty system task or a yield asked for by a handler leaves the process
+            // runnable: its state bits send it on at schedule-out.
+            Err(VmError::Dirty(_) | VmError::Yield) => (0, ReceiveHelper::Yield),
+            Err(error) => {
+                let reason = super::exit::exit_reason_from(self, &error);
+                self.erts_set_self_exiting(ctx, reason);
+                self.heap.abi.flags &= !arinsal_term::pflags::F_DELAY_GC;
+                self.heap.abi.arity = 0;
+                self.heap.abi.current = std::ptr::null();
+                (0, ReceiveHelper::Exiting)
+            }
+        }
+    }
+
+    fn receive_helper_signals(
+        &mut self,
+        ctx: &mut RunCtx<'_, crate::Process>,
+        fcalls: i32,
     ) -> Result<(i32, ReceiveHelper), VmError> {
         // `neg_o_reds` is nonzero only while saving calls (`save_calls`).
         let mut left_reds = fcalls;

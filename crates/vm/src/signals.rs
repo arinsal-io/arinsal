@@ -46,8 +46,6 @@ fn runtime(process: &Process) -> Result<&Runtime, VmError> {
 mod task_latency_tests {
     use arinsal_difftest::RefErl;
 
-    use crate::Vm;
-
     const SOURCE: &str = concat!(
         "-module(task_latency_probe). -export([run/0]).\n",
         "task() -> Ref=make_ref(), Pid=spawn(fun() -> receive {Alias, Ref} -> Alias ! {Ref, ok} end end),\n",
@@ -69,7 +67,7 @@ mod task_latency_tests {
         let beam = reference
             .compile_named("task_latency_probe", SOURCE, &[])
             .expect("compile alias monitor latency probe");
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam)
             .expect("load alias monitor latency probe");
         let elapsed = vm
@@ -114,7 +112,7 @@ suspend_busy() ->
             .compile_named("sig_prio_mon_probe", source, &[])
             .expect("compile monitor/suspend priority probe");
         reference.load("sig_prio_mon_probe", &beam).unwrap();
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam)
             .expect("load monitor/suspend priority probe");
 
@@ -156,7 +154,7 @@ run() ->
             arinsal_etf::OwnedTerm::Int(workers) => workers as usize,
             value => panic!("expected scheduler count, got {value:?}"),
         };
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("spawn_scheduler_probe", "run", &[], workers)
@@ -197,7 +195,7 @@ catch_error(F) -> try F() catch error:R -> R end.
             .unwrap();
         reference.load("light_spawn_probe", &beam).unwrap();
         let expected = reference.call("light_spawn_probe", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("light_spawn_probe", "run", &[], 2)
@@ -218,7 +216,7 @@ catch_error(F) -> try F() catch error:R -> R end.
             .unwrap();
         reference.load("absolute_timer_probe", &beam).unwrap();
         let expected = reference.call("absolute_timer_probe", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("absolute_timer_probe", "run", &[], 2)
@@ -255,7 +253,7 @@ busy_wait(Until) ->
             .load("queued_timeout_cancel_probe", &beam)
             .unwrap();
         let expected = reference.call("queued_timeout_cancel_probe", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("queued_timeout_cancel_probe", "run", &[], 2)
@@ -284,7 +282,7 @@ busy_wait(Until) ->
             .unwrap();
         reference.load("dead_pid_timer_probe", &beam).unwrap();
         let expected = reference.call("dead_pid_timer_probe", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("dead_pid_timer_probe", "run", &[], 2)
@@ -309,7 +307,7 @@ busy_wait(Until) ->
             .unwrap();
         reference.load("wide_timer_probe", &beam).unwrap();
         let expected = reference.call("wide_timer_probe", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("wide_timer_probe", "run", &[], 2)
@@ -349,7 +347,7 @@ busy_wait(Until) ->
             .unwrap();
         reference.load("cross_timer_probe", &beam).unwrap();
         let expected = reference.call("cross_timer_probe", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("cross_timer_probe", "run", &[], 2)
@@ -377,7 +375,7 @@ busy_wait(Until) ->
             .unwrap();
         reference.load("registered_timer_probe", &beam).unwrap();
         let expected = reference.call("registered_timer_probe", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("registered_timer_probe", "run", &[], 2)
@@ -1055,7 +1053,8 @@ fn call_resolved(
             // Port of erts/emulator/beam/erl_init.c (erts_internal_spawn_system_process_3:
             // erl_spawn_system_process with default options), OTP-29.1.1.
             let mut so = crate::natives::erl_process::ErlSpawnOpts::new(process.runtime);
-            let pid = crate::natives::erl_process::erl_create_process(
+            so.system_proc = true;
+            crate::natives::erl_process::erl_create_process(
                 process,
                 std::ptr::null_mut(),
                 *module,
@@ -1063,11 +1062,7 @@ fn call_resolved(
                 *args,
                 &mut so,
             )
-            .map_err(crate::natives::erl_process::CreateError::into_bif_error)?;
-            if let (Some(pid), Some(runtime)) = (Pid::from_term(pid), process.runtime.as_ref()) {
-                runtime.system_processes.lock().unwrap().insert(pid);
-            }
-            Ok(pid)
+            .map_err(crate::natives::erl_process::CreateError::into_bif_error)
         }
         (SignalBif::DirtyProcessHandleSignals1, [arg]) => {
             dirty_process_handle_signals(vm, process, ctx, *arg)

@@ -12,11 +12,6 @@ pub(crate) mod raw;
 pub(crate) enum NativeExit {
     #[default]
     None,
-    /// A traced `timeout` left its event for the scheduler (`ColdState::native_timeout_trace`).
-    TimeoutTrace,
-    /// The receive helper handled a signal that ends the process
-    /// (`ProcessCold::native_exiting`).
-    Exiting,
     /// `wait` or `wait_timeout` (`ColdState::native_wait`).
     Wait,
 }
@@ -505,6 +500,8 @@ pub struct Process {
     /// mix_loop1. Port of the freason kept across `i_raise` (beam_emu), OTP-29.1.1.
     pub(crate) exc_class: Option<arinsal_bifs::Class>,
     pub(crate) entry: bool,
+    /// `p->static_flags` (erl_process.h `ERTS_STC_FLG_*`), set once by erl_create_process.
+    pub(crate) static_flags: u8,
     /// The next native entry resumes a raw continuation already on the stack.
     pub(crate) native_continuation_resume: bool,
     /// `header.arity` already holds the live X register count of the resumed native
@@ -1511,8 +1508,6 @@ pub(crate) struct SliceWork {
     pub(crate) profile_active: bool,
     /// Call site (module, ip) of a traced native BIF whose call event was emitted and which
     /// yielded before finishing, with the trace actions its return events still need.
-    /// Native code ran `timeout` while tracing is active; the executor emits the receive event.
-    pub(crate) native_timeout_trace: bool,
     /// The last slice ended because the process is suspended, not because it waits in a
     /// receive: it stays active (runnable once resumed).
     pub(crate) suspend_parked: bool,
@@ -1562,7 +1557,6 @@ impl SliceWork {
             || self.bif_trap.is_some()
             || self.debug_wait_completion.is_some()
             || self.sys_tasks_deferred
-            || self.native_timeout_trace
             || self.profile_active
             || self.dirty_exited
             || self.rla_block.is_some()
@@ -1582,10 +1576,6 @@ pub(crate) struct ProcessCold {
     /// THE_NON_VALUE with TRAP to its call, and the scheduler finishes the call with this
     /// result instead of calling the BIF again.
     pub(crate) bif_outcome: Option<Box<crate::VmError>>,
-    /// The exit a signal handled by the native receive helper started: erts sets
-    /// `ERTS_PSFLG_EXITING` and the reason in `c_p->fvalue`, then `i_loop_rec_shared` schedules
-    /// out (`*get_outp = 1`); the scheduler completes the exit with it.
-    pub(crate) native_exiting: Option<Box<crate::VmError>>,
     /// The parked `erlang:hibernate` continuation (erts keeps it on the process; `F_HIBERNATE_SCHED`).
     pub(crate) hibernate: Option<crate::process::HibernateCont>,
     /// `p->max_heap_size` (erts erl_process.h:1034): the limit and its flags.
@@ -1723,6 +1713,10 @@ pub(crate) struct BifTrapPending {
     /// `apply(Module, Function, Args)` built from the trap state.
     pub(crate) callee: (arinsal_term::Atom, arinsal_term::Atom),
 }
+
+/// `ERTS_STC_FLG_SYSTEM_PROC` (erl_process.h): a process spawned by `erl_spawn_system_process`
+/// (`SPO_SYSTEM_PROC`); its termination brings the node down (erl_process.c:14186).
+pub(crate) const ERTS_STC_FLG_SYSTEM_PROC: u8 = 1 << 0;
 
 impl Process {
     /// The call site a pending BIF trap belongs to: the interpreter's position. The JIT flavor
@@ -2125,12 +2119,6 @@ impl Process {
     ) -> Option<&mut (usize, usize, arinsal_bifs::SchedulerClass)> {
         self.cold.as_deref_mut()?.work.native_dirty_nif.as_mut()
     }
-    /// Clears and returns the native `timeout` trace request.
-    #[inline(always)]
-    pub(crate) fn take_native_timeout_trace(&mut self) -> bool {
-        self.take_work(|work| std::mem::take(&mut work.native_timeout_trace).then_some(()))
-            .is_some()
-    }
     /// Removes the first signal of the middle queue.
     #[inline(always)]
     pub(crate) fn pop_sig_cont_signal(
@@ -2344,6 +2332,7 @@ impl Process {
             persistent_terms: arinsal_pterm::global_store(),
             exc_class: None,
             entry: false,
+            static_flags: 0,
             native_continuation_resume: false,
             native_arity_set: false,
             native_error_pc: 0,
@@ -3053,6 +3042,10 @@ mod layout_report {
         );
         eprintln!("  Process.exc_class {}", size_of_val(&process.exc_class));
         eprintln!("  Process.entry {}", size_of_val(&process.entry));
+        eprintln!(
+            "  Process.static_flags {}",
+            size_of_val(&process.static_flags)
+        );
         eprintln!(
             "  Process.native_continuation_resume {}",
             size_of_val(&process.native_continuation_resume)

@@ -84,14 +84,14 @@ pub(super) fn trace_boot_enabled() -> bool {
 static PF_MONITOR_DOWN: AtomicU64 = AtomicU64::new(0);
 
 /// VM part of one scheduler's data: `esdp->registers` and the per-scheduler state erts keeps in
-/// `ErtsSchedulerData` (`current_process` as the NIF hub sees it, the allocator index). It
+/// `ErtsSchedulerData` (`current_nif`, the allocator index). It
 /// lives inline in [`arinsal_sched::ErtsSchedulerData`] and is
 /// reached through `esdp` ([`arinsal_sched::erts_sched_registers`]) by the slice and the code it
 /// calls, by shared reference only: no exclusive borrow of it is held across a call into
 /// generated code.
 ///
 /// Port of erts/emulator/beam/erl_process.h:687 (struct ErtsSchedulerData_: `registers`,
-/// `current_process`) and erl_process.c:5994 (init_scheduler_data), OTP-29.1.1.
+/// `no`) and erl_process.c:5994 (init_scheduler_data), OTP-29.1.1.
 pub struct SchedulerData {
     /// `esdp->registers`: the scheduler's X and F register file, which `copy_in_registers`
     /// loads the scheduled process's live registers into.
@@ -101,10 +101,8 @@ pub struct SchedulerData {
     /// slice runs. An address derived from the slice's own borrow, as erts' `reg` is the
     /// pointer process_main hands down.
     pub(crate) registers_addr: std::cell::Cell<usize>,
-    /// `esdp->current_process`, shared with this scheduler thread's NIF hub.
-    pub(super) current_process: crate::natives::nif::CurrentProcess,
-    /// The scheduler thread's hub is bound to `current_process`.
-    pub(super) hub_bound: std::cell::Cell<bool>,
+    /// `esdp->current_nif`: the NIF call running on this scheduler (erts_pre_nif).
+    pub(crate) current_nif: std::cell::Cell<Option<crate::natives::nif::CurrentNif>>,
     /// `esdp->no` as the allocator numbers it: the allocator index of this scheduler's thread,
     /// read once on its first process turn and handed to the heap of each process it runs.
     pub(super) alloc_ix: std::cell::Cell<Option<usize>>,
@@ -123,8 +121,7 @@ impl Default for SchedulerData {
         Self {
             registers,
             registers_addr: std::cell::Cell::new(0),
-            current_process: Default::default(),
-            hub_bound: std::cell::Cell::new(false),
+            current_nif: std::cell::Cell::new(None),
             alloc_ix: std::cell::Cell::new(None),
         }
     }
@@ -244,12 +241,6 @@ pub(super) fn process_main_dispatch(
         reg.active_code_ix =
             crate::code_ix::global().process_code_ix(crate::trace::saves_calls(process)) as u64;
         let native = crate::native_bridge::run_native_resume(process, &mut *reg, code_ptr);
-        // Native `timeout` has no scheduler context to send its trace event.
-        if process.native_exit_kind != crate::proc_create::NativeExit::None
-            && process.take_native_timeout_trace()
-        {
-            crate::trace::timeout_event(Some(&mut Vm {}), process, ctx);
-        }
         let outcome = match native {
             Ok(outcome) => outcome,
             Err(VmError::Trap(trap)) => {
@@ -310,20 +301,6 @@ pub(super) fn process_main_dispatch(
                     return Some(Err(error));
                 }
                 return Some(Ok(RunState::Wait { timeout_pos }));
-            }
-            crate::proc_create::NativeExit::Exiting => {
-                #[cfg(target_arch = "aarch64")]
-                crate::beamasm_integration::count_native_yield();
-                process.native_exit_kind = crate::proc_create::NativeExit::None;
-                // The native receive helper handled a signal that ends the process.
-                if let Some(error) = process
-                    .cold
-                    .as_mut()
-                    .and_then(|cold| cold.native_exiting.take())
-                {
-                    return Some(Err(*error));
-                }
-                return Some(Ok(RunState::Yield));
             }
             _ => match context_switch(process, ctx, reg, outcome, code_ptr) {
                 Ok(Flow::Continue) => continue,

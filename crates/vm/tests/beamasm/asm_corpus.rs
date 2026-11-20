@@ -439,7 +439,12 @@ extern "C" fn map_many(
 ) -> u64 {
     0
 }
-extern "C" fn exception(_: *mut ProcessHeader, _: u64, _: *mut u64, _: u64) -> usize {
+extern "C" fn exception(
+    _: *mut ProcessHeader,
+    _: usize,
+    _: *mut u64,
+    _: *const arinsal_term::ErtsCodeMfa,
+) -> usize {
     0
 }
 extern "C" fn fun(_: *mut ProcessHeader, _: u64, _: u32, _: *mut u64) -> usize {

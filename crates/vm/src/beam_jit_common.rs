@@ -372,9 +372,19 @@ pub extern "C" fn beam_jit_timeout(header: *mut ProcessHeader) {
         if crate::trace::saves_calls(process) {
             crate::trace::save_call(process, crate::trace::SavedCall::Timeout);
         }
+        // `if (IS_TRACED_FL(c_p, F_TRACE_RECEIVE)) trace_receive(c_p, am_clock_service,
+        // am_undefined, am_timeout)`: the event is sent here, on the scheduler running the
+        // process (`erts_proc_sched_data(c_p)`), not at schedule-out.
         if crate::trace::active() {
-            process.slice_mut().native_timeout_trace = true;
-            process.native_exit_kind = crate::proc_create::NativeExit::TimeoutTrace;
+            arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
+                arinsal_sched::RunCtx::with_current(esdp, |ctx| {
+                    crate::trace::timeout_event(Some(&mut crate::Vm {}), process, ctx);
+                })
+            })
+            .flatten()
+            .expect(
+                "native code runs inside an executor slice, which publishes its scheduler data",
+            );
         }
     }
 }

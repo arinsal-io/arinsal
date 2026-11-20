@@ -2153,7 +2153,7 @@ mod tests {
             .eval("code:get_coverage(function, code_bifs_function_cov)")
             .unwrap();
 
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.set_coverage_mode(CoverageMode::FunctionCounters);
         loaded(&mut vm, &beam);
         vm.eval_exported(module, "run", &[]).unwrap();
@@ -2199,7 +2199,7 @@ mod tests {
             .eval("{code:get_coverage(line, code_bifs_line_cov),code:get_coverage(cover_id_line, code_bifs_line_cov)}")
             .unwrap();
 
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.set_coverage_mode(CoverageMode::LineCounters);
         loaded(&mut vm, &beam);
         vm.eval_exported(module, "run", &[]).unwrap();
@@ -2250,7 +2250,7 @@ mod tests {
         let expected = reference
             .eval("code:get_debug_info(code_bifs_debug_info)")
             .unwrap();
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         loaded(&mut vm, &beam);
         let actual =
             to_owned(get_debug_info(&mut Process::new(), crate::atom_cache::put(module)).unwrap())
@@ -2303,7 +2303,7 @@ mod tests {
         let expected = reference
             .eval("code:get_coverage(function, code_bifs_function_flags)")
             .unwrap();
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.set_coverage_mode(CoverageMode::Function);
         loaded(&mut vm, &beam);
         vm.eval_exported(module, "run", &[]).unwrap();
@@ -2347,7 +2347,7 @@ mod tests {
                 &[],
             )
             .unwrap();
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         assert_eq!(loaded(&mut vm, &v1), OwnedTerm::Atom("ok".into()));
         reference.load("arinsal_hot_versions", &v1).unwrap();
         assert_eq!(
@@ -2433,7 +2433,7 @@ mod tests {
         let a3 = compile("arinsal_atomic_a", "v3");
         let b1 = compile("arinsal_atomic_b", "v1");
         let b2 = compile("arinsal_atomic_b", "v2");
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         assert_eq!(
             loaded_many(&mut vm, &[&a1, &b1]),
             OwnedTerm::Atom("ok".into())
@@ -2487,7 +2487,7 @@ mod tests {
             )
             .unwrap();
         reference.load("arinsal_hot_info", &bytes).unwrap();
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&bytes).unwrap();
         vm.load_named("lists").unwrap();
         for module in ["arinsal_hot_info", "lists"] {
@@ -2538,7 +2538,7 @@ mod tests {
             return;
         };
         let bytes = reference.compile_named("arinsal_hot_onload", "-module(arinsal_hot_onload). -on_load(init/0). -export([value/0,init/0]). init() -> ok. value() -> loaded.", &[]).unwrap();
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         assert_eq!(
             loaded(&mut vm, &bytes),
             OwnedTerm::Tuple(vec![
@@ -2589,7 +2589,7 @@ mod tests {
             "run",
             &[OwnedTerm::Binary(v2.clone())],
         );
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&v1).unwrap();
         vm.load_bytes(&control).unwrap();
         let mut heap = arinsal_term::VecHeap::new();
@@ -2643,7 +2643,7 @@ mod tests {
             &[OwnedTerm::Binary(new.clone())],
         );
 
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&wait).unwrap();
         vm.load_bytes(&old).unwrap();
         vm.load_bytes(&control).unwrap();
@@ -2685,7 +2685,7 @@ mod tests {
             &[OwnedTerm::Binary(old.clone())],
         );
 
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&old).unwrap();
         vm.load_bytes(&control).unwrap();
         let mut heap = arinsal_term::VecHeap::new();
@@ -2714,7 +2714,7 @@ mod tests {
                 OwnedTerm::Binary(bad.clone()),
             ],
         );
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&control).unwrap();
         let mut heap = arinsal_term::VecHeap::new();
         let args = [ok, bad].map(|bytes| from_owned(&OwnedTerm::Binary(bytes), &mut heap).unwrap());
@@ -2761,7 +2761,7 @@ mod tests {
             &[OwnedTerm::Binary(beam.clone())],
         );
 
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&control).unwrap();
         let mut heap = arinsal_term::VecHeap::new();
         let binary = from_owned(&OwnedTerm::Binary(beam), &mut heap).unwrap();
@@ -2785,7 +2785,7 @@ mod tests {
         let input = OwnedTerm::Binary(vec![42]);
         let expected = reference.call("arinsal_wide_bs_match", "run", std::slice::from_ref(&input));
 
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let mut heap = arinsal_term::VecHeap::new();
         let input = from_owned(&input, &mut heap).unwrap();
@@ -2825,7 +2825,7 @@ mod tests {
             "run",
             &[OwnedTerm::Binary(v2.clone())],
         );
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&v1).unwrap();
         vm.load_bytes(&control).unwrap();
         let mut heap = arinsal_term::VecHeap::new();
@@ -2853,7 +2853,7 @@ mod tests {
         reference.load("arinsal_delete_target", &target).unwrap();
         reference.load("arinsal_delete_control", &control).unwrap();
         let expected = reference.call("arinsal_delete_control", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&target).unwrap();
         vm.load_bytes(&control).unwrap();
         let result = vm
@@ -2871,7 +2871,7 @@ mod tests {
         let control = reference.compile_named("arinsal_code_errors", "-module(arinsal_code_errors). -export([run/0]). run() -> A=code:load_binary(arinsal_missing,[bad],<<>>), B=try code:load_binary(arinsal_missing,42,<<>>) catch error:R1 -> R1 end, C=try erlang:prepare_loading(arinsal_missing,bad) catch error:R2 -> R2 end, D=try erlang:finish_loading(bad) catch error:R3 -> R3 end, E=try erlang:check_old_code(42) catch error:R4 -> R4 end, F=try erlang:delete_module(42) catch error:R5 -> R5 end, G=try erlang:check_process_code(42,arinsal_missing) catch error:R6 -> R6 end, H=try erts_internal:purge_module(arinsal_missing,prepare) catch error:R7 -> R7 end, {A,B,C,D,E,F,G,H}.", &[]).unwrap();
         reference.load("arinsal_code_errors", &control).unwrap();
         let expected = reference.call("arinsal_code_errors", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&control).unwrap();
         let result = vm
             .eval_scheduled("arinsal_code_errors", "run", &[], 1)
@@ -2912,7 +2912,8 @@ mod boot_loop1_tests {
             let name = crate::atom_cache::put(module);
             let binary = from_owned(&OwnedTerm::Binary(beam), &mut input_heap).unwrap();
             let mut process = Process::new();
-            let prepared = prepare(&Vm::new([]), &mut process, &[name, binary]).unwrap();
+            let prepared =
+                prepare(&crate::boot::test_node(), &mut process, &[name, binary]).unwrap();
             let actual = has_prepared_code_on_load(prepared).unwrap();
             assert_eq!(to_owned(actual).unwrap(), expected, "{module}");
             std::fs::remove_file(path).unwrap();
@@ -2938,7 +2939,7 @@ mod boot_loop1_tests {
             paths.push(path);
             let binary = from_owned(&OwnedTerm::Binary(beam), &mut input_heap).unwrap();
             let prepared = prepare(
-                &Vm::new([]),
+                &crate::boot::test_node(),
                 &mut process,
                 &[crate::atom_cache::put(module), binary],
             )
@@ -2958,7 +2959,7 @@ mod boot_loop1_tests {
             .map(|index| process.heap.stack_get(index).unwrap())
             .collect::<Vec<_>>();
         let list = make_list(&mut process, prepared).unwrap();
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         let actual = super::tests::finish_now(&mut vm, &mut process, &[list]);
         assert_eq!(to_owned(actual).unwrap(), expected);
         assert!(

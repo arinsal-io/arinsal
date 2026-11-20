@@ -1,9 +1,12 @@
 //! Differential tests against an isolated OTP 29.1.1 reference node.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod codec;
 pub mod gens;
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+mod raw;
 pub mod reference;
 pub mod suites;
 
@@ -386,7 +389,8 @@ impl Drop for BuildDir {
 }
 
 fn spawn(ebin: &std::path::Path, erl_args: &[String]) -> Result<Process, Error> {
-    let mut child = Command::new("erl")
+    let mut command = Command::new("erl");
+    command
         .args(erl_args)
         .args(["-noshell", "-pa"])
         .arg(ebin)
@@ -400,8 +404,10 @@ fn spawn(ebin: &std::path::Path, erl_args: &[String]) -> Result<Process, Error> 
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    #[cfg(target_os = "linux")]
+    raw::set_parent_death_signal(&mut command);
+    let mut child = command.spawn()?;
     let stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));

@@ -1019,7 +1019,7 @@ mod tests {
                 &[],
             )
             .unwrap();
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let args = [Term::small(17).unwrap(), Term::small(29).unwrap()];
         let result = vm

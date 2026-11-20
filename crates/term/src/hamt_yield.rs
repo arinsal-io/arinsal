@@ -74,8 +74,11 @@ fn random_hash_64_to_32(mut key: u64) -> u32 {
     key as u32
 }
 
+/// `erts_sched_local_random(additional_seed)`: hash of the calling scheduler's
+/// `esdp->rand_state`, advanced by one, or of a shared counter on a thread that is no
+/// scheduler.
 // Port of erts/emulator/beam/erl_process.h:3054 (erts_sched_local_random), OTP-29.1.1.
-fn sched_local_random(additional_seed: u64) -> u32 {
+pub fn erts_sched_local_random(additional_seed: u64) -> u32 {
     let value = RAND_STATE.with(|state| match state.get() {
         Some(value) => {
             state.set(Some(value.wrapping_add(1)));
@@ -168,7 +171,11 @@ struct Qsort {
 impl Qsort {
     fn new(kind: SortKey, n: usize) -> Self {
         // utils.c:3687: the improved seed is only worth its cost for big arrays.
-        let seed = if n > 128 { sched_local_random(0) } else { 1 };
+        let seed = if n > 128 {
+            erts_sched_local_random(0)
+        } else {
+            1
+        };
         Self {
             compare: match kind {
                 SortKey::Hash => node_cmp_hash,
@@ -359,7 +366,7 @@ pub(crate) fn qsort_nodes(nodes: &mut [HxNode], key_order: bool) {
         node_cmp_hash
     };
     let seed = if nodes.len() > 128 {
-        sched_local_random(0)
+        erts_sched_local_random(0)
     } else {
         1
     };

@@ -58,8 +58,7 @@ fn fragments() -> Option<&'static DispatchFragments> {
                     bif_table: crate::bif_table::table_address(),
                     light_bif_gc: crate::raw::gc_ffi::erts_gc_after_bif_call_lhf as *const ()
                         as usize,
-                    exception_resolver: crate::native_helpers::arinsal_beamasm_exception_resolver
-                        as *const () as usize,
+                    exception_resolver: crate::beam_common::handle_error as *const () as usize,
                     save_calls_export: crate::native_helpers::arinsal_beamasm_save_calls_export
                         as *const () as usize,
                     unloaded_fun: crate::native_helpers::arinsal_beamasm_fun_resolver as *const ()
@@ -134,7 +133,7 @@ fn raise_fragments() -> Option<&'static arinsal_beamasm::raise_frag::RaiseFragme
     FRAGMENTS
         .get_or_init(|| {
             arinsal_beamasm::raise_frag::RaiseFragments::new(
-                crate::native_helpers::arinsal_beamasm_exception_resolver as *const () as usize,
+                crate::beam_common::handle_error as *const () as usize,
                 crate::beam_common::erts_sanitize_freason as *const () as usize,
             )
             .ok()
@@ -1242,7 +1241,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
             .map_err(|error| format!("binary literal: {error:?}"))
     }
     fn exception_resolver(&self) -> arinsal_beamasm::catch::ExceptionResolver {
-        crate::native_helpers::arinsal_beamasm_exception_resolver
+        crate::beam_common::handle_error
     }
     fn fun_resolver(&self) -> arinsal_beamasm::fun::FunResolver {
         crate::native_helpers::arinsal_beamasm_fun_resolver

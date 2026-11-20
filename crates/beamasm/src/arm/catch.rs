@@ -33,9 +33,11 @@ const TAG_IMMED2_CATCH: u64 = 0x1b;
 /// never an Erlang term.
 pub const NON_VALUE_MARKER: u64 = TAG_IMMED2_CATCH;
 
-/// Resolves an exception against the process catch chain and returns a native handler address.
-/// A zero result means that the exception is uncaught and should return to the runtime.
-pub type ExceptionResolver = extern "C" fn(*mut ProcessHeader, u64, *mut u64, u64) -> usize;
+/// `ErtsCodePtr handle_error(Process *c_p, ErtsCodePtr pc, Eterm *reg, const ErtsCodeMFA
+/// *bif_mfa)` (beam_common.h): the handler to continue at, or null after it terminated the
+/// process.
+pub type ExceptionResolver =
+    extern "C" fn(*mut ProcessHeader, usize, *mut u64, *const arinsal_term::ErtsCodeMfa) -> usize;
 /// Runtime callback that pairs an error reason with its materialized stacktrace.
 pub type AddStacktraceHook = extern "C" fn(*mut ProcessHeader, u64, u64) -> u64;
 /// Runtime callback that materializes a raw stacktrace term.

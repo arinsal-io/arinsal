@@ -88,8 +88,6 @@ mod tests {
     use arinsal_difftest::RefErl;
     use arinsal_term::{Term, TermBuilder, VecHeap};
 
-    use crate::Vm;
-
     #[test]
     fn utf8_tail_matches_survive_repeated_collection() {
         let Ok(reference) = RefErl::start() else {
@@ -110,7 +108,7 @@ mod tests {
                 &[],
             )
             .unwrap();
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let bytes = "Привіт, Elixir 123. ".repeat(8).into_bytes();
         let mut source_heap = VecHeap::new();

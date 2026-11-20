@@ -1,3 +1,4 @@
+//! Port of `erts/emulator/beam/erl_proc_sig_queue.c`, OTP-29.1.1.
 //! Selective receive state owned by the running process: the receive marker block and the
 //! save pointer operations of the message queue.
 
@@ -191,12 +192,10 @@ impl PrioQInfo {
     }
 }
 
-/// The marker structures of the process, taken out of its cold part for an operation on
-/// them and the queues together (the boxes keep the markers in place).
+/// The receive marker block, taken out of the process cold part while its queue is updated.
 #[derive(Default)]
 struct Markers {
     blk: Option<Box<ReceiveMarkers>>,
-    pq: Option<Box<PrioQInfo>>,
 }
 
 /// Which marker a marker node is.
@@ -207,8 +206,8 @@ enum WhichMarker {
 }
 
 impl Markers {
-    fn which(&self, addr: usize) -> WhichMarker {
-        if let Some(pq) = self.pq.as_ref() {
+    fn which(&self, addr: usize, pq: Option<&PrioQInfo>) -> WhichMarker {
+        if let Some(pq) = pq {
             if std::ptr::from_ref(&pq.marker[PRIO_Q_MARK_END]) as usize == addr {
                 return WhichMarker::PrioEnd;
             }
@@ -269,34 +268,16 @@ impl Process {
             .cold
             .as_mut()
             .and_then(|cold| cold.receive_markers.take());
-        let pq = crate::proc_create::raw::erts_psd_set::<PrioQInfo>(
-            &mut self.psd,
-            crate::proc_create::raw::ERTS_PSD_PRIO_Q_INFO,
-            None,
-        );
-        Markers { blk, pq }
+        Markers { blk }
     }
 
     fn put_markers(&mut self, markers: Markers) {
         if markers.blk.is_some() || self.cold.is_some() {
             self.cold_mut().receive_markers = markers.blk;
         }
-        if markers.pq.is_some()
-            || crate::proc_create::raw::erts_psd_get::<PrioQInfo>(
-                &self.psd,
-                crate::proc_create::raw::ERTS_PSD_PRIO_Q_INFO,
-            )
-            .is_some()
-        {
-            crate::proc_create::raw::erts_psd_set(
-                &mut self.psd,
-                crate::proc_create::raw::ERTS_PSD_PRIO_Q_INFO,
-                markers.pq,
-            );
-        }
     }
 
-    /// Run `f` with the marker structures taken out of the process; what `f` leaves goes back.
+    /// Run `f` with the receive marker block taken out; the prio queue stays in the PSD.
     fn with_markers<R>(&mut self, f: impl FnOnce(&mut Self, &mut Markers) -> R) -> R {
         let mut markers = self.take_markers();
         let result = f(self, &mut markers);
@@ -320,9 +301,16 @@ impl Process {
         self.inbox.flags = (self.inbox.flags & !FS_SET_SAVE_INFO_MASK) | info;
     }
 
-    /// `remove_prio_q_marker`.
-    fn remove_prio_q_marker(&mut self, pq: &mut PrioQInfo, which: usize) {
-        self.inbox.entries.remove_marker(&mut pq.marker[which]);
+    /// Remove a queued priority marker and clear its queue state.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:9065 (destroy_prio_q_info), OTP-29.1.1.
+    fn remove_prio_q_marker(&mut self, which: usize) {
+        let (psd, inbox) = (&mut self.psd, &mut self.inbox);
+        let pq = crate::proc_create::raw::erts_psd_get_mut::<PrioQInfo>(
+            psd,
+            crate::proc_create::raw::ERTS_PSD_PRIO_Q_INFO,
+        )
+        .expect("prio queue info");
+        inbox.entries.remove_marker(&mut pq.marker[which]);
         pq.marker[which].in_msgq = 0;
         pq.marker[which].in_sigq = 0;
     }
@@ -334,14 +322,35 @@ impl Process {
     fn destroy_prio_q_info(&mut self, markers: &mut Markers, terminating: bool) {
         debug_assert!(terminating || self.inbox.flags & FS_PRIO_MQ_SAVE == 0);
         debug_assert!(terminating || self.inbox.flags & FS_PRIO_MQ_END_MARK == 0);
-        debug_assert!(terminating || markers.pq.as_ref().is_some_and(|pq| pq.refc == 0));
-        if let Some(mut pq) = markers.pq.take() {
-            for which in [PRIO_Q_MARK_END, PRIO_Q_MARK_CONT] {
-                if pq.marker[which].in_msgq != 0 {
-                    self.remove_prio_q_marker(&mut pq, which);
-                }
+        debug_assert!(
+            terminating || {
+                crate::proc_create::raw::erts_psd_get::<PrioQInfo>(
+                    &self.psd,
+                    crate::proc_create::raw::ERTS_PSD_PRIO_Q_INFO,
+                )
+                .is_some_and(|pq| pq.refc == 0)
+            }
+        );
+        for which in [PRIO_Q_MARK_END, PRIO_Q_MARK_CONT] {
+            let in_msgq = crate::proc_create::raw::erts_psd_get::<PrioQInfo>(
+                &self.psd,
+                crate::proc_create::raw::ERTS_PSD_PRIO_Q_INFO,
+            )
+            .expect("prio queue info")
+            .marker[which]
+                .in_msgq
+                != 0;
+            if in_msgq {
+                self.remove_prio_q_marker(which);
             }
         }
+        let pq = crate::proc_create::raw::erts_psd_set::<PrioQInfo>(
+            &mut self.psd,
+            crate::proc_create::raw::ERTS_PSD_PRIO_Q_INFO,
+            None,
+        )
+        .expect("prio queue info");
+        drop(pq);
         if let Some(blk) = markers.blk.as_mut() {
             for marker in &mut blk.marker {
                 marker.in_prioq = 0;
@@ -361,7 +370,11 @@ impl Process {
         leading: bool,
     ) -> SaveField {
         while let Some(addr) = self.inbox.entries.marker_at(field) {
-            match markers.which(addr) {
+            let pq = crate::proc_create::raw::erts_psd_get::<PrioQInfo>(
+                &self.psd,
+                crate::proc_create::raw::ERTS_PSD_PRIO_Q_INFO,
+            );
+            match markers.which(addr, pq) {
                 WhichMarker::Recv(ix) => {
                     let b = markers.blk.as_mut().expect("a queued marker has its block");
                     match b.marker[ix].mark_type {
@@ -394,8 +407,7 @@ impl Process {
                         // priority items keep the prio queue installed.
                         self.inbox.flags &= !(FS_PRIO_MQ_SAVE | FS_PRIO_MQ_END_MARK);
                         if self.inbox.flags & FS_PRIO_MQ != 0 {
-                            let pq = markers.pq.as_mut().expect("prio queue info");
-                            self.remove_prio_q_marker(pq, PRIO_Q_MARK_END);
+                            self.remove_prio_q_marker(PRIO_Q_MARK_END);
                         } else {
                             self.destroy_prio_q_info(markers, false);
                         }
@@ -404,14 +416,17 @@ impl Process {
                         if self.save_info() != FS_SET_SAVE_INFO_FIRST {
                             return self.msgq_pass_recv_markers_prioq_end(markers);
                         }
-                        field = markers.pq.as_mut().expect("prio queue info").marker
-                            [PRIO_Q_MARK_END]
+                        field = crate::proc_create::raw::erts_psd_get_mut::<PrioQInfo>(
+                            &mut self.psd,
+                            crate::proc_create::raw::ERTS_PSD_PRIO_Q_INFO,
+                        )
+                        .expect("prio queue info")
+                        .marker[PRIO_Q_MARK_END]
                             .next_field();
                     }
                 }
                 WhichMarker::PrioCont => {
-                    let pq = markers.pq.as_mut().expect("prio queue info");
-                    self.remove_prio_q_marker(pq, PRIO_Q_MARK_CONT);
+                    self.remove_prio_q_marker(PRIO_Q_MARK_CONT);
                 }
             }
         }
@@ -425,10 +440,13 @@ impl Process {
     fn msgq_pass_recv_markers_prioq_end(&mut self, markers: &mut Markers) -> SaveField {
         let field = match self.save_info() {
             FS_SET_SAVE_INFO_MARK => {
-                let pq = markers.pq.as_mut().expect("prio queue info");
-                let saved = pq.saved_save_info;
-                let field = pq.marker[PRIO_Q_MARK_CONT].prev_next();
-                self.remove_prio_q_marker(pq, PRIO_Q_MARK_CONT);
+                let (saved, field) = crate::proc_create::raw::erts_psd_get::<PrioQInfo>(
+                    &self.psd,
+                    crate::proc_create::raw::ERTS_PSD_PRIO_Q_INFO,
+                )
+                .map(|pq| (pq.saved_save_info, pq.marker[PRIO_Q_MARK_CONT].prev_next()))
+                .expect("prio queue info");
+                self.remove_prio_q_marker(PRIO_Q_MARK_CONT);
                 self.set_save_info(saved);
                 field
             }
@@ -543,12 +561,15 @@ impl Process {
             }
         }
         debug_assert!(self.inbox.flags & FS_PRIO_MQ != 0);
-        let mut pq = markers
-            .pq
-            .take()
-            .expect("a priority message needs an installed prio queue");
-        if self.inbox.flags & FS_PRIO_MQ_SAVE == 0 {
-            let set_save = match self.save_info() {
+        let (psd, inbox) = (&mut self.psd, &mut self.inbox);
+        let pq = crate::proc_create::raw::erts_psd_get_mut::<PrioQInfo>(
+            psd,
+            crate::proc_create::raw::ERTS_PSD_PRIO_Q_INFO,
+        )
+        .expect("a priority message needs an installed prio queue");
+        if inbox.flags & FS_PRIO_MQ_SAVE == 0 {
+            let save_info = inbox.flags & FS_SET_SAVE_INFO_MASK;
+            let set_save = match save_info {
                 FS_SET_SAVE_INFO_FIRST => true,
                 FS_SET_SAVE_INFO_LAST => false,
                 FS_SET_SAVE_INFO_RCVM => markers
@@ -558,35 +579,38 @@ impl Process {
                 _ => unreachable!("save mark set while save is outside the prio queue"),
             };
             if empty_prio_q {
-                let first = self.inbox.entries.first_field();
-                self.inbox.entries.insert_marker_at(
+                let first = inbox.entries.first_field();
+                inbox.entries.insert_marker_at(
                     first,
                     &mut pq.marker[PRIO_Q_MARK_END],
                     marker_value,
                 );
-                self.inbox.flags |= FS_PRIO_MQ_END_MARK;
+                inbox.flags |= FS_PRIO_MQ_END_MARK;
             }
             if set_save {
                 if pq.marker[PRIO_Q_MARK_CONT].in_msgq != 0 {
-                    self.remove_prio_q_marker(&mut pq, PRIO_Q_MARK_CONT);
+                    inbox
+                        .entries
+                        .remove_marker(&mut pq.marker[PRIO_Q_MARK_CONT]);
+                    pq.marker[PRIO_Q_MARK_CONT].in_msgq = 0;
+                    pq.marker[PRIO_Q_MARK_CONT].in_sigq = 0;
                 }
-                let save = self.inbox.entries.save_field();
-                self.inbox.entries.insert_marker_at(
+                let save = inbox.entries.save_field();
+                inbox.entries.insert_marker_at(
                     save,
                     &mut pq.marker[PRIO_Q_MARK_CONT],
                     marker_value,
                 );
-                pq.saved_save_info = self.save_info();
-                self.set_save_info(FS_SET_SAVE_INFO_MARK);
+                pq.saved_save_info = save_info;
+                inbox.flags = (inbox.flags & !FS_SET_SAVE_INFO_MASK) | FS_SET_SAVE_INFO_MARK;
                 let end = pq.marker[PRIO_Q_MARK_END].prev_next();
-                self.inbox.entries.set_save_field(end);
-                self.inbox.flags |= FS_PRIO_MQ_SAVE;
+                inbox.entries.set_save_field(end);
+                inbox.flags |= FS_PRIO_MQ_SAVE;
             }
         }
-        self.inbox
+        inbox
             .entries
             .insert_before_marker(&mut pq.marker[PRIO_Q_MARK_END], node);
-        markers.pq = Some(pq);
         Ok(())
     }
 
@@ -599,10 +623,10 @@ impl Process {
         if self.inbox.flags & FS_PRIO_MQ == 0 {
             self.inbox.flags |= FS_PRIO_MQ;
             if self.inbox.flags & FS_PRIO_MQ_END_MARK == 0 {
-                let previous = crate::proc_create::raw::erts_psd_set(
+                let previous = crate::proc_create::raw::erts_psd_set::<PrioQInfo>(
                     &mut self.psd,
                     crate::proc_create::raw::ERTS_PSD_PRIO_Q_INFO,
-                    Some(Box::new(PrioQInfo::new())),
+                    Some(PrioQInfo::new()),
                 );
                 debug_assert!(previous.is_none());
             }
@@ -1259,7 +1283,7 @@ pub extern "C" fn erts_proc_sig_receive_helper(
     .flatten()
     .expect("native code runs inside an executor slice, which publishes its scheduler data");
     let (consumed, message, get_out) = match result {
-        Ok((consumed, crate::process::ReceiveHelper::Message)) => (
+        (consumed, crate::process::ReceiveHelper::Message) => (
             consumed,
             process
                 .inbox
@@ -1268,18 +1292,11 @@ pub extern "C" fn erts_proc_sig_receive_helper(
                 .map_or(0, |node| node.as_ptr() as u64),
             0,
         ),
-        Ok((consumed, crate::process::ReceiveHelper::Wait)) => (consumed, 0, 0),
+        (consumed, crate::process::ReceiveHelper::Wait) => (consumed, 0, 0),
         // erl_proc_sig_queue.c:7843 / :7864: `*get_outp` is 1 for an exiting process and -1
         // for a yield.
-        Ok((consumed, crate::process::ReceiveHelper::Yield)) => (consumed, 0, -1),
-        Ok((consumed, crate::process::ReceiveHelper::Exiting)) => (consumed, 0, 1),
-        // A signal-handling failure that is not an exit (an exit makes the process exiting
-        // and returns `Exiting`): it schedules out and the scheduler ends the process.
-        Err(error) => {
-            process.native_exit_kind = crate::proc_create::NativeExit::Exiting;
-            process.cold_mut().native_exiting = Some(Box::new(error));
-            (0, 0, 1)
-        }
+        (consumed, crate::process::ReceiveHelper::Yield) => (consumed, 0, -1),
+        (consumed, crate::process::ReceiveHelper::Exiting) => (consumed, 0, 1),
     };
     crate::raw::jit_ffi::write_out(msgpp, message);
     crate::raw::jit_ffi::write_out(get_outp, get_out);

@@ -16,6 +16,7 @@ full-etf = []
 
 [dependencies]
 arinsal-etf.workspace = true
+libc = "0.2.189"
 num-bigint.workspace = true
 num-traits.workspace = true
 proptest.workspace = true

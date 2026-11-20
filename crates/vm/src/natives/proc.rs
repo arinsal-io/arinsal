@@ -5725,7 +5725,6 @@ pub(crate) fn process_dump(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use arinsal_difftest::{CallResult, RefErl};
 
     #[test]
@@ -5770,7 +5769,7 @@ process_info_looper(Parent) ->
             .unwrap();
         reference.load("process_info_location_diff", &beam).unwrap();
         let expected = reference.call("process_info_location_diff", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("process_info_location_diff", "run", &[], 4)

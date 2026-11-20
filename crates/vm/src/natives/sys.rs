@@ -5727,7 +5727,7 @@ mod tests {
             .load("scheduler_startup_info_probe", &beam)
             .unwrap();
         let expected = reference.call("scheduler_startup_info_probe", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("scheduler_startup_info_probe", "run", &[], 1)
@@ -5750,7 +5750,7 @@ mod tests {
             .unwrap();
         reference.load("beam_jump_table_probe", &beam).unwrap();
         let expected = reference.call("beam_jump_table_probe", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("beam_jump_table_probe", "run", &[], 1)
@@ -5774,7 +5774,7 @@ mod tests {
             .unwrap();
         reference.load("all_scheduler_state_probe", &beam).unwrap();
         let expected = reference.call("all_scheduler_state_probe", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("all_scheduler_state_probe", "run", &[], 10)
@@ -5800,7 +5800,7 @@ mod tests {
             .unwrap();
         reference.load("scheduler_count_probe", &beam).unwrap();
         let expected = reference.call("scheduler_count_probe", "run", &[]);
-        let mut vm = Vm::new([]);
+        let mut vm = crate::boot::test_node();
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("scheduler_count_probe", "run", &[], 10)
@@ -5836,9 +5836,10 @@ mod tests {
             &[OwnedTerm::atom("debug_compiled")],
         );
         let selector = Term::atom(global_atoms().intern("debug_compiled").unwrap());
-        let actual = system_info_test_item(&Vm::new([]), &mut Process::new(), selector)
-            .unwrap()
-            .unwrap();
+        let actual =
+            system_info_test_item(&crate::boot::test_node(), &mut Process::new(), selector)
+                .unwrap()
+                .unwrap();
         assert_eq!(expected, CallResult::Ok(to_owned(actual).unwrap()));
     }
 
@@ -5854,9 +5855,10 @@ mod tests {
             &[OwnedTerm::atom("ets_always_compress")],
         );
         let selector = Term::atom(global_atoms().intern("ets_always_compress").unwrap());
-        let actual = system_info_test_item(&Vm::new([]), &mut Process::new(), selector)
-            .unwrap()
-            .unwrap();
+        let actual =
+            system_info_test_item(&crate::boot::test_node(), &mut Process::new(), selector)
+                .unwrap()
+                .unwrap();
         assert_eq!(expected, CallResult::Ok(to_owned(actual).unwrap()));
     }
 
@@ -5868,9 +5870,10 @@ mod tests {
         };
         let expected = reference.call("erlang", "system_info", &[OwnedTerm::atom("max_integer")]);
         let selector = Term::atom(global_atoms().intern("max_integer").unwrap());
-        let actual = system_info_test_item(&Vm::new([]), &mut Process::new(), selector)
-            .unwrap()
-            .unwrap();
+        let actual =
+            system_info_test_item(&crate::boot::test_node(), &mut Process::new(), selector)
+                .unwrap()
+                .unwrap();
         assert_eq!(expected, CallResult::Ok(to_owned(actual).unwrap()));
     }
 
@@ -5883,7 +5886,7 @@ mod tests {
         let expected = reference.call("erlang", "system_info", &[OwnedTerm::atom("check_io")]);
         let selector = Term::atom(global_atoms().intern("check_io").unwrap());
         let mut process = Process::new();
-        let actual = system_info_test_item(&Vm::new([]), &mut process, selector)
+        let actual = system_info_test_item(&crate::boot::test_node(), &mut process, selector)
             .unwrap()
             .unwrap();
         let CallResult::Ok(expected) = expected else {
@@ -5904,9 +5907,10 @@ mod tests {
         };
         let expected = reference.call("erlang", "system_info", &[OwnedTerm::atom("cpu_quota")]);
         let selector = Term::atom(global_atoms().intern("cpu_quota").unwrap());
-        let actual = system_info_test_item(&Vm::new([]), &mut Process::new(), selector)
-            .unwrap()
-            .unwrap();
+        let actual =
+            system_info_test_item(&crate::boot::test_node(), &mut Process::new(), selector)
+                .unwrap()
+                .unwrap();
         similar_asserts::assert_eq!(expected, CallResult::Ok(to_owned(actual).unwrap()));
     }
 
@@ -5963,9 +5967,10 @@ mod tests {
             let mut heap = VecHeap::new();
             let selector_term = from_owned(&selector, &mut heap).unwrap();
             let mut process = Process::new();
-            let actual = system_info_test_item(&Vm::new([]), &mut process, selector_term)
-                .unwrap()
-                .unwrap();
+            let actual =
+                system_info_test_item(&crate::boot::test_node(), &mut process, selector_term)
+                    .unwrap()
+                    .unwrap();
             assert_eq!(expected, CallResult::Ok(to_owned(actual).unwrap()));
         }
     }
@@ -6020,9 +6025,10 @@ mod tests {
         ] {
             let expected = reference.call("erlang", "system_info", &[OwnedTerm::atom(selector)]);
             let input = Term::atom(global_atoms().intern(selector).unwrap());
-            let actual = system_info_test_item(&Vm::new([]), &mut Process::new(), input)
-                .unwrap()
-                .unwrap();
+            let actual =
+                system_info_test_item(&crate::boot::test_node(), &mut Process::new(), input)
+                    .unwrap()
+                    .unwrap();
             assert_eq!(
                 CallResult::Ok(to_owned(actual).unwrap()),
                 expected,
@@ -6218,7 +6224,7 @@ mod tests {
                 &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
             )
             .unwrap();
-            let actual = system_info_test_item(&Vm::new([]), &mut process, input)
+            let actual = system_info_test_item(&crate::boot::test_node(), &mut process, input)
                 .unwrap()
                 .unwrap();
             assert_eq!(
@@ -6243,7 +6249,7 @@ mod tests {
                 &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
             )
             .unwrap();
-            let actual = system_info_test_item(&Vm::new([]), &mut process, input)
+            let actual = system_info_test_item(&crate::boot::test_node(), &mut process, input)
                 .unwrap()
                 .unwrap();
             assert_eq!(to_owned(actual).unwrap(), *expected, "{selector}");
@@ -6302,7 +6308,7 @@ mod tests {
             .unwrap();
             actual_infos.push(
                 to_owned(
-                    system_info_test_item(&Vm::new([]), &mut process, input)
+                    system_info_test_item(&crate::boot::test_node(), &mut process, input)
                         .unwrap()
                         .unwrap(),
                 )
@@ -6329,7 +6335,7 @@ mod tests {
         }
         let mut process = Process::new();
         let input = Term::atom(global_atoms().intern("allocator").unwrap());
-        let actual = system_info_test_item(&Vm::new([]), &mut process, input)
+        let actual = system_info_test_item(&crate::boot::test_node(), &mut process, input)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -6346,7 +6352,7 @@ mod tests {
             &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
         )
         .unwrap();
-        let actual = system_info_test_item(&Vm::new([]), &mut process, input)
+        let actual = system_info_test_item(&crate::boot::test_node(), &mut process, input)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -6375,7 +6381,7 @@ mod tests {
             &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
         )
         .unwrap();
-        let actual = system_info_test_item(&Vm::new([]), &mut process, input)
+        let actual = system_info_test_item(&crate::boot::test_node(), &mut process, input)
             .unwrap()
             .unwrap();
         assert_eq!(

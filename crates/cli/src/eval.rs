@@ -1,6 +1,7 @@
 //! Small command-line entry point for unmodified BEAM benchmark functions.
 use arinsal_term::{Term, global_atoms};
 use arinsal_vm::{Vm, VmError};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -51,10 +52,9 @@ pub fn command(args: &[String]) -> Result<(), VmError> {
             values.push(Term::atom(atom));
         }
     }
-    let mut vm = Vm::new(dirs);
+    let mut vm = boot_node(&dirs, workers)?;
     let beam_name = format!("{module}.beam");
-    let path = vm
-        .paths()
+    let path = dirs
         .iter()
         .map(|dir| dir.join(&beam_name))
         .find(|path| path.is_file())
@@ -83,4 +83,50 @@ pub fn command(args: &[String]) -> Result<(), VmError> {
         }
     }
     Ok(())
+}
+
+/// Starts the node as `arinsal -noshell -noinput -pa Dir...` does (erl_init.c erl_start ->
+/// erl_first_process_otp, `init:boot/1`) and returns once `init` reports `{started, started}`:
+/// the function then runs in a booted node, as `erl -s` would run it after the boot.
+fn boot_node(dirs: &[PathBuf], workers: usize) -> Result<Vm, VmError> {
+    let mut argv = vec![
+        "arinsal".to_owned(),
+        "-noshell".to_owned(),
+        "-noinput".to_owned(),
+    ];
+    for dir in dirs {
+        argv.push("-pa".to_owned());
+        argv.push(dir.display().to_string());
+    }
+    let env: BTreeMap<String, String> = std::env::vars().collect();
+    let launch = arinsal_args::parse(&argv, &env)
+        .map_err(|error| VmError::Load(format!("node arguments: {error:?}")))?;
+    arinsal_args::configure_emulator_flags(launch.emulator.clone());
+    let mut seeded = vec![("PATH".to_owned(), launch.path.clone())];
+    seeded.extend(launch.set_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    arinsal_vm::boot::seed_environment(&seeded);
+    let mut vm = arinsal_vm::boot::erl_start(
+        std::path::Path::new(&launch.root_dir),
+        &launch.boot_args,
+        &[],
+        workers,
+        launch.emulator.debugger_support,
+        launch.emulator.debugger_line_breakpoints.unwrap_or(true),
+        launch.emulator.distribution_buffer_busy_limit,
+    )?;
+    let init = Term::atom(
+        global_atoms()
+            .intern("init")
+            .map_err(|_| VmError::Load("invalid atom: init".into()))?,
+    );
+    loop {
+        // `init:get_status/0` calls the registered `init`, which `init:boot/1` registers first.
+        if vm.eval_scheduled("erlang", "whereis", &[init], 1)?.text != "undefined" {
+            let status = vm.eval_scheduled("init", "get_status", &[], 1)?.text;
+            if status == "{started,started}" {
+                return Ok(vm);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }

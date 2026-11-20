@@ -290,7 +290,9 @@ pub(crate) fn erts_poll_fallback_sink(sink: fn(RawFd, u32)) {
 /// with `erts_poll_wait__fallback`), OTP-29.1.1: a regular file is always ready under
 /// `select`, which a kqueue read filter at end of file is not.
 mod fallback {
-    use super::{ERTS_POLL_EV_IN, ERTS_POLL_EV_OUT, ErtsPollOp};
+    use super::{
+        ERTS_POLL_EV_ERR, ERTS_POLL_EV_IN, ERTS_POLL_EV_NVAL, ERTS_POLL_EV_OUT, ErtsPollOp,
+    };
     use std::collections::HashMap;
     use std::io;
     use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
@@ -330,7 +332,9 @@ mod fallback {
     }
 
     pub(super) fn control(fd: RawFd, op: ErtsPollOp, events: u32) -> io::Result<()> {
-        if fd < 0 || fd as usize >= libc::FD_SETSIZE {
+        // erts' fallback is select(2) on macOS (bounded by FD_SETSIZE) and poll(2) on Linux,
+        // where only a negative descriptor is invalid (erl_poll.c poll_control).
+        if fd < 0 || (cfg!(target_os = "macos") && fd as usize >= libc::FD_SETSIZE) {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
         let set = set()?;
@@ -354,8 +358,8 @@ mod fallback {
 
     /// The selected descriptor for one `poll` call.
     fn borrow(fd: RawFd) -> BorrowedFd<'static> {
-        // SAFETY: the owner keeps a selected descriptor open until it deselects it; a closed
-        // one makes poll report POLLNVAL, which is delivered as ready, and nothing is read.
+        // SAFETY: poll only reads the number; a closed descriptor makes it report POLLNVAL,
+        // delivered as ERTS_POLL_EV_NVAL, and nothing is read.
         unsafe { BorrowedFd::borrow_raw(fd) }
     }
 
@@ -394,33 +398,44 @@ mod fallback {
                 if revents.is_empty() {
                     continue;
                 }
-                let mut ready = 0;
-                if events & ERTS_POLL_EV_IN != 0
-                    && revents.intersects(
-                        PollFlags::IN | PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL,
-                    )
-                {
-                    ready |= ERTS_POLL_EV_IN;
-                }
-                if events & ERTS_POLL_EV_OUT != 0
-                    && revents.intersects(
-                        PollFlags::OUT | PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL,
-                    )
-                {
-                    ready |= ERTS_POLL_EV_OUT;
-                }
-                if ready == 0 {
+                // Port of erl_poll.c (pollev2ev, ERTS_POLL_EV_NKP_NVAL), OTP-29.1.1: a descriptor
+                // that is not open is reported as NVAL, not as ready; erts_check_io then reports
+                // it (bad_fd_in_pollset) and unmaps the selection, so the set drops it.
+                if revents.contains(PollFlags::NVAL) {
+                    set.fds.lock().unwrap().remove(fd);
+                    if let Some(sink) = SINK.get() {
+                        sink(*fd, ERTS_POLL_EV_NVAL);
+                    }
                     continue;
                 }
-                // One-shot: the interest is gone until the owner re-arms it.
+                // Port of erl_poll.c (pollev2ev, ERTS_POLL_EV_NKP_ERR = POLLERR|POLLHUP),
+                // OTP-29.1.1: an error or hang-up is ERTS_POLL_EV_ERR, not readiness;
+                // erts_check_io triggers every active event of the descriptor on it.
+                let mut ready = 0;
+                if events & ERTS_POLL_EV_IN != 0 && revents.contains(PollFlags::IN) {
+                    ready |= ERTS_POLL_EV_IN;
+                }
+                if events & ERTS_POLL_EV_OUT != 0 && revents.contains(PollFlags::OUT) {
+                    ready |= ERTS_POLL_EV_OUT;
+                }
+                let error = revents.intersects(PollFlags::HUP | PollFlags::ERR);
+                if ready == 0 && !error {
+                    continue;
+                }
+                // One-shot: the interest is gone until the owner re-arms it; an error
+                // consumes every interest, as it triggers all of them.
+                let consumed = if error { *events } else { ready };
                 {
                     let mut fds = set.fds.lock().unwrap();
                     if let Some(current) = fds.get_mut(fd) {
-                        *current &= !ready;
+                        *current &= !consumed;
                         if *current == 0 {
                             fds.remove(fd);
                         }
                     }
+                }
+                if error {
+                    ready |= ERTS_POLL_EV_ERR;
                 }
                 if let Some(sink) = SINK.get() {
                     sink(*fd, ready);

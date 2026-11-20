@@ -1298,7 +1298,10 @@ impl CATree {
         if !self.debug_random_split_join.load(AtomicOrdering::Relaxed) {
             return;
         }
-        let random = scheduler_local_random();
+        // erts seeds with the base node that was just unlocked; this pass picks the node
+        // from the random value itself, so the table address seeds it.
+        let random =
+            arinsal_term::erts_sched_local_random(std::ptr::from_ref(self) as usize as u64);
         if random & LOCK_GRAVITY_PATTERN != 0 {
             return;
         }
@@ -1347,27 +1350,6 @@ impl CATree {
 enum JoinCause {
     LowStatistic,
     RandomGravity,
-}
-
-thread_local! {
-    static SCHEDULER_RANDOM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-fn scheduler_local_random() -> u32 {
-    SCHEDULER_RANDOM.with(|state| {
-        let mut value = state.get();
-        if value == 0 {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            std::thread::current().id().hash(&mut hasher);
-            value = hasher.finish() | 1;
-        }
-        value ^= value << 13;
-        value ^= value >> 7;
-        value ^= value << 17;
-        state.set(value);
-        (value >> 16) as u32
-    })
 }
 
 /// Port of erts/emulator/beam/erl_db_catree.c (join_trees), OTP-29.1.1.

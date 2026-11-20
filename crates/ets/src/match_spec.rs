@@ -863,20 +863,24 @@ impl MatchProgram {
         dst: &mut H,
         context: &C,
     ) -> Result<Option<Term>, EtsError> {
-        // The match pseudo process (heap, stack, variables) is cached per thread like erts's
-        // `match_pseudo_process`; creating one per object dominated select over big tables.
+        // Port of erts/emulator/beam/erl_db_util.c:498 (get_match_pseudo_process),
+        // OTP-29.1.1: a scheduler keeps it in `esdp->match_pseudo_process`, any other thread
+        // under `match_pseudo_process_key`.
         thread_local! {
-            static STATE: Cell<Option<Box<pam::PamState>>> = const { Cell::new(None) };
+            static MATCH_PSEUDO_PROCESS_KEY: Cell<Option<Box<pam::PamState>>> =
+                const { Cell::new(None) };
         }
-        let mut state = STATE
-            .take()
+        let mut state = arinsal_sched::erts_take_match_pseudo_process::<pam::PamState>()
+            .unwrap_or_else(|| MATCH_PSEUDO_PROCESS_KEY.take())
             .unwrap_or_else(|| Box::new(pam::PamState::new(self.stack_need, self.num_bindings)));
         state.prepare(self.stack_need, self.num_bindings);
         let result = self.run_program(object, dst, context, &mut state, None);
         if state.heap.used_words() != 0 {
             state.heap.reset(128);
         }
-        STATE.set(Some(state));
+        if let Err(state) = arinsal_sched::erts_put_match_pseudo_process(state) {
+            MATCH_PSEUDO_PROCESS_KEY.set(Some(state));
+        }
         result
     }
 

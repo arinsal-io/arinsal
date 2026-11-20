@@ -1,16 +1,18 @@
 //! OTP startup through the first process used by ERTS.
 
-use crate::{EntryProcess, ScheduledResult, Vm, VmError};
+use crate::{Vm, VmError};
 use arinsal_term::{Term, TermBuilder, VecHeap, global_atoms};
 use std::path::{Path, PathBuf};
 
-/// Start `erl_init:start(init, BootArgs)` with OTP's preloaded code available.
+/// Starts the node ([`erl_start`]) and turns the calling (main) thread into
+/// `erts_sys_main_thread`: it returns only when the node could not be started. The node ends
+/// through `erts_exit` (`halt/2`, or a system process terminating).
 pub fn run(
     root: &Path,
     boot_args: &[String],
     extra_paths: &[PathBuf],
     workers: usize,
-) -> Result<ScheduledResult, VmError> {
+) -> Result<std::convert::Infallible, VmError> {
     run_with_debugger_flags(root, boot_args, extra_paths, workers, false, true, None)
 }
 
@@ -19,7 +21,9 @@ pub fn seed_environment(vars: &[(String, String)]) {
     crate::erl_osenv::seed(vars);
 }
 
-/// Start OTP after applying the emulator's debugger startup flags.
+/// [`run`] with the emulator's debugger startup flags.
+// Port of erts/emulator/beam/erl_init.c:1295-2617 (erl_start ending in
+// `erts_sys_main_thread()`), OTP-29.1.1.
 pub fn run_with_debugger_flags(
     root: &Path,
     boot_args: &[String],
@@ -28,8 +32,8 @@ pub fn run_with_debugger_flags(
     debugger_support: bool,
     line_breakpoints: bool,
     distribution_buffer_busy_limit_kb: Option<u64>,
-) -> Result<ScheduledResult, VmError> {
-    let (_vm, first) = erl_start(
+) -> Result<std::convert::Infallible, VmError> {
+    let _vm = erl_start(
         root,
         boot_args,
         extra_paths,
@@ -38,13 +42,13 @@ pub fn run_with_debugger_flags(
         line_breakpoints,
         distribution_buffer_busy_limit_kb,
     )?;
-    first.wait()
+    crate::sys_signals::erts_sys_main_thread()
 }
 
-/// Starts the node and returns once its first process runs: the runtime initialisation, the
-/// preloaded modules and `erl_init:start(init, BootArgs)` as the first process, which boots
-/// OTP (`init:boot/1`). The returned `Vm` evaluates in the running node; the [`EntryProcess`]
-/// ends when `init` does.
+/// Starts the node and returns once its scheduler threads run: the runtime initialisation, the
+/// preloaded modules, `erl_init:start(init, BootArgs)` as the first process, which boots OTP
+/// (`init:boot/1`), and the system processes. The returned `Vm` loads and evaluates in the
+/// running node.
 // Port of erts/emulator/beam/erl_init.c (erl_start: erl_init, load_preloaded,
 // erl_first_process_otp), OTP-29.1.1.
 pub fn erl_start(
@@ -55,7 +59,7 @@ pub fn erl_start(
     debugger_support: bool,
     line_breakpoints: bool,
     distribution_buffer_busy_limit_kb: Option<u64>,
-) -> Result<(Vm, EntryProcess), VmError> {
+) -> Result<Vm, VmError> {
     // Port of erts/emulator/sys/common/erl_sys_common_misc.c (erts_init_sys_common_misc):
     // the locale is read once at boot and decides the native file name encoding.
     crate::natives::erl_unicode::set_locale_utf8(arinsal_nif_tty::locale_is_utf8());
@@ -83,9 +87,6 @@ pub fn erl_start(
     if flags.replace_intr {
         crate::natives::tty::replace_intr();
     }
-    erl_init_atoms()?;
-    erl_init_global_literals();
-    crate::trace_bp::configure_debugger(debugger_support, line_breakpoints);
     // g_erl_flags: -pa / -pz / -path and ERL_LIBS. boot_loop2 should keep this
     // block; it only chooses the loader path before preloaded modules load.
     // Port of erts/preloaded/src/init.erl:1259 (path_flags) and
@@ -134,21 +135,18 @@ pub fn erl_start(
     }
     let erts_ebin = root.join("lib/erts-17.1/ebin");
     paths.push(erts_ebin.clone());
-    let mut vm = Vm::new_with_otp_root(paths, root.to_path_buf());
+    let (mut vm, runtime) = crate::erl_init::erl_init(
+        paths,
+        root.to_path_buf(),
+        workers,
+        debugger_support,
+        line_breakpoints,
+    )?;
+    // Port of erts/emulator/sys/unix/sys.c (erts_sys_unix_later_init) and erl_init.c
+    // (init_break_handler): the signal dispatcher and dispositions exist before init runs.
+    crate::sys_signals::install_boot_signals(runtime)?;
 
-    // Port of erts/emulator/beam/erl_init.c:518-535 (load_preloaded), OTP-29.1.1:
-    // modules load in the generated preload.c order, each name interned first.
-    for module in PRELOADED {
-        let path = erts_ebin.join(format!("{module}.beam"));
-        if crate::calls::trace_boot_enabled() {
-            eprintln!("arinsal boot: load {}", path.display());
-        }
-        global_atoms()
-            .intern(module)
-            .map_err(|error| VmError::Load(format!("cannot intern {module}: {error:?}")))?;
-        let bytes = std::fs::read(&path).map_err(|e| VmError::Load(e.to_string()))?;
-        vm.load_bytes(&preload_strip(&bytes))?;
-    }
+    load_preloaded(&mut vm, &erts_ebin)?;
 
     let mut input_heap = VecHeap::new();
     let boot_list =
@@ -164,28 +162,37 @@ pub fn erl_start(
                 .list_from_iter(args)
                 .map_err(|e| VmError::Load(format!("cannot construct boot arguments: {e:?}")))?
         };
-    let first = erl_first_process_otp(&mut vm, "init", boot_list, workers)?;
-    Ok((vm, first))
+    let init = global_atoms()
+        .intern("init")
+        .map_err(|error| VmError::Load(format!("cannot intern init: {error:?}")))?;
+    vm.erl_first_process_otp(runtime, Term::atom(init), boot_list)?;
+    vm.erl_system_processes_otp(runtime)?;
+    runtime.erts_start_schedulers()?;
+    Ok(vm)
 }
 
-/// Spawns `erl_init:start(Modname, Argv)` as the node's first process.
-// Port of erts/emulator/beam/erl_init.c (erl_first_process_otp), OTP-29.1.1.
-fn erl_first_process_otp(
-    vm: &mut Vm,
-    modname: &str,
-    argv: Term,
-    workers: usize,
-) -> Result<EntryProcess, VmError> {
-    let modname = global_atoms()
-        .intern(modname)
-        .map_err(|error| VmError::Load(format!("cannot intern {modname}: {error:?}")))?;
-    vm.spawn_entry(
-        "erl_init",
-        "start",
-        &[Term::atom(modname), argv],
-        workers.max(1),
-        4_000,
-    )
+/// Loads the preloaded modules into one staging code index and commits it once.
+// Port of erts/emulator/beam/erl_init.c:508 (load_preloaded) and erl_start's
+// `erts_end_staging_code_ix(); erts_commit_staging_code_ix();`, OTP-29.1.1: modules load in
+// the generated preload.c order, each name interned first.
+fn load_preloaded(vm: &mut Vm, erts_ebin: &Path) -> Result<(), VmError> {
+    let staging = crate::code_ix::global().start_staging();
+    for module in PRELOADED {
+        let path = erts_ebin.join(format!("{module}.beam"));
+        if crate::calls::trace_boot_enabled() {
+            eprintln!("arinsal boot: load {}", path.display());
+        }
+        global_atoms()
+            .intern(module)
+            .map_err(|error| VmError::Load(format!("cannot intern {module}: {error:?}")))?;
+        let bytes = std::fs::read(&path).map_err(|e| VmError::Load(e.to_string()))?;
+        vm.load_bytes(&preload_strip(&bytes))?;
+    }
+    staging
+        .end()
+        .ok_or_else(|| VmError::Load("load_preloaded: staging area not open".into()))?
+        .commit();
+    Ok(())
 }
 
 // Port of lib/kernel/src/code_server.erl:127 (get_user_lib_dirs), OTP-29.1.1.
@@ -298,9 +305,7 @@ const OS_FLAVOR: &str = if cfg!(target_os = "macos") {
 /// The global literals the owners' inits build.
 ///
 /// Port of erts/emulator/beam/erl_init.c (erl_init): os_info_init (erts_bif_info_init),
-/// init_dist and beamfile_init each build their global literal. A `Vm` built outside `boot`
-/// (an in-process VM of a test or tool) runs it from its constructor, as its `erl_init`; each
-/// step is guarded to run once per process.
+/// init_dist and beamfile_init each build their global literal.
 pub(crate) fn erl_init_global_literals() {
     arinsal_term::init_global_literals();
     arinsal_bifs::os_info_init();
@@ -313,7 +318,7 @@ pub(crate) fn erl_init_global_literals() {
 ///
 /// Atom indices decide flatmap key order and the HAMT hash of atom keys, so
 /// these must get the same indices as in erts.
-fn erl_init_atoms() -> Result<(), VmError> {
+pub(crate) fn erl_init_atoms() -> Result<(), VmError> {
     let groups: [&[&str]; 9] = [
         // Port of erts/emulator/beam/jit/beam_jit_main.cpp:273 (beamasm_init), OTP-29.1.1.
         &["erts_beamasm"],
@@ -449,4 +454,53 @@ fn erl_init_atoms() -> Result<(), VmError> {
             .map_err(|error| VmError::Load(format!("cannot intern {name}: {error:?}")))?;
     }
     Ok(())
+}
+
+/// The node of this test process, started as `arinsal -noshell -noinput` ([`erl_start`]) and
+/// returned once `init:get_status()` is `{started, started}`: erts has no bare VM to evaluate
+/// in. Each test runs in its own OS process (nextest), so every test gets a fresh node.
+#[cfg(test)]
+pub(crate) fn test_node() -> std::sync::MutexGuard<'static, Vm> {
+    static NODE: std::sync::OnceLock<std::sync::Mutex<Vm>> = std::sync::OnceLock::new();
+    NODE.get_or_init(|| {
+        let root = arinsal_difftest::reference::otp_root().expect("OTP root (erl on PATH)");
+        let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+        env.insert("ERL_ROOTDIR".into(), root.display().to_string());
+        let launch = arinsal_args::parse(&["arinsal", "-noshell", "-noinput"], &env)
+            .unwrap_or_else(|error| panic!("test node arguments: {error:?}"));
+        arinsal_args::configure_emulator_flags(launch.emulator.clone());
+        let workers = arinsal_alloc::cpuinfo::default_schedulers().0.max(1);
+        let mut vm = erl_start(
+            Path::new(&launch.root_dir),
+            &launch.boot_args,
+            &[],
+            workers,
+            false,
+            true,
+            None,
+        )
+        .expect("start test node");
+        let init = Term::atom(global_atoms().intern("init").expect("intern init"));
+        for _ in 0..12_000 {
+            // `init:get_status/0` calls the registered `init`, which `init:boot/1` registers first.
+            let registered = vm
+                .eval_scheduled("erlang", "whereis", &[init], 1)
+                .expect("erlang:whereis(init)")
+                .text
+                != "undefined";
+            if registered
+                && vm
+                    .eval_scheduled("init", "get_status", &[], 1)
+                    .expect("init:get_status()")
+                    .text
+                    == "{started,started}"
+            {
+                return std::sync::Mutex::new(vm);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("test node did not finish booting");
+    })
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner())
 }

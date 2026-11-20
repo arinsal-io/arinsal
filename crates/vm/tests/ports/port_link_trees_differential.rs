@@ -78,6 +78,9 @@ run() ->
     receive after 200 -> ok end,
     K = erlang:port_info(P5, name) =/= undefined,
     L2 = Linker(boom),
+    % the opener's own link would take it down with the port (erts sends the port's exit
+    % reason to every linked process): only the monitor observes the port here
+    true = unlink(P5),
     Mon5 = erlang:monitor(port, P5),
     L2 ! go,
     L = receive {'DOWN', Mon5, port, P5, R5} -> R5 after 2000 -> timeout end,

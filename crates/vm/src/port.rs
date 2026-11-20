@@ -659,6 +659,20 @@ fn release_port_name(runtime: &crate::process::Runtime, handle: &PortHandle) {
     }
 }
 
+// Port of erts/emulator/beam/io.c:458 (erts_port_free): the port is freed when its last
+// reference drops, after the port table's reference was released by a thread progress later
+// operation (erl_ptab.c erts_ptab_delete_element); only then is the driver handle
+// dereferenced, which may complete a pending unload.
+impl Drop for PortHandle {
+    fn drop(&mut self) {
+        if let Some(drv_port) = &self.driver
+            && !drv_port.driver().is_native()
+        {
+            crate::ddll::port_freed(&self.scheduler, drv_port.driver());
+        }
+    }
+}
+
 impl PortHandle {
     /// The runtime this port belongs to.
     pub(crate) fn runtime(&self) -> Option<&'static crate::process::Runtime> {
@@ -1877,7 +1891,7 @@ fn open_driver_port(
         drv_port.abandon();
         release_io(&handle);
         if handle_id.is_some() {
-            crate::ddll::port_closed(scheduler, &driver);
+            crate::ddll::port_closed(&driver);
         }
         // Port of erts/emulator/beam/erl_bif_port.c:69-89 (open_port error atoms).
         return Ok(match error {
@@ -3691,7 +3705,7 @@ pub(crate) fn release_io_flushing(handle: &PortHandle, flush: bool) {
         })
         && !drv_port.driver().is_native()
     {
-        crate::ddll::port_closed(&handle.scheduler, drv_port.driver());
+        crate::ddll::port_closed(drv_port.driver());
     }
     let waiters = {
         let mut st = handle.state.lock();
@@ -3742,7 +3756,15 @@ pub(crate) fn erts_deliver_port_exit(
     };
     runtime.port_ids.release(id);
     drop(ports);
+    if let Some(drv_port) = handle.driver.as_ref() {
+        drv_port.sched_enter_exiting_state();
+    }
     crate::trace::emit_port_event(runtime, id, crate::trace::PORTS, "closed", &[reason]);
+    // io.c:3887: set_busy_port(prt, 0) resumes the processes suspended on the busy port before
+    // the port is flushed; a port that stays CLOSING with queued data must not keep them.
+    if let Some(drv_port) = handle.driver.as_ref() {
+        drv_port.set_busy_port(false);
+    }
     release_port_name(runtime, &handle);
     if let Some(dep) = handle.set_dist_entry(None) {
         let _ = crate::dist::erts_do_net_exits_ctrl(

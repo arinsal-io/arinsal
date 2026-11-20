@@ -509,6 +509,16 @@ fn check_event(states: &FdStateTable, fd: RawFd, event: ErtsPollEvent, from: Pol
         // managed by a scheduler, we ignore the any IN events".
         seen.readable = false;
     }
+    // Port of erl_check_io.c (erts_check_io, ERTS_EV_TYPE_DRV_SEL / ERTS_EV_TYPE_NIF), OTP-29.1.1:
+    // NVAL without IN, OUT or ERR calls no callback; the selection is reported and unmapped.
+    if event.events & (ERTS_POLL_EV_IN | ERTS_POLL_EV_OUT | ERTS_POLL_EV_ERR) == 0
+        && event.events & ERTS_POLL_EV_NVAL != 0
+        && state.sel.is_some()
+    {
+        arinsal_drv::bad_fd_in_pollset(&mut state.sel, fd);
+        let _ = sync_pollset(fd, &mut state);
+        return;
+    }
     let poll_error = event.events & (ERTS_POLL_EV_ERR | ERTS_POLL_EV_NVAL) != 0;
     let mut callbacks = Vec::new();
     let mut triggered_driver_reads = 0u32;
