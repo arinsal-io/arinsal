@@ -41,6 +41,8 @@ mod sig_queue;
 mod spawn_eval;
 
 pub(crate) use self::executor::*;
+#[cfg(target_arch = "aarch64")]
+pub(crate) use self::executor_run::beam_exit_address;
 use self::exit::*;
 pub(crate) use self::gc::*;
 use self::links::*;
@@ -52,6 +54,7 @@ pub use self::runtime::ScheduledResult;
 pub(crate) use self::runtime::*;
 use self::schedule::*;
 pub(crate) use self::sig_queue::*;
+pub use self::spawn_eval::EntryProcess;
 use self::spawn_eval::*;
 
 /// Offset of the process state word (`c_p->state`, [`arinsal_sched::psflg`]) from `c_p`, the

@@ -4,6 +4,7 @@ use super::*;
 /// Raises the error of a native call to an undefined function that has no error handler
 /// (`undef`) at the call, like the interpreter's call_ext; the arguments are restored first.
 // Port of erts/emulator/beam/beam_common.c (call_error_handler), OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 pub(super) fn raise_undefined_call(
     vm: &mut Vm,
     process: &mut Process,
@@ -219,6 +220,10 @@ pub(super) fn process_main_dispatch(
         let code_ptr = process.native_pc()?;
         if !first && !fast_entry_ok(process, ctx, sys_task_run) {
             return None;
+        }
+        // `jmp c_p->i` at beam_exit: the process was made exiting during this slice.
+        if super::executor_run::at_beam_exit(process) {
+            return Some(super::executor_run::error_action_code(process));
         }
         if first {
             first = false;

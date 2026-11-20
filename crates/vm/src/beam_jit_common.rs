@@ -147,12 +147,12 @@ fn unloaded_fun_error_handler(
         }
         return 0;
     }
-    let handler = process
-        .cold
-        .as_ref()
-        .and_then(|cold| cold.flags.error_handler)
-        .and_then(Term::as_atom)
-        .unwrap_or(arinsal_term::atoms::ERROR_HANDLER);
+    let handler = crate::proc_create::raw::erts_psd_get_term(
+        &process.psd,
+        crate::proc_create::raw::ERTS_PSD_ERROR_HANDLER,
+    )
+    .and_then(Term::as_atom)
+    .unwrap_or(arinsal_term::atoms::ERROR_HANDLER);
     let Ok(undefined_lambda) = arinsal_term::global_atoms().intern("undefined_lambda") else {
         crate::native_hooks::set_error(process, "undef");
         return 0;

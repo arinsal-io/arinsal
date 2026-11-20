@@ -2254,12 +2254,16 @@ fn remote_relations(
             return;
         };
         let exiting = |target: &Process| target.dirty_exiting() || target.has_exit_cont();
+        // An exit signal the drain handled makes the target exiting (ERTS_PROC_IS_EXITING):
+        // it has no relations to report, and its exit is not the caller's failure.
         if !exiting(target)
             && let Err(error) = target.drain(target_ctx)
+            && !Process::erts_proc_is_exiting(target_ctx)
         {
             signal_error = Some(error);
         }
-        if signal_error.is_none() && !exiting(target) {
+        if signal_error.is_none() && !exiting(target) && !Process::erts_proc_is_exiting(target_ctx)
+        {
             relations = Some(Relations::of(target));
         }
     });

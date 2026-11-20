@@ -67,12 +67,17 @@ impl Process {
             && self.cold.as_ref().is_none_or(|cold| {
                 cold.persistent_get_all.is_none()
                     && cold.apply_roots.is_empty()
-                    && cold
-                        .psd_nfunc_trap_wrapper
-                        .as_ref()
-                        .is_none_or(|nep| nep.get().argc <= 0)
-                    && cold.call_memory.is_empty()
             })
+            && crate::proc_create::raw::erts_psd_get::<crate::erl_nfunc_sched::NativeFuncBox>(
+                &self.psd,
+                crate::proc_create::raw::ERTS_PSD_NFUNC_TRAP_WRAPPER,
+            )
+            .is_none_or(|nep| nep.get().argc <= 0)
+            && crate::proc_create::raw::erts_psd_get::<Vec<crate::trace_bp::ProcBpTrace>>(
+                &self.psd,
+                crate::proc_create::raw::ERTS_PSD_CALL_MEMORY_BP,
+            )
+            .is_none_or(Vec::is_empty)
             && !self.has_dirty_result_roots()
             && self.max_heap_peak == 0
             && !self.max_heap_limited()
@@ -121,10 +126,11 @@ impl Process {
         }
         // Port of erts/emulator/beam/erl_gc.c:823-825 (garbage_collect), OTP-29.1.1: the words
         // allocated so far stay counted by call_memory after the collection resets the heap.
-        if self
-            .cold
-            .as_ref()
-            .is_some_and(|cold| !cold.call_memory.is_empty())
+        if crate::proc_create::raw::erts_psd_get::<Vec<crate::trace_bp::ProcBpTrace>>(
+            &self.psd,
+            crate::proc_create::raw::ERTS_PSD_CALL_MEMORY_BP,
+        )
+        .is_some_and(|entries| !entries.is_empty())
         {
             let allocated = self.allocated_words(0);
             crate::trace_bp::adjust_memory_break(self, allocated);
@@ -192,18 +198,19 @@ impl Process {
         }
         let inline_len = usize::from(self.apply_inline_len);
         roots.push(&mut self.apply_inline[..inline_len]);
+        if let Some(argv) = crate::erl_nfunc_sched::erts_setup_nfunc_rootset(
+            crate::proc_create::raw::erts_psd_get_mut(
+                &mut self.psd,
+                crate::proc_create::raw::ERTS_PSD_NFUNC_TRAP_WRAPPER,
+            ),
+        ) {
+            roots.push(argv);
+        }
         if let Some(cold) = self.cold.as_deref_mut() {
             if let Some(state) = cold.persistent_get_all.as_mut() {
                 roots.push_term(&mut state.result);
             }
             roots.push(&mut cold.apply_roots);
-            // Port of erts/emulator/beam/erl_gc.c (setup_rootset: erts_setup_nfunc_rootset),
-            // OTP-29.1.1.
-            if let Some(argv) =
-                crate::erl_nfunc_sched::erts_setup_nfunc_rootset(&mut cold.psd_nfunc_trap_wrapper)
-            {
-                roots.push(argv);
-            }
             for root in crate::dirty::dirty_root_slots(
                 &mut cold.dirty_bif,
                 &mut cold.static_nif_done,

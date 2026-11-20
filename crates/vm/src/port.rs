@@ -2215,6 +2215,10 @@ impl arinsal_drv::PortHost for DrvHost {
             return;
         };
         handle.state.lock().busy_port = on;
+        // Processes suspended on distribution ports are normally queued on the dist entry.
+        if !on && handle.dist_entry().is_some() {
+            crate::dist::erts_dist_port_not_busy(self.runtime, port.id());
+        }
     }
 
     // Port of erts/emulator/beam/erl_port_task.c:107 (profile_runnable_port), OTP-29.1.1.
@@ -2520,7 +2524,7 @@ pub(crate) fn driver_port_exit(runtime: &crate::process::Runtime, id: u64, reaso
     let Some(owner) = runtime.ports.get(id).map(|handle| handle.owner_pid()) else {
         return;
     };
-    erts_deliver_port_exit(runtime, id, owner, reason, None);
+    erts_deliver_port_exit(runtime, id, owner, reason, None, false);
 }
 
 fn erl_launcher(name: &str, executable: bool) -> bool {
@@ -3715,6 +3719,7 @@ pub(crate) fn erts_deliver_port_exit(
     from: Pid,
     reason: Term,
     send_closed: Option<Pid>,
+    drop_normal: bool,
 ) -> bool {
     let modified_reason = if reason == Term::atom(arinsal_term::atoms::KILL) {
         Term::atom(arinsal_term::atoms::KILLED)
@@ -3722,6 +3727,16 @@ pub(crate) fn erts_deliver_port_exit(
         reason
     };
     let ports = runtime.ports.lock();
+    // `from` is a process here; a port exiting itself passes its connected process.
+    if drop_normal
+        && reason == Term::atom(arinsal_term::atoms::NORMAL)
+        && runtime
+            .ports
+            .get(id)
+            .is_some_and(|handle| handle.owner_pid() != from)
+    {
+        return false;
+    }
     let Some(handle) = runtime.ports.remove_locked(id) else {
         return false;
     };
@@ -3775,6 +3790,7 @@ fn close_inner(process: &Process, term: Term, trace_receive: bool) -> Result<Ter
         sender,
         Term::atom(arinsal_term::atoms::NORMAL),
         None,
+        false,
     ) {
         Ok(Term::atom(arinsal_term::atoms::TRUE))
     } else {
@@ -3831,7 +3847,7 @@ pub(crate) fn exit_port(process: &mut Process, port: Term, reason: Term) -> Resu
         return Ok(());
     }
     let caller = process.self_pid.ok_or_else(badarg)?;
-    erts_deliver_port_exit(runtime, id, caller, reason, None);
+    erts_deliver_port_exit(runtime, id, caller, reason, None, false);
     Ok(())
 }
 
@@ -3861,6 +3877,7 @@ pub(crate) fn halt_reap_ports(runtime: &'static crate::process::Runtime, progres
             handle.owner_pid(),
             Term::atom(arinsal_term::atoms::KILLED),
             None,
+            true,
         );
     }
 }
@@ -3945,30 +3962,27 @@ pub(crate) fn owner_exit(
     reason: Term,
     port_links: &[u64],
 ) {
-    let abnormal = reason != Term::atom(arinsal_term::atoms::NORMAL);
-    let affected = {
+    // erts_port_exit(NULL, FORCE_SCHED | BROKEN_LINK, prt, c_p->common.id, reason, NULL) for
+    // every port the process is linked to; `normal` is dropped there unless the process is
+    // the port's connected process (erts_deliver_port_exit with `drop_normal`).
+    let linked = {
         let _ports = runtime.ports.lock();
         port_links
             .iter()
-            .filter_map(|id| {
-                let handle = runtime.ports.get(*id)?;
-                let is_owner = handle.owner.get() == owner;
-                let linked = if handle.driver.as_ref().is_some() {
-                    handle.links.lock().get(owner.data()).is_some()
-                } else {
-                    handle.links.lock().remove(owner.data()).is_some()
-                };
-                (is_owner || (abnormal && linked)).then_some((*id, handle))
-            })
+            .filter_map(|id| runtime.ports.get(*id).map(|handle| (*id, handle)))
             .collect::<Vec<_>>()
     };
-    for (port_id, handle) in affected {
+    for (port_id, handle) in linked {
         if handle.driver.as_ref().is_some() {
             let exit_reason = to_owned(reason).unwrap_or_else(|_| OwnedTerm::Atom("normal".into()));
             drv_sig::exit_for_process_termination(runtime, handle, owner, exit_reason);
             continue;
         }
-        erts_deliver_port_exit(runtime, port_id, owner, reason, None);
+        // call_deliver_port_exit with `broken_link`: no link, nothing to do.
+        if handle.links.lock().remove(owner.data()).is_none() {
+            continue;
+        }
+        erts_deliver_port_exit(runtime, port_id, owner, reason, None, true);
     }
 }
 

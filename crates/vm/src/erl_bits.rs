@@ -3,15 +3,19 @@
 //! Port of erts/emulator/beam/erl_bits.c:1725 (`erts_bs_append_checked`) for the
 //! `<<Bin/binary, Bin2/binary>>` shape the compiler lowers to append + one binary.
 
+#[cfg(target_arch = "aarch64")]
 use crate::native_hooks::{raw, set_error};
 use arinsal_beamasm::ProcessHeader;
-use arinsal_bits::{BitsError, MatchOps, SegFlags, SegSize, SegType, Segment, SegmentValue};
+#[cfg(target_arch = "aarch64")]
+use arinsal_bits::{BitsError, SegSize, SegType, Segment, SegmentValue};
+use arinsal_bits::{MatchOps, SegFlags};
 use arinsal_term::Term;
 
 /// Appends the whole of `X[extra]` onto `X[src]` and returns the new bitstring.
 /// Zero means the construction failed and the process error registers are set.
 // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1812-1890 (append to binary) and
 // erl_bits.c:1725, OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 pub extern "C" fn append_binary(
     header: *mut ProcessHeader,
     src_index: u64,
@@ -137,6 +141,7 @@ pub extern "C" fn append_binary(
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 fn fail(process: &mut crate::Process, error: BitsError) -> u64 {
     // An earlier collection of this helper may have moved the heap.
     let (reason, info) = crate::bits::native_error(error);

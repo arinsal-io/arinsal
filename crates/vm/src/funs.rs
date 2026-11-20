@@ -5,7 +5,7 @@ use crate::{EvalResult, ImportOutcome, Process, Vm, VmError, exceptions};
 use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle};
 use arinsal_loader::Module;
 use arinsal_sched::RunCtx;
-use arinsal_term::{ExportEntry, FunRef, Term, TermBuilder, TermKind, global_atoms};
+use arinsal_term::{FunRef, Term, TermBuilder, TermKind, global_atoms};
 use std::sync::Arc;
 
 pub(super) fn set_module_uniq(module: &mut Module, uniq: [u8; 16]) {
@@ -22,6 +22,7 @@ pub(super) fn call_error_reason(
     reg: &mut [Term],
     fun: Term,
     arity: usize,
+    args: Term,
 ) -> Result<Term, VmError> {
     let is_fun = fun.classify() == TermKind::Fun;
     p.ensure_objv(6 + arity * 2, &mut reg[..arity + 1])?;
@@ -35,12 +36,17 @@ pub(super) fn call_error_reason(
             .tuple(&[Term::atom(kind), fun])
             .map_err(|e| VmError::Unsupported(format!("exception allocation {e:?}")));
     }
-    let mut args = Term::NIL;
-    for value in reg[..arity].iter().rev().copied() {
-        args = builder
-            .cons(value, args)
-            .map_err(|e| VmError::Unsupported(format!("exception allocation {e:?}")))?;
-    }
+    let args = if args == Term::NON_VALUE {
+        let mut list = Term::NIL;
+        for value in reg[..arity].iter().rev().copied() {
+            list = builder
+                .cons(value, list)
+                .map_err(|e| VmError::Unsupported(format!("exception allocation {e:?}")))?;
+        }
+        list
+    } else {
+        args
+    };
     let detail = builder
         .tuple(&[fun, args])
         .map_err(|e| VmError::Unsupported(format!("exception allocation {e:?}")))?;
@@ -49,27 +55,27 @@ pub(super) fn call_error_reason(
         .map_err(|e| VmError::Unsupported(format!("exception allocation {e:?}")))
 }
 
-fn error_handler_module(process: &Process) -> String {
-    process
-        .cold
-        .as_ref()
-        .and_then(|cold| cold.flags.error_handler)
-        .and_then(atom_name)
-        .unwrap_or_else(|| "error_handler".to_owned())
+pub(super) fn error_handler_module(process: &Process) -> String {
+    crate::proc_create::raw::erts_psd_get_term(
+        &process.psd,
+        crate::proc_create::raw::ERTS_PSD_ERROR_HANDLER,
+    )
+    .and_then(atom_name)
+    .unwrap_or_else(|| "error_handler".to_owned())
 }
 
-fn atom_name(term: Term) -> Option<String> {
+pub(super) fn atom_name(term: Term) -> Option<String> {
     global_atoms()
         .text(term.as_atom()?)
         .map(|name| name.to_string())
 }
 
-enum ArgumentError {
+pub(super) enum ArgumentError {
     Badarg,
     SystemLimit,
 }
 
-fn argument_list(mut list: Term) -> Result<Vec<Term>, ArgumentError> {
+pub(super) fn argument_list(mut list: Term) -> Result<Vec<Term>, ArgumentError> {
     let mut args = Vec::new();
     while list.classify() == TermKind::List {
         if args.len() >= 1023 {
@@ -86,7 +92,7 @@ fn argument_list(mut list: Term) -> Result<Vec<Term>, ArgumentError> {
 }
 
 // Port of erts/emulator/beam/beam_common.c:1462-1495 (nested apply loop), OTP-29.1.1.
-fn unwrap_nested_apply(
+pub(super) fn unwrap_nested_apply(
     mut module: Term,
     mut function: Term,
     mut arguments: Term,
@@ -154,96 +160,6 @@ impl Vm {
 
     // Port of erts/emulator/beam/beam_common.c:1605 (call_fun), OTP-29.1.1.
     #[inline]
-    pub(super) fn call_fun_term(
-        &mut self,
-        p: &mut Process,
-        fun: Term,
-        arity: usize,
-        ctx: Option<&mut RunCtx<'_, crate::Process>>,
-    ) -> Result<ImportOutcome, VmError> {
-        if arity >= crate::proc_create::ATTACHED_X_REGS {
-            return Err(VmError::Unsupported("fun arity exceeds X registers".into()));
-        }
-        self.x_regs()?[arity] = fun;
-        // SAFETY: The fun is held in an X register while this process is live.
-        let view = unsafe { fun.fun_ref() };
-        let actual = match &view {
-            Some(FunRef::Local { .. } | FunRef::Export { .. }) => fun.fun_arity().map(usize::from),
-            None => None,
-        };
-        if actual != Some(arity) {
-            let reason = call_error_reason(p, self.reg_prefix(arity + 1)?, fun, arity)?;
-            return Err(VmError::Trap(exceptions::Trap::error(reason)));
-        }
-        match view.unwrap() {
-            FunRef::Local { entry, free_vars } => {
-                // Port of erts/emulator/beam/beam_common.c:1621-1624 (call_fun), OTP-29.1.1.
-                let cached = entry.get_dispatch(0).and_then(|(id, target, generation)| {
-                    if generation == crate::load::code_generation() {
-                        return Some((id, target));
-                    }
-                    (code_tables(erts_active_code_ix()).module_live.get(id) == Some(&true))
-                        .then_some((id, target))
-                });
-                let resolved = match cached {
-                    Some(cached) if !crate::natives::code::erts_purge_state().pending(cached.0) => {
-                        Some(cached)
-                    }
-                    // A cached target in code pending purge is re-resolved: the fun
-                    // entry may also exist in the current instance, where erts
-                    // already dispatches it.
-                    _ => self.resolve_local_fun(p, entry, arity)?,
-                };
-                let Some((module_id, target)) = resolved else {
-                    return self.call_lambda_handler(p, entry.module, arity, false, ctx);
-                };
-                if crate::natives::code::erts_purge_state().pending(module_id) {
-                    return self.call_lambda_handler(p, entry.module, arity, true, ctx);
-                }
-                // The caller module's register file is sized from its own beam.
-                // A closure passes its environment in `x[arity..]`, which can sit
-                // past that size (elixir_erl_compiler's spawn fun). OTP grows the
-                // process X array; shrinking never happens, so the callee keeps it.
-                let need = arity + free_vars.len();
-                if need > crate::proc_create::ATTACHED_X_REGS {
-                    return Err(VmError::Unsupported(
-                        "closure environment exceeds X registers".into(),
-                    ));
-                }
-                for (i, &word) in free_vars.iter().enumerate() {
-                    // SAFETY: The fun header bounds the environment and every word is a term.
-                    self.x_regs()?[arity + i] = unsafe { std::mem::transmute::<u64, Term>(word) };
-                }
-                p.gc_live = arity + free_vars.len();
-                self.set_position(p, module_id, target)?;
-                Ok(ImportOutcome::Dispatch)
-            }
-            FunRef::Export { entry } => {
-                let module = atom_name(Term::atom(entry.module()))
-                    .ok_or_else(|| VmError::Unsupported("export module atom".into()))?;
-                let function = atom_name(Term::atom(entry.function()))
-                    .ok_or_else(|| VmError::Unsupported("export function atom".into()))?;
-                if module == "erlang" && function == "apply" && matches!(arity, 2 | 3) {
-                    return self.apply_bif(p, arity, ctx);
-                }
-                // The fun's own checks (badfun, badarity) raise before the frame is released;
-                // only the callee BIF runs with it gone.
-                let began = p.begin_tail_apply(crate::proc_create::TAIL_FUN_CALL);
-                let result = self.call_named_atoms(
-                    p,
-                    entry.module(),
-                    entry.function(),
-                    &module,
-                    &function,
-                    arity,
-                    ctx,
-                );
-                p.end_tail_apply(began, &result);
-                result
-            }
-        }
-    }
-
     /// Continue a local fun call whose code is not callable in
     /// `Handler(Module, Fun, Args)`. With `pending_purge` the code is being purged:
     /// the caller suspends in `erts_code_purger:pending_purge_lambda/3`, which retries
@@ -251,7 +167,7 @@ impl Vm {
     /// `error_handler:undefined_lambda/3` tries to load it.
     /// Port of erts/emulator/beam/beam_common.c:1677-1727 (call_fun), OTP-29.1.1.
     #[cold]
-    fn call_lambda_handler(
+    pub(super) fn call_lambda_handler(
         &mut self,
         p: &mut Process,
         module: arinsal_term::Atom,
@@ -308,7 +224,7 @@ impl Vm {
     }
 
     #[cold]
-    fn resolve_local_fun(
+    pub(super) fn resolve_local_fun(
         &mut self,
         p: &mut Process,
         entry: &arinsal_term::FunEntry,
@@ -368,6 +284,7 @@ impl Vm {
     /// that trapped.
     // Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*) and
     // jit/arm/beam_asm_global.cpp:145-155 (emit_bif_export_trap), OTP-29.1.1.
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn trap_to_export(
         &mut self,
         p: &mut Process,
@@ -444,7 +361,7 @@ impl Vm {
     }
 
     #[allow(clippy::too_many_arguments)] // Preserve the call metadata without rebuilding an MFA tuple.
-    fn call_named_atoms(
+    pub(super) fn call_named_atoms(
         &mut self,
         p: &mut Process,
         module_atom: arinsal_term::Atom,
@@ -522,45 +439,6 @@ impl Vm {
                 failed.map(ImportOutcome::Returned)
             }
         }
-    }
-
-    /// Run a plain BIF or static NIF reached through `apply`, as a static call of the same
-    /// export would.
-    #[allow(clippy::too_many_arguments)] // The call site's own context, passed through.
-    fn run_apply_bif(
-        &mut self,
-        p: &mut Process,
-        module: &str,
-        function: &str,
-        arity: usize,
-        bif: arinsal_bifs::BifFn,
-    ) -> Result<ImportOutcome, VmError> {
-        // The BIF's BUMP_REDS lowers FCALLS, which the context switch reads.
-        let result = {
-            let mut heap = ProcessHeapHandle(&mut p.heap);
-            let mut state = arinsal_bifs::BifState::default();
-            let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut state);
-            bif(&mut bif_ctx, &self.x_regs()?[..arity])
-        };
-        let mut bif_args = self.x_regs()?[..arity].to_vec();
-        // Port of erts/emulator/beam/beam_jit_common.cpp (beam_jit_call_bif:
-        // ERTS_IS_GC_AFTER_BIF_DESIRED → erts_gc_after_bif_call_lhf), OTP-29.1.1: the export's
-        // call_bif_mfa stub an apply reaches collects after the BIF returns, before the
-        // epilogue raises or returns. A value roots only the result; an error roots the
-        // argument registers.
-        let mut result = result;
-        // `bif_args` are this call's `reg[..arity]`: the error raised below names them.
-        crate::calls::gc_after_bif(p, &mut bif_args, &mut result)?;
-        let result = result.map_err(|error| match error {
-            BifError::Unsupported(reason) => VmError::Unsupported(reason.into()),
-            error => exceptions::bif_error(p, module, function, &bif_args, error),
-        })?;
-        self.x_regs()?[0] = result;
-        // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_bif_shared, bif_nif_epilogue)
-        // and instr_call.cpp (emit_variable_apply, emit_fixed_apply), OTP-29.1.1: neither the
-        // apply nor the BIF stub decrements FCALLS; the BIF's own BUMP_REDS, already taken
-        // from FCALLS and folded above, is the whole charge.
-        Ok(Self::return_value(p, self.x_regs()?[0]))
     }
 
     #[allow(clippy::too_many_arguments)] // Same signature as `call_named_resolved`, which it backs.
@@ -667,7 +545,13 @@ impl Vm {
                             VmError::Unsupported("dirty trap function atom".into())
                         })?);
                     p.gc_live = target_arity;
-                    return self.apply_fixed(p, target_arity, ctx);
+                    return crate::beam_common::fixed_apply(
+                        p,
+                        self.x_regs()?,
+                        target_arity,
+                        self,
+                        ctx,
+                    );
                 }
                 _ => {}
             }
@@ -799,22 +683,45 @@ impl Vm {
         // sys_core_fold:fold_lit_args/4 applies erlang:make_fun/3 the same way.
         if module == "erlang" && function == "make_fun" && arity == 3 {
             let args = [self.x_regs()?[0], self.x_regs()?[1], self.x_regs()?[2]];
-            self.x_regs()?[0] = self.make_export_fun(p, &args)?;
+            let value = crate::bif::make_fun_3(p, &args)
+                .ok_or_else(|| VmError::Unsupported("make_fun BIF declined".into()))?
+                .map_err(VmError::Trap)?;
+            self.x_regs()?[0] = value;
             return Ok(Self::return_value(p, self.x_regs()?[0]));
         }
         if module == "erlang" && function == "fun_info" && (arity == 1 || arity == 2) {
-            self.x_regs()?[0] = self.fun_info(p, arity == 2)?;
+            self.x_regs()?[0] = if arity == 2 {
+                crate::erl_bif_info::fun_info_2(p, &self.x_regs()?[..2])
+                    .ok_or_else(|| VmError::Unsupported("fun_info/2 BIF declined".into()))?
+                    .map_err(VmError::Trap)?
+            } else {
+                self.fun_info(p)?
+            };
             return Ok(Self::return_value(p, self.x_regs()?[0]));
         }
         if module == "erlang" && function == "fun_info_mfa" && arity == 1 {
-            self.x_regs()?[0] = self.fun_info_mfa(p)?;
+            self.x_regs()?[0] = crate::erl_bif_info::fun_info_mfa_1(p, self.x_regs()?)?;
             return Ok(Self::return_value(p, self.x_regs()?[0]));
         }
         // elixir_loop1: dynamic apply must see static NIFs such as re:import/1.
         if let Some(bif) = arity8
             .and_then(|arity| crate::natives::plain_static_nif_lookup(module, function, arity))
         {
-            return self.run_apply_bif(p, module, function, arity, bif);
+            let result = {
+                let mut heap = ProcessHeapHandle(&mut p.heap);
+                let mut state = arinsal_bifs::BifState::default();
+                let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut state);
+                bif(&mut bif_ctx, &self.x_regs()?[..arity])
+            };
+            let mut bif_args = self.x_regs()?[..arity].to_vec();
+            let mut result = result;
+            crate::calls::gc_after_bif(p, &mut bif_args, &mut result)?;
+            let result = result.map_err(|error| match error {
+                BifError::Unsupported(reason) => VmError::Unsupported(reason.into()),
+                error => exceptions::bif_error(p, module, function, &bif_args, error),
+            })?;
+            self.x_regs()?[0] = result;
+            return Ok(Self::return_value(p, self.x_regs()?[0]));
         }
         if arity8.is_some_and(|arity| arinsal_spec::bif_lookup(module, function, arity).is_some()) {
             return Err(VmError::Unsupported(format!(
@@ -824,7 +731,14 @@ impl Vm {
         // Same as `call_import`: a not-yet-loaded `-on_load` module has to go
         // through `code_server` or its NIF stubs run.
         if self.unloaded_on_load(p, module) {
-            return self.call_undefined_function_with_ctx(p, module, function, arity, ctx);
+            return crate::beam_common::call_error_handler(
+                p,
+                (module, function, arity),
+                self.x_regs()?,
+                "undefined_function",
+                self,
+                ctx,
+            );
         }
         let module_id = match self.load_named_traced(p, module) {
             Ok(id) => id,
@@ -835,7 +749,14 @@ impl Vm {
                 if crate::calls::trace_boot_enabled() {
                     eprintln!("arinsal boot: autoload {module}:{function}/{arity}");
                 }
-                return self.call_undefined_function_with_ctx(p, module, function, arity, ctx);
+                return crate::beam_common::call_error_handler(
+                    p,
+                    (module, function, arity),
+                    self.x_regs()?,
+                    "undefined_function",
+                    self,
+                    ctx,
+                );
             }
             Err(_) => {
                 return Err(VmError::Exception {
@@ -849,7 +770,14 @@ impl Vm {
         else {
             // Port of erts/emulator/beam/beam_common.c (call_error_handler).
             if self.should_autoload(p, module) {
-                return self.call_undefined_function_with_ctx(p, module, function, arity, ctx);
+                return crate::beam_common::call_error_handler(
+                    p,
+                    (module, function, arity),
+                    self.x_regs()?,
+                    "undefined_function",
+                    self,
+                    ctx,
+                );
             }
             return Err(VmError::Exception {
                 reason: "undef".into(),
@@ -949,448 +877,13 @@ impl Vm {
             .is_some_and(|runtime| runtime.reg.whereis_proc_str("code_server").is_some())
     }
 
-    /// Jump to `error_handler:undefined_function(Module, Function, Args)`.
-    pub(super) fn call_undefined_function(
-        &mut self,
-        p: &mut Process,
-        module: &str,
-        function: &str,
-        arity: usize,
-    ) -> Result<ImportOutcome, VmError> {
-        self.call_undefined_function_with_ctx(p, module, function, arity, None)
-    }
-
-    fn call_undefined_function_with_ctx(
-        &mut self,
-        p: &mut Process,
-        module: &str,
-        function: &str,
-        arity: usize,
-        ctx: Option<&mut RunCtx<'_, crate::Process>>,
-    ) -> Result<ImportOutcome, VmError> {
-        // Port of erts/emulator/beam/beam_common.c:1294-1345
-        // (`call_error_handler`), OTP-29.1.1. Resolve the handler before changing X registers:
-        // with no handler, the undef stack frame must retain the original call arguments.
-        // `process_flag(error_handler, Module)` also disables autoload for that module.
-        let handler = error_handler_module(p);
-        let ready = code_tables(erts_active_code_ix())
-            .loaded
-            .get(&handler)
-            .is_some_and(|id| {
-                code_tables(erts_active_code_ix()).modules[*id]
-                    .export("undefined_function", 3)
-                    .is_some()
-            });
-        if !ready {
-            return Err(VmError::Exception {
-                reason: "undef".into(),
-                frame: format!("{module}:{function}/{arity}"),
-            });
-        }
-        p.ensure_objv(
-            arity.saturating_mul(2).saturating_add(8),
-            self.reg_prefix(arity)?,
-        )?;
-        let args: Vec<Term> = self.x_regs()?[..arity].to_vec();
-        let list = TermBuilder::new(&mut p.heap)
-            .list_from_iter(args)
-            .map_err(|error| VmError::Unsupported(format!("undef arg list: {error:?}")))?;
-        let module_atom = global_atoms()
-            .intern(module)
-            .map_err(|_| VmError::Unsupported("undef module atom".into()))?;
-        let function_atom = global_atoms()
-            .intern(function)
-            .map_err(|_| VmError::Unsupported("undef function atom".into()))?;
-        self.x_regs()?[0] = Term::atom(module_atom);
-        self.x_regs()?[1] = Term::atom(function_atom);
-        self.x_regs()?[2] = list;
-        self.call_named(p, &handler, "undefined_function", 3, ctx)
-    }
-
-    /// Call the configured error handler for a debug breakpoint.
-    pub(super) fn call_debug_breakpoint_handler(
-        &mut self,
-        p: &mut Process,
-        module: &str,
-        function: &str,
-        arity: usize,
-        ctx: Option<&mut RunCtx<'_, crate::Process>>,
-    ) -> Result<ImportOutcome, VmError> {
-        // Port of erts/emulator/beam/beam_common.c:1294-1345
-        // (`call_error_handler`), OTP-29.1.1. A breakpoint dispatches through the
-        // process-configured handler just like an undefined call does.
-        let handler = error_handler_module(p);
-        let ready = code_tables(erts_active_code_ix())
-            .loaded
-            .get(&handler)
-            .is_some_and(|id| {
-                code_tables(erts_active_code_ix()).modules[*id]
-                    .export("breakpoint", 3)
-                    .is_some()
-            });
-        if !ready {
-            return Err(VmError::Exception {
-                reason: "undef".into(),
-                frame: format!("{module}:{function}/{arity}"),
-            });
-        }
-        p.ensure_objv(
-            arity.saturating_mul(2).saturating_add(8),
-            self.reg_prefix(arity)?,
-        )?;
-        let args = self.x_regs()?[..arity].to_vec();
-        let list = TermBuilder::new(&mut p.heap)
-            .list_from_iter(args)
-            .map_err(|error| VmError::Unsupported(format!("breakpoint arg list: {error:?}")))?;
-        let module_atom = global_atoms()
-            .intern(module)
-            .map_err(|_| VmError::Unsupported("breakpoint module atom".into()))?;
-        let function_atom = global_atoms()
-            .intern(function)
-            .map_err(|_| VmError::Unsupported("breakpoint function atom".into()))?;
-        self.x_regs()?[0] = Term::atom(module_atom);
-        self.x_regs()?[1] = Term::atom(function_atom);
-        self.x_regs()?[2] = list;
-        self.call_named(p, &handler, "breakpoint", 3, ctx)
-    }
-
-    #[inline]
-    pub(super) fn apply_fixed(
-        &mut self,
-        p: &mut Process,
-        arity: usize,
-        ctx: Option<&mut RunCtx<'_, crate::Process>>,
-    ) -> Result<ImportOutcome, VmError> {
-        if arity + 1 >= crate::proc_create::ATTACHED_X_REGS {
-            return Err(self.exception(p, "system_limit"));
-        }
-        if self.x_regs()?[arity].as_atom().is_none()
-            || self.x_regs()?[arity + 1].as_atom().is_none()
-        {
-            // Port of erts/emulator/beam/beam_common.c:1543-1550 (fixed_apply), OTP-29.1.1.
-            let words = arity
-                .checked_mul(2)
-                .ok_or_else(|| self.exception(p, "system_limit"))?;
-            p.ensure_objv(words, self.reg_prefix(arity + 2)?)?;
-            let module_term = self.x_regs()?[arity];
-            let function_term = self.x_regs()?[arity + 1];
-            let arguments = TermBuilder::new(&mut p.heap)
-                .list_from_iter(self.x_regs()?[..arity].iter().copied())
-                .map_err(|error| VmError::Unsupported(format!("apply args {error:?}")))?;
-            return Err(exceptions::bif_error(
-                p,
-                "erlang",
-                "apply",
-                &[module_term, function_term, arguments],
-                BifError::BADARG,
-            ));
-        }
-        let module_term = self.x_regs()?[arity];
-        let function_term = self.x_regs()?[arity + 1];
-        let module_atom = module_term.as_atom();
-        let function_atom = function_term.as_atom();
-        let module_atom = module_atom.expect("checked apply module");
-        let function_atom = function_atom.expect("checked apply function");
-        let module =
-            atom_name(Term::atom(module_atom)).ok_or_else(|| self.exception(p, "badarg"))?;
-        let function =
-            atom_name(Term::atom(function_atom)).ok_or_else(|| self.exception(p, "badarg"))?;
-        if crate::trace::saves_calls(p) {
-            crate::trace::save_call(
-                p,
-                crate::trace::SavedCall::Mfa(module_atom, function_atom, arity as u32),
-            );
-        }
-        if module == "erlang" && function == "apply" && arity == 3 {
-            // Port of erts/emulator/beam/beam_common.c:1445-1450 (apply), OTP-29.1.1.
-            return self.apply_bif(p, 3, ctx);
-        }
-        // Port of erts/emulator/beam/jit/arm/instr_call.cpp (emit_i_apply_last, OTP-29.1.1):
-        // the frame is deallocated before the callee runs, but a failure of the apply itself
-        // (above) is raised at the apply instruction, in the caller.
-        let began = p.begin_tail_apply(crate::proc_create::TAIL_APPLY);
-        let result = self.call_named_atoms(
-            p,
-            module_atom,
-            function_atom,
-            &module,
-            &function,
-            arity,
-            ctx,
-        );
-        p.end_tail_apply(began, &result);
-        result
-    }
-
-    #[inline]
-    // Port of erts/emulator/beam/beam_common.c:1350-1519 (apply and its BIF adjustment), OTP-29.1.1.
-    pub(super) fn apply_bif(
-        &mut self,
-        p: &mut Process,
-        arity: usize,
-        ctx: Option<&mut RunCtx<'_, crate::Process>>,
-    ) -> Result<ImportOutcome, VmError> {
-        let original_position = p.position_marker();
-        let original_gc_live = p.gc_live;
-        let original_operands = [self.x_regs()?[0], self.x_regs()?[1], self.x_regs()?[2]];
-        let (module_term, function_term, arguments_term, target) = if arity == 2 {
-            (
-                self.x_regs()?[0],
-                self.x_regs()?[1],
-                self.x_regs()?[1],
-                Some(self.x_regs()?[0]),
-            )
-        } else {
-            let (module, function, arguments) =
-                unwrap_nested_apply(self.x_regs()?[0], self.x_regs()?[1], self.x_regs()?[2]);
-            (module, function, arguments, None)
-        };
-        let named = if arity == 3 {
-            match (module_term.as_atom(), function_term.as_atom()) {
-                (Some(module), Some(function)) => Some((module, function)),
-                _ => {
-                    // Port of erts/emulator/beam/beam_common.c:1543-1550 (fixed_apply), OTP-29.1.1.
-                    return Err(exceptions::bif_error(
-                        p,
-                        "erlang",
-                        "apply",
-                        &[module_term, function_term, arguments_term],
-                        BifError::BADARG,
-                    ));
-                }
-            }
-        } else {
-            None
-        };
-        let bif_args = if arity == 2 {
-            vec![module_term, arguments_term]
-        } else {
-            vec![module_term, function_term, arguments_term]
-        };
-        let args = argument_list(arguments_term).map_err(|error| {
-            exceptions::bif_error(
-                p,
-                "erlang",
-                "apply",
-                &bif_args,
-                match error {
-                    ArgumentError::Badarg => BifError::BADARG,
-                    ArgumentError::SystemLimit => BifError::SystemLimit,
-                },
-            )
-        })?;
-        if args.len() >= crate::proc_create::ATTACHED_X_REGS {
-            return Err(exceptions::bif_error(
-                p,
-                "erlang",
-                "apply",
-                &bif_args,
-                BifError::SystemLimit,
-            ));
-        }
-        self.x_regs()?[..args.len()].copy_from_slice(&args);
-        if named.is_some_and(|(module, function)| {
-            global_atoms().text(module) == Some("erlang")
-                && global_atoms().text(function) == Some("apply")
-        }) && args.len() == 2
-        {
-            return self.apply_bif(p, 2, ctx);
-        }
-        // erts' `apply_bif_error_adjustment` pushes the apply site as the CP of a tail-applied
-        // error/exit/throw. Under BeamAsm only the `i_apply_only` instruction passes that site
-        // (`I`, with a zero stack offset); the native caller records it at its own call site,
-        // and every other apply (through an export) passes NULL, which skips the adjustment.
-        // Port of erts/emulator/beam/beam_common.c:1345-1427 (apply_bif_error_adjustment) and
-        // erts/emulator/beam/jit/arm/instr_call.cpp (emit_variable_apply), OTP-29.1.1.
-        // Re-executing this apply needs its own operands; keep them rooted while the callee runs.
-        // The outermost apply (spawn's erlang:apply/2) stays on the process. Nested applies
-        // spill into ProcessCold, which erts does not allocate for an empty fun.
-        let inline = arity <= 3
-            && p.apply_inline_len == 0
-            && p.cold
-                .as_ref()
-                .is_none_or(|cold| cold.apply_roots.is_empty());
-        let roots_base = if inline {
-            p.apply_inline[..arity].copy_from_slice(&original_operands[..arity]);
-            p.apply_inline_len = arity as u8;
-            0
-        } else {
-            let cold = p.cold_mut();
-            let base = cold.apply_roots.len();
-            cold.apply_roots
-                .extend_from_slice(&original_operands[..arity]);
-            base
-        };
-        let began = arity == 3 && p.begin_tail_apply(crate::proc_create::TAIL_APPLY);
-        let result = if let Some(fun) = target {
-            self.call_fun_term(p, fun, args.len(), ctx)
-        } else {
-            let (module_atom, function_atom) = named.unwrap();
-            let module = global_atoms()
-                .text(module_atom)
-                .ok_or_else(|| self.exception(p, "badarg"))?;
-            let function = global_atoms()
-                .text(function_atom)
-                .ok_or_else(|| self.exception(p, "badarg"))?;
-            self.call_named_atoms(
-                p,
-                module_atom,
-                function_atom,
-                module,
-                function,
-                args.len(),
-                ctx,
-            )
-        };
-        p.end_tail_apply(began, &result);
-        let mut operand_buf = [Term::NIL; 3];
-        let operand_len = if inline {
-            operand_buf[..arity].copy_from_slice(&p.apply_inline[..arity]);
-            p.apply_inline_len = 0;
-            arity
-        } else {
-            let cold = p.cold_mut();
-            let len = cold.apply_roots.len() - roots_base;
-            operand_buf[..len].copy_from_slice(&cold.apply_roots[roots_base..]);
-            cold.apply_roots.truncate(roots_base);
-            len
-        };
-        let reexec_apply =
-            matches!(&result, Ok(ImportOutcome::Yield)) && p.position_marker() == original_position;
-        if matches!(&result, Err(VmError::Dirty(_))) || reexec_apply {
-            // Only a yield that re-executes this apply may restore its argument registers; a yield after the
-            // callee returned (reductions exhausted, ip advanced) must keep the result in x0.
-            self.x_regs()?[..operand_len].copy_from_slice(&operand_buf[..operand_len]);
-            p.gc_live = original_gc_live;
-        } else if result.is_ok() {
-            // The deferred collector runs before the next instruction. A completed callee
-            // has installed its result in X0, while later caller X registers may still
-            // hold values used after apply/3 returns.
-            p.gc_live = original_gc_live;
-        }
-        result
-    }
-
-    /// `erlang:make_fun/3` as a light BIF. A call that is not a plain `{Module, Function,
-    /// Arity}` of atoms and a byte-sized arity is declined for the executor to raise.
-    // Port of erts/emulator/beam/bif.c:4467 (make_fun_3), OTP-29.1.1.
-    pub(crate) fn make_fun_light(
-        process: &mut Process,
-        args: &[Term],
-    ) -> Option<Result<Term, exceptions::Trap>> {
-        let [module, function, arity] = args else {
-            return None;
-        };
-        let (module, function) = (module.as_atom()?, function.as_atom()?);
-        let arity = arity.as_small()?;
-        if !(0..=255).contains(&arity) {
-            return None;
-        }
-        let arity = arity as u32;
-        process.runtime?;
-        let entry = crate::export::export_get_or_make_stub((module, function, arity))?;
-        TermBuilder::new(&mut process.heap)
-            .export_fun(entry)
-            .ok()
-            .map(Ok)
-    }
-
-    pub(super) fn make_export_fun(
-        &mut self,
-        p: &mut Process,
-        args: &[Term],
-    ) -> Result<Term, VmError> {
-        let module = args[0]
-            .as_atom()
-            .ok_or_else(|| self.exception(p, "badarg"))?;
-        let function = args[1]
-            .as_atom()
-            .ok_or_else(|| self.exception(p, "badarg"))?;
-        let arity = args[2]
-            .as_small()
-            .filter(|n| (0..=255).contains(n))
-            .ok_or_else(|| self.exception(p, "badarg"))? as u32;
-        // Port of erts/emulator/beam/bif.c (erlang:make_fun/3: erts_export_get_or_make_stub,
-        // the fun is the export's lambda), OTP-29.1.1.
-        let entry = crate::export::export_get_or_make_stub((module, function, arity))
-            .unwrap_or_else(|| Arc::new(ExportEntry::new(module, function, arity)));
-        TermBuilder::new(&mut p.heap)
-            .export_fun(entry)
-            .map_err(|e| VmError::Unsupported(format!("export fun allocation {e:?}")))
-    }
-
-    // elixir_loop1: Port of erts/emulator/beam/erl_bif_info.c:4011
-    // (fun_info_mfa_1), OTP-29.1.1.
-    pub(super) fn fun_info_mfa(&self, p: &mut Process) -> Result<Term, VmError> {
-        p.ensure_objv(4, self.reg_prefix(1)?)?;
-        // SAFETY: X0 retains the fun throughout this BIF; tuple construction cannot collect.
-        let view =
-            unsafe { self.x_regs()?[0].fun_ref() }.ok_or_else(|| self.exception(p, "badarg"))?;
-        let (module, name) = match view {
-            FunRef::Local { entry, .. } => (entry.module, self.fun_function_name(entry)),
-            FunRef::Export { entry } => (entry.module(), atom_name(Term::atom(entry.function()))),
-        };
-        let arity = u32::from(self.x_regs()?[0].fun_arity().unwrap());
-        let name = match name {
-            Some(name) => Term::atom(
-                global_atoms()
-                    .intern(&name)
-                    .map_err(|_| VmError::Unsupported("fun name atom".into()))?,
-            ),
-            None => Term::NIL,
-        };
-        TermBuilder::new(&mut p.heap)
-            .tuple(&[
-                Term::atom(module),
-                name,
-                Term::small(i64::from(arity)).unwrap(),
-            ])
-            .map_err(|error| VmError::Unsupported(format!("fun_info_mfa tuple: {error:?}")))
-    }
-
-    /// Function name of a local fun, or `None` for an unloaded or pending-purge fun.
-    /// Port of erts/emulator/beam/erl_fun.c:37 (erts_get_fun_mfa), OTP-29.1.1.
-    fn fun_function_name(&self, entry: &arinsal_term::FunEntry) -> Option<String> {
-        let module = atom_name(Term::atom(entry.module))?;
-        let (id, target) = [
-            code_tables(erts_active_code_ix()).loaded.get(&module),
-            code_tables(erts_active_code_ix()).old.get(&module),
-        ]
-        .into_iter()
-        .flatten()
-        .find_map(|&id| {
-            code_tables(erts_active_code_ix()).modules[id]
-                .funs
-                .iter()
-                .find(|slot| {
-                    slot.entry.index == entry.index
-                        && slot.entry.uniq == entry.uniq
-                        && slot.entry.arity == entry.arity
-                })
-                .map(|slot| (id, slot.target))
-        })?;
-        if crate::natives::code::erts_purge_state().pending(id) {
-            return None;
-        }
-        code_tables(erts_active_code_ix()).modules[id]
-            .function_at(target)
-            .map(|(name, _)| name.to_owned())
-    }
-
-    pub(super) fn fun_info(&self, p: &mut Process, keyed: bool) -> Result<Term, VmError> {
-        // Port of erts/emulator/beam/erl_bif_info.c:3912 (fun_info_2), OTP-29.1.1.
-        p.ensure_objv(1024, self.reg_prefix(usize::from(keyed) + 1)?)?;
+    /// `fun_info/1` is the OTP-level list wrapper around the keyed `fun_info/2` BIF.
+    pub(super) fn fun_info(&self, p: &mut Process) -> Result<Term, VmError> {
+        p.ensure_objv(1024, self.reg_prefix(1)?)?;
         let fun = self.x_regs()?[0];
         // SAFETY: X0 retains the fun throughout construction; no collection follows.
         let view = unsafe { fun.fun_ref() }.ok_or_else(|| self.exception(p, "badarg"))?;
-        let requested = if keyed {
-            Some(atom_name(self.x_regs()?[1]).ok_or_else(|| self.exception(p, "badarg"))?)
-        } else {
-            None
-        };
-        let keys: &[&str] = if let Some(ref key) = requested {
-            &[key]
-        } else if matches!(view, FunRef::Local { .. }) {
+        let keys: &[&str] = if matches!(view, FunRef::Local { .. }) {
             &[
                 "pid",
                 "module",
@@ -1434,17 +927,9 @@ impl Vm {
                 (FunRef::Local { entry, .. }, "new_uniq") => builder
                     .binary(&entry.uniq)
                     .map_err(|e| VmError::Unsupported(format!("fun uniq allocation {e:?}")))?,
-                (FunRef::Local { entry, .. }, "name") => {
-                    if let Some(function) = self.fun_function_name(entry) {
-                        Term::atom(
-                            global_atoms()
-                                .intern(&function)
-                                .map_err(|_| VmError::Unsupported("fun name atom".into()))?,
-                        )
-                    } else {
-                        Term::NIL
-                    }
-                }
+                (FunRef::Local { entry, .. }, "name") => crate::erl_fun::erts_get_fun_mfa(entry)
+                    .map(|mfa| crate::native_hooks::from_raw(mfa.function))
+                    .unwrap_or(Term::NIL),
                 (FunRef::Export { entry }, "name") => Term::atom(entry.function()),
                 (FunRef::Local { .. } | FunRef::Export { .. }, "arity") => {
                     Term::small(i64::from(fun.fun_arity().unwrap())).unwrap()
@@ -1484,13 +969,9 @@ impl Vm {
                 .map_err(|e| VmError::Unsupported(format!("fun info allocation {e:?}")))?;
             pairs.push(pair);
         }
-        if keyed {
-            Ok(pairs[0])
-        } else {
-            builder
-                .list_from_iter(pairs)
-                .map_err(|e| VmError::Unsupported(format!("fun info list {e:?}")))
-        }
+        builder
+            .list_from_iter(pairs)
+            .map_err(|e| VmError::Unsupported(format!("fun info list {e:?}")))
     }
 }
 

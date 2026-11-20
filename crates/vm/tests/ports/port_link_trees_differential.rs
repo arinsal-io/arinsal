@@ -1,5 +1,6 @@
 //! Port links and monitors live in the trees of the processes at both ends: `process_info`
-//! of the owner and of a driver-monitored process, and the exit of a process that unlinked.
+//! of the owner and of a driver-monitored process, the exit of a process that unlinked, and
+//! the exit of a linked process that is not the port's connected process.
 use arinsal_difftest::{CallResult, RefErl};
 
 const SOURCE: &str = r#"
@@ -65,7 +66,22 @@ run() ->
     DownA = receive {'DOWN', RefA, port, P1, normal} -> RefA after 1000 -> timeout end,
     DownB = receive {'DOWN', RefB, port, P1, normal} -> RefB after 1000 -> timeout end,
     J = [DownA, DownB] =:= [RefA, RefB],
-    {A, B, C, D, E =/= undefined, F, G, H, I, J}.
+    % a linked process that is not the connected one: `normal` is dropped, another reason
+    % closes the port (erts_deliver_port_exit with drop_normal)
+    P5 = open_port({spawn, "cat"}, []),
+    Linker = fun(Reason) ->
+        Pid = spawn(fun() -> link(P5), Parent ! {linked, self()}, receive go -> exit(Reason) end end),
+        receive {linked, Pid} -> Pid end
+    end,
+    L1 = Linker(normal),
+    L1 ! go,
+    receive after 200 -> ok end,
+    K = erlang:port_info(P5, name) =/= undefined,
+    L2 = Linker(boom),
+    Mon5 = erlang:monitor(port, P5),
+    L2 ! go,
+    L = receive {'DOWN', Mon5, port, P5, R5} -> R5 after 2000 -> timeout end,
+    {A, B, C, D, E =/= undefined, F, G, H, I, J, K, L}.
 "#;
 
 #[test]

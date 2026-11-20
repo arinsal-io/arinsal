@@ -57,24 +57,31 @@ impl ErtsNativeFunc {
 
 /// `ERTS_PROC_GET_NFUNC_TRAP_WRAPPER(p)`.
 pub(crate) fn get_nfunc_trap_wrapper(p: &mut Process) -> Option<&mut NativeFuncBox> {
-    p.cold.as_deref_mut()?.psd_nfunc_trap_wrapper.as_mut()
+    crate::proc_create::raw::erts_psd_get_mut(
+        &mut p.psd,
+        crate::proc_create::raw::ERTS_PSD_NFUNC_TRAP_WRAPPER,
+    )
 }
 
 /// Port of erts/emulator/beam/erl_nfunc_sched.c (erts_new_proc_nfunc), OTP-29.1.1.
 pub(crate) fn erts_new_proc_nfunc(c_p: &mut Process, argc: usize) -> &mut NativeFuncBox {
     // ERTS_PROC_SET_NFUNC_TRAP_WRAPPER frees the old wrapper.
-    c_p.cold_mut()
-        .psd_nfunc_trap_wrapper
-        .insert(NativeFuncBox::new(argc))
+    crate::proc_create::raw::erts_psd_set(
+        &mut c_p.psd,
+        crate::proc_create::raw::ERTS_PSD_NFUNC_TRAP_WRAPPER,
+        Some(Box::new(NativeFuncBox::new(argc))),
+    );
+    get_nfunc_trap_wrapper(c_p).expect("new process NIF wrapper")
 }
 
 /// Port of erts/emulator/beam/erl_nfunc_sched.c (erts_destroy_nfunc), OTP-29.1.1.
 pub(crate) fn erts_destroy_nfunc(p: &mut Process) {
-    let nep = p
-        .cold
-        .as_deref_mut()
-        .and_then(|cold| cold.psd_nfunc_trap_wrapper.take());
-    if let Some(mut nep) = nep
+    let nep = crate::proc_create::raw::erts_psd_set::<NativeFuncBox>(
+        &mut p.psd,
+        crate::proc_create::raw::ERTS_PSD_NFUNC_TRAP_WRAPPER,
+        None,
+    );
+    if let Some(mut nep) = nep.map(|nep| *nep)
         && nep.get().m != 0
     {
         crate::natives::nif::erts_nfunc_cleanup_nif_mod(nep.get_mut());
@@ -88,10 +95,7 @@ pub(crate) fn erts_get_proc_nfunc(c_p: &mut Process, argc: usize) -> &mut Native
     if !fits {
         return erts_new_proc_nfunc(c_p, argc);
     }
-    c_p.cold_mut()
-        .psd_nfunc_trap_wrapper
-        .as_mut()
-        .expect("wrapper checked above")
+    get_nfunc_trap_wrapper(c_p).expect("wrapper checked above")
 }
 
 /// The process fields `erts_nfunc_schedule` writes: `c_p` on a normal scheduler, the dirty
@@ -146,8 +150,8 @@ pub(crate) fn erts_nfunc_schedule(
 
 /// Port of erts/emulator/beam/erl_nfunc_sched.h (erts_setup_nfunc_rootset), OTP-29.1.1: the
 /// saved arguments of a wrapper in use are GC roots.
-pub(crate) fn erts_setup_nfunc_rootset(wrapper: &mut Option<NativeFuncBox>) -> Option<&mut [Term]> {
-    let nep = wrapper.as_mut()?;
+pub(crate) fn erts_setup_nfunc_rootset(wrapper: Option<&mut NativeFuncBox>) -> Option<&mut [Term]> {
+    let nep = wrapper?;
     let argc = nep.get().argc;
     if argc <= 0 {
         return None;

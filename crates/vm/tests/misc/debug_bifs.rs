@@ -406,7 +406,7 @@ fn debug_bifs_hashmap_children_match_one_shot_otp() {
     let beam = reference
         .compile_named("debug_bifs_diff", SOURCE, &[])
         .expect("compile map children fixture");
-    let actual = run_vm(&beam, "hash_children");
+    // The reference runs before the node boots: the node ignores SIGCHLD (erts sys.c).
     let expression = "M=#{1=>2,2=>4,3=>6,4=>8,5=>10,6=>12,7=>14,8=>16,9=>18,10=>20,11=>22,12=>24,13=>26,14=>28,15=>30,16=>32,17=>34,18=>36,19=>38,20=>40,21=>42,22=>44,23=>46,24=>48,25=>50,26=>52,27=>54,28=>56,29=>58,30=>60,31=>62,32=>64,33=>66,34=>68,35=>70,36=>72,37=>74,38=>76,39=>78,40=>80}, io:put_chars([case is_map(C) of true->$M; false->$L end || C <- erts_internal:map_hashmap_children(M)]), halt().";
     let output = std::process::Command::new("erl")
         .args(["-noshell", "-eval", expression])
@@ -418,6 +418,7 @@ fn debug_bifs_hashmap_children_match_one_shot_otp() {
         String::from_utf8_lossy(&output.stderr)
     );
     let expected = output.stdout;
+    let actual = run_vm(&beam, "hash_children");
     let OwnedTerm::List { elems, tail } = &actual else {
         panic!("expected hashmap child list, got {actual:?}");
     };

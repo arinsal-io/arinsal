@@ -132,9 +132,15 @@ pub(crate) fn system_info_body(process: &mut Process, selector: Term) -> Result<
             crate::natives::sys::system_info_dump(process, name.unwrap())
         }
         // Port of erts/emulator/beam/erl_bif_info.c:2784 (system_info scheduler_id), OTP-29.1.1.
-        Some("scheduler_id") => Term::small(i64::from(process.scheduler_id))
-            .filter(|_| process.scheduler_id != 0)
-            .ok_or_else(badarg),
+        Some("scheduler_id") => {
+            let scheduler_id = crate::proc_create::raw::erts_psd_get_word(
+                &process.psd,
+                crate::proc_create::raw::ERTS_PSD_SCHED_ID,
+            );
+            Term::small(scheduler_id as i64)
+                .filter(|_| scheduler_id != 0)
+                .ok_or_else(badarg)
+        }
         // Port of erts/emulator/beam/erl_bif_info.c:2879 (allocated_areas), OTP-29.1.1.
         Some("allocated_areas") => crate::natives::sys::memory_areas(process),
         _ => Err(badarg()),

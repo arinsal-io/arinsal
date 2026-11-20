@@ -130,8 +130,10 @@ fn scheduled(function: &str) -> OwnedTerm {
 }
 
 fn scheduled_args(function: &str, args: &[arinsal_term::Term]) -> OwnedTerm {
+    // erlc runs before the node boots: the node ignores SIGCHLD (erts sys.c).
+    let beam = beam();
     let mut vm = crate::common::node();
-    vm.load_bytes(beam()).unwrap();
+    vm.load_bytes(beam).unwrap();
     vm.eval_scheduled("tty_diff", function, args, 1)
         .unwrap_or_else(|error| panic!("{function}: {error}"))
         .term
@@ -286,6 +288,9 @@ fn read_available(fd: RawFd, exact: usize) -> Vec<u8> {
 #[test]
 fn plain_bifs_do_not_touch_the_tty_poller() {
     let _lock = stdio();
+    // The booted node's own standard I/O stays registered; only the call must add nothing.
+    beam();
+    drop(crate::common::node());
     let before = arinsal_vm::tty_registered_callers();
     let result = scheduled("plain_bifs");
     assert_eq!(result, atom("ok"));
@@ -400,6 +405,8 @@ fn write_finishes_after_partial_nonblocking_pipe() {
     set_nonblock(read.as_raw_fd());
     set_nonblock(write.as_raw_fd());
     let expected_len = 131_072;
+    // erl runs before the node boots: the node ignores SIGCHLD (erts sys.c).
+    let expected = erl_term(&[], "ok");
     let tty = {
         let _saved = redirect(1, write.as_raw_fd());
         scheduled("create")
@@ -409,7 +416,7 @@ fn write_finishes_after_partial_nonblocking_pipe() {
     let reader = std::thread::spawn(move || read_available(read_fd, expected_len));
     let actual = call_with("write_big", &tty);
     let got = reader.join().unwrap();
-    assert_eq!(actual, erl_term(&[], "ok"));
+    assert_eq!(actual, expected);
     assert_eq!(got.len(), expected_len);
     assert!(got.iter().all(|byte| *byte == 0x5a));
 }
@@ -460,6 +467,23 @@ fn width_locale_and_badarg_match_erl() {
         &[],
         "begin ok = prim_tty:load(), {prim_tty:sizeof_wchar(), [prim_tty:wcswidth(<<C:32/native-signed>>) || C <- [65, 10, 16#1F600, 0]]} end",
     );
+    // Every erl reference runs before the node boots: the node ignores SIGCHLD (erts sys.c).
+    let locale = erl_term(
+        &[],
+        "begin ok = prim_tty:load(), register(tty_locale, self()), S = prim_tty:init(#{input => disabled, output => raw}), prim_tty:unicode(S) end",
+    );
+    let encoding = erl_term(&[], "utf8");
+    let badarg = erl_term(
+        &[],
+        "begin ok = prim_tty:load(), try prim_tty:isatty(other) catch error:Reason -> {error, Reason} end end",
+    );
+    let reference = RefErl::start().expect("erl");
+    let open_bad = reference.call(
+        "prim_tty",
+        "tty_is_open",
+        &[OwnedTerm::atom("x"), OwnedTerm::atom("stdin")],
+    );
+    drop(reference);
     let actual = scheduled("chars");
     let OwnedTerm::Tuple(parts) = &actual else {
         panic!("chars {actual}");
@@ -482,27 +506,12 @@ fn width_locale_and_badarg_match_erl() {
         };
         assert_eq!(one, wide);
     }
-    let locale = erl_term(
-        &[],
-        "begin ok = prim_tty:load(), register(tty_locale, self()), S = prim_tty:init(#{input => disabled, output => raw}), prim_tty:unicode(S) end",
-    );
     assert_eq!(scheduled("locale"), locale);
-    assert_eq!(scheduled("encoding"), erl_term(&[], "utf8"));
-    let badarg = erl_term(
-        &[],
-        "begin ok = prim_tty:load(), try prim_tty:isatty(other) catch error:Reason -> {error, Reason} end end",
-    );
+    assert_eq!(scheduled("encoding"), encoding);
     let OwnedTerm::Tuple(ref bad) = scheduled("bad") else {
         panic!("bad");
     };
     assert!(bad.iter().all(|term| term == &badarg));
-    let reference = RefErl::start().expect("erl");
-    let open_bad = reference.call(
-        "prim_tty",
-        "tty_is_open",
-        &[OwnedTerm::atom("x"), OwnedTerm::atom("stdin")],
-    );
-    drop(reference);
     let arinsal_difftest::CallResult::Exception { class, reason, .. } = open_bad else {
         panic!("erl tty_is_open should fail: {open_bad:?}");
     };

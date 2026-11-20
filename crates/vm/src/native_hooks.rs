@@ -1,11 +1,17 @@
 //! Runtime callbacks used by BeamAsm slow paths.
 
 use crate::{Process, VmError};
-use arinsal_arith::{ArithError, ArithResult};
+use arinsal_arith::ArithError;
+#[cfg(target_arch = "aarch64")]
+use arinsal_arith::ArithResult;
 use arinsal_beamasm::{ProcessHeader, SchedulerRegisters};
+#[cfg(target_arch = "aarch64")]
 use arinsal_bifs::BifError;
+#[cfg(target_arch = "aarch64")]
 use arinsal_maps::MapError;
-use arinsal_term::{Term, TermBuilder, TermKind, cmp, cmp_exact};
+use arinsal_term::{Term, cmp, cmp_exact};
+#[cfg(target_arch = "aarch64")]
+use arinsal_term::{TermBuilder, TermKind};
 #[cfg(target_arch = "aarch64")]
 use arinsal_term::{exact_eq, loose_eq};
 use num_traits::ToPrimitive;
@@ -15,6 +21,7 @@ use std::cmp::Ordering;
 ///
 /// # Safety
 /// The pointers must be the active process header and scheduler registers.
+#[cfg(target_arch = "aarch64")]
 pub extern "C" fn arinsal_beamasm_map_lookup(
     header: *mut ProcessHeader,
     _reg: *mut u64,
@@ -44,6 +51,7 @@ pub extern "C" fn arinsal_beamasm_map_lookup(
 ///
 /// # Safety
 /// `header` must be the active process header with its live scheduler registers.
+#[cfg(target_arch = "aarch64")]
 pub extern "C" fn arinsal_beamasm_guard3(
     header: *mut ProcessHeader,
     _op: u32,
@@ -59,6 +67,7 @@ pub extern "C" fn arinsal_beamasm_guard3(
 ///
 /// # Safety
 /// The pointers must refer to the active process header and scheduler registers.
+#[cfg(target_arch = "aarch64")]
 pub extern "C" fn arinsal_beamasm_bif_mfa(
     header: *mut ProcessHeader,
     _reg: *mut u64,
@@ -286,6 +295,7 @@ pub(crate) fn fun_view(term: Term) -> Option<arinsal_term::FunRef<'static>> {
 }
 
 // Port of erts/emulator/beam/erl_arith.c:358-405 (erts_mixed_plus), OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 fn with_fragment_alloc(
     process: &mut Process,
     lhs: Term,
@@ -518,6 +528,7 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
 
 /// The erlang BIF behind a generic arithmetic helper op.
 // Port of erts/emulator/beam/jit/arm/instr_arith.cpp, OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 fn arith_bif(op: u32) -> Option<(arinsal_term::Atom, u8)> {
     Some(match op {
         0 => (arinsal_term::atoms::PLUS, 2),
@@ -541,6 +552,7 @@ fn arith_bif(op: u32) -> Option<(arinsal_term::Atom, u8)> {
 
 /// `beam_jit_int128_to_big`: a signed 128-bit magnitude becomes a small or a bignum.
 // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1025-1040, OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 fn int128_to_big(process: &mut Process, low: u64, high: u64, sign: u64) -> u64 {
     let mut magnitude = num_bigint::BigInt::from((u128::from(high) << 64) | u128::from(low));
     if sign != 0 {
@@ -557,6 +569,7 @@ fn int128_to_big(process: &mut Process, low: u64, high: u64, sign: u64) -> u64 {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 fn float_value(term: Term) -> Option<f64> {
     // SAFETY: The float header identifies a live boxed float in this process.
     (term.classify() == TermKind::Number)
@@ -735,9 +748,11 @@ pub unsafe extern "C" fn arinsal_beamasm_guard(
 }
 
 /// Guard helper op flag: the instruction has a failure label.
+#[cfg(target_arch = "aarch64")]
 pub const QUIET_GUARD: u32 = 0x100;
 
 /// Sets the exception for a BIF error without recording a BIF frame.
+#[cfg(target_arch = "aarch64")]
 fn set_light_error(process: &mut Process, error: &BifError) {
     match error {
         BifError::Error(reason) => {
@@ -751,6 +766,7 @@ fn set_light_error(process: &mut Process, error: &BifError) {
 }
 
 /// Builds `error:{Tag, Value}` for a guard BIF failure.
+#[cfg(target_arch = "aarch64")]
 fn tagged_error(process: &mut Process, tag: &str, value: Term) -> BifError {
     let tag = crate::atom_cache::put(tag);
     match TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
@@ -761,11 +777,13 @@ fn tagged_error(process: &mut Process, tag: &str, value: Term) -> BifError {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 fn tuple_size(term: Term) -> Option<usize> {
     // SAFETY: tuple_ref validates the tagged term before exposing its header.
     unsafe { term.tuple_ref() }.map(|tuple| tuple.len())
 }
 
+#[cfg(target_arch = "aarch64")]
 fn binary_size(term: Term, bits: bool) -> Option<usize> {
     // SAFETY: binary_ref validates the tagged term before exposing its bitstring.
     let length = unsafe { term.binary_ref() }?.bit_len();
@@ -778,6 +796,7 @@ fn binary_size(term: Term, bits: bool) -> Option<usize> {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 fn list_length(mut list: Term) -> Option<usize> {
     let mut length = 0_usize;
     loop {
@@ -814,6 +833,7 @@ pub(crate) fn collect_native(
 /// # Safety
 /// `header` and `registers` must be the active process and scheduler register
 /// pointers supplied by generated BeamAsm code.
+#[cfg(target_arch = "aarch64")]
 pub unsafe extern "C" fn arinsal_beamasm_gc(
     header: *mut ProcessHeader,
     reg: *mut u64,

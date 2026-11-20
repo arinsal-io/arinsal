@@ -10,6 +10,7 @@ mod fun_dispatch;
 // c_boot: Launcher entry point for the preloaded OTP boot process.
 mod beam_common;
 mod beam_load;
+mod bif;
 mod bif_dispatch;
 mod bif_table;
 pub mod boot;
@@ -24,7 +25,9 @@ mod difftest;
 mod dirty;
 mod dist;
 mod erl_arith;
+mod erl_bif_info;
 mod erl_bits;
+mod erl_fun;
 mod erl_gc;
 mod erl_init;
 mod erl_map;
@@ -52,9 +55,10 @@ pub use child_setup::run_child_setup;
 #[doc(hidden)]
 pub use child_setup::run_child_setup_exec;
 pub use process::{
-    ERTS_MESSAGE_TERM_OFFSET, PROCESS_FLAGS_OFFSET, PROCESS_MBUF_OFFSET, PROCESS_MBUF_SZ_OFFSET,
-    PROCESS_SIGQ_CONT_OFFSET, PROCESS_SIGQ_FIRST_OFFSET, PROCESS_SIGQ_LAST_OFFSET,
-    PROCESS_SIGQ_MQ_LEN_OFFSET, PROCESS_SIGQ_SAVE_OFFSET, PROCESS_STATE_OFFSET, ScheduledResult,
+    ERTS_MESSAGE_TERM_OFFSET, EntryProcess, PROCESS_FLAGS_OFFSET, PROCESS_MBUF_OFFSET,
+    PROCESS_MBUF_SZ_OFFSET, PROCESS_SIGQ_CONT_OFFSET, PROCESS_SIGQ_FIRST_OFFSET,
+    PROCESS_SIGQ_LAST_OFFSET, PROCESS_SIGQ_MQ_LEN_OFFSET, PROCESS_SIGQ_SAVE_OFFSET,
+    PROCESS_STATE_OFFSET, ScheduledResult,
 };
 mod inet_drv;
 // g_inet_udp

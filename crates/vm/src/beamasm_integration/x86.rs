@@ -277,6 +277,16 @@ pub(crate) fn owns_native_address(address: usize) -> bool {
     })
 }
 
+/// Resolve an active native code address to its function metadata.
+// Port of erts/emulator/beam/beam_ranges.c (`erts_find_function_from_pc`), OTP-29.1.1.
+pub(crate) fn native_function_for_pc(address: usize) -> Option<crate::NativeFunction> {
+    let versions = compiled_versions().read().ok()?;
+    versions
+        .iter()
+        .filter_map(Weak::upgrade)
+        .find_map(|version| version.native_function_for_pc(address).cloned())
+}
+
 fn versions_of(module: &str) -> Vec<Arc<CompiledVersion>> {
     compiled_versions()
         .read()

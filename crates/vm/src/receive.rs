@@ -265,22 +265,35 @@ fn contains_reference(term: &arinsal_etf::OwnedTerm, reference: u64) -> bool {
 
 impl Process {
     fn take_markers(&mut self) -> Markers {
-        match self.cold.as_mut() {
-            Some(cold) => Markers {
-                blk: cold.receive_markers.take(),
-                pq: cold.prio_q.take(),
-            },
-            None => Markers::default(),
-        }
+        let blk = self
+            .cold
+            .as_mut()
+            .and_then(|cold| cold.receive_markers.take());
+        let pq = crate::proc_create::raw::erts_psd_set::<PrioQInfo>(
+            &mut self.psd,
+            crate::proc_create::raw::ERTS_PSD_PRIO_Q_INFO,
+            None,
+        );
+        Markers { blk, pq }
     }
 
     fn put_markers(&mut self, markers: Markers) {
-        if markers.blk.is_none() && markers.pq.is_none() && self.cold.is_none() {
-            return;
+        if markers.blk.is_some() || self.cold.is_some() {
+            self.cold_mut().receive_markers = markers.blk;
         }
-        let cold = self.cold_mut();
-        cold.receive_markers = markers.blk;
-        cold.prio_q = markers.pq;
+        if markers.pq.is_some()
+            || crate::proc_create::raw::erts_psd_get::<PrioQInfo>(
+                &self.psd,
+                crate::proc_create::raw::ERTS_PSD_PRIO_Q_INFO,
+            )
+            .is_some()
+        {
+            crate::proc_create::raw::erts_psd_set(
+                &mut self.psd,
+                crate::proc_create::raw::ERTS_PSD_PRIO_Q_INFO,
+                markers.pq,
+            );
+        }
     }
 
     /// Run `f` with the marker structures taken out of the process; what `f` leaves goes back.
@@ -586,15 +599,19 @@ impl Process {
         if self.inbox.flags & FS_PRIO_MQ == 0 {
             self.inbox.flags |= FS_PRIO_MQ;
             if self.inbox.flags & FS_PRIO_MQ_END_MARK == 0 {
-                let previous = self.cold_mut().prio_q.replace(PrioQInfo::new());
+                let previous = crate::proc_create::raw::erts_psd_set(
+                    &mut self.psd,
+                    crate::proc_create::raw::ERTS_PSD_PRIO_Q_INFO,
+                    Some(Box::new(PrioQInfo::new())),
+                );
                 debug_assert!(previous.is_none());
             }
         }
-        let pq = self
-            .cold
-            .as_mut()
-            .and_then(|cold| cold.prio_q.as_mut())
-            .expect("prio queue info");
+        let pq = crate::proc_create::raw::erts_psd_get_mut::<PrioQInfo>(
+            &mut self.psd,
+            crate::proc_create::raw::ERTS_PSD_PRIO_Q_INFO,
+        )
+        .expect("prio queue info");
         pq.refc += 1;
         #[cfg(debug_assertions)]
         {
@@ -611,11 +628,11 @@ impl Process {
     // OTP-29.1.1.
     pub(crate) fn prio_item_deleted(&mut self, item: PrioItemType) {
         debug_assert!(self.inbox.flags & FS_PRIO_MQ != 0);
-        let pq = self
-            .cold
-            .as_mut()
-            .and_then(|cold| cold.prio_q.as_mut())
-            .expect("prio queue info");
+        let pq = crate::proc_create::raw::erts_psd_get_mut::<PrioQInfo>(
+            &mut self.psd,
+            crate::proc_create::raw::ERTS_PSD_PRIO_Q_INFO,
+        )
+        .expect("prio queue info");
         pq.refc -= 1;
         #[cfg(debug_assertions)]
         {
@@ -967,7 +984,12 @@ impl Process {
             || self
                 .cold
                 .as_ref()
-                .is_some_and(|cold| cold.receive_markers.is_some() || !cold.call_memory.is_empty())
+                .is_some_and(|cold| cold.receive_markers.is_some())
+            || crate::proc_create::raw::erts_psd_get::<Vec<crate::trace_bp::ProcBpTrace>>(
+                &self.psd,
+                crate::proc_create::raw::ERTS_PSD_CALL_MEMORY_BP,
+            )
+            .is_some_and(|entries| !entries.is_empty())
             || !self
                 .inbox
                 .pop_front_untokened(&mut self.heap, self.seq_trace_token.is_some())?
@@ -995,12 +1017,13 @@ impl Process {
         // Port of erts/emulator/beam/erl_message.c:975 (erts_save_message_in_proc,
         // erts_adjust_message_break), OTP-29.1.1: a message that was copied onto the heap is
         // counted by call_memory when it is received.
-        let on_heap_words = if self
-            .cold
-            .as_ref()
-            .is_some_and(|cold| !cold.call_memory.is_empty())
-            && self.inbox.is_on_heap_at_save()
-        {
+        let call_memory_active = crate::proc_create::raw::erts_psd_get::<
+            Vec<crate::trace_bp::ProcBpTrace>,
+        >(
+            &self.psd, crate::proc_create::raw::ERTS_PSD_CALL_MEMORY_BP
+        )
+        .is_some_and(|entries| !entries.is_empty());
+        let on_heap_words = if call_memory_active && self.inbox.is_on_heap_at_save() {
             self.inbox
                 .peek()
                 .map_or(0, |term| arinsal_term::size_object(*term))
@@ -1246,9 +1269,12 @@ pub extern "C" fn erts_proc_sig_receive_helper(
             0,
         ),
         Ok((consumed, crate::process::ReceiveHelper::Wait)) => (consumed, 0, 0),
-        Ok((consumed, crate::process::ReceiveHelper::Yield)) => (consumed, 0, 1),
-        // A handled signal ends the process (erts: ERTS_PSFLG_EXITING, `*get_outp = 1`): it
-        // schedules out and the scheduler completes the exit.
+        // erl_proc_sig_queue.c:7843 / :7864: `*get_outp` is 1 for an exiting process and -1
+        // for a yield.
+        Ok((consumed, crate::process::ReceiveHelper::Yield)) => (consumed, 0, -1),
+        Ok((consumed, crate::process::ReceiveHelper::Exiting)) => (consumed, 0, 1),
+        // A signal-handling failure that is not an exit (an exit makes the process exiting
+        // and returns `Exiting`): it schedules out and the scheduler ends the process.
         Err(error) => {
             process.native_exit_kind = crate::proc_create::NativeExit::Exiting;
             process.cold_mut().native_exiting = Some(Box::new(error));

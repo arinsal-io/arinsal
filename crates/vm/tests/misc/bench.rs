@@ -26,8 +26,9 @@ fn benchmark_kernels_match_otp_small_cases() {
         "{}",
         String::from_utf8_lossy(&compiled.stderr)
     );
-    let mut vm = crate::common::node_with_dir(&dir);
-    for (function, n) in [("fib", 20), ("trees", 12), ("nbody", 100), ("idle", 0)] {
+    // The reference runs first: the booted node ignores SIGCHLD for its OS process, as erts'
+    // erts_sys_unix_later_init does, so the test process cannot wait for children after it.
+    let cases = [("fib", 20), ("trees", 12), ("nbody", 100), ("idle", 0)].map(|(function, n)| {
         let expression = format!("io:format(\"~p\", [bench:{function}({n})]), halt().");
         let otp = Command::new("erl")
             .args(["-noshell", "-pa"])
@@ -40,7 +41,10 @@ fn benchmark_kernels_match_otp_small_cases() {
             "{}",
             String::from_utf8_lossy(&otp.stderr)
         );
-        let expected = String::from_utf8(otp.stdout).unwrap();
+        (function, n, String::from_utf8(otp.stdout).unwrap())
+    });
+    let mut vm = crate::common::node_with_dir(&dir);
+    for (function, n, expected) in cases {
         let result = vm
             .eval_exported("bench", function, &[Term::small(n).unwrap()])
             .unwrap();
@@ -78,7 +82,8 @@ fn select_tables_match_otp() {
         "{}",
         String::from_utf8_lossy(&compiled.stderr)
     );
-    let mut vm = crate::common::node_with_dir(&dir);
+    // The reference runs before the node boots: the node ignores SIGCHLD (erts sys.c).
+    let mut cases = Vec::new();
     for (function, values) in [
         ("dense", vec![-1, 0, 1, 2, 3, 4, 5]),
         ("sparse", vec![-100, -1, 0, 100, 1000, 10000]),
@@ -92,15 +97,15 @@ fn select_tables_match_otp() {
                 .output()
                 .unwrap();
             assert!(otp.status.success());
-            let actual = vm
-                .eval_exported("select_fast", function, &[Term::small(n).unwrap()])
-                .unwrap();
-            assert_eq!(
-                actual.term.to_string(),
-                String::from_utf8(otp.stdout).unwrap(),
-                "{function}({n})"
-            );
+            cases.push((function, n, String::from_utf8(otp.stdout).unwrap()));
         }
+    }
+    let mut vm = crate::common::node_with_dir(&dir);
+    for (function, n, expected) in cases {
+        let actual = vm
+            .eval_exported("select_fast", function, &[Term::small(n).unwrap()])
+            .unwrap();
+        assert_eq!(actual.term.to_string(), expected, "{function}({n})");
     }
     let _ = std::fs::remove_dir_all(dir);
 }

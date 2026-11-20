@@ -271,6 +271,21 @@ impl Vm {
         workers: usize,
         reductions: u32,
     ) -> Result<ScheduledResult, VmError> {
+        self.spawn_entry(module, function, args, workers, reductions)?
+            .wait()
+    }
+
+    /// Spawns `module:function(args)` as an entry process and returns without waiting for it:
+    /// [`EntryProcess::wait`] receives its result. The node's first call starts the runtime
+    /// tables, the schedulers and the system processes (erl_init.c, erl_start).
+    pub(crate) fn spawn_entry(
+        &mut self,
+        module: &str,
+        function: &str,
+        args: &[Term],
+        workers: usize,
+        reductions: u32,
+    ) -> Result<EntryProcess, VmError> {
         // A booted node gets these from erl_features:init_features/0 during the
         // boot, exactly like erts; seeding them earlier would also give the
         // feature atoms indices erts does not give them.
@@ -355,7 +370,7 @@ impl Vm {
         });
         *runtime.result.lock().unwrap() = sender;
         let first_runtime = runtime.scheduler.get().is_none();
-        (|| -> Result<ScheduledResult, VmError> {
+        (|| -> Result<EntryProcess, VmError> {
             if first_runtime {
                 let (dirty_cpu_schedulers, dirty_cpu_online, dirty_io_schedulers) =
                     crate::natives::sys::dirty_scheduler_defaults(runtime);
@@ -500,14 +515,26 @@ impl Vm {
             scheduler
                 .schedule_unscheduled(entry_pid)
                 .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
-            let result = receiver
-                .recv()
-                .map_err(|_| VmError::Unsupported("entry process disappeared".into()))?;
-            while arinsal_pterm::global_store().has_retired() {
-                std::thread::park_timeout(std::time::Duration::from_millis(1));
-            }
-            result
+            Ok(EntryProcess(receiver))
         })()
+    }
+}
+
+/// A running entry process: the first process of a node (erl_init.c, erl_first_process_otp)
+/// or one evaluation of [`Vm::eval_scheduled`].
+pub struct EntryProcess(mpsc::Receiver<Result<ScheduledResult, VmError>>);
+
+impl EntryProcess {
+    /// Blocks until the entry process exits and returns its result.
+    pub fn wait(self) -> Result<ScheduledResult, VmError> {
+        let result = self
+            .0
+            .recv()
+            .map_err(|_| VmError::Unsupported("entry process disappeared".into()))?;
+        while arinsal_pterm::global_store().has_retired() {
+            std::thread::park_timeout(std::time::Duration::from_millis(1));
+        }
+        result
     }
 }
 

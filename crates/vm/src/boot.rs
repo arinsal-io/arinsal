@@ -1,6 +1,6 @@
 //! OTP startup through the first process used by ERTS.
 
-use crate::{ScheduledResult, Vm, VmError};
+use crate::{EntryProcess, ScheduledResult, Vm, VmError};
 use arinsal_term::{Term, TermBuilder, VecHeap, global_atoms};
 use std::path::{Path, PathBuf};
 
@@ -29,6 +29,33 @@ pub fn run_with_debugger_flags(
     line_breakpoints: bool,
     distribution_buffer_busy_limit_kb: Option<u64>,
 ) -> Result<ScheduledResult, VmError> {
+    let (_vm, first) = erl_start(
+        root,
+        boot_args,
+        extra_paths,
+        workers,
+        debugger_support,
+        line_breakpoints,
+        distribution_buffer_busy_limit_kb,
+    )?;
+    first.wait()
+}
+
+/// Starts the node and returns once its first process runs: the runtime initialisation, the
+/// preloaded modules and `erl_init:start(init, BootArgs)` as the first process, which boots
+/// OTP (`init:boot/1`). The returned `Vm` evaluates in the running node; the [`EntryProcess`]
+/// ends when `init` does.
+// Port of erts/emulator/beam/erl_init.c (erl_start: erl_init, load_preloaded,
+// erl_first_process_otp), OTP-29.1.1.
+pub fn erl_start(
+    root: &Path,
+    boot_args: &[String],
+    extra_paths: &[PathBuf],
+    workers: usize,
+    debugger_support: bool,
+    line_breakpoints: bool,
+    distribution_buffer_busy_limit_kb: Option<u64>,
+) -> Result<(Vm, EntryProcess), VmError> {
     // Port of erts/emulator/sys/common/erl_sys_common_misc.c (erts_init_sys_common_misc):
     // the locale is read once at boot and decides the native file name encoding.
     crate::natives::erl_unicode::set_locale_utf8(arinsal_nif_tty::locale_is_utf8());
@@ -137,14 +164,27 @@ pub fn run_with_debugger_flags(
                 .list_from_iter(args)
                 .map_err(|e| VmError::Load(format!("cannot construct boot arguments: {e:?}")))?
         };
-    let init = global_atoms()
-        .intern("init")
-        .map_err(|error| VmError::Load(format!("cannot intern init atom: {error:?}")))?;
-    vm.eval_scheduled(
+    let first = erl_first_process_otp(&mut vm, "init", boot_list, workers)?;
+    Ok((vm, first))
+}
+
+/// Spawns `erl_init:start(Modname, Argv)` as the node's first process.
+// Port of erts/emulator/beam/erl_init.c (erl_first_process_otp), OTP-29.1.1.
+fn erl_first_process_otp(
+    vm: &mut Vm,
+    modname: &str,
+    argv: Term,
+    workers: usize,
+) -> Result<EntryProcess, VmError> {
+    let modname = global_atoms()
+        .intern(modname)
+        .map_err(|error| VmError::Load(format!("cannot intern {modname}: {error:?}")))?;
+    vm.spawn_entry(
         "erl_init",
         "start",
-        &[Term::atom(init), boot_list],
+        &[Term::atom(modname), argv],
         workers.max(1),
+        4_000,
     )
 }
 

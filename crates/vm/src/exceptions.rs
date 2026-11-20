@@ -120,17 +120,6 @@ impl Trap {
             untrappable: false,
         }
     }
-    pub(super) fn exit(reason: Term) -> Self {
-        Self {
-            class: Class::Exit,
-            reason,
-            trace: None,
-            top: None,
-            raw_rethrow: false,
-            untrappable: false,
-        }
-    }
-
     /// An `exit/2` self-signal that erts handles before returning to BEAM code.
     pub(super) fn untrappable_exit(reason: Term) -> Self {
         Self {

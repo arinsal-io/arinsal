@@ -632,23 +632,29 @@ pub(crate) struct SavedCalls {
 /// Whether `process` has a `save_calls` buffer (`ERTS_PROC_GET_SAVED_CALLS_BUF`).
 #[inline(always)]
 pub(crate) fn saves_calls(process: &Process) -> bool {
-    process
-        .cold
-        .as_ref()
-        .is_some_and(|cold| cold.saved_calls.is_some())
+    crate::proc_create::raw::erts_psd_get::<SavedCalls>(
+        &process.psd,
+        crate::proc_create::raw::ERTS_PSD_SAVED_CALLS_BUF,
+    )
+    .is_some()
 }
 
 /// Replaces the `save_calls` buffer of `process` and returns the old length.
 // Port of erts/emulator/beam/bif.c:1907-1950 (process_flag save_calls), OTP-29.1.1.
 pub(crate) fn set_save_calls(process: &mut Process, len: usize) -> usize {
-    let new = (len != 0).then(|| SavedCalls {
-        len,
-        cur: 0,
-        n: 0,
-        ct: vec![None; len],
+    let new = (len != 0).then(|| {
+        Box::new(SavedCalls {
+            len,
+            cur: 0,
+            n: 0,
+            ct: vec![None; len],
+        })
     });
-    let cold = process.cold_mut();
-    let old = std::mem::replace(&mut cold.saved_calls, new);
+    let old = crate::proc_create::raw::erts_psd_set(
+        &mut process.psd,
+        crate::proc_create::raw::ERTS_PSD_SAVED_CALLS_BUF,
+        new,
+    );
     let was = old.as_ref().map_or(0, |scb| scb.len);
     if (was != 0) != (len != 0) {
         // Port of erts/emulator/beam/bif.h:99-104 (`ERTS_VBUMP_ALL_REDS`), OTP-29.1.1.
@@ -661,9 +667,11 @@ pub(crate) fn set_save_calls(process: &mut Process, len: usize) -> usize {
 
 /// Drops the buffer of an exiting process.
 pub(crate) fn clear_save_calls(process: &mut Process) {
-    if let Some(cold) = process.cold.as_mut() {
-        cold.saved_calls = None;
-    }
+    crate::proc_create::raw::erts_psd_set::<SavedCalls>(
+        &mut process.psd,
+        crate::proc_create::raw::ERTS_PSD_SAVED_CALLS_BUF,
+        None,
+    );
 }
 
 /// Records a call in the buffer of `process`, unless it is sensitive.
@@ -675,11 +683,10 @@ pub(crate) fn save_call(process: &mut Process, call: SavedCall) {
     {
         return;
     }
-    let Some(scb) = process
-        .cold
-        .as_mut()
-        .and_then(|cold| cold.saved_calls.as_mut())
-    else {
+    let Some(scb) = crate::proc_create::raw::erts_psd_get_mut::<SavedCalls>(
+        &mut process.psd,
+        crate::proc_create::raw::ERTS_PSD_SAVED_CALLS_BUF,
+    ) else {
         return;
     };
     scb.ct[scb.cur] = Some(call);
@@ -716,7 +723,10 @@ pub(crate) fn saved_export_mfa(
 
 /// Saved calls, newest first.
 pub(crate) fn saved_calls(process: &Process) -> Option<Vec<SavedCall>> {
-    let scb = process.cold.as_ref()?.saved_calls.as_ref()?;
+    let scb = crate::proc_create::raw::erts_psd_get::<SavedCalls>(
+        &process.psd,
+        crate::proc_create::raw::ERTS_PSD_SAVED_CALLS_BUF,
+    )?;
     Some(
         (0..scb.n)
             .filter_map(|i| {
@@ -3685,10 +3695,7 @@ pub(crate) fn timeout_event(
 #[inline(always)]
 pub(crate) fn send_hooks_idle(process: &Process) -> bool {
     process.seq_trace_token.is_none()
-        && process
-            .cold
-            .as_deref()
-            .is_none_or(|cold| cold.saved_calls.is_none())
+        && !saves_calls(process)
         && process.signal_probe().is_some_and(|probe| {
             probe.proc_flags().load(Ordering::Relaxed) & arinsal_sched::proc_flags::TRACE == 0
         })
@@ -4377,10 +4384,13 @@ fn emit_module(
     owned_state: &OwnedTerm,
     event: TraceEvent<'_>,
 ) {
-    let scheduler_id = ctx
-        .as_ref()
-        .and_then(|ctx| ctx.scheduler_id())
-        .or_else(|| (process.scheduler_id != 0).then_some(process.scheduler_id as usize));
+    let scheduler_id = ctx.as_ref().and_then(|ctx| ctx.scheduler_id()).or_else(|| {
+        let scheduler_id = crate::proc_create::raw::erts_psd_get_word(
+            &process.psd,
+            crate::proc_create::raw::ERTS_PSD_SCHED_ID,
+        );
+        (scheduler_id != 0).then_some(scheduler_id)
+    });
     if let Some(ctx) = ctx {
         crate::natives::nif::refresh_hub(process, ctx);
     }

@@ -135,14 +135,24 @@ impl Process {
     // Port of erts/emulator/beam/erl_process.c:11823-11935 (erts_set_gc_state), OTP-29.1.1.
     pub(crate) fn erts_set_gc_state_enable(&mut self) -> bool {
         self.heap.set_gc_enabled(true);
-        let Some(cold) = self.cold.as_mut() else {
+        let Some(delayed) =
+            crate::proc_create::raw::erts_psd_get_mut::<crate::signals::SysTaskQueues>(
+                &mut self.psd,
+                crate::proc_create::raw::ERTS_PSD_DELAYED_GC_TASK_QS,
+            )
+        else {
             return false;
         };
-        if cold.delayed_gc_tasks.is_empty() {
+        if delayed.is_empty() {
             return false;
         }
-        let delayed = std::mem::take(&mut cold.delayed_gc_tasks);
-        cold.sys_tasks.push_delayed_front(delayed);
+        let delayed = std::mem::take(delayed);
+        crate::proc_create::raw::erts_psd_set::<crate::signals::SysTaskQueues>(
+            &mut self.psd,
+            crate::proc_create::raw::ERTS_PSD_DELAYED_GC_TASK_QS,
+            None,
+        );
+        self.cold_mut().sys_tasks.push_delayed_front(delayed);
         self.slice_mut().sys_tasks_deferred = true;
         true
     }
@@ -297,10 +307,12 @@ impl Process {
         }
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:1332 (erts_proc_sig_fetch__): the outer
         // queue, messages only, is spliced onto the message queue as a whole.
-        let traced_words = self
-            .cold
-            .as_ref()
-            .is_some_and(|cold| !cold.call_memory.is_empty());
+        let traced_words =
+            crate::proc_create::raw::erts_psd_get::<Vec<crate::trace_bp::ProcBpTrace>>(
+                &self.psd,
+                crate::proc_create::raw::ERTS_PSD_CALL_MEMORY_BP,
+            )
+            .is_some_and(|entries| !entries.is_empty());
         if !traced_words {
             let Some(fetched) = self.probe_fetch_messages_into_inbox() else {
                 return Ok(0);
@@ -355,18 +367,21 @@ impl Process {
     }
 
     pub(super) fn message_words_before(&self) -> Option<i64> {
-        self.cold
-            .as_ref()
-            .is_some_and(|cold| !cold.call_memory.is_empty())
-            .then(|| self.allocated_words(0))
+        crate::proc_create::raw::erts_psd_get::<Vec<crate::trace_bp::ProcBpTrace>>(
+            &self.psd,
+            crate::proc_create::raw::ERTS_PSD_CALL_MEMORY_BP,
+        )
+        .is_some_and(|entries| !entries.is_empty())
+        .then(|| self.allocated_words(0))
     }
 
     pub(super) fn uncount_message_words(&mut self, allocated_before: Option<i64>) {
         if let Some(allocated_before) = allocated_before
-            && self
-                .cold
-                .as_ref()
-                .is_some_and(|cold| !cold.call_memory.is_empty())
+            && crate::proc_create::raw::erts_psd_get::<Vec<crate::trace_bp::ProcBpTrace>>(
+                &self.psd,
+                crate::proc_create::raw::ERTS_PSD_CALL_MEMORY_BP,
+            )
+            .is_some_and(|entries| !entries.is_empty())
         {
             let delta = self.allocated_words(0) - allocated_before;
             if delta > 0 {

@@ -67,7 +67,11 @@ impl Task for Process {
     fn trace_schedule_in(c_p: &mut CP<'_>, esdp: &ErtsSchedulerData) {
         esdp.with_ctx(c_p, |process, ctx| {
             // `p->scheduler_data = esdp` precedes the trace (erl_process.c:10232).
-            process.scheduler_id = ctx.scheduler_id().map_or(0, |id| id as u32);
+            crate::proc_create::raw::erts_psd_set_word(
+                &mut process.psd,
+                crate::proc_create::raw::ERTS_PSD_SCHED_ID,
+                ctx.scheduler_id().unwrap_or(0),
+            );
             let exiting = process.has_exit_cont();
             if process.runtime.is_none() {
                 return;
@@ -178,6 +182,35 @@ impl Task for Process {
                     - std::ptr::from_mut(process.native_header()).addr(),
                 crate::process::PROCESS_STATE_OFFSET
             );
+            let exec_key = ctx.scheduler_key();
+            let cached =
+                exec_key != 0 && process.exec_key == exec_key && process.self_pid.is_some();
+            if !cached {
+                process.heap.abi.self_pid = ctx.pid().to_term().expect("valid pid").tagged_word();
+                process.self_pid = Some(ctx.pid());
+            }
+            // Port of erts/emulator/beam/erl_process.c:10180 (erts_schedule:
+            // `esdp->current_process = p`), OTP-29.1.1: the NIF hub of this scheduler reads it.
+            let data = arinsal_sched::erts_sched_registers(esdp);
+            if data.hub_bound.get() {
+                data.current_process
+                    .store(ctx.pid().data(), Ordering::Relaxed);
+            } else {
+                data.hub_bound.set(crate::natives::nif::bind_scheduler_hub(
+                    process,
+                    &data.current_process,
+                ));
+            }
+            // Port of erts/emulator/beam/erl_process.c:10232 (`p->scheduler_data = esdp`; the
+            // scheduler number process_info reports is `esdp->no`), OTP-29.1.1.
+            if !cached {
+                crate::proc_create::raw::erts_psd_set_word(
+                    &mut process.psd,
+                    crate::proc_create::raw::ERTS_PSD_SCHED_ID,
+                    ctx.scheduler_id().unwrap_or(0),
+                );
+                process.exec_key = exec_key;
+            }
             // Port of erts/emulator/beam/erl_trace.c:704-716 (trace_sched), OTP-29.1.1.
             if crate::trace::running_procs_enabled() {
                 crate::trace::emit_process(
@@ -211,7 +244,6 @@ impl Task for Process {
             // Port of erts/emulator/beam/erl_alloc.c (erts_alloc passes `esdp->no` to the
             // thread-specific allocators), OTP-29.1.1: the process heap allocates on this scheduler's
             // instance without looking the thread up, while it is scheduled in.
-            let data = arinsal_sched::erts_sched_registers(esdp);
             let alloc_ix = data.alloc_ix.get().unwrap_or_else(|| {
                 let ix = arinsal_alloc::thread_alloc_ix();
                 data.alloc_ix.set(Some(ix));
@@ -488,7 +520,6 @@ impl Process {
             && !self.slice().is_some_and(|work| work.profile_active)
         {
             crate::natives::misc::profile_process_event(self, ctx, true);
-            self.cold_mut().scheduler_id = self.scheduler_id as usize;
             self.slice_mut().profile_active = true;
         }
         if self.dirty_exiting() {

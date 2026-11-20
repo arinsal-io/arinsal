@@ -529,9 +529,12 @@ fn read_allowed(table: &arinsal_ets::Table, pid: arinsal_sched::Pid, super_user:
 /// The reader group of the calling scheduler: `erts_get_scheduler_id() - 1`.
 #[inline]
 fn reader_group(process: &Process) -> usize {
-    match process.scheduler_id {
+    match crate::proc_create::raw::erts_psd_get_word(
+        &process.psd,
+        crate::proc_create::raw::ERTS_PSD_SCHED_ID,
+    ) {
         0 => arinsal_term::current_reader_group(),
-        id => id as usize - 1,
+        id => id - 1,
     }
 }
 

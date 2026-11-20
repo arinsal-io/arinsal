@@ -78,6 +78,7 @@ impl DispatchTarget {
     /// `Export.is_bif_traced`: the one decision whether a BIF call enters the export's
     /// breakpoint.
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:391 (call_light_bif_shared), OTP-29.1.1.
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn is_bif_traced(&self) -> bool {
         self.slot
             .is_bif_traced
@@ -99,6 +100,7 @@ impl DispatchTarget {
     /// of its own, or the plain adapter of its `arinsal_bifs` body. Not an entry that parks the
     /// call in the executor.
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-151 (`bif->f`), OTP-29.1.1.
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn bif_table_runs_bif(&self) -> bool {
         crate::bif_table::is_body(self.bif_table_function())
     }

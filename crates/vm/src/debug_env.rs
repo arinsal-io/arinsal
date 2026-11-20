@@ -4,6 +4,7 @@
 //! variable. erts reads its debug switches at emulator startup; these helpers
 //! do the same so send, receive, and load paths do not call `getenv` per use.
 
+#[cfg(target_arch = "aarch64")]
 use std::ffi::{OsStr, OsString};
 use std::sync::OnceLock;
 
@@ -25,6 +26,7 @@ pub(crate) fn difftest_unscheduled() -> bool {
 }
 
 /// `ARINSAL_BEAMASM_DUMP`: directory for native assembly dumps.
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn beamasm_dump() -> Option<&'static OsStr> {
     static VALUE: OnceLock<Option<OsString>> = OnceLock::new();
     VALUE
@@ -34,6 +36,7 @@ pub(crate) fn beamasm_dump() -> Option<&'static OsStr> {
 
 /// `ARINSAL_BEAMASM_STATS=1`: print native-call counters when a VM drops.
 #[inline]
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn beamasm_stats() -> bool {
     slice::get() & slice::BEAMASM_STATS != 0
 }

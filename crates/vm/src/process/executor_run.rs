@@ -1,6 +1,38 @@
 use super::executor_after_native::context_switch;
 use super::*;
 
+/// `beam_exit_`: the one instruction `beam_exit` points to while arm runs this Rust
+/// process_main; its address only identifies `error_action_code`.
+// Port of erts/emulator/beam/emu/beam_emu.c (`static BeamInstr beam_exit_[1]`, set to
+// `OpCode(error_action_code)`, `beam_exit = &beam_exit_[0]`), OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
+static BEAM_EXIT_: u64 = 0;
+
+/// The address of [`BEAM_EXIT_`], published as `beam_exit` by the arm `beamasm_init`.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn beam_exit_address() -> usize {
+    std::ptr::addr_of!(BEAM_EXIT_) as usize
+}
+
+/// Whether the process continues at `beam_exit` (`c_p->i == beam_exit`): an exit signal made
+/// it exiting.
+pub(super) fn at_beam_exit(process: &Process) -> bool {
+    process.heap.abi.i as usize == crate::beam_jit_main::beam_exit()
+}
+
+/// `error_action_code`, the instruction at `beam_exit`: `handle_error(c_p, NULL, reg, NULL)`
+/// finds no catch (erts_set_self_exiting killed them), so the process terminates with
+/// `c_p->fvalue` (terminate_proc; an EXTAG_EXIT is not logged) through the scheduler's
+/// handle_error result.
+// Port of erts/emulator/beam/emu/beam_emu.c (error_action_code) and beam_common.c
+// (handle_error -> terminate_proc), OTP-29.1.1.
+pub(super) fn error_action_code(process: &mut Process) -> Result<RunState, VmError> {
+    let reason = crate::native_hooks::from_raw(process.heap.abi.exc.fvalue);
+    Err(VmError::Trap(crate::exceptions::Trap::untrappable_exit(
+        reason,
+    )))
+}
+
 /// One process slice on this scheduler: schedule-in, native entry, schedule-out.
 // Inlined into `Task::run` (its only caller), and `run_native_resume` into this: erts
 // switches out through one C frame (the JIT `bl erts_schedule`), and every Rust frame
@@ -14,28 +46,10 @@ pub(super) fn process_main(
     reg: &mut SchedulerRegisters,
 ) -> Result<RunState, VmError> {
     let esdp = ctx.esdp();
-    let exec_key = ctx.scheduler_key();
-    let cached = exec_key != 0 && process.exec_key == exec_key && process.self_pid.is_some();
-    if !cached {
-        process.heap.abi.self_pid = ctx.pid().to_term().expect("valid pid").tagged_word();
-        process.self_pid = Some(ctx.pid());
-    }
-    // Port of erts/emulator/beam/erl_process.c:10180 (erts_schedule: esdp->current_process
-    // = p), OTP-29.1.1.
     let data = arinsal_sched::erts_sched_registers(esdp);
-    if data.hub_bound.get() {
-        data.current_process
-            .store(ctx.pid().data(), Ordering::Relaxed);
-    } else {
-        data.hub_bound.set(crate::natives::nif::bind_scheduler_hub(
-            process,
-            &data.current_process,
-        ));
-    }
-    if !cached {
-        process.scheduler_id = ctx.scheduler_id().map_or(0, |id| id as u32);
-        process.exec_key = exec_key;
-    }
+    // Port of jit/x86/process_main.cpp:200-230 and beam_emu.c (process_main: `start_time =
+    // erts_timestamp_millis()` after erts_schedule returns, when long_schedule is monitored),
+    // OTP-29.1.1.
     let schedule_started =
         crate::natives::erts_debug::long_schedule_monitored(process).then(std::time::Instant::now);
     // Port of erts/emulator/beam/erl_process.c:12616 (erl_create_process: `p->i =
@@ -70,6 +84,9 @@ pub(super) fn process_main(
     }
     let fast_result = if let Some(error) = signal_error {
         Some(Err(error))
+    } else if at_beam_exit(process) {
+        // process_main: `jmp c_p->i` enters beam_exit.
+        Some(error_action_code(process))
     } else if fast_entry_ok(process, ctx, sys_task_run) {
         process_main_dispatch(process, ctx, reg, &mut fast_ran, sys_task_run)
     } else {
@@ -108,6 +125,10 @@ pub(super) fn process_main(
                     && (sys_task_run || !process.sig_cont_empty() || ctx.has_pending_nmsg())
                 {
                     schedule_in_signals(process, ctx, sys_task_run)?;
+                }
+                // process_main: `jmp c_p->i` enters beam_exit.
+                if at_beam_exit(process) {
+                    break 'execution error_action_code(process);
                 }
 
                 // erts collects a process that is being scheduled in once signals have
@@ -194,7 +215,13 @@ pub(super) fn process_main(
                         reg.x_reg_array[..arity].copy_from_slice(&args);
                         process.heap.abi.arity = arity as u8;
                         process.gc_live = arity;
-                        let continuation = (Vm {}).apply_fixed(process, arity, Some(ctx));
+                        let continuation = crate::beam_common::fixed_apply(
+                            process,
+                            (Vm {}).x_regs()?,
+                            arity,
+                            &mut Vm {},
+                            Some(ctx),
+                        );
                         let continuation = match continuation {
                             Ok(outcome) => outcome,
                             Err(VmError::Trap(trap)) => {
@@ -438,6 +465,10 @@ pub(super) fn process_main(
                             Ok(Flow::Break(result)) => break result,
                             Err(error) => return Err(error),
                         }
+                    }
+                    // `jmp c_p->i` at beam_exit: the process was made exiting in this slice.
+                    if at_beam_exit(process) {
+                        break error_action_code(process);
                     }
                     let mut sched_out = false;
                     let result = process.drain(ctx).and_then(|()| {

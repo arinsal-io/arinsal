@@ -1409,6 +1409,7 @@ pub(crate) fn with_breakpoints(process: &Process, functions: Vec<BpFunction>) ->
 }
 
 /// True while some runtime holds a function breakpoint; keeps untraced BIF calls on the fast path.
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn any_pattern() -> bool {
     ACTIVE_NODES.load(Ordering::Relaxed) != 0
 }
@@ -2152,19 +2153,19 @@ fn cached_timem_break(
     memory: bool,
 ) -> Option<Arc<TimemTrace>> {
     let ix = bp_node(process).active_bp_ix();
-    if let Some(cache) = pbt_list(process, memory).get(pbt_index)?.cache.as_ref()
+    if let Some(cache) = pbt_list(process, memory)?.get(pbt_index)?.cache.as_ref()
         && cache.cell.id == id
         && cache.ix == ix
         && cache.version == cache.cell.version.load(Ordering::Acquire)
     {
         return Some(cache.bdt.clone());
     }
-    let session = pbt_list(process, memory).get(pbt_index)?.session;
+    let session = pbt_list(process, memory)?.get(pbt_index)?.session;
     let cell = cell_by_id(id)?;
     // Read the version before the data: a later write makes the cache entry stale, not wrong.
     let version = cell.version.load(Ordering::Acquire);
     let found = timem_break_of(process, &cell, session, memory)?;
-    pbt_list(process, memory).get_mut(pbt_index)?.cache = Some(PbtCache {
+    pbt_list(process, memory)?.get_mut(pbt_index)?.cache = Some(PbtCache {
         cell,
         version,
         ix,
@@ -2173,18 +2174,35 @@ fn cached_timem_break(
     Some(found)
 }
 
-fn pbt_list(process: &mut Process, memory: bool) -> &mut Vec<ProcBpTrace> {
-    let cold = process.cold_mut();
-    if memory {
-        &mut cold.call_memory
+fn pbt_list(process: &mut Process, memory: bool) -> Option<&mut Vec<ProcBpTrace>> {
+    let slot = if memory {
+        crate::proc_create::raw::ERTS_PSD_CALL_MEMORY_BP
     } else {
-        &mut cold.call_time
+        crate::proc_create::raw::ERTS_PSD_CALL_TIME_BP
+    };
+    crate::proc_create::raw::erts_psd_get_mut(&mut process.psd, slot)
+}
+
+fn pbt_list_or_default(process: &mut Process, memory: bool) -> &mut Vec<ProcBpTrace> {
+    let slot = if memory {
+        crate::proc_create::raw::ERTS_PSD_CALL_MEMORY_BP
+    } else {
+        crate::proc_create::raw::ERTS_PSD_CALL_TIME_BP
+    };
+    if pbt_list(process, memory).is_none() {
+        crate::proc_create::raw::erts_psd_set(
+            &mut process.psd,
+            slot,
+            Some(Box::new(Vec::<ProcBpTrace>::new())),
+        );
     }
+    crate::proc_create::raw::erts_psd_get_mut(&mut process.psd, slot)
+        .expect("call breakpoint slot initialized")
 }
 
 /// The adjustment the session's `call_memory` state holds, `None` before its first call.
 pub(crate) fn call_memory_adjustment(process: &mut Process, session: u64) -> Option<i64> {
-    pbt_list(process, true)
+    pbt_list(process, true)?
         .iter()
         .find(|pbt| pbt.session == session)
         .map(|pbt| pbt.allocated)
@@ -2203,22 +2221,24 @@ pub(crate) fn trace_call_acc(
     bdt: &TimemTrace,
 ) -> Option<u32> {
     let pbt_index = if let Some(index) = pbt_list(process, memory)
-        .iter()
-        .position(|pbt| pbt.session == session)
+        .and_then(|entries| entries.iter().position(|pbt| pbt.session == session))
     {
         index
     } else {
-        pbt_list(process, memory).push(ProcBpTrace {
+        pbt_list_or_default(process, memory).push(ProcBpTrace {
             session,
             ci: None,
             accumulator: 0,
             allocated: 0,
             cache: None,
         });
-        pbt_list(process, memory).len() - 1
+        pbt_list(process, memory)
+            .expect("call breakpoint slot initialized")
+            .len()
+            - 1
     };
     let (previous, accumulator) = {
-        let pbt = &pbt_list(process, memory)[pbt_index];
+        let pbt = &pbt_list(process, memory).expect("call breakpoint slot initialized")[pbt_index];
         (pbt.ci, pbt.accumulator)
     };
     let mut counted = false;
@@ -2237,7 +2257,7 @@ pub(crate) fn trace_call_acc(
     if !counted {
         bdt.accum(pid, 1, 0);
     }
-    let pbt = &mut pbt_list(process, memory)[pbt_index];
+    let pbt = &mut pbt_list(process, memory).expect("call breakpoint slot initialized")[pbt_index];
     let prev = pbt.ci.replace(ci);
     pbt.accumulator = accum;
     prev
@@ -2255,11 +2275,10 @@ pub(crate) fn call_trace_return(
 ) {
     if bp_flags & BPF_TIME_TRACE_ACTIVE != 0 {
         let pbt_index = pbt_list(process, false)
-            .iter()
-            .position(|pbt| pbt.session == session);
+            .and_then(|entries| entries.iter().position(|pbt| pbt.session == session));
         if let Some(pbt_index) = pbt_index {
             let (ci, accumulator) = {
-                let pbt = &pbt_list(process, false)[pbt_index];
+                let pbt = &pbt_list(process, false).expect("call time slot initialized")[pbt_index];
                 (pbt.ci, pbt.accumulator)
             };
             let time = arinsal_sched::erl_time_sup::monotonic_time_raw_nanos();
@@ -2267,25 +2286,26 @@ pub(crate) fn call_trace_return(
             if let Some(bdt) = ci.and_then(|ci| cached_timem_break(process, pbt_index, ci, false)) {
                 bdt.accum(pid, 0, time - accumulator);
             }
-            let pbt = &mut pbt_list(process, false)[pbt_index];
+            let pbt = &mut pbt_list(process, false).expect("call time slot initialized")[pbt_index];
             pbt.ci = prev;
             pbt.accumulator = time;
         }
     }
     if bp_flags & BPF_MEM_TRACE_ACTIVE != 0 {
         let pbt_index = pbt_list(process, true)
-            .iter()
-            .position(|pbt| pbt.session == session);
+            .and_then(|entries| entries.iter().position(|pbt| pbt.session == session));
         if let Some(pbt_index) = pbt_index {
             let (ci, accumulator, allocated) = {
-                let pbt = &pbt_list(process, true)[pbt_index];
+                let pbt =
+                    &pbt_list(process, true).expect("call memory slot initialized")[pbt_index];
                 (pbt.ci, pbt.accumulator, pbt.allocated)
             };
             let words = process.allocated_words(allocated);
             if let Some(bdt) = ci.and_then(|ci| cached_timem_break(process, pbt_index, ci, true)) {
                 bdt.accum(pid, 0, words - accumulator);
             }
-            let pbt = &mut pbt_list(process, true)[pbt_index];
+            let pbt =
+                &mut pbt_list(process, true).expect("call memory slot initialized")[pbt_index];
             pbt.ci = prev;
             pbt.accumulator = words;
         }
@@ -2297,7 +2317,7 @@ pub(crate) fn call_trace_return(
 // Port of erts/emulator/beam/beam_bp.c:2017-2073 (erts_schedule_time_break), OTP-29.1.1.
 pub(crate) fn schedule_time_break(process: &mut Process, pid: Pid, out: bool) {
     let now = arinsal_sched::erl_time_sup::monotonic_time_raw_nanos();
-    let entries = pbt_list(process, false).clone();
+    let entries = pbt_list(process, false).map_or_else(Vec::new, |entries| entries.clone());
     if out {
         // When a process is scheduled out, add its delta to the previous breakpoint.
         for pbt in &entries {
@@ -2309,8 +2329,10 @@ pub(crate) fn schedule_time_break(process: &mut Process, pid: Pid, out: bool) {
         }
     } else {
         // When a process is scheduled in, remove the previous timestamp.
-        for pbt in pbt_list(process, false).iter_mut() {
-            pbt.accumulator = now;
+        if let Some(entries) = pbt_list(process, false) {
+            for pbt in entries.iter_mut() {
+                pbt.accumulator = now;
+            }
         }
     }
 }
@@ -2318,8 +2340,8 @@ pub(crate) fn schedule_time_break(process: &mut Process, pid: Pid, out: bool) {
 /// Adjust the memory accounting of a process (heap words freed by GC or received).
 // Port of erts/emulator/beam/beam_bp.h:240-254 (erts_adjust_memory_break), OTP-29.1.1.
 pub(crate) fn adjust_memory_break(process: &mut Process, adjustment: i64) {
-    if let Some(cold) = process.cold.as_mut() {
-        for pbt in &mut cold.call_memory {
+    if let Some(entries) = pbt_list(process, true) {
+        for pbt in entries {
             pbt.allocated += adjustment;
         }
     }

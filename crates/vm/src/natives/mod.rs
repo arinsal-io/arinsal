@@ -380,7 +380,10 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
         return Some(proc::process_info_1_light);
     }
     if module == "erlang" && function == "fun_info" && arity == 2 {
-        return Some(proc::fun_info_arity_light);
+        return Some(crate::erl_bif_info::fun_info_2);
+    }
+    if module == "erlang" && function == "make_fun" && arity == 3 {
+        return Some(crate::bif::make_fun_3);
     }
     if module == "erts_internal" && function == "suspend_process" && arity == 2 {
         return Some(proc::suspend_process_light);
@@ -417,7 +420,6 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
             ("statistics", 1) => return Some(sys::statistics_light),
             ("module_loaded", 1) => return Some(code::module_loaded_light),
             ("function_exported", 3) => return Some(code::function_exported_light),
-            ("make_fun", 3) => return Some(crate::Vm::make_fun_light),
             _ => {}
         }
     }

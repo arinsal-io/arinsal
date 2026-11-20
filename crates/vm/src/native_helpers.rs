@@ -1495,7 +1495,13 @@ fn set_call_fun_error(
     // `apply/2` may pass more arguments than the module's registers (erts raises badarity with
     // all of them): the scheduler array holds them.
     registers.x_reg_array[arity] = fun;
-    match crate::funs::call_error_reason(process, &mut registers.x_reg_array, fun, arity) {
+    match crate::funs::call_error_reason(
+        process,
+        &mut registers.x_reg_array,
+        fun,
+        arity,
+        Term::NON_VALUE,
+    ) {
         Ok(reason) => {
             process.heap.abi.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
             process.heap.abi.exc.fvalue = crate::native_hooks::raw(reason);

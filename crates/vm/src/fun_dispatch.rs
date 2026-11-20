@@ -1,5 +1,6 @@
 //! Fun dispatch glue: the node export lookup behind `erts_export_get_or_make_stub` for terms
 //! built outside a process, and the runtime half of the `dispatch_save_calls_fun` fragment.
+#[cfg(target_arch = "aarch64")]
 use arinsal_beamasm::ProcessHeader;
 use arinsal_term::{Atom, ExportEntry, FunEntry};
 use std::sync::Arc;
@@ -30,6 +31,7 @@ pub(crate) fn init(unloaded_fun: usize, save_calls_fun: usize) {
 /// address in its node's active code index.
 // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:139-149 (emit_dispatch_save_calls_fun),
 // OTP-29.1.1: erts reads `the_active_code_index`, here each node has its own.
+#[cfg(target_arch = "aarch64")]
 pub(crate) extern "C" fn arinsal_beamasm_save_calls_fun(
     header: *mut ProcessHeader,
     fun_raw: u64,

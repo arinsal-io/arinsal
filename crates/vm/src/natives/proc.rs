@@ -4,9 +4,7 @@ use crate::code_ix::{code_tables, erts_active_code_ix};
 use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_sched::{Pid, Priority, RunCtx, Signal};
-use arinsal_term::{
-    Atom, FunRef, HeapReservation, Term, TermBuilder, TermError, TermKind, global_atoms,
-};
+use arinsal_term::{Atom, HeapReservation, Term, TermBuilder, TermError, TermKind, global_atoms};
 
 fn atom_name(term: Term) -> Option<String> {
     Some(global_atoms().text(term.as_atom()?)?.to_string())
@@ -19,11 +17,26 @@ fn badarg() -> VmError {
 }
 
 fn flag_value(process: &Process, name: &str) -> Option<Term> {
-    process.cold.as_ref()?.flags.get(name)
+    if name == "error_handler" {
+        crate::proc_create::raw::erts_psd_get_term(
+            &process.psd,
+            crate::proc_create::raw::ERTS_PSD_ERROR_HANDLER,
+        )
+    } else {
+        process.cold.as_ref()?.flags.get(name)
+    }
 }
 
 pub(crate) fn set_flag(process: &mut Process, name: &str, value: Term) -> Option<Term> {
-    process.cold_mut().flags.insert(name, value)
+    if name == "error_handler" {
+        crate::proc_create::raw::erts_psd_set_term(
+            &mut process.psd,
+            crate::proc_create::raw::ERTS_PSD_ERROR_HANDLER,
+            Some(value),
+        )
+    } else {
+        process.cold_mut().flags.insert(name, value)
+    }
 }
 
 fn list(term: Term) -> Option<Vec<Term>> {
@@ -1825,36 +1838,6 @@ pub(crate) fn list_to_pid_light(
     list_to_pid(process, *chars).ok().map(Ok)
 }
 
-/// Handle `fun_info(Fun, arity)` from the process/register BIF entry.
-// Port of erts/emulator/beam/erl_bif_info.c:3912 (`fun_info_2`), OTP-29.1.1.
-pub(crate) fn fun_info_arity_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [fun, what] = args else {
-        return None;
-    };
-    if *what != Term::atom(arinsal_term::atoms::ARITY) {
-        return None;
-    }
-    let arity = u32::from(fun.fun_arity()?);
-    // Port of erts/emulator/beam/erl_bif_info.c:3976 (`HAlloc(p, 3)`), OTP-29.1.1:
-    // release the inspected fun before a possible collection and reserve the result tuple.
-    if let Err(error) = process.ensure_entry(3, &mut []) {
-        return Some(Err(match error {
-            VmError::Trap(trap) => trap,
-            _ => crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT)),
-        }));
-    }
-    let arity = Term::small(i64::from(arity)).expect("fun arity fits a small integer");
-    let result = TermBuilder::new(&mut process.heap).tuple2(*what, arity);
-    Some(
-        result.map_err(|_| {
-            crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT))
-        }),
-    )
-}
-
 // Port of erts/emulator/beam/bif.c:4608 (list_to_port_1), OTP-29.1.1.
 fn list_to_port(chars: Term) -> Result<Term, VmError> {
     let buf = intlist_to_buf(chars, 6 + 11 + 21 + 1).ok_or_else(badarg)?;
@@ -3186,7 +3169,9 @@ fn call_values(
                     trace_session_info(process, ctx, session, spec, item)
                 })
             }
-            ("fun_info_mfa", [fun]) if module == "erlang" => fun_info_mfa(process, *fun),
+            ("fun_info_mfa", [fun]) if module == "erlang" => {
+                crate::erl_bif_info::fun_info_mfa_1(process, &mut [*fun])
+            }
             _ => {
                 debug_assert!(
                     !super::listed(IMPLEMENTED, "erlang", function, args.len() as u8)
@@ -5550,50 +5535,6 @@ fn processes_next(
     let next = Term::small(i64::from(scan_end)).ok_or_else(badarg)?;
     let batch = make_list(process, pid_terms)?;
     make_tuple(process, &[next, batch])
-}
-
-// Port of erts/emulator/beam/erl_bif_info.c:4011 (fun_info_mfa_1), OTP-29.1.1.
-fn fun_info_mfa(process: &mut Process, fun: Term) -> Result<Term, VmError> {
-    // SAFETY: The fun stays rooted in the caller heap for this BIF.
-    let view = unsafe { fun.fun_ref() }.ok_or_else(badarg)?;
-    // Port of erts/emulator/beam/erl_bif_info.c:4011 (`fun_info_mfa_1`):
-    // the reported arity comes from the fun header's arity byte.
-    let fun_arity = i64::from(fun.fun_arity().ok_or_else(badarg)?);
-    let (module, name, arity) = match view {
-        FunRef::Export { entry } => (
-            Term::atom(entry.module()),
-            Term::atom(entry.function()),
-            fun_arity,
-        ),
-        FunRef::Local { entry, .. } => {
-            let module_name = global_atoms()
-                .text(entry.module)
-                .ok_or_else(badarg)?
-                .to_string();
-            let function = code_tables(erts_active_code_ix())
-                .loaded
-                .get(&module_name)
-                .and_then(|&id| {
-                    code_tables(erts_active_code_ix()).modules[id]
-                        .funs
-                        .iter()
-                        .find(|slot| slot.entry.index == entry.index)
-                        .map(|slot| (id, slot.target))
-                });
-            let name = function
-                .and_then(|(id, target)| {
-                    code_tables(erts_active_code_ix()).modules[id]
-                        .function_at(target)
-                        .map(|(name, _)| name.to_owned())
-                })
-                .and_then(|name| global_atoms().intern(&name).ok())
-                .map(Term::atom)
-                .unwrap_or(Term::NIL);
-            (Term::atom(entry.module), name, fun_arity)
-        }
-    };
-    let arity = Term::small(arity).ok_or_else(badarg)?;
-    make_tuple(process, &[module, name, arity])
 }
 
 /// Text that `print_process_info` writes for the running process, as returned by the

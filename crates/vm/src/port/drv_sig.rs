@@ -618,15 +618,19 @@ fn deliver_exit(
     from: Pid,
     reason: Term,
     closed_to: Option<Pid>,
+    broken_link: bool,
 ) -> bool {
     let id = handle.id;
     if bang && from != handle.owner_pid() {
         signal_badsig(handle, id);
         return true;
     }
+    if broken_link && handle.links.lock().remove(from.data()).is_none() {
+        return false;
+    }
     // io.c:3841 (erts_deliver_port_exit): links and monitors first, then
     // terminate_port runs `stop`, whose output still reaches the connected process.
-    erts_deliver_port_exit(runtime, id, from, reason, closed_to)
+    erts_deliver_port_exit(runtime, id, from, reason, closed_to, broken_link)
 }
 
 /// `trace_port_receive(prt, from, am_close)` (io.c:2196).
@@ -670,7 +674,7 @@ pub(crate) fn exit(
             let mut heap = ProcessHeap::with_words(64);
             let reason = from_owned(&reason, &mut heap)
                 .unwrap_or_else(|_| Term::atom(arinsal_term::atoms::NORMAL));
-            let done = deliver_exit(runtime, handle, bang, from, reason, closed_to);
+            let done = deliver_exit(runtime, handle, bang, from, reason, closed_to, false);
             drop(imm);
             return if done { Ok(None) } else { Err(badarg()) };
         }
@@ -702,8 +706,8 @@ pub(crate) fn exit(
         let mut heap = ProcessHeap::with_words(64);
         let reason = from_owned(&reason, &mut heap)
             .unwrap_or_else(|_| Term::atom(arinsal_term::atoms::NORMAL));
-        let ok =
-            op == SigOp::Exec && deliver_exit(runtime, &task_handle, bang, from, reason, closed_to);
+        let ok = op == SigOp::Exec
+            && deliver_exit(runtime, &task_handle, bang, from, reason, closed_to, false);
         if let Some(reply) = reply {
             reply.atom(if ok { "true" } else { "badarg" });
         }
@@ -729,7 +733,7 @@ pub(crate) fn exit_for_halt(
             let mut heap = ProcessHeap::with_words(64);
             let reason = from_owned(&reason, &mut heap)
                 .unwrap_or_else(|_| Term::atom(arinsal_term::atoms::KILLED));
-            deliver_exit(runtime, &handle, false, from, reason, None);
+            deliver_exit(runtime, &handle, false, from, reason, None, false);
             drop(imm);
         }
         Err(ImmFail::InvalidPort) => {}
@@ -739,7 +743,7 @@ pub(crate) fn exit_for_halt(
                     let mut heap = ProcessHeap::with_words(64);
                     let reason = from_owned(&reason, &mut heap)
                         .unwrap_or_else(|_| Term::atom(arinsal_term::atoms::KILLED));
-                    deliver_exit(runtime, &handle, false, from, reason, None);
+                    deliver_exit(runtime, &handle, false, from, reason, None, false);
                 }
                 REDS_EXIT
             });
@@ -763,11 +767,10 @@ pub(crate) fn exit_for_process_termination(
         if op == SigOp::Exec {
             // Port of erts/emulator/beam/io.c:2187 (`call_deliver_port_exit`),
             // OTP-29.1.1: the forced exit breaks the exiting process's port link.
-            handle.links.lock().remove(from.data());
             let mut heap = ProcessHeap::with_words(64);
             let reason = from_owned(&reason, &mut heap)
                 .unwrap_or_else(|_| Term::atom(arinsal_term::atoms::NORMAL));
-            deliver_exit(runtime, &handle, false, from, reason, None);
+            deliver_exit(runtime, &handle, false, from, reason, None, true);
         }
         REDS_EXIT
     });

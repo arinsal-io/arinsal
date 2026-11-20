@@ -514,14 +514,15 @@ fn finish_command(sock: &Arc<Sock>, outcome: SendOutcome, reply: Option<(Pid, [u
 
 /// `dist_port_commandv`: the driver's `outputv` with a distribution output buffer's I/O
 /// vector (no caller-ref prefix, no `inet_reply`), its binaries referenced, with the port
-/// locked as the dist command task does. Returns whether the port became busy.
+/// locked as the dist command task does. A send at the high watermark sets the port busy
+/// (`ERTS_PTS_FLG_BUSY_PORT`), which the caller reads from the port's flags.
 ///
 /// Port of dist.c (`dist_port_commandv`) calling `tcp_inet_commandv` with
 /// `prt->caller = NIL`, so `init_caller` skips the ref header, OTP-29.1.1.
 pub(crate) fn dist_outputv(
     sock: &Arc<Sock>,
     eiov: arinsal_drv::CommandVector,
-) -> Result<bool, VmError> {
+) -> Result<(), VmError> {
     let (Some(port), Some(_handle)) = (sock.port(), sock.handle.upgrade()) else {
         return Err(badarg());
     };
@@ -531,7 +532,9 @@ pub(crate) fn dist_outputv(
             accept_send(&mut inner, SendData::Pieces(eiov, 0))
         };
         finish_command(sock, outcome, None);
-        Ok(sock.inner.lock().busy)
+        // tcp_sendv: set_busy_port(desc->inet.port, 1) at the high watermark.
+        settle(sock);
+        Ok(())
     })
 }
 
@@ -4627,8 +4630,6 @@ fn try_io(sock: &Arc<Sock>, writable_ready: bool) {
     }
     // Passive EOF is remembered; `{active, true}` must still emit `{tcp_closed,S}`.
     deliver_pending_close(sock);
-    let busy = sock.inner.lock().busy;
-    crate::dist::distribution_port_state_changed(sock.runtime(), sock.id, busy);
 }
 
 /// Write queued output once the poll set reports the connected socket writable.

@@ -4,7 +4,7 @@ use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::RunCtx;
-use arinsal_term::{ProcessHeap, Term, TermBuilder, global_atoms, pflags};
+use arinsal_term::{Term, TermBuilder, global_atoms, pflags};
 use num_bigint::BigInt;
 use std::io::Write;
 
@@ -143,11 +143,14 @@ fn call_setnode2(
         // flags when net_kernel calls, else net_kernel's under its main lock (free while thread
         // progress is blocked).
         // `!ERTS_PROC_IS_EXITING(net_kernel) && !ERTS_PROC_GET_DIST_ENTRY(net_kernel)`.
-        let mut set_distribution = |flags: &mut ProcessHeap,
-                                    psd_dist_entry: &mut Option<
-            std::sync::Arc<node_tables::DistEntry>,
-        >| {
-            if exiting || psd_dist_entry.is_some() {
+        let mut set_distribution = |target: &mut Process| {
+            if exiting
+                || crate::proc_create::raw::erts_psd_get::<node_tables::DistEntry>(
+                    &target.psd,
+                    crate::proc_create::raw::ERTS_PSD_DIST_ENTRY,
+                )
+                .is_some()
+            {
                 return false;
             }
             // Port of dist.c:5030-5037: a creation below 4 is raised to 4.
@@ -157,23 +160,19 @@ fn call_setnode2(
             events = node_tables::lock().nodes_monitor_events("nodeup", name, u32::MAX, true, None);
             // F_DISTRIBUTION: the exit of net_kernel runs erts_do_net_exits (dist.c:5045) on
             // its dist entry, the new erts_this_dist_entry.
-            flags.set_flag(pflags::F_DISTRIBUTION, true);
-            *psd_dist_entry = node_tables::erts_this_dist_entry();
+            target.heap.set_flag(pflags::F_DISTRIBUTION, true);
+            crate::proc_create::raw::erts_psd_set_arc(
+                &mut target.psd,
+                crate::proc_create::raw::ERTS_PSD_DIST_ENTRY,
+                node_tables::erts_this_dist_entry(),
+            );
             true
         };
         success = if net_kernel == me {
-            let mut psd = process.cold_mut().psd_dist_entry.take();
-            let set = set_distribution(&mut process.heap, &mut psd);
-            process.cold_mut().psd_dist_entry = psd;
-            set
+            set_distribution(process)
         } else {
             scheduler
-                .try_with_task(net_kernel, |task| {
-                    let mut psd = task.cold_mut().psd_dist_entry.take();
-                    let set = set_distribution(&mut task.heap, &mut psd);
-                    task.cold_mut().psd_dist_entry = psd;
-                    set
-                })
+                .try_with_task(net_kernel, |task| set_distribution(task))
                 .unwrap_or(false)
         };
         if success {

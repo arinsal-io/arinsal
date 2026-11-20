@@ -118,6 +118,7 @@ fn exported_definition(id: Term) -> Option<Term> {
 
 /// Port of erts/emulator/beam/erl_record.c:254-379 (erl_create_local_native_record,
 /// erl_create_native_record), OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 fn create(
     header: *mut ProcessHeader,
     reg: *mut u64,
@@ -205,6 +206,7 @@ fn create_record(
 }
 
 /// Runtime helper of `i_create_local_native_record`.
+#[cfg(target_arch = "aarch64")]
 pub extern "C" fn arinsal_beamasm_create_local_record(
     header: *mut ProcessHeader,
     reg: *mut u64,
@@ -217,6 +219,7 @@ pub extern "C" fn arinsal_beamasm_create_local_record(
 }
 
 /// Runtime helper of `i_create_native_record`.
+#[cfg(target_arch = "aarch64")]
 pub extern "C" fn arinsal_beamasm_create_record(
     header: *mut ProcessHeader,
     reg: *mut u64,
@@ -229,6 +232,7 @@ pub extern "C" fn arinsal_beamasm_create_record(
 }
 
 /// Port of erts/emulator/beam/erl_record.c:381-468 (erl_update_native_record), OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 pub extern "C" fn arinsal_beamasm_update_record(
     header: *mut ProcessHeader,
     reg: *mut u64,
@@ -527,6 +531,7 @@ pub extern "C" fn erl_get_record_field(
 /// Port of erts/emulator/beam/erl_record.c:223-252 (erl_get_record_elements), OTP-29.1.1.
 /// Reads the sorted keys staged at `base` and replaces each with its value; returns 1 when
 /// every key was found.
+#[cfg(target_arch = "aarch64")]
 pub extern "C" fn arinsal_beamasm_get_record_elements(
     header: *mut ProcessHeader,
     reg: *mut u64,
@@ -625,6 +630,7 @@ fn get_field(
 }
 
 /// Runtime helper of `get_record_field` with an atom record id.
+#[cfg(target_arch = "aarch64")]
 pub extern "C" fn arinsal_beamasm_get_local_record_field(
     header: *mut ProcessHeader,
     source: u64,
@@ -636,6 +642,7 @@ pub extern "C" fn arinsal_beamasm_get_local_record_field(
 }
 
 /// Runtime helper of `get_record_field` with a `{Module, Name}` or `_` record id.
+#[cfg(target_arch = "aarch64")]
 pub extern "C" fn arinsal_beamasm_get_record_field(
     header: *mut ProcessHeader,
     source: u64,

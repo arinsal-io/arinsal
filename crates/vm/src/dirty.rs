@@ -194,6 +194,7 @@ impl Process {
             .is_some_and(|cold| cold.static_nif_done.is_some())
     }
 
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn dirty_bif_scheduled(&self) -> bool {
         self.cold.as_ref().is_some_and(|cold| {
             matches!(cold.dirty_bif, Some(DirtyBif::Job(..) | DirtyBif::Done(_)))

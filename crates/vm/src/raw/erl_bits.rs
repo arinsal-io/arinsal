@@ -423,6 +423,7 @@ pub extern "C" fn erts_bs_private_append_checked(
 /// Private append entry used by the arm emitter, which passes its register base.
 // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1865-1880 and
 // erts/emulator/beam/erl_bits.c:1928-2017, OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 pub(crate) extern "C" fn private_append_from_reg(
     c_p: *mut ProcessHeader,
     reg: *mut u64,

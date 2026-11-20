@@ -33,6 +33,9 @@ pub(crate) fn beamasm_init() {
         save_calls_fun: fragments.save_calls_fun(),
         unloaded_fun: fragments.unloaded_fun(),
         i_line_breakpoint_cleanup: fragments.line_breakpoint_cleanup(),
+        // arm runs the Rust process_main shaped like beam_emu.c until its migration, so
+        // `beam_exit` is that loop's `error_action_code` instruction (beam_emu.c `beam_exit_`).
+        exit: crate::process::beam_exit_address(),
     });
     arinsal_beamasm::set_process_main_labels(fragments.dispatch_nif());
 }
@@ -654,6 +657,16 @@ pub(crate) fn owns_native_address(address: usize) -> bool {
             .upgrade()
             .is_some_and(|version| version.code_start <= address && address < version.code_end)
     })
+}
+
+/// Resolve an active native code address to its function metadata.
+// Port of erts/emulator/beam/beam_ranges.c (`erts_find_function_from_pc`), OTP-29.1.1.
+pub(crate) fn native_function_for_pc(address: usize) -> Option<crate::NativeFunction> {
+    let versions = compiled_versions().read().ok()?;
+    versions
+        .iter()
+        .filter_map(Weak::upgrade)
+        .find_map(|version| version.native_function_for_pc(address).cloned())
 }
 
 struct VmModuleEnv<'a> {

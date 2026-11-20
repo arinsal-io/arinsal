@@ -56,6 +56,7 @@ impl Process {
     }
 
     /// Whether an outer signal is waiting on an on-heap message queue.
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn gc_outer_queue_pending(&self) -> bool {
         self.message_queue_data() == MessageQueueData::OnHeap
             && self
@@ -73,6 +74,9 @@ pub(crate) enum ReceiveHelper {
     Wait,
     /// Out of reductions: yield and rerun `loop_rec`.
     Yield,
+    /// A handled exit signal made the process exiting: it schedules out to terminate at
+    /// `c_p->i = beam_exit`.
+    Exiting,
 }
 
 impl Process {
@@ -109,7 +113,7 @@ impl Process {
     /// The receive helper `loop_rec` runs at the end of the message queue: fetch the outer
     /// queue and handle signals until a message is available at the save pointer, the queues
     /// are empty, or `fcalls` run out. Returns the reductions consumed. An exit signal that
-    /// terminates the process is the error.
+    /// makes the process exiting ends it with `Exiting`.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:7729-7860
     // (erts_proc_sig_receive_helper), OTP-29.1.1.
     pub(crate) fn receive_helper(
@@ -142,6 +146,14 @@ impl Process {
             self.handle_incoming(ctx, &mut reds, max_reds, true)?;
             consumed_reds += reds;
             left_reds -= reds;
+            // erl_proc_sig_queue.c:7826-7846: exited by an incoming signal, the process must
+            // schedule out in order to terminate.
+            if Self::erts_proc_is_exiting(ctx) {
+                self.heap.abi.flags &= !arinsal_term::pflags::F_DELAY_GC;
+                self.heap.abi.arity = 0;
+                self.heap.abi.current = std::ptr::null();
+                return Ok((consumed_reds, ReceiveHelper::Exiting));
+            }
             if self.inbox.peek().is_some() {
                 return Ok((consumed_reds, ReceiveHelper::Message));
             }

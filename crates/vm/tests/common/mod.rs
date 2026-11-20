@@ -164,22 +164,58 @@ pub(crate) fn erl_beam(module: &str, source: &str) -> Option<Vec<u8>> {
 /// The test binary's one node. erts runs one node per OS process (erl_init.c, erl_start) and an
 /// OTP suite runs all its cases in it; a case loads its module here and evaluates in it. A case
 /// that needs different emulator flags starts a separate OS process, never a second `Vm`.
+///
+/// The node boots as `erl -noshell -noinput` does: erlexec's argument handling
+/// (`arinsal_args::parse`) and the release binary's `arinsal_vm::boot::erl_start`, which runs
+/// `init:boot/1` with the `start_clean` boot script; cases run once `init:get_status()` is
+/// `{started, started}`. Panics when no OTP root is found.
 #[allow(dead_code)]
 pub(crate) fn node() -> std::sync::MutexGuard<'static, arinsal_vm::Vm> {
     static NODE: std::sync::OnceLock<std::sync::Mutex<arinsal_vm::Vm>> = std::sync::OnceLock::new();
     NODE.get_or_init(|| {
-        let mut vm = arinsal_vm::Vm::new([]);
-        // `erl` starts its default number of normal schedulers at node boot. Start the shared
-        // node's scheduler with that same total so later cases can pin processes to any scheduler.
-        let schedulers = arinsal_alloc::cpuinfo::default_schedulers().0;
-        let selector = arinsal_term::Term::atom(
+        let root = arinsal_difftest::reference::otp_root().expect("OTP root (erl on PATH)");
+        let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+        env.insert("ERL_ROOTDIR".into(), root.display().to_string());
+        let launch = arinsal_args::parse(&["arinsal", "-noshell", "-noinput"], &env)
+            .unwrap_or_else(|error| panic!("test node arguments: {error:?}"));
+        arinsal_args::configure_emulator_flags(launch.emulator.clone());
+        let workers = arinsal_alloc::cpuinfo::default_schedulers().0.max(1);
+        let (mut vm, first) = arinsal_vm::boot::erl_start(
+            std::path::Path::new(&launch.root_dir),
+            &launch.boot_args,
+            &[],
+            workers,
+            false,
+            true,
+            None,
+        )
+        .expect("start test node");
+        // `init` runs for the life of the node; its result is never awaited.
+        drop(first);
+        // `init:get_status/0` calls the registered `init`, which `init:boot/1` registers first.
+        let init = arinsal_term::Term::atom(
             arinsal_term::global_atoms()
-                .intern("schedulers")
-                .expect("intern scheduler selector"),
+                .intern("init")
+                .expect("intern init"),
         );
-        vm.eval_scheduled("erlang", "system_info", &[selector], schedulers.max(1))
-            .expect("start shared node with default schedulers");
-        std::sync::Mutex::new(vm)
+        for _ in 0..12_000 {
+            let registered = vm
+                .eval_scheduled("erlang", "whereis", &[init], 1)
+                .expect("erlang:whereis(init)")
+                .text
+                != "undefined";
+            if registered
+                && vm
+                    .eval_scheduled("init", "get_status", &[], 1)
+                    .expect("init:get_status()")
+                    .text
+                    == "{started,started}"
+            {
+                return std::sync::Mutex::new(vm);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("test node did not finish booting");
     })
     .lock()
     // A failed case must not fail the cases after it.

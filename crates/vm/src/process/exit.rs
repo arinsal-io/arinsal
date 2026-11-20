@@ -354,10 +354,11 @@ impl Process {
             } else {
                 reason
             };
-            let dep = self
-                .cold
-                .as_deref_mut()
-                .and_then(|cold| cold.psd_dist_entry.take());
+            let dep = crate::proc_create::raw::erts_psd_set_arc::<crate::node_tables::DistEntry>(
+                &mut self.psd,
+                crate::proc_create::raw::ERTS_PSD_DIST_ENTRY,
+                None,
+            );
             if let Some(dep) = dep {
                 let _ = crate::dist::erts_do_net_exits(self, runtime, &dep, ctx.pid(), reason);
             }
@@ -599,6 +600,35 @@ pub(super) fn report_process_error(
 }
 
 impl Process {
+    /// Make the running process exiting with `reason`: `c_p->fvalue = reason`, EXITING and
+    /// ACTIVE set and SUSPENDED and the dirty work bits cleared in `c_p->state`, `freason =
+    /// EXTAG_EXIT | EXF_PANIC`, its catches killed and `c_p->i = beam_exit`, where it
+    /// terminates when it next runs code. The process is running (on this scheduler or as a
+    /// dirty signal handler's target), so the state change enqueues nothing.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:13519 (erts_set_self_exiting) and :13485
+    /// (set_self_exiting: change_proc_schedule_state), OTP-29.1.1.
+    pub(crate) fn erts_set_self_exiting(&mut self, ctx: &RunCtx<'_, crate::Process>, reason: Term) {
+        use arinsal_sched::psflg;
+        self.heap.abi.exc.fvalue = reason.tagged_word();
+        let state = ctx.proc_state();
+        let _ = state.fetch_update(Ordering::AcqRel, Ordering::Acquire, |st| {
+            Some((st & !(psflg::SUSPENDED | psflg::DIRTY_WORK)) | psflg::EXITING | psflg::ACTIVE)
+        });
+        self.heap.abi.exc.freason = arinsal_term::exc::EXTAG_EXIT | arinsal_term::exc::EXF_PANIC;
+        // KILL_CATCHES(c_p): handle_error finds no catch.
+        self.heap.abi.catches = 0;
+        self.heap.abi.i = crate::beam_jit_main::beam_exit() as *const core::ffi::c_void;
+    }
+
+    /// `ERTS_PROC_IS_EXITING(c_p)`: EXITING or FREE in `c_p->state`.
+    // Port of erts/emulator/beam/erl_process.h (ERTS_PROC_IS_EXITING), OTP-29.1.1.
+    pub(crate) fn erts_proc_is_exiting(ctx: &RunCtx<'_, crate::Process>) -> bool {
+        ctx.proc_state().load(Ordering::Acquire)
+            & (arinsal_sched::psflg::EXITING | arinsal_sched::psflg::FREE)
+            != 0
+    }
+
     /// Terminate the process: everything up to the owned ETS tables now, the tables a slice of
     /// reductions at a time, and the rest once they are released. Ends with the process FREE
     /// in `p->state`, or yielded with its continuation in `p->u.terminate`; the schedule-out

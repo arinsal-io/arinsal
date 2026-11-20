@@ -36,6 +36,7 @@ pub(crate) const BIF_SIZE: usize = arinsal_spec::BIFS.len() + 5;
 static BIF_TABLE: [AtomicUsize; BIF_SIZE] = [const { AtomicUsize::new(0) }; BIF_SIZE];
 
 /// Address of `bif_table`, which the call fragments index by `Export.bif_number`.
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn table_address() -> usize {
     BIF_TABLE.as_ptr() as usize
 }

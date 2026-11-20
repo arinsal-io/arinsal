@@ -15,7 +15,9 @@ impl Process {
     ) -> Result<(), VmError> {
         loop {
             let mut reds = CONTEXT_REDS;
-            if self.handle_incoming(ctx, &mut reds, CONTEXT_REDS, true)? {
+            let done = self.handle_incoming(ctx, &mut reds, CONTEXT_REDS, true)?;
+            Self::erts_bif_chk_exited(self, ctx)?;
+            if done {
                 return Ok(());
             }
         }
@@ -29,11 +31,31 @@ impl Process {
         let mut local_only = false;
         loop {
             let mut reds = CONTEXT_REDS;
-            if self.handle_incoming(ctx, &mut reds, CONTEXT_REDS, local_only)? {
+            let done = self.handle_incoming(ctx, &mut reds, CONTEXT_REDS, local_only)?;
+            Self::erts_bif_chk_exited(self, ctx)?;
+            if done {
                 return Ok(());
             }
             local_only = true;
         }
+    }
+
+    /// `ERTS_BIF_CHK_EXITED(c_p)` of a BIF that handled its own signals: a process an exit
+    /// signal made exiting fails with its catches killed and `freason = EXTAG_EXIT |
+    /// EXF_PANIC`, `fvalue` the reason erts_set_self_exiting stored.
+    // Port of erts/emulator/beam/bif.h (ERTS_BIF_CHK_EXITED, ERTS_BIF_EXITED), OTP-29.1.1.
+    pub(crate) fn erts_bif_chk_exited(
+        process: &mut Process,
+        ctx: &RunCtx<'_, crate::Process>,
+    ) -> Result<(), VmError> {
+        if !Self::erts_proc_is_exiting(ctx) {
+            return Ok(());
+        }
+        process.heap.abi.catches = 0;
+        let reason = crate::native_hooks::from_raw(process.heap.abi.exc.fvalue);
+        Err(VmError::Trap(crate::exceptions::Trap::untrappable_exit(
+            reason,
+        )))
     }
 
     /// Receive-trace a signal that was converted into a message.
@@ -123,7 +145,8 @@ impl Process {
     /// (and `max_reds` when the limit is stretched), after fetching the outer queue unless
     /// `local_only`. Messages before the next unhandled signal move to the message queue; the
     /// rest stays in the middle queue. `*reds` returns the reductions used. Returns whether
-    /// every signal was handled. An exit signal that terminates the process is the error.
+    /// every signal was handled. An exit signal that terminates the process makes it exiting
+    /// (erts_set_self_exiting) and stops the handling; callers read ERTS_PROC_IS_EXITING.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:6229-7178
     // (erts_proc_sig_handle_incoming), OTP-29.1.1.
     pub(crate) fn handle_incoming(
@@ -314,9 +337,14 @@ impl Process {
                 }
                 continue;
             }
-            match self.handle_signal(ctx, from, payload) {
+            let mut exited = false;
+            match self.handle_signal(ctx, from, payload, &mut exited) {
                 Ok(cost) => cnt += cost + 1,
                 Err(error) => break Err(error),
+            }
+            if exited {
+                // erl_proc_sig_queue.c:6349 (`if (exited) goto stop`): terminated by signal.
+                break Ok(self.sig_cont_empty());
             }
         };
         // Port of erl_proc_sig_queue.c:7146-7150: the save pointer does not stay at a marker.
@@ -335,6 +363,8 @@ impl Process {
 
     /// Handle one non-message signal; returns its reduction count (`cnt`) in units of
     /// 1/`ERTS_SIG_REDS_CNT_FACTOR` reduction, without the `cnt++` every signal costs.
+    /// `*exited` is set when an exit signal made the process exiting (handle_exit_signal's
+    /// `*exited`).
     // Port of the signal cases of erts/emulator/beam/erl_proc_sig_queue.c:6336-6968
     // (erts_proc_sig_handle_incoming), OTP-29.1.1.
     fn handle_signal(
@@ -342,6 +372,7 @@ impl Process {
         ctx: &mut RunCtx<'_, crate::Process>,
         from: Pid,
         payload: Payload<Message>,
+        exited: &mut bool,
     ) -> Result<i32, VmError> {
         let Payload::Signal(signal) = payload else {
             unreachable!("message signals are moved to the message queue before this");
@@ -506,9 +537,12 @@ impl Process {
                     let seq_token = message.take_seq_token();
                     let reason = message.into_receiver(self)?;
                     if reason == Term::atom(arinsal_term::atoms::KILL) && !linked_exit {
-                        // Port of erts/emulator/beam/erl_proc_sig_queue.c:4782
-                        // (handle_exit_signal), OTP-29.1.1: `kill` exits without exception dispatch.
-                        break 'exit Err(VmError::Trap(crate::exceptions::Trap::killed()));
+                        // Port of erts/emulator/beam/erl_proc_sig_queue.c:4766-4782
+                        // (handle_exit_signal), OTP-29.1.1: an untrappable `kill` terminates
+                        // with `killed` through erts_set_self_exiting; `cnt++`.
+                        self.erts_set_self_exiting(ctx, Term::atom(arinsal_term::atoms::KILLED));
+                        *exited = true;
+                        break 'exit Ok(1);
                     }
                     if self.trap_exit() {
                         // Port of erts/emulator/beam/external.c:3127-3141, OTP-29.1.1.
@@ -538,8 +572,11 @@ impl Process {
                         break 'exit Ok(1);
                     }
                     if reason != Term::atom(arinsal_term::atoms::NORMAL) {
-                        self.heap.abi.exc.fvalue = reason.tagged_word();
-                        break 'exit Err(VmError::Trap(crate::exceptions::Trap::exit(reason)));
+                        // handle_exit_signal (erl_proc_sig_queue.c:4763-4784): terminate
+                        // through erts_set_self_exiting; `cnt++`.
+                        self.erts_set_self_exiting(ctx, reason);
+                        *exited = true;
+                        break 'exit Ok(1);
                     }
                     if was_linked {
                         self.trace_getting_unlinked(ctx, from);
@@ -599,8 +636,11 @@ impl Process {
                         break 'exit Ok(1);
                     }
                     if reason != Term::atom(arinsal_term::atoms::NORMAL) {
-                        self.heap.abi.exc.fvalue = reason.tagged_word();
-                        break 'exit Err(VmError::Trap(crate::exceptions::Trap::exit(reason)));
+                        // handle_exit_signal (erl_proc_sig_queue.c:4763-4784): terminate
+                        // through erts_set_self_exiting; `cnt++`.
+                        self.erts_set_self_exiting(ctx, reason);
+                        *exited = true;
+                        break 'exit Ok(1);
                     }
                     Ok(2)
                 };
@@ -759,7 +799,7 @@ impl Process {
                 }
             }
             arinsal_sched::Signal::DistExit(exit) => {
-                self.handle_dist_exit_signal(ctx, from, *exit)?
+                self.handle_dist_exit_signal(ctx, from, *exit, exited)?
             }
             arinsal_sched::Signal::UnlinkAckSignal(id) => self.handle_unlink_ack_signal(from, id),
             // Port of erl_proc_sig_queue.c:6879 (ERTS_SIG_Q_OP_DIST_SPAWN_REPLY): the handler
@@ -951,6 +991,7 @@ impl Process {
         ctx: &mut RunCtx<'_, crate::Process>,
         sender: Pid,
         exit: arinsal_sched::DistExitSignal<Message>,
+        exited: &mut bool,
     ) -> Result<i32, VmError> {
         let arinsal_sched::DistExitSignal {
             from,
@@ -991,8 +1032,8 @@ impl Process {
             was_linked = true;
             prio = link_prio;
         }
-        let result =
-            self.convert_dist_exit_signal(ctx, sender, from, linked, was_linked, prio, reason);
+        let result = self
+            .convert_dist_exit_signal(ctx, sender, from, linked, was_linked, prio, reason, exited);
         // handle_exit_signal: deleted after the message is inserted, so the prio queue is
         // still installed for it.
         if prio_link_removed {
@@ -1013,6 +1054,7 @@ impl Process {
         was_linked: bool,
         prio: bool,
         reason: Message,
+        exited: &mut bool,
     ) -> Result<i32, VmError> {
         let mut message = reason;
         // erl_proc_sig_queue.c:4724-4736 (handle_exit_signal): the reason of an exit received
@@ -1042,12 +1084,18 @@ impl Process {
             }
             return Ok(1);
         }
+        // handle_exit_signal (erl_proc_sig_queue.c:4763-4784): an untrappable `kill`
+        // terminates with `killed`, any other abnormal reason with itself, through
+        // erts_set_self_exiting; `cnt++`.
         if !linked && reason == Term::atom(arinsal_term::atoms::KILL) {
-            return Err(VmError::Trap(crate::exceptions::Trap::killed()));
+            self.erts_set_self_exiting(ctx, Term::atom(arinsal_term::atoms::KILLED));
+            *exited = true;
+            return Ok(1);
         }
         if reason != Term::atom(arinsal_term::atoms::NORMAL) {
-            self.heap.abi.exc.fvalue = reason.tagged_word();
-            return Err(VmError::Trap(crate::exceptions::Trap::exit(reason)));
+            self.erts_set_self_exiting(ctx, reason);
+            *exited = true;
+            return Ok(1);
         }
         if was_linked {
             self.trace_getting_unlinked_external(ctx, from);
@@ -1153,7 +1201,9 @@ impl Process {
         // `erts_proc_sig_handle_incoming`.
         let mut reds = reds.max(1);
         let max_reds = reds;
-        let result = self.handle_incoming(ctx, &mut reds, max_reds, false);
+        let result = self
+            .handle_incoming(ctx, &mut reds, max_reds, false)
+            .and_then(|done| Self::erts_bif_chk_exited(self, ctx).map(|()| done));
         self.set_gc_enabled(gc);
         let done = !matches!(result, Ok(false));
         if let Err(error) = result {

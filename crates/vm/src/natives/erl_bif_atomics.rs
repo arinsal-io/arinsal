@@ -390,7 +390,10 @@ fn counters_add(process: &mut Process, x: &[Term]) -> Result<Term, VmError> {
                 .ok_or_else(badarg)?
                 - 1;
             let increment = arithmetic_value(increment_term).ok_or_else(badarg)?;
-            let slot = process.scheduler_id as usize;
+            let slot = crate::proc_create::raw::erts_psd_get_word(
+                &process.psd,
+                crate::proc_create::raw::ERTS_PSD_SCHED_ID,
+            );
             let cell = counter_cell(array, index, slot);
             let value = cell.load(Ordering::Relaxed).wrapping_add(increment);
             cell.store(value, Ordering::Relaxed);

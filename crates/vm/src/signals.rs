@@ -1395,10 +1395,24 @@ fn run_request(
             RemoteOp::Collect { .. } | RemoteOp::CopyLiteralArea { .. }
         )
     {
-        process
-            .cold_mut()
-            .delayed_gc_tasks
-            .save_gc_task(index, pending);
+        if crate::proc_create::raw::erts_psd_get_mut::<SysTaskQueues>(
+            &mut process.psd,
+            crate::proc_create::raw::ERTS_PSD_DELAYED_GC_TASK_QS,
+        )
+        .is_none()
+        {
+            crate::proc_create::raw::erts_psd_set(
+                &mut process.psd,
+                crate::proc_create::raw::ERTS_PSD_DELAYED_GC_TASK_QS,
+                Some(Box::new(SysTaskQueues::default())),
+            );
+        }
+        crate::proc_create::raw::erts_psd_get_mut::<SysTaskQueues>(
+            &mut process.psd,
+            crate::proc_create::raw::ERTS_PSD_DELAYED_GC_TASK_QS,
+        )
+        .expect("delayed GC task queue initialized")
+        .save_gc_task(index, pending);
         return Ok(());
     }
     // `ERTS_PSTT_CLA` with the check flag is only queued when the signal handler
@@ -1670,10 +1684,16 @@ pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, crate:
         for queue in std::mem::take(&mut cold.sys_tasks).sys {
             pending.extend(queue);
         }
-        for queue in std::mem::take(&mut cold.delayed_gc_tasks).sys {
+        pending.extend(std::mem::take(&mut cold.dirty_sys_tasks));
+    }
+    if let Some(mut delayed) = crate::proc_create::raw::erts_psd_set::<SysTaskQueues>(
+        &mut process.psd,
+        crate::proc_create::raw::ERTS_PSD_DELAYED_GC_TASK_QS,
+        None,
+    ) {
+        for queue in std::mem::take(&mut *delayed).sys {
             pending.extend(queue);
         }
-        pending.extend(std::mem::take(&mut cold.dirty_sys_tasks));
     }
     for pending in pending {
         fail_sys_task(process, ctx, pending);

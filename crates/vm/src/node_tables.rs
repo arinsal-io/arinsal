@@ -112,8 +112,6 @@ pub(crate) struct DistState {
     pub(crate) pending_bytes: u64,
     pub(crate) busy_limit: u64,
     pub(crate) busy: bool,
-    /// The inet port's own busy state is separate from the dist entry queue.
-    pub(crate) port_busy: bool,
     pub(crate) suspended_senders: Vec<Pid>,
     pub(crate) flags: u64,
     pub(crate) remote_pids: HashMap<(u32, u32, u32), Pid>,
@@ -150,7 +148,6 @@ impl DistState {
             pending_bytes: 0,
             busy_limit: 1024 * 1024,
             busy: false,
-            port_busy: false,
             suspended_senders: Vec::new(),
             flags,
             remote_pids: HashMap::new(),

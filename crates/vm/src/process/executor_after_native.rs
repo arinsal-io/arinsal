@@ -212,7 +212,13 @@ pub(super) fn context_switch(
                 reg.x_reg_array[5] = Term::atom(handler_function);
                 process.gc_live = 4;
                 process.native_apply = true;
-                let result = (Vm {}).apply_fixed(process, 4, Some(ctx));
+                let result = crate::beam_common::fixed_apply(
+                    process,
+                    &mut reg.x_reg_array,
+                    4,
+                    &mut Vm {},
+                    Some(ctx),
+                );
                 process.native_apply = false;
                 match result? {
                     crate::ImportOutcome::Dispatch => {}
@@ -275,11 +281,12 @@ pub(super) fn context_switch(
                     // tail-call the process-configured breakpoint handler.
                     process.gc_live = arity;
                     super::executor::bump_fcalls(process, 1);
-                    let called = (Vm {}).call_debug_breakpoint_handler(
+                    let called = crate::beam_common::call_error_handler(
                         process,
-                        function.module,
-                        function.function,
-                        arity,
+                        (function.module, function.function, arity),
+                        &mut reg.x_reg_array,
+                        "breakpoint",
+                        &mut Vm {},
                         Some(ctx),
                     )?;
                     match called {
@@ -453,10 +460,7 @@ pub(super) fn context_switch(
                 let saved_arguments: smallvec::SmallVec<[Term; 8]> =
                     smallvec::SmallVec::from_slice(&reg.x_reg_array[..export.arity as usize]);
                 let collections_before = process.stats.gc.collections;
-                // erlang:make_fun/3 is implemented by the VM's call path (funs.rs), not
-                // by the native BIF table; handle it here like the interpreter does.
-                // erlang:make_fun/3 and fun_info/1,2, fun_info_mfa/1 are implemented
-                // by the VM's call path (funs.rs), not by the native BIF table.
+                // These exports use the same C-file ports as the interpreter call path.
                 // A BIF native code already called left an outcome only the scheduler
                 // completes: finish the call with it, without calling the BIF again.
                 let outcome = process
@@ -473,12 +477,18 @@ pub(super) fn context_switch(
                     )
                 {
                     Some(match export.function.as_str() {
-                        "make_fun" => {
-                            let args = [reg.x_reg_array[0], reg.x_reg_array[1], reg.x_reg_array[2]];
-                            (Vm {}).make_export_fun(process, &args)
+                        "make_fun" => crate::bif::make_fun_3(process, &reg.x_reg_array[..3])
+                            .ok_or_else(|| VmError::Unsupported("make_fun BIF declined".into()))?
+                            .map_err(VmError::Trap),
+                        "fun_info" if export.arity == 2 => {
+                            crate::erl_bif_info::fun_info_2(process, &reg.x_reg_array[..2])
+                                .ok_or_else(|| {
+                                    VmError::Unsupported("fun_info/2 BIF declined".into())
+                                })
+                                .and_then(|result| result.map_err(VmError::Trap))
                         }
-                        "fun_info" => (Vm {}).fun_info(process, export.arity == 2),
-                        _ => (Vm {}).fun_info_mfa(process),
+                        "fun_info" => (Vm {}).fun_info(process),
+                        _ => crate::erl_bif_info::fun_info_mfa_1(process, &mut reg.x_reg_array),
                     })
                 } else {
                     // Port of erts/emulator/beam/jit/arm/process_main.cpp
@@ -743,11 +753,13 @@ pub(super) fn context_switch(
                         Ok(module_id) => module_id,
                         Err(_) => {
                             let saved = reg.x_reg_array[..export.arity as usize].to_vec();
-                            let called = (Vm {}).call_undefined_function(
+                            let called = crate::beam_common::call_error_handler(
                                 process,
-                                &export.module,
-                                &export.function,
-                                export.arity as usize,
+                                (&export.module, &export.function, export.arity as usize),
+                                &mut reg.x_reg_array,
+                                "undefined_function",
+                                &mut Vm {},
+                                None,
                             );
                             let outcome = match called {
                                 Ok(outcome) => outcome,
@@ -843,11 +855,13 @@ pub(super) fn context_switch(
                 // callee's own `i_test_yield` at its native entry.
             } else {
                 let saved = reg.x_reg_array[..export.arity as usize].to_vec();
-                let called = (Vm {}).call_undefined_function(
+                let called = crate::beam_common::call_error_handler(
                     process,
-                    &export.module,
-                    &export.function,
-                    export.arity as usize,
+                    (&export.module, &export.function, export.arity as usize),
+                    &mut reg.x_reg_array,
+                    "undefined_function",
+                    &mut Vm {},
+                    None,
                 );
                 let outcome = match called {
                     Ok(outcome) => outcome,

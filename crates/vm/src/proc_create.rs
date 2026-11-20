@@ -378,6 +378,9 @@ pub struct Process {
     pub heap: ProcessHeap,
     /// X registers. Inline for the erts default of six (`def_arg_reg`).
     pub x: ArgRegs,
+    /// Nullable `p->psd` (`ErtsPSD *`), allocated when a non-null PSD value is first stored.
+    // Port of erts/emulator/beam/erl_process.h (`Process.psd`), OTP-29.1.1.
+    pub(crate) psd: std::sync::atomic::AtomicPtr<raw::ErtsPSD>,
     /// The erts process dictionary pointer is part of the hot process structure.
     pub(crate) dictionary: Option<Box<ProcDict>>,
     /// Per-process sequential trace token; `None` is the no-token fast path.
@@ -429,9 +432,6 @@ pub struct Process {
     /// The running scheduler's native sender (`c_p->scheduler_data` of erts), fetched on first
     /// use in a run and dropped when the run ends.
     pub(crate) native: Option<arinsal_sched::NativeHandle<process::Message>>,
-    /// One-based id of the scheduler running this process (0 outside a run), refreshed each slice
-    /// like erts' `c_p->scheduler_data`.
-    pub(crate) scheduler_id: u32,
     /// `p->scheduler_data` (erl_process.h): the data of the normal scheduler running the
     /// process, set and cleared by `erts_schedule`; read through
     /// [`arinsal_sched::erts_proc_sched_data`].
@@ -985,6 +985,7 @@ impl ProcDict {
 }
 /// The traced native functions a return left, innermost first with their trace actions, and the
 /// returned value.
+#[cfg(target_arch = "aarch64")]
 pub(crate) type NativeReturnEvents = crate::trace::NativeReturnEvent;
 
 /// The words stored terms are copied to with `size_object` + `copy_struct`: the `heap` of
@@ -1535,6 +1536,7 @@ pub(crate) struct SliceWork {
 impl ProcessCold {
     /// The pending BIF trap, for a change that leaves it pending.
     #[inline(always)]
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn bif_trap_mut(&mut self) -> Option<&mut BifTrapPending> {
         self.work.bif_trap.as_mut()
     }
@@ -1588,8 +1590,6 @@ pub(crate) struct ProcessCold {
     pub(crate) hibernate: Option<crate::process::HibernateCont>,
     /// `p->max_heap_size` (erts erl_process.h:1034): the limit and its flags.
     pub(crate) max_heap: crate::process::MaxHeap,
-    /// `process_flag(save_calls, N)` buffer (erts `ERTS_PSD_SAVED_CALLS_BUF`).
-    pub(crate) saved_calls: Option<crate::trace::SavedCalls>,
     /// Shared copy of `dirty_exited` for a dirty job running without the process.
     pub(crate) dirty_exit_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// A dirty BIF call waiting for its dirty job, or the job's result.
@@ -1606,13 +1606,9 @@ pub(crate) struct ProcessCold {
     pub(crate) dirty_bif_exception_trace: Option<Term>,
     /// Result of a static dirty NIF executed as a dirty job.
     pub(crate) static_nif_done: Option<Result<Term, arinsal_bifs::BifError>>,
-    /// One-based id of the scheduler running this process, like `erts_get_scheduler_id()`
-    /// for events raised outside a scheduler context (GC trace).
-    pub(crate) scheduler_id: usize,
-    /// `ErtsPrioQInfo`: the prio queue's markers, while it has messages.
-    pub(crate) prio_q: Option<Box<crate::receive::PrioQInfo>>,
     /// The traced function (by pc), actions and return value of a native trace frame whose
     /// return events the executor emits.
+    #[cfg(target_arch = "aarch64")]
     pub(crate) native_return_events: Option<Box<NativeReturnEvents>>,
     /// Sessions whose return_to frame a traced BIF raised through; the exception's catch
     /// reports their return_to events.
@@ -1624,11 +1620,6 @@ pub(crate) struct ProcessCold {
     // carry their return address the way erts does.
     pub(crate) apply_frame_released: u8,
     pub(crate) traced_native_call: Option<(usize, usize, Vec<crate::trace::CallActions>)>,
-    /// Call time and call memory accounting of the process, per trace session.
-    // Port of erts/emulator/beam/erl_process.h (ERTS_PSD_CALL_TIME_BP, ERTS_PSD_CALL_MEMORY_BP),
-    // OTP-29.1.1.
-    pub(crate) call_time: Vec<crate::trace_bp::ProcBpTrace>,
-    pub(crate) call_memory: Vec<crate::trace_bp::ProcBpTrace>,
     /// The trace flags of the process per session as of trace epoch `.0` (erts reaches them
     /// through the process's tracer reference list, `get_tracer_ref`).
     pub(crate) trace_flags: (u64, Vec<(u64, u64)>),
@@ -1646,13 +1637,6 @@ pub(crate) struct ProcessCold {
     /// Operand registers of `apply` calls in progress. A callee may collect before it
     /// yields back to re-execute the apply, so these stay GC roots until it returns.
     pub(crate) apply_roots: Vec<Term>,
-    /// `ERTS_PSD_NFUNC_TRAP_WRAPPER`: the `ErtsNativeFunc` of a native call that scheduled
-    /// itself; its saved arguments are GC roots while it is in use.
-    pub(crate) psd_nfunc_trap_wrapper: Option<crate::erl_nfunc_sched::NativeFuncBox>,
-    /// `ERTS_PSD_DIST_ENTRY` of a process distribution controller (set with
-    /// `F_DISTRIBUTION` by setup_connection_distctrl); its exit runs erts_do_net_exits on
-    /// the entry; net_kernel's is `erts_this_dist_entry` (set by setnode_2).
-    pub(crate) psd_dist_entry: Option<std::sync::Arc<crate::node_tables::DistEntry>>,
     /// Set while the process handles its signals before executing code (erts
     /// `ERTS_PSFLG_RUNNING_SYS`): the only place system tasks execute (erl_process.c
     /// execute_sys_tasks), as no Erlang, native or BIF code is half-way done; a potentially
@@ -1661,10 +1645,6 @@ pub(crate) struct ProcessCold {
     /// erts `p->sys_task_qs`: the system tasks whose ordered signal was handled, until
     /// `execute_sys_tasks` runs them.
     pub(crate) sys_tasks: crate::signals::SysTaskQueues,
-    /// erts `ERTS_PSD_DELAYED_GC_TASK_QS`: GC and copy-literal-area tasks fetched while
-    /// `F_DISABLE_GC` was set (`save_gc_task`); `erts_set_gc_state(1)` moves them back to
-    /// `sys_tasks`.
-    pub(crate) delayed_gc_tasks: crate::signals::SysTaskQueues,
     /// erts `c_p->dirty_sys_tasks`: tasks answered once the dirty scheduler has run the
     /// collection the process was scheduled out for (`save_dirty_task`).
     pub(crate) dirty_sys_tasks: Vec<crate::signals::Pending>,
@@ -1935,10 +1915,11 @@ impl Process {
         let used = self.heap.words_since_high_water() as i64;
         self.heap.delay_collection(need);
         if first_abandon
-            && self
-                .cold
-                .as_ref()
-                .is_some_and(|cold| !cold.call_memory.is_empty())
+            && raw::erts_psd_get::<Vec<crate::trace_bp::ProcBpTrace>>(
+                &self.psd,
+                raw::ERTS_PSD_CALL_MEMORY_BP,
+            )
+            .is_some_and(|entries| !entries.is_empty())
         {
             crate::trace_bp::adjust_memory_break(self, used);
         }
@@ -2127,6 +2108,7 @@ impl Process {
     }
     /// The pending BIF trap, for a change that leaves it pending.
     #[inline(always)]
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn bif_trap_mut(&mut self) -> Option<&mut BifTrapPending> {
         self.cold.as_deref_mut()?.bif_trap_mut()
     }
@@ -2137,6 +2119,7 @@ impl Process {
     }
     /// The pending dirty NIF, for a change that leaves it pending.
     #[inline(always)]
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn native_dirty_nif_mut(
         &mut self,
     ) -> Option<&mut (usize, usize, arinsal_bifs::SchedulerClass)> {
@@ -2305,6 +2288,7 @@ impl Process {
             // erts' x_reg_array always has at least X0..X3 for `found_catch` to install
             // the exception registers without growing the process on the raise path.
             x: ArgRegs::new(x_registers.max(4)),
+            psd: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             dictionary: None,
             seq_trace_token: None,
             seq_token_root: Term::NIL,
@@ -2329,7 +2313,6 @@ impl Process {
             self_pid: None,
             on_managed: false,
             native: None,
-            scheduler_id: 0,
             scheduler_data: arinsal_sched::ProcSchedData::default(),
             run_key: 0,
             exec_key: 0,
@@ -2490,6 +2473,7 @@ impl Process {
         }
         Ok(gc.reductions)
     }
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn tick(&mut self) {
         self.heap.abi.fcalls -= 1;
         if self.heap.abi.fcalls == 0 {
@@ -2660,7 +2644,6 @@ mod procdict_tests {
 /// `None` until the flag is first set; readers then report the erts default.
 #[derive(Default)]
 pub(crate) struct ProcFlags {
-    pub(crate) error_handler: Option<Term>,
     pub(crate) priority: Option<Term>,
     pub(crate) message_queue_data: Option<Term>,
     pub(crate) sensitive: Option<Term>,
@@ -2675,7 +2658,6 @@ pub(crate) struct ProcFlags {
 impl ProcFlags {
     fn slot(&mut self, name: &str) -> &mut Option<Term> {
         match name {
-            "error_handler" => &mut self.error_handler,
             "priority" => &mut self.priority,
             "message_queue_data" => &mut self.message_queue_data,
             "sensitive" => &mut self.sensitive,
@@ -2692,7 +2674,6 @@ impl ProcFlags {
     /// The value of a flag by name, for the cold `process_info` paths.
     pub(crate) fn get(&self, name: &str) -> Option<Term> {
         match name {
-            "error_handler" => self.error_handler,
             "priority" => self.priority,
             "message_queue_data" => self.message_queue_data,
             "sensitive" => self.sensitive,
@@ -2933,6 +2914,7 @@ mod layout_report {
         eprintln!("Process {}", size_of::<Process>());
         eprintln!("  Process.heap.abi {}", size_of_val(&process.heap.abi));
         eprintln!("  Process.x {}", size_of_val(&process.x));
+        eprintln!("  Process.psd {}", size_of_val(&process.psd));
         eprintln!("  Process.heap {}", size_of_val(&process.heap));
         eprintln!("  Process.dictionary {}", size_of_val(&process.dictionary));
         eprintln!(
@@ -3000,10 +2982,6 @@ mod layout_report {
         );
         eprintln!("  Process.runtime {}", size_of_val(&process.runtime));
         eprintln!("  Process.self_pid {}", size_of_val(&process.self_pid));
-        eprintln!(
-            "  Process.scheduler_id {}",
-            size_of_val(&process.scheduler_id)
-        );
         eprintln!(
             "  Process.signal_probe {}",
             size_of_val(&process.signal_probe)
@@ -3128,7 +3106,6 @@ mod layout_report {
         }
         field!("hibernate", Option<crate::process::HibernateCont>);
         field!("max_heap", crate::process::MaxHeap);
-        field!("saved_calls", Option<crate::trace::SavedCalls>);
         field!("dirty_bif", Option<crate::dirty::DirtyBif>);
         field!(
             "static_nif_done",

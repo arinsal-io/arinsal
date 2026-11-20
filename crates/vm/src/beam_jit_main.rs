@@ -15,6 +15,7 @@ static BEAM_SAVE_CALLS_EXPORT: AtomicUsize = AtomicUsize::new(0);
 static BEAM_SAVE_CALLS_FUN: AtomicUsize = AtomicUsize::new(0);
 static BEAM_UNLOADED_FUN: AtomicUsize = AtomicUsize::new(0);
 static BEAM_I_LINE_BREAKPOINT_CLEANUP: AtomicUsize = AtomicUsize::new(0);
+static BEAM_EXIT: AtomicUsize = AtomicUsize::new(0);
 
 /// The code pointers `beamasm_init` of a backend publishes (beam_jit_main.cpp:373-397).
 pub(crate) struct BeamCodePtrs {
@@ -30,6 +31,8 @@ pub(crate) struct BeamCodePtrs {
     pub(crate) unloaded_fun: usize,
     /// `beam_i_line_breakpoint_cleanup`.
     pub(crate) i_line_breakpoint_cleanup: usize,
+    /// `beam_exit`.
+    pub(crate) exit: usize,
 }
 
 /// Stores the code pointers of the backend's global code.
@@ -42,6 +45,9 @@ pub(crate) fn publish(ptrs: &BeamCodePtrs) {
     BEAM_SAVE_CALLS_FUN.store(ptrs.save_calls_fun, Ordering::Relaxed);
     BEAM_UNLOADED_FUN.store(ptrs.unloaded_fun, Ordering::Relaxed);
     BEAM_I_LINE_BREAKPOINT_CLEANUP.store(ptrs.i_line_breakpoint_cleanup, Ordering::Relaxed);
+    // `c_p->i == beam_exit` identifies an exiting process: never the null `i`.
+    assert_ne!(ptrs.exit, 0, "beamasm_init: beam_exit");
+    BEAM_EXIT.store(ptrs.exit, Ordering::Relaxed);
     crate::fun_dispatch::init(ptrs.unloaded_fun, ptrs.save_calls_fun);
 }
 
@@ -63,6 +69,12 @@ pub(crate) fn beam_save_calls_export() -> usize {
 /// `beam_i_line_breakpoint_cleanup`: the return address of a line breakpoint hit.
 pub(crate) fn beam_i_line_breakpoint_cleanup() -> usize {
     BEAM_I_LINE_BREAKPOINT_CLEANUP.load(Ordering::Relaxed)
+}
+
+/// `beam_exit`: where a process that `erts_set_self_exiting` made exiting continues; it
+/// terminates through `handle_error` with its catches killed.
+pub(crate) fn beam_exit() -> usize {
+    BEAM_EXIT.load(Ordering::Relaxed)
 }
 
 /// `beamasm_init()`: the global code of the backend, generated once per OS process.
@@ -161,6 +173,8 @@ mod x86 {
             save_calls_fun: get(GlobalLabels::DispatchSaveCallsFun),
             unloaded_fun: get(GlobalLabels::UnloadedFun),
             i_line_breakpoint_cleanup: get(GlobalLabels::ILineBreakpointCleanup),
+            // `beam_exit = (ErtsCodePtr)bga->get_process_exit()` (beam_jit_main.cpp:395).
+            exit: get(GlobalLabels::ProcessExit),
         });
         arinsal_beamasm::set_process_main_labels(get(GlobalLabels::DispatchNif));
     }
