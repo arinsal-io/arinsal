@@ -19,7 +19,8 @@ clock_values() ->
      erts_internal:time_unit(), erts_internal:perf_counter_unit(),
      erlang:convert_time_unit(-500, native, microsecond),
      erlang:convert_time_unit(123456789, 137, 1000),
-     erlang:convert_time_unit(1000000000, perf_counter, microsecond)}.
+     erlang:convert_time_unit(1000000000, perf_counter, microsecond),
+     os:perf_counter()}.
 
 unit_values() ->
     Units = [native, nanosecond, nano_seconds, microsecond, micro_seconds,
@@ -207,23 +208,30 @@ fn time_bifs_match_otp_values_and_clock_relations() {
     };
     let beam = reference.compile_named(MODULE, SOURCE, &[]).unwrap();
     reference.load(MODULE, &beam).unwrap();
+    let mut vm = crate::common::node();
+    vm.load_bytes(&beam).unwrap();
     let expected = reference.call(MODULE, "clock_values", &[]);
     let CallResult::Ok(expected) = expected else {
         panic!("OTP clock snapshot failed: {expected:?}");
     };
-    let mut vm = crate::common::node();
-    vm.load_bytes(&beam).unwrap();
     let actual = vm
         .eval_scheduled(MODULE, "clock_values", &[], 1)
         .unwrap()
         .term;
     let actual = tuple(&actual);
     let expected = tuple(&expected);
-    assert_eq!(actual.len(), 20);
-    assert_eq!(expected.len(), 20);
+    assert_eq!(actual.len(), 21);
+    assert_eq!(expected.len(), 21);
+    assert!(int(&actual[20]) > 0);
+    assert!(int(&expected[20]) > 0);
 
     for index in [0, 1, 2, 3, 4, 5] {
-        assert!((int(&actual[index]) - int(&expected[index])).abs() < 2_000_000_000);
+        let actual_clock = int(&actual[index]);
+        let expected_clock = int(&expected[index]);
+        assert!(
+            (actual_clock - expected_clock).abs() < 2_000_000_000,
+            "clock {index}: Arinsal={actual_clock}, OTP={expected_clock}"
+        );
     }
     for values in [actual, expected] {
         for (nanos, millis) in [(0, 1), (3, 4), (6, 7), (9, 10)] {

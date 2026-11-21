@@ -85,7 +85,7 @@ fn request_allocators(
     }
     let sources = MemorySources::gather(process);
     let runtime = process.runtime.ok_or_else(badarg)?;
-    let target = process.self_pid.ok_or_else(badarg)?;
+    let target = process.self_pid().ok_or_else(badarg)?;
     let names = names
         .iter()
         .map(|name| (*name).to_owned())

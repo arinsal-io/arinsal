@@ -4,7 +4,7 @@
 //! (`emit_read_bits`, `emit_extract_integer`, `emit_extract_bitstring`,
 //! `emit_i_bs_match_test_heap`), OTP-29.1.1.
 
-use crate::bs_match::{BsMatchCmdHelper, BsMatchHelper};
+use crate::bs_match::emit_bs_runtime_call;
 pub use crate::common::bs::BsmCommand;
 use crate::common::bs::{Action, SMALL_BITS, bsm_init, heap_bits_size, opt_bsm_segments};
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
@@ -604,9 +604,6 @@ impl BeamModuleAssembler {
         need: u64,
         live: u32,
         commands: &[BsmCommand],
-        helper: BsMatchHelper,
-        cmd_helper: BsMatchCmdHelper,
-        gc_hook: crate::construct::GcHook,
     ) -> Result<(), ModuleError> {
         let segments = bsm_init(commands);
         let segments = opt_bsm_segments(&segments, need, live);
@@ -693,7 +690,7 @@ impl BeamModuleAssembler {
                     self.code.b_cond(Cond::Ne, fail_label)?;
                 }
                 Action::TestHeap => {
-                    self.emit_test_heap(seg.size as u32, seg.live.unwrap_or(0), gc_hook)?;
+                    self.emit_test_heap(seg.size as u32, seg.live.unwrap_or(0))?;
                     position_is_valid = false;
                     small_tag_valid = false;
                 }
@@ -746,30 +743,37 @@ impl BeamModuleAssembler {
                     // Integers wider than 64 bits and bitstrings that are not extracted
                     // inline run through the runtime (erts_bs_get_integer_2,
                     // erts_build_sub_bitstring).
-                    let kind = u32::from(seg.action == Action::GetBitstring);
-                    let tagged = |value: u64| ArgVal::Immediate((value << 4) | 0xf);
-                    self.emit_bs_match_command(
-                        kind,
-                        seg.live.unwrap_or(0),
-                        &[ctx, tagged(seg.flags), tagged(seg.size), tagged(1)],
-                        fail,
-                        seg.dst,
-                        cmd_helper,
-                    )?;
+                    let live = seg.live.unwrap_or(0);
+                    if seg.action == Action::GetInteger {
+                        let context = self.source_reg(ctx)?;
+                        self.code.emit(|e| {
+                            e.and_imm(TMP4, context, !7)?;
+                            e.mov_const(TMP3, seg.size)?;
+                            e.mov_const(TMP2, seg.flags)
+                        })?;
+                        emit_bs_runtime_call(
+                            self,
+                            crate::rt::erts_bs_get_integer_2 as *const () as usize,
+                            live as usize,
+                            crate::Update::HEAP,
+                            &[Gpr::x(21), TMP3, TMP2, TMP4],
+                        )?;
+                        self.code.cbz(Gpr::x(0), fail_label)?;
+                        self.store_register(
+                            seg.dst.ok_or(ModuleError::InvalidOperand(
+                                "read integer has no destination",
+                            ))?,
+                            Gpr::x(0),
+                        )?;
+                    } else {
+                        self.emit_bs_build_sub_bitstring(ctx, seg.dst, live, Some(seg.size))?;
+                    }
                     position_is_valid = false;
                     small_tag_valid = false;
                 }
                 Action::GetTail => {
-                    // The heap test above reserved BUILD_SUB_BITSTRING_HEAP_NEED words.
-                    self.emit_bs_helper(
-                        10,
-                        ctx,
-                        ArgVal::Immediate(u64::from(seg.live.unwrap_or(0))),
-                        0,
-                        seg.dst,
-                        None,
-                        helper,
-                    )?;
+                    let live = seg.live.unwrap_or(0);
+                    self.emit_bs_build_sub_bitstring(ctx, seg.dst, live, None)?;
                     position_is_valid = false;
                     small_tag_valid = false;
                 }

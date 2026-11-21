@@ -7,86 +7,74 @@ use std::sync::{
 
 use arinsal_a64::enc::Gpr;
 use arinsal_beamasm::{
-    ExitReason, ProcessHeader, SchedulerRegisters,
-    construct::GcHook,
-    enter_native,
+    ExitReason, ProcessHeader, SchedulerRegisters, enter_native,
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
     rt,
     types::{ArgType, TypedArg},
 };
 
+/// The process native code runs on: the native prefix at `c_p` and the `ERTS_PSFLG_*` word
+/// at `offsetof(Process, state)`, which the garbage-collection fragment reads.
+#[repr(C)]
+struct TestProcess {
+    header: ProcessHeader,
+    state: u32,
+}
+
+const STATE_OFFSET: u32 = std::mem::offset_of!(TestProcess, state) as u32;
+
 static MOVED_AREAS: OnceLock<Mutex<Vec<Box<[u64]>>>> = OnceLock::new();
 static GC_CALLS: AtomicUsize = AtomicUsize::new(0);
 static LAST_GC_LIVE: AtomicUsize = AtomicUsize::new(0);
-static Y_ROOT_GC_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// One past the last stack word of the running case (`run_native`'s area end): the moving
+/// collector relocates the stack words in `[stop, STACK_END)`.
+static STACK_END: AtomicUsize = AtomicUsize::new(0);
 
-extern "C" fn arithmetic_fallback(
-    _header: *mut ProcessHeader,
-    _op: u32,
-    _lhs: u64,
-    _rhs: u64,
-    _extra: u64,
-    _reg: *mut u64,
-) -> u64 {
-    0
+/// The process-wide fragments (`ga`), built once as the VM builds them, with [`moving_gc`] as
+/// `erts_garbage_collect_nobump`.
+fn yield_entries() -> arinsal_beamasm::yield_frag::YieldEntries {
+    use arinsal_beamasm::yield_frag::YieldFragments;
+    static FRAGMENTS: OnceLock<YieldFragments> = OnceLock::new();
+    FRAGMENTS
+        .get_or_init(|| YieldFragments::new(moving_gc as *const () as usize, STATE_OFFSET).unwrap())
+        .entries()
 }
 
+/// The process-wide fragments the arithmetic emitters call on their slow paths, which these
+/// tests never take (their operands are smalls).
+fn bif_fragments() -> arinsal_beamasm::raise_frag::BifFragments {
+    use arinsal_beamasm::raise_frag::RaiseFragments;
+    static RAISE: OnceLock<RaiseFragments> = OnceLock::new();
+    extern "C" fn unused() {
+        unreachable!("the tests run only fast paths")
+    }
+    RAISE
+        .get_or_init(|| {
+            let context_switch = yield_entries().context_switch;
+            RaiseFragments::new(
+                unused as *const () as usize,
+                unused as *const () as usize,
+                context_switch,
+            )
+            .unwrap()
+        })
+        .bif_fragments()
+}
+
+/// `erts_garbage_collect_nobump` of these cases: moves the heap to a new area and relocates
+/// the `nobj` X roots in `objv` and the stack words.
 extern "C" fn moving_gc(
     header_pointer: *mut ProcessHeader,
-    regs_pointer: *mut u64,
     need_words: usize,
-    live: usize,
+    objv: *mut u64,
+    nobj: i32,
     _fcalls: i32,
 ) -> i32 {
+    let live = usize::try_from(nobj).unwrap();
     LAST_GC_LIVE.store(live, Ordering::SeqCst);
     rt::process_header_mut(header_pointer, |header| {
-        rt::scheduler_registers_mut(regs_pointer, |regs| {
-            let old_heap = header.heap;
-            let old_top = header.htop;
-            let used = (old_top as usize - old_heap as usize) / std::mem::size_of::<u64>();
-            let capacity = used + need_words + 64;
-            let mut new_area = vec![0u64; capacity].into_boxed_slice();
-            let new_heap = new_area.as_mut_ptr();
-            rt::copy_words(old_heap, new_heap, used);
-            let old_start = old_heap as usize;
-            let old_end = old_top as usize;
-            for root in regs.x_reg_array.iter_mut().take(live.min(6)) {
-                let word = root.tagged_word();
-                let tag = word & 7;
-                if tag == 1 || tag == 2 {
-                    let pointer = (word & !7) as usize;
-                    if (old_start..old_end).contains(&pointer) {
-                        *root = rt::fixture_term(
-                            ((word & !7)
-                                .wrapping_add((new_heap as usize).wrapping_sub(old_start) as u64))
-                                | tag,
-                        );
-                    }
-                }
-            }
-            header.heap = new_heap;
-            header.htop = new_heap.wrapping_add(used);
-            header.hend = new_heap.wrapping_add(capacity);
-            MOVED_AREAS
-                .get_or_init(Default::default)
-                .lock()
-                .unwrap()
-                .push(new_area);
-            GC_CALLS.fetch_add(1, Ordering::SeqCst);
-            0
-        })
-    })
-}
-
-extern "C" fn moving_gc_with_y_root(
-    header_pointer: *mut ProcessHeader,
-    regs_pointer: *mut u64,
-    need_words: usize,
-    live: usize,
-    _fcalls: i32,
-) -> i32 {
-    rt::process_header_mut(header_pointer, |header| {
-        rt::scheduler_registers_mut(regs_pointer, |regs| {
+        // `objv` is `load_x_reg_array`, the start of the register file.
+        rt::scheduler_registers_mut(objv, |regs| {
             let old_heap = header.heap;
             let old_top = header.htop;
             let old_start = old_heap as usize;
@@ -101,10 +89,14 @@ extern "C" fn moving_gc_with_y_root(
                 relocate_test_root(&mut word, old_start, old_end, new_heap);
                 *root = rt::fixture_term(word);
             }
-            let mut y_root = 0;
-            rt::copy_words(header.stop, &mut y_root, 1);
-            relocate_test_root(&mut y_root, old_start, old_end, new_heap);
-            rt::copy_words(&y_root, header.stop, 1);
+            let mut slot = header.stop;
+            while (slot as usize) < STACK_END.load(Ordering::SeqCst) {
+                let mut word = 0;
+                rt::copy_words(slot, &mut word, 1);
+                relocate_test_root(&mut word, old_start, old_end, new_heap);
+                rt::copy_words(&word, slot, 1);
+                slot = slot.wrapping_add(1);
+            }
             header.heap = new_heap;
             header.htop = new_heap.wrapping_add(used);
             header.hend = new_heap.wrapping_add(capacity);
@@ -113,7 +105,7 @@ extern "C" fn moving_gc_with_y_root(
                 .lock()
                 .unwrap()
                 .push(new_area);
-            Y_ROOT_GC_CALLS.fetch_add(1, Ordering::SeqCst);
+            GC_CALLS.fetch_add(1, Ordering::SeqCst);
             0
         })
     })
@@ -131,16 +123,15 @@ fn relocate_test_root(root: &mut u64, old_start: usize, old_end: usize, new_heap
 }
 
 fn run_native(
-    emit: impl FnOnce(
-        &mut BeamModuleAssembler,
-        GcHook,
-    ) -> Result<(), arinsal_beamasm::module::ModuleError>,
+    emit: impl FnOnce(&mut BeamModuleAssembler) -> Result<(), arinsal_beamasm::module::ModuleError>,
     setup: impl FnOnce(&mut [u64; 128], &mut ProcessHeader, &mut SchedulerRegisters),
 ) -> (ProcessHeader, [u64; 1024], [u64; 128], usize) {
     let mut asm = BeamModuleAssembler::new();
+    asm.set_yield_fragments(yield_entries());
+    asm.set_bif_fragments(bif_fragments());
     asm.emit_i_func_label(1).unwrap();
     asm.emit_raw(|e| e.mov_reg(Gpr::x(24), Gpr::x(30))).unwrap();
-    emit(&mut asm, moving_gc).unwrap();
+    emit(&mut asm).unwrap();
     asm.emit_raw(|e| {
         e.mov_reg(Gpr::x(30), Gpr::x(24))?;
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
@@ -151,21 +142,25 @@ fn run_native(
     let mut area = [0u64; 128];
     let base = area.as_mut_ptr();
     let stop = base.wrapping_add(area.len());
+    STACK_END.store(stop as usize, Ordering::SeqCst);
     let hend = base.wrapping_add(96);
-    let mut header = ProcessHeader {
-        htop: base,
-        stop,
-        heap: base,
-        hend,
-        fcalls: 100,
-        ..ProcessHeader::default()
+    let mut process = TestProcess {
+        header: ProcessHeader {
+            htop: base,
+            stop,
+            heap: base,
+            hend,
+            fcalls: 100,
+            ..ProcessHeader::default()
+        },
+        state: 0,
     };
     let mut regs = SchedulerRegisters::default();
-    setup(&mut area, &mut header, &mut regs);
-    let result = enter_native(&mut header, &mut regs, &module.entry(1).unwrap());
+    setup(&mut area, &mut process.header, &mut regs);
+    let result = enter_native(&mut process.header, &mut regs, &module.entry(1).unwrap());
     assert_eq!(result, ExitReason::Returned);
     (
-        header,
+        process.header,
         rt::fixture_words(&regs.x_reg_array).try_into().unwrap(),
         area,
         base as usize,
@@ -178,7 +173,7 @@ fn word_ptr(words: &mut [u64], index: usize) -> *mut u64 {
 
 fn native_put_list() {
     let (_, regs, heap, base) = run_native(
-        |m, _| m.emit_put_list(ArgVal::X(0), ArgVal::X(1), ArgVal::X(2)),
+        |m| m.emit_put_list(ArgVal::X(0), ArgVal::X(1), ArgVal::X(2)),
         |_, _, regs| {
             regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(tagged_small(13));
             regs.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(0x3b);
@@ -190,7 +185,7 @@ fn native_put_list() {
 
 fn native_put_tuple2() {
     let (_, regs, heap, base) = run_native(
-        |m, _| m.emit_put_tuple2(ArgVal::X(3), &[ArgVal::X(0), ArgVal::Immediate(0x3b)]),
+        |m| m.emit_put_tuple2(ArgVal::X(3), &[ArgVal::X(0), ArgVal::Immediate(0x3b)]),
         |_, _, regs| {
             regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(tagged_small(4));
         },
@@ -201,7 +196,7 @@ fn native_put_tuple2() {
 
 fn native_get_list() {
     let (_, regs, _, _) = run_native(
-        |m, _| m.emit_get_list(ArgVal::X(0), ArgVal::X(1), ArgVal::X(2)),
+        |m| m.emit_get_list(ArgVal::X(0), ArgVal::X(1), ArgVal::X(2)),
         |heap, _, regs| {
             heap[..2].copy_from_slice(&[tagged_small(8), 0x3b]);
             regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64 | 1);
@@ -213,7 +208,7 @@ fn native_get_list() {
 #[test]
 fn native_get_list_alias_survives_y_frame_return() {
     let (header, regs, _, base) = run_native(
-        |m, hook| {
+        |m| {
             m.emit_is_tuple(ArgVal::X(0), 100)?;
             m.emit_test_arity(ArgVal::X(0), ArgVal::Immediate(2 << 6), 101)?;
             m.emit_get_tuple_element(ArgVal::X(0), 8, ArgVal::X(1))?;
@@ -227,7 +222,7 @@ fn native_get_list_alias_survives_y_frame_return() {
             m.emit_get_list(ArgVal::X(2), ArgVal::X(3), ArgVal::X(2))?;
             m.emit_is_nil(ArgVal::X(2), 106)?;
             m.emit_is_list(ArgVal::X(1), 107)?;
-            m.allocate_checked(2, 4, hook)?;
+            m.allocate_checked(2, 4)?;
             m.init_yregs(0, 1)?;
             m.move_(ArgVal::X(3), ArgVal::Y(1))?;
             m.emit_is_nonempty_list(ArgVal::X(1), 108)?;
@@ -235,9 +230,9 @@ fn native_get_list_alias_survives_y_frame_return() {
             m.emit_is_nonempty_list(ArgVal::X(2), 40)?;
             m.emit_i_func_label(40)?;
             m.emit_is_nil(ArgVal::X(2), 110)?;
-            m.emit_test_heap(3, 2, hook)?;
+            m.emit_test_heap(3, 2)?;
             m.emit_put_tuple2(ArgVal::X(0), &[ArgVal::Immediate(0x3b), ArgVal::X(1)])?;
-            m.emit_test_heap(6, 1, hook)?;
+            m.emit_test_heap(6, 1)?;
             m.emit_put_tuple2(
                 ArgVal::X(1),
                 &[ArgVal::Immediate(tagged_small(99)), ArgVal::Y(1)],
@@ -293,7 +288,7 @@ fn native_get_list_alias_survives_y_frame_return() {
 
 fn native_list_tail_survives_tuple_field_loads() {
     let (_, regs, _, base) = run_native(
-        |m, _| {
+        |m| {
             m.emit_get_list(ArgVal::X(0), ArgVal::X(3), ArgVal::X(4))?;
             m.emit_load_tuple_ptr(ArgVal::X(3), ArgVal::X(3))?;
             m.emit_get_tuple_element(ArgVal::X(3), 8, ArgVal::X(0))?;
@@ -301,7 +296,6 @@ fn native_list_tail_survives_tuple_field_loads() {
                 TypedArg::new(ArgVal::X(1), ArgType::ANY),
                 TypedArg::new(ArgVal::X(0), ArgType::ANY),
                 ArgVal::X(0),
-                arithmetic_fallback,
             )?;
             m.emit_load_tuple_ptr(ArgVal::X(3), ArgVal::X(3))?;
             m.emit_get_tuple_element(ArgVal::X(3), 16, ArgVal::X(1))?;
@@ -309,7 +303,6 @@ fn native_list_tail_survives_tuple_field_loads() {
                 TypedArg::new(ArgVal::X(1), ArgType::ANY),
                 TypedArg::new(ArgVal::Immediate(tagged_small(0)), ArgType::ANY),
                 ArgVal::X(2),
-                arithmetic_fallback,
             )?;
             m.move_(ArgVal::X(0), ArgVal::X(1))?;
             m.move_(ArgVal::X(4), ArgVal::X(0))
@@ -336,7 +329,7 @@ fn native_list_tail_survives_tuple_field_loads() {
 
 fn native_get_hd() {
     let (_, regs, _, _) = run_native(
-        |m, _| m.emit_get_hd(ArgVal::X(0), ArgVal::X(1)),
+        |m| m.emit_get_hd(ArgVal::X(0), ArgVal::X(1)),
         |heap, _, regs| {
             heap[0] = tagged_small(21);
             regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64 | 1);
@@ -347,7 +340,7 @@ fn native_get_hd() {
 
 fn native_get_tl() {
     let (_, regs, _, _) = run_native(
-        |m, _| m.emit_get_tl(ArgVal::X(0), ArgVal::X(1)),
+        |m| m.emit_get_tl(ArgVal::X(0), ArgVal::X(1)),
         |heap, _, regs| {
             heap[1] = tagged_small(22);
             regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64 | 1);
@@ -358,7 +351,7 @@ fn native_get_tl() {
 
 fn native_get_tuple_element() {
     let (_, regs, _, _) = run_native(
-        |m, _| {
+        |m| {
             m.emit_load_tuple_ptr(ArgVal::X(0), ArgVal::X(0))?;
             m.emit_get_tuple_element(ArgVal::X(0), 16, ArgVal::X(1))
         },
@@ -372,7 +365,7 @@ fn native_get_tuple_element() {
 
 fn native_i_get_tuple_element2() {
     let (_, regs, _, _) = run_native(
-        |m, _| m.emit_i_get_tuple_element2(ArgVal::X(0), 8, ArgVal::X(1)),
+        |m| m.emit_i_get_tuple_element2(ArgVal::X(0), 8, ArgVal::X(1)),
         |heap, _, regs| {
             heap[1] = tagged_small(31);
             regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64);
@@ -383,7 +376,7 @@ fn native_i_get_tuple_element2() {
 
 fn native_load_tuple_ptr() {
     let (_, regs, _, base) = run_native(
-        |m, _| m.emit_load_tuple_ptr(ArgVal::X(0), ArgVal::X(1)),
+        |m| m.emit_load_tuple_ptr(ArgVal::X(0), ArgVal::X(1)),
         |heap, _, regs| {
             regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64 | 2);
         },
@@ -397,12 +390,12 @@ fn native_load_tuple_ptr() {
 
 #[test]
 fn tuple_pointer_operation_preserves_y_root_across_moving_gc() {
-    Y_ROOT_GC_CALLS.store(0, Ordering::SeqCst);
+    GC_CALLS.store(0, Ordering::SeqCst);
     let (_, regs, _, _) = run_native(
-        |m, _| {
+        |m| {
             m.move_(ArgVal::X(0), ArgVal::Y(0))?;
             m.emit_load_tuple_ptr(ArgVal::Y(0), ArgVal::Y(0))?;
-            m.emit_test_heap(100, 1, moving_gc_with_y_root)?;
+            m.emit_test_heap(100, 1)?;
             m.move_(ArgVal::Y(0), ArgVal::X(1))
         },
         |area, header, regs| {
@@ -413,14 +406,14 @@ fn tuple_pointer_operation_preserves_y_root_across_moving_gc() {
             regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(area.as_ptr() as u64 | 2);
         },
     );
-    assert_eq!(Y_ROOT_GC_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(GC_CALLS.load(Ordering::SeqCst), 1);
     assert_eq!(regs[0], regs[1]);
     assert_eq!(rt::read_heap_word(regs[1], 2), tagged_small(42));
 }
 
 fn native_set_tuple_element() {
     let (_, _, heap, _) = run_native(
-        |m, _| m.emit_set_tuple_element(ArgVal::X(1), ArgVal::X(0), 16),
+        |m| m.emit_set_tuple_element(ArgVal::X(1), ArgVal::X(0), 16),
         |heap, _, regs| {
             heap[2] = tagged_small(1);
             regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64 | 2);
@@ -432,7 +425,7 @@ fn native_set_tuple_element() {
 
 fn native_update_record() {
     let (_, regs, heap, base) = run_native(
-        |m, _| {
+        |m| {
             m.emit_update_record(
                 false,
                 ArgVal::X(0),
@@ -453,7 +446,7 @@ fn native_update_record() {
 
 fn native_update_record_reuse(value: u64) -> (u64, u64, usize, Vec<u64>) {
     let (header, regs, heap, base) = run_native(
-        |m, _| m.emit_update_record(true, ArgVal::X(0), ArgVal::X(1), 2, &[(2, ArgVal::X(2))]),
+        |m| m.emit_update_record(true, ArgVal::X(0), ArgVal::X(1), 2, &[(2, ArgVal::X(2))]),
         |heap, header, regs| {
             heap[..3].copy_from_slice(&[(2 << 6) | 2, tagged_small(5), tagged_small(6)]);
             header.htop = word_ptr(heap, 3);
@@ -496,7 +489,7 @@ fn native_update_record_large_copies_every_word() {
         (25, ArgVal::X(2)),
     ];
     let (header, regs, heap, base) = run_native(
-        |m, _| m.emit_update_record(false, ArgVal::X(0), ArgVal::X(1), ARITY as u32, &updates),
+        |m| m.emit_update_record(false, ArgVal::X(0), ArgVal::X(1), ARITY as u32, &updates),
         |heap, header, regs| {
             heap[0] = ((ARITY as u64) << 6) | 2;
             for (index, word) in heap.iter_mut().enumerate().take(ARITY + 1).skip(1) {
@@ -529,7 +522,7 @@ fn native_update_record_large_copies_every_word() {
 
 fn native_update_record_in_place_reuses_young_tuple() {
     let (header, regs, heap, base) = run_native(
-        |m, _| m.emit_update_record_in_place(ArgVal::X(0), ArgVal::X(1), 2, &[(2, ArgVal::X(2))]),
+        |m| m.emit_update_record_in_place(ArgVal::X(0), ArgVal::X(1), 2, &[(2, ArgVal::X(2))]),
         |heap, header, regs| {
             heap[..3].copy_from_slice(&[(2 << 6) | 2, tagged_small(5), tagged_small(6)]);
             header.htop = word_ptr(heap, 3);
@@ -548,7 +541,7 @@ fn native_update_record_in_place_reuses_young_tuple() {
 
 fn native_update_record_in_place_copies_old_tuple() {
     let (header, regs, heap, base) = run_native(
-        |m, _| m.emit_update_record_in_place(ArgVal::X(0), ArgVal::X(1), 2, &[(2, ArgVal::X(2))]),
+        |m| m.emit_update_record_in_place(ArgVal::X(0), ArgVal::X(1), 2, &[(2, ArgVal::X(2))]),
         |heap, header, regs| {
             heap[..3].copy_from_slice(&[(2 << 6) | 2, tagged_small(5), tagged_small(6)]);
             header.htop = word_ptr(heap, 3);
@@ -572,7 +565,7 @@ fn native_update_record_in_place_copies_old_tuple() {
 fn native_test_heap() {
     let before = GC_CALLS.load(Ordering::SeqCst);
     let (header, regs, _, base) = run_native(
-        |m, hook| m.emit_test_heap(1, 1, hook),
+        |m| m.emit_test_heap(1, 1),
         |heap, header, regs| {
             heap[..2].copy_from_slice(&[(1 << 6) | 2, tagged_small(77)]);
             header.htop = word_ptr(heap, 2);
@@ -591,7 +584,7 @@ fn native_test_heap() {
 fn native_allocate_heap() {
     let before = GC_CALLS.load(Ordering::SeqCst);
     let (header, _, _, _) = run_native(
-        |m, hook| m.emit_allocate_heap(1, 1, 1, hook),
+        |m| m.emit_allocate_heap(1, 1, 1),
         |heap, header, _| {
             header.htop = word_ptr(heap, 2);
             header.stop = word_ptr(heap, 2);
@@ -605,7 +598,7 @@ fn native_allocate_heap() {
 fn native_allocate_heap_zero() {
     let before = GC_CALLS.load(Ordering::SeqCst);
     let (header, _, area, _) = run_native(
-        |m, hook| m.emit_allocate_heap_zero(1, 1, 1, hook),
+        |m| m.emit_allocate_heap_zero(1, 1, 1),
         |heap, header, _| {
             header.htop = word_ptr(heap, 2);
             header.stop = word_ptr(heap, 2);
@@ -621,7 +614,7 @@ fn native_allocate_heap_zero() {
 fn native_test_heap_with_more_than_six_live_registers() {
     let before = GC_CALLS.load(Ordering::SeqCst);
     let (_, _, _, _) = run_native(
-        |m, hook| m.emit_test_heap(1, 7, hook),
+        |m| m.emit_test_heap(1, 7),
         |heap, header, _| {
             header.htop = word_ptr(heap, 2);
             header.stop = word_ptr(heap, 2);
@@ -677,13 +670,13 @@ extern "C" fn big_counter() -> u64 {
 #[test]
 fn native_perf_counter() {
     let (_, regs, _, _) = run_native(
-        |m, hook| m.emit_i_perf_counter(small_counter as *const () as usize, hook),
+        |m| m.emit_i_perf_counter(small_counter as *const () as usize),
         |_, _, _| {},
     );
     assert_eq!(regs[0], tagged_small(123_456_789));
 
     let (header, regs, heap, base) = run_native(
-        |m, hook| m.emit_i_perf_counter(big_counter as *const () as usize, hook),
+        |m| m.emit_i_perf_counter(big_counter as *const () as usize),
         |_, _, _| {},
     );
     assert_eq!(regs[0], base as u64 | 2);

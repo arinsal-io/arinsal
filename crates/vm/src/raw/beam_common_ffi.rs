@@ -142,13 +142,6 @@ pub(crate) fn write_word(output: *mut u64, value: u64) -> bool {
     true
 }
 
-/// Reconstitutes an Eterm received from native runtime code.
-// Port of erts/emulator/beam/beam_common.c (handle_error), OTP-29.1.1.
-pub(crate) fn term_from_raw_bits(bits: u64) -> arinsal_term::Term {
-    // SAFETY: the native runtime hook passes a tagged BEAM term in its `Eterm` argument.
-    unsafe { arinsal_term::Term::from_raw_bits(bits) }
-}
-
 /// Attaches the process X file to the scheduler's register array for the current slice.
 // Port of erts/emulator/beam/beam_common.c (copy_in_registers), OTP-29.1.1.
 pub(crate) fn attach_process_registers(

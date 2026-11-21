@@ -55,6 +55,7 @@ mod send_bif_differential;
 mod seq_trace_receive_heap;
 mod sig_bifs;
 mod sig_buffers;
+mod sig_flush_differential;
 mod signals_exit_infinity_differential;
 mod sigterm_exit;
 mod spawn_alias_bif_differential;

@@ -124,6 +124,30 @@ pub(crate) fn arinsal_once(module: &str, beam: &[u8], expr: &str) -> arinsal_etf
     result.unwrap_or_else(|| panic!("arinsal one-shot failed for {expr}"))
 }
 
+/// Directory containing this build's `erl_child_setup` (forker_start's `$BINDIR`).
+/// OTP's `inet_gethost` is linked beside it so BINDIR stays a complete erts bindir.
+fn test_bindir() -> std::path::PathBuf {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("arinsal-bindir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test BINDIR");
+        let helper = std::path::Path::new(env!("CARGO_BIN_EXE_erl_child_setup"));
+        let dest = dir.join("erl_child_setup");
+        if !dest.exists() {
+            std::os::unix::fs::symlink(helper, &dest).expect("link erl_child_setup into BINDIR");
+        }
+        if let Some(root) = arinsal_difftest::reference::otp_root() {
+            let src = root.join("erts-17.1/bin/inet_gethost");
+            let dest = dir.join("inet_gethost");
+            if src.is_file() && !dest.exists() {
+                let _ = std::os::unix::fs::symlink(src, dest);
+            }
+        }
+        dir
+    })
+    .clone()
+}
+
 fn arinsal_cli_binary() -> Option<std::path::PathBuf> {
     let executable = std::env::current_exe().ok()?;
     let mut directory = executable.parent();
@@ -174,9 +198,16 @@ pub(crate) fn node() -> std::sync::MutexGuard<'static, arinsal_vm::Vm> {
     static NODE: std::sync::OnceLock<std::sync::Mutex<arinsal_vm::Vm>> = std::sync::OnceLock::new();
     NODE.get_or_init(|| {
         let root = arinsal_difftest::reference::otp_root().expect("OTP root (erl on PATH)");
+        let bindir = test_bindir();
+        arinsal_vm::boot::seed_environment(&[
+            ("BINDIR".into(), bindir.display().to_string()),
+            ("ERL_ROOTDIR".into(), root.display().to_string()),
+        ]);
         let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
         env.insert("ERL_ROOTDIR".into(), root.display().to_string());
+        env.insert("BINDIR".into(), bindir.display().to_string());
         let mut argv = vec!["arinsal".to_owned(), "-noshell".into(), "-noinput".into()];
+        arinsal_vm::boot::apply_eval_plus_s_argv(&mut argv);
         let carrier = concat!(env!("CARGO_MANIFEST_DIR"), "/eval_carrier");
         argv.extend(
             arinsal_vm::boot::eval_carrier_args(std::path::Path::new(carrier))
@@ -185,7 +216,7 @@ pub(crate) fn node() -> std::sync::MutexGuard<'static, arinsal_vm::Vm> {
         let launch = arinsal_args::parse(&argv, &env)
             .unwrap_or_else(|error| panic!("test node arguments: {error:?}"));
         arinsal_args::configure_emulator_flags(launch.emulator.clone());
-        let workers = arinsal_alloc::cpuinfo::default_schedulers().0.max(1);
+        let workers = arinsal_vm::boot::workers_from_emulator_flags(&launch.emulator);
         let mut vm = arinsal_vm::boot::erl_start(
             std::path::Path::new(&launch.root_dir),
             &launch.boot_args,
@@ -203,13 +234,13 @@ pub(crate) fn node() -> std::sync::MutexGuard<'static, arinsal_vm::Vm> {
         );
         for _ in 0..12_000 {
             let registered = vm
-                .eval_scheduled("erlang", "whereis", &[init], 1)
+                .eval_scheduled("erlang", "whereis", &[init], 0)
                 .expect("erlang:whereis(init)")
                 .text
                 != "undefined";
             if registered
                 && vm
-                    .eval_scheduled("init", "get_status", &[], 1)
+                    .eval_scheduled("init", "get_status", &[], 0)
                     .expect("init:get_status()")
                     .text
                     == "{started,started}"

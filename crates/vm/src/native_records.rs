@@ -116,44 +116,6 @@ fn exported_definition(id: Term) -> Option<Term> {
     Definition::parse(definition)?.exported.then_some(cons)
 }
 
-/// Port of erts/emulator/beam/erl_record.c:254-379 (erl_create_local_native_record,
-/// erl_create_native_record), OTP-29.1.1.
-#[cfg(target_arch = "aarch64")]
-fn create(
-    header: *mut ProcessHeader,
-    reg: *mut u64,
-    id: u64,
-    live: u64,
-    count: u64,
-    base: u64,
-    external: bool,
-) -> u64 {
-    let Some((process, registers)) = native_hooks::enter_runtime_reg(header, reg) else {
-        return 0;
-    };
-    let (Ok(live), Ok(count), Ok(base)) = (
-        usize::try_from(live),
-        usize::try_from(count),
-        usize::try_from(base),
-    ) else {
-        return 0;
-    };
-    let result = create_record(
-        process,
-        &mut registers.x_reg_array,
-        native_hooks::from_raw(id),
-        (live, count, base),
-        external,
-    );
-    match result {
-        Ok(record) => native_hooks::raw(record),
-        Err(failure) => {
-            report(process, failure);
-            0
-        }
-    }
-}
-
 fn create_record(
     process: &mut Process,
     x: &mut [Term],
@@ -171,9 +133,7 @@ fn create_record(
     let defaults = term_sequence(defaults).ok_or(Failure::SystemLimit)?;
     let top = base + count;
     stage_roots(x, live, base, top).ok_or(Failure::SystemLimit)?;
-    process
-        .ensure_objv(2 + definition.keys.len(), &mut x[..top])
-        .map_err(|_| Failure::SystemLimit)?;
+    process.ensure_objv(2 + definition.keys.len(), &mut x[..top]);
     let pairs = staged_pairs(x, base, count);
     let mut values = Vec::with_capacity(definition.keys.len());
     let mut next = 0;
@@ -205,67 +165,6 @@ fn create_record(
         .map_err(|_| Failure::SystemLimit)
 }
 
-/// Runtime helper of `i_create_local_native_record`.
-#[cfg(target_arch = "aarch64")]
-pub extern "C" fn arinsal_beamasm_create_local_record(
-    header: *mut ProcessHeader,
-    reg: *mut u64,
-    definition: u64,
-    live: u64,
-    count: u64,
-    base: u64,
-) -> u64 {
-    create(header, reg, definition, live, count, base, false)
-}
-
-/// Runtime helper of `i_create_native_record`.
-#[cfg(target_arch = "aarch64")]
-pub extern "C" fn arinsal_beamasm_create_record(
-    header: *mut ProcessHeader,
-    reg: *mut u64,
-    id: u64,
-    live: u64,
-    count: u64,
-    base: u64,
-) -> u64 {
-    create(header, reg, id, live, count, base, true)
-}
-
-/// Port of erts/emulator/beam/erl_record.c:381-468 (erl_update_native_record), OTP-29.1.1.
-#[cfg(target_arch = "aarch64")]
-pub extern "C" fn arinsal_beamasm_update_record(
-    header: *mut ProcessHeader,
-    reg: *mut u64,
-    source: u64,
-    live: u64,
-    count: u64,
-    base: u64,
-) -> u64 {
-    let Some((process, registers)) = native_hooks::enter_runtime_reg(header, reg) else {
-        return 0;
-    };
-    let (Ok(live), Ok(count), Ok(base)) = (
-        usize::try_from(live),
-        usize::try_from(count),
-        usize::try_from(base),
-    ) else {
-        return 0;
-    };
-    let result = update_record(
-        process,
-        &mut registers.x_reg_array,
-        native_hooks::from_raw(source),
-        (live, count, base),
-    );
-    match result {
-        Ok(record) => native_hooks::raw(record),
-        Err(failure) => {
-            report(process, failure);
-            0
-        }
-    }
-}
-
 fn update_record(
     process: &mut Process,
     x: &mut [Term],
@@ -282,9 +181,7 @@ fn update_record(
     }
     x[source_slot] = source;
     stage_roots(x, live, base, top).ok_or(Failure::SystemLimit)?;
-    process
-        .ensure_objv(2 + snapshot.fields.len(), &mut x[..top])
-        .map_err(|_| Failure::SystemLimit)?;
+    process.ensure_objv(2 + snapshot.fields.len(), &mut x[..top]);
     let source = x[source_slot];
     let snapshot = source.record_snapshot().ok_or(Failure::BadRecord(source))?;
     let definition = Definition::parse(snapshot.definition).ok_or(Failure::SystemLimit)?;
@@ -310,7 +207,7 @@ fn update_record(
 }
 
 /// Port of the x86 `GetSource` operands in erl_record.c's native record helpers.
-fn x86_elements(
+fn vararg_elements(
     elements: *const u64,
     count: usize,
     x: &[Term],
@@ -404,7 +301,7 @@ pub extern "C" fn erl_create_local_native_record(
     count: usize,
     elements: *const u64,
 ) -> u64 {
-    x86_create_record(header, reg, definition, live, count, elements, false)
+    create_native_record(header, reg, definition, live, count, elements, false)
 }
 
 /// Port of erts/emulator/beam/erl_record.c:337-379 (erl_create_native_record), OTP-29.1.1.
@@ -417,10 +314,10 @@ pub extern "C" fn erl_create_native_record(
     count: usize,
     elements: *const u64,
 ) -> u64 {
-    x86_create_record(header, reg, definition_id, live, count, elements, true)
+    create_native_record(header, reg, definition_id, live, count, elements, true)
 }
 
-fn x86_create_record(
+fn create_native_record(
     header: *mut ProcessHeader,
     reg: *mut u64,
     definition: u64,
@@ -438,7 +335,8 @@ fn x86_create_record(
     if !count.is_multiple_of(2) {
         return native_hooks::raw(Term::NON_VALUE);
     }
-    let Some(values) = x86_elements(elements, count, &registers.x_reg_array, &process.heap) else {
+    let Some(values) = vararg_elements(elements, count, &registers.x_reg_array, &process.heap)
+    else {
         return native_hooks::raw(Term::NON_VALUE);
     };
     let Some(end) = live.checked_add(count) else {
@@ -482,7 +380,8 @@ pub extern "C" fn erl_update_native_record(
     if count == 0 || !count.is_multiple_of(2) {
         return native_hooks::raw(Term::NON_VALUE);
     }
-    let Some(values) = x86_elements(elements, count, &registers.x_reg_array, &process.heap) else {
+    let Some(values) = vararg_elements(elements, count, &registers.x_reg_array, &process.heap)
+    else {
         return native_hooks::raw(Term::NON_VALUE);
     };
     let Some(end) = live.checked_add(count) else {
@@ -514,7 +413,7 @@ pub extern "C" fn erl_get_local_record_field(
     definition_id: u64,
     name: u64,
 ) -> u64 {
-    get_field(header, source, definition_id, name, 1, true)
+    get_field(header, source, definition_id, name, true)
 }
 
 /// Port of erts/emulator/beam/erl_record.c:507-578 (erl_get_record_field), OTP-29.1.1.
@@ -525,58 +424,12 @@ pub extern "C" fn erl_get_record_field(
     definition_id: u64,
     name: u64,
 ) -> u64 {
-    get_field(header, source, definition_id, name, 1, false)
-}
-
-/// Port of erts/emulator/beam/erl_record.c:223-252 (erl_get_record_elements), OTP-29.1.1.
-/// Reads the sorted keys staged at `base` and replaces each with its value; returns 1 when
-/// every key was found.
-#[cfg(target_arch = "aarch64")]
-pub extern "C" fn arinsal_beamasm_get_record_elements(
-    header: *mut ProcessHeader,
-    reg: *mut u64,
-    source: u64,
-    count: u64,
-    base: u64,
-) -> u64 {
-    let Some((process, registers)) = native_hooks::enter_runtime_reg(header, reg) else {
-        return 0;
-    };
-    let (Ok(count), Ok(base)) = (usize::try_from(count), usize::try_from(base)) else {
-        return 0;
-    };
-    let _ = process;
-    let Some(snapshot) = native_hooks::from_raw(source).record_snapshot() else {
-        return 0;
-    };
-    let Some(definition) = Definition::parse(snapshot.definition) else {
-        return 0;
-    };
-    u64::from(scan_record_elements(
-        &definition,
-        &snapshot.values,
-        count,
-        |index, key, value| {
-            let slot = registers.x_reg_array.get_mut(base + index)?;
-            if *slot != key {
-                return Some(false);
-            }
-            *slot = value;
-            Some(true)
-        },
-    ))
+    get_field(header, source, definition_id, name, false)
 }
 
 /// Port of erts/emulator/beam/erl_record.c:470-578 (erl_get_local_record_field,
 /// erl_get_record_field), OTP-29.1.1.
-fn get_field(
-    header: *mut ProcessHeader,
-    source: u64,
-    id: u64,
-    field: u64,
-    raise: u64,
-    local: bool,
-) -> u64 {
+fn get_field(header: *mut ProcessHeader, source: u64, id: u64, field: u64, local: bool) -> u64 {
     let Some(process) = enter_runtime(header) else {
         return 0;
     };
@@ -621,34 +474,9 @@ fn get_field(
     })();
     match outcome {
         Ok(value) => native_hooks::raw(value),
-        Err(_) if raise == 0 => 0,
         Err(failure) => {
             report(process, failure);
             0
         }
     }
-}
-
-/// Runtime helper of `get_record_field` with an atom record id.
-#[cfg(target_arch = "aarch64")]
-pub extern "C" fn arinsal_beamasm_get_local_record_field(
-    header: *mut ProcessHeader,
-    source: u64,
-    id: u64,
-    field: u64,
-    raise: u64,
-) -> u64 {
-    get_field(header, source, id, field, raise, true)
-}
-
-/// Runtime helper of `get_record_field` with a `{Module, Name}` or `_` record id.
-#[cfg(target_arch = "aarch64")]
-pub extern "C" fn arinsal_beamasm_get_record_field(
-    header: *mut ProcessHeader,
-    source: u64,
-    id: u64,
-    field: u64,
-    raise: u64,
-) -> u64 {
-    get_field(header, source, id, field, raise, false)
 }

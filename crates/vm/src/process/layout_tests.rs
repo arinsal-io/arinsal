@@ -12,16 +12,14 @@ fn envelope() -> Message {
 #[test]
 fn off_heap_message_fragment_stays_outside_gc_roots_until_removed() {
     let mut process = Process::new();
-    arinsal_sched::Task::init_in_place(&mut process);
+    arinsal_sched::Task::init_in_place(&mut process, arinsal_sched::Pid::from_data(0));
     process.cold_mut().off_heap_msgq = true;
     let heap_words = process.heap.total_heap_size_words();
     process.inbox.push_message(envelope()).unwrap();
 
     assert!(process.inbox.gc_root_snapshot().1.is_empty());
     assert_eq!(process.heap.total_heap_size_words(), heap_words);
-    process
-        .collect_heap_roots_objv(&mut [], &mut [], 0)
-        .unwrap();
+    process.collect_heap_roots_objv(&mut [], &mut [], 0);
     let term = process
         .inbox
         .remove_to_heap(&mut process.heap)
@@ -37,15 +35,13 @@ fn off_heap_message_fragment_stays_outside_gc_roots_until_removed() {
 #[test]
 fn on_heap_message_is_a_gc_root_in_the_process_heap() {
     let mut process = Process::new();
-    arinsal_sched::Task::init_in_place(&mut process);
+    arinsal_sched::Task::init_in_place(&mut process, arinsal_sched::Pid::from_data(0));
     process.inbox.push_message(envelope()).unwrap();
 
     // The fetched message keeps its fragment until a collection moves it onto the heap.
     assert!(process.inbox.gc_root_snapshot().1.is_empty());
     assert!(!process.inbox.is_on_heap_at_save());
-    process
-        .collect_heap_roots_objv(&mut [], &mut [], 0)
-        .unwrap();
+    process.collect_heap_roots_objv(&mut [], &mut [], 0);
     assert_eq!(process.inbox.gc_root_snapshot().1.len(), 1);
     assert_eq!(process.inbox.entries.len(), 1);
     assert!(
@@ -53,9 +49,7 @@ fn on_heap_message_is_a_gc_root_in_the_process_heap() {
             .data
             .is_none()
     );
-    process
-        .collect_heap_roots_objv(&mut [], &mut [], 0)
-        .unwrap();
+    process.collect_heap_roots_objv(&mut [], &mut [], 0);
     let term = process
         .inbox
         .remove_to_heap(&mut process.heap)
@@ -74,10 +68,10 @@ fn on_heap_message_is_a_gc_root_in_the_process_heap() {
 #[test]
 fn collection_publishes_the_new_heap_to_the_native_header() {
     let mut process = Process::new();
-    arinsal_sched::Task::init_in_place(&mut process);
+    arinsal_sched::Task::init_in_place(&mut process, arinsal_sched::Pid::from_data(0));
     let before = (process.heap.abi.heap, process.heap.abi.hend);
     // Force a collection that grows the young heap.
-    process.ensure_objv(1 << 14, &mut []).unwrap();
+    process.ensure_objv(1 << 14, &mut []);
     let (heap, hend) = process.heap.heap_bounds();
     let (htop, stop) = process.heap.heap_cursor();
     assert_ne!(
@@ -94,7 +88,7 @@ fn collection_publishes_the_new_heap_to_the_native_header() {
 #[test]
 fn partial_cursor_sync_also_publishes_heap_bounds() {
     let mut process = Process::new();
-    arinsal_sched::Task::init_in_place(&mut process);
+    arinsal_sched::Task::init_in_place(&mut process, arinsal_sched::Pid::from_data(0));
     let _ = process.heap.heap_bounds();
     process.heap.delay_collection(0);
     process.heap.abi.heap = std::ptr::null_mut();
@@ -106,7 +100,7 @@ fn partial_cursor_sync_also_publishes_heap_bounds() {
 #[test]
 fn post_bif_result_root_survives_collection_in_the_fast_arm() {
     let mut process = Process::new();
-    arinsal_sched::Task::init_in_place(&mut process);
+    arinsal_sched::Task::init_in_place(&mut process, arinsal_sched::Pid::from_data(0));
     let elements = [
         Term::small(1).unwrap(),
         Term::small(2).unwrap(),
@@ -117,9 +111,7 @@ fn post_bif_result_root_survives_collection_in_the_fast_arm() {
         .unwrap();
     let expected = arinsal_term::to_owned(result).unwrap();
     let mut roots = [result];
-    let stats = process
-        .collect_heap_roots_objv(&mut [], &mut roots, 0)
-        .unwrap();
+    let stats = process.collect_heap_roots_objv(&mut [], &mut roots, 0);
     assert_eq!(stats.collections, 1);
     assert_ne!(roots[0], result);
     assert_eq!(arinsal_term::to_owned(roots[0]).unwrap(), expected);
@@ -144,7 +136,7 @@ fn check_process_code_sees_the_function_of_a_return_trace_frame() {
     // A return trace frame names its traced function by a pc in it (erts `&mfa`); a purge of
     // that code has to find it.
     let mut process = Process::new();
-    arinsal_sched::Task::init_in_place(&mut process);
+    arinsal_sched::Task::init_in_place(&mut process, arinsal_sched::Pid::from_data(0));
     let range = (0x4000_usize, 0x5000_usize);
     let stub = crate::trace::TraceFrameKind::ReturnTrace.address();
     assert!(process.heap.reserve_stack(4));
@@ -192,7 +184,7 @@ fn check_process_code_clears_ftrace_that_names_the_module() {
     }
 
     let mut process = Process::new();
-    arinsal_sched::Task::init_in_place(&mut process);
+    arinsal_sched::Task::init_in_place(&mut process, arinsal_sched::Pid::from_data(0));
     install(&mut process, packed(7, 4), 0, &[]);
     assert!(!process.references_code(7, |_| false));
     assert_eq!(process.heap.abi.exc.freason, 0);

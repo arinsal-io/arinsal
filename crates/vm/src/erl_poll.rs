@@ -311,9 +311,7 @@ mod fallback {
         if let Some(set) = SET.get() {
             return Ok(set);
         }
-        let (read, write) = rustix::pipe::pipe()?;
-        rustix::io::fcntl_setfd(&read, rustix::io::FdFlags::CLOEXEC)?;
-        rustix::io::fcntl_setfd(&write, rustix::io::FdFlags::CLOEXEC)?;
+        let (read, write) = crate::port::pipe_cloexec()?;
         let mut created = false;
         let set = SET.get_or_init(|| {
             created = true;

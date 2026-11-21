@@ -22,8 +22,9 @@ pub(crate) struct RootSlot {
 pub(crate) struct MessageQueue {
     /// `sig_qs.first`/`last`/`save`/`mq_len`.
     pub(crate) entries: arinsal_sched::MessageQueueList<Event<Message>>,
-    /// The prio queue and save-info bits of `sig_qs.flags` (see `crate::receive`).
-    pub(crate) flags: u8,
+    /// `sig_qs.flags` (prio-queue bits remapped in the low byte; `FS_FLUSHING_SIGS` /
+    /// `FS_FLUSHED_SIGS` at erts bits 7/8). See `crate::receive`.
+    pub(crate) flags: u32,
 }
 
 /// A message in the message queue: the signal node it arrived in, relinked from the middle
@@ -133,6 +134,7 @@ impl MessageQueue {
     // Port of erts/emulator/beam/erl_process.c:12723-12727 (erl_create_process), OTP-29.1.1.
     pub(crate) fn init_in_place(&mut self) {
         self.entries.init_in_place();
+        self.flags = 0;
     }
 
     /// `erts_msgq_peek_msg`: the message at the save pointer.
@@ -600,14 +602,10 @@ impl arinsal_term::GcMessageQueue for MessageQueue {
         }
     }
 
-    fn move_msgs_to_heap(
-        &mut self,
-        heap: &mut arinsal_term::ProcessHeap,
-    ) -> Result<(), arinsal_term::TermError> {
-        let mut result = Ok(());
+    fn move_msgs_to_heap(&mut self, heap: &mut arinsal_term::ProcessHeap) {
         self.entries.relink_each(|_, mut node| {
             // erl_proc_sig_queue.c (move_msg_to_heap): a combined message is left as it is.
-            if result.is_err() || queued(&node).combined || !queued(&node).data_attached() {
+            if queued(&node).combined || !queued(&node).data_attached() {
                 return node;
             }
             let message = queued_mut(&mut node);
@@ -616,21 +614,15 @@ impl arinsal_term::GcMessageQueue for MessageQueue {
                 .and_then(|fragment| fragment.seq_token.as_ref())
                 .map_or(Term::NIL, |token| token.root());
             let mut refs = [message.term, token];
-            let moved = if let Some(heap_frag) =
-                message.data.as_mut().and_then(MessageData::heap_frag_mut)
-            {
+            if let Some(heap_frag) = message.data.as_mut().and_then(MessageData::heap_frag_mut) {
                 // erts_copy_one_frag; the buffer is freed below (free_message_buffer).
-                heap.move_node_fragment(heap_frag, &mut refs)
+                heap.move_node_fragment(heap_frag, &mut refs);
             } else {
                 let data = message
                     .fragment_mut()
                     .and_then(|fragment| fragment.heap.take())
                     .expect("attached message heap");
-                heap.move_message_heap(data, &mut refs)
-            };
-            if let Err(error) = moved {
-                result = Err(error);
-                return node;
+                heap.move_message_heap(data, &mut refs);
             }
             let message = queued_mut(&mut node);
             message.term = refs[0];
@@ -648,6 +640,5 @@ impl arinsal_term::GcMessageQueue for MessageQueue {
             }
             node
         });
-        result
     }
 }

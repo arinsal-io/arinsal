@@ -221,6 +221,17 @@ pub(crate) extern "C" fn os_system_time_1(c_p: *mut ProcessHeader, reg: *mut u64
     })
 }
 
+/// `os:perf_counter/0`.
+// Port of erts/emulator/beam/erl_time_sup.c (os_perf_counter_0), OTP-29.1.1.
+pub(crate) extern "C" fn os_perf_counter_0(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    call(c_p, i, |process| {
+        integer(
+            process,
+            i128::from(arinsal_sched::sys_time::erts_sys_perf_counter()),
+        )
+    })
+}
+
 /// `erts_internal:time_unit/0`.
 // Port of erts/emulator/beam/erl_time_sup.c (erts_internal_time_unit_0), OTP-29.1.1.
 pub(crate) extern "C" fn time_unit_0(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
@@ -234,8 +245,12 @@ pub(crate) extern "C" fn perf_counter_unit_0(
     _reg: *mut u64,
     i: u64,
 ) -> u64 {
-    // On macOS, erts_sys_perf_counter uses nanoseconds and reports 1e9 ticks per second.
-    call(c_p, i, |_| small(NATIVE as i64))
+    call(c_p, i, |process| {
+        integer(
+            process,
+            i128::from(arinsal_sched::sys_time::erts_sys_perf_counter_unit()),
+        )
+    })
 }
 
 /// `erlang:time_offset/0`.

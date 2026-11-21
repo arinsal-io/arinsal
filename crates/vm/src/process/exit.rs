@@ -316,11 +316,11 @@ impl Process {
         let resources = proc_flags::resources_to_clean(ctx.exit_flags());
         if resources & proc_flags::DDLL != 0
             && let Some(runtime) = self.runtime
-            && let Ok(scheduler) = runtime.scheduler()
+            && let Ok(scheduler) = runtime.scheduler_arc()
         {
             // Port of erts/emulator/beam/erl_process.c:14415-14417
             // (ERTS_CONTINUE_EXIT_FREE), OTP-29.1.1.
-            crate::ddll::proc_dead(scheduler, ctx.pid());
+            crate::ddll::proc_dead(&scheduler, ctx.pid());
         }
         // ERTS_CONTINUE_EXIT_FREE releases the registered name before removing the pid from
         // the process table. The name index is stored on the process-table entry.
@@ -619,6 +619,33 @@ impl Process {
         // KILL_CATCHES(c_p): handle_error finds no catch.
         self.heap.abi.catches = 0;
         self.heap.abi.i = crate::beam_jit_main::beam_exit() as *const core::ffi::c_void;
+    }
+
+    /// `erts_set_self_exiting(c_p, reason)` from code that holds only `c_p`
+    /// (`garbage_collect` killing a process over its `max_heap_size`): the state word is
+    /// reached through the scheduler `c_p` runs on (`erts_proc_sched_data(c_p)`).
+    // Port of erts/emulator/beam/erl_gc.c:875-878 (garbage_collect: `reds == -2`), OTP-29.1.1.
+    pub(crate) fn erts_set_self_exiting_c_p(&mut self, reason: Term) {
+        arinsal_sched::erts_proc_sched_data(self, |process, esdp| {
+            RunCtx::with_current(esdp, |ctx| process.erts_set_self_exiting(ctx, reason))
+        })
+        .flatten()
+        .expect("erts_set_self_exiting: c_p runs on a scheduler");
+    }
+
+    /// `erts_atomic32_read_nob(&c_p->state) & ERTS_PSFLG_EXITING` from code that holds only
+    /// `c_p`. A process that runs on no scheduler (built by a unit test) has no state word and
+    /// is not exiting.
+    // Port of erts/emulator/beam/erl_gc.c:780-782 (garbage_collect: `state & ERTS_PSFLG_EXITING`),
+    // OTP-29.1.1.
+    pub(crate) fn erts_c_p_state_exiting(&mut self) -> bool {
+        arinsal_sched::erts_proc_sched_data(self, |_, esdp| {
+            RunCtx::with_current(esdp, |ctx| {
+                ctx.proc_state().load(Ordering::Relaxed) & arinsal_sched::psflg::EXITING != 0
+            })
+        })
+        .flatten()
+        .unwrap_or(false)
     }
 
     /// `ERTS_PROC_IS_EXITING(c_p)`: EXITING or FREE in `c_p->state`.

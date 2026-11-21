@@ -12,6 +12,7 @@
 
 use std::alloc::{Layout, alloc, dealloc};
 use std::cell::UnsafeCell;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 
 use crate::proc_ref::ProcRef;
@@ -340,11 +341,251 @@ struct Proxy<T: Task> {
     process: ProcRef<T>,
 }
 
+/// The intrusive Port.sched.next link. The owning rq->mtx serializes every access.
+// Port of erts/emulator/beam/erl_port.h (Port.sched.next) and erl_port_task.c
+// (enqueue_port, pop_port), OTP-29.1.1.
+#[derive(Default)]
+pub(crate) struct PortLink(UnsafeCell<Option<Arc<dyn crate::RunPort>>>);
+
+// SAFETY: the link is read or written only by a PortList method while that port's run-queue
+// mutex is held; RunPort itself is Send + Sync.
+unsafe impl Send for PortLink {}
+// SAFETY: as for Send, the containing run-queue lock serializes all accesses to the cell.
+unsafe impl Sync for PortLink {}
+
+impl PortLink {
+    fn replace(&self, next: Option<Arc<dyn crate::RunPort>>) -> Option<Arc<dyn crate::RunPort>> {
+        // SAFETY: callers hold the run-queue lock that owns this link.
+        unsafe { std::mem::replace(&mut *self.0.get(), next) }
+    }
+}
+
+/// The rq->ports FIFO list, with links stored in each port.
+// Port of erts/emulator/beam/erl_process.h (ErtsRunQueue.ports) and
+// erl_port_task.c (enqueue_port, pop_port), OTP-29.1.1.
+#[derive(Default)]
+pub(crate) struct PortList {
+    first: Option<Arc<dyn crate::RunPort>>,
+    last: Option<Arc<dyn crate::RunPort>>,
+}
+
+impl PortList {
+    fn is_empty(&self) -> bool {
+        self.first.is_none()
+    }
+
+    fn push_back(&mut self, port: Arc<dyn crate::RunPort>) {
+        let next = port.run_queue().next.replace(None);
+        debug_assert!(next.is_none());
+        if let Some(last) = &self.last {
+            let next = last.run_queue().next.replace(Some(Arc::clone(&port)));
+            debug_assert!(next.is_none());
+        } else {
+            self.first = Some(Arc::clone(&port));
+        }
+        self.last = Some(port);
+    }
+
+    fn pop_front(&mut self) -> Option<Arc<dyn crate::RunPort>> {
+        let port = self.first.take()?;
+        self.first = port.run_queue().next.replace(None);
+        if self.first.is_none() {
+            self.last = None;
+        }
+        Some(port)
+    }
+}
+
+pub(crate) type MiscCallback = fn(usize);
+
+pub(crate) struct MiscOp {
+    next: Option<Box<MiscOp>>,
+    callback: MiscCallback,
+    arg: usize,
+}
+
+impl MiscOp {
+    pub(crate) fn new(callback: MiscCallback, arg: usize) -> Box<Self> {
+        Box::new(Self {
+            next: None,
+            callback,
+            arg,
+        })
+    }
+}
+
+/// The first, last and intrusive callback nodes of ErtsMiscOpList.
+// Port of erts/emulator/beam/erl_process.h (ErtsMiscOpList) and erl_process.c
+// (erts_schedule_misc_op, exec_misc_ops), OTP-29.1.1.
+pub(crate) struct MiscOpList {
+    first: Option<Box<MiscOp>>,
+    last: *mut MiscOp,
+}
+
+// SAFETY: the list is only mutated under its owning run-queue mutex; callbacks are Send.
+unsafe impl Send for MiscOpList {}
+
+impl Default for MiscOpList {
+    fn default() -> Self {
+        Self {
+            first: None,
+            last: std::ptr::null_mut(),
+        }
+    }
+}
+
+impl MiscOpList {
+    fn is_empty(&self) -> bool {
+        self.first.is_none()
+    }
+
+    fn push_back(&mut self, node: Box<MiscOp>) {
+        let node_ptr = Box::into_raw(node);
+        if self.last.is_null() {
+            // SAFETY: this pointer came from Box::into_raw and the list now owns that node.
+            self.first = Some(unsafe { Box::from_raw(node_ptr) });
+        } else {
+            // SAFETY: last points at the owned tail node in first; this list is exclusively
+            // accessed while the run-queue mutex is held.
+            // SAFETY: node_ptr came from Box::into_raw and is moved into the owned next link.
+            unsafe {
+                (*self.last).next = Some(Box::from_raw(node_ptr));
+            }
+        }
+        self.last = node_ptr;
+    }
+
+    fn detach_batch(&mut self, max: usize) -> Option<Box<MiscOp>> {
+        let mut first = self.first.take()?;
+        let mut tail: *mut MiscOp = &mut *first;
+        let mut count = 1;
+        while count < max {
+            // SAFETY: tail points to a node in the chain owned by first, and this method holds
+            // the run-queue mutex for exclusive access.
+            let next = unsafe { (*tail).next.as_mut().map(|node| &mut **node as *mut MiscOp) };
+            let Some(next) = next else {
+                break;
+            };
+            tail = next;
+            count += 1;
+        }
+        // SAFETY: tail remains the final node in the detached prefix.
+        self.first = unsafe { (*tail).next.take() };
+        if self.first.is_none() {
+            self.last = std::ptr::null_mut();
+        }
+        Some(first)
+    }
+}
+
+/// Run a detached prefix after releasing rq->mtx, then free each misc-op node.
+// Port of erts/emulator/beam/erl_process.c (exec_misc_ops), OTP-29.1.1.
+pub(crate) fn execute_misc_ops(mut ops: Option<Box<MiscOp>>) {
+    while let Some(mut op) = ops {
+        (op.callback)(op.arg);
+        ops = op.next.take();
+    }
+}
+
 /// The lists of one run queue.
 pub(crate) struct Lists<T: Task> {
     first: [usize; PROC_QUEUES],
     last: [usize; PROC_QUEUES],
+    ports: PortList,
+    misc: MiscOpList,
     _marker: std::marker::PhantomData<ProcRef<T>>,
+}
+
+/// Detached process nodes stolen from one `ErtsRunPrioQueue`.
+// Port of erts/emulator/beam/erl_process.c (try_steal_task_from_victim), OTP-29.1.1.
+pub(crate) struct ProcessChain<T: Task> {
+    first: usize,
+    last: usize,
+    queue: usize,
+    counts: [usize; crate::balance::PRIO_LEVELS],
+    _marker: std::marker::PhantomData<ProcRef<T>>,
+}
+
+impl<T: Task> Default for ProcessChain<T> {
+    fn default() -> Self {
+        Self {
+            first: 0,
+            last: 0,
+            queue: 0,
+            counts: [0; crate::balance::PRIO_LEVELS],
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T: Task> ProcessChain<T> {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.first == 0
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.counts.iter().sum()
+    }
+
+    pub(crate) fn counts(&self) -> &[usize; crate::balance::PRIO_LEVELS] {
+        &self.counts
+    }
+
+    // Port of erts/emulator/beam/erl_process.c (try_steal_task_from_victim), OTP-29.1.1.
+    pub(crate) fn visit_all(&self, mut visit: impl FnMut(&ProcRef<T>)) {
+        let mut node = self.first;
+        while node != 0 {
+            // SAFETY: node is linked in this exclusively owned detached chain.
+            let next = unsafe {
+                with_node::<T, _>(node, |link, process| {
+                    visit(process);
+                    link.next.load(Ordering::Relaxed)
+                })
+            };
+            node = next;
+        }
+    }
+
+    /// Return the first runnable node and keep the rest linked for the thief.
+    // Port of erts/emulator/beam/erl_process.c (try_steal_task_from_victim), OTP-29.1.1.
+    pub(crate) fn pop_first(&mut self) -> Option<Scheduled<T>> {
+        let node = self.first;
+        if node == 0 {
+            return None;
+        }
+        // SAFETY: node is owned by this detached chain.
+        let (next, schedule_count, prio) = unsafe {
+            with_node::<T, _>(node, |link, _| {
+                (
+                    link.next.load(Ordering::Relaxed),
+                    link.schedule_count.load(Ordering::Relaxed),
+                    link.prio.load(Ordering::Relaxed),
+                )
+            })
+        };
+        self.first = next;
+        if next == 0 {
+            self.last = 0;
+        } else {
+            // SAFETY: next is the new head of this exclusively owned chain.
+            unsafe { with_node::<T, _>(next, |link, _| link.prev.store(0, Ordering::Relaxed)) };
+        }
+        self.counts[usize::from(prio)] -= 1;
+        Some(node_into_scheduled::<T>(
+            node,
+            self.queue,
+            schedule_count,
+            prio,
+        ))
+    }
+}
+
+impl<T: Task> Drop for ProcessChain<T> {
+    fn drop(&mut self) {
+        while let Some(item) = self.pop_first() {
+            drop(item);
+        }
+    }
 }
 
 // SAFETY: the lists own counted references to `Process<T>`, which is `Send + Sync` (the bound
@@ -368,17 +609,64 @@ unsafe fn with_node<T: Task, R>(node: usize, f: impl FnOnce(&RqLink, &ProcRef<T>
     }
 }
 
+// Port of erts/emulator/beam/erl_process.c (unqueue_process), OTP-29.1.1.
+fn node_into_scheduled<T: Task>(
+    node: usize,
+    queue: usize,
+    schedule_count: u8,
+    prio: u8,
+) -> Scheduled<T> {
+    let proxy = node & PROXY != 0;
+    let process = if !proxy {
+        // SAFETY: the owning intrusive list gave up the reference when this node was unlinked.
+        unsafe { ProcRef::<T>::from_raw(node as *mut ()) }
+    } else {
+        // SAFETY: the proxy box was allocated when this node entered its owning list.
+        let proxy = unsafe { Box::from_raw((node & !PROXY) as *mut Proxy<T>) };
+        proxy.process.clone()
+    };
+    Scheduled {
+        process,
+        schedule_count,
+        prio,
+        kind: if proxy { Enqueue::Proxy } else { Enqueue::Real },
+        queue,
+    }
+}
+
 impl<T: Task> Lists<T> {
     pub(crate) fn new() -> Self {
         Self {
             first: [0; PROC_QUEUES],
             last: [0; PROC_QUEUES],
+            ports: PortList::default(),
+            misc: MiscOpList::default(),
             _marker: std::marker::PhantomData,
         }
     }
 
-    pub(crate) fn is_empty(&self, queue: usize) -> bool {
-        self.first[queue] == 0
+    pub(crate) fn ports_is_empty(&self) -> bool {
+        self.ports.is_empty()
+    }
+
+    pub(crate) fn enqueue_port(&mut self, port: Arc<dyn crate::RunPort>) {
+        self.ports.push_back(port);
+    }
+
+    pub(crate) fn pop_port(&mut self) -> Option<Arc<dyn crate::RunPort>> {
+        self.ports.pop_front()
+    }
+
+    pub(crate) fn enqueue_misc_op(&mut self, op: Box<MiscOp>) {
+        self.misc.push_back(op);
+    }
+
+    pub(crate) fn misc_ops_is_empty(&self) -> bool {
+        self.misc.is_empty()
+    }
+
+    pub(crate) fn detach_misc_ops(&mut self, max: usize) -> Option<Box<MiscOp>> {
+        self.misc.detach_batch(max)
     }
 
     /// Link `item` at the tail of `queue` (`enqueue_process_internal`); a `proxy` entry is a
@@ -447,23 +735,7 @@ impl<T: Task> Lists<T> {
                 with_node::<T, _>(next, |link, _| link.prev.store(prev, Ordering::Relaxed));
             }
         }
-        let proxy = node & PROXY != 0;
-        let process = if node & PROXY == 0 {
-            // SAFETY: the list held the reference `into_raw` gave up in `push_back`; the node
-            // is unlinked, so this is its only owner.
-            unsafe { ProcRef::<T>::from_raw(node as *mut ()) }
-        } else {
-            // SAFETY: the box made in `push_back`, unlinked now.
-            let proxy = unsafe { Box::from_raw((node & !PROXY) as *mut Proxy<T>) };
-            proxy.process.clone()
-        };
-        Scheduled {
-            process,
-            schedule_count,
-            prio,
-            kind: if proxy { Enqueue::Proxy } else { Enqueue::Real },
-            queue,
-        }
+        node_into_scheduled::<T>(node, queue, schedule_count, prio)
     }
 
     /// Unlink the head of `queue` (`dequeue_process`).
@@ -533,6 +805,93 @@ impl<T: Task> Lists<T> {
             node = next;
         }
         taken
+    }
+
+    /// Detach accepted process nodes into the chain used by `try_steal_task_from_victim`.
+    // Port of erts/emulator/beam/erl_process.c (try_steal_task_from_victim), OTP-29.1.1.
+    pub(crate) fn take_chain(
+        &mut self,
+        queue: usize,
+        max: usize,
+        mut accept: impl FnMut(&ProcRef<T>) -> bool,
+    ) -> ProcessChain<T> {
+        let mut chain = ProcessChain {
+            queue,
+            ..ProcessChain::default()
+        };
+        let mut prev = 0;
+        let mut node = self.first[queue];
+        while node != 0 && chain.len() < max {
+            // SAFETY: node is in queue; the caller holds the run-queue mutex.
+            let (next, prio, ok) = unsafe {
+                with_node::<T, _>(node, |link, process| {
+                    (
+                        link.next.load(Ordering::Relaxed),
+                        link.prio.load(Ordering::Relaxed),
+                        accept(process),
+                    )
+                })
+            };
+            if ok {
+                // SAFETY: prev and next are adjacent nodes in the victim list. The victim's
+                // run-queue mutex is held, and chain owns the detached nodes after this update.
+                unsafe {
+                    if prev == 0 {
+                        self.first[queue] = next;
+                    } else {
+                        with_node::<T, _>(prev, |link, _| link.next.store(next, Ordering::Relaxed));
+                    }
+                    if next == 0 {
+                        self.last[queue] = prev;
+                    } else {
+                        with_node::<T, _>(next, |link, _| link.prev.store(prev, Ordering::Relaxed));
+                    }
+                    with_node::<T, _>(node, |link, _| {
+                        link.prev.store(chain.last, Ordering::Relaxed);
+                        link.next.store(0, Ordering::Relaxed);
+                    });
+                    if chain.last == 0 {
+                        chain.first = node;
+                    } else {
+                        with_node::<T, _>(chain.last, |link, _| {
+                            link.next.store(node, Ordering::Relaxed)
+                        });
+                    }
+                }
+                chain.last = node;
+                chain.counts[usize::from(prio)] += 1;
+            } else {
+                prev = node;
+            }
+            node = next;
+        }
+        chain
+    }
+
+    /// Splice a detached chain at the tail of its priority queue.
+    // Port of erts/emulator/beam/erl_process.c (try_steal_task_from_victim), OTP-29.1.1.
+    pub(crate) fn append_chain(&mut self, chain: &mut ProcessChain<T>) {
+        if chain.is_empty() {
+            return;
+        }
+        let queue = chain.queue;
+        let first = chain.first;
+        let last = chain.last;
+        let prev = self.last[queue];
+        // SAFETY: chain exclusively owns its detached nodes, this list is protected by the
+        // thief's run-queue mutex, and neither chain nor list has another writer.
+        unsafe {
+            with_node::<T, _>(first, |link, _| link.prev.store(prev, Ordering::Relaxed));
+            if prev == 0 {
+                self.first[queue] = first;
+            } else {
+                with_node::<T, _>(prev, |link, _| link.next.store(first, Ordering::Relaxed));
+            }
+        }
+        self.last[queue] = last;
+        chain.first = 0;
+        chain.last = 0;
+        chain.counts = [0; crate::balance::PRIO_LEVELS];
     }
 
     /// Unlink every entry of every queue.

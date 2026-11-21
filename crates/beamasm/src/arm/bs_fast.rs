@@ -2,12 +2,11 @@
 //!
 //! Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1076-2494, OTP-29.1.1.
 
-use crate::bs_construct::{BsCreateBinHelpers, BsSegment, BsSegmentKind};
+use crate::bs_construct::{BsSegment, BsSegmentKind};
 use crate::common::bs::{BscAction, BscSegment, beam_jit_bsc_combine_segments};
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
 use arinsal_a64::enc::{Cond, Gpr, Shift, Shifted};
 use arinsal_term::{Term, atoms};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 const HTOP: Gpr = Gpr::x(23);
 const E: Gpr = Gpr::x(20);
@@ -28,35 +27,6 @@ const ONHEAP_BITS: u64 = 64 * 8;
 const HEAP_BITS_TAG: u64 = 0x20;
 const BSF_LITTLE_OR_NATIVE: u32 = 2;
 const TMP_MEM0: u32 = crate::arm::beam_asm::tmp_mem_ref(0);
-
-static APPEND_BINARY: AtomicUsize = AtomicUsize::new(0);
-static APPEND_CHECKED: AtomicUsize = AtomicUsize::new(0);
-static PRIVATE_APPEND_CHECKED: AtomicUsize = AtomicUsize::new(0);
-static BS_GC: AtomicUsize = AtomicUsize::new(0);
-
-/// Publishes the runtime used for `<<Bin/binary, Bin2/binary>>` (append + one binary).
-pub fn install_bs_append_binary(function: usize) {
-    APPEND_BINARY.store(function, Ordering::Relaxed);
-}
-
-/// Publishes the checked writable binary append entry used by native bit syntax code.
-pub fn install_bs_append_checked(function: usize) {
-    APPEND_CHECKED.store(function, Ordering::Relaxed);
-}
-
-/// Publishes the checked private append entry used by native bit syntax code.
-pub fn install_bs_private_append(checked: usize) {
-    PRIVATE_APPEND_CHECKED.store(checked, Ordering::Relaxed);
-}
-
-/// Publishes the GC hook `emit_gc_test` calls (`garbage_collect` in BeamAsm).
-pub fn install_bs_gc(hook: crate::construct::GcHook) {
-    BS_GC.store(hook as usize, Ordering::Relaxed);
-}
-
-fn gc_addr() -> usize {
-    BS_GC.load(Ordering::Relaxed)
-}
 
 fn tmp_at(index: usize) -> u32 {
     crate::arm::beam_asm::tmp_mem_ref(index)
@@ -97,33 +67,25 @@ pub(crate) fn emit_fast_bs_create_bin(
     live: u32,
     dst: ArgVal,
     segments: &[BsSegment],
-    helpers: BsCreateBinHelpers,
 ) -> Result<bool, ModuleError> {
     if let Some(plan) = private_plan(asm, segments) {
-        emit_private(asm, fail, alloc, live, dst, segments, helpers, &plan)?;
+        emit_private(asm, fail, alloc, live, dst, segments, &plan)?;
         return Ok(true);
     }
     // The slow path rebuilds from the source register, so a collection inside the helper
     // must have updated it: only a source among the live roots takes this path.
-    if APPEND_CHECKED.load(Ordering::Relaxed) != 0
-        && let Some(plan) = append_plan(asm, segments)
+    if let Some(plan) = append_plan(asm, segments)
         && x_index(plan.bin).is_some_and(|index| index < live)
     {
-        emit_append(asm, fail, alloc, live, dst, segments, helpers, &plan)?;
+        emit_append(asm, fail, alloc, live, dst, segments, &plan)?;
         return Ok(true);
     }
     if let Some(plan) = fixed_plan(asm, segments, alloc) {
-        emit_fixed(asm, fail, alloc, live, dst, segments, helpers, &plan)?;
+        emit_fixed(asm, fail, alloc, live, dst, segments, &plan)?;
         return Ok(true);
     }
     if let Some(src) = utf8_plan(segments) {
-        emit_utf8(asm, fail, alloc, live, dst, segments, helpers, src)?;
-        return Ok(true);
-    }
-    if APPEND_BINARY.load(Ordering::Relaxed) != 0
-        && let Some((src, extra)) = append_binary_plan(segments)
-    {
-        emit_append_binary(asm, fail, alloc, live, dst, segments, helpers, src, extra)?;
+        emit_utf8(asm, fail, alloc, live, dst, segments, src)?;
         return Ok(true);
     }
     Ok(false)
@@ -187,22 +149,6 @@ fn fixed_plan(asm: &BeamModuleAssembler, segments: &[BsSegment], alloc: u32) -> 
 fn utf8_plan(segments: &[BsSegment]) -> Option<ArgVal> {
     match segments {
         [seg] if seg.kind == BsSegmentKind::Utf8 => Some(seg.src),
-        _ => None,
-    }
-}
-
-fn append_binary_plan(segments: &[BsSegment]) -> Option<(u32, u32)> {
-    match segments {
-        [head, tail]
-            if head.kind == BsSegmentKind::Append
-                && tail.kind == BsSegmentKind::Binary
-                && head.unit % 8 == 0
-                && tail.unit % 8 == 0
-                && is_all(head)
-                && is_all(tail) =>
-        {
-            Some((x_index(head.src)?, x_index(tail.src)?))
-        }
         _ => None,
     }
 }
@@ -283,7 +229,6 @@ fn emit_private(
     live: u32,
     dst: ArgVal,
     segments: &[BsSegment],
-    helpers: BsCreateBinHelpers,
     plan: &PrivatePlan,
 ) -> Result<(), ModuleError> {
     let slow = asm.code.new_label();
@@ -309,7 +254,10 @@ fn emit_private(
         e.mov_const(Gpr::x(3), plan.extra_bits)
     })?;
     crate::emit_enter_runtime(&mut asm.code, live as usize, update)?;
-    asm.fragment_call(PRIVATE_APPEND_CHECKED.load(Ordering::Relaxed))?;
+    emit_direct_call(
+        asm,
+        crate::raw::erts_bs_private_append_checked as *const () as usize,
+    )?;
     crate::emit_leave_runtime(&mut asm.code, live as usize, update)?;
     asm.code.cbz(Gpr::x(0), slow)?;
     asm.code
@@ -356,7 +304,7 @@ fn emit_private(
     let segments = segments.to_vec();
     asm.push_bs_cold(Box::new(move |asm| {
         asm.code.bind(slow)?;
-        asm.emit_generic_bs_create_bin(fail, alloc, live, dst, &segments, helpers)?;
+        asm.emit_generic_bs_create_bin(fail, alloc, live, dst, &segments)?;
         asm.code.b(done)?;
         Ok(())
     }));
@@ -371,7 +319,6 @@ fn emit_append(
     live: u32,
     dst: ArgVal,
     segments: &[BsSegment],
-    helpers: BsCreateBinHelpers,
     plan: &AppendPlan,
 ) -> Result<(), ModuleError> {
     let slow = asm.code.new_label();
@@ -386,8 +333,7 @@ fn emit_append(
         }
     }
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1810-1845 (`am_append`), OTP-29.1.1:
-    // `mov_arg(ArgXRegister(Live), src)`, then `erts_bs_append_checked(c_p, reg, Live, ...)`
-    // with `Live + 1` X registers synced. The helper collects with exactly those roots.
+    // `mov_arg(ArgXRegister(Live), src)`, then `erts_bs_append_checked(c_p, reg, Live, ...)`.
     let append_source = ArgVal::X(live);
     let source = asm.source_reg(plan.bin)?;
     asm.store_register(append_source, source)?;
@@ -400,11 +346,13 @@ fn emit_append(
         crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(1))?;
         e.mov_const(Gpr::x(2), u64::from(live))?;
         e.mov_const(Gpr::x(3), plan.extra_bits)?;
-        e.mov_const(Gpr::x(4), plan.unit)?;
-        e.mov_const(Gpr::x(5), u64::from(live))?;
-        e.mov_const(Gpr::x(6), u64::from(alloc))
+        e.mov_const(Gpr::x(4), u64::from(alloc))?;
+        e.mov_const(Gpr::x(5), plan.unit)
     })?;
-    asm.fragment_call(APPEND_CHECKED.load(Ordering::Relaxed))?;
+    emit_direct_call(
+        asm,
+        crate::raw::erts_bs_append_checked as *const () as usize,
+    )?;
     crate::emit_leave_runtime(&mut asm.code, live as usize + 1, update)?;
     asm.code.cbz(Gpr::x(0), slow)?;
     asm.code.emit(|e| e.cmn_imm(Gpr::x(0), 1, false))?;
@@ -453,7 +401,7 @@ fn emit_append(
         asm.code.bind(failed)?;
         asm.branch_error()?;
         asm.code.bind(slow)?;
-        asm.emit_generic_bs_create_bin(fail, alloc, live, dst, &segments, helpers)?;
+        asm.emit_generic_bs_create_bin(fail, alloc, live, dst, &segments)?;
         asm.code.b(done)?;
         Ok(())
     }));
@@ -468,7 +416,6 @@ fn emit_fixed(
     live: u32,
     dst: ArgVal,
     segments: &[BsSegment],
-    helpers: BsCreateBinHelpers,
     plan: &FixedPlan,
 ) -> Result<(), ModuleError> {
     let slow = asm.code.new_label();
@@ -476,7 +423,11 @@ fn emit_fixed(
     // Port of instr_bs.cpp:1933-1958 (allocate heap bitstring of static size)
     // and instr_common.cpp:137-157 (emit_gc_test). A failed check collects and
     // continues; it does not rebuild the binary in the generic helper.
-    let gc_stub = emit_static_gc(asm, plan.heap_words, alloc, live, slow)?;
+    let need = plan
+        .heap_words
+        .checked_add(alloc)
+        .ok_or(ModuleError::InvalidOperand("heap check size overflow"))?;
+    asm.emit_test_heap(need, live)?;
     let ebs = bits_state();
     let saved = tmp_at(1);
     asm.code.emit(|e| {
@@ -528,21 +479,14 @@ fn emit_fixed(
         bit_at += bits;
     }
     reload_boxed(asm, dst, saved)?;
-    // The generic builder and the GC stub are emitted with the yield stubs, after this
-    // function, so the success path falls into the next instruction. erts does the same:
-    // `b.ls` skips `mov ARG4, Live; bl garbage_collect` and the body has no trailing branch
-    // (instr_bs.cpp:1941-1958, instr_common.cpp:150-157).
+    // The generic builder is emitted with the yield stubs, after this function, so the
+    // success path falls into the next instruction.
     asm.code.bind(done)?;
     let segments = segments.to_vec();
-    let stub = gc_stub;
     asm.push_bs_cold(Box::new(move |asm| {
         asm.code.bind(slow)?;
-        asm.emit_generic_bs_create_bin(fail, alloc, live, dst, &segments, helpers)?;
+        asm.emit_generic_bs_create_bin(fail, alloc, live, dst, &segments)?;
         asm.code.b(done)?;
-        if let Some(stub) = stub {
-            asm.code.bind(stub)?;
-            emit_gc_stub(asm, live, gc_addr())?;
-        }
         Ok(())
     }));
     Ok(())
@@ -556,7 +500,6 @@ fn emit_utf8(
     live: u32,
     dst: ArgVal,
     segments: &[BsSegment],
-    helpers: BsCreateBinHelpers,
     src: ArgVal,
 ) -> Result<(), ModuleError> {
     let slow = asm.code.new_label();
@@ -622,21 +565,13 @@ fn emit_utf8(
         .emit(|e| e.add_reg(Gpr::x(2), HTOP, Gpr::x(8), Shift::Lsr, 3))?;
     asm.code.emit(|e| e.cmp_reg(Gpr::x(2), E, Shift::Lsl, 0))?;
     asm.code.b_cond(Cond::Ls, after_gc)?;
-    let hook = gc_addr();
-    if hook == 0 {
-        asm.code.b(slow)?;
-    } else {
-        asm.code.emit(|e| {
-            e.lsr_imm(Gpr::x(12), Gpr::x(10), 6)?;
-            e.add_imm(
-                Gpr::x(12),
-                Gpr::x(12),
-                (2 + alloc + arinsal_term::S_RESERVED as u32) as u16,
-                false,
-            )
-        })?;
-        emit_gc_call(asm, live, hook, Gpr::x(12), &[Gpr::x(7), Gpr::x(10)])?;
-    }
+    // sizeReg (x7) and TMP3 (x10) survive the collection in TMP_MEM1q/TMP_MEM2q.
+    asm.code
+        .emit(|e| e.stp(Gpr::x(7), Gpr::x(10), SCHEDULER_REGS, tmp_at(0) as i16))?;
+    asm.code.emit(|e| e.mov_const(Gpr::x(3), u64::from(live)))?;
+    asm.gc_fragment_call()?;
+    asm.code
+        .emit(|e| e.ldp(Gpr::x(7), Gpr::x(10), SCHEDULER_REGS, tmp_at(0) as i16))?;
     asm.code.bind(after_gc)?;
     let ebs = bits_state();
     // instr_bs.cpp:1979 stores the boxed pointer at TMP_MEM1q (tmp_mem[0]).
@@ -679,11 +614,20 @@ fn emit_utf8(
     let segments = segments.to_vec();
     asm.push_bs_cold(Box::new(move |asm| {
         asm.code.bind(slow)?;
-        asm.emit_generic_bs_create_bin(fail, alloc, live, dst, &segments, helpers)?;
+        asm.emit_generic_bs_create_bin(fail, alloc, live, dst, &segments)?;
         asm.code.b(done)?;
         asm.code.bind(shared)?;
         emit_construct_utf8_shared(asm)
     }));
+    Ok(())
+}
+
+/// `runtime_call<Function>()`: load the erts runtime entry and issue its ABI call.
+fn emit_direct_call(asm: &mut BeamModuleAssembler, target: usize) -> Result<(), ModuleError> {
+    asm.code.emit(|e| {
+        e.mov_const(Gpr::x(17), target as u64)?;
+        e.blr(Gpr::x(17))
+    })?;
     Ok(())
 }
 
@@ -790,119 +734,6 @@ fn emit_construct_utf8_shared(asm: &mut BeamModuleAssembler) -> Result<(), Modul
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_append_binary(
-    asm: &mut BeamModuleAssembler,
-    fail: u32,
-    alloc: u32,
-    live: u32,
-    dst: ArgVal,
-    segments: &[BsSegment],
-    helpers: BsCreateBinHelpers,
-    src: u32,
-    extra: u32,
-) -> Result<(), ModuleError> {
-    let slow = asm.code.new_label();
-    let done = asm.code.new_label();
-    let function = APPEND_BINARY.load(Ordering::Relaxed);
-    let roots = live.max(src.saturating_add(1)).max(extra.saturating_add(1));
-    let update = crate::Update::HEAP_ALLOC
-        .union(crate::Update::X_REGS)
-        .union(crate::Update::REDUCTIONS);
-    crate::emit_enter_runtime(&mut asm.code, roots as usize, update)?;
-    asm.code.emit(|e| {
-        e.mov_reg(Gpr::x(0), C_P)?;
-        e.mov_const(Gpr::x(1), u64::from(src))?;
-        e.mov_const(Gpr::x(2), u64::from(extra))?;
-        e.mov_const(Gpr::x(3), u64::from(roots))?;
-        e.mov_const(Gpr::x(4), u64::from(alloc))?;
-        // `reg`: the operands and the GC roots are in the register array.
-        crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(5))
-    })?;
-    asm.fragment_call(function)?;
-    crate::emit_leave_runtime(&mut asm.code, roots as usize, update)?;
-    asm.code.cbz(Gpr::x(0), slow)?;
-    asm.store_register(dst, Gpr::x(0))?;
-    asm.code.bind(done)?;
-    let segments = segments.to_vec();
-    asm.push_bs_cold(Box::new(move |asm| {
-        asm.code.bind(slow)?;
-        asm.emit_generic_bs_create_bin(fail, alloc, live, dst, &segments, helpers)?;
-        asm.code.b(done)?;
-        Ok(())
-    }));
-    Ok(())
-}
-
-/// Port of instr_common.cpp:150-157 (`emit_gc_test`).
-///
-/// Hot path: `add ARG3, HTOP, #bytes; cmp ARG3, E; b.ls cont`. A miss is
-/// `mov ARG4, Live; bl garbage_collect` with the body of that fragment out of
-/// line, so the header setup is the next straight-line instruction. Returns the
-/// stub label when a hook is installed.
-fn emit_static_gc(
-    asm: &mut BeamModuleAssembler,
-    heap_words: u32,
-    alloc: u32,
-    live: u32,
-    slow: arinsal_a64::buf::Label,
-) -> Result<Option<arinsal_a64::buf::Label>, ModuleError> {
-    let need = heap_words
-        .checked_add(alloc)
-        .and_then(|words| words.checked_add(arinsal_term::S_RESERVED as u32))
-        .ok_or(ModuleError::InvalidOperand("heap check size overflow"))?;
-    let bytes = u64::from(need) * 8;
-    let ok = asm.code.new_label();
-    // ARG3 is x2 (beam_asm.hpp). OTP's fragment reads this register.
-    if bytes <= 4095 {
-        asm.code
-            .emit(|e| e.add_imm(Gpr::x(2), HTOP, bytes as u16, false))?;
-    } else {
-        asm.code.emit(|e| {
-            e.mov_const(Gpr::x(2), bytes)?;
-            e.add_reg(Gpr::x(2), HTOP, Gpr::x(2), Shift::Lsl, 0)
-        })?;
-    }
-    asm.code.emit(|e| e.cmp_reg(Gpr::x(2), E, Shift::Lsl, 0))?;
-    asm.code.b_cond(Cond::Ls, ok)?;
-    let hook = gc_addr();
-    let stub = if hook == 0 {
-        asm.code.b(slow)?;
-        None
-    } else {
-        let stub = asm.code.new_label();
-        asm.code.emit(|e| e.mov_const(Gpr::x(3), u64::from(live)))?;
-        asm.code.bl(stub)?;
-        Some(stub)
-    };
-    asm.code.bind(ok)?;
-    Ok(stub)
-}
-
-/// Out-of-line `garbage_collect` fragment for the static heap check.
-///
-/// x2 is `HTOP + (heap + alloc + S_RESERVED) * 8`, the value `emit_gc_test` leaves
-/// in ARG3. beam_asm_global.cpp:107-109 turns that into a word count and subtracts
-/// `S_RESERVED` because `erts_garbage_collect_nobump` adds it again (erl_gc.c:1429).
-/// The installed hook is `emit_test_heap`'s contract: the count already includes
-/// `S_RESERVED`, and `Process::ensure` adds only the redzone. Subtracting here
-/// would skip a collection when fewer than `S_RESERVED` words remain.
-fn emit_gc_stub(asm: &mut BeamModuleAssembler, live: u32, hook: usize) -> Result<(), ModuleError> {
-    // Port of beam_asm_global.cpp (emit_garbage_collect), OTP-29.1.1: the fragment keeps its
-    // return address in a runtime frame, because the runtime call below overwrites x30.
-    asm.code
-        .emit(|e| e.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16))?;
-    asm.code.emit(|e| {
-        e.sub_reg(Gpr::x(12), Gpr::x(2), HTOP, Shift::Lsl, 0)?;
-        e.lsr_imm(Gpr::x(12), Gpr::x(12), 3)
-    })?;
-    emit_gc_call(asm, live, hook, Gpr::x(12), &[])?;
-    asm.code
-        .emit(|e| e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16))?;
-    asm.code.emit(|e| e.ret(Gpr::x(30)))?;
-    Ok(())
-}
-
 /// `ldur Xdst, [scheduler, saved]` — erts reloads the boxed pointer straight into the
 /// destination (`ldr x25, TMP_MEM1q`), not via a scratch and a move.
 fn reload_boxed(
@@ -922,58 +753,6 @@ fn reload_boxed(
             asm.store_register(dst, Gpr::x(0))
         }
     }
-}
-
-/// Calls the installed GC hook. `words` includes `S_RESERVED`, as `emit_test_heap` does.
-/// `keep` is restored afterwards.
-fn emit_gc_call(
-    asm: &mut BeamModuleAssembler,
-    live: u32,
-    hook: usize,
-    words: Gpr,
-    keep: &[Gpr],
-) -> Result<(), ModuleError> {
-    asm.code
-        .emit(|e| e.str_uoff(words, SCHEDULER_REGS, tmp_at(3)))?;
-    let mut slot = 0usize;
-    for reg in keep {
-        if slot == 2 || slot == 3 {
-            slot = 4;
-        }
-        asm.code
-            .emit(|e| e.str_uoff(*reg, SCHEDULER_REGS, tmp_at(slot)))?;
-        slot += 1;
-    }
-    let update = crate::Update::HEAP_ALLOC.union(crate::Update::X_REGS);
-    crate::emit_enter_runtime(&mut asm.code, live as usize, update)?;
-    asm.code.emit(|e| {
-        e.mov_reg(Gpr::x(0), C_P)?;
-        crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(1))?;
-        e.ldr_uoff(Gpr::x(2), SCHEDULER_REGS, tmp_at(3))?;
-        e.mov_const(Gpr::x(3), u64::from(live))?;
-        e.mov_reg(Gpr::w(4), Gpr::w(22))
-    })?;
-    asm.fragment_call(hook)?;
-    // The word count lived in tmp_mem[3], which the native-return bridge treats
-    // as a handoff marker. A leftover count would be consumed as that marker.
-    asm.code
-        .emit(|e| e.str_uoff(Gpr::xzr(), SCHEDULER_REGS, tmp_at(3)))?;
-    crate::emit_leave_runtime(&mut asm.code, live as usize, update)?;
-    asm.code.emit(|e| {
-        e.sub_reg(Gpr::w(22), Gpr::w(22), Gpr::w(0), Shift::Lsl, 0)?;
-        e.ldr_uoff(Gpr::x(9), C_P, 40)
-    })?;
-    asm.error_if_nonzero(Gpr::x(9))?;
-    let mut slot = 0usize;
-    for reg in keep {
-        if slot == 2 || slot == 3 {
-            slot = 4;
-        }
-        asm.code
-            .emit(|e| e.ldr_uoff(*reg, SCHEDULER_REGS, tmp_at(slot)))?;
-        slot += 1;
-    }
-    Ok(())
 }
 
 fn emit_is_small(

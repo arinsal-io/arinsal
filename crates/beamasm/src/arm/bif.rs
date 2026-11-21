@@ -6,9 +6,6 @@ use std::sync::OnceLock;
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
 use crate::{Update, emit_enter_runtime, emit_leave_runtime};
 
-/// BIF target supplied by the runtime.
-pub type BifTarget = extern "C" fn(*mut crate::ProcessHeader, u64, u64, u64, u32) -> u64;
-
 pub use arinsal_term::ErtsCodeMfa;
 
 /// `erlang:load_nif/2`, passed to `raise_exception_shared` when the loader returns an error.
@@ -57,8 +54,8 @@ arith_mfa!(ERLANG_BSL_MFA, BSL, 2);
 arith_mfa!(ERLANG_BSR_MFA, BSR, 2);
 arith_mfa!(ERLANG_DIV_2_MFA, DIV_2, 2);
 
-fn guard_mfas() -> &'static [ErtsCodeMfa; 13] {
-    static MFAS: OnceLock<[ErtsCodeMfa; 13]> = OnceLock::new();
+fn guard_mfas() -> &'static [ErtsCodeMfa; 14] {
+    static MFAS: OnceLock<[ErtsCodeMfa; 14]> = OnceLock::new();
     MFAS.get_or_init(|| {
         let module = arinsal_term::Term::atom(arinsal_term::atoms::ERLANG).word();
         let function = |name| {
@@ -139,6 +136,13 @@ fn guard_mfas() -> &'static [ErtsCodeMfa; 13] {
                 function: function("or"),
                 arity: 2,
             },
+            // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:1084-1087
+            // (emit_handle_node_error), OTP-29.1.1.
+            ErtsCodeMfa {
+                module,
+                function: function("node"),
+                arity: 1,
+            },
         ]
     })
 }
@@ -147,7 +151,7 @@ fn guard_mfas() -> &'static [ErtsCodeMfa; 13] {
 // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:52-56, OTP-29.1.1.
 pub fn guard_bif_mfa(index: usize) -> Option<usize> {
     // Indexes: 0 element, 1 hd, 2 tl, 3 bit_size, 4 byte_size, 5 map_size, 6 tuple_size,
-    // 7 map_get, 8 length, 9 is_map_key, 10 not, 11 and, 12 or.
+    // 7 map_get, 8 length, 9 is_map_key, 10 not, 11 and, 12 or, 13 node.
     let mfa = guard_mfas().get(index)?;
     Some(std::ptr::from_ref(mfa) as usize)
 }
@@ -192,9 +196,6 @@ pub fn static_bif_mfa(info: u64) -> Option<(arinsal_term::Atom, arinsal_term::At
     ))
 }
 
-/// Apply resolver supplied by the runtime; zero means the target could not be resolved.
-pub type ApplyResolver = extern "C" fn(*mut crate::ProcessHeader, u64, u32, u32) -> usize;
-
 /// Code-index constants and the export entry (`Export`), shared with the term crate whose
 /// export funs point at the same entries.
 // Port of erts/emulator/beam/code_ix.h:72-95 and erts/emulator/beam/export.h:39-75, OTP-29.1.1.
@@ -215,19 +216,6 @@ pub const EXPORT_IS_BIF_TRACED_OFFSET: u32 =
 pub const EXPORT_BIF_NUMBER_OFFSET: u32 = core::mem::offset_of!(ExportEntry, bif_number) as u32;
 const _: () = assert!(EXPORT_BIF_NUMBER_OFFSET.is_multiple_of(4));
 
-// erts calls `i_bif*` with only `Update::eReductions` (instr_bif.cpp:47-64) because its guard
-// BIFs never allocate on the process heap. This port's BIFs may build terms on the heap, so the
-// call also publishes and reloads HTOP and E.
-const PLAIN_BIF_UPDATE: Update = Update::HEAP_ALLOC.union(Update::REDUCTIONS);
-
-const XREGS: [Gpr; 6] = [
-    Gpr::x(25),
-    Gpr::x(26),
-    Gpr::x(27),
-    Gpr::x(28),
-    Gpr::x(10 + 5),
-    Gpr::x(10 + 6),
-];
 const E: Gpr = Gpr::x(20);
 /// The process's code index (`active_code_ix`), loaded on every entry into native code.
 const ACTIVE_CODE_IX: Gpr = Gpr::x(24);
@@ -261,7 +249,7 @@ impl BeamModuleAssembler {
 
         self.code.bind(schedule)?;
         self.code.adr(Gpr::x(2), entry)?;
-        self.fragment_branch(self.yield_fragments.2)?;
+        self.fragment_branch(self.yield_fragments.context_switch)?;
         self.code.bind(next)?;
         Ok(())
     }
@@ -278,160 +266,6 @@ impl BeamModuleAssembler {
         self.code
             .emit(|e| e.mov_const(Gpr::x(3), mfa as *const ErtsCodeMfa as u64))?;
         self.fragment_branch(self.raise_fragments.1)
-    }
-
-    /// Calls a lightweight BIF with the supplied X-register arguments.
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:595-610, OTP-29.1.1
-    pub fn emit_call_light_bif(
-        &mut self,
-        bif: BifTarget,
-        args: &[ArgVal],
-        dst: ArgVal,
-    ) -> Result<(), ModuleError> {
-        self.emit_bif_call(
-            bif,
-            args,
-            dst,
-            args.len() as u32,
-            None,
-            3,
-            Update::HEAP_ALLOC
-                .union(Update::REDUCTIONS)
-                .union(Update::X_REGS),
-        )
-    }
-
-    /// Calls a BIF resolved from an MFA by the runtime.
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:819-839, OTP-29.1.1
-    pub fn emit_call_bif_mfa(
-        &mut self,
-        bif: BifTarget,
-        args: &[ArgVal],
-        dst: ArgVal,
-    ) -> Result<(), ModuleError> {
-        self.emit_bif_call(
-            bif,
-            args,
-            dst,
-            args.len() as u32,
-            None,
-            6,
-            Update::HEAP_ALLOC
-                .union(Update::REDUCTIONS)
-                .union(Update::X_REGS),
-        )
-    }
-
-    /// Emits `i_bif1` and branches to a supplied BEAM label on a false result.
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-120, OTP-29.1.1
-    pub fn emit_i_bif1(
-        &mut self,
-        src1: ArgVal,
-        fail: Option<u32>,
-        bif: BifTarget,
-        dst: ArgVal,
-    ) -> Result<(), ModuleError> {
-        self.emit_bif_call(bif, &[src1], dst, 1, fail, 6, PLAIN_BIF_UPDATE)
-    }
-
-    /// Emits `i_bif2` and branches to a supplied BEAM label on a false result.
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:122-133, OTP-29.1.1
-    pub fn emit_i_bif2(
-        &mut self,
-        src1: ArgVal,
-        src2: ArgVal,
-        fail: Option<u32>,
-        bif: BifTarget,
-        dst: ArgVal,
-    ) -> Result<(), ModuleError> {
-        self.emit_bif_call(bif, &[src1, src2], dst, 2, fail, 6, PLAIN_BIF_UPDATE)
-    }
-
-    /// Emits `i_bif3` and branches to a supplied BEAM label on a false result.
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:135-151, OTP-29.1.1
-    pub fn emit_i_bif3(
-        &mut self,
-        src1: ArgVal,
-        src2: ArgVal,
-        src3: ArgVal,
-        fail: Option<u32>,
-        bif: BifTarget,
-        dst: ArgVal,
-    ) -> Result<(), ModuleError> {
-        self.emit_bif_call(bif, &[src1, src2, src3], dst, 3, fail, 6, PLAIN_BIF_UPDATE)
-    }
-
-    /// Emits `i_gc_bif1`, passing the live X-register count to the runtime.
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:154-175, OTP-29.1.1
-    pub fn emit_i_gc_bif1(
-        &mut self,
-        src1: ArgVal,
-        fail: Option<u32>,
-        bif: BifTarget,
-        live: u32,
-        dst: ArgVal,
-    ) -> Result<(), ModuleError> {
-        self.emit_bif_call(
-            bif,
-            &[src1],
-            dst,
-            live,
-            fail,
-            live as usize,
-            Update::HEAP_ALLOC
-                .union(Update::REDUCTIONS)
-                .union(Update::X_REGS),
-        )
-    }
-
-    /// Emits `i_gc_bif2`, passing the live X-register count to the runtime.
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:177-200, OTP-29.1.1
-    pub fn emit_i_gc_bif2(
-        &mut self,
-        src1: ArgVal,
-        src2: ArgVal,
-        fail: Option<u32>,
-        bif: BifTarget,
-        live: u32,
-        dst: ArgVal,
-    ) -> Result<(), ModuleError> {
-        self.emit_bif_call(
-            bif,
-            &[src1, src2],
-            dst,
-            live,
-            fail,
-            live as usize,
-            Update::HEAP_ALLOC
-                .union(Update::REDUCTIONS)
-                .union(Update::X_REGS),
-        )
-    }
-
-    /// Emits `i_gc_bif3`, passing the live X-register count to the runtime.
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:202-228, OTP-29.1.1
-    #[allow(clippy::too_many_arguments)]
-    pub fn emit_i_gc_bif3(
-        &mut self,
-        src1: ArgVal,
-        src2: ArgVal,
-        src3: ArgVal,
-        fail: Option<u32>,
-        bif: BifTarget,
-        live: u32,
-        dst: ArgVal,
-    ) -> Result<(), ModuleError> {
-        self.emit_bif_call(
-            bif,
-            &[src1, src2, src3],
-            dst,
-            live,
-            fail,
-            live as usize,
-            Update::HEAP_ALLOC
-                .union(Update::REDUCTIONS)
-                .union(Update::X_REGS),
-        )
     }
 
     /// Emits an external call through the current address in an export entry.
@@ -460,80 +294,15 @@ impl BeamModuleAssembler {
         self.emit_i_call_ext_only(export)
     }
 
-    /// Calls the target resolved from X0 and arity X1, retaining a caller continuation.
-    // Port of erts/emulator/beam/jit/arm/instr_call.cpp:246-249, OTP-29.1.1
-    pub fn emit_i_apply(&mut self, resolver: ApplyResolver, live: u32) -> Result<(), ModuleError> {
-        self.emit_apply(resolver, live, false, false)
-    }
-
-    /// Deallocates a Y frame and tail-calls the target resolved from X0 and arity X1.
-    // Port of erts/emulator/beam/jit/arm/instr_call.cpp:251-254, OTP-29.1.1
-    pub fn emit_i_apply_last(
-        &mut self,
-        resolver: ApplyResolver,
-        live: u32,
-        deallocate: u32,
-    ) -> Result<(), ModuleError> {
-        self.deallocate(deallocate)?;
-        self.emit_apply(resolver, live, true, true)
-    }
-
-    /// Tail-calls the target resolved from X0 and arity X1.
-    // Port of erts/emulator/beam/jit/arm/instr_call.cpp:256-260, OTP-29.1.1
-    pub fn emit_i_apply_only(
-        &mut self,
-        resolver: ApplyResolver,
-        live: u32,
-    ) -> Result<(), ModuleError> {
-        self.emit_apply(resolver, live, true, true)
-    }
-
-    /// Calls a fun target resolved from X0 and arity X1.
-    // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:330-333, OTP-29.1.1
-    pub fn emit_i_apply_fun(
-        &mut self,
-        resolver: ApplyResolver,
-        live: u32,
-    ) -> Result<(), ModuleError> {
-        self.emit_apply(resolver, live, false, false)
-    }
-
-    /// Deallocates a Y frame and tail-calls a fun target resolved from X0 and X1.
-    // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:335-338, OTP-29.1.1
-    pub fn emit_i_apply_fun_last(
-        &mut self,
-        resolver: ApplyResolver,
-        live: u32,
-        deallocate: u32,
-    ) -> Result<(), ModuleError> {
-        self.deallocate(deallocate)?;
-        self.emit_apply(resolver, live, true, true)
-    }
-
-    /// Tail-calls a fun target resolved from X0 and X1.
-    // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:340-342, OTP-29.1.1
-    pub fn emit_i_apply_fun_only(
-        &mut self,
-        resolver: ApplyResolver,
-        live: u32,
-    ) -> Result<(), ModuleError> {
-        self.emit_apply(resolver, live, true, true)
-    }
-
-    /// Calls `bif_table[].f` of a BIF export (`i_bif1/2/3`, `nofail_bif1/2`).
+    /// Emits `i_bif1/2/3` and `nofail_bif1/2`: `bif` is `bif_table[].f` of a guard BIF.
     ///
-    /// With a nonzero `fail` label an exception raised by the BIF is discarded and control
-    /// branches to the label instead, like `bif1 Fail Bif ...` in a guard.
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:46-200 (emit_i_bif_guard_shared,
-    // emit_i_bif_body_shared, emit_i_bif1/2/3, emit_i_bif), OTP-29.1.1: the operands are stored
-    // in X0..X2 of the register array, which holds no live value (X0..X3 live in callee-saved
-    // machine registers), and the BIF is called as `f(c_p, reg, 0)` with only the reductions
-    // synchronized. `identity` is the export, whose `info.mfa` `c_p->current` points at for
-    // the BIF body; `bif` is `bif_table[ep->bif_number].f`, bound when the call site is emitted.
-    pub fn emit_bif_by_identity(
+    /// With a nonzero `fail` label a failure branches there (`i_bif_guard_shared`), otherwise
+    /// `i_bif_body_shared` raises with the MFA `ubif2mfa` finds for `bif`.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:103-170 (emit_i_bif1/2/3, emit_i_bif),
+    // OTP-29.1.1: the operands are stored in X0..X2 of the register array, which holds no live
+    // value (X0..X3 live in callee-saved machine registers).
+    pub fn emit_i_bif(
         &mut self,
-        identity: usize,
-        bif_mfa: usize,
         bif: usize,
         args: &[ArgVal],
         fail: u32,
@@ -542,140 +311,27 @@ impl BeamModuleAssembler {
         if args.len() > 3 {
             return Err(ModuleError::InvalidOperand("BIF arity exceeds three"));
         }
+        let fragments = self.bif_fragments;
+        if fragments.i_bif_body == 0 || fragments.i_bif_guard == 0 {
+            return Err(ModuleError::InvalidOperand(
+                "i_bif without the i_bif_*_shared fragments",
+            ));
+        }
         for (i, arg) in args.iter().copied().enumerate() {
             let source = self.source_reg(arg)?;
             self.code
                 .emit(|e| e.str_uoff(source, Gpr::x(19), crate::arm::beam_asm::x_ref(i as u32)))?;
         }
-        let update = Update::HEAP_ALLOC.union(Update::REDUCTIONS);
-        emit_enter_runtime(&mut self.code, 6, update)?;
-        self.code.emit(|e| {
-            // `c_p->current = &exp->info.mfa`, which the BIF body's BIF_ERROR names.
-            e.mov_const(Gpr::x(1), identity as u64 + u64::from(EXPORT_MFA_OFFSET))?;
-            e.str_uoff(
-                Gpr::x(1),
-                Gpr::x(21),
-                std::mem::offset_of!(crate::ProcessHeader, current) as u32,
-            )?;
-            e.mov_reg(Gpr::x(0), Gpr::x(21))?;
-            crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(1))?;
-            e.mov_reg(Gpr::x(2), Gpr::xzr())
-        })?;
-        self.fragment_call(bif)?;
-        emit_leave_runtime(&mut self.code, 6, update)?;
-        let ok = self.code.new_label();
-        self.code.cbnz(Gpr::x(0), ok)?;
+        // ARG4 = the BIF function pointer.
+        self.code.emit(|e| e.mov_const(Gpr::x(3), bif as u64))?;
         if fail != 0 {
-            // A guard failure drops the exception; the registers are untouched.
+            self.fragment_call(fragments.i_bif_guard)?;
             let label = self.label(fail);
-            self.code.emit(|e| e.str_uoff(Gpr::xzr(), Gpr::x(21), 40))?;
-            self.code.b(label)?;
+            self.code.cbz(Gpr::x(0), label)?;
         } else {
-            // handle_error names the BIF by its MFA and reads the operands from X0..X2:
-            // reload them from the register array, where the call left them.
-            if bif_mfa != 0 {
-                self.code.emit(|e| {
-                    e.mov_const(Gpr::x(1), bif_mfa as u64)?;
-                    e.str_uoff(
-                        Gpr::x(1),
-                        Gpr::x(21),
-                        std::mem::offset_of!(crate::ProcessHeader, current) as u32,
-                    )
-                })?;
-            }
-            emit_leave_runtime(&mut self.code, 3, Update::X_REGS)?;
-            self.branch_error_with_bif()?;
+            self.fragment_call(fragments.i_bif_body)?;
         }
-        self.code.bind(ok)?;
-        self.store_bif_result(dst, Gpr::x(0))
-    }
-
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-151, OTP-29.1.1
-    #[allow(clippy::too_many_arguments)]
-    fn emit_bif_call(
-        &mut self,
-        bif: BifTarget,
-        args: &[ArgVal],
-        dst: ArgVal,
-        live: u32,
-        fail: Option<u32>,
-        state_live: usize,
-        update: Update,
-    ) -> Result<(), ModuleError> {
-        if args.len() > 3 || live > 6 {
-            return Err(ModuleError::InvalidOperand(
-                "invalid BIF arity or live count",
-            ));
-        }
-        let mut regs = [Gpr::xzr(); 3];
-        for (i, arg) in args.iter().copied().enumerate() {
-            let source = self.source_reg(arg)?;
-            regs[i] = Gpr::x(10 + i as u8);
-            self.code.emit(|e| e.mov_reg(regs[i], source))?;
-        }
-        self.code
-            .emit(|e| e.mov_const(Gpr::x(13), u64::from(live)))?;
-        self.emit_bif_runtime_call(
-            bif as usize,
-            &[regs[0], regs[1], regs[2], Gpr::x(13)],
-            state_live,
-            update,
-            Some(args),
-        )?;
-        if let Some(label) = fail {
-            self.code.emit(|e| e.mov_reg(Gpr::x(14), Gpr::x(0)))?;
-            let target = self.label(label);
-            self.code.cbz(Gpr::x(14), target)?;
-        }
-        self.store_bif_result(dst, Gpr::x(0))?;
-        Ok(())
-    }
-
-    fn store_bif_result(&mut self, dst: ArgVal, src: Gpr) -> Result<(), ModuleError> {
-        self.store_operand(dst, src)
-    }
-
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:47-65, OTP-29.1.1
-    fn emit_bif_runtime_call(
-        &mut self,
-        target: usize,
-        args: &[Gpr],
-        live: usize,
-        update: Update,
-        error_args: Option<&[ArgVal]>,
-    ) -> Result<(), ModuleError> {
-        emit_enter_runtime(&mut self.code, live, update)?;
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(0), Gpr::x(21))?;
-            for (index, arg) in args.iter().copied().enumerate() {
-                e.mov_reg(Gpr::x(index as u8 + 1), arg)?;
-            }
-            Ok(())
-        })?;
-        self.fragment_call(target)?;
-        emit_leave_runtime(&mut self.code, live, update)?;
-        self.code.emit(|e| e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40))?;
-        if let Some(error_args) = error_args {
-            let ok = self.code.new_label();
-            self.code.cbz(Gpr::x(9), ok)?;
-            self.stage_bif_args_for_raise(error_args)?;
-            self.code.bind(ok)?;
-        }
-        self.error_if_nonzero_with_bif_context(Gpr::x(9))?;
-        Ok(())
-    }
-
-    fn stage_bif_args_for_raise(&mut self, args: &[ArgVal]) -> Result<(), ModuleError> {
-        let mut regs = [Gpr::xzr(); 3];
-        for (index, arg) in args.iter().copied().enumerate() {
-            let source = self.source_reg(arg)?;
-            regs[index] = Gpr::x(10 + index as u8);
-            self.code.emit(|e| e.mov_reg(regs[index], source))?;
-        }
-        for (index, reg) in regs.iter().copied().enumerate().take(args.len()) {
-            self.store_operand(ArgVal::X(index as u32), reg)?;
-        }
-        Ok(())
+        self.store_operand(dst, Gpr::x(0))
     }
 
     // Port of erts/emulator/beam/jit/arm/instr_call.cpp:150-170, OTP-29.1.1
@@ -695,59 +351,6 @@ impl BeamModuleAssembler {
                 e.blr(target)
             }
         })?;
-        Ok(())
-    }
-
-    // Port of erts/emulator/beam/jit/arm/instr_call.cpp:220-260, OTP-29.1.1
-    fn emit_apply(
-        &mut self,
-        resolver: ApplyResolver,
-        live: u32,
-        _include_i: bool,
-        tail: bool,
-    ) -> Result<(), ModuleError> {
-        if live > 6 {
-            return Err(ModuleError::InvalidOperand(
-                "apply live count exceeds X registers",
-            ));
-        }
-        let continuation = self.code.new_label();
-        if tail {
-            self.record_call_site()?;
-        } else {
-            self.record_return_site(continuation)?;
-        }
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(10), XREGS[0])?;
-            e.mov_reg(Gpr::x(11), XREGS[1])?;
-            e.mov_const(Gpr::x(12), u64::from(live))
-        })?;
-        let update = Update::HEAP_ALLOC
-            .union(Update::REDUCTIONS)
-            .union(Update::X_REGS);
-        self.emit_bif_runtime_call(
-            resolver as usize,
-            &[Gpr::x(10), Gpr::x(11), Gpr::x(12)],
-            live as usize,
-            update,
-            None,
-        )?;
-        let resolved = self.code.new_label();
-        self.code.cbnz(Gpr::x(0), resolved)?;
-        self.branch_error()?;
-        self.code.bind(resolved)?;
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(14), Gpr::x(0))?;
-            if tail {
-                e.ldr_post(Gpr::x(30), E, 8)?;
-                e.br(Gpr::x(14))
-            } else {
-                e.blr(Gpr::x(14))
-            }
-        })?;
-        if !tail {
-            self.code.bind(continuation)?;
-        }
         Ok(())
     }
 }

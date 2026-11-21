@@ -179,16 +179,15 @@ fn emit_apply_common(
         let resolved = asm.code.new_label();
         asm.code.cbnz(Gpr::x(1), resolved)?;
         // Port of erts/emulator/beam/jit/arm/instr_call.cpp:220-230,92-96
-        // (emit_raise_exception(entry, &apply3_mfa)), OTP-29.1.1: the resolver set `current`
-        // to erlang:apply/3 and X0..X2 to its operands.
-        asm.code.emit(|e| {
-            e.ldr_uoff(
-                Gpr::x(3),
-                Gpr::x(21),
-                std::mem::offset_of!(crate::ProcessHeader, current) as u32,
-            )
-        })?;
-        asm.branch_error_preserving_bif()?;
+        // (emit_raise_exception(entry, &apply3_mfa)), OTP-29.1.1: X0..X2 hold the operands.
+        static APPLY3_MFA: std::sync::OnceLock<crate::bif::ErtsCodeMfa> =
+            std::sync::OnceLock::new();
+        let mfa = APPLY3_MFA.get_or_init(|| crate::bif::ErtsCodeMfa {
+            module: arinsal_term::Term::atom(arinsal_term::atoms::ERLANG).word(),
+            function: arinsal_term::Term::atom(arinsal_term::atoms::APPLY).word(),
+            arity: 3,
+        });
+        asm.branch_error_with_mfa(std::ptr::from_ref(mfa) as usize)?;
         asm.code.bind(resolved)?;
         asm.code.emit(|e| e.mov_reg(Gpr::x(17), Gpr::x(1)))?;
     }
@@ -225,15 +224,7 @@ fn emit_apply_fun(
         function: arinsal_term::Term::atom(arinsal_term::atoms::APPLY).word(),
         arity: 2,
     });
-    asm.code.emit(|e| {
-        e.mov_const(Gpr::x(3), std::ptr::from_ref(mfa) as u64)?;
-        e.str_uoff(
-            Gpr::x(3),
-            Gpr::x(21),
-            std::mem::offset_of!(crate::ProcessHeader, current) as u32,
-        )
-    })?;
-    asm.branch_error_preserving_bif()?;
+    asm.branch_error_with_mfa(std::ptr::from_ref(mfa) as usize)?;
     asm.code.bind(unpacked)?;
     asm.emit_dynamic_fun_call(runtime.fun_resolver, tail, 0)?;
     Ok(())

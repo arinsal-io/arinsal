@@ -11,10 +11,8 @@ use crate::beam_asm::{CompileError, CoverageProbe, resolve_new_literal, with_tra
 use arinsal_beam::{self as beam, BeamFile};
 use arinsal_beamasm::{
     NativeEntry, ProcessHeader,
-    arith::ArithHelper,
-    construct::GcHook,
     fun::FunCallTag,
-    guard::{CompareShared, GuardHelper, GuardHelper3},
+    guard::CompareShared,
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
     types::{ArgType, TypedArg},
 };
@@ -152,8 +150,9 @@ pub trait ModuleEnv {
     fn breakpoint_fragment(&self) -> usize {
         self.light_bif_fragment()
     }
-    /// Process-wide `(dispatch_return, i_test_yield_shared, context_switch_simplified)` fragments.
-    fn yield_fragments(&self) -> (usize, usize, usize);
+    /// Process-wide `dispatch_return`, `i_test_yield_shared`, `context_switch_simplified` and
+    /// `garbage_collect` fragments.
+    fn yield_fragments(&self) -> arinsal_beamasm::yield_frag::YieldEntries;
     /// Process-wide `(raise_shared, raise_exception_shared, i_func_info_shared)` fragments.
     fn raise_fragments(&self) -> (usize, usize, usize);
     /// Process-wide `(handle_map_get_badmap, handle_map_get_badkey, handle_map_size_error)`
@@ -178,18 +177,16 @@ pub trait ModuleEnv {
     fn process_dictionary_get_helper(&self) -> usize {
         0
     }
-    /// Arithmetic slow path used for bignums and exceptional operands.
-    fn arithmetic_helper(&self) -> ArithHelper;
-    /// Guard slow path used for term comparisons and guard BIFs.
-    fn guard_helper(&self) -> GuardHelper;
+    /// Process-wide `i_length_*_shared`, `i_bif_*_shared` and instr_arith.cpp fragments, or
+    /// zeros when none are installed (then `length/1`, `i_bif*` and arithmetic slow paths are
+    /// not compiled).
+    fn bif_fragments(&self) -> arinsal_beamasm::raise_frag::BifFragments {
+        arinsal_beamasm::raise_frag::BifFragments::default()
+    }
     /// Process-wide comparison fragments. The default is unset; the VM installs the real ones.
     fn compare_shared(&self) -> CompareShared {
         CompareShared::default()
     }
-    /// Guard slow path for checks that compare a tuple tag as well as its arity.
-    fn guard_helper3(&self) -> GuardHelper3;
-    /// Heap slow path used by allocating native operations.
-    fn gc_hook(&self) -> GcHook;
     /// Map lookup slow path. It returns zero when the key is absent.
     fn map_lookup_helper(&self) -> MapLookupHelper;
     /// Dispatches an OTP BIF function body using the current X registers.
@@ -199,21 +196,8 @@ pub trait ModuleEnv {
     fn bif_mfa_entry(&self, _module: &str, _function: &str, _arity: u8) -> Result<usize, String> {
         Err("module environment has no BIF dispatch slots".into())
     }
-    /// Executes a bit syntax matching slow path.
-    fn bs_match_helper(&self) -> arinsal_beamasm::bs_match::BsMatchHelper;
     /// Runtime callbacks for map creation and updates.
     fn map_runtime(&self) -> arinsal_beamasm::map::MapRuntime;
-    /// Runtime callbacks of the native record instructions.
-    fn record_runtime(&self) -> arinsal_beamasm::records::RecordRuntime {
-        arinsal_beamasm::records::RecordRuntime {
-            get_field: unused_record_field,
-            get_local_field: unused_record_field,
-            create_local: unused_record_create,
-            create: unused_record_create,
-            get_elements: unused_record_elements,
-            update: unused_record_create,
-        }
-    }
     /// `bif_table[ep->bif_number].f` of the BIF export `identity`, which `i_bif*` calls as
     /// `(c_p, reg, I)`.
     fn bif_function(&self, _identity: usize) -> usize {
@@ -223,20 +207,9 @@ pub trait ModuleEnv {
     fn plain_bif_identity(&self, _beam: &BeamFile, _index: u32) -> Option<usize> {
         None
     }
-    /// Return the stable `Export.info.mfa` address for a plain BIF import.
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-151, OTP-29.1.1.
-    fn plain_bif_mfa(&self, _beam: &BeamFile, _index: u32) -> Option<usize> {
-        None
-    }
-    /// Runtime hook for the field-decoding `bs_match` commands.
-    fn bs_match_cmd_helper(&self) -> arinsal_beamasm::bs_match::BsMatchCmdHelper {
-        unused_bs_match_cmd
-    }
-    /// Runtime primitives for native `bs_create_bin` allocation and segment writes.
-    fn bs_create_bin_helper(&self) -> arinsal_beamasm::bs_construct::BsCreateBinHelpers;
-    /// Register a string-table constant for `i_bs_match_string` and return its handle.
-    fn match_string(&self, _bytes: &[u8]) -> Result<u64, String> {
-        Err("module environment cannot register match strings".into())
+    /// Base address of the loaded module's BEAM string table.
+    fn string_table_base(&self, beam: &BeamFile) -> usize {
+        beam.strings.as_ptr() as usize
     }
     /// Build a binary literal from bytes and return its tagged word.
     fn binary_literal(&self, _bytes: &[u8]) -> Result<u64, String> {
@@ -261,10 +234,6 @@ pub trait ModuleEnv {
             timeout_locked: unused_recv_header,
             timeout: unused_recv_header,
         }
-    }
-    /// Runtime hook creating the writable binary of `bs_init_writable`.
-    fn bs_init_writable_helper(&self) -> arinsal_beamasm::bs_construct::BsInitWritableHelper {
-        unused_bs_init_writable
     }
     /// Runtime hook converting a bignum to IEEE-754 bits for `fconv`.
     fn big_to_float_helper(&self) -> arinsal_beamasm::float::BigToFloat {
@@ -383,50 +352,6 @@ extern "C" fn unused_wait_timeout(
 }
 
 extern "C" fn unused_bif_function(_p: *mut ProcessHeader, _reg: *mut u64, _i: u64) -> u64 {
-    0
-}
-
-extern "C" fn unused_record_field(
-    _p: *mut ProcessHeader,
-    _s: u64,
-    _i: u64,
-    _f: u64,
-    _r: u64,
-) -> u64 {
-    0
-}
-
-extern "C" fn unused_record_create(
-    _p: *mut ProcessHeader,
-    _reg: *mut u64,
-    _id: u64,
-    _live: u64,
-    _count: u64,
-    _base: u64,
-) -> u64 {
-    0
-}
-
-extern "C" fn unused_record_elements(
-    _p: *mut ProcessHeader,
-    _reg: *mut u64,
-    _src: u64,
-    _count: u64,
-    _base: u64,
-) -> u64 {
-    0
-}
-
-extern "C" fn unused_bs_match_cmd(
-    _process: *mut ProcessHeader,
-    _kind: u64,
-    _live: u64,
-    _reg: *mut u64,
-) -> u64 {
-    0
-}
-
-extern "C" fn unused_bs_init_writable(_process: *mut ProcessHeader, _size: u64) -> u64 {
     0
 }
 
@@ -1816,8 +1741,7 @@ fn compile_parsed_module_with_options_in_arena(
         assembler.set_beam_literal(index, word);
     }
     assembler.set_exception_resolver(env.exception_resolver() as usize);
-    let (dispatch_return, test_yield, context_switch) = env.yield_fragments();
-    assembler.set_yield_fragments(dispatch_return, test_yield, context_switch);
+    assembler.set_yield_fragments(env.yield_fragments());
     let shared = env.compare_shared();
     if shared.arith != 0 {
         assembler.set_arith_compare_shared(shared.arith);
@@ -1830,6 +1754,7 @@ fn compile_parsed_module_with_options_in_arena(
     }
     let (raise_shared, raise_exception, func_info_shared) = env.raise_fragments();
     assembler.set_raise_fragments(raise_shared, raise_exception, func_info_shared);
+    assembler.set_bif_fragments(env.bif_fragments());
     if let Some((badmap, badkey, size_error)) = env.map_error_fragments() {
         assembler.set_map_error_fragments(badmap, badkey, size_error);
     }
@@ -2272,20 +2197,6 @@ fn small_or_arg(
     }
 }
 
-/// Converts an untagged arity word to the tagged small value expected by the assembler API.
-fn tagged_small_number(
-    value: Option<&SpecificOperand>,
-    beam: &BeamFile,
-    env: &impl ModuleEnv,
-) -> Result<ArgVal, EmitError> {
-    match value {
-        Some(SpecificOperand::Unsigned(value)) if *value < (1 << 59) => {
-            Ok(ArgVal::Immediate((value << 4) | 0xf))
-        }
-        other => arg(other, beam, env).map_err(EmitError::Operand),
-    }
-}
-
 /// Converts an untagged tuple arity to the header immediate used by BeamAsm.
 // Port of erts/emulator/beam/jit/asm_load.c:486-490 (case 'A'), OTP-29.1.1.
 fn arity_value(
@@ -2373,7 +2284,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
         }
     };
     let n = |index| number(args.get(index)).map_err(EmitError::Operand);
-    let helper = env.arithmetic_helper();
     if GENERIC == erts_tables::GENOP_I_GET_MAP_ELEMENTS_3 {
         count_at_least(args, 3, op.name())?;
         let size = usize::try_from(n(2)?)
@@ -2389,8 +2299,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
             .iter()
             .map(|operand| arg(Some(operand), beam, env).map_err(EmitError::Operand))
             .collect::<Result<Vec<_>, _>>()?;
-        let result =
-            assembler.emit_i_get_map_elements(n(0)?, value(1)?, &triples, env.map_runtime());
+        let result = assembler.emit_i_get_map_elements(n(0)?, value(1)?, &triples);
         return result.map_err(|error| EmitError::Assembler(format!("{error:?}")));
     }
     // Guard-context arithmetic branches to its failure label instead of raising.
@@ -2594,15 +2503,15 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
         EmitterKind::Length => {
             count(3)?;
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:320-339, OTP-29.1.1.
-            assembler.emit_bif_length(n(0)?, n(1)?, value(2)?, env.guard_helper())
+            assembler.emit_bif_length(n(0)?, n(1)?, value(2)?)
         }
         EmitterKind::Allocate => {
             count(2)?;
-            assembler.allocate_checked(n(0)?, n(1)?, env.gc_hook())
+            assembler.allocate_checked(n(0)?, n(1)?)
         }
         EmitterKind::AllocateZero => {
             count(2)?;
-            assembler.allocate_zero_checked(n(0)?, n(1)?, env.gc_hook())
+            assembler.allocate_zero_checked(n(0)?, n(1)?)
         }
         EmitterKind::Deallocate => {
             count(1)?;
@@ -2684,7 +2593,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
                 value(4)?,
                 n(0)?,
-                helper,
             )
         }
         EmitterKind::Minus => {
@@ -2694,7 +2602,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
                 value(4)?,
                 n(0)?,
-                helper,
             )
         }
         EmitterKind::Times => {
@@ -2704,7 +2611,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
                 value(4)?,
                 n(0)?,
-                helper,
             )
         }
         EmitterKind::MulAdd => {
@@ -2717,7 +2623,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 TypedArg::new(value(4)?, operand_type(args.get(4), beam)),
                 value(5)?,
                 n(0)?,
-                helper,
             )
         }
         EmitterKind::IntDiv if GENERIC == erts_tables::GENOP_I_M_DIV_5 => {
@@ -2727,7 +2632,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
                 value(4)?,
                 n(0)?,
-                helper,
             )
         }
         EmitterKind::IntDiv => {
@@ -2737,7 +2641,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
                 value(4)?,
                 n(0)?,
-                helper,
             )
         }
         EmitterKind::Rem if GENERIC == erts_tables::GENOP_I_DIV_REM_6 => {
@@ -2749,7 +2652,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 value(4)?,
                 value(5)?,
                 n(0)?,
-                helper,
             )
         }
         EmitterKind::Rem if GENERIC == erts_tables::GENOP_I_REM_DIV_6 => {
@@ -2761,7 +2663,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 value(4)?,
                 value(5)?,
                 n(0)?,
-                helper,
             )
         }
         EmitterKind::Rem => {
@@ -2771,7 +2672,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
                 value(4)?,
                 n(0)?,
-                helper,
             )
         }
         EmitterKind::Band => {
@@ -2781,7 +2681,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
                 value(4)?,
                 n(0)?,
-                helper,
             )
         }
         EmitterKind::Bor => {
@@ -2791,7 +2690,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
                 value(4)?,
                 n(0)?,
-                helper,
             )
         }
         EmitterKind::Bxor => {
@@ -2801,7 +2699,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
                 value(4)?,
                 n(0)?,
-                helper,
             )
         }
         EmitterKind::Bsl => {
@@ -2811,7 +2708,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
                 value(4)?,
                 n(0)?,
-                helper,
             )
         }
         EmitterKind::Bsr => {
@@ -2821,16 +2717,15 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 TypedArg::new(value(3)?, operand_type(args.get(3), beam)),
                 value(4)?,
                 n(0)?,
-                helper,
             )
         }
         EmitterKind::Bnot => {
             count(4)?;
-            assembler.emit_i_bnot_with_fail(value(2)?, value(3)?, n(0)?, helper)
+            assembler.emit_i_bnot_with_fail(value(2)?, value(3)?, n(0)?)
         }
         EmitterKind::UnaryMinus => {
             count(4)?;
-            assembler.emit_i_unary_minus_with_fail(value(2)?, value(3)?, n(0)?, helper)
+            assembler.emit_i_unary_minus_with_fail(value(2)?, value(3)?, n(0)?)
         }
         EmitterKind::Guard => {
             let fail = n(0)?;
@@ -2838,10 +2733,9 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 if GENERIC == erts_tables::GENOP_IS_IN_RANGE_5 {
                     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:2537-2634, OTP-29.1.1.
                     count(5)?;
-                    let helper = env.guard_helper();
                     let source = TypedArg::new(value(2)?, operand_type(args.get(2), beam));
-                    assembler.emit_is_ge(source, value(3)?, fail, helper)?;
-                    assembler.emit_is_ge(value(4)?, source, n(1)?, helper)?;
+                    assembler.emit_is_ge(source, value(3)?, fail)?;
+                    assembler.emit_is_ge(value(4)?, source, n(1)?)?;
                     break 'body;
                 }
                 let source_index = usize::from(matches!(
@@ -2859,13 +2753,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                             "range guard requires a failure label".to_owned(),
                         ));
                     }
-                    assembler.emit_is_int_in_range(
-                        typed_source,
-                        value(2)?,
-                        value(3)?,
-                        fail,
-                        env.guard_helper(),
-                    )?;
+                    assembler.emit_is_int_in_range(typed_source, value(2)?, value(3)?, fail)?;
                     break 'body;
                 }
                 if GENERIC == erts_tables::GENOP_I_IS_TUPLE_OF_ARITY_FF_4 {
@@ -2915,13 +2803,9 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                     erts_tables::GENOP_IS_FUNCTION_2 => {
                         assembler.emit_is_function(typed_source, fail)?
                     }
-                    erts_tables::GENOP_IS_FUNCTION2_3 => assembler
-                        .emit_is_function2_guard_with_helper(
-                            typed_source,
-                            value(2)?,
-                            fail,
-                            env.guard_helper(),
-                        )?,
+                    erts_tables::GENOP_IS_FUNCTION2_3 => {
+                        assembler.emit_is_function2_dynamic(typed_source, value(2)?, fail)?
+                    }
                     erts_tables::GENOP_IS_ANY_NATIVE_RECORD_2 => {
                         assembler.emit_is_any_native_record(fail, source)?
                     }
@@ -3007,25 +2891,21 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                                 typed_arg(args.get(1), beam, env)?,
                                 typed_arg(args.get(2), beam, env)?,
                                 fail,
-                                env.guard_helper(),
                             )?,
                             erts_tables::GENOP_IS_NE_3 => assembler.emit_is_ne(
                                 typed_arg(args.get(1), beam, env)?,
                                 typed_arg(args.get(2), beam, env)?,
                                 fail,
-                                env.guard_helper(),
                             )?,
                             erts_tables::GENOP_IS_LT_3 => assembler.emit_is_lt(
                                 typed_arg(args.get(1), beam, env)?,
                                 typed_arg(args.get(2), beam, env)?,
                                 fail,
-                                env.guard_helper(),
                             )?,
                             erts_tables::GENOP_IS_GE_3 => assembler.emit_is_ge(
                                 typed_arg(args.get(1), beam, env)?,
                                 typed_arg(args.get(2), beam, env)?,
                                 fail,
-                                env.guard_helper(),
                             )?,
                             // Port of erts/emulator/beam/jit/arm/instr_common.cpp (emit_is_int_ge),
                             // OTP-29.1.1: fails unless the source is an integer AND >= Min.
@@ -3033,7 +2913,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                                 TypedArg::new(lhs, operand_type(args.get(1), beam)),
                                 rhs,
                                 fail,
-                                env.guard_helper(),
                             )?,
                             _ => {
                                 return Err(EmitError::Operand(format!(
@@ -3057,12 +2936,12 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
             count(5)?;
             // Port of erts/emulator/beam/jit/arm/instr_common.cpp:2696-2755, OTP-29.1.1.
             let source = TypedArg::new(value(2)?, operand_type(args.get(2), beam));
-            assembler.emit_is_ge(source, value(3)?, n(0)?, env.guard_helper())?;
+            assembler.emit_is_ge(source, value(3)?, n(0)?)?;
             if GENERIC == erts_tables::GENOP_IS_GE_LT_5 {
                 // `is_ge_lt` is `is_ge Src A` followed by `is_lt B Src` (instr_common.cpp:2713-2716).
-                assembler.emit_is_lt(value(4)?, source, n(1)?, env.guard_helper())?;
+                assembler.emit_is_lt(value(4)?, source, n(1)?)?;
             } else {
-                assembler.emit_is_ge(source, value(4)?, n(1)?, env.guard_helper())?;
+                assembler.emit_is_ge(source, value(4)?, n(1)?)?;
             }
             Ok(())
         }
@@ -3159,13 +3038,13 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 .collect::<Result<Vec<_>, _>>()?;
             let words = u32::try_from(values.len() + 3)
                 .map_err(|_| EmitError::Operand("map literal size overflow".to_owned()))?;
-            assembler.emit_test_heap(words, n(1)?, env.gc_hook())?;
+            assembler.emit_test_heap(words, n(1)?)?;
             assembler.emit_i_new_small_map_lit(value(0)?, value(2)?, &values)
         }
         EmitterKind::BsConstruct if GENERIC == erts_tables::GENOP_BS_INIT_WRITABLE_0 => {
             count(0)?;
             // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:985-1000, OTP-29.1.1.
-            assembler.emit_bs_init_writable(ArgVal::X(0), env.bs_init_writable_helper())
+            assembler.emit_bs_init_writable(ArgVal::X(0))
         }
         EmitterKind::BsConstruct => {
             use arinsal_beamasm::bs_construct::{BsSegment, BsSegmentKind};
@@ -3206,22 +3085,19 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                             return Err(EmitError::Operand("string segment length".to_owned()));
                         }
                     };
-                    let bytes = beam
-                        .strings
+                    beam.strings
                         .get(start..start.saturating_add(length))
                         .ok_or_else(|| EmitError::Operand("string table range".to_owned()))?;
-                    let string = env.match_string(bytes).map_err(EmitError::Operand)?;
+                    let pointer =
+                        env.string_table_base(beam)
+                            .checked_add(start)
+                            .ok_or_else(|| {
+                                EmitError::Operand("string table address overflow".to_owned())
+                            })?;
                     segments.push(BsSegment {
                         kind: BsSegmentKind::String,
                         index: number(fields.get(1)).map_err(EmitError::Operand)?,
-                        src: ArgVal::Immediate(
-                            string
-                                .checked_shl(4)
-                                .and_then(|tagged| tagged.checked_add(0xf))
-                                .ok_or_else(|| {
-                                    EmitError::Operand("string handle overflow".to_owned())
-                                })?,
-                        ),
+                        src: ArgVal::Immediate(pointer as u64),
                         size: ArgVal::Immediate(length as u64),
                         size_is_all: false,
                         size_is_units: true,
@@ -3252,14 +3128,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                     flags,
                 });
             }
-            assembler.emit_i_bs_create_bin(
-                n(0)?,
-                n(1)?,
-                n(2)?,
-                value(3)?,
-                &segments,
-                env.bs_create_bin_helper(),
-            )
+            assembler.emit_i_bs_create_bin(n(0)?, n(1)?, n(2)?, value(3)?, &segments)
         }
         EmitterKind::Bif => {
             // Port of erts/emulator/beam/jit/arm/ops.tab:812-836 and instr_bif.cpp:110-200.
@@ -3299,12 +3168,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
             let identity = env
                 .plain_bif_identity(beam, import)
                 .ok_or_else(|| EmitError::Operand("BIF import is not a plain BIF".to_owned()))?;
-            // An import can resolve to a BIF without exposing a stable export MFA descriptor.
-            // erts passes a null `bif_mfa` in that case and lets `handle_error` use `current`.
-            let bif_mfa = env.plain_bif_mfa(beam, import).unwrap_or(0);
-            assembler.emit_bif_by_identity(
-                identity,
-                bif_mfa,
+            assembler.emit_i_bif(
                 env.bif_function(identity),
                 &sources,
                 fail,
@@ -3313,7 +3177,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
         }
         EmitterKind::Records => {
             // Port of erts/emulator/beam/jit/arm/instr_records.cpp:117-274, OTP-29.1.1.
-            let runtime = env.record_runtime();
             // Key/value pairs, sorted in flatmap key order like the loader's `map_key_sort`.
             let sorted_pairs = |first: usize| -> Result<Vec<(ArgVal, ArgVal)>, EmitError> {
                 let size = usize::try_from(n(first - 1)?)
@@ -3347,15 +3210,15 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                         value(2)?,
                         value(3)?,
                         value(4)?,
-                        runtime,
                     )
                 }
                 erts_tables::GENOP_I_GET_RECORD_ELEMENTS_3 => {
                     count_at_least(args, 3, op.name())?;
-                    let pairs = sorted_pairs(3)?;
-                    let keys: Vec<ArgVal> = pairs.iter().map(|(key, _)| *key).collect();
-                    let dsts: Vec<ArgVal> = pairs.iter().map(|(_, dst)| *dst).collect();
-                    assembler.emit_i_get_record_elements(n(0)?, value(1)?, &keys, &dsts, runtime)
+                    let pairs: Vec<ArgVal> = sorted_pairs(3)?
+                        .into_iter()
+                        .flat_map(|(key, dst)| [key, dst])
+                        .collect();
+                    assembler.emit_i_get_record_elements(n(0)?, value(1)?, &pairs)
                 }
                 erts_tables::GENOP_I_CREATE_LOCAL_NATIVE_RECORD_4
                 | erts_tables::GENOP_I_CREATE_NATIVE_RECORD_4 => {
@@ -3370,16 +3233,9 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                             value(1)?,
                             n(2)?,
                             &staged,
-                            runtime,
                         )
                     } else {
-                        assembler.emit_i_create_native_record(
-                            value(0)?,
-                            value(1)?,
-                            n(2)?,
-                            &staged,
-                            runtime,
-                        )
+                        assembler.emit_i_create_native_record(value(0)?, value(1)?, n(2)?, &staged)
                     }
                 }
                 erts_tables::GENOP_I_UPDATE_NATIVE_RECORD_4 => {
@@ -3388,13 +3244,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                         .into_iter()
                         .flat_map(|(key, val)| [key, val])
                         .collect();
-                    assembler.emit_i_update_native_record(
-                        value(0)?,
-                        value(1)?,
-                        n(2)?,
-                        &staged,
-                        runtime,
-                    )
+                    assembler.emit_i_update_native_record(value(0)?, value(1)?, n(2)?, &staged)
                 }
                 _ => return Err(EmitError::Operand(format!("unknown op {}", op.name()))),
             }
@@ -3539,7 +3389,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 }
                 erts_tables::GENOP_CATCH_END_1 => {
                     count(1)?;
-                    assembler.emit_catch_end(value(0)?, env.gc_hook(), env.add_stacktrace_helper())
+                    assembler.emit_catch_end(value(0)?, env.add_stacktrace_helper())
                 }
                 erts_tables::GENOP_TRY_CASE_1 => {
                     count(1)?;
@@ -3819,35 +3669,30 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
             }
             _ => return Err(EmitError::Operand(format!("unknown op {}", op.name()))),
         },
-        EmitterKind::Heap => {
-            let hook = env.gc_hook();
-            match GENERIC {
-                erts_tables::GENOP_TEST_HEAP_2 => {
-                    count(2)?;
-                    let (words, live) = (number(args.first())?, number(args.get(1))?);
-                    assembler.emit_test_heap(words, live, hook)
-                }
-                erts_tables::GENOP_ALLOCATE_HEAP_3 => {
-                    count(3)?;
-                    assembler.emit_allocate_heap(
-                        number(args.first())?,
-                        number(args.get(1))?,
-                        number(args.get(2))?,
-                        hook,
-                    )
-                }
-                erts_tables::GENOP_ALLOCATE_HEAP_ZERO_3 => {
-                    count(3)?;
-                    assembler.emit_allocate_heap_zero(
-                        number(args.first())?,
-                        number(args.get(1))?,
-                        number(args.get(2))?,
-                        hook,
-                    )
-                }
-                _ => return Err(EmitError::Operand(format!("unknown op {}", op.name()))),
+        EmitterKind::Heap => match GENERIC {
+            erts_tables::GENOP_TEST_HEAP_2 => {
+                count(2)?;
+                let (words, live) = (number(args.first())?, number(args.get(1))?);
+                assembler.emit_test_heap(words, live)
             }
-        }
+            erts_tables::GENOP_ALLOCATE_HEAP_3 => {
+                count(3)?;
+                assembler.emit_allocate_heap(
+                    number(args.first())?,
+                    number(args.get(1))?,
+                    number(args.get(2))?,
+                )
+            }
+            erts_tables::GENOP_ALLOCATE_HEAP_ZERO_3 => {
+                count(3)?;
+                assembler.emit_allocate_heap_zero(
+                    number(args.first())?,
+                    number(args.get(1))?,
+                    number(args.get(2))?,
+                )
+            }
+            _ => return Err(EmitError::Operand(format!("unknown op {}", op.name()))),
+        },
         EmitterKind::Fused => match GENERIC {
             erts_tables::GENOP_STORE_TWO_VALUES_4 => {
                 count(4)?;
@@ -3918,7 +3763,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
             }
             erts_tables::GENOP_I_PERF_COUNTER_0 => {
                 count(0)?;
-                assembler.emit_i_perf_counter(env.sys_perf_counter(), env.gc_hook())
+                assembler.emit_i_perf_counter(env.sys_perf_counter())
             }
             erts_tables::GENOP_I_HIBERNATE_0 | erts_tables::GENOP_I_CALL_ON_LOAD_FUNCTION_0 => {
                 // Port of erts/emulator/beam/jit/arm/ops.tab:612-641, OTP-29.1.1: the loader
@@ -3979,7 +3824,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
             _ => return Err(EmitError::Operand(format!("unknown op {}", op.name()))),
         },
         EmitterKind::GuardBif => {
-            let runtime = env.guard_helper();
             match GENERIC {
                 erts_tables::GENOP_BIF_AND_4 => {
                     count(4)?;
@@ -3996,9 +3840,9 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 erts_tables::GENOP_BIF_HD_2 | erts_tables::GENOP_BIF_TL_2 => {
                     count(2)?;
                     if GENERIC == erts_tables::GENOP_BIF_HD_2 {
-                        assembler.emit_bif_hd(value(0)?, value(1)?, runtime)
+                        assembler.emit_bif_hd(value(0)?, value(1)?)
                     } else {
-                        assembler.emit_bif_tl(value(0)?, value(1)?, runtime)
+                        assembler.emit_bif_tl(value(0)?, value(1)?)
                     }
                 }
                 erts_tables::GENOP_BIF_ELEMENT_4 => {
@@ -4008,7 +3852,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                         typed_arg(args.get(1), beam, env)?,
                         typed_arg(args.get(2), beam, env)?,
                         value(3)?,
-                        runtime,
                     )
                 }
                 erts_tables::GENOP_BIF_NODE_3
@@ -4021,22 +3864,21 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                     let destination = value(2)?;
                     match GENERIC {
                         erts_tables::GENOP_BIF_NODE_3 => {
-                            assembler.emit_bif_node(n(0)?, source, destination, runtime)
+                            assembler.emit_bif_node(n(0)?, source, destination)
                         }
                         erts_tables::GENOP_BIF_BIT_SIZE_3 => {
-                            assembler.emit_bif_bit_size(n(0)?, source, destination, runtime)
+                            assembler.emit_bif_bit_size(n(0)?, source, destination)
                         }
                         erts_tables::GENOP_BIF_BYTE_SIZE_3 => {
-                            assembler.emit_bif_byte_size(n(0)?, source, destination, runtime)
+                            assembler.emit_bif_byte_size(n(0)?, source, destination)
                         }
                         erts_tables::GENOP_BIF_TUPLE_SIZE_3 => {
-                            assembler.emit_bif_tuple_size(n(0)?, source, destination, runtime)
+                            assembler.emit_bif_tuple_size(n(0)?, source, destination)
                         }
                         erts_tables::GENOP_BIF_MAP_SIZE_3 => assembler.emit_bif_map_size_typed(
                             n(0)?,
                             typed_arg(args.get(1), beam, env)?,
                             destination,
-                            runtime,
                         ),
                         _ => return Err(EmitError::Operand(format!("unknown op {}", op.name()))),
                     }
@@ -4055,7 +3897,6 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                             value(key_at)?,
                             value(map_at)?,
                             value(dest_at)?,
-                            runtime,
                             operand_is_exact_map(args.get(map_at), beam),
                             operand_maybe_one_of(
                                 args.get(key_at),
@@ -4077,10 +3918,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                         let identity = env.plain_bif_identity(beam, import).ok_or_else(|| {
                             EmitError::Operand("BIF import is not a plain BIF".to_owned())
                         })?;
-                        let bif_mfa = env.plain_bif_mfa(beam, import).unwrap_or(0);
-                        assembler.emit_bif_by_identity(
-                            identity,
-                            bif_mfa,
+                        assembler.emit_i_bif(
                             env.bif_function(identity),
                             &[value(key_at)?, value(map_at)?],
                             n(1)?,
@@ -4088,11 +3926,9 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                         )
                     } else {
                         assembler.emit_bif_is_map_key_typed(
-                            n(1)?,
                             typed_arg(args.get(key_at), beam, env)?,
                             typed_arg(args.get(map_at), beam, env)?,
                             value(dest_at)?,
-                            runtime,
                             env.map_runtime(),
                         )
                     }
@@ -4100,9 +3936,17 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 erts_tables::GENOP_BIF_MAX_3 | erts_tables::GENOP_BIF_MIN_3 => {
                     count(3)?;
                     if GENERIC == erts_tables::GENOP_BIF_MAX_3 {
-                        assembler.emit_bif_max(value(0)?, value(1)?, value(2)?, runtime)
+                        assembler.emit_bif_max(
+                            typed_arg(args.first(), beam, env)?,
+                            typed_arg(args.get(1), beam, env)?,
+                            value(2)?,
+                        )
                     } else {
-                        assembler.emit_bif_min(value(0)?, value(1)?, value(2)?, runtime)
+                        assembler.emit_bif_min(
+                            typed_arg(args.first(), beam, env)?,
+                            typed_arg(args.get(1), beam, env)?,
+                            value(2)?,
+                        )
                     }
                 }
                 erts_tables::GENOP_BIF_IS_EQ_EXACT_3
@@ -4128,7 +3972,7 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                 }
                 erts_tables::GENOP_SELF_1 => {
                     count(1)?;
-                    assembler.emit_bif_self(value(0)?, runtime)
+                    assembler.emit_bif_self(value(0)?)
                 }
                 _ => return Err(EmitError::Operand(format!("unknown op {}", op.name()))),
             }
@@ -4257,33 +4101,25 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
             assembler.jump(n(0)?)
         }
         EmitterKind::BsMatch => {
-            let helper = env.bs_match_helper();
             match GENERIC {
                 erts_tables::GENOP_I_BS_START_MATCH3_4 => {
                     count(4)?;
-                    assembler.emit_i_bs_start_match3(
-                        value(0)?,
-                        n(1)?,
-                        n(2)?,
-                        value(3)?,
-                        helper,
-                        env.gc_hook(),
-                    )
+                    assembler.emit_i_bs_start_match3(value(0)?, n(1)?, n(2)?, value(3)?)
                 }
                 erts_tables::GENOP_BS_GET_INTEGER2_7 => {
                     // Fail Ms Live Sz Unit Flags Dst
                     count(7)?;
-                    let flags =
-                        (assembler.bs_get_flags(bs_flags_arg(args.get(5), beam, env)?)? << 4) | 0xf;
+                    let flags = assembler.bs_get_flags(bs_flags_arg(args.get(5), beam, env)?)?;
                     let size = small_or_arg(args.get(3), beam, env)?;
-                    let unit = small_or_arg(args.get(4), beam, env)?;
-                    assembler.emit_bs_match_command(
-                        0,
-                        n(2)?,
-                        &[value(1)?, ArgVal::Immediate(flags), size, unit],
+                    let unit = n(4)?;
+                    assembler.emit_bs_get_integer2(
+                        value(1)?,
                         n(0)?,
-                        Some(value(6)?),
-                        env.bs_match_cmd_helper(),
+                        n(2)?,
+                        size,
+                        unit,
+                        flags,
+                        value(6)?,
                     )
                 }
                 erts_tables::GENOP_I_BS_MATCH_2 | erts_tables::GENOP_I_BS_MATCH_TEST_HEAP_4 => {
@@ -4406,28 +4242,19 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                             }
                         }
                     }
-                    assembler.emit_i_bs_match_segments(
-                        ctx,
-                        fail,
-                        need,
-                        live,
-                        &commands,
-                        helper,
-                        env.bs_match_cmd_helper(),
-                        env.gc_hook(),
-                    )
+                    assembler.emit_i_bs_match_segments(ctx, fail, need, live, &commands)
                 }
                 erts_tables::GENOP_I_BS_GET_POSITION_2 => {
                     count(2)?;
-                    assembler.emit_i_bs_get_position(value(0)?, value(1)?, helper)
+                    assembler.emit_i_bs_get_position(value(0)?, value(1)?)
                 }
                 erts_tables::GENOP_BS_SET_POSITION_2 => {
                     count(2)?;
-                    assembler.emit_i_bs_set_position(value(0)?, value(1)?, helper)
+                    assembler.emit_i_bs_set_position(value(0)?, value(1)?)
                 }
                 erts_tables::GENOP_BS_GET_TAIL_3 => {
                     count(3)?;
-                    assembler.emit_bs_get_tail(value(0)?, value(1)?, n(2)?, helper, env.gc_hook())
+                    assembler.emit_bs_get_tail(value(0)?, value(1)?, n(2)?)
                 }
                 erts_tables::GENOP_I_BS_GET_BINARY2_6 => {
                     count(6)?;
@@ -4438,9 +4265,11 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                         value(3)?,
                         n(4)?,
                         value(5)?,
-                        helper,
-                        env.gc_hook(),
                     )
+                }
+                _ if op.name() == "i_bs_get_binary_all2" => {
+                    count(5)?;
+                    assembler.emit_i_bs_get_binary_all2(value(0)?, n(1)?, n(2)?, n(3)?, value(4)?)
                 }
                 erts_tables::GENOP_I_BS_GET_BIN_AND_TAIL_7 => {
                     count(7)?;
@@ -4453,26 +4282,23 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                         value(3)?,
                         n(4)?,
                         value(5)?,
-                        helper,
-                        env.gc_hook(),
                     )?;
-                    assembler.emit_bs_get_tail(value(0)?, value(6)?, n(2)?, helper, env.gc_hook())
+                    assembler.emit_bs_get_tail(value(0)?, value(6)?, n(2)?)
                 }
                 erts_tables::GENOP_I_BS_GET_UTF8_3 => {
                     count(3)?;
-                    assembler.emit_i_bs_get_utf8(value(0)?, n(1)?, value(2)?, helper)
+                    assembler.emit_i_bs_get_utf8(value(0)?, n(1)?, value(2)?)
                 }
                 erts_tables::GENOP_I_BS_SKIP_UTF8_2 => {
                     count(2)?;
-                    assembler.emit_i_bs_skip_utf8(value(0)?, n(1)?, helper)
+                    assembler.emit_i_bs_skip_utf8(value(0)?, n(1)?)
                 }
                 erts_tables::GENOP_I_BS_SKIP_UTF16_3 => {
                     count(3)?;
                     assembler.emit_i_bs_skip_utf16(
                         value(0)?,
                         n(1)?,
-                        tagged_small_number(args.get(2), beam, env)?,
-                        helper,
+                        ArgVal::Immediate(u64::from(n(2)?)),
                     )
                 }
                 erts_tables::GENOP_I_BS_VALIDATE_UNICODE_RETRACT_3 => {
@@ -4484,9 +4310,8 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                     assembler.emit_i_bs_get_utf16(
                         value(0)?,
                         n(1)?,
-                        tagged_small_number(args.get(2), beam, env)?,
+                        ArgVal::Immediate(u64::from(n(2)?)),
                         value(3)?,
-                        helper,
                     )
                 }
                 erts_tables::GENOP_I_BS_GET_FLOAT2_6 => {
@@ -4498,29 +4323,30 @@ fn emit_op<const GENERIC: i32, const EMITTER: u8>(
                         value(3)?,
                         n(4)?,
                         value(5)?,
-                        helper,
-                        env.gc_hook(),
                     )
                 }
                 erts_tables::GENOP_I_BS_MATCH_STRING_4 => {
                     count(4)?;
-                    // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:191-234, OTP-29.1.1: the
-                    // constant lives in the module's string table; the hook gets it as a
-                    // registered constant.
-                    let bits = n(2)?;
+                    // Port of instr_bs.cpp:191-234: the runtime call reads the string-table
+                    // bytes directly from the loaded module's string table.
+                    let bits = u64::from(n(2)?);
                     let start = usize::try_from(n(3)?)
                         .map_err(|_| EmitError::Operand("string offset overflow".to_owned()))?;
                     let end = start.saturating_add(usize::try_from(bits.div_ceil(8)).unwrap_or(0));
-                    let bytes = beam.strings.get(start..end).ok_or_else(|| {
+                    beam.strings.get(start..end).ok_or_else(|| {
                         EmitError::Operand("match string is outside the string table".to_owned())
                     })?;
-                    let constant = env.match_string(bytes).map_err(EmitError::Operand)?;
+                    let pointer =
+                        env.string_table_base(beam)
+                            .checked_add(start)
+                            .ok_or_else(|| {
+                                EmitError::Operand("string table address overflow".to_owned())
+                            })?;
                     assembler.emit_i_bs_match_string(
                         value(0)?,
                         n(1)?,
-                        ArgVal::Immediate((u64::from(bits) << 4) | 0xf),
-                        ArgVal::Immediate((constant << 4) | 0xf),
-                        helper,
+                        bits,
+                        ArgVal::Immediate(pointer as u64),
                     )
                 }
                 erts_tables::GENOP_I_BS_SKIP_BITS2_4 => {

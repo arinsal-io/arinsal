@@ -6,6 +6,8 @@
 //! through the scheduler. Local calls inside `prim_tty` reach the NIF body
 //! directly; the heap address recorded on earlier scheduler calls identifies
 //! the owner. External calls record the owner immediately before the NIF runs.
+// Port of erts/emulator/sys/unix/erl_child_setup.c (`SET_CLOEXEC`), OTP-29.1.1.
+// Port of erts/emulator/sys/unix/erl_child_setup.c (`SET_CLOEXEC`), OTP-29.1.1.
 
 use crate::process::Message;
 use crate::{Process, Vm, VmError, exceptions};
@@ -15,7 +17,7 @@ use arinsal_sched::{Pid, RunCtx, Scheduler};
 use arinsal_term::{ProcessHeap, Term, TermBuilder, from_owned};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock, Weak};
 use std::thread;
@@ -51,26 +53,8 @@ static HUB: std::sync::OnceLock<Hub> = std::sync::OnceLock::new();
 
 fn hub() -> &'static Hub {
     HUB.get_or_init(|| {
-        let mut pipe = [-1; 2];
-        // SAFETY: pipe writes two new descriptors on success; mark both before
-        // publishing either descriptor to the polling thread.
-        let status = crate::port::cloexec_publish(|| unsafe {
-            let status = libc::pipe(pipe.as_mut_ptr());
-            if status != 0 {
-                Err(std::io::Error::last_os_error())
-            } else if libc::fcntl(pipe[0], libc::F_SETFD, libc::FD_CLOEXEC) < 0
-                || libc::fcntl(pipe[1], libc::F_SETFD, libc::FD_CLOEXEC) < 0
-            {
-                let error = std::io::Error::last_os_error();
-                libc::close(pipe[0]);
-                libc::close(pipe[1]);
-                Err(error)
-            } else {
-                Ok(())
-            }
-        });
-        status.expect("tty select wake pipe");
-        for fd in pipe {
+        let (read_fd, write_fd) = crate::port::pipe_cloexec().expect("tty select wake pipe");
+        for fd in [read_fd.as_raw_fd(), write_fd.as_raw_fd()] {
             // SAFETY: both pipe ends are open descriptors from the successful pipe call.
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
             if flags >= 0 {
@@ -80,14 +64,13 @@ fn hub() -> &'static Hub {
                 }
             }
         }
-        let wake_read = pipe[0];
+        let wake_read = read_fd.into_raw_fd();
+        let wake_write = write_fd.into_raw_fd();
         thread::Builder::new()
             .name("arinsal-tty-select".into())
             .spawn(move || poll_loop(wake_read))
             .expect("tty select thread");
-        Hub {
-            wake_write: pipe[1],
-        }
+        Hub { wake_write }
     })
 }
 
@@ -130,27 +113,11 @@ pub(crate) fn request_break() {
 /// Initialize the break menu's wake pipe. `sys_signals` installs the disposition after the
 /// node runtime exists, and its dispatcher calls [`request_break`].
 pub(crate) fn start_break_menu() {
-    let mut pipe = [-1; 2];
-    // SAFETY: pipe creates two fresh descriptors; mark them close-on-exec before
-    // publishing the write descriptor to the signal handler.
-    let status = crate::port::cloexec_publish(|| unsafe {
-        let status = libc::pipe(pipe.as_mut_ptr());
-        if status == 0
-            && (libc::fcntl(pipe[0], libc::F_SETFD, libc::FD_CLOEXEC) < 0
-                || libc::fcntl(pipe[1], libc::F_SETFD, libc::FD_CLOEXEC) < 0)
-        {
-            libc::close(pipe[0]);
-            libc::close(pipe[1]);
-            -1
-        } else {
-            status
-        }
-    });
-    if status != 0 {
+    let Ok((read_fd, write_fd)) = crate::port::pipe_cloexec() else {
         return;
-    }
-    BREAK_WRITE.store(pipe[1], Ordering::Relaxed);
-    let read = pipe[0];
+    };
+    BREAK_WRITE.store(write_fd.into_raw_fd(), Ordering::Relaxed);
+    let read = read_fd.into_raw_fd();
     thread::Builder::new()
         .name("arinsal-break".into())
         .spawn(move || break_loop(read))
@@ -264,7 +231,7 @@ pub(crate) fn note_caller(process: &Process, ctx: &RunCtx<'_, crate::Process>) {
 }
 
 pub(crate) fn note_caller_native(process: &Process) {
-    let Some(pid) = process.self_pid.as_ref() else {
+    let Some(ref pid) = process.self_pid() else {
         return;
     };
     note_caller_pid(process, *pid);

@@ -543,30 +543,23 @@ impl HeapAlloc for BlockHeap {
         _writable: bool,
         _overhead_words: u64,
         owner: Option<arinsal_term::OwnedBinaryRef>,
-    ) -> Result<(), TermError> {
-        self.chain_first_oh(bin_ref as usize)?;
+    ) {
+        let _ = self.chain_first_oh(bin_ref as usize);
         let off_heap = self.off_heap();
         if let Some(mut owner) = owner {
             owner.attach_to_bin_ref(bin_ref);
             off_heap.binary_refs.push(owner);
         }
-        Ok(())
     }
-    fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
+    fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) {
         drop(binary);
-        Ok(())
     }
     fn supports_writable_binary(&self) -> bool {
         true
     }
-    fn link_external_binary(
-        &mut self,
-        bin_ref: *mut u64,
-        binary: Arc<ExternalBinary>,
-    ) -> Result<(), TermError> {
+    fn link_external_binary(&mut self, bin_ref: *mut u64, binary: Arc<ExternalBinary>) {
         let _ = self.chain_first_oh(bin_ref as usize);
         self.off_heap().external.push(binary);
-        Ok(())
     }
     fn supports_external_binary(&self) -> bool {
         true
@@ -577,10 +570,9 @@ impl HeapAlloc for BlockHeap {
         let _ = self.chain_first_oh(thing as usize);
         self.off_heap().nodes.push(node);
     }
-    fn link_magic_ref(&mut self, thing: *mut u64, owner: MagicBin) -> Result<(), TermError> {
-        self.chain_first_oh(thing as usize)?;
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: MagicBin) {
+        let _ = self.chain_first_oh(thing as usize);
         self.off_heap().magic.push(owner);
-        Ok(())
     }
     fn supports_magic(&self) -> bool {
         true

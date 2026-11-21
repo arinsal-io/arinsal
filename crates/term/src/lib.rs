@@ -5,6 +5,7 @@ mod bignum_div;
 mod bits;
 mod copy;
 pub mod erl_bits;
+mod erl_init;
 pub mod erl_iolist;
 pub mod exc;
 mod fun;
@@ -66,7 +67,7 @@ pub use fun::{
 };
 pub use gc::{
     FragmentAlloc, FragmentIndex, GcMessageQueue, GcRootSet, GcStats, erts_next_heap_size,
-    normalize_heap_minimum, set_gc_clock_for_long_gc, set_gc_clock_for_msacc, spawned_heap_words,
+    normalize_heap_minimum, set_gc_clock_for_long_gc, spawned_heap_words,
 };
 pub use global_literals::{
     GlobalLiteralBuild, global_dflags_record, global_empty_tuple, global_erl_file_suffix,

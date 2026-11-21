@@ -17,6 +17,10 @@ mod arm;
 #[cfg(target_arch = "aarch64")]
 pub use arm::*;
 
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_code)]
+mod raw;
+
 #[cfg(target_arch = "x86_64")]
 mod x86;
 #[cfg(target_arch = "x86_64")]
@@ -69,9 +73,6 @@ pub struct SchedulerRegisters {
     pub x_reg_array: [arinsal_term::Term; 1024],
     /// Floating point register array.
     pub f_reg_array: [f64; 1024],
-    /// Operands of a `bs_match` command for its runtime hook. They are kept out of the X
-    /// register array, whose registers above the command's live count may still be in use.
-    pub match_staging: [u64; 4],
     /// Code index loaded into `active_code_ix` (x24) on every entry into native code:
     /// the node's active code index, or `ERTS_SAVE_CALLS_CODE_IX` for a process saving calls.
     // Port of erts/emulator/beam/jit/arm/process_main.cpp:236-247, OTP-29.1.1.
@@ -82,12 +83,6 @@ pub struct SchedulerRegisters {
     // a call entered from the scheduler gets its caller's continuation in LR, like any other
     // call, so the callee's frame holds that one CP.
     pub entry_return: u64,
-    /// Return address a trapping BIF call site leaves for the shared helper fragment: the
-    /// point after the call where XREG0 holds the result, as after any Erlang call. The trap
-    /// target returns there directly, so it is the address the fragment pushes as CP.
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:527-540, OTP-29.1.1: erts pushes the
-    // call site's return address, behind which the BIF result is in XREG0.
-    pub trap_return: u64,
 }
 
 /// Offset of `x_reg_array` (`getXRef(0)` on arm64, the x86-64 `registers` base).
@@ -113,18 +108,12 @@ pub const RUNTIME_STACK_DISP: i32 =
 /// Displacement of `f_reg_array` from the x86-64 `registers` base.
 pub const F_REG_ARRAY_DISP: i32 =
     scheduler_reg_disp(std::mem::offset_of!(SchedulerRegisters, f_reg_array));
-/// Displacement of `match_staging` from the x86-64 `registers` base.
-pub const MATCH_STAGING_DISP: i32 =
-    scheduler_reg_disp(std::mem::offset_of!(SchedulerRegisters, match_staging));
 /// Displacement of `active_code_ix`, read by the native entry trampoline.
 pub const ACTIVE_CODE_IX_DISP: i32 =
     scheduler_reg_disp(std::mem::offset_of!(SchedulerRegisters, active_code_ix));
 /// Displacement of `entry_return`, read by the native entry trampoline.
 pub const ENTRY_RETURN_DISP: i32 =
     scheduler_reg_disp(std::mem::offset_of!(SchedulerRegisters, entry_return));
-/// Displacement of `trap_return`, read by the shared helper fragment.
-pub const TRAP_RETURN_DISP: i32 =
-    scheduler_reg_disp(std::mem::offset_of!(SchedulerRegisters, trap_return));
 
 // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:236-239 (getSchedulerRegRef), OTP-29.1.1:
 // the whole aux_regs field is addressable with an 8-bit displacement from the register base.
@@ -135,10 +124,8 @@ const _: () = {
     assert!(tmp_mem_disp(0) == -120);
     assert!(ERL_BITS_STATE_DISP == -56);
     assert!(F_REG_ARRAY_DISP == 8192);
-    assert!(MATCH_STAGING_DISP == 16384);
-    assert!(ACTIVE_CODE_IX_DISP == 16416);
-    assert!(ENTRY_RETURN_DISP == 16424);
-    assert!(TRAP_RETURN_DISP == 16432);
+    assert!(ACTIVE_CODE_IX_DISP == 16384);
+    assert!(ENTRY_RETURN_DISP == 16392);
 };
 
 impl SchedulerRegisters {
@@ -169,10 +156,8 @@ impl Default for SchedulerRegisters {
             _aux_align: [0; 5],
             x_reg_array: [arinsal_term::Term::NIL; 1024],
             f_reg_array: [0.0; 1024],
-            match_staging: [0; 4],
             active_code_ix: 0,
             entry_return: 0,
-            trap_return: 0,
         }
     }
 }

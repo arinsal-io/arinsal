@@ -1,153 +1,10 @@
-//! Runtime helpers for BeamAsm binary construction.
+//! Rust ports of the erts bit-syntax runtime functions.
 //!
-//! Port of erts/emulator/beam/erl_bits.c:1725 (`erts_bs_append_checked`) for the
-//! `<<Bin/binary, Bin2/binary>>` shape the compiler lowers to append + one binary.
+//! Port of erts/emulator/beam/erl_bits.c, OTP-29.1.1.
 
-#[cfg(target_arch = "aarch64")]
-use crate::native_hooks::{raw, set_error};
 use arinsal_beamasm::ProcessHeader;
-#[cfg(target_arch = "aarch64")]
-use arinsal_bits::{BitsError, SegSize, SegType, Segment, SegmentValue};
 use arinsal_bits::{MatchOps, SegFlags};
 use arinsal_term::Term;
-
-/// Appends the whole of `X[extra]` onto `X[src]` and returns the new bitstring.
-/// Zero means the construction failed and the process error registers are set.
-// Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1812-1890 (append to binary) and
-// erl_bits.c:1725, OTP-29.1.1.
-#[cfg(target_arch = "aarch64")]
-pub extern "C" fn append_binary(
-    header: *mut ProcessHeader,
-    src_index: u64,
-    extra_index: u64,
-    live: u64,
-    alloc: u64,
-    reg: *mut u64,
-) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
-        return 0;
-    };
-    let (Ok(src_index), Ok(extra_index), Ok(live), Ok(alloc)) = (
-        usize::try_from(src_index),
-        usize::try_from(extra_index),
-        usize::try_from(live),
-        usize::try_from(alloc),
-    ) else {
-        return 0;
-    };
-    let root_live = live
-        .max(src_index.saturating_add(1))
-        .max(extra_index.saturating_add(1));
-    if root_live > crate::proc_create::ATTACHED_X_REGS
-        || src_index >= root_live
-        || extra_index >= root_live
-    {
-        set_error(process, "system_limit");
-        return 0;
-    }
-    let build = |src: Term, extra: Term| {
-        [
-            Segment {
-                ty: SegType::Append,
-                index: 1,
-                unit: 8,
-                flags: SegFlags::default(),
-                value: SegmentValue::Term(src),
-                size: SegSize::All,
-            },
-            Segment {
-                ty: SegType::Binary,
-                index: 2,
-                unit: 8,
-                flags: SegFlags::default(),
-                value: SegmentValue::Term(extra),
-                size: SegSize::All,
-            },
-        ]
-    };
-    // Port of erts/emulator/beam/erl_bits.c (`erts_bs_put_binary_all` and
-    // `erts_bs_append_checked` call BUMP_REDS with the bits they copy per ERL_BITS_PER_REDUCTION).
-    // The call site stores FCALLS and reloads it (`Update::eReductions`), so the charge goes
-    // through `process.reductions`, which `enter_runtime` started from the stored FCALLS. BUMP_REDS
-    // clamps FCALLS at zero.
-    let copy_reductions = arinsal_bits::create_bin_reductions(&build(
-        registers.x_reg_array[src_index],
-        registers.x_reg_array[extra_index],
-    ))
-    .unwrap_or(0);
-    let charge = |process: &mut crate::Process| {
-        process.heap.abi.fcalls = process
-            .heap
-            .abi
-            .fcalls
-            .saturating_sub(copy_reductions.min(i32::MAX as usize) as i32)
-            .max(0);
-    };
-    // Port of `erts_bs_append_checked`'s ERL_REFC_BITS_SIZE heap request: BinRef + SubBits.
-    // `<<Bin/binary, Bin2/binary>>` fills one destination with the two source ranges.
-    // The heap bitstring of a result up to 64 bytes takes up to 10 words, more than a BinRef plus
-    // SubBits, so the request follows what the builder writes. `Alloc` is the heap the
-    // instruction's following stores use without their own test (`extra_words` in erts).
-    if let Some(words) = arinsal_bits::concat_byte_binary_heap_words(
-        registers.x_reg_array[src_index],
-        registers.x_reg_array[extra_index],
-    )
-    .and_then(|words| words.checked_add(alloc))
-        && let Ok(_) = process.ensure_native_roots(words, &mut registers.x_reg_array[..root_live])
-        && let Ok(Some(term)) = arinsal_bits::concat_byte_binary(
-            registers.x_reg_array[src_index],
-            registers.x_reg_array[extra_index],
-            &mut process.heap,
-        )
-    {
-        charge(process);
-        return raw(term);
-    }
-    let initial = build(
-        registers.x_reg_array[src_index],
-        registers.x_reg_array[extra_index],
-    );
-    let mut request = match arinsal_bits::create_bin_size(&initial) {
-        Ok(size) => size.heap_words.saturating_add(alloc),
-        Err(error) => return fail(process, error),
-    };
-    let result = loop {
-        if process
-            .ensure_objv(request, &mut registers.x_reg_array[..root_live])
-            .is_err()
-        {
-            set_error(process, "system_limit");
-            return 0;
-        }
-        let segments = build(
-            registers.x_reg_array[src_index],
-            registers.x_reg_array[extra_index],
-        );
-        match arinsal_bits::create_bin(&segments, &mut process.heap) {
-            Err(BitsError::HeapFull { need_words }) => {
-                request = need_words
-                    .saturating_add(alloc)
-                    .max(request.saturating_mul(2));
-            }
-            other => break other,
-        }
-    };
-    if result.is_ok() {
-        charge(process);
-    }
-    match result {
-        Ok(term) => raw(term),
-        Err(error) => fail(process, error),
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-fn fail(process: &mut crate::Process, error: BitsError) -> u64 {
-    // An earlier collection of this helper may have moved the heap.
-    let (reason, info) = crate::bits::native_error(error);
-    crate::native_helpers::set_native_error_info(process, &reason, info);
-    0
-}
 
 /// Creates the empty writable binary for a native `bs_init_writable`.
 // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:985-1000 and erl_bits.c:2002
@@ -158,10 +15,7 @@ pub extern "C" fn erts_bs_init_writable(header: *mut ProcessHeader, size: u64) -
         return 0;
     };
     let size = crate::native_hooks::from_raw(size).as_small();
-    if process.ensure_objv(8, &mut []).is_err() {
-        crate::native_hooks::set_error(process, "system_limit");
-        return 0;
-    }
+    process.ensure_objv(8, &mut []);
     let result = arinsal_bits::init_writable_with_size(size, &mut process.heap);
     match result {
         Ok(value) => crate::native_hooks::raw(value),
@@ -207,7 +61,8 @@ pub extern "C" fn erts_bs_get_binary_2(
     let Ok(num_bits) = usize::try_from(num_bits) else {
         return crate::native_hooks::raw(Term::NON_VALUE);
     };
-    match context.get_binary(num_bits, &mut process.heap) {
+    let mut heap = crate::ProcessHeapHandle(&mut process.heap);
+    match context.get_binary(num_bits, &mut heap) {
         Ok(Some(term)) => crate::native_hooks::raw(term),
         Ok(None) | Err(_) => crate::native_hooks::raw(Term::NON_VALUE),
     }
@@ -231,8 +86,9 @@ pub extern "C" fn erts_bs_get_float_2(
     let Ok(num_bits) = usize::try_from(num_bits) else {
         return crate::native_hooks::raw(Term::NON_VALUE);
     };
+    let mut heap = crate::ProcessHeapHandle(&mut process.heap);
     let Some(term) = context
-        .get_float(num_bits, segment_flags(flags), &mut process.heap)
+        .get_float(num_bits, segment_flags(flags), &mut heap)
         .ok()
         .flatten()
     else {
@@ -278,7 +134,8 @@ fn get_integer_inner(
     let Ok(num_bits) = usize::try_from(num_bits) else {
         return crate::native_hooks::raw(Term::NON_VALUE);
     };
-    match context.get_integer(num_bits, segment_flags(flags), &mut process.heap) {
+    let mut heap = crate::ProcessHeapHandle(&mut process.heap);
+    match context.get_integer(num_bits, segment_flags(flags), &mut heap) {
         Ok(Some(term)) => crate::native_hooks::raw(term),
         Ok(None) | Err(_) => crate::native_hooks::raw(Term::NON_VALUE),
     }
@@ -324,13 +181,7 @@ pub extern "C" fn beam_jit_bs_get_integer(
         let Some(root_count) = live.checked_add(1) else {
             return crate::native_hooks::raw(Term::NON_VALUE);
         };
-        if process
-            .ensure_native_roots(words_needed, &mut registers.x_reg_array[..root_count])
-            .is_err()
-        {
-            crate::native_hooks::set_error(process, "system_limit");
-            return crate::native_hooks::raw(Term::NON_VALUE);
-        }
+        process.ensure_native_roots(words_needed, &mut registers.x_reg_array[..root_count]);
         let context = registers.x_reg_array[live];
         return get_integer_inner(process, context, size as u64, flags as u32);
     }

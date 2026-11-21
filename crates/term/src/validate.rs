@@ -503,7 +503,7 @@ mod tests {
             .cons(Term::small(1).unwrap(), Term::NIL)
             .unwrap();
         let mut roots = [term];
-        heap.collect(&mut roots, &mut [], 0).unwrap();
+        heap.collect(&mut roots, &mut [], 0);
         check_term(&heap, roots[0], "gc:root/1 after GC");
     }
 

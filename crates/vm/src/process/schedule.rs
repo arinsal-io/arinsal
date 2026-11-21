@@ -40,7 +40,10 @@ impl Task for Process {
     }
 
     // Port of erts/emulator/beam/erl_process.c:12723-12727 (erl_create_process), OTP-29.1.1.
-    fn init_in_place(&mut self) {
+    // Port of erts/emulator/beam/erl_ptab.c (erts_ptab_new_element: `p->common.id`), OTP-29.1.1:
+    // the process knows its own identifier from its creation on.
+    fn init_in_place(&mut self, pid: Pid) {
+        self.heap.abi.self_pid = pid.to_term().expect("valid pid").tagged_word();
         self.inbox.init_in_place();
     }
 
@@ -173,7 +176,7 @@ impl Task for Process {
     // Port of erts/emulator/beam/erl_process.c:10232-10440 (erts_schedule, schedule-in of the
     // selected process after `p->scheduler_data = esdp` and trace_schedule_in: `p->fcalls =
     // reds`), OTP-29.1.1.
-    fn schedule_in(c_p: &mut CP<'_>, esdp: &ErtsSchedulerData, reds: u32) {
+    fn schedule_in(c_p: &mut CP<'_>, esdp: &ErtsSchedulerData, reds: u32, calls: &mut u32) -> bool {
         esdp.with_ctx(c_p, |process, ctx| {
             // `c_p` (the native prefix at the start of this task) and the process state word are in
             // one process struct, the state word at `offsetof(Process, state)` from `c_p`.
@@ -182,26 +185,16 @@ impl Task for Process {
                     - std::ptr::from_mut(process.native_header()).addr(),
                 crate::process::PROCESS_STATE_OFFSET
             );
-            let exec_key = ctx.scheduler_key();
-            let cached =
-                exec_key != 0 && process.exec_key == exec_key && process.self_pid.is_some();
-            if !cached {
-                process.heap.abi.self_pid = ctx.pid().to_term().expect("valid pid").tagged_word();
-                process.self_pid = Some(ctx.pid());
-            }
             // The NIF hub of this scheduler reads `esdp->current_process`, which erts_schedule
             // set (erl_process.c:10180, OTP-29.1.1).
             crate::natives::nif::bind_scheduler_hub(process);
             // Port of erts/emulator/beam/erl_process.c:10232 (`p->scheduler_data = esdp`; the
             // scheduler number process_info reports is `esdp->no`), OTP-29.1.1.
-            if !cached {
-                crate::proc_create::raw::erts_psd_set_word(
-                    &mut process.psd,
-                    crate::proc_create::raw::ERTS_PSD_SCHED_ID,
-                    ctx.scheduler_id().unwrap_or(0),
-                );
-                process.exec_key = exec_key;
-            }
+            crate::proc_create::raw::erts_psd_set_word(
+                &mut process.psd,
+                crate::proc_create::raw::ERTS_PSD_SCHED_ID,
+                ctx.scheduler_id().unwrap_or(0),
+            );
             // Port of erts/emulator/beam/erl_trace.c:704-716 (trace_sched), OTP-29.1.1.
             if crate::trace::running_procs_enabled() {
                 crate::trace::emit_process(
@@ -211,19 +204,6 @@ impl Task for Process {
                     "in",
                     &[],
                 );
-            }
-            // The buffer mode depends on the process alone; the key carries it with the scheduler,
-            // so a slice on the same scheduler with the same mode has nothing to redo.
-            let offheap = process.message_queue_data() == MessageQueueData::OffHeap;
-            let key = ctx.scheduler_key();
-            let run_key = if key == 0 {
-                0
-            } else {
-                key | (u64::from(offheap) << 63)
-            };
-            if run_key == 0 || process.run_key != run_key {
-                ctx.set_parallel_signal_buffers(offheap);
-                process.run_key = run_key;
             }
             // The light BIF path has no scheduler context. A probe is the process-side
             // `sig_inq` flag (`ERTS_PSFLG_MSG_SIG_IN_Q`) it checks before collecting.
@@ -242,12 +222,52 @@ impl Task for Process {
                 ix
             });
             process.heap.set_alloc_ix(Some(alloc_ix));
-            process.on_managed = !ctx.scheduler_type().is_dirty();
             if process.receive_timeout_pos.is_some() {
                 process.receive_timeout_schedule_in();
             }
-            // Port of erts/emulator/beam/erl_process.c:10435 (`p->fcalls = reds`), OTP-29.1.1.
-            process.heap.abi.fcalls = reds.min(i32::MAX as u32) as i32;
+            // Port of erts/emulator/beam/erl_process.c:10435 (`p->fcalls = reds`), OTP-29.1.1:
+            // the RUNNING_SYS work below charges `reds` (`reds -= sig_reds`, `reds -= cost`)
+            // through `c_p->fcalls`.
+            let reds = reds.min(i32::MAX as u32) as i32;
+            process.heap.abi.fcalls = reds;
+            // Port of erts/emulator/beam/erl_process.c:10232-10318 (erts_schedule: the
+            // RUNNING_SYS work is the normal-scheduler branch; erts_dirty_process_main runs
+            // a dirty scheduler's job), OTP-29.1.1. A process that is exiting resumes its
+            // exit (`p->i = beam_continue_exit`) without it.
+            if ctx.scheduler_type().is_dirty()
+                || process.runtime.is_none()
+                || process.dirty_exiting()
+                || process.has_exit_cont()
+            {
+                // An exiting process claimed for system work (ERTS_PSFLG_RUNNING_SYS) goes to
+                // ERTS_PSFLG_RUNNING: the cmpxchg of erl_process.c:10377-10404 never refuses an
+                // exiting process.
+                if !ctx.scheduler_type().is_dirty()
+                    && ctx.proc_state().load(Ordering::Acquire) & arinsal_sched::psflg::RUNNING_SYS
+                        != 0
+                {
+                    let _ = ctx.running_sys_to_running();
+                }
+                return true;
+            }
+            let result = super::executor_run::schedule_in_running_sys(process, ctx);
+            let used = u32::try_from(reds.saturating_sub(process.heap.abi.fcalls)).unwrap_or(0);
+            *calls = used;
+            let outcome = match result {
+                Ok(true) => {
+                    // Port of erts/emulator/beam/erl_process.c:10440-10447 (`if (reds !=
+                    // context_reds) { ... p->reds += actual_reds; }`), OTP-29.1.1.
+                    process.reductions_used =
+                        process.reductions_used.saturating_add(u64::from(used));
+                    return true;
+                }
+                Ok(false) => crate::signals::reschedule_deferred_sys_tasks(process, ctx)
+                    .map(|()| RunState::Yield),
+                Err(error) => Err(error),
+            };
+            // `goto sched_out_proc`: the schedule-in work is the slice's outcome.
+            process.finish_run(ctx, outcome);
+            false
         })
     }
 
@@ -299,7 +319,7 @@ impl Task for Process {
     fn scheduler_shutdown(&mut self) {
         // The probe holds a reference to this process's own struct.
         self.set_signal_probe(None);
-        if let Some(pid) = self.self_pid {
+        if let Some(pid) = self.self_pid() {
             self.persistent_terms
                 .release_update_permission(crate::natives::sys::persistent_owner(pid));
         }
@@ -529,6 +549,15 @@ impl Process {
             return self.exit_outcome(ctx);
         }
         let result = self.run_executor(ctx);
+        if self.has_exit_cont()
+            || ctx.proc_state().load(Ordering::Acquire) & arinsal_sched::psflg::FREE != 0
+        {
+            // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:304-385 (process_exit /
+            // raise_exception_shared: `handle_error` returned NULL, `jmp do_schedule`),
+            // OTP-29.1.1: the slice terminated the process in place (terminate_proc ->
+            // erts_do_exit_process); erts_schedule reads FREE or the exit continuation.
+            return self.exit_outcome(ctx);
+        }
         if self.dirty_exiting() {
             // Port of erts/emulator/beam/erl_process.c:10096 (need_forced_exit), OTP-29.1.1:
             // the process already terminated while the job ran; whatever the job returned,
@@ -558,9 +587,13 @@ impl Process {
     /// ends (remove_message / timeout / exit), never here.
     // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1192-1196 (beam_jit_wait_locked:
     // `erts_atomic32_read_band_relb(&c_p->state, ~ERTS_PSFLG_ACTIVE)`), OTP-29.1.1.
+    //
+    // A message that reached the outer queue since the process last looked
+    // (`ERTS_PSFLG_MSG_SIG_IN_Q`) keeps it active: erts clears the bit under the msgq lock, which
+    // a sender takes before it reads the state, so the sender sees the process inactive and
+    // schedules it; the lock-free queue has the same order in the one state word.
     fn wait_locked(&self, ctx: &RunCtx<'_, crate::Process>) {
-        ctx.proc_state()
-            .fetch_and(!arinsal_sched::psflg::ACTIVE, Ordering::Release);
+        let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
     }
 
     /// The slice ends with dirty work: `ERTS_PSFLG_DIRTY_CPU_PROC` / `ERTS_PSFLG_DIRTY_IO_PROC`
@@ -628,10 +661,6 @@ impl Process {
             crate::natives::misc::profile_process_event(self, ctx, false);
             self.slice_mut().profile_active = false;
         }
-        // g_proc_sched. Port of erts/emulator/beam/erl_gc.c:1197 (max_heap_size kill), OTP-29.1.1.
-        if heap_limit_kills(self, ctx) {
-            return self.exit_with(ctx, Term::atom(arinsal_term::atoms::KILLED));
-        }
         // Port of erts/emulator/beam/erl_process.c:6747-6763 (schedule_out_process), OTP-29.1.1:
         // with GC disabled the dirty collection is dropped; the next collection does it.
         if !ctx.scheduler_type().is_dirty()
@@ -653,20 +682,12 @@ impl Process {
                     && self.slice().is_some_and(|work| work.dirty_sys_gc) =>
             {
                 // ERTS_PSFLG_DIRTY_ACTIVE_SYS sends it to the dirty CPU run queue.
-                ctx.set_active(true);
                 ctx.set_dirty_active_sys();
             }
-            Ok(RunState::Yield) => {
-                ctx.set_active(true);
-            }
+            Ok(RunState::Yield) => {}
             Ok(RunState::Wait) => {
-                // Port of erts/emulator/beam/erl_process.c:9304 (erts_process_state2status),
-                // OTP-29.1.1: suspension keeps ERTS_PSFLG_ACTIVE, so a process resumed while
-                // this slice ended is runnable, not waiting.
-                let parked = self
-                    .take_work(|work| std::mem::take(&mut work.suspend_parked).then_some(()))
-                    .is_some();
-                ctx.set_active(parked);
+                let _ =
+                    self.take_work(|work| std::mem::take(&mut work.suspend_parked).then_some(()));
                 self.wait_locked(ctx);
             }
             Ok(RunState::Done(term)) => {
@@ -712,17 +733,26 @@ impl Process {
                     Self::schedule_dirty(ctx, kind);
                     return;
                 }
-                let reason = exit_reason_from(self, &error);
-                if matches!(&error, VmError::Raised(raised) if raised.class == arinsal_bifs::Class::Error)
-                {
-                    report_process_error(self, ctx, reason);
-                }
-                crate::signals::process_exiting(self, ctx);
-                if trace_boot_enabled() {
-                    eprintln!("arinsal boot: process {:?} exited: {error}", ctx.pid());
-                }
-                self.exit_with(ctx, reason)
+                self.terminate_proc(ctx, error);
+                self.exit_outcome(ctx)
             }
         }
+    }
+
+    /// Terminates the process with the exception `error` found no catch for: `{Value,
+    /// Stacktrace}` for an error (add_stacktrace), the EXF_LOG message, then
+    /// `erts_do_exit_process`.
+    // Port of erts/emulator/beam/beam_common.c:685-725 (terminate_proc), OTP-29.1.1.
+    pub(crate) fn terminate_proc(&mut self, ctx: &mut RunCtx<'_, crate::Process>, error: VmError) {
+        let reason = exit_reason_from(self, &error);
+        if matches!(&error, VmError::Raised(raised) if raised.class == arinsal_bifs::Class::Error) {
+            report_process_error(self, ctx, reason);
+        }
+        crate::signals::process_exiting(self, ctx);
+        if trace_boot_enabled() {
+            eprintln!("arinsal boot: process {:?} exited: {error}", ctx.pid());
+        }
+        // erl_process.c:14173 (erts_do_exit_process: `p->arity = 0`) runs inside.
+        self.erts_do_exit_process(&mut Vm {}, ctx, reason);
     }
 }

@@ -1,4 +1,5 @@
 //! POSIX signal and pipe operations for `sys_signals`.
+// Port of erts/emulator/sys/unix/sys.c (`init_smp_sig_notify`), OTP-29.1.1.
 
 use crate::VmError;
 use crate::process::Runtime;
@@ -7,32 +8,13 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 static SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
-// Port of `init_smp_sig_notify` in erts/emulator/sys/unix/sys.c, OTP-29.1.1.
+// Port of `init_smp_sig_notify` in erts/emulator/sys/unix/sys.c (`pipe(sig_notify_fds)`),
+// OTP-29.1.1. erts does not SET_CLOEXEC on this pipe.
 pub(super) fn init_dispatcher(runtime: &'static Runtime) -> Result<(), VmError> {
     let mut fds = [-1; 2];
-    let result = crate::port::cloexec_publish(|| {
-        // SAFETY: pipe initializes both fresh descriptors in `fds`.
-        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-        if rc == 0 {
-            // SAFETY: both descriptors were created by pipe and remain open.
-            let failed = unsafe {
-                libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) < 0
-                    || libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC) < 0
-            };
-            if failed {
-                let error = std::io::Error::last_os_error();
-                // SAFETY: both descriptors are still ours and are closed on this error path.
-                unsafe {
-                    libc::close(fds[0]);
-                    libc::close(fds[1]);
-                }
-                return Err(error);
-            }
-        }
-        Ok(rc)
-    })
-    .map_err(|error| VmError::Unsupported(format!("signal pipe close-on-exec: {error}")))?;
-    if result != 0 {
+    // SAFETY: `pipe` writes two new descriptors into `fds` or returns -1.
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if rc != 0 {
         return Err(VmError::Unsupported(format!(
             "signal pipe creation: {}",
             std::io::Error::last_os_error()

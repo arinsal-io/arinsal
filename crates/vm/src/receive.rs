@@ -135,16 +135,20 @@ impl ReceiveMarkers {
 }
 
 /// `sig_qs.flags` bits of the prio queue (erl_process.h:1675-1677).
-pub(crate) const FS_PRIO_MQ_SAVE: u8 = 1 << 0;
-pub(crate) const FS_PRIO_MQ_END_MARK: u8 = 1 << 1;
+pub(crate) const FS_PRIO_MQ_SAVE: u32 = 1 << 0;
+pub(crate) const FS_PRIO_MQ_END_MARK: u32 = 1 << 1;
 /// `FS_PRIO_MQ`: the prio queue is installed (priority items exist).
-pub(crate) const FS_PRIO_MQ: u8 = 1 << 4;
+pub(crate) const FS_PRIO_MQ: u32 = 1 << 4;
+/// `FS_FLUSHING_SIGS`: currently flushing signals (erl_process.h:1666).
+pub(crate) const FS_FLUSHING_SIGS: u32 = 1 << 7;
+/// `FS_FLUSHED_SIGS`: flushing of signals completed (erl_process.h:1667).
+pub(crate) const FS_FLUSHED_SIGS: u32 = 1 << 8;
 /// The save info of `sig_qs.flags` (erl_process.h:1705-1710): how the save pointer was set.
-const FS_SET_SAVE_INFO_MASK: u8 = 3 << 2;
-const FS_SET_SAVE_INFO_FIRST: u8 = 0;
-const FS_SET_SAVE_INFO_RCVM: u8 = 1 << 2;
-const FS_SET_SAVE_INFO_MARK: u8 = 2 << 2;
-const FS_SET_SAVE_INFO_LAST: u8 = 3 << 2;
+const FS_SET_SAVE_INFO_MASK: u32 = 3 << 2;
+const FS_SET_SAVE_INFO_FIRST: u32 = 0;
+const FS_SET_SAVE_INFO_RCVM: u32 = 1 << 2;
+const FS_SET_SAVE_INFO_MARK: u32 = 2 << 2;
+const FS_SET_SAVE_INFO_LAST: u32 = 3 << 2;
 
 const PRIO_Q_MARK_END: usize = 0;
 const PRIO_Q_MARK_CONT: usize = 1;
@@ -164,7 +168,7 @@ pub(crate) enum PrioItemType {
 // Port of erts/emulator/beam/erl_proc_sig_queue.c:247-258 (ErtsPrioQInfo) and 9005
 // (create_prio_q_info), OTP-29.1.1.
 pub(crate) struct PrioQInfo {
-    saved_save_info: u8,
+    saved_save_info: u32,
     refc: isize,
     /// The per-type counts erts keeps under `DEBUG`.
     #[cfg(debug_assertions)]
@@ -293,11 +297,11 @@ impl Process {
         self.with_markers(|process, markers| f(process, &mut markers.blk))
     }
 
-    fn save_info(&self) -> u8 {
+    fn save_info(&self) -> u32 {
         self.inbox.flags & FS_SET_SAVE_INFO_MASK
     }
 
-    fn set_save_info(&mut self, info: u8) {
+    fn set_save_info(&mut self, info: u32) {
         self.inbox.flags = (self.inbox.flags & !FS_SET_SAVE_INFO_MASK) | info;
     }
 
@@ -1069,7 +1073,7 @@ impl Process {
             && let Some(pid) = ctx
                 .as_deref()
                 .map(|run_ctx| run_ctx.pid())
-                .or(self.self_pid)
+                .or(self.self_pid())
         {
             let message =
                 arinsal_term::to_owned(term).unwrap_or(arinsal_etf::OwnedTerm::atom("undefined"));
@@ -1318,7 +1322,7 @@ mod tests {
     #[test]
     fn marker_block_is_allocated_only_for_a_nonempty_mailbox() {
         let mut process = Process::new();
-        arinsal_sched::Task::init_in_place(&mut process);
+        arinsal_sched::Task::init_in_place(&mut process, arinsal_sched::Pid::from_data(0));
         assert_eq!(
             process.reserve_receive_marker().unwrap(),
             Term::atom(arinsal_term::atoms::UNDEFINED)
@@ -1347,7 +1351,7 @@ mod tests {
     #[test]
     fn exhausted_small_marker_ids_return_a_typed_error() {
         let mut process = Process::new();
-        arinsal_sched::Task::init_in_place(&mut process);
+        arinsal_sched::Task::init_in_place(&mut process, arinsal_sched::Pid::from_data(0));
         process.inbox.push_back(Term::small(7).unwrap());
         process.cold_mut().receive_marker_uniq =
             arinsal_term::MAX_SMALL - arinsal_term::MIN_SMALL + 1;
@@ -1360,7 +1364,7 @@ mod tests {
     #[test]
     fn marker_count_stays_bounded_through_100k_call_cycles() {
         let mut process = Process::new();
-        arinsal_sched::Task::init_in_place(&mut process);
+        arinsal_sched::Task::init_in_place(&mut process, arinsal_sched::Pid::from_data(0));
         for i in 0..100_000 {
             process.inbox.push_back(Term::small(i).unwrap());
             let marker = process.reserve_receive_marker().unwrap();

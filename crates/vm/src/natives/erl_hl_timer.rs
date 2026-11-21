@@ -179,11 +179,11 @@ fn bif_timer(
     let message = Message::copy_from_timer(message, id, process.heap.alloc_ix())?;
     // A timer for a process that does not exist is destroyed at once.
     if let Some(pid) = pid
-        && !scheduler.lookup_from(pid, process.on_managed)
+        && !scheduler.lookup(pid)
     {
         return Ok(reference);
     }
-    let me = process.self_pid.ok_or_else(badarg)?;
+    let me = process.self_pid().ok_or_else(badarg)?;
     let esdp = process.native_handle().ok_or_else(no_scheduler)?;
     let started = match (pid, name) {
         (Some(pid), _) => esdp.start_timer(me, pid, ms, message, false),
@@ -201,7 +201,7 @@ fn bif_timer(
         .map_err(|error| VmError::Unsupported(format!("timer: {error}")))?;
     // The receiver exited meanwhile; its exit may already have swept its timers.
     if let Some(pid) = pid
-        && !scheduler.lookup_from(pid, process.on_managed)
+        && !scheduler.lookup(pid)
     {
         scheduler.cancel_timer_async(timer, |_| {});
     }
@@ -242,7 +242,7 @@ fn access_bif_timer(
     let scheduler = std::sync::Arc::clone(process.runtime.ok_or_else(badarg)?.scheduler()?);
     let timer = scheduler.timer_for_ref_key(key);
     if asynchronous {
-        let me = process.self_pid.ok_or_else(badarg)?;
+        let me = process.self_pid().ok_or_else(badarg)?;
         let reply = info
             .then(|| to_owned(tref))
             .transpose()
@@ -273,7 +273,7 @@ fn access_bif_timer(
     if let Some(remaining) = scheduler.try_access_timer_local(timer, cancel) {
         return Ok(timer_result(remaining, info));
     }
-    let me = process.self_pid.ok_or_else(badarg)?;
+    let me = process.self_pid().ok_or_else(badarg)?;
     await_timer_access(process, me, tref, scheduler, timer, cancel, info)
 }
 
@@ -295,7 +295,7 @@ fn no_timer_result(
         let message = process.tuple(&[tag, tref, Term::atom(atoms::FALSE)])?;
         // `erts_queue_message(c_p, .., am_clock_service)`: through the caller's own signal
         // in-queue, so the answer lands behind a receive marker reserved before the call.
-        let me = process.self_pid.ok_or_else(badarg)?;
+        let me = process.self_pid().ok_or_else(badarg)?;
         process
             .runtime
             .ok_or_else(badarg)?

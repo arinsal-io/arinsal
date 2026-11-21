@@ -40,15 +40,20 @@ if [ ! -d "$otp_root/lib/wx-2.7/ebin" ] || \
     exit 1
 fi
 
-ARINSAL_RELEASE_VERSION="$version" cargo build --release -p arinsal-cli --target "$target"
+ARINSAL_RELEASE_VERSION="$version" cargo build --release -p arinsal-cli -p arinsal-vm --bin erl_child_setup --target "$target"
 build_root=${CARGO_TARGET_DIR:-"$repo/target"}
 case "$build_root" in
     /*) ;;
     *) build_root="$repo/$build_root" ;;
 esac
 binary="$build_root/$target/release/arinsal"
+helper="$build_root/$target/release/erl_child_setup"
 if [ ! -x "$binary" ]; then
     echo "package.sh: release executable is missing: $binary" >&2
+    exit 1
+fi
+if [ ! -x "$helper" ]; then
+    echo "package.sh: erl_child_setup is missing: $helper" >&2
     exit 1
 fi
 
@@ -59,6 +64,7 @@ trap 'rm -rf "$stage"' EXIT HUP INT TERM
 prefix="$stage/prefix"
 mkdir -p "$prefix/bin"
 cp "$binary" "$prefix/bin/arinsal"
+cp "$helper" "$prefix/bin/erl_child_setup"
 
 "$repo/tools/release/bundle_otp.sh" "$otp_root" "$prefix"
 bundle="$prefix/lib/arinsal/otp"
@@ -144,6 +150,7 @@ for tool in erl erlc escript; do
     ln -s "../../../../bin/$tool" "$bundle/bin/$tool"
     ln -s "../../../../../bin/$tool" "$bundle/erts-17.1/bin/$tool"
 done
+ln -s "../../../../../bin/erl_child_setup" "$bundle/erts-17.1/bin/erl_child_setup"
 
 case "$(uname -s)" in
     Darwin)

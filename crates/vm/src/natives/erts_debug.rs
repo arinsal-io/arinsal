@@ -212,7 +212,7 @@ fn after_collection_one(
     if flags == 0 {
         return;
     }
-    let Some(pid) = process.self_pid else {
+    let Some(pid) = process.self_pid() else {
         return;
     };
     let OwnedTerm::Pid {
@@ -324,7 +324,7 @@ fn after_schedule_one(process: &mut Process, elapsed_nanoseconds: u64, state: &S
     if flags & MONITOR_LONG_SCHEDULE == 0 {
         return;
     }
-    let Some(pid) = process.self_pid else {
+    let Some(pid) = process.self_pid() else {
         return;
     };
     let Some(MonitorOption::Limit(limit)) = state.options.get("long_schedule") else {
@@ -462,7 +462,7 @@ fn after_message_queue_change_one(process: &mut Process, state: &SystemMonitorSt
     if flags & MONITOR_LONG_MESSAGE_QUEUE == 0 {
         return;
     }
-    let Some(pid) = process.self_pid else {
+    let Some(pid) = process.self_pid() else {
         return;
     };
     let Some(MonitorOption::Queue(off, on)) = state.options.get("long_message_queue") else {

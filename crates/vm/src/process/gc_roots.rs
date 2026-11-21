@@ -11,13 +11,13 @@ impl Process {
         extra: &mut [Term],
         min_free: usize,
         hibernate: bool,
-    ) -> Result<arinsal_term::GcStats, VmError> {
-        let stats = self.collect_roots_inner(objv, extra, min_free, hibernate)?;
+    ) -> arinsal_term::GcStats {
+        let stats = self.collect_roots_inner(objv, extra, min_free, hibernate);
         // A collection moves the young heap. erts keeps HTOP, STOP, HEAP and HEND as the
         // process's own fields, so they are right the moment the collector returns; here the
         // ABI prefix is a copy, and every path that returns to native code after a collection
         // (success, error or trap alike) must find the new heap in it.
-        Ok(stats)
+        stats
     }
 
     fn collect_roots_inner(
@@ -26,7 +26,7 @@ impl Process {
         extra: &mut [Term],
         min_free: usize,
         hibernate: bool,
-    ) -> Result<arinsal_term::GcStats, VmError> {
+    ) -> arinsal_term::GcStats {
         if crate::xreg_poison_enabled()
             && let Some(register) = objv.iter().position(|term| *term == crate::XREG_POISON)
         {
@@ -35,21 +35,26 @@ impl Process {
                 objv.len()
             );
         }
-        // Port of erts/emulator/beam/erl_gc.c:782-785 (garbage_collect: F_DELAY_GC), OTP-29.1.1.
-        if !hibernate && self.delay_gc() {
+        // Port of erts/emulator/beam/erl_gc.c:780-785 (garbage_collect: F_DELAY_GC, and
+        // `state & ERTS_PSFLG_EXITING`: a process killed by an earlier collection is not
+        // collected again), OTP-29.1.1.
+        if !hibernate && (self.delay_gc() || self.erts_c_p_state_exiting()) {
             self.heap.delay_collection(min_free);
-            return Ok(arinsal_term::GcStats::default());
+            return arinsal_term::GcStats::default();
         }
         if !hibernate && let Some(reds_left) = self.delay_for_dirty_gc(min_free) {
-            return Ok(arinsal_term::GcStats {
+            return arinsal_term::GcStats {
                 reductions: reds_left,
                 ..arinsal_term::GcStats::default()
-            });
+            };
         }
+        // Port of erts/emulator/beam/erl_gc.c:800-937 (garbage_collect switches to GC before
+        // collection setup and restores the saved state after the collection), OTP-29.1.1.
+        let _msacc = arinsal_sched::erts_msacc_push_and_set_state(arinsal_sched::MsaccState::Gc);
         // An on-heap message installed while this process was queued lives only in
         // the outer signal queue until this fetch. Scanning without it would
         // reclaim that term. Hibernate fetches too (erl_gc.c:1016).
-        self.fetch_outer_queue_for_gc()?;
+        self.fetch_outer_queue_for_gc();
         // Port of erl_gc.c:2616 (`setup_rootset` with no dictionary and an empty message
         // queue): the stack is scanned in place and `extra` is rooted directly, as in
         // `erts_garbage_collect(p, 0, &result, 1)` after a BIF. Building and rewriting
@@ -79,30 +84,25 @@ impl Process {
             )
             .is_none_or(Vec::is_empty)
             && !self.has_dirty_result_roots()
-            && self.max_heap_peak == 0
             && !self.max_heap_limited()
             && self
-                .self_pid
+                .self_pid()
                 .is_none_or(|pid| crate::trace::flags(self, pid) & crate::trace::GC == 0)
         {
-            let stats = self
-                .heap
-                .collect(objv, extra, min_free)
-                .map_err(|error| VmError::Unsupported(format!("process GC: {error:?}")))?;
+            // Port of erts/emulator/beam/erl_gc.c:800-937 (garbage_collect enters GC before
+            // minor_collection / major_collection and restores the saved state), OTP-29.1.1.
+            let _msacc =
+                arinsal_sched::erts_msacc_push_and_set_state(arinsal_sched::MsaccState::Gc);
+            let stats = self.heap.collect(objv, extra, min_free);
             self.stats.gc.collections += stats.collections;
             self.stats.gc.nanoseconds += stats.nanoseconds;
             crate::natives::erts_debug::after_collection(self, stats.nanoseconds);
-            return Ok(stats);
-        }
-        // Port of erts/emulator/beam/erl_gc.c:3730 (`has_reached_max_heap_size`) call in
-        // `garbage_collect`, OTP-29.1.1: the limit is judged on the pre-collection size.
-        if self.max_heap_limited() {
-            self.max_heap_peak = self.max_heap_peak.max(self.heap.total_heap_size_words());
+            return stats;
         }
         crate::seq_trace::sync_epoch(self);
         // Port of erts/emulator/beam/erl_gc.c:832-901 (`trace_gc` around minor/major collections), OTP-29.1.1.
         let traced = self
-            .self_pid
+            .self_pid()
             .filter(|&pid| crate::trace::flags(self, pid) & crate::trace::GC != 0);
         if let Some(pid) = traced
             && self.heap.minor_falls_back_to_major()
@@ -159,17 +159,25 @@ impl Process {
             };
             let checks = self
                 .heap
-                .max_heap_collection_checks(min_free, message_words)
-                .map_err(|error| VmError::Unsupported(format!("process GC: {error:?}")))?;
+                .max_heap_collection_checks(min_free, message_words);
             let exceeded = [Some(checks.0), checks.1]
                 .into_iter()
                 .flatten()
                 .find(|&size| (size as u64).saturating_add(binary_words) > limit.size);
-            if let Some(size) = exceeded {
-                self.max_heap_peak = self.max_heap_peak.max(size);
-                if limit.kill {
-                    return Err(VmError::Unsupported("max_heap_size".into()));
-                }
+            // Port of erts/emulator/beam/erl_gc.c:1454-1457 / 1903-1906 (minor_collection /
+            // major_collection: `has_reached_max_heap_size` + `reached_max_heap_size` return
+            // -2) and 870-886 (garbage_collect: `reds == -2`), OTP-29.1.1: a process configured
+            // to be killed is made exiting and its collection delayed; it leaves through
+            // `do_schedule` and terminates at `beam_exit`.
+            if let Some(size) = exceeded
+                && reached_max_heap_size(self, limit, (size as u64).saturating_add(binary_words))
+            {
+                self.erts_set_self_exiting_c_p(Term::atom(arinsal_term::atoms::KILLED));
+                self.delay_heap_collection(min_free);
+                return arinsal_term::GcStats {
+                    reductions: self.delay_garbage_collection_reds(),
+                    ..arinsal_term::GcStats::default()
+                };
             }
         }
         // Port of erts/emulator/beam/erl_gc.c:2616 (`setup_rootset`), OTP-29.1.1:
@@ -247,18 +255,13 @@ impl Process {
         if exc_rooted[1] {
             self.heap.abi.exc.ftrace = exc_roots[1].tagged_word();
         }
-        let stats =
-            stats.map_err(|error| VmError::Unsupported(format!("process GC: {error:?}")))?;
         if let Some(pid) = traced {
             self.trace_gc(pid, end_tag, stats.words_reclaimed as usize);
         }
         self.stats.gc.collections += stats.collections;
         self.stats.gc.nanoseconds += stats.nanoseconds;
-        if self.max_heap_peak != 0 || self.max_heap_limited() {
-            self.max_heap_peak = self.max_heap_peak.max(self.heap.total_heap_size_words());
-        }
         crate::natives::erts_debug::after_collection(self, stats.nanoseconds);
-        Ok(stats)
+        stats
     }
 
     /// Hand a potentially long collection to a dirty CPU scheduler: satisfy `need` without
@@ -325,7 +328,7 @@ impl Process {
         }
         if failed_minor {
             let traced = self
-                .self_pid
+                .self_pid()
                 .filter(|&pid| crate::trace::flags(self, pid) & crate::trace::GC != 0);
             if let Some(pid) = traced {
                 self.trace_gc(pid, "gc_minor_start", need);
@@ -342,24 +345,30 @@ impl Process {
         // erts_schedule_dirty_sys_execution: the process moves to a dirty CPU scheduler
         // when it leaves this one.
         self.delay_heap_collection(need);
-        // erl_gc.c, delay_garbage_collection (force_reschedule): the remaining reductions
-        // are returned for the caller's BUMP_REDS, and all but ERTS_ABANDON_HEAP_COST of
-        // them are not the process's own work.
+        Some(self.delay_garbage_collection_reds())
+    }
+
+    /// The end of a delayed collection: the remaining reductions are returned for the
+    /// caller's BUMP_REDS, and all but ERTS_ABANDON_HEAP_COST of them are not the process's
+    /// own work.
+    // Port of erts/emulator/beam/erl_gc.c:584-602 (delay_garbage_collection: force_reschedule),
+    // OTP-29.1.1.
+    fn delay_garbage_collection_reds(&mut self) -> u32 {
         let reds_left = self.heap.abi.fcalls.max(0);
         if reds_left > ABANDON_HEAP_COST {
             self.virtual_reds = self
                 .virtual_reds
                 .saturating_add((reds_left - ABANDON_HEAP_COST) as u32);
         }
-        Some(reds_left as u32)
+        reds_left as u32
     }
 
     /// Run the collection a normal scheduler delayed, on the dirty CPU scheduler.
     // Port of erts/emulator/beam/erl_process.c:11196-11201 (erts_execute_dirty_system_task),
     // OTP-29.1.1: the roots are the `arity` registers the process was scheduled out with.
-    pub(super) fn run_dirty_gc(&mut self) -> Result<(), VmError> {
+    pub(super) fn run_dirty_gc(&mut self) {
         let Some(kind) = self.cold.as_mut().and_then(|cold| cold.dirty_gc.take()) else {
-            return Ok(());
+            return;
         };
         if kind == crate::proc_create::DirtyGc::Major {
             // F_NEED_FULLSWEEP.
@@ -367,10 +376,9 @@ impl Process {
         }
         let live = switched_out_live(self);
         self.verify_dirty_gc_roots(live, "before dirty GC");
-        let stats = self.collect_arg_reg(live, &mut [], 0)?;
+        let stats = self.collect_arg_reg(live, &mut [], 0);
         self.verify_dirty_gc_roots(live, "after dirty GC");
         crate::natives::sys::after_collection(self, stats.collections, stats.words_reclaimed);
-        Ok(())
     }
 
     /// Check the roots presented to a dirty system task when validation is enabled.

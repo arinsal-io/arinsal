@@ -576,7 +576,7 @@ pub(crate) fn flag(process: &mut Process, name: &str, value: Term) -> Result<Ter
                 return Err(badarg());
             }
             // Port of erts/emulator/beam/bif.c:2173 (process_flag sensitive), OTP-29.1.1.
-            let pid = process.self_pid.ok_or_else(badarg)?;
+            let pid = process.self_pid().ok_or_else(badarg)?;
             let old = crate::trace::set_sensitive(
                 process,
                 pid,
@@ -653,24 +653,18 @@ pub(crate) fn flag(process: &mut Process, name: &str, value: Term) -> Result<Ter
 }
 
 /// The executor's builder for `process_info`: `process` is the caller and holds the result;
-/// `src` is the process read (`rp` in erts). `drain` is the run context of a call on the
-/// caller itself, which fetches its queued signals first.
+/// `src` is the process read (`rp` in erts).
 #[allow(clippy::too_many_arguments)]
 fn process_info(
     vm: Option<&Vm>,
     src: InfoSource<'_>,
     process: &mut Process,
     pid: Pid,
-    drain: Option<&mut RunCtx<'_, crate::Process>>,
+    _drain: Option<&mut RunCtx<'_, crate::Process>>,
     args: &ProcessInfoArgs,
     status: Term,
     charge: bool,
 ) -> Result<Term, VmError> {
-    // Messages already queued are part of process_info. A request handled from
-    // inside drain must not pull signals that were ordered after it.
-    if let Some(ctx) = drain {
-        process.drain(ctx)?;
-    }
     // `process_info_bif` snapshots these only when the matching indexed item is read.
     let mut info_reds = 0i32;
     let mut reserve = args.reserve_size;
@@ -871,7 +865,7 @@ fn process_info_aux(
             .unwrap_or_else(|| Term::atom(arinsal_term::atoms::UNDEFINED));
         // Port of erts/emulator/beam/erl_bif_info.c:2288 (ERTS_PI_IX_DICTIONARY_LOOKUP), OTP-29.1.1.
         let value = if process
-            .self_pid
+            .self_pid()
             .is_some_and(|pid| crate::trace::is_sensitive(process, pid))
         {
             Term::atom(arinsal_term::atoms::UNDEFINED)
@@ -1172,7 +1166,7 @@ fn process_info_aux(
 fn process_info_item_messages(process: &mut Process) -> Result<Term, VmError> {
     Ok({
         let sensitive = process
-            .self_pid
+            .self_pid()
             .is_some_and(|pid| crate::trace::is_sensitive(process, pid));
         let messages = if sensitive {
             Vec::new()
@@ -1188,7 +1182,7 @@ fn process_info_item_messages(process: &mut Process) -> Result<Term, VmError> {
 fn process_info_item_dictionary(process: &mut Process) -> Result<Term, VmError> {
     Ok({
         let sensitive = process
-            .self_pid
+            .self_pid()
             .is_some_and(|pid| crate::trace::is_sensitive(process, pid));
         let raw = process
             .dictionary
@@ -1996,6 +1990,13 @@ fn initial_call_atoms(vm: Option<&Vm>, process: &Process) -> Result<(Atom, Atom,
 // interpreter and native paths already expose MFA atoms; only synthetic trap metadata needs
 // interning because Arinsal currently stores those exceptional names as text.
 fn resolve_mfa_atoms(vm: Option<&Vm>, process: &Process) -> Result<(Atom, Atom, u32), VmError> {
+    // `if (rp->current == NULL)` looks the code address up; until its first run a spawned
+    // process has `p->current = &p->u.initial` (erl_process.c:12614), not its `p->i`.
+    if !process.entry_started()
+        && let Some((module, function, arity)) = process.initial_mfa
+    {
+        return Ok((module, function, u32::from(arity)));
+    }
     let intern = |name: &str| global_atoms().intern(name).map_err(|_| badarg());
     if let Some((module, function, arity)) =
         process.cold.as_ref().and_then(|cold| cold.dirty_bif_mfa)
@@ -2042,6 +2043,13 @@ fn native_position(process: &Process) -> Option<usize> {
 }
 
 fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u32), VmError> {
+    // `p->current = &p->u.initial` until the first run (erl_process.c:12614).
+    if !process.entry_started()
+        && let Some((module, function, arity)) = process.initial_mfa
+    {
+        let text = |atom: Atom| global_atoms().text(atom).unwrap_or_default().to_owned();
+        return Ok((text(module), text(function), u32::from(arity)));
+    }
     if let Some((module, function, arity)) =
         process.cold.as_ref().and_then(|cold| cold.dirty_bif_mfa)
     {
@@ -2109,7 +2117,7 @@ fn pc_description(word: Term, native: bool) -> String {
 // `erts_program_counter_info` reads it and prints neither `arity = N` nor the registers.
 fn backtrace_text(process: &mut Process) -> Result<Vec<u8>, VmError> {
     if process
-        .self_pid
+        .self_pid()
         .is_some_and(|pid| crate::trace::is_sensitive(process, pid))
     {
         return Ok(Vec::new());
@@ -2242,8 +2250,8 @@ pub(crate) fn process_info_light(
     pid: Pid,
     item: Term,
 ) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let own = process.self_pid?;
-    if !process.sig_cont_empty() {
+    let own = process.self_pid()?;
+    if !process.sig_cont_empty() || process.inbox.flags & crate::receive::FS_FLUSHING_SIGS != 0 {
         return None;
     }
     let single = if let Some((key, _)) = dictionary_lookup(item) {
@@ -2264,12 +2272,14 @@ pub(crate) fn process_info_light(
     // table is the fallback.
     let busy = match process.signal_probe() {
         Some(probe) => {
-            probe.has_pending()
+            probe.maybe_self_sigs()
+                || probe.has_pending()
                 || probe
                     .proc_state()
                     .load(std::sync::atomic::Ordering::Acquire)
                     & arinsal_sched::psflg::SUSPENDED
                     != 0
+                || (pid != own && probe.has_incoming_signals())
         }
         None => runtime.scheduler().ok()?.input_has_pending(own)? || runtime.suspend_active(own),
     };
@@ -2336,14 +2346,18 @@ pub(crate) fn process_info_1_light(
     let [target] = args else {
         return None;
     };
-    let own = process.self_pid?;
-    if Pid::from_term(*target) != Some(own) || !process.sig_cont_empty() {
+    let own = process.self_pid()?;
+    if Pid::from_term(*target) != Some(own)
+        || !process.sig_cont_empty()
+        || process.inbox.flags & crate::receive::FS_FLUSHING_SIGS != 0
+    {
         return None;
     }
     let runtime = process.runtime.as_ref()?;
     let busy = match process.signal_probe() {
         Some(probe) => {
-            probe.has_pending()
+            probe.maybe_self_sigs()
+                || probe.has_pending()
                 || probe
                     .proc_state()
                     .load(std::sync::atomic::Ordering::Acquire)
@@ -2386,12 +2400,14 @@ fn process_info_light_single(
     let runtime = process.runtime.as_ref()?;
     let busy = match process.signal_probe() {
         Some(probe) => {
-            probe.has_pending()
+            probe.maybe_self_sigs()
+                || probe.has_pending()
                 || probe
                     .proc_state()
                     .load(std::sync::atomic::Ordering::Acquire)
                     & arinsal_sched::psflg::SUSPENDED
                     != 0
+                || (pid != own && probe.has_incoming_signals())
         }
         None => runtime.scheduler().ok()?.input_has_pending(own)? || runtime.suspend_active(own),
     };
@@ -2501,12 +2517,34 @@ fn process_info_call(
     let readable = args.all_remote_readable();
     let pid = Pid::from_term(target).ok_or_else(badarg)?;
     if pid == ctx.pid() {
+        match process.pi_maybe_flush_signals(ctx)? {
+            crate::process::FlushSignals::Done => {}
+            crate::process::FlushSignals::Yield => {
+                crate::bif_traps::vbump_all_reds(process);
+                return Err(VmError::TrapExport(crate::ExportTrap::new(
+                    process,
+                    if item.is_none() {
+                        "erlang:process_info/1"
+                    } else {
+                        "erlang:process_info/2"
+                    },
+                    match item {
+                        None => vec![target],
+                        Some(item) => vec![target, item],
+                    },
+                )));
+            }
+            crate::process::FlushSignals::Exiting => {
+                return Process::erts_bif_chk_exited(process, ctx)
+                    .map(|()| Term::atom(arinsal_term::atoms::UNDEFINED));
+            }
+        }
         return process_info(
             Some(vm),
             InfoSource::Caller,
             process,
             pid,
-            Some(ctx),
+            None,
             &args,
             Term::atom(arinsal_term::atoms::RUNNING),
             true,
@@ -2534,7 +2572,19 @@ fn process_info_call(
             ))
         });
         match read {
-            Ok(Some(result)) => return result,
+            Ok(Some(result)) => {
+                let term = result?;
+                // Port of erl_bif_info.c:1439-1443: a result about another process is returned
+                // through `ERTS_BIF_HANDLE_SIGNALS_FROM_RETURN` when we have incoming signals.
+                if ctx.has_incoming_signals() {
+                    return Err(VmError::TrapExport(crate::ExportTrap::new(
+                        process,
+                        crate::natives::sys::BIF_HANDLE_SIGNALS_RETURN,
+                        vec![target, term],
+                    )));
+                }
+                return Ok(term);
+            }
             Ok(None) | Err(arinsal_sched::SignalFreeError::Busy) => {}
             Err(arinsal_sched::SignalFreeError::NoProcess) => {
                 return Ok(Term::atom(arinsal_term::atoms::UNDEFINED));
@@ -2612,7 +2662,7 @@ pub(crate) fn collect_heap(
     let live = crate::process::switched_out_live(process);
     let collected = process.collect_arg_reg(live, keep, 0);
     process.heap.set_fullsweep_after(fullsweep_after);
-    let stats = collected?;
+    let stats = collected;
     // Port of erts/emulator/beam/erl_gc.c:922-932 (`garbage_collect` updates
     // `esdp->gc_info`), OTP-29.1.1: a `garbage_collect` system task is a collection.
     crate::natives::sys::after_collection(process, stats.collections, stats.words_reclaimed);
@@ -2691,17 +2741,29 @@ pub(crate) fn fulfill_request(
                 None => None,
             };
             let args = ProcessInfoArgs::parse(item)?;
-            // Port of erts/emulator/beam/erl_bif_info.c:1660-1685 (ERTS_PI_IX_STATUS) with
+            // Port of erts/emulator/beam/erl_bif_info.c:1658-1686 (ERTS_PI_IX_STATUS) with
             // erl_process.c:9305 (erts_process_state2status), OTP-29.1.1. The handler is the
             // target itself, executing: RUNNING, RUNNING_SYS, DIRTY_RUNNING and
-            // DIRTY_RUNNING_SYS are all `running`, and only a parked process is `waiting`.
-            // A process queued on a dirty run queue but not executing is `runnable`
-            // (ERTS_PSFLG_DIRTY_ACTIVE_SYS); the running states above take precedence.
+            // DIRTY_RUNNING_SYS are all `running`. A process queued on a dirty run queue but
+            // not executing is `runnable` (ERTS_PSFLG_DIRTY_ACTIVE_SYS). A process scheduled
+            // only to serve signals (ERTS_PSFLG_RUNNING_SYS) with no Erlang work
+            // (ERTS_PSFLG_ACTIVE), no further signals and no system task is `waiting`: the
+            // requester would have seen it waiting had it looked itself. erts clears
+            // ERTS_PSFLG_SIG_Q when it takes the last signal of the middle queue
+            // (erl_proc_sig_queue.c:7017); an empty middle queue is that state here.
+            let state = ctx.proc_state().load(std::sync::atomic::Ordering::Acquire);
             let status = Term::atom(if ctx.dirty_running() {
                 arinsal_term::atoms::RUNNING
             } else if ctx.dirty_queued() {
                 arinsal_term::atoms::RUNNABLE
-            } else if crate::signals::is_waiting(process, ctx.pid()) {
+            } else if state & arinsal_sched::psflg::RUNNING_SYS != 0
+                && state
+                    & (arinsal_sched::psflg::ACTIVE
+                        | arinsal_sched::psflg::NMSG_SIG_IN_Q
+                        | arinsal_sched::psflg::SYS_TASKS)
+                    == 0
+                && process.sig_cont_empty()
+            {
                 arinsal_term::atoms::WAITING
             } else {
                 arinsal_term::atoms::RUNNING
@@ -3380,7 +3442,7 @@ pub(crate) fn suspend_process_light(
     if crate::trace::active() {
         return None;
     }
-    let me = process.self_pid?;
+    let me = process.self_pid()?;
     let target_pid = Pid::from_term(*target)?;
     let scheduler = process.runtime.as_ref()?.scheduler().ok()?;
     let mine = scheduler.process_priority(me)?;
@@ -3458,7 +3520,7 @@ pub(crate) fn resume_process_light(
     if crate::trace::active() {
         return None;
     }
-    let me = process.self_pid?;
+    let me = process.self_pid()?;
     let badarg = || {
         Some(Err(crate::exceptions::Trap::error(Term::atom(
             arinsal_term::atoms::BADARG,
@@ -3614,7 +3676,7 @@ fn reply_mode(value: Term) -> Option<(bool, bool)> {
 
 /// Whether `limit` is the default `max_heap_size` (the process keeps no field for it).
 pub(crate) fn is_default_max_heap(limit: crate::process::MaxHeap) -> bool {
-    limit.size == 0 && limit.kill && limit.log && !limit.include_shared_binaries && !limit.reported
+    limit.size == 0 && limit.kill && limit.log && !limit.include_shared_binaries
 }
 
 pub(crate) fn tuple2(term: Term) -> Option<(Term, Term)> {
@@ -5039,8 +5101,28 @@ fn suspend_for_code_barrier(process: &mut Process, ctx: &mut RunCtx<'_, crate::P
     };
     let pid = ctx.pid();
     crate::suspend::suspend_self(process);
-    ctx.thread_progress_later(move || crate::natives::code::resume_suspended(runtime, pid));
+    let finish = process
+        .cold_mut()
+        .trace_finish
+        .as_mut()
+        .expect("code-barrier wait parks TraceFinish first");
+    finish.resume_runtime = Some(runtime);
+    finish.resume_pid = pid;
+    ctx.erts_schedule_thr_prgr_later_op(
+        resume_trace_finish,
+        std::ptr::from_mut(&mut **finish).cast(),
+        finish.later_op.as_list_node(),
+    );
     true
+}
+
+/// Port of erts/emulator/beam/erl_bif_trace.c (`smp_bp_finisher` resume), OTP-29.1.1.
+fn resume_trace_finish(data: *mut ()) {
+    let finish = crate::code_ix::later_data::<crate::trace_bp::TraceFinish>(data);
+    let (runtime, pid) = (finish.resume_runtime, finish.resume_pid);
+    if let Some(runtime) = runtime {
+        crate::natives::code::resume_suspended(runtime, pid);
+    }
 }
 
 /// [`advance_trace_finish`] for an update that only waits for code barriers.
@@ -5056,13 +5138,19 @@ fn wait_code_barriers(
             .all(|stage| *stage == crate::trace_bp::FinishStage::Wait)
     );
     loop {
+        process.cold_mut().trace_finish = Some(Box::new(finish));
         if suspend_for_code_barrier(process, ctx) {
-            process.cold_mut().trace_finish = Some(Box::new(finish));
             return Err(VmError::Yield);
         }
-        if finish.stages.pop_front().is_none() {
-            return Ok(finish);
+        let mut parked = process
+            .cold_mut()
+            .trace_finish
+            .take()
+            .expect("code-barrier wait parked TraceFinish");
+        if parked.stages.pop_front().is_none() {
+            return Ok(*parked);
         }
+        finish = *parked;
     }
 }
 
@@ -5079,9 +5167,16 @@ fn advance_trace_finish(
     mut barrier_passed: bool,
 ) -> Result<crate::trace_bp::TraceFinish, VmError> {
     loop {
-        if !barrier_passed && suspend_for_code_barrier(process, ctx) {
+        if !barrier_passed {
             process.cold_mut().trace_finish = Some(Box::new(finish));
-            return Err(VmError::Yield);
+            if suspend_for_code_barrier(process, ctx) {
+                return Err(VmError::Yield);
+            }
+            finish = *process
+                .cold_mut()
+                .trace_finish
+                .take()
+                .expect("code-barrier wait parked TraceFinish");
         }
         barrier_passed = false;
         let Some(stage) = finish.stages.pop_front() else {
@@ -5118,10 +5213,15 @@ fn advance_timem_trace_finish(
     mut finish: crate::trace_bp::TraceFinish,
 ) -> Result<crate::trace_bp::TraceFinish, VmError> {
     loop {
+        process.cold_mut().trace_finish = Some(Box::new(finish));
         if suspend_for_code_barrier(process, ctx) {
-            process.cold_mut().trace_finish = Some(Box::new(finish));
             return Err(VmError::Yield);
         }
+        finish = *process
+            .cold_mut()
+            .trace_finish
+            .take()
+            .expect("code-barrier wait parked TraceFinish");
         let Some(stage) = finish.stages.pop_front() else {
             return Ok(finish);
         };
@@ -5299,7 +5399,7 @@ fn trace_pattern(
                 if meta_tracer.is_none() {
                     meta_tracer = Some(match crate::trace::session_tracer(process, session) {
                         None | Some(crate::trace::Tracer::Default) => {
-                            crate::trace::Tracer::Pid(process.self_pid.ok_or_else(badarg)?)
+                            crate::trace::Tracer::Pid(process.self_pid().ok_or_else(badarg)?)
                         }
                         Some(tracer) => tracer,
                     });

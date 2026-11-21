@@ -10,6 +10,10 @@
 //! `PROCESS_SIGQ_SAVE_OFFSET`, `ERTS_MESSAGE_TERM_OFFSET`) to the global assembler of either
 //! architecture once, when it emits the global fragments that read them.
 
+/// `ERTS_PSFLG_EXITING`: `ERTS_PSFLG_BIT(5)`.
+// Port of erts/emulator/beam/erl_process.h (ERTS_PSFLG_BIT, ERTS_PSFLG_EXITING), OTP-29.1.1.
+pub const ERTS_PSFLG_EXITING: u32 = 1 << (6 + 5);
+
 /// `offsetof` of the process and message fields the global fragments read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessOffsets {

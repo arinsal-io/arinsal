@@ -12,7 +12,6 @@ pub(crate) struct MaxHeap {
     pub kill: bool,
     pub log: bool,
     pub include_shared_binaries: bool,
-    pub reported: bool,
 }
 
 impl Default for MaxHeap {
@@ -22,7 +21,6 @@ impl Default for MaxHeap {
             kill: true,
             log: true,
             include_shared_binaries: false,
-            reported: false,
         }
     }
 }
@@ -36,57 +34,29 @@ impl Process {
     }
 }
 
-// g_proc_sched. Port of erl_gc.c:3730 (`has_reached_max_heap_size`) and
-// erl_gc.c:3741 (`reached_max_heap_size`), OTP-29.1.1.
-#[inline(always)]
-pub(super) fn heap_limit_kills(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
-) -> bool {
-    if process
-        .cold
-        .as_ref()
-        .is_none_or(|cold| cold.max_heap.size == 0)
-    {
-        return false;
+/// Called by the collection once the heap it would grow to (`used` words) is over the limit:
+/// logs the error report (`MAX_HEAP_SIZE_LOG`), sends the `gc_max_heap_size` trace event to a
+/// GC tracer, and returns whether the process is killed (`MAX_HEAP_SIZE_KILL`). As in erts,
+/// every collection over the limit reports: a killed process collects no more.
+// Port of erts/emulator/beam/erl_gc.c:3741-3822 (reached_max_heap_size), OTP-29.1.1.
+pub(super) fn reached_max_heap_size(process: &mut Process, limit: MaxHeap, used: u64) -> bool {
+    // `ERTS_IS_P_TRACED_FL(p, F_TRACE_GC)`.
+    let traced = process
+        .self_pid()
+        .filter(|&pid| crate::trace::flags(process, pid) & crate::trace::GC != 0);
+    if traced.is_some() || limit.log {
+        // `msg = erts_process_gc_info(p, ...)`, shared by the report and the trace event.
+        let msg = crate::natives::proc::process_gc_info(process).unwrap_or(Term::NIL);
+        if limit.log {
+            report_max_heap(process, limit, used, msg);
+        }
+        if let Some(pid) = traced {
+            // `trace_gc(p, am_gc_max_heap_size, 0, msg)` (erl_trace.c:1439): `msg` is a value,
+            // so it is sent as is, without the `{wordsize, Size}` entry.
+            crate::trace::emit_process(process, pid, crate::trace::GC, "gc_max_heap_size", &[msg]);
+        }
     }
-    heap_limit_check(process, ctx)
-}
-
-#[inline(never)]
-fn heap_limit_check(process: &mut Process, ctx: &mut RunCtx<'_, crate::Process>) -> bool {
-    let snapshot = {
-        // Port of erts/emulator/beam/erl_process.h (`p->max_heap_size`), OTP-29.1.1: the limit
-        // is a field of the process itself, so only the process reads or writes it.
-        let Some(mut limit) = process.cold.as_ref().map(|cold| cold.max_heap) else {
-            return false;
-        };
-        if limit.size == 0 {
-            return false;
-        }
-        // Only a collection checks the limit (`garbage_collect`), so judge the size seen there.
-        let mut used = std::mem::take(&mut process.max_heap_peak) as u64;
-        if limit.include_shared_binaries {
-            // Only the `arity` registers a switched-out process saved are roots; a completed
-            // process has released its register file.
-            let objv = &process.x[..switched_out_live(process)];
-            used = used.saturating_add(off_heap_binary_words(process, objv) as u64);
-        }
-        if used <= limit.size {
-            return false;
-        }
-        let log = limit.log && !limit.reported;
-        if log {
-            limit.reported = true;
-            process.cold_mut().max_heap = limit;
-        }
-        (log, limit.kill, limit, used)
-    };
-    let (log, kill, limit, used) = snapshot;
-    if log {
-        report_max_heap(process, ctx, limit, used);
-    }
-    kill
+    limit.kill
 }
 
 /// Off-heap binary words reachable from `objv` (the X register roots the caller holds), the
@@ -167,16 +137,14 @@ pub(super) fn off_heap_binary_words(process: &Process, objv: &[Term]) -> usize {
 
 // g_proc_sched. Port of erl_gc.c:3756 (error_logger report in `reached_max_heap_size`),
 // OTP-29.1.1.
-fn report_max_heap(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
-    limit: MaxHeap,
-    used: u64,
-) {
+fn report_max_heap(process: &mut Process, limit: MaxHeap, used: u64, gc_info: Term) {
     let Some(runtime) = process.runtime else {
         return;
     };
-    let Some(pid) = ctx.pid().to_term() else {
+    let Some(self_pid) = process.self_pid() else {
+        return;
+    };
+    let Some(pid) = self_pid.to_term() else {
         return;
     };
     let node_name =
@@ -197,9 +165,7 @@ fn report_max_heap(
             arinsal_term::atoms::FALSE
         })
     };
-    // `msg = erts_process_gc_info(...)` and `erts_build_stacktrace(&hfact, p, 0,
-    // erts_backtrace_depth, 1)`.
-    let gc_info = crate::natives::proc::process_gc_info(process).unwrap_or(Term::NIL);
+    // `erts_build_stacktrace(&hfact, p, 0, erts_backtrace_depth, 1)`.
     let depth = crate::erl_init::erts_backtrace_depth();
     let stacktrace = crate::stacktrace::build(process, depth).unwrap_or(Term::NIL);
     let built = (|| -> Result<Term, VmError> {
@@ -227,6 +193,6 @@ fn report_max_heap(
             .map_err(|error| VmError::Unsupported(format!("logger args: {error:?}")))
     })();
     if let Ok(args) = built {
-        crate::utils::send_error_term_to_logger(runtime, ctx.pid(), group_leader, &format, args);
+        crate::utils::send_error_term_to_logger(runtime, self_pid, group_leader, &format, args);
     }
 }

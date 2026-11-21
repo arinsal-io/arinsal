@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use arinsal_term::{
-    BinaryRef, ExternalBinary, HeapAlloc, MagicBin, Node, Term, TermBuilder, TermError, TermKind,
+    BinaryRef, ExternalBinary, HeapAlloc, MagicBin, Node, Term, TermBuilder, TermKind,
 };
 
 use crate::{BifError, Ctx};
@@ -39,23 +39,20 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
         writable: bool,
         overhead_words: u64,
         owner: Option<arinsal_term::OwnedBinaryRef>,
-    ) -> Result<(), TermError> {
+    ) {
         HeapAlloc::link_bin_ref(self.0, bin_ref, writable, overhead_words, owner)
     }
     fn add_bin_vheap(&mut self, words: u64) {
         HeapAlloc::add_bin_vheap(self.0, words)
     }
-    fn retain_writable_binary(
-        &mut self,
-        value: Arc<arinsal_term::WritableBinary>,
-    ) -> Result<(), arinsal_term::TermError> {
+    fn retain_writable_binary(&mut self, value: Arc<arinsal_term::WritableBinary>) {
         self.0.retain_writable_binary(value)
     }
     fn retain_writable_binary_with_apparent_size(
         &mut self,
         value: Arc<arinsal_term::WritableBinary>,
         apparent_size_bits: usize,
-    ) -> Result<(), arinsal_term::TermError> {
+    ) {
         self.0
             .retain_writable_binary_with_apparent_size(value, apparent_size_bits)
     }
@@ -74,21 +71,13 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn link_node(&mut self, thing: *mut u64, value: Node) {
         self.0.link_node(thing, value)
     }
-    fn link_external_binary(
-        &mut self,
-        bin_ref: *mut u64,
-        value: Arc<ExternalBinary>,
-    ) -> Result<(), arinsal_term::TermError> {
+    fn link_external_binary(&mut self, bin_ref: *mut u64, value: Arc<ExternalBinary>) {
         self.0.link_external_binary(bin_ref, value)
     }
     fn supports_external_binary(&self) -> bool {
         self.0.supports_external_binary()
     }
-    fn link_magic_ref(
-        &mut self,
-        thing: *mut u64,
-        owner: MagicBin,
-    ) -> Result<(), arinsal_term::TermError> {
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: MagicBin) {
         self.0.link_magic_ref(thing, owner)
     }
     fn supports_magic(&self) -> bool {

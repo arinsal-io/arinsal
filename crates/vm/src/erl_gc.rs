@@ -26,32 +26,26 @@ pub(crate) fn erts_gc_after_bif_call_lhf(
         }
         return result;
     }
-    let collected = if result == THE_NON_VALUE {
+    let (stats, result) = if result == THE_NON_VALUE {
         let live = if p.heap.abi.exc.freason == exc::TRAP {
             usize::from(p.heap.abi.arity)
         } else {
             arity
         };
-        p.collect_heap_roots_objv(&mut regs[..live], &mut [], 0)
-            .map(|stats| (stats, THE_NON_VALUE))
+        (
+            p.collect_heap_roots_objv(&mut regs[..live], &mut [], 0),
+            THE_NON_VALUE,
+        )
     } else {
         let mut val = [crate::native_hooks::from_raw(result)];
-        p.collect_heap_roots_objv(&mut [], &mut val, 0)
-            .map(|stats| (stats, crate::native_hooks::raw(val[0])))
+        let stats = p.collect_heap_roots_objv(&mut [], &mut val, 0);
+        (stats, crate::native_hooks::raw(val[0]))
     };
-    match collected {
-        Ok((stats, result)) => {
-            // BUMP_REDS(p, cost), and the scheduler's collection statistics
-            // (erl_gc.c:922-932, garbage_collect).
-            crate::natives::sys::after_collection(p, stats.collections, stats.words_reclaimed);
-            p.charge_gc_stats(&stats);
-            result
-        }
-        Err(_) => {
-            crate::native_hooks::set_error(p, "system_limit");
-            THE_NON_VALUE
-        }
-    }
+    // BUMP_REDS(p, cost), and the scheduler's collection statistics
+    // (erl_gc.c:922-932, garbage_collect).
+    crate::natives::sys::after_collection(p, stats.collections, stats.words_reclaimed);
+    p.charge_gc_stats(&stats);
+    result
 }
 
 /// Collects without changing the process reduction count and returns reductions spent.
@@ -67,10 +61,11 @@ pub extern "C" fn erts_garbage_collect_nobump(
     let Some(process) = crate::native_hooks::enter_runtime(c_p) else {
         return 0;
     };
-    let Ok(nobj) = usize::try_from(nobj) else {
-        set_system_limit(process);
-        return 0;
-    };
+    // `garbage_collect(p, ..., fcalls, ...)` takes the reductions left from the caller, whose
+    // FCALLS lives in a register; a delayed collection (delay_garbage_collection) reads them
+    // from `p->fcalls` here.
+    process.heap.abi.fcalls = fcalls;
+    let nobj = usize::try_from(nobj).expect("erts_garbage_collect_nobump: nobj >= 0");
     if process.gc_must_fetch_signals() {
         let fetched = arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
             arinsal_sched::RunCtx::with_current(esdp, |ctx| process.fetch_signals(ctx))
@@ -81,19 +76,11 @@ pub extern "C" fn erts_garbage_collect_nobump(
             return 0;
         }
     }
-    let Some(result) = crate::raw::beam_common_ffi::with_mut_terms(objv, nobj, |roots| {
+    let reds = crate::raw::beam_common_ffi::with_mut_terms(objv, nobj, |roots| {
         process.ensure_uncharged(need, roots)
-    }) else {
-        set_system_limit(process);
-        return 0;
-    };
-    match result {
-        Ok(reds) => i32::try_from(reds).unwrap_or(i32::MAX).min(fcalls.max(0)),
-        Err(_) => {
-            set_system_limit(process);
-            0
-        }
-    }
+    })
+    .expect("erts_garbage_collect_nobump: objv holds nobj registers");
+    i32::try_from(reds).unwrap_or(i32::MAX).min(fcalls.max(0))
 }
 
 fn set_system_limit(process: &mut Process) {

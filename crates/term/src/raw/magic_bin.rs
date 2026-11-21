@@ -573,6 +573,15 @@ impl MagicBin {
         this.0 as *const MagicRef
     }
 
+    /// Take back a counted `Binary *` held as later-op `data` (`erts_bin_release` on drop).
+    ///
+    /// # Safety
+    /// `ptr` is a live magic binary block that already holds one `intern.refc` for this owner.
+    pub unsafe fn from_raw_held(ptr: *const MagicRef) -> Self {
+        debug_assert!(!ptr.is_null());
+        Self(ptr as usize)
+    }
+
     /// Give up this count to a raw pointer word (an `ErtsMRefThing` taking over the count).
     pub(crate) fn into_raw(this: Self) -> *const MagicRef {
         let ptr = this.0 as *const MagicRef;

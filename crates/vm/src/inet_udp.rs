@@ -22,7 +22,7 @@ use crate::process::Message;
 use arinsal_drv::{ControlReply, DriverPort, NativeDriver};
 use arinsal_sched::Pid;
 use arinsal_term::{ProcessHeap, Term, TermBuilder};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -295,30 +295,13 @@ fn open_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     if domain == libc::AF_UNIX {
         protocol = 0;
     }
-    // SAFETY: socket returns a fresh descriptor; set close-on-exec before publishing it.
-    let (fd, cloexec_error) = crate::port::cloexec_publish(|| unsafe {
-        let fd = libc::socket(domain, libc::SOCK_DGRAM, protocol);
-        if fd >= 0 && libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
-            let error = last_errno();
-            libc::close(fd);
-            (-1, Some(error))
-        } else {
-            (fd, None)
-        }
-    });
-    if let Some(error) = cloexec_error {
-        return err_bytes(errno_name(error));
-    }
-    if fd < 0 {
-        return err_bytes(errno_name(last_errno()));
-    }
-    set_nonblock(fd);
-    set_nosigpipe(fd);
-    // SAFETY: fd was just created and is moved into OwnedFd.
-    inner.fd = Some(UdpFd::new(
-        unsafe { OwnedFd::from_raw_fd(fd) },
-        inner.port.clone(),
-    ));
+    let fd = match crate::port::socket_cloexec(domain, libc::SOCK_DGRAM, protocol) {
+        Ok(fd) => fd,
+        Err(error) => return err_bytes(errno_name(error.raw_os_error().unwrap_or(libc::EIO))),
+    };
+    set_nonblock(fd.as_raw_fd());
+    set_nosigpipe(fd.as_raw_fd());
+    inner.fd = Some(UdpFd::new(fd, inner.port.clone()));
     inner.domain = domain;
     inner.family_code = data[0];
     inner.open = true;

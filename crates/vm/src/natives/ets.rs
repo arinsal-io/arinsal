@@ -1,4 +1,5 @@
 //! ETS BIFs whose storage and access policy belong to the scheduled runtime.
+// Port of erts/emulator/beam/erl_db.c, OTP-29.1.1.
 
 use crate::proc_create::EtsInsert;
 use crate::process::Message;
@@ -9,12 +10,13 @@ use arinsal_ets::{
     BigCounterOp, CounterOp, ElementLookup, EtsError, Heir, Protection, Table, TableOptions,
     TableType, Tid, WriteConcurrency,
 };
-use arinsal_sched::{Pid, RunCtx};
-use arinsal_term::{HeapAlloc, MagicBin, Term, TermBuilder, TermKind, global_atoms};
+use arinsal_sched::{ErtsThrPrgrLaterOp, Pid, RunCtx};
+use arinsal_term::{HeapAlloc, MagicBin, ProcessHeap, Term, TermBuilder, TermKind, global_atoms};
 use num_bigint::BigInt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // Only atoms of the static erts table: interning others here would give them
@@ -25,6 +27,14 @@ static ETS_ATOMS: LazyLock<HashMap<&'static str, arinsal_term::Atom>> = LazyLock
         "system_limit",
         "function_clause",
         "named_table",
+        "access",
+        "already_exists",
+        "badkey",
+        "default",
+        "not_owner",
+        "owner",
+        "keypos",
+        "position",
         "set",
         "ordered_set",
         "bag",
@@ -52,12 +62,11 @@ static ETS_ATOMS: LazyLock<HashMap<&'static str, arinsal_term::Atom>> = LazyLock
         "id",
         "name",
         "type",
+        "table_type",
         "protection",
-        "owner",
         "size",
         "memory",
         "node",
-        "named_table",
         "true",
         "false",
     ]
@@ -93,41 +102,14 @@ fn badarg() -> VmError {
         arinsal_term::atoms::BADARG,
     )))
 }
-thread_local! {
-    /// The extended error information of the failing ETS BIF, as erts keeps it in
-    /// `p->fvalue` next to `BADARG | EXF_HAS_EXT_INFO` (erl_db.c), OTP-29.1.1.
-    static BIF_CAUSE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
-}
-
-thread_local! {
-    /// Atoms of the cause names raised so far, keyed by the literal's address. There are a few
-    /// dozen causes, so a scan beats hashing on the failure path.
-    static BIF_NAME_ATOMS: std::cell::RefCell<Vec<(usize, usize, arinsal_term::Atom)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-fn bif_name_atom(name: &'static str) -> Result<arinsal_term::Atom, VmError> {
-    let key = (name.as_ptr() as usize, name.len());
-    if let Some(atom) = BIF_NAME_ATOMS.with(|names| {
-        names
-            .borrow()
-            .iter()
-            .find(|entry| (entry.0, entry.1) == key)
-            .map(|entry| entry.2)
-    }) {
-        return Ok(atom);
-    }
-    let atom = global_atoms()
-        .intern(name)
-        .map_err(|_| VmError::Unsupported(format!("BIF frame atom {name}")))?;
-    BIF_NAME_ATOMS.with(|names| names.borrow_mut().push((key.0, key.1, atom)));
-    Ok(atom)
-}
-
-/// `badarg` with an erts `EXI_*` cause for the BIF frame's `error_info`.
-fn badarg_cause(cause: &'static str) -> VmError {
-    BIF_CAUSE.with(|slot| slot.set(Some(cause)));
-    badarg()
+/// `p->fvalue = EXI_*`. `db_bif_fail` assigns `p->freason = BADARG | EXF_HAS_EXT_INFO`.
+/// The cause atom on the `Trap` is the local `freason__` of `DB_GET_TABLE`, not an
+/// exception class: `db_bif_fail` turns it into `BADARG | EXF_HAS_EXT_INFO`.
+// Port of erts/emulator/beam/erl_db.c (`db_get_table_aux`, `handle_lacking_permission`), OTP-29.1.1.
+fn badarg_cause(heap: &mut ProcessHeap, cause: &'static str) -> VmError {
+    let cause = *ETS_ATOMS.get(cause).expect("ETS error cause atom");
+    heap.abi.exc.fvalue = crate::native_hooks::raw(Term::atom(cause));
+    VmError::Trap(crate::exceptions::Trap::error(Term::atom(cause)))
 }
 
 fn system_limit() -> VmError {
@@ -135,12 +117,12 @@ fn system_limit() -> VmError {
         arinsal_term::atoms::SYSTEM_LIMIT,
     )))
 }
-fn binary_info_err(error: EtsError) -> VmError {
+fn binary_info_err(heap: &mut ProcessHeap, error: EtsError) -> VmError {
     match error {
         EtsError::Term(
             arinsal_term::TermError::HeapFull | arinsal_term::TermError::SystemLimit,
         ) => system_limit(),
-        error => err(error),
+        error => err(heap, error),
     }
 }
 /// `is_list(arg2) && CDR(arg2) != NIL`: a list for `ets_insert_2_list_driver`.
@@ -213,10 +195,10 @@ fn integer(term: Term) -> Option<BigInt> {
     // SAFETY: the integer term is rooted in the active process heap.
     unsafe { term.big_ref().map(|value| value.to_bigint()) }
 }
-fn err(error: EtsError) -> VmError {
+fn err(heap: &mut ProcessHeap, error: EtsError) -> VmError {
     match error {
-        EtsError::NoTable => badarg_cause("id"),
-        EtsError::BadArgCause(cause) => badarg_cause(cause),
+        EtsError::NoTable => badarg_cause(heap, "id"),
+        EtsError::BadArgCause(cause) => badarg_cause(heap, cause),
         EtsError::BadArg | EtsError::NameTaken => badarg(),
         EtsError::Unsupported(_) => badarg(),
         // Port of erts/emulator/beam/erl_db.c: the BIF traps and runs again.
@@ -224,6 +206,15 @@ fn err(error: EtsError) -> VmError {
         // Port of erts/emulator/beam/erl_db.c (DB_ERROR_SYSRES -> SYSTEM_LIMIT), OTP-29.1.1.
         EtsError::Term(arinsal_term::TermError::SystemLimit) => system_limit(),
         EtsError::Term(_) => badarg(),
+    }
+}
+
+/// Translate `SavedKey::new` errors, which can only come from copying its term into a local heap.
+pub(super) fn saved_key_error(error: EtsError) -> VmError {
+    match error {
+        EtsError::Term(arinsal_term::TermError::SystemLimit) => system_limit(),
+        EtsError::Term(_) => badarg(),
+        _ => unreachable!("SavedKey::new only reports term-copy errors"),
     }
 }
 enum ResolveFail {
@@ -291,11 +282,16 @@ fn table_guard<'a>(
     registry: &'a RegistryAccess<'_>,
     tid: Tid,
     shared: bool,
+    heap: &mut ProcessHeap,
 ) -> Result<TableGuard<'a>, VmError> {
     if shared {
-        Ok(TableGuard::Read(registry.get_shared(tid).map_err(err)?))
+        Ok(TableGuard::Read(
+            registry.get_shared(tid).map_err(|error| err(heap, error))?,
+        ))
     } else {
-        Ok(TableGuard::Write(registry.get_mut(tid).map_err(err)?))
+        Ok(TableGuard::Write(
+            registry.get_mut(tid).map_err(|error| err(heap, error))?,
+        ))
     }
 }
 
@@ -315,10 +311,14 @@ fn resolve(registry: &arinsal_ets::Registry, term: Term) -> Result<Tid, ResolveF
 
 // Port of erts/emulator/beam/erl_db.c (tid2tab) and :805-910
 // (db_get_table_aux), OTP-29.1.1.
-fn handle(registry: &arinsal_ets::Registry, term: Term) -> Result<Tid, VmError> {
+fn handle(
+    heap: &mut ProcessHeap,
+    registry: &arinsal_ets::Registry,
+    term: Term,
+) -> Result<Tid, VmError> {
     resolve(registry, term).map_err(|fail| match fail {
-        ResolveFail::BadType => badarg_cause("type"),
-        ResolveFail::Missing => badarg_cause("id"),
+        ResolveFail::BadType => badarg_cause(heap, "type"),
+        ResolveFail::Missing => badarg_cause(heap, "id"),
     })
 }
 
@@ -328,19 +328,24 @@ fn scheduler_count() -> usize {
 }
 
 /// Live tables as `ets:all/0` prints them: names for named tables, ids otherwise.
-fn live_table_terms<H: HeapAlloc>(
+fn live_table_terms(
     registry: &arinsal_ets::Registry,
-    heap: &mut H,
+    heap: &mut ProcessHeap,
 ) -> Result<Vec<Term>, VmError> {
+    let mut heap = arinsal_bifs::ProcessHeapHandle(heap);
     registry
         .all()
         .into_iter()
         .map(|tid| {
-            let table = registry.get(tid).map_err(err)?;
+            let table = registry
+                .get(tid)
+                .map_err(|error| err(&mut *heap.0, error))?;
             if table.options.named_table {
                 Ok(Term::atom(table.options.name))
             } else {
-                registry.tid_term(tid, heap).map_err(err)
+                registry
+                    .tid_term(tid, &mut heap)
+                    .map_err(|error| err(&mut *heap.0, error))
             }
         })
         .collect()
@@ -450,6 +455,7 @@ fn update_list<T>(spec: Term, mut parse: impl FnMut(Term) -> Option<T>) -> Vec<O
 /// Check the `Default` argument of update_element/4 and update_counter/4.
 // Port of erts/emulator/beam/erl_db.c and :1718-1726, OTP-29.1.1.
 fn default_object(
+    heap: &mut ProcessHeap,
     table: &arinsal_ets::Table,
     default: Option<Term>,
 ) -> Result<Option<Term>, VmError> {
@@ -458,7 +464,7 @@ fn default_object(
     };
     match tuple_items(default) {
         Some(items) if items.len() >= table.options.keypos => Ok(Some(default)),
-        _ => Err(badarg_cause("default")),
+        _ => Err(badarg_cause(heap, "default")),
     }
 }
 
@@ -479,38 +485,6 @@ fn output_list_slice<H: HeapAlloc>(heap: &mut H, items: &[Term]) -> Result<Term,
     TermBuilder::new(heap)
         .list_from_slice(items)
         .map_err(|_| badarg())
-}
-
-// Port of erts/emulator/beam/beam_common.c (`save_stacktrace`), OTP-29.1.1.
-/// Keeps the BIF operands in the X registers until `save_stacktrace` materializes its argument list.
-#[cold]
-#[inline(never)]
-fn bif_register_frame(
-    module: arinsal_term::Atom,
-    function: arinsal_term::Atom,
-    arity: usize,
-    result: Result<Term, VmError>,
-) -> Result<Term, VmError> {
-    let cause = BIF_CAUSE.with(std::cell::Cell::take);
-    let Err(VmError::Trap(mut trap)) = result else {
-        return result;
-    };
-    if trap.class == arinsal_bifs::Class::Error && trap.top.is_none() && trap.trace.is_none() {
-        let info = match cause {
-            Some(cause) => {
-                let cause_atom = bif_name_atom(cause)?;
-                crate::stacktrace::BifErrorInfo::Cause(Term::atom(cause_atom))
-            }
-            None => crate::stacktrace::BifErrorInfo::Plain,
-        };
-        trap.top = Some(crate::stacktrace::TopFrame::BifRegisters {
-            module,
-            function,
-            arity,
-            info,
-        });
-    }
-    Err(VmError::Trap(trap))
 }
 
 /// `allowed(.., write = false)` for a reader whose pid term is built only when the table's
@@ -539,7 +513,7 @@ fn reader_group(process: &Process) -> usize {
 }
 
 fn direct_caller(process: &Process) -> Option<Term> {
-    process.self_pid?.to_term()
+    process.self_pid()?.to_term()
 }
 
 /// Run `body` on the table a tid reference points at: `None` for anything but the reference
@@ -584,7 +558,7 @@ pub(crate) fn ets_lookup_2(process: &mut Process, args: &[Term]) -> Result<Term,
 fn direct_lookup_named(process: &mut Process, args: &[Term]) -> Option<Term> {
     let super_user = ets_super_user(process);
     let name = args[0].as_atom()?;
-    let pid = process.self_pid?;
+    let pid = process.self_pid()?;
     let group = reader_group(process);
     let rt = process.runtime.as_ref()?;
     rt.named_ets
@@ -606,7 +580,7 @@ fn direct_lookup_named(process: &mut Process, args: &[Term]) -> Option<Term> {
 
 fn direct_lookup_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
     let super_user = ets_super_user(process);
-    let pid = process.self_pid?;
+    let pid = process.self_pid()?;
     let key = args[1];
     let group = reader_group(process);
     with_cached_table(process, args[0], |shared, _options, process| {
@@ -635,7 +609,7 @@ pub(crate) fn ets_member_2(process: &mut Process, args: &[Term]) -> Result<Term,
 
 fn direct_member_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
     let super_user = ets_super_user(process);
-    let pid = process.self_pid?;
+    let pid = process.self_pid()?;
     let key = args[1];
     let group = reader_group(process);
     with_cached_table(process, args[0], |shared, _options, _| {
@@ -667,7 +641,7 @@ fn direct_lookup_element_hit(process: &mut Process, args: &[Term]) -> Option<Ter
     if args.len() != 3 {
         return None;
     }
-    let pid = process.self_pid?;
+    let pid = process.self_pid()?;
     let (key, position) = (args[1], usize::try_from(args[2].as_small()?).ok()?);
     let group = reader_group(process);
     with_cached_table(process, args[0], |shared, _, process| {
@@ -712,7 +686,7 @@ fn direct_lookup_element_cached(
         match rt.named_ets.with_table(name, |shared| {
             let table = shared.read_at(group);
             if table.is_detached() || !table.options.named_table || table.options.name != name {
-                return Some(Err(badarg_cause("id")));
+                return Some(Err(badarg_cause(&mut process.heap, "id")));
             }
             if table.is_busy() {
                 return None;
@@ -723,7 +697,7 @@ fn direct_lookup_element_cached(
             ))
         }) {
             Some(result) => result,
-            None => Some(Err(badarg_cause("id"))),
+            None => Some(Err(badarg_cause(&mut process.heap, "id"))),
         }
     } else {
         None
@@ -828,7 +802,7 @@ pub(crate) fn ets_call(
     function: EtsBif,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    let pid = process.self_pid.ok_or_else(badarg)?;
+    let pid = process.self_pid().ok_or_else(badarg)?;
     arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
         arinsal_sched::RunCtx::with_current(esdp, |ctx| {
             call_inner(process, Some(ctx), pid, function, args)
@@ -836,21 +810,6 @@ pub(crate) fn ets_call(
     })
     .flatten()
     .expect("native code runs inside an executor slice, which publishes its scheduler data")
-}
-
-/// Attach the BIF's stack frame to a failure, as `handle_error` builds it from the X registers.
-// Port of erts/emulator/beam/beam_common.c (save_stacktrace), OTP-29.1.1.
-pub(crate) fn bif_failure(
-    module: &str,
-    function: &str,
-    args: &[Term],
-    result: Result<Term, VmError>,
-) -> Result<Term, VmError> {
-    let atoms = arinsal_term::global_atoms();
-    let (Ok(module), Ok(function)) = (atoms.intern(module), atoms.intern(function)) else {
-        return result;
-    };
-    bif_register_frame(module, function, args.len(), result)
 }
 
 /// One tuple inserted into a set, bag or CA-tree table: table lookup, access check, bucket
@@ -948,7 +907,7 @@ fn direct_update_counter_cached(
             )
         }) {
             Some(result) => result,
-            None => Some(Err(badarg_cause("id"))),
+            None => Some(Err(badarg_cause(&mut process.heap, "id"))),
         }
     } else {
         None
@@ -974,14 +933,14 @@ fn direct_update_counter_from_shared(
             return None;
         }
         if let Some(increment) = args.get(2).and_then(|operation| operation.as_small()) {
-            if let Err(error) = validate_counter_request(&table, caller, super_user, args) {
+            if let Err(error) = validate_counter_request(heap, &table, caller, super_user, args) {
                 return Some(Err(error));
             }
             if let Some(value) = table.update_counter_one_in_place_shared(args[1], increment) {
                 return Some(Ok(value));
             }
         }
-        let request = match counter_request(&table, caller, super_user, args) {
+        let request = match counter_request(heap, &table, caller, super_user, args) {
             Ok(Some(request)) => request,
             Ok(None) => return None,
             Err(error) => return Some(Err(error)),
@@ -999,14 +958,14 @@ fn direct_update_counter_from_shared(
         return None;
     }
     if let Some(increment) = args.get(2).and_then(|operation| operation.as_small()) {
-        if let Err(error) = validate_counter_request(&table, caller, super_user, args) {
+        if let Err(error) = validate_counter_request(heap, &table, caller, super_user, args) {
             return Some(Err(error));
         }
         if let Some(value) = table.update_counter_one_in_place(args[1], increment) {
             return Some(Ok(value));
         }
     }
-    let request = match counter_request(&table, caller, super_user, args) {
+    let request = match counter_request(heap, &table, caller, super_user, args) {
         Ok(Some(request)) => request,
         Ok(None) => return None,
         Err(error) => return Some(Err(error)),
@@ -1020,12 +979,13 @@ fn direct_update_counter_from_shared(
 type CounterRequest = (Term, smallvec::SmallVec<[CounterOp; 4]>, bool);
 
 fn counter_request(
+    heap: &mut ProcessHeap,
     table: &arinsal_ets::Table,
     caller: Term,
     super_user: bool,
     args: &[Term],
 ) -> Result<Option<CounterRequest>, VmError> {
-    validate_counter_request(table, caller, super_user, args)?;
+    validate_counter_request(heap, table, caller, super_user, args)?;
     let Some((operations, single)) = small_counter_ops(table.options.keypos, args[2]) else {
         return Ok(None);
     };
@@ -1033,25 +993,26 @@ fn counter_request(
 }
 
 fn validate_counter_request(
+    heap: &mut ProcessHeap,
     table: &arinsal_ets::Table,
     caller: Term,
     super_user: bool,
     args: &[Term],
 ) -> Result<(), VmError> {
     if !allowed(table, caller, super_user, true) {
-        return Err(badarg_cause("access"));
+        return Err(badarg_cause(heap, "access"));
     }
     // ets_update_counter_4 validates Default before do_update_counter checks table type.
     if let Some(default) = args.get(3).copied()
         && tuple_items(default).is_none_or(|items| items.len() < table.options.keypos)
     {
-        return Err(badarg_cause("default"));
+        return Err(badarg_cause(heap, "default"));
     }
     if !matches!(
         table.options.table_type,
         TableType::Set | TableType::OrderedSet
     ) {
-        return Err(badarg_cause("table_type"));
+        return Err(badarg_cause(heap, "table_type"));
     }
     Ok(())
 }
@@ -1076,40 +1037,44 @@ pub(crate) fn insert_args(
     };
     let single = object.is_some();
     let object = object.unwrap_or(objects);
+    let group = reader_group(process);
+    let heap = &mut process.heap;
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
-    let insert = |shared: &arinsal_ets::TableLock,
-                  name: Option<arinsal_term::Atom>|
+    let mut insert = |shared: &arinsal_ets::TableLock,
+                      name: Option<arinsal_term::Atom>|
      -> Result<Term, VmError> {
         let options = shared.options();
         if objects == Term::NIL && options.write_concurrency != WriteConcurrency::Disabled {
-            let table = shared.read_at(reader_group(process));
+            let table = shared.read_at(group);
             if table.is_detached()
                 || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
             {
-                return Err(badarg_cause("id"));
+                return Err(badarg_cause(heap, "id"));
             }
             if table.is_busy() {
                 return Err(VmError::Yield);
             }
             if !allowed(&table, caller, super_user, true) {
-                return Err(badarg_cause("access"));
+                return Err(badarg_cause(heap, "access"));
             }
             return Ok(boolean_term(true));
         }
         if single && options.write_concurrency != WriteConcurrency::Disabled {
-            let table = shared.read_at(reader_group(process));
+            let table = shared.read_at(group);
             if table.is_detached()
                 || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
             {
-                return Err(badarg_cause("id"));
+                return Err(badarg_cause(heap, "id"));
             }
             if table.is_busy() {
                 return Err(VmError::Yield);
             }
             if !allowed(&table, caller, super_user, true) {
-                return Err(badarg_cause("access"));
+                return Err(badarg_cause(heap, "access"));
             }
-            let yes = table.insert_term_shared(object, insert_new).map_err(err)?;
+            let yes = table
+                .insert_term_shared(object, insert_new)
+                .map_err(|error| err(heap, error))?;
             return Ok(if insert_new {
                 boolean_term(yes)
             } else {
@@ -1121,22 +1086,24 @@ pub(crate) fn insert_args(
         if table.is_detached()
             || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
         {
-            return Err(badarg_cause("id"));
+            return Err(badarg_cause(heap, "id"));
         }
         if table.is_busy() {
             return Err(VmError::Yield);
         }
         if !allowed(&table, caller, super_user, true) {
-            return Err(badarg_cause("access"));
+            return Err(badarg_cause(heap, "access"));
         }
         let yes = if single {
-            table.insert_term(object, insert_new).map_err(err)?
+            table
+                .insert_term(object, insert_new)
+                .map_err(|error| err(heap, error))?
         } else {
             let items = list(objects).ok_or_else(badarg)?;
             if insert_new {
-                table.insert_new(&items).map_err(err)?
+                table.insert_new(&items).map_err(|error| err(heap, error))?
             } else {
-                table.insert(&items).map_err(err)?;
+                table.insert(&items).map_err(|error| err(heap, error))?;
                 true
             }
         };
@@ -1151,11 +1118,11 @@ pub(crate) fn insert_args(
         return rt
             .named_ets
             .with_table(name, |shared| insert(shared, Some(name)))
-            .unwrap_or_else(|| Err(badarg_cause("id")));
+            .unwrap_or_else(|| Err(badarg_cause(heap, "id")));
     }
     target
         .with_magic_payload::<arinsal_ets::TableLock, _>(|shared| insert(shared, None))
-        .unwrap_or_else(|| Err(badarg_cause("type")))
+        .unwrap_or_else(|| Err(badarg_cause(heap, "type")))
 }
 
 /// `ets:insert/2` and `ets:insert_new/2` with a list of two or more objects.
@@ -1189,28 +1156,31 @@ pub(crate) fn insert_list(
         return match outcome.load(std::sync::atomic::Ordering::Acquire) {
             1 => Ok(ListInsert::Value(boolean_term(true))),
             2 => Ok(ListInsert::Value(boolean_term(false))),
-            _ => Err(badarg_cause("id")),
+            _ => Err(badarg_cause(&mut process.heap, "id")),
         };
     }
     let registry = rt.ets.read().unwrap();
-    let tid = handle(&registry, target)?;
-    let shared = registry.shared(tid).map_err(err)?.clone();
+    let tid = handle(&mut process.heap, &registry, target)?;
+    let shared = registry
+        .shared(tid)
+        .map_err(|error| err(&mut process.heap, error))?
+        .clone();
     let options = shared.options();
     // Keep the table alive by its shared handle. Holding the registry lock while waiting for a
     // table writer prevents ets:delete/1 from detaching the table, unlike erts' btid reference.
     drop(registry);
     // Port of erts/emulator/beam/erl_db.c (ets_insert_2_list_check), OTP-29.1.1: the
     // check pass is a yieldable loop that takes one iteration per object.
-    let check_failure = || {
+    let check_failure = |heap: &mut ProcessHeap| {
         let table = shared.read();
         if table.is_detached()
             || target
                 .as_atom()
                 .is_some_and(|name| table.options.named_table && table.options.name != name)
         {
-            err(EtsError::NoTable)
+            err(heap, EtsError::NoTable)
         } else if !allowed(&table, caller, super_user, true) {
-            badarg_cause("access")
+            badarg_cause(heap, "access")
         } else {
             badarg()
         }
@@ -1237,15 +1207,15 @@ pub(crate) fn insert_list(
             let object = match advance_list(&mut cursor) {
                 Ok(Some(object)) => object,
                 Ok(None) => unreachable!(),
-                Err(_) => return Err(check_failure()),
+                Err(_) => return Err(check_failure(&mut process.heap)),
             };
             if Table::check_object(options, object).is_err() {
-                return Err(check_failure());
+                return Err(check_failure(&mut process.heap));
             }
             checked += 1;
         }
         if cursor != Term::NIL {
-            return Err(check_failure());
+            return Err(check_failure(&mut process.heap));
         }
     }
     if prepared.is_none()
@@ -1261,20 +1231,23 @@ pub(crate) fn insert_list(
                 .as_atom()
                 .is_some_and(|name| table.options.named_table && table.options.name != name)
         {
-            return Err(err(EtsError::NoTable));
+            return Err(err(&mut process.heap, EtsError::NoTable));
         }
         if table.is_busy() {
-            return Err(err(EtsError::Busy));
+            return Err(err(&mut process.heap, EtsError::Busy));
         }
         if !allowed(&table, caller, super_user, true) {
-            return Err(badarg_cause("access"));
+            return Err(badarg_cause(&mut process.heap, "access"));
         }
         let mut check_cursor = objects;
         if insert_new {
             while check_cursor.classify() == TermKind::List {
                 loops -= 1;
                 let object = advance_list(&mut check_cursor)?.expect("list cursor checked");
-                if table.member_object(object).map_err(err)? {
+                if table
+                    .member_object(object)
+                    .map_err(|error| err(&mut process.heap, error))?
+                {
                     return done(process, loops, false);
                 }
             }
@@ -1285,7 +1258,8 @@ pub(crate) fn insert_list(
             // generated loop consumes one reduction before db_put, which consumes at least one.
             loops -= 1;
             let object = advance_list(&mut insert_cursor)?.expect("list cursor checked");
-            let prepared = Table::prepare_object(options, object).map_err(err)?;
+            let prepared = Table::prepare_object(options, object)
+                .map_err(|error| err(&mut process.heap, error))?;
             let extra_reds = table.insert_prepared_counted(prepared);
             loops -= 1 + extra_reds as isize;
         }
@@ -1309,20 +1283,20 @@ pub(crate) fn insert_list(
         let object = match advance_list(&mut cursor) {
             Ok(Some(object)) => object,
             Ok(None) => unreachable!(),
-            Err(_) => return Err(check_failure()),
+            Err(_) => return Err(check_failure(&mut process.heap)),
         };
         match Table::prepare_object(options, object) {
             Ok(object) => prepared.push(object),
             Err(error) => {
                 if error == EtsError::BadArg {
-                    return Err(check_failure());
+                    return Err(check_failure(&mut process.heap));
                 }
-                return Err(err(error));
+                return Err(err(&mut process.heap, error));
             }
         }
     }
     if cursor != Term::NIL {
-        return Err(check_failure());
+        return Err(check_failure(&mut process.heap));
     }
     // Acquire the table lock independently of the registry, as in ets_insert_2_list_lock_tbl.
     let mut table = shared.write();
@@ -1331,14 +1305,14 @@ pub(crate) fn insert_list(
             .as_atom()
             .is_some_and(|name| table.options.named_table && table.options.name != name)
     {
-        return Err(err(EtsError::NoTable));
+        return Err(err(&mut process.heap, EtsError::NoTable));
     }
     if table.is_busy() {
         drop(table);
         return Ok(ListInsert::Trap(EtsInsert::Copy { cursor, prepared }));
     }
     if !allowed(&table, caller, super_user, true) {
-        return Err(badarg_cause("access"));
+        return Err(badarg_cause(&mut process.heap, "access"));
     }
     let mut member_cursor = None;
     let mut destroy_copied = false;
@@ -1402,19 +1376,21 @@ fn lookup_args(
         if table.is_detached()
             || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
         {
-            return Err(badarg_cause("id"));
+            return Err(badarg_cause(&mut process.heap, "id"));
         }
         if table.is_busy() {
-            return Err(err(arinsal_ets::EtsError::Busy));
+            return Err(err(&mut process.heap, arinsal_ets::EtsError::Busy));
         }
         if !allowed(&table, caller, super_user, false) {
-            return Err(badarg_cause("access"));
+            return Err(badarg_cause(&mut process.heap, "access"));
         }
         if member {
             return Ok(boolean_term(table.member_at(key, group)));
         }
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        table.lookup_list_at(key, group, &mut heap).map_err(err)
+        table
+            .lookup_list_at(key, group, &mut heap)
+            .map_err(|error| err(&mut *heap.0, error))
     };
     if let Some(name) = target.as_atom() {
         // Port of erts/emulator/beam/erl_db.c (db_get_table_aux), OTP-29.1.1.
@@ -1422,11 +1398,11 @@ fn lookup_args(
         let lookup = rt
             .named_ets
             .with_table(name, |shared| lookup(shared, Some(name)));
-        return lookup.unwrap_or_else(|| Err(badarg_cause("id")));
+        return lookup.unwrap_or_else(|| Err(badarg_cause(&mut process.heap, "id")));
     }
     target
         .with_magic_payload::<arinsal_ets::TableLock, _>(|shared| lookup(shared, None))
-        .unwrap_or_else(|| Err(badarg_cause("type")))
+        .unwrap_or_else(|| Err(badarg_cause(&mut process.heap, "type")))
 }
 
 fn lookup_element_locked(
@@ -1440,7 +1416,7 @@ fn lookup_element_locked(
 ) -> Result<Term, VmError> {
     let super_user = heap.0.has_flag(arinsal_term::pflags::F_ETS_SUPER_USER);
     if !allowed(table, caller, super_user, false) {
-        return Err(badarg_cause("access"));
+        return Err(badarg_cause(&mut *heap.0, "access"));
     }
     // Port of erts/emulator/beam/erl_db.c ets_lookup_element_3: the table is looked up and its
     // access checked before the position is validated.
@@ -1454,17 +1430,17 @@ fn lookup_element_locked(
     {
         return table
             .lookup_element_one_at(key, position, group, heap)
-            .map_err(err);
+            .map_err(|error| err(&mut *heap.0, error));
     }
     let Some(default) = default else {
         // Bag and duplicate_bag: the list is consed on the heap without an intermediate vector.
         return table
             .lookup_element_list_at(key, position, group, heap)
-            .map_err(err);
+            .map_err(|error| err(&mut *heap.0, error));
     };
     let values = match table
         .lookup_element_default(key, position, default, heap)
-        .map_err(err)?
+        .map_err(|error| err(&mut *heap.0, error))?
     {
         ElementLookup::Values(values) => values,
         ElementLookup::Default(value) => return Ok(value),
@@ -1617,11 +1593,20 @@ fn delete_or_clear(
     let mut reds = initial;
     if function == EtsBif::Delete {
         let mut registry = rt.ets.write().unwrap();
-        let tid = handle(&registry, args[0])?;
-        if !allowed(&*registry.get(tid).map_err(err)?, caller, super_user, true) {
-            return Err(badarg_cause("access"));
+        let tid = handle(&mut process.heap, &registry, args[0])?;
+        if !allowed(
+            &*registry
+                .get(tid)
+                .map_err(|error| err(&mut process.heap, error))?,
+            caller,
+            super_user,
+            true,
+        ) {
+            return Err(badarg_cause(&mut process.heap, "access"));
         }
-        let (mut garbage, fixations) = registry.detach(tid).map_err(err)?;
+        let (mut garbage, fixations) = registry
+            .detach(tid)
+            .map_err(|error| err(&mut process.heap, error))?;
         drop(registry);
         reds -= fixations as isize;
         if !garbage.step(&mut reds) {
@@ -1637,10 +1622,12 @@ fn delete_or_clear(
         return Ok(Term::atom(arinsal_term::atoms::TRUE));
     }
     let registry = rt.ets.read().unwrap();
-    let tid = handle(&registry, args[0])?;
-    let mut table = registry.get_mut(tid).map_err(err)?;
+    let tid = handle(&mut process.heap, &registry, args[0])?;
+    let mut table = registry
+        .get_mut(tid)
+        .map_err(|error| err(&mut process.heap, error))?;
     if !allowed(&table, caller, super_user, true) {
-        return Err(badarg_cause("access"));
+        return Err(badarg_cause(&mut process.heap, "access"));
     }
     // `BIF_ARG_2 != undefined`: this is the continuation, and the table is no longer busy.
     if args[1] != Term::atom(arinsal_term::atoms::UNDEFINED) {
@@ -1657,7 +1644,7 @@ fn delete_or_clear(
     let tid_term = if args[0].as_atom().is_some() {
         registry
             .tid_term(tid, &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
-            .map_err(err)?
+            .map_err(|error| err(&mut process.heap, error))?
     } else {
         args[0]
     };
@@ -1682,7 +1669,11 @@ fn delete_or_clear(
 /// Fix a table for `caller`, stamping the first fixation with the current times.
 ///
 /// Port of erts/emulator/beam/erl_db.c, fix_table_locked, OTP-29.1.1.
-fn fix_table<H: HeapAlloc>(heap: &mut H, table: &mut Table, caller: Term) -> Result<(), VmError> {
+fn fix_table(
+    heap: &mut arinsal_bifs::ProcessHeapHandle<'_>,
+    table: &mut Table,
+    caller: Term,
+) -> Result<(), VmError> {
     let micros = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| badarg())?
@@ -1699,7 +1690,7 @@ fn fix_table<H: HeapAlloc>(heap: &mut H, table: &mut Table, caller: Term) -> Res
         .map_err(|_| system_limit())?;
     table
         .safe_fixtable_for_at(caller, true, system_time, monotonic_time)
-        .map_err(err)
+        .map_err(|error| err(&mut *heap.0, error))
 }
 
 mod select_chunk;
@@ -1917,17 +1908,17 @@ fn hash_select(
     let (start, hash, cycle) = {
         let registry = rt.ets.read().unwrap();
         let tid = match items.as_ref() {
-            Some(items) => handle(&registry, items[0])?,
-            None => handle(&registry, args[0])?,
+            Some(items) => handle(&mut process.heap, &registry, items[0])?,
+            None => handle(&mut process.heap, &registry, args[0])?,
         };
         let table = match registry.get_shared(tid) {
             Ok(table) => table,
             // The trap target runs again with the same continuation once the table is idle.
             Err(EtsError::Busy) => return Err(VmError::Yield),
-            Err(error) => return Err(err(error)),
+            Err(error) => return Err(err(&mut process.heap, error)),
         };
         if !allowed(&table, caller, super_user, false) {
-            return Err(badarg_cause("access"));
+            return Err(badarg_cause(&mut process.heap, "access"));
         }
         let hash = table.is_hash();
         let start = match () {
@@ -1984,7 +1975,7 @@ fn hash_select(
                     EtsBif::MatchObject => MatchProgram::from_pattern(args[1], true),
                     _ => MatchProgram::compile(args[1]),
                 }
-                .map_err(err)?;
+                .map_err(|error| err(&mut process.heap, error))?;
                 let program = Arc::new(program);
                 let program_owner = select_chunk::new_match_program_owner(&program);
                 let (plan, safety) = if hash {
@@ -2005,7 +1996,7 @@ fn hash_select(
                         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
                         let rows = table
                             .select_limit(&program, false, usize::MAX, &mut heap)
-                            .map_err(err)?;
+                            .map_err(|error| err(&mut *heap.0, error))?;
                         if rows.is_empty() {
                             return Ok(Some(Term::atom(arinsal_term::atoms::EOT)));
                         }
@@ -2074,7 +2065,7 @@ fn hash_select(
             if was_resumed && safety != IterSafety::Safe {
                 unfix_table(rt, tid, caller);
             }
-            return Err(err(error));
+            return Err(err(&mut process.heap, error));
         }
     };
     let next_of = |cycle: &mut SelectCycle| -> Next {
@@ -2096,7 +2087,9 @@ fn hash_select(
         // fix immediately after the first trap; the traversal is not replayed.
         if hash && safety != IterSafety::Safe {
             let registry = rt.ets.read().unwrap();
-            let mut table = registry.get_mut(tid).map_err(err)?;
+            let mut table = registry
+                .get_mut(tid)
+                .map_err(|error| err(&mut process.heap, error))?;
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             fix_table(&mut heap, &mut table, caller)?;
             fixed_now = true;
@@ -2121,7 +2114,7 @@ fn hash_select(
                 .read()
                 .unwrap()
                 .tid_term(tid, &mut heap)
-                .map_err(err)?;
+                .map_err(|error| err(&mut *heap.0, error))?;
             // The matches so far, newest first: an unchunked call conses the cycle's onto the
             // list it got, a chunk is rebuilt from the at most one page it holds.
             let matches = if count {
@@ -2178,7 +2171,7 @@ fn hash_select(
                     .end_condition_term(backwards)
                     .map(arinsal_ets::SavedKey::new)
                     .transpose()
-                    .map_err(err)?,
+                    .map_err(saved_key_error)?,
                 _ => None,
             };
             bump_direct(process, used);
@@ -2188,7 +2181,7 @@ fn hash_select(
                 .read()
                 .unwrap()
                 .tid_term(tid, &mut heap)
-                .map_err(err)?;
+                .map_err(|error| err(&mut *heap.0, error))?;
             let continuation = match &key {
                 Some(key) => select_chunk::tree_continuation(
                     &mut heap,
@@ -2245,7 +2238,7 @@ fn hash_select(
             .read()
             .unwrap()
             .tid_term(tid, &mut heap)
-            .map_err(err)?;
+            .map_err(|error| err(&mut *heap.0, error))?;
         // The accumulator is newest first; the chunk's results are in visit order.
         let mut values = select_chunk::expand(accum.0)?;
         values.extend(cycle.results);
@@ -2293,67 +2286,126 @@ fn unfix_table(rt: &crate::process::Runtime, tid: Tid, caller: Term) {
     }
 }
 
-// erl_db.c: the ets:info decentralized-counter snapshot (DecentralizedReadSnapshotInfo).
-arinsal_term::magic_payload!(InfoSnapshot => erts_db_read_snapshot_destructor);
-/// The state an `ets:info` call that took a counter snapshot traps with: the counters of the
-/// snapshot and the words of the table structure at that time (erts folds the structure into
-/// the memory counter, Arinsal computes it from the table layout).
-struct InfoSnapshot {
-    state: Arc<arinsal_ets::flxctr::SnapshotState>,
+// Port of erl_flxctr.c (`erts_flxctr_read_ctx_bin_dtor`).
+arinsal_term::magic_payload!(DecentralizedReadSnapshotInfo => erts_flxctr_read_ctx_bin_dtor);
+// Port of erl_flxctr.c (`erts_flxctr_wait_dtor`).
+arinsal_term::magic_payload!(ErtsFlxCtrWakeUpLaterInfo => erts_flxctr_wait_dtor);
+
+/// Port of erts/emulator/beam/erl_flxctr.c (`DecentralizedReadSnapshotInfo`), OTP-29.1.1.
+struct DecentralizedReadSnapshotInfo {
+    later_op: ErtsThrPrgrLaterOp,
+    runtime: &'static crate::process::Runtime,
+    pid: Pid,
+    work: arinsal_ets::flxctr::BegunSnapshot,
+    completed: AtomicBool,
+    result: [AtomicIsize; arinsal_ets::flxctr::ATOMICS_PER_CACHE_LINE],
     structure_words: usize,
 }
 
-impl InfoSnapshot {
+impl DecentralizedReadSnapshotInfo {
     fn counters(&self) -> arinsal_ets::CounterValues {
         arinsal_ets::CounterValues {
-            size: self.state.result(arinsal_ets::NITEMS_COUNTER_ID),
+            size: self.result[arinsal_ets::NITEMS_COUNTER_ID].load(AtomicOrdering::Acquire),
             memory_words: self.structure_words
-                + self.state.result(arinsal_ets::MEM_COUNTER_ID).max(0) as usize,
+                + self.result[arinsal_ets::MEM_COUNTER_ID]
+                    .load(AtomicOrdering::Acquire)
+                    .max(0) as usize,
         }
     }
+}
+
+/// Port of erts/emulator/beam/erl_flxctr.c (`ErtsFlxCtrWakeUpLaterInfo`), OTP-29.1.1.
+struct ErtsFlxCtrWakeUpLaterInfo {
+    later_op: ErtsThrPrgrLaterOp,
+    runtime: &'static crate::process::Runtime,
+    pid: Pid,
 }
 
 /// `erts_flxctr_is_snapshot_result` and `erts_flxctr_get_snapshot_result_after_trap`.
 fn snapshot_result_of(term: Term) -> Option<arinsal_ets::CounterValues> {
-    term.with_magic_payload::<InfoSnapshot, _>(InfoSnapshot::counters)
+    term.with_magic_payload::<DecentralizedReadSnapshotInfo, _>(
+        DecentralizedReadSnapshotInfo::counters,
+    )
 }
 
-/// The process side of `erts_flxctr_snapshot`: records the operation to run after thread
-/// progress. The caller suspends the process and schedules it once the table lock is released.
-#[derive(Default)]
-struct RecordedLater(Option<Box<dyn FnOnce() + Send + 'static>>);
+fn retain_magic_for_later(bin: &MagicBin) -> *mut () {
+    std::mem::forget(bin.clone());
+    MagicBin::as_ptr(bin) as *mut ()
+}
 
-impl arinsal_ets::flxctr::SnapshotHost for RecordedLater {
-    fn suspend_and_run_later(&mut self, op: Box<dyn FnOnce() + Send + 'static>) {
-        self.0 = Some(op);
+struct NoopHost;
+
+impl arinsal_ets::flxctr::SnapshotHost for NoopHost {
+    fn suspend_and_run_later(&mut self, _op: Box<dyn FnOnce() + Send + 'static>) {
+        unreachable!("a centralized snapshot does not suspend");
     }
 }
 
-/// `erts_suspend(p, ERTS_PROC_LOCK_MAIN, NULL)`, `ERTS_VBUMP_ALL_REDS` and
-/// `erts_schedule_thr_prgr_later_op` of erl_flxctr.c: the process stays suspended until thread
-/// progress, then `op` runs and the process is resumed.
-// Port of erts/emulator/beam/erl_flxctr.c (suspend_until_thr_prg, thr_prg_wake_up_and_count),
-// OTP-29.1.1.
-fn suspend_until_thr_prgr(
+/// Port of erts/emulator/beam/erl_flxctr.c:299-318 (snapshot magic bin + later op), OTP-29.1.1.
+fn schedule_snapshot_later_op(
+    process: &mut Process,
+    ctx: Option<&mut RunCtx<'_, crate::Process>>,
+    bin: MagicBin,
+) -> Result<(), VmError> {
+    let Some(ctx) = ctx else {
+        return Err(needs_context());
+    };
+    crate::suspend::suspend_self(process);
+    crate::bif_traps::vbump_all_reds(process);
+    let lop = crate::code_ix::raw_magic_payload::<DecentralizedReadSnapshotInfo>(&bin)
+        .later_op
+        .as_list_node();
+    let data = retain_magic_for_later(&bin);
+    ctx.erts_schedule_thr_prgr_later_op(thr_prg_wake_up_and_count, data, lop);
+    Ok(())
+}
+
+/// Port of erts/emulator/beam/erl_flxctr.c:154 (`suspend_until_thr_prg`), OTP-29.1.1.
+fn suspend_until_thr_prg(
     process: &mut Process,
     ctx: Option<&mut RunCtx<'_, crate::Process>>,
     pid: Pid,
-    host: RecordedLater,
 ) -> Result<(), VmError> {
     let (Some(runtime), Some(ctx)) = (process.runtime, ctx) else {
         return Err(needs_context());
     };
-    // erl_flxctr.c:163-166: erts_suspend, ERTS_VBUMP_ALL_REDS, then the later op.
+    let bin = MagicBin::with_erts_payload_size(
+        ErtsFlxCtrWakeUpLaterInfo {
+            later_op: ErtsThrPrgrLaterOp::new(),
+            runtime,
+            pid,
+        },
+        std::mem::size_of::<ErtsFlxCtrWakeUpLaterInfo>(),
+    );
     crate::suspend::suspend_self(process);
     crate::bif_traps::vbump_all_reds(process);
-    let op = host.0;
-    ctx.thread_progress_later(move || {
-        if let Some(op) = op {
-            op();
-        }
-        crate::natives::code::resume_suspended(runtime, pid);
-    });
+    let lop = crate::code_ix::raw_magic_payload::<ErtsFlxCtrWakeUpLaterInfo>(&bin)
+        .later_op
+        .as_list_node();
+    let data = retain_magic_for_later(&bin);
+    ctx.erts_schedule_thr_prgr_later_op(thr_prg_wake_up_later, data, lop);
     Ok(())
+}
+
+/// Port of erts/emulator/beam/erl_flxctr.c:125 (`thr_prg_wake_up_later`), OTP-29.1.1.
+fn thr_prg_wake_up_later(data: *mut ()) {
+    let bin = crate::code_ix::magic_from_later_data(data);
+    let info = crate::code_ix::raw_magic_payload::<ErtsFlxCtrWakeUpLaterInfo>(&bin);
+    crate::natives::code::resume_suspended(info.runtime, info.pid);
+}
+
+/// Port of erts/emulator/beam/erl_flxctr.c:75 (`thr_prg_wake_up_and_count`), OTP-29.1.1.
+fn thr_prg_wake_up_and_count(data: *mut ()) {
+    let bin = crate::code_ix::magic_from_later_data(data);
+    let info = crate::code_ix::raw_magic_payload::<DecentralizedReadSnapshotInfo>(&bin);
+    if !info.completed.swap(true, AtomicOrdering::AcqRel) {
+        let mut values = [0isize; arinsal_ets::flxctr::ATOMICS_PER_CACHE_LINE];
+        info.work.complete(&mut values);
+        for (slot, value) in info.result.iter().zip(values) {
+            slot.store(value, AtomicOrdering::Release);
+        }
+    }
+    crate::natives::code::resume_suspended(info.runtime, info.pid);
 }
 
 /// `erts_make_integer`.
@@ -2418,14 +2470,18 @@ fn info_counters(
         Err(ResolveFail::Missing) => {
             return Ok(Some(Term::atom(arinsal_term::atoms::UNDEFINED)));
         }
-        Err(ResolveFail::BadType) => return Err(badarg_cause("type")),
+        Err(ResolveFail::BadType) => return Err(badarg_cause(&mut process.heap, "type")),
     };
-    let table = table_guard(&registry, tid, true)?;
+    let table = table_guard(&registry, tid, true, &mut process.heap)?;
     let schedulers = if key == Some("size") {
         1
     } else {
         rt.scheduler()?.scheduler_count()
     };
+    enum TrapKind {
+        Wait,
+        Snapshot(MagicBin),
+    }
     let mut trap_with = None;
     if snapshot.is_none() {
         let counters = table.counters();
@@ -2433,46 +2489,53 @@ fn info_counters(
             // The direct call cannot suspend the process: the scheduler path takes the snapshot.
             return Err(needs_context());
         }
-        let mut host = RecordedLater::default();
-        match counters.snapshot(&mut host) {
-            arinsal_ets::flxctr::SnapshotResult::Done(values) => {
-                snapshot = Some(arinsal_ets::CounterValues {
-                    size: values[arinsal_ets::NITEMS_COUNTER_ID],
-                    memory_words: table.structure_memory_words_for_schedulers(schedulers)
-                        + values[arinsal_ets::MEM_COUNTER_ID].max(0) as usize,
-                });
+        if !counters.is_decentralized() {
+            match counters.snapshot(&mut NoopHost) {
+                arinsal_ets::flxctr::SnapshotResult::Done(values) => {
+                    snapshot = Some(arinsal_ets::CounterValues {
+                        size: values[arinsal_ets::NITEMS_COUNTER_ID],
+                        memory_words: table.structure_memory_words_for_schedulers(schedulers)
+                            + values[arinsal_ets::MEM_COUNTER_ID].max(0) as usize,
+                    });
+                }
+                _ => return Err(badarg()),
             }
-            arinsal_ets::flxctr::SnapshotResult::TryAgainAfterTrap => {
-                trap_with = Some((host, None));
-            }
-            arinsal_ets::flxctr::SnapshotResult::GetResultAfterTrap(state) => {
-                let structure_words = table.structure_memory_words_for_schedulers(schedulers);
-                trap_with = Some((
-                    host,
-                    Some(InfoSnapshot {
-                        state,
-                        structure_words,
-                    }),
-                ));
-            }
+        } else if let Some(work) = counters.try_begin_snapshot() {
+            let runtime = process.runtime.ok_or_else(needs_context)?;
+            trap_with = Some(TrapKind::Snapshot(MagicBin::with_erts_payload_size(
+                DecentralizedReadSnapshotInfo {
+                    later_op: ErtsThrPrgrLaterOp::new(),
+                    runtime,
+                    pid: caller_pid,
+                    work,
+                    completed: AtomicBool::new(false),
+                    result: std::array::from_fn(|_| AtomicIsize::new(0)),
+                    structure_words: table.structure_memory_words_for_schedulers(schedulers),
+                },
+                std::mem::size_of::<DecentralizedReadSnapshotInfo>(),
+            )));
+        } else {
+            trap_with = Some(TrapKind::Wait);
         }
     }
-    if let Some((host, state)) = trap_with {
+    if let Some(kind) = trap_with {
         // `db_unlock` before the trap.
         drop(table);
         drop(registry);
-        let state_term = match state {
-            Some(state) => Some(
+        let state_term = match &kind {
+            TrapKind::Snapshot(bin) => Some(
                 TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
-                    .magic_ref(MagicBin::with_erts_payload_size(
-                        state,
-                        std::mem::size_of::<InfoSnapshot>(),
-                    ))
+                    .magic_ref(bin.clone())
                     .map_err(|_| badarg())?,
             ),
-            None => None,
+            TrapKind::Wait => None,
         };
-        suspend_until_thr_prgr(process, ctx, caller_pid, host)?;
+        match kind {
+            TrapKind::Wait => suspend_until_thr_prg(process, ctx, caller_pid)?,
+            TrapKind::Snapshot(bin) => {
+                schedule_snapshot_later_op(process, ctx, bin)?;
+            }
+        }
         let trap_args = if args.len() == 2 {
             vec![state_term.unwrap_or(args[0]), args[1]]
         } else if let Some(state) = state_term {
@@ -2503,7 +2566,9 @@ fn info_counters(
         }
         None => table.info_list_with_counters(node, &mut heap, schedulers, Some(counters)),
     };
-    value.map(Some).map_err(err)
+    value
+        .map(Some)
+        .map_err(|error| err(&mut process.heap, error))
 }
 
 /// Run one ETS BIF. `ctx` is only present on the scheduler path: erts sends messages
@@ -2541,7 +2606,7 @@ fn call_inner(
             &mut heap,
             &ProcessMatchContext(caller, trace_control_word, seq_token),
         )
-        .map_err(err);
+        .map_err(|error| err(&mut *heap.0, error));
     }
     if function == EtsBif::SuperUser {
         let [flag] = args else {
@@ -2744,49 +2809,62 @@ fn call_inner(
             }
             opts.decentralized_counters = decentralized_counters_option
                 .unwrap_or(opts.decentralized_counters);
-            opts.normalize_erts_lock_flags().map_err(err)?;
+            opts.normalize_erts_lock_flags()
+                .map_err(|error| err(&mut *heap.0, error))?;
             // Port of erts/emulator/beam/erl_db.c (ets_new_2), OTP-29.1.1.
             // db_create_table allocates its btid magic binary on this scheduler.
             let tid = registry
                 .exclusive()?
                 .create_with_magic_ref_numbers(opts, table_refn.unwrap())
                 .map_err(|error| match error {
-                    EtsError::NameTaken => badarg_cause("already_exists"),
-                    error => err(error),
+                    EtsError::NameTaken => badarg_cause(&mut *heap.0, "already_exists"),
+                    error => err(&mut *heap.0, error),
                 })?;
             // erl_db.c: BIF_P->flags |= F_USING_DB so exit can find the table.
             if !rt.publish_proc_flag(caller_pid, arinsal_sched::proc_flags::USING_DB) {
                 registry.exclusive()?.detach(tid).ok();
                 return Err(badarg());
             }
-            if registry.get(tid).map_err(err)?.options.named_table {
+            if registry
+                .get(tid)
+                .map_err(|error| err(&mut *heap.0, error))?
+                .options
+                .named_table
+            {
                 Ok(Term::atom(name.as_atom().unwrap()))
             } else {
-                registry.tid_term(tid, &mut heap).map_err(err)
+                registry
+                    .tid_term(tid, &mut heap)
+                    .map_err(|error| err(&mut *heap.0, error))
             }
         }
         (EtsBif::Whereis, [name]) => Ok(registry
             .whereis(name.as_atom().ok_or_else(badarg)?)
             .map(|tid| registry.tid_term(tid, &mut heap))
             .transpose()
-            .map_err(err)?
+            .map_err(|error| err(&mut *heap.0, error))?
             .unwrap_or(Term::atom(arinsal_term::atoms::UNDEFINED))),
         (EtsBif::Rename, [target, name]) => {
             // Port of erts/emulator/beam/erl_db.c (ets_rename_2), OTP-29.1.1:
             // the table needs write access, and is looked up even for a bad name.
-            let tid = handle(&registry, *target)?;
+            let tid = handle(&mut *heap.0, &registry, *target)?;
             let named = {
-                let table = registry.get(tid).map_err(err)?;
+                let table = registry
+                    .get(tid)
+                    .map_err(|error| err(&mut *heap.0, error))?;
                 if table.is_busy() {
                     return Err(VmError::Yield);
                 }
                 if !allowed(&table, caller, super_user, true) {
-                    return Err(badarg_cause("access"));
+                    return Err(badarg_cause(&mut *heap.0, "access"));
                 }
                 table.options.named_table
             };
             let new_name = name.as_atom().ok_or_else(badarg)?;
-            registry.exclusive()?.rename(tid, new_name).map_err(err)?;
+            registry
+                .exclusive()?
+                .rename(tid, new_name)
+                .map_err(|error| err(&mut *heap.0, error))?;
             // Unnamed tables keep their id; only the displayed name changes.
             // Port of erts/emulator/beam/erl_db.c (ets_rename_2), OTP-29.1.1.
             if named { Ok(*name) } else { Ok(*target) }
@@ -2797,19 +2875,19 @@ fn call_inner(
             let tid = match resolve(&registry, *target) {
                 Ok(tid) => tid,
                 Err(ResolveFail::Missing) => return Ok(Term::atom(arinsal_term::atoms::UNDEFINED)),
-                Err(ResolveFail::BadType) => return Err(badarg_cause("type")),
+                Err(ResolveFail::BadType) => return Err(badarg_cause(&mut *heap.0, "type")),
             };
             // Port of erts/emulator/beam/erl_db.c (ets_info_2, DB_INFO/LCK_READ),
             // OTP-29.1.1.
             if args.len() == 1 {
-                let table = table_guard(&registry, tid, true)?;
+                let table = table_guard(&registry, tid, true, &mut *heap.0)?;
                 let schedulers = rt.scheduler()?.scheduler_count();
                 table
                     .info_list_for_schedulers(Term::atom(arinsal_term::atoms::NONAME), &mut heap, schedulers)
-                    .map_err(err)
+                    .map_err(|error| err(&mut *heap.0, error))
             } else {
                 let key = info_item_name(args[1]).ok_or_else(badarg)?;
-                let table = table_guard(&registry, tid, true)?;
+                let table = table_guard(&registry, tid, true, &mut *heap.0)?;
                 let schedulers = if key == "memory" {
                     rt.scheduler()?.scheduler_count()
                 } else {
@@ -2817,29 +2895,33 @@ fn call_inner(
                 };
                 table
                     .info_item_for_schedulers(key, Term::atom(arinsal_term::atoms::NONAME), &mut heap, schedulers)
-                    .map_err(err)
+                    .map_err(|error| err(&mut *heap.0, error))
             }
         }
         (EtsBif::Delete, [target, key]) => {
-            let tid = handle(&registry, *target)?;
+            let tid = handle(&mut *heap.0, &registry, *target)?;
             if registry
                 .shared(tid)
-                .map_err(err)?
+                .map_err(|error| err(&mut *heap.0, error))?
                 .options()
                 .write_concurrency
                 != WriteConcurrency::Disabled
             {
-                let table = registry.get_shared(tid).map_err(err)?;
+                let table = registry
+                    .get_shared(tid)
+                    .map_err(|error| err(&mut *heap.0, error))?;
                 if !allowed(&table, caller, super_user, true) {
-                    return Err(badarg_cause("access"));
+                    return Err(badarg_cause(&mut *heap.0, "access"));
                 }
                 if table.delete_key_shared(*key) {
                     return Ok(Term::atom(arinsal_term::atoms::TRUE));
                 }
             }
-            let mut table = registry.get_mut(tid).map_err(err)?;
+            let mut table = registry
+                .get_mut(tid)
+                .map_err(|error| err(&mut *heap.0, error))?;
             if !allowed(&table, caller, super_user, true) {
-                return Err(badarg_cause("access"));
+                return Err(badarg_cause(&mut *heap.0, "access"));
             }
             table.delete_key(*key);
             Ok(Term::atom(arinsal_term::atoms::TRUE))
@@ -2847,14 +2929,16 @@ fn call_inner(
         // Port of erts/emulator/beam/erl_db.c and erl_db_hash.c,
         // OTP-29.1.1.
         (EtsBif::LookupBinaryInfo, [target, key]) => {
-            let tid = handle(&registry, *target)?;
-            let table = registry.get_shared(tid).map_err(err)?;
+            let tid = handle(&mut *heap.0, &registry, *target)?;
+            let table = registry
+                .get_shared(tid)
+                .map_err(|error| err(&mut *heap.0, error))?;
             if !allowed(&table, caller, super_user, false) {
-                return Err(badarg_cause("access"));
+                return Err(badarg_cause(&mut *heap.0, "access"));
             }
             let binaries = table
                 .lookup_binary_info(*key, &mut heap)
-                .map_err(binary_info_err)?;
+                .map_err(|error| binary_info_err(&mut *heap.0, error))?;
             TermBuilder::new(&mut heap)
                 .list_from_iter(binaries)
                 .map_err(|_| system_limit())
@@ -2862,10 +2946,12 @@ fn call_inner(
         // Port of erts/emulator/beam/erl_db.c (`ets_setopts_2`),
         // OTP-29.1.1.
         (EtsBif::SetOpts, [target, options]) => {
-            let tid = handle(&registry, *target)?;
-            let mut table = registry.get_mut(tid).map_err(err)?;
+            let tid = handle(&mut *heap.0, &registry, *target)?;
+            let mut table = registry
+                .get_mut(tid)
+                .map_err(|error| err(&mut *heap.0, error))?;
             if !allowed(&table, caller, super_user, true) {
-                return Err(badarg_cause("access"));
+                return Err(badarg_cause(&mut *heap.0, "access"));
             }
             if table.options.owner != caller {
                 return Err(badarg());
@@ -2939,7 +3025,7 @@ fn call_inner(
             }
             table
                 .set_access_options(protection, heir.flatten())
-                .map_err(err)?;
+                .map_err(|error| err(&mut *heap.0, error))?;
             if matches!(heir, Some(None)) {
                 table.options.heir = None;
             }
@@ -2948,76 +3034,90 @@ fn call_inner(
         // Port of erts/emulator/beam/erl_db.c (`erts_internal_ets_raw_first_1`),
         // OTP-29.1.1.
         (EtsBif::RawFirst, [target]) => {
-            let tid = handle(&registry, *target)?;
-            let table = registry.get_shared(tid).map_err(err)?;
+            let tid = handle(&mut *heap.0, &registry, *target)?;
+            let table = registry
+                .get_shared(tid)
+                .map_err(|error| err(&mut *heap.0, error))?;
             if !allowed(&table, caller, super_user, false) {
-                return Err(badarg_cause("access"));
+                return Err(badarg_cause(&mut *heap.0, "access"));
             }
             Ok(table
                 .raw_first(&mut heap)
-                .map_err(err)?
+                .map_err(|error| err(&mut *heap.0, error))?
                 .unwrap_or(Term::atom(arinsal_term::atoms::EOT)))
         }
         // Port of erts/emulator/beam/erl_db.c (`erts_internal_ets_raw_next_2`),
         // OTP-29.1.1.
         (EtsBif::RawNext, [target, key]) => {
-            let tid = handle(&registry, *target)?;
-            let table = registry.get_shared(tid).map_err(err)?;
+            let tid = handle(&mut *heap.0, &registry, *target)?;
+            let table = registry
+                .get_shared(tid)
+                .map_err(|error| err(&mut *heap.0, error))?;
             if !allowed(&table, caller, super_user, false) {
-                return Err(badarg_cause("access"));
+                return Err(badarg_cause(&mut *heap.0, "access"));
             }
             Ok(table
                 .raw_next(*key, &mut heap)
-                .map_err(err)?
+                .map_err(|error| err(&mut *heap.0, error))?
                 .unwrap_or(Term::atom(arinsal_term::atoms::EOT)))
         }
         (EtsBif::Take, [target, key]) => {
-            let tid = handle(&registry, *target)?;
+            let tid = handle(&mut *heap.0, &registry, *target)?;
             if registry
                 .shared(tid)
-                .map_err(err)?
+                .map_err(|error| err(&mut *heap.0, error))?
                 .options()
                 .write_concurrency
                 != WriteConcurrency::Disabled
             {
-                let table = registry.get_shared(tid).map_err(err)?;
+                let table = registry
+                    .get_shared(tid)
+                    .map_err(|error| err(&mut *heap.0, error))?;
                 if !allowed(&table, caller, super_user, true) {
-                    return Err(badarg_cause("access"));
+                    return Err(badarg_cause(&mut *heap.0, "access"));
                 }
                 if table.options.table_type != TableType::OrderedSet {
-                    let values = table.take_shared(*key, &mut heap).map_err(err)?;
+                    let values = table
+                        .take_shared(*key, &mut heap)
+                        .map_err(|error| err(&mut *heap.0, error))?;
                     return output_list(&mut heap, values);
                 }
             }
-            let mut table = registry.get_mut(tid).map_err(err)?;
+            let mut table = registry
+                .get_mut(tid)
+                .map_err(|error| err(&mut *heap.0, error))?;
             if !allowed(&table, caller, super_user, true) {
-                return Err(badarg_cause("access"));
+                return Err(badarg_cause(&mut *heap.0, "access"));
             }
-            let values = table.take(*key, &mut heap).map_err(err)?;
+            let values = table
+                .take(*key, &mut heap)
+                .map_err(|error| err(&mut *heap.0, error))?;
             output_list(&mut heap, values)
         }
         (EtsBif::Slot, [target, index]) => {
-            let tid = handle(&registry, *target)?;
-            let table = registry.get_shared(tid).map_err(err)?;
+            let tid = handle(&mut *heap.0, &registry, *target)?;
+            let table = registry
+                .get_shared(tid)
+                .map_err(|error| err(&mut *heap.0, error))?;
             if !allowed(&table, caller, super_user, false) {
-                return Err(badarg_cause("access"));
+                return Err(badarg_cause(&mut *heap.0, "access"));
             }
             let slot =
                 usize::try_from(index.as_small().ok_or_else(badarg)?).map_err(|_| badarg())?;
             Ok(table
                 .slot(slot, &mut heap)
-                .map_err(err)?
+                .map_err(|error| err(&mut *heap.0, error))?
                 .unwrap_or(Term::atom(arinsal_term::atoms::EOT)))
         }
         (EtsBif::First | EtsBif::Last, [target]) => {
-            let tid = handle(&registry, *target)?;
-            let table = table_guard(&registry, tid, true)?;
+            let tid = handle(&mut *heap.0, &registry, *target)?;
+            let table = table_guard(&registry, tid, true, &mut *heap.0)?;
             if !allowed(&table, caller, super_user, false) {
-                return Err(badarg_cause("access"));
+                return Err(badarg_cause(&mut *heap.0, "access"));
             }
             Ok(table
                 .edge(function == EtsBif::Last, &mut heap)
-                .map_err(err)?
+                .map_err(|error| err(&mut *heap.0, error))?
                 .unwrap_or(Term::atom(arinsal_term::atoms::EOT)))
         }
         (EtsBif::Next | EtsBif::Prev, [target, key]) => {
@@ -3026,17 +3126,17 @@ fn call_inner(
             if end_of_table(*key) {
                 return Err(badarg());
             }
-            let tid = handle(&registry, *target)?;
-            let table = table_guard(&registry, tid, true)?;
+            let tid = handle(&mut *heap.0, &registry, *target)?;
+            let table = table_guard(&registry, tid, true, &mut *heap.0)?;
             if !allowed(&table, caller, super_user, false) {
-                return Err(badarg_cause("access"));
+                return Err(badarg_cause(&mut *heap.0, "access"));
             }
             Ok((if function == EtsBif::Next {
                 table.next(*key, &mut heap)
             } else {
                 table.prev(*key, &mut heap)
             })
-            .map_err(err)?
+            .map_err(|error| err(&mut *heap.0, error))?
             .unwrap_or(Term::atom(arinsal_term::atoms::EOT)))
         }
         // Port of erts/emulator/beam/erl_db.c (ets_first_lookup_1),
@@ -3044,14 +3144,14 @@ fn call_inner(
         // :1332 (ets_prev_lookup_2), OTP-29.1.1. Hash tables treat last as
         // first and prev as next (erl_db_hash.c).
         (EtsBif::FirstLookup | EtsBif::LastLookup, [target]) => {
-            let tid = handle(&registry, *target)?;
-            let table = table_guard(&registry, tid, true)?;
+            let tid = handle(&mut *heap.0, &registry, *target)?;
+            let table = table_guard(&registry, tid, true, &mut *heap.0)?;
             if !allowed(&table, caller, super_user, false) {
-                return Err(badarg_cause("access"));
+                return Err(badarg_cause(&mut *heap.0, "access"));
             }
             match table
                 .edge_lookup(function == EtsBif::LastLookup, &mut heap)
-                .map_err(err)?
+                .map_err(|error| err(&mut *heap.0, error))?
             {
                 None => Ok(Term::atom(arinsal_term::atoms::EOT)),
                 Some((key, objects)) => lookup_pair(&mut heap, key, objects),
@@ -3061,24 +3161,26 @@ fn call_inner(
             if end_of_table(*key) {
                 return Err(badarg());
             }
-            let tid = handle(&registry, *target)?;
-            let table = table_guard(&registry, tid, true)?;
+            let tid = handle(&mut *heap.0, &registry, *target)?;
+            let table = table_guard(&registry, tid, true, &mut *heap.0)?;
             if !allowed(&table, caller, super_user, false) {
-                return Err(badarg_cause("access"));
+                return Err(badarg_cause(&mut *heap.0, "access"));
             }
             match table
                 .adjacent_lookup(*key, function == EtsBif::PrevLookup, &mut heap)
-                .map_err(err)?
+                .map_err(|error| err(&mut *heap.0, error))?
             {
                 None => Ok(Term::atom(arinsal_term::atoms::EOT)),
                 Some((found, objects)) => lookup_pair(&mut heap, found, objects),
             }
         }
         (EtsBif::SafeFixtable, [target, fixed]) => {
-            let tid = handle(&registry, *target)?;
-            let mut table = registry.get_mut(tid).map_err(err)?;
+            let tid = handle(&mut *heap.0, &registry, *target)?;
+            let mut table = registry
+                .get_mut(tid)
+                .map_err(|error| err(&mut *heap.0, error))?;
             if !allowed(&table, caller, super_user, false) {
-                return Err(badarg_cause("access"));
+                return Err(badarg_cause(&mut *heap.0, "access"));
             }
             let fixed = boolean(*fixed)?;
             if fixed {
@@ -3088,66 +3190,87 @@ fn call_inner(
                 // erl_db.c and 5187: a fixation sets F_USING_DB on the fixing process.
                 let _ = rt.publish_proc_flag(caller_pid, arinsal_sched::proc_flags::USING_DB);
             } else {
-                table.safe_fixtable_for(caller, false).map_err(err)?;
+                table
+                    .safe_fixtable_for(caller, false)
+                    .map_err(|error| err(&mut *heap.0, error))?;
             }
             Ok(Term::atom(arinsal_term::atoms::TRUE))
         }
         (EtsBif::DeleteObject, [target, object]) => {
-            let tid = handle(&registry, *target)?;
+            let tid = handle(&mut *heap.0, &registry, *target)?;
             if registry
                 .shared(tid)
-                .map_err(err)?
+                .map_err(|error| err(&mut *heap.0, error))?
                 .options()
                 .write_concurrency
                 != WriteConcurrency::Disabled
             {
-                let table = registry.get_shared(tid).map_err(err)?;
+                let table = registry
+                    .get_shared(tid)
+                    .map_err(|error| err(&mut *heap.0, error))?;
                 if !allowed(&table, caller, super_user, true) {
-                    return Err(badarg_cause("access"));
+                    return Err(badarg_cause(&mut *heap.0, "access"));
                 }
-                if table.delete_object_shared(*object).map_err(err)? {
+                if table
+                    .delete_object_shared(*object)
+                    .map_err(|error| err(&mut *heap.0, error))?
+                {
                     return Ok(Term::atom(arinsal_term::atoms::TRUE));
                 }
             }
-            let mut table = registry.get_mut(tid).map_err(err)?;
+            let mut table = registry
+                .get_mut(tid)
+                .map_err(|error| err(&mut *heap.0, error))?;
             if !allowed(&table, caller, super_user, true) {
-                return Err(badarg_cause("access"));
+                return Err(badarg_cause(&mut *heap.0, "access"));
             }
-            table.delete_object(*object).map_err(err)?;
+            table
+                .delete_object(*object)
+                .map_err(|error| err(&mut *heap.0, error))?;
             Ok(Term::atom(arinsal_term::atoms::TRUE))
         }
         (EtsBif::GiveAway, [target, new_owner, data]) => {
             // Port of erts/emulator/beam/erl_db.c (ets_give_away_3), OTP-29.1.1:
             // table errors come first, then the receiver, then ownership.
-            let tid = handle(&registry, *target)?;
+            let tid = handle(&mut *heap.0, &registry, *target)?;
             {
-                let table = registry.get(tid).map_err(err)?;
+                let table = registry
+                    .get(tid)
+                    .map_err(|error| err(&mut *heap.0, error))?;
                 if !allowed(&table, caller, super_user, true) {
-                    return Err(badarg_cause("access"));
+                    return Err(badarg_cause(&mut *heap.0, "access"));
                 }
             }
             let pid = Pid::from_term(*new_owner).ok_or_else(badarg)?;
             if *new_owner != caller && !rt.scheduler().map_err(|_| badarg())?.lookup(pid) {
                 return Err(badarg());
             }
-            let options = registry.get(tid).map_err(err)?.options;
+            let options = registry
+                .get(tid)
+                .map_err(|error| err(&mut *heap.0, error))?
+                .options;
             if options.owner != caller {
-                return Err(badarg_cause("not_owner"));
+                return Err(badarg_cause(&mut *heap.0, "not_owner"));
             }
             if *new_owner == caller {
-                return Err(badarg_cause("owner"));
+                return Err(badarg_cause(&mut *heap.0, "owner"));
             }
             // Port of erts/emulator/beam/erl_db.c (send_ets_transfer_message),
             // OTP-29.1.1: a named table is identified by its name.
             let tab = if options.named_table {
                 Term::atom(options.name)
             } else {
-                registry.tid_term(tid, &mut heap).map_err(err)?
+                registry
+                    .tid_term(tid, &mut heap)
+                    .map_err(|error| err(&mut *heap.0, error))?
             };
             let transfer = TermBuilder::new(&mut heap)
                 .tuple(&[Term::atom(arinsal_term::atoms::ETS_TRANSFER), tab, caller, *data])
                 .map_err(|_| badarg())?;
-            registry.exclusive()?.give_away(tid, *new_owner).map_err(err)?;
+            registry
+                .exclusive()?
+                .give_away(tid, *new_owner)
+                .map_err(|error| err(&mut *heap.0, error))?;
             // erl_db.c: the receiver's F_USING_DB is set so its exit deletes the table.
             if !rt.publish_proc_flag(pid, arinsal_sched::proc_flags::USING_DB) {
                 return Err(badarg());
@@ -3161,10 +3284,10 @@ fn call_inner(
         (EtsBif::Select | EtsBif::SelectReverse, [target, spec])
         | (EtsBif::Match, [target, spec])
         | (EtsBif::MatchObject, [target, spec]) => {
-            let tid = handle(&registry, *target)?;
-            let table = table_guard(&registry, tid, true)?;
+            let tid = handle(&mut *heap.0, &registry, *target)?;
+            let table = table_guard(&registry, tid, true, &mut *heap.0)?;
             if !allowed(&table, caller, super_user, false) {
-                return Err(badarg_cause("access"));
+                return Err(badarg_cause(&mut *heap.0, "access"));
             }
             if matches!(function, EtsBif::Select | EtsBif::SelectReverse)
                 && *spec == Term::NIL
@@ -3176,7 +3299,7 @@ fn call_inner(
             } else {
                 MatchProgram::from_pattern(*spec, function == EtsBif::MatchObject)
             }
-            .map_err(err)?;
+            .map_err(|error| err(&mut *heap.0, error))?;
             let values = if function == EtsBif::Match {
                 table.match_pattern(*spec, &mut heap)
             } else if function == EtsBif::MatchObject {
@@ -3184,7 +3307,7 @@ fn call_inner(
             } else {
                 table.select(&program, function == EtsBif::SelectReverse, &mut heap)
             }
-            .map_err(err)?;
+            .map_err(|error| err(&mut *heap.0, error))?;
             TermBuilder::new(&mut heap)
                 .list_from_iter(values)
                 .map_err(|_| badarg())
@@ -3193,7 +3316,9 @@ fn call_inner(
             // Port of erts/emulator/beam/erl_db.c
             // (ets_match_spec_compile_1), OTP-29.1.1. The program lifetime follows
             // the magic reference through the process heap and its garbage collector.
-            let program = Arc::new(MatchProgram::compile(*spec).map_err(err)?);
+            let program = Arc::new(
+                MatchProgram::compile(*spec).map_err(|error| err(&mut *heap.0, error))?,
+            );
             let payload_size = program.erts_magic_payload_size();
             TermBuilder::new(&mut heap)
                 .magic_ref(MagicBin::with_erts_payload_size_and_refn(
@@ -3221,7 +3346,7 @@ fn call_inner(
             let id = rt.next_ref();
             let reference = Term::local_ref(&mut heap, arinsal_sched::unique::ordinary_ref_words(id))
                 .map_err(|_| badarg())?;
-            let tables = live_table_terms(&registry, &mut heap)?;
+            let tables = live_table_terms(&registry, &mut *heap.0)?;
             let table_list = TermBuilder::new(&mut heap)
                 .list_from_iter(tables)
                 .map_err(|_| badarg())?;
@@ -3252,7 +3377,10 @@ fn call_inner(
             let objects = list(*objects).ok_or_else(badarg)?;
             let mut matched = Vec::new();
             for object in objects {
-                if let Some(result) = program.run(object, &mut heap).map_err(err)? {
+                if let Some(result) = program
+                    .run(object, &mut heap)
+                    .map_err(|error| err(&mut *heap.0, error))?
+                {
                     matched.push(result);
                 }
             }
@@ -3269,29 +3397,32 @@ fn call_inner(
         // The BIF has no delete-all special case; `[]` returns 0 and a match spec deletes.
         | (EtsBif::InternalSelectDelete, [target, spec])
         | (EtsBif::SelectReplace, [target, spec]) => {
-            let tid = handle(&registry, *target)?;
+            let tid = handle(&mut *heap.0, &registry, *target)?;
             if function == EtsBif::SelectReplace
                 && registry
                     .shared(tid)
-                    .map_err(err)?
+                    .map_err(|error| err(&mut *heap.0, error))?
                     .options()
                     .write_concurrency
                     != WriteConcurrency::Disabled
             {
-                let table = registry.get_shared(tid).map_err(err)?;
+                let table = registry
+                    .get_shared(tid)
+                    .map_err(|error| err(&mut *heap.0, error))?;
                 if !allowed(&table, caller, super_user, true) {
-                    return Err(badarg_cause("access"));
+                    return Err(badarg_cause(&mut *heap.0, "access"));
                 }
                 if table.options.table_type == TableType::Bag {
-                    return Err(badarg_cause("table_type"));
+                    return Err(badarg_cause(&mut *heap.0, "table_type"));
                 }
                 if *spec == Term::NIL {
                     return Term::small(0).ok_or_else(badarg);
                 }
-                let program = MatchProgram::compile(*spec).map_err(err)?;
+                let program = MatchProgram::compile(*spec)
+                    .map_err(|error| err(&mut *heap.0, error))?;
                 if let Some(count) = table
                     .select_replace_key_shared(&program)
-                    .map_err(err)?
+                    .map_err(|error| err(&mut *heap.0, error))?
                 {
                     return TermBuilder::new(&mut heap)
                         .int_from_i128(count as i128)
@@ -3299,46 +3430,56 @@ fn call_inner(
                 }
             }
             if function == EtsBif::SelectCount {
-                let table = registry.get_shared(tid).map_err(err)?;
+                let table = registry
+                    .get_shared(tid)
+                    .map_err(|error| err(&mut *heap.0, error))?;
                 if !allowed(&table, caller, super_user, false) {
-                    return Err(badarg_cause("access"));
+                    return Err(badarg_cause(&mut *heap.0, "access"));
                 }
                 if *spec == Term::NIL {
                     return Term::small(0).ok_or_else(badarg);
                 }
-                let program = MatchProgram::compile(*spec).map_err(err)?;
-                let count = table.select_count(&program).map_err(err)?;
+                let program = MatchProgram::compile(*spec)
+                    .map_err(|error| err(&mut *heap.0, error))?;
+                let count = table
+                    .select_count(&program)
+                    .map_err(|error| err(&mut *heap.0, error))?;
                 return TermBuilder::new(&mut heap)
                     .int_from_i128(count as i128)
                     .map_err(|_| badarg());
             }
-            let mut table = registry.get_mut(tid).map_err(err)?;
+            let mut table = registry
+                .get_mut(tid)
+                .map_err(|error| err(&mut *heap.0, error))?;
             if !allowed(&table, caller, super_user, function != EtsBif::SelectCount) {
-                return Err(badarg_cause("access"));
+                return Err(badarg_cause(&mut *heap.0, "access"));
             }
             // Port of erts/emulator/beam/erl_db.c (ets_select_replace_2), OTP-29.1.1.
             if function == EtsBif::SelectReplace && table.options.table_type == TableType::Bag {
-                return Err(badarg_cause("table_type"));
+                return Err(badarg_cause(&mut *heap.0, "table_type"));
             }
             if *spec == Term::NIL {
                 return Term::small(0).ok_or_else(badarg);
             }
-            let program = MatchProgram::compile(*spec).map_err(err)?;
+            let program = MatchProgram::compile(*spec)
+                .map_err(|error| err(&mut *heap.0, error))?;
             let count = match function {
                 EtsBif::SelectCount => table.select_count(&program),
                 EtsBif::InternalSelectDelete => table.select_delete(&program),
                 EtsBif::SelectReplace => table.select_replace(&program),
                 _ => unreachable!(),
             }
-            .map_err(err)?;
+            .map_err(|error| err(&mut *heap.0, error))?;
             TermBuilder::new(&mut heap)
                 .int_from_i128(count as i128)
                 .map_err(|_| badarg())
         }
         (EtsBif::LookupElement, [target, key, position])
         | (EtsBif::LookupElement, [target, key, position, _]) => {
-            let tid = handle(&registry, *target)?;
-            let table = registry.get_shared(tid).map_err(err)?;
+            let tid = handle(&mut *heap.0, &registry, *target)?;
+            let table = registry
+                .get_shared(tid)
+                .map_err(|error| err(&mut *heap.0, error))?;
             lookup_element_locked(
                 &table,
                 arinsal_term::current_reader_group(),
@@ -3351,20 +3492,22 @@ fn call_inner(
         }
         (EtsBif::UpdateElement, [target, key, updates])
         | (EtsBif::UpdateElement, [target, key, updates, _]) => {
-            let tid = handle(&registry, *target)?;
+            let tid = handle(&mut *heap.0, &registry, *target)?;
             if registry
                 .shared(tid)
-                .map_err(err)?
+                .map_err(|error| err(&mut *heap.0, error))?
                 .options()
                 .write_concurrency
                 != WriteConcurrency::Disabled
             {
-                let table = registry.get_shared(tid).map_err(err)?;
+                let table = registry
+                    .get_shared(tid)
+                    .map_err(|error| err(&mut *heap.0, error))?;
                 if table.options.table_type == TableType::Set {
                     if !allowed(&table, caller, super_user, true) {
-                        return Err(badarg_cause("access"));
+                        return Err(badarg_cause(&mut *heap.0, "access"));
                     }
-                    let default = default_object(&table, args.get(3).copied())?;
+                    let default = default_object(&mut *heap.0, &table, args.get(3).copied())?;
                     let parsed = update_list(*updates, |entry| {
                         match tuple_items(entry)?.as_slice() {
                             [position_term, value] => Some((position(*position_term)?, *value)),
@@ -3374,15 +3517,17 @@ fn call_inner(
                     return Ok(boolean_term(
                         table
                             .update_element_shared(*key, &parsed, default)
-                            .map_err(err)?,
+                            .map_err(|error| err(&mut *heap.0, error))?,
                     ));
                 }
             }
-            let mut table = registry.get_mut(tid).map_err(err)?;
+            let mut table = registry
+                .get_mut(tid)
+                .map_err(|error| err(&mut *heap.0, error))?;
             if !allowed(&table, caller, super_user, true) {
-                return Err(badarg_cause("access"));
+                return Err(badarg_cause(&mut *heap.0, "access"));
             }
-            let default = default_object(&table, args.get(3).copied())?;
+            let default = default_object(&mut *heap.0, &table, args.get(3).copied())?;
             // Port of erts/emulator/beam/erl_db.c (do_update_element), OTP-29.1.1:
             // a malformed `{Pos, Value}` fails only after the key lookup.
             let parsed = update_list(*updates, |entry| match tuple_items(entry)?.as_slice() {
@@ -3391,28 +3536,30 @@ fn call_inner(
             });
             let updated = table
                 .update_element(*key, &parsed, default)
-                .map_err(err)?;
+                .map_err(|error| err(&mut *heap.0, error))?;
             Ok(boolean_term(updated))
         }
         (EtsBif::UpdateCounter, [target, key, operation])
         | (EtsBif::UpdateCounter, [target, key, operation, _]) => {
-            let tid = handle(&registry, *target)?;
+            let tid = handle(&mut *heap.0, &registry, *target)?;
             if registry
                 .shared(tid)
-                .map_err(err)?
+                .map_err(|error| err(&mut *heap.0, error))?
                 .options()
                 .write_concurrency
                 != WriteConcurrency::Disabled
             {
-                let table = registry.get_shared(tid).map_err(err)?;
+                let table = registry
+                    .get_shared(tid)
+                    .map_err(|error| err(&mut *heap.0, error))?;
                 if matches!(
                     table.options.table_type,
                     TableType::Set | TableType::OrderedSet
                 ) {
                     if !allowed(&table, caller, super_user, true) {
-                        return Err(badarg_cause("access"));
+                        return Err(badarg_cause(&mut *heap.0, "access"));
                     }
-                    let default = default_object(&table, args.get(3).copied())?;
+                    let default = default_object(&mut *heap.0, &table, args.get(3).copied())?;
                     let single = integer(*operation).is_some()
                         || operation.classify() == TermKind::Tuple;
                     if let Some((operations, _)) =
@@ -3450,7 +3597,7 @@ fn call_inner(
                     };
                     let values = table
                         .update_counter_big_shared(*key, &operations, default, &mut heap)
-                        .map_err(err)?
+                        .map_err(|error| err(&mut *heap.0, error))?
                         .ok_or_else(badarg)?;
                     return if single {
                         values.first().copied().ok_or_else(badarg)
@@ -3459,11 +3606,13 @@ fn call_inner(
                     };
                 }
             }
-            let mut table = registry.get_mut(tid).map_err(err)?;
+            let mut table = registry
+                .get_mut(tid)
+                .map_err(|error| err(&mut *heap.0, error))?;
             if !allowed(&table, caller, super_user, true) {
-                return Err(badarg_cause("access"));
+                return Err(badarg_cause(&mut *heap.0, "access"));
             }
-            let default = default_object(&table, args.get(3).copied())?;
+            let default = default_object(&mut *heap.0, &table, args.get(3).copied())?;
             if let Some((operations, single)) = small_counter_ops(table.options.keypos, *operation)
                 && let Some(values) = table.update_counter_in_place(*key, &operations)
             {
@@ -3499,7 +3648,7 @@ fn call_inner(
             };
             let values = table
                 .update_counter_big(*key, &operations, default, &mut heap)
-                .map_err(err)?;
+                .map_err(|error| err(&mut *heap.0, error))?;
             if single {
                 values.first().copied().ok_or_else(badarg)
             } else {

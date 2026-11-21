@@ -7,10 +7,10 @@
 //! that passes no thread progress point, or an unmanaged thread that delays progress. The
 //! slot's reference is dropped by a later operation once every managed thread passed a point.
 //!
-//! Every `unsafe` of this kind of table is in this module (the process table's is in
-//! `proc_ref.rs`); users get a safe API.
+//! Every `unsafe` of this kind of table is in `thr_progress/raw.rs`; users get a safe API.
 
-use crate::thr_progress::{self, DelayHandle, LaterOp, ThrProgress};
+use crate::thr_progress::{self, DelayHandle, ThrProgress, raw};
+use crate::{Scheduler, Task};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
@@ -57,8 +57,9 @@ impl Drop for Delay<'_> {
     }
 }
 
-/// One slot of a table: null, or the address of an `Arc<T>` the slot holds a reference to.
-pub struct ProgressSlot<T: Send + Sync + 'static>(AtomicPtr<T>);
+/// One slot of a table: null, or a slot-owned header holding an `Arc<T>` reference and the
+/// later-op node (`ptab_el->u.release`).
+pub struct ProgressSlot<T: Send + Sync + 'static>(AtomicPtr<raw::ProgressHeld<T>>);
 
 impl<T: Send + Sync + 'static> Default for ProgressSlot<T> {
     fn default() -> Self {
@@ -80,17 +81,21 @@ impl<T: Send + Sync + 'static> ProgressSlot<T> {
     /// Publish `value` in the empty slot; the slot keeps the reference. A value that was in
     /// the slot is released like a removed one (at once without a `progress` domain, where no
     /// reader can exist).
-    pub fn store(&self, value: Arc<T>, progress: Option<&Progress>) {
-        let old = self
+    pub fn store(&self, value: Arc<T>) {
+        let held = raw::alloc_progress_held(Arc::into_raw(value));
+        if self
             .0
-            .swap(Arc::into_raw(value).cast_mut(), Ordering::AcqRel);
-        if !old.is_null() {
-            match progress {
-                Some(progress) => schedule_release::<T>(old, progress),
-                // SAFETY: `old` carries the slot's reference; without a progress domain nothing
-                // reads the table concurrently.
-                None => drop(unsafe { Arc::from_raw(old) }),
-            }
+            .compare_exchange(
+                std::ptr::null_mut(),
+                held,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            // `erts_ptab_new_element` publishes only into an empty slot.
+            raw::drop_progress_held(held);
+            panic!("ProgressSlot store requires an empty slot");
         }
     }
 
@@ -112,16 +117,11 @@ impl<T: Send + Sync + 'static> ProgressSlot<T> {
     /// [`ProgressSlot::with`] for a managed thread: a bare load of the slot, which needs no
     /// progress domain (`erts_ptab_pix2intptr_ddrb` is a load and nothing else).
     pub fn with_managed<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
-        let raw = self.0.load(Ordering::Acquire);
-        if raw.is_null() {
+        let held = self.0.load(Ordering::Acquire);
+        if held.is_null() {
             return None;
         }
-        // SAFETY: `raw` came from `Arc::into_raw` and the slot owns that reference. Dropping it
-        // is deferred by `schedule_release` until every managed thread passed a progress point
-        // after the slot was cleared; the caller is a managed thread that passes none, or an
-        // unmanaged one that delays progress (`with`), until `f` returns, so the element
-        // outlives the borrow.
-        Some(f(unsafe { &*raw }))
+        Some(f(raw::progress_held_value(held)))
     }
 
     /// A counted reference to the element, for a caller that keeps it.
@@ -137,64 +137,48 @@ impl<T: Send + Sync + 'static> ProgressSlot<T> {
         keep: impl FnOnce(&T) -> bool,
     ) -> Option<Arc<T>> {
         let _delay = Delay::begin(&progress.0, managed);
-        let raw = self.0.load(Ordering::Acquire);
-        if raw.is_null() {
+        let held = self.0.load(Ordering::Acquire);
+        if held.is_null() {
             return None;
         }
-        // SAFETY: as in `with`, the element is alive during the delay.
-        if !keep(unsafe { &*raw }) {
+        let value = raw::progress_held_value(held);
+        if !keep(value) {
             return None;
         }
-        // SAFETY: as in `with`, the element is alive during the delay, and `raw` is the
-        // address of an `Arc<T>` whose strong count the slot holds, so taking one more is sound.
-        Some(unsafe {
-            Arc::increment_strong_count(raw);
-            Arc::from_raw(raw)
-        })
+        Some(raw::progress_held_clone_arc(held))
     }
 
     /// Empty the slot and return a reference to the element; the slot's own reference is
     /// released after thread progress (`erts_ptab_delete_element`).
-    pub fn take(&self, progress: &Progress) -> Option<Arc<T>> {
-        let raw = self.0.swap(std::ptr::null_mut(), Ordering::AcqRel);
-        if raw.is_null() {
+    pub fn take<S: Task>(&self, scheduler: &Scheduler<S>) -> Option<Arc<T>> {
+        let (taken, args) = self.take_deferred()?;
+        scheduler.schedule_later_op_args(args);
+        Some(taken)
+    }
+
+    /// Empty the slot and return the table reference plus the call arguments for
+    /// `erts_schedule_thr_prgr_later_cleanup_op` to its scheduler-owned caller.
+    pub(crate) fn take_deferred(&self) -> Option<(Arc<T>, raw::LaterOpArgs)> {
+        let held = self.0.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if held.is_null() {
             return None;
         }
-        // SAFETY: the swap took the slot's reference out of the slot; it is still alive (it is
-        // released only by the later operation scheduled below), so another count can be taken.
-        let taken = unsafe {
-            Arc::increment_strong_count(raw);
-            Arc::from_raw(raw)
+        let taken = raw::progress_held_clone_arc(held);
+        let args = raw::LaterOpArgs {
+            func: raw::release_progress_held::<T>,
+            data: held.cast(),
+            lop: raw::progress_held_lop(held),
+            size: Some(std::mem::size_of::<raw::ProgressHeld<T>>()),
         };
-        schedule_release::<T>(raw, progress);
-        Some(taken)
+        Some((taken, args))
     }
 }
 
 impl<T: Send + Sync + 'static> Drop for ProgressSlot<T> {
     fn drop(&mut self) {
-        let raw = *self.0.get_mut();
-        if !raw.is_null() {
-            // SAFETY: `&mut self` means no reader exists; `raw` carries the slot's reference.
-            drop(unsafe { Arc::from_raw(raw) });
+        let held = *self.0.get_mut();
+        if !held.is_null() {
+            raw::drop_progress_held(held);
         }
     }
-}
-
-/// Drop the slot's reference to the element at `raw` once thread progress has passed.
-fn schedule_release<T: Send + Sync + 'static>(raw: *mut T, progress: &Progress) {
-    thr_progress::schedule_later_op(
-        &progress.0,
-        LaterOp::Cleanup {
-            release: release::<T>,
-            data: raw as usize,
-            size: std::mem::size_of::<T>(),
-        },
-    );
-}
-
-fn release<T: Send + Sync + 'static>(data: usize) {
-    // SAFETY: `data` is a pointer scheduled by `schedule_release`, which came from
-    // `Arc::into_raw` and carries the slot's reference; a later operation runs once.
-    drop(unsafe { Arc::from_raw(data as *const T) });
 }

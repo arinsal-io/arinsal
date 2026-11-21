@@ -1,16 +1,10 @@
 //! AArch64 emitters for BEAM bit syntax matching.
+//!
+//! Port of erts/emulator/beam/jit/arm/instr_bs.cpp and beam_jit_bs.cpp, OTP-29.1.1.
 
-use super::beam_asm::is_register_backed;
+use super::beam_asm::{NUM_REGISTER_BACKED_XREGS, is_register_backed};
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
 use arinsal_a64::enc::{Cond, Gpr};
-
-/// Runtime slow path for operations that allocate a term or decode variable-width fields.
-pub type BsMatchHelper = extern "C" fn(*mut crate::ProcessHeader, u32, u64, u64, u64) -> u64;
-/// Runtime hook for the `bs_match` commands that decode fields (integer, binary, tail, `=:=`).
-/// Arguments: the command kind, then the live X register count; the operands are staged in
-/// [`crate::SchedulerRegisters::match_staging`]. Zero means the match failed.
-/// The last argument is `reg` (x19), whose staging slots hold the command's operands.
-pub type BsMatchCmdHelper = extern "C" fn(*mut crate::ProcessHeader, u64, u64, *mut u64) -> u64;
 /// Words of a `SUB_BITS` object (erts/emulator/beam/erl_bits.h, ERL_SUB_BITS_SIZE).
 const ERL_SUB_BITS_SIZE: u32 = 5;
 /// Heap words for an extracted bitstring: a sub-bitstring, or an on-heap copy of at most
@@ -25,56 +19,60 @@ const TMP: Gpr = Gpr::x(9);
 /// Field size in bits; the context cursor loads may use `TMP` as scratch.
 const FIELD_BITS: Gpr = Gpr::x(12);
 
+/// Emits a direct `runtime_call<erts function>()` with the C ABI argument registers.
+// Port of erts/emulator/beam/jit/arm/beam_asm.hpp (`runtime_call`), OTP-29.1.1.
+pub(super) fn emit_bs_runtime_call(
+    asm: &mut BeamModuleAssembler,
+    target: usize,
+    live: usize,
+    update: crate::Update,
+    args: &[Gpr],
+) -> Result<(), ModuleError> {
+    if args.len() > 8 {
+        return Err(ModuleError::InvalidOperand(
+            "too many bit-syntax runtime arguments",
+        ));
+    }
+    crate::emit_enter_runtime(&mut asm.code, live, update)?;
+    asm.code.emit(|e| {
+        let mut copies = args
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, source)| (Gpr::x(index as u8), source))
+            .filter(|(destination, source)| destination != source)
+            .collect::<Vec<_>>();
+        while !copies.is_empty() {
+            if let Some(index) = copies.iter().position(|(destination, _)| {
+                !copies.iter().any(|(_, source)| source == destination)
+            }) {
+                let (destination, source) = copies.remove(index);
+                e.mov_reg(destination, source)?;
+            } else {
+                let saved = copies[0].0;
+                e.mov_reg(Gpr::x(16), saved)?;
+                for (_, source) in &mut copies {
+                    if *source == saved {
+                        *source = Gpr::x(16);
+                    }
+                }
+            }
+        }
+        e.str_uoff(Gpr::x(30), Gpr::x(21), 72)?;
+        e.mov_const(Gpr::x(17), target as u64)?;
+        e.blr(Gpr::x(17))
+    })?;
+    crate::emit_leave_runtime(&mut asm.code, live, update)?;
+    asm.code.emit(|e| e.ldr_uoff(Gpr::x(30), Gpr::x(21), 72))?;
+    Ok(())
+}
+
 impl BeamModuleAssembler {
     /// Resolves a `bs_match` flags operand through the module's literal table.
     // Port of erts/emulator/beam/jit/beam_jit_bs.cpp:255-285 (bs_get_flags), OTP-29.1.1.
     pub fn bs_get_flags(&self, value: ArgVal) -> Result<u64, ModuleError> {
         crate::common::bs::beam_jit_bs_get_flags(value, &|index| self.beamfile_get_literal(index))
             .map_err(ModuleError::InvalidOperand)
-    }
-
-    /// Runs one field-decoding `bs_match` command through the runtime.
-    ///
-    /// `staged` holds the match context and the command's operands as terms; the collector
-    /// sees them as roots. A zero result branches to `fail`; a pending exception propagates.
-    // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:2910-3210 (emit_i_bs_match_test_heap), OTP-29.1.1.
-    pub fn emit_bs_match_command(
-        &mut self,
-        kind: u32,
-        live: u32,
-        staged: &[ArgVal],
-        fail: u32,
-        dst: Option<ArgVal>,
-        helper: BsMatchCmdHelper,
-    ) -> Result<(), ModuleError> {
-        let staging = crate::arm::beam_asm::MATCH_STAGING_REF;
-        for (index, operand) in staged.iter().copied().enumerate() {
-            let register = self.source_reg(operand)?;
-            let offset = staging + index as u32 * 8;
-            self.code
-                .emit(|e| e.str_uoff(register, Gpr::x(19), offset))?;
-        }
-        let update = crate::Update::HEAP_ALLOC
-            .union(crate::Update::X_REGS)
-            .union(crate::Update::REDUCTIONS);
-        crate::emit_enter_runtime(&mut self.code, live as usize, update)?;
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(0), Gpr::x(21))?;
-            e.mov_const(Gpr::x(1), u64::from(kind))?;
-            e.mov_const(Gpr::x(2), u64::from(live))?;
-            crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(3))?;
-            Ok(())
-        })?;
-        self.fragment_call(helper as usize)?;
-        crate::emit_leave_runtime(&mut self.code, 6, update)?;
-        self.code.emit(|e| e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40))?;
-        self.error_if_nonzero(Gpr::x(9))?;
-        let fail = self.label(fail);
-        self.code.cbz(Gpr::x(0), fail)?;
-        if let Some(dst) = dst {
-            self.store_register(dst, Gpr::x(0))?;
-        }
-        Ok(())
     }
 
     /// Checks heap space for a match allocation while keeping the match context alive.
@@ -88,105 +86,24 @@ impl BeamModuleAssembler {
         need: u32,
         live: u32,
         ctx: ArgVal,
-        hook: crate::construct::GcHook,
     ) -> Result<(), ModuleError> {
         let index = match ctx {
             ArgVal::X(index) => index,
-            _ => return self.emit_test_heap(need, live, hook),
+            _ => return self.emit_test_heap(need, live),
         };
         if index < live {
-            return self.emit_test_heap(need, live, hook);
+            return self.emit_test_heap(need, live);
         }
         let parked = ArgVal::X(live);
         let value = self.source_reg(ctx)?;
         self.store_x(parked, value)?;
-        self.emit_test_heap(need, live + 1, hook)?;
+        self.emit_test_heap(need, live + 1)?;
         let value = self.source_reg(parked)?;
         self.store_x(ctx, value)
     }
 
     fn store_x(&mut self, dst: ArgVal, src: Gpr) -> Result<(), ModuleError> {
         self.store_operand(dst, src)
-    }
-
-    fn emit_bs_runtime_hook(
-        &mut self,
-        helper: usize,
-        args: &[Gpr],
-        live: usize,
-        update: crate::Update,
-    ) -> Result<(), ModuleError> {
-        if args.len() > 5 {
-            return Err(ModuleError::InvalidOperand(
-                "runtime hook has too many arguments",
-            ));
-        }
-        crate::emit_enter_runtime(&mut self.code, live, update)?;
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(0), Gpr::x(21))?;
-            for (index, arg) in args.iter().copied().enumerate() {
-                e.mov_reg(Gpr::x(index as u8 + 1), arg)?;
-            }
-            Ok(())
-        })?;
-        self.fragment_call(helper)?;
-        crate::emit_leave_runtime(&mut self.code, live, update)?;
-        self.code.emit(|e| e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40))?;
-        self.error_if_nonzero(Gpr::x(9))?;
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn emit_bs_helper(
-        &mut self,
-        op: u32,
-        ctx: ArgVal,
-        size: ArgVal,
-        unit: u32,
-        dst: Option<ArgVal>,
-        fail: Option<u32>,
-        helper: BsMatchHelper,
-    ) -> Result<(), ModuleError> {
-        let ctx = self.source_reg(ctx)?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(2), ctx))?;
-        let live = if op == 0 {
-            self.constant_word(size).map_or(0, |value| value as usize)
-        } else {
-            6
-        };
-        let size = self.source_reg(size)?;
-        self.code.emit(|e| {
-            e.mov_const(Gpr::x(1), u64::from(op))?;
-            e.mov_reg(Gpr::x(3), size)?;
-            e.mov_const(Gpr::x(4), u64::from(unit))
-        })?;
-        // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:175-182, OTP-29.1.1.
-        // `start_match` may collect (it needs two words for the context), and a collection
-        // moves the stack together with the heap, so the stack pointer is reloaded as well.
-        let update = if op == 0 {
-            crate::Update::HEAP_ALLOC
-        } else {
-            crate::Update::HEAP_ALLOC
-                .union(crate::Update::REDUCTIONS)
-                .union(crate::Update::X_REGS)
-        };
-        self.emit_bs_runtime_hook(
-            helper as usize,
-            &[Gpr::x(1), Gpr::x(2), Gpr::x(3), Gpr::x(4)],
-            live,
-            update,
-        )?;
-        // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:142-163, OTP-29.1.1:
-        // `{f,0}` means the compiler proved this match cannot fail.
-        if let Some(label) = fail.filter(|label| *label != 0) {
-            let label = self.label(label);
-            self.code.cbz(Gpr::x(0), label)?;
-        }
-        if let Some(dst) = dst {
-            // The helper result must not pass through X0: it may hold the match context.
-            self.store_register(dst, Gpr::x(0))?;
-        }
-        Ok(())
     }
 
     fn cursor(&mut self, ctx: ArgVal) -> Result<(), ModuleError> {
@@ -218,33 +135,25 @@ impl BeamModuleAssembler {
         bits: u16,
         fail: u32,
         dst: ArgVal,
-        helper: BsMatchHelper,
     ) -> Result<(), ModuleError> {
-        self.cursor(ctx)?;
+        let context = self.source_reg(ctx)?;
         self.code.emit(|e| {
-            e.sub_reg(TMP, END, START, arinsal_a64::enc::Shift::Lsl, 0)?;
-            e.cmp_imm(TMP, bits, false)
+            e.and_imm(CTX, context, !7)?;
+            e.mov_const(Gpr::x(10), u64::from(bits))?;
+            e.mov_const(Gpr::x(9), 0)
         })?;
-        let enough = self.code.new_label();
-        self.code.b_cond(Cond::Cs, enough)?;
-        let fail_label = self.label(fail);
-        self.code.b(fail_label)?;
-        self.code.bind(enough)?;
-        self.code.emit(|e| e.ldr_uoff(Gpr::x(10), CTX, 8))?;
-        self.code
-            .emit(|e| e.cmp_reg(Gpr::x(10), Gpr::x(10), arinsal_a64::enc::Shift::Lsl, 0))?;
-        let aligned = self.code.new_label();
-        self.code.b_cond(Cond::Eq, aligned)?;
-        self.code.bind(aligned)?;
-        self.emit_bs_helper(
-            u32::from(bits),
-            ctx,
-            ArgVal::Immediate(u64::from(bits)),
-            1,
-            Some(dst),
-            Some(fail),
-            helper,
-        )
+        emit_bs_runtime_call(
+            self,
+            crate::raw::erts_bs_get_integer_2 as *const () as usize,
+            0,
+            crate::Update::NONE,
+            &[Gpr::x(21), Gpr::x(10), Gpr::x(9), CTX],
+        )?;
+        if fail != 0 {
+            let fail = self.label(fail);
+            self.code.cbz(Gpr::x(0), fail)?;
+        }
+        self.store_register(dst, Gpr::x(0))
     }
 
     /// Creates or reuses a `SUB_BITS` match context.
@@ -255,17 +164,11 @@ impl BeamModuleAssembler {
         live: u32,
         fail: u32,
         dst: ArgVal,
-        helper: BsMatchHelper,
-        gc_hook: crate::construct::GcHook,
     ) -> Result<(), ModuleError> {
-        // Reuse an existing match context. A plain bitstring falls through to
-        // erts_bs_start_match_3, which allocates a fresh context.
         let next = self.code.new_label();
         let hit = self.code.new_label();
         let src_reg = self.source_reg_into(src, Gpr::x(8))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(8), src_reg))?;
-        // Port of instr_bs.cpp:142-146: `{f,0}` skips the box test; bit 0 rejects lists
-        // and immediates.
         if fail != 0 {
             let fail_label = self.label(fail);
             self.code.tbnz(Gpr::x(8), 0, fail_label)?;
@@ -279,9 +182,6 @@ impl BeamModuleAssembler {
         })?;
         self.code.b_cond(Cond::Eq, hit)?;
         if fail != 0 {
-            // Anything that is not a bitstring header fails here, before any GC test or
-            // runtime call; the helper is only for bitstring-shaped sources.
-            // Port of instr_bs.cpp:157-166 (mask _BITSTRING_TAG_MASK & ~_TAG_PRIMARY_MASK), OTP-29.1.1.
             let fail_label = self.label(fail);
             self.code.emit(|e| {
                 e.and_imm(Gpr::x(9), Gpr::x(10), 0x38)?;
@@ -289,79 +189,21 @@ impl BeamModuleAssembler {
             })?;
             self.code.b_cond(Cond::Ne, fail_label)?;
         }
-        // Plain sub-bitstrings and heap bitstrings become five-word match contexts inline.
-        // Writable binaries still go through erts_bs_start_match_3.
-        // Port of erts/emulator/beam/erl_bits.c:81-104 (erts_bs_start_match_3), OTP-29.1.1.
-        let sub_bits = self.code.new_label();
-        let heap_bits = self.code.new_label();
-        let plain = self.code.new_label();
-        self.code.emit(|e| {
-            e.and_imm(Gpr::x(9), Gpr::x(10), 63)?;
-            e.cmp_imm(Gpr::x(9), 0x24, false)
-        })?;
-        self.code.b_cond(Cond::Eq, sub_bits)?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(9), 0x20, false))?;
-        self.code.b_cond(Cond::Eq, heap_bits)?;
-        self.code.b(plain)?;
-        self.code.bind(sub_bits)?;
-        self.code.emit(|e| e.tst_imm(Gpr::x(12), 3))?;
-        self.code.b_cond(Cond::Ne, plain)?;
-        self.emit_gc_test_preserve(ERL_SUB_BITS_SIZE, live, src, gc_hook)?;
+        // erts delegates construction of all fresh contexts to its ErlBits implementation.
+        // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:134-190.
+        self.emit_gc_test_preserve(ERL_SUB_BITS_SIZE, live, src)?;
         let src_reg = self.source_reg_into(src, Gpr::x(8))?;
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(8), src_reg)?;
-            e.and_imm(CTX, Gpr::x(8), !7)?;
-            e.ldp(Gpr::x(12), START, CTX, 8)?;
-            e.ldp(END, Gpr::x(9), CTX, 24)?;
-            e.orr_imm(Gpr::x(12), Gpr::x(12), 1)?;
-            e.mov_const(Gpr::x(10), 0x124)?;
-            e.mov_reg(Gpr::x(8), Gpr::x(23))?;
-            e.stp(Gpr::x(10), Gpr::x(12), Gpr::x(8), 0)?;
-            e.stp(START, END, Gpr::x(8), 16)?;
-            e.str_uoff(Gpr::x(9), Gpr::x(8), 32)?;
-            e.add_imm(Gpr::x(23), Gpr::x(8), 40, false)?;
-            e.orr_imm(Gpr::x(8), Gpr::x(8), 2)
-        })?;
-        self.store_register(dst, Gpr::x(8))?;
-        self.code.b(next)?;
-        self.code.bind(heap_bits)?;
-        // Heap bitstrings already hold their data and bit length in the first object. Pin
-        // those fields in a SUB_BITS context directly, after reserving its five words.
-        // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:134-190 and
-        // erts/emulator/beam/erl_bits.c:81-104 (erts_bs_start_match_3), OTP-29.1.1.
-        self.emit_gc_test_preserve(ERL_SUB_BITS_SIZE, live, src, gc_hook)?;
-        let src_reg = self.source_reg_into(src, Gpr::x(8))?;
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(8), src_reg)?;
-            e.and_imm(CTX, Gpr::x(8), !7)?;
-            e.ldr_uoff(END, CTX, 8)?;
-            e.add_imm(Gpr::x(12), CTX, 16, false)?;
-            e.orr_imm(Gpr::x(12), Gpr::x(12), 1)?;
-            e.mov_const(Gpr::x(10), 0x124)?;
-            e.mov_reg(Gpr::x(9), Gpr::x(23))?;
-            e.stp(Gpr::x(10), Gpr::x(12), Gpr::x(9), 0)?;
-            e.mov_const(START, 0)?;
-            e.stp(START, END, Gpr::x(9), 16)?;
-            e.str_uoff(Gpr::x(8), Gpr::x(9), 32)?;
-            e.add_imm(Gpr::x(23), Gpr::x(9), 40, false)?;
-            e.orr_imm(Gpr::x(9), Gpr::x(9), 2)
-        })?;
-        self.store_register(dst, Gpr::x(9))?;
-        self.code.b(next)?;
-        self.code.bind(plain)?;
-        // OTP ensures space before entering the heap-only runtime call.
-        // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:170-182, OTP-29.1.1.
-        self.emit_gc_test_preserve(ERL_SUB_BITS_SIZE, live, src, gc_hook)?;
-        self.emit_bs_helper(
-            0,
-            src,
-            ArgVal::Immediate(u64::from(live)),
-            0,
-            Some(dst),
-            // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:134-186, OTP-29.1.1.
-            (fail != 0).then_some(fail),
-            helper,
+        self.code.emit(|e| e.mov_reg(Gpr::x(8), src_reg))?;
+        emit_bs_runtime_call(
+            self,
+            crate::raw::erts_bs_start_match_3 as *const () as usize,
+            live as usize,
+            crate::Update::HEAP,
+            &[Gpr::x(21), Gpr::x(8)],
         )?;
+        self.code
+            .emit(|e| e.add_imm(Gpr::x(0), Gpr::x(0), 2, false))?;
+        self.store_register(dst, Gpr::x(0))?;
         self.code.b(next)?;
         self.code.bind(hit)?;
         self.store_register(dst, Gpr::x(8))?;
@@ -371,12 +213,7 @@ impl BeamModuleAssembler {
 
     /// Reads the current bit position into a destination term.
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:236-255, OTP-29.1.1.
-    pub fn emit_i_bs_get_position(
-        &mut self,
-        ctx: ArgVal,
-        dst: ArgVal,
-        _helper: BsMatchHelper,
-    ) -> Result<(), ModuleError> {
+    pub fn emit_i_bs_get_position(&mut self, ctx: ArgVal, dst: ArgVal) -> Result<(), ModuleError> {
         // One unscaled load of `start`. The position is tagged in a temporary so the
         // cursor registers stay available to the next command.
         // Port of instr_bs.cpp:244-252, OTP-29.1.1.
@@ -391,28 +228,12 @@ impl BeamModuleAssembler {
 
     /// Restores a saved match position.
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:371-384, OTP-29.1.1.
-    pub fn emit_i_bs_set_position(
-        &mut self,
-        ctx: ArgVal,
-        pos: ArgVal,
-        helper: BsMatchHelper,
-    ) -> Result<(), ModuleError> {
-        let slow = self.code.new_label();
-        let next = self.code.new_label();
+    pub fn emit_i_bs_set_position(&mut self, ctx: ArgVal, pos: ArgVal) -> Result<(), ModuleError> {
         let pos_reg = self.source_reg_into(pos, Gpr::x(8))?;
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(8), pos_reg)?;
-            e.and_imm(Gpr::x(10), Gpr::x(8), 0xf)?;
-            e.cmp_imm(Gpr::x(10), 0xf, false)
-        })?;
-        self.code.b_cond(Cond::Ne, slow)?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(8), pos_reg))?;
         self.cursor(ctx)?;
         self.code.emit(|e| e.lsr_imm(Gpr::x(8), Gpr::x(8), 4))?;
         self.code.emit(|e| e.str_uoff(Gpr::x(8), CTX, 16))?;
-        self.code.b(next)?;
-        self.code.bind(slow)?;
-        self.emit_bs_helper(4, ctx, pos, 0, None, None, helper)?;
-        self.code.bind(next)?;
         Ok(())
     }
 
@@ -547,17 +368,8 @@ impl BeamModuleAssembler {
         ctx: ArgVal,
         fail: u32,
         dst: ArgVal,
-        helper: BsMatchHelper,
     ) -> Result<(), ModuleError> {
-        self.cursor(ctx)?;
-        self.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(10), CTX, 8)?;
-            e.cmp_reg(Gpr::x(10), Gpr::x(10), arinsal_a64::enc::Shift::Lsl, 0)
-        })?;
-        let aligned = self.code.new_label();
-        self.code.b_cond(Cond::Eq, aligned)?;
-        self.code.bind(aligned)?;
-        self.fixed_integer_inline(ctx, 8, fail, dst, helper)
+        self.fixed_integer_inline(ctx, 8, fail, dst)
     }
     /// Inline aligned 16-bit integer extraction fast path.
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:257-311, OTP-29.1.1.
@@ -566,17 +378,8 @@ impl BeamModuleAssembler {
         ctx: ArgVal,
         fail: u32,
         dst: ArgVal,
-        helper: BsMatchHelper,
     ) -> Result<(), ModuleError> {
-        self.cursor(ctx)?;
-        self.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(10), CTX, 8)?;
-            e.cmp_reg(Gpr::x(10), Gpr::x(10), arinsal_a64::enc::Shift::Lsl, 0)
-        })?;
-        let aligned = self.code.new_label();
-        self.code.b_cond(Cond::Eq, aligned)?;
-        self.code.bind(aligned)?;
-        self.fixed_integer_inline(ctx, 16, fail, dst, helper)
+        self.fixed_integer_inline(ctx, 16, fail, dst)
     }
     /// Inline aligned 32-bit integer extraction fast path.
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:257-311, OTP-29.1.1.
@@ -585,17 +388,8 @@ impl BeamModuleAssembler {
         ctx: ArgVal,
         fail: u32,
         dst: ArgVal,
-        helper: BsMatchHelper,
     ) -> Result<(), ModuleError> {
-        self.cursor(ctx)?;
-        self.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(10), CTX, 8)?;
-            e.cmp_reg(Gpr::x(10), Gpr::x(10), arinsal_a64::enc::Shift::Lsl, 0)
-        })?;
-        let aligned = self.code.new_label();
-        self.code.b_cond(Cond::Eq, aligned)?;
-        self.code.bind(aligned)?;
-        self.fixed_integer_inline(ctx, 32, fail, dst, helper)
+        self.fixed_integer_inline(ctx, 32, fail, dst)
     }
     /// Extracts a general sized integer field.
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:312-359, OTP-29.1.1.
@@ -606,9 +400,98 @@ impl BeamModuleAssembler {
         bits: ArgVal,
         unit: u32,
         dst: ArgVal,
-        helper: BsMatchHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_bs_helper(5, ctx, bits, unit, Some(dst), Some(fail), helper)
+        let fail_label = self.label(fail);
+        if !self.emit_bs_field_size(bits, unit, fail_label)? {
+            return Ok(());
+        }
+        let context = self.source_reg_into(ctx, Gpr::x(9))?;
+        self.code.emit(|e| e.and_imm(CTX, context, !7))?;
+        emit_bs_runtime_call(
+            self,
+            crate::raw::erts_bs_get_integer_2 as *const () as usize,
+            0,
+            crate::Update::HEAP,
+            &[Gpr::x(21), FIELD_BITS, Gpr::xzr(), CTX],
+        )?;
+        self.code.cbz(Gpr::x(0), fail_label)?;
+        self.store_register(dst, Gpr::x(0))
+    }
+
+    /// Emits `bs_get_integer2` with the same small and allocating calls as erts.
+    // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:330-377, OTP-29.1.1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_bs_get_integer2(
+        &mut self,
+        ctx: ArgVal,
+        fail: u32,
+        live: u32,
+        size: ArgVal,
+        unit: u32,
+        mut flags: u64,
+        dst: ArgVal,
+    ) -> Result<(), ModuleError> {
+        const BSF_NATIVE: u64 = 16;
+        const BSF_LITTLE: u64 = 2;
+        if flags & BSF_NATIVE != 0 {
+            flags &= !BSF_NATIVE;
+            flags |= BSF_LITTLE;
+        }
+        let fail = self.label(fail);
+        if !self.emit_bs_field_size(size, unit, fail)? {
+            return Ok(());
+        }
+        let is_static_small = self
+            .constant_word(size)
+            .filter(|word| word & 0xf == 0xf)
+            .map(|word| (word as i64) >> 4)
+            .is_some_and(|size| {
+                (0..64).contains(&size) && (size as u64).saturating_mul(u64::from(unit)) < 64
+            });
+        if is_static_small {
+            let context = self.source_reg(ctx)?;
+            self.code.emit(|e| {
+                e.and_imm(CTX, context, !7)?;
+                e.mov_const(Gpr::x(10), flags)
+            })?;
+            emit_bs_runtime_call(
+                self,
+                crate::raw::erts_bs_get_integer_2 as *const () as usize,
+                live as usize,
+                crate::Update::NONE,
+                &[Gpr::x(21), FIELD_BITS, Gpr::x(10), CTX],
+            )?;
+            self.code.cbz(Gpr::x(0), fail)?;
+        } else {
+            let context = self.source_reg(ctx)?;
+            self.code.emit(|e| {
+                if context != Gpr::x(9) {
+                    e.mov_reg(Gpr::x(9), context)?;
+                }
+                crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(8))?;
+                e.mov_const(Gpr::x(10), flags)?;
+                e.mov_const(Gpr::x(11), u64::from(live))?;
+                Ok(())
+            })?;
+            emit_bs_runtime_call(
+                self,
+                crate::raw::beam_jit_bs_get_integer as *const () as usize,
+                live as usize,
+                crate::Update::HEAP_ALLOC
+                    .union(crate::Update::X_REGS)
+                    .union(crate::Update::REDUCTIONS),
+                &[
+                    Gpr::x(21),
+                    Gpr::x(8),
+                    Gpr::x(9),
+                    Gpr::x(10),
+                    FIELD_BITS,
+                    Gpr::x(11),
+                ],
+            )?;
+            self.code.cbz(Gpr::x(0), fail)?;
+        }
+        self.store_register(dst, Gpr::x(0))
     }
     /// Extracts a bitstring sub-binary with a unit constraint.
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:506-577, OTP-29.1.1.
@@ -621,12 +504,24 @@ impl BeamModuleAssembler {
         bits: ArgVal,
         unit: u32,
         dst: ArgVal,
-        helper: BsMatchHelper,
-        gc_hook: crate::construct::GcHook,
     ) -> Result<(), ModuleError> {
-        self.emit_gc_test_preserve(BUILD_SUB_BITSTRING_HEAP_NEED, live, ctx, gc_hook)?;
-        // Port of erts/emulator/beam/erl_bits.c:2635-2668 (erts_build_sub_bitstring), OTP-29.1.1.
-        self.emit_inline_get_binary(ctx, fail, bits, unit, dst, helper)
+        let fail_label = self.label(fail);
+        if !self.emit_bs_field_size(bits, unit, fail_label)? {
+            return Ok(());
+        }
+        self.emit_gc_test_preserve(BUILD_SUB_BITSTRING_HEAP_NEED, live, ctx)?;
+        let context = self.source_reg(ctx)?;
+        self.code.emit(|e| e.and_imm(CTX, context, !7))?;
+        self.emit_bs_field_size(bits, unit, fail_label)?;
+        emit_bs_runtime_call(
+            self,
+            crate::raw::erts_bs_get_binary_2 as *const () as usize,
+            live as usize,
+            crate::Update::HEAP,
+            &[Gpr::x(21), FIELD_BITS, CTX],
+        )?;
+        self.code.cbz(Gpr::x(0), fail_label)?;
+        self.store_register(dst, Gpr::x(0))
     }
     /// Extracts all remaining bits as a sub-binary.
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:386-405, OTP-29.1.1.
@@ -634,19 +529,42 @@ impl BeamModuleAssembler {
         &mut self,
         ctx: ArgVal,
         fail: u32,
+        live: u32,
         unit: u32,
         dst: ArgVal,
-        helper: BsMatchHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_bs_helper(
-            7,
-            ctx,
-            ArgVal::Immediate(0),
-            unit,
-            Some(dst),
-            Some(fail),
-            helper,
-        )
+        let fail_label = self.label(fail);
+        let context = self.source_reg(ctx)?;
+        self.code.emit(|e| {
+            e.and_imm(CTX, context, !7)?;
+            e.ldp(START, END, CTX, 16)?;
+            e.sub_reg(FIELD_BITS, END, START, arinsal_a64::enc::Shift::Lsl, 0)
+        })?;
+        if unit != 1 {
+            self.code.emit(|e| {
+                e.mov_const(Gpr::x(10), u64::from(unit))?;
+                e.udiv(Gpr::x(9), FIELD_BITS, Gpr::x(10))?;
+                e.msub(Gpr::x(9), Gpr::x(9), Gpr::x(10), FIELD_BITS)?;
+                e.cmp_imm(Gpr::x(9), 0, false)
+            })?;
+            self.code.b_cond(Cond::Ne, fail_label)?;
+        }
+        self.emit_gc_test_preserve(BUILD_SUB_BITSTRING_HEAP_NEED, live, ctx)?;
+        let context = self.source_reg(ctx)?;
+        self.code.emit(|e| {
+            e.and_imm(CTX, context, !7)?;
+            e.ldp(START, END, CTX, 16)?;
+            e.sub_reg(FIELD_BITS, END, START, arinsal_a64::enc::Shift::Lsl, 0)
+        })?;
+        emit_bs_runtime_call(
+            self,
+            crate::raw::erts_bs_get_binary_2 as *const () as usize,
+            live as usize,
+            crate::Update::HEAP,
+            &[Gpr::x(21), FIELD_BITS, CTX],
+        )?;
+        self.code.cbz(Gpr::x(0), fail_label)?;
+        self.store_register(dst, Gpr::x(0))
     }
     /// Compares fixed bits against a module string constant.
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:191-234, OTP-29.1.1.
@@ -654,19 +572,52 @@ impl BeamModuleAssembler {
         &mut self,
         ctx: ArgVal,
         fail: u32,
-        bits: ArgVal,
+        bits: u64,
         string: ArgVal,
-        helper: BsMatchHelper,
     ) -> Result<(), ModuleError> {
-        // The hook receives the bit count in the unit argument.
-        let ArgVal::Immediate(bits) = bits else {
-            return Err(ModuleError::InvalidOperand(
-                "match string size must be an immediate",
-            ));
-        };
-        let bits = u32::try_from(bits >> 4)
-            .map_err(|_| ModuleError::InvalidOperand("match string size overflow"))?;
-        self.emit_bs_helper(9, ctx, string, bits, None, Some(fail), helper)
+        let fail_label = self.label(fail);
+        let context = self.source_reg(ctx)?;
+        let pointer = self.source_reg(string)?;
+        self.code.emit(|e| {
+            // erts keeps the match-context pointer in TMP5 while TMP4 holds `start + size`.
+            // CTX is x11/TMP4 here, so using it for both would lose the context before the
+            // base-field load below.
+            e.and_imm(Gpr::x(12), context, !7)?;
+            e.ldp(START, END, Gpr::x(12), 16)?;
+            e.mov_const(Gpr::x(10), bits)?;
+            e.add_reg(CTX, START, Gpr::x(10), arinsal_a64::enc::Shift::Lsl, 0)?;
+            e.cmp_reg(CTX, END, arinsal_a64::enc::Shift::Lsl, 0)
+        })?;
+        self.code.b_cond(Cond::Hi, fail_label)?;
+        self.code.emit(|e| {
+            e.ldr_uoff(Gpr::x(12), Gpr::x(12), 8)?;
+            e.and_imm(Gpr::x(12), Gpr::x(12), !3)?;
+            e.and_imm(Gpr::x(14), START, 7)?;
+            e.add_reg(
+                Gpr::x(13),
+                Gpr::x(12),
+                START,
+                arinsal_a64::enc::Shift::Lsr,
+                3,
+            )
+        })?;
+        emit_bs_runtime_call(
+            self,
+            crate::raw::erts_cmp_bits as *const () as usize,
+            NUM_REGISTER_BACKED_XREGS as usize,
+            crate::Update::NONE,
+            &[pointer, Gpr::xzr(), Gpr::x(13), Gpr::x(14), Gpr::x(10)],
+        )?;
+        self.code.cbnz(Gpr::x(0), fail_label)?;
+        let context = self.source_reg(ctx)?;
+        self.code.emit(|e| {
+            e.and_imm(CTX, context, !7)?;
+            e.ldr_uoff(START, CTX, 16)?;
+            e.mov_const(Gpr::x(10), bits)?;
+            e.add_reg(START, START, Gpr::x(10), arinsal_a64::enc::Shift::Lsl, 0)?;
+            e.str_uoff(START, CTX, 16)
+        })?;
+        Ok(())
     }
     /// Builds a sub-bitstring from the current cursor to the context end.
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:407-455, OTP-29.1.1.
@@ -675,19 +626,68 @@ impl BeamModuleAssembler {
         ctx: ArgVal,
         dst: ArgVal,
         live: u32,
-        helper: BsMatchHelper,
-        gc_hook: crate::construct::GcHook,
     ) -> Result<(), ModuleError> {
-        self.emit_gc_test_preserve(BUILD_SUB_BITSTRING_HEAP_NEED, live, ctx, gc_hook)?;
-        self.emit_bs_helper(
-            10,
-            ctx,
-            ArgVal::Immediate(u64::from(live)),
-            0,
-            Some(dst),
-            None,
-            helper,
-        )
+        self.emit_gc_test_preserve(BUILD_SUB_BITSTRING_HEAP_NEED, live, ctx)?;
+        self.emit_bs_build_sub_bitstring(ctx, Some(dst), live, None)
+    }
+
+    /// Builds an extracted or tail bitstring using the common erts allocation function.
+    // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:407-455 and 3129-3172, OTP-29.1.1.
+    pub(super) fn emit_bs_build_sub_bitstring(
+        &mut self,
+        ctx: ArgVal,
+        dst: Option<ArgVal>,
+        live: u32,
+        size: Option<u64>,
+    ) -> Result<(), ModuleError> {
+        let context = self.source_reg(ctx)?;
+        self.code.emit(|e| {
+            e.and_imm(CTX, context, !7)?;
+            e.ldr_uoff(Gpr::x(9), CTX, 8)?;
+            e.ldr_uoff(Gpr::x(10), CTX, 32)?;
+            e.ldp(START, END, CTX, 16)?;
+            e.and_imm(Gpr::x(9), Gpr::x(9), !3)?;
+            if let Some(size) = size {
+                e.mov_const(Gpr::x(12), size)?;
+                e.add_reg(END, START, Gpr::x(12), arinsal_a64::enc::Shift::Lsl, 0)?;
+                e.str_uoff(END, CTX, 16)?;
+            } else {
+                e.sub_reg(Gpr::x(12), END, START, arinsal_a64::enc::Shift::Lsl, 0)?;
+            }
+            // Keep CTX live through the cursor update. In the erts sequence, the
+            // match-context pointer is consumed before ARG2 is reused for its tag.
+            e.and_imm(Gpr::x(11), Gpr::x(10), 3)?;
+            e.and_imm(Gpr::x(10), Gpr::x(10), !3)?;
+            Ok(())
+        })?;
+        // Port of instr_bs.cpp:407-436: the shared tail fragment establishes the runtime frame
+        // before `emit_enter_runtime`, so stack walking sees the C call as a native frame.
+        self.code.emit(|e| {
+            e.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16)?;
+            e.mov_reg(Gpr::x(29), Gpr::sp())
+        })?;
+        emit_bs_runtime_call(
+            self,
+            crate::raw::erts_build_sub_bitstring as *const () as usize,
+            live as usize,
+            crate::Update::HEAP,
+            &[
+                Gpr::x(21),
+                Gpr::x(11),
+                Gpr::x(10),
+                Gpr::x(9),
+                START,
+                Gpr::x(12),
+            ],
+        )?;
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::sp(), Gpr::x(29))?;
+            e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)
+        })?;
+        if let Some(dst) = dst {
+            self.store_register(dst, Gpr::x(0))?;
+        }
+        Ok(())
     }
     /// Extracts and validates one UTF-8 scalar.
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:712-899, OTP-29.1.1.
@@ -696,19 +696,13 @@ impl BeamModuleAssembler {
         ctx: ArgVal,
         fail: u32,
         dst: ArgVal,
-        helper: BsMatchHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_inline_utf8(ctx, fail, Some(dst), helper)
+        self.emit_bs_get_utf8(ctx, fail, Some(dst))
     }
     /// Skips one UTF-8 scalar, failing on malformed input.
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:900-903, OTP-29.1.1.
-    pub fn emit_i_bs_skip_utf8(
-        &mut self,
-        ctx: ArgVal,
-        fail: u32,
-        helper: BsMatchHelper,
-    ) -> Result<(), ModuleError> {
-        self.emit_inline_utf8(ctx, fail, None, helper)
+    pub fn emit_i_bs_skip_utf8(&mut self, ctx: ArgVal, fail: u32) -> Result<(), ModuleError> {
+        self.emit_bs_get_utf8(ctx, fail, None)
     }
     /// Skips one UTF-16 scalar, failing on malformed input.
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:930-934, OTP-29.1.1.
@@ -717,9 +711,8 @@ impl BeamModuleAssembler {
         ctx: ArgVal,
         fail: u32,
         flags: ArgVal,
-        helper: BsMatchHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_bs_helper(12, ctx, flags, 0, None, Some(fail), helper)
+        self.emit_bs_get_utf16(ctx, fail, flags, None)
     }
     /// Rejects a 32-bit value that is not a Unicode scalar and un-reads its 32 bits.
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:935-984
@@ -774,9 +767,8 @@ impl BeamModuleAssembler {
         fail: u32,
         flags: ArgVal,
         dst: ArgVal,
-        helper: BsMatchHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_bs_helper(12, ctx, flags, 0, Some(dst), Some(fail), helper)
+        self.emit_bs_get_utf16(ctx, fail, flags, Some(dst))
     }
     /// Extracts an IEEE binary16, binary32, or binary64 value.
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:578-617, OTP-29.1.1.
@@ -787,474 +779,73 @@ impl BeamModuleAssembler {
         fail: u32,
         live: u32,
         bits: ArgVal,
-        unit: u32,
+        flags: u32,
         dst: ArgVal,
-        helper: BsMatchHelper,
-        gc_hook: crate::construct::GcHook,
     ) -> Result<(), ModuleError> {
-        self.emit_gc_test_preserve(FLOAT_SIZE_OBJECT, live, ctx, gc_hook)?;
-        self.emit_bs_helper(13, ctx, bits, unit, Some(dst), Some(fail), helper)
-    }
-
-    /// Parses a fixed number of bytes in a native loop and returns their sum.
-    // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:257-311, OTP-29.1.1.
-    pub fn emit_i_bs_sum_bytes_loop(
-        &mut self,
-        ctx: ArgVal,
-        count: u32,
-        helper: BsMatchHelper,
-    ) -> Result<(), ModuleError> {
-        let loop_label = self.code.new_label();
-        self.code.emit(|e| {
-            e.mov_const(Gpr::x(27), u64::from(count))?;
-            e.mov_reg(Gpr::x(28), Gpr::xzr())
-        })?;
-        self.code.bind(loop_label)?;
-        self.emit_bs_helper(
-            8,
-            ctx,
-            ArgVal::Immediate(8),
-            1,
-            Some(ArgVal::X(1)),
-            None,
-            helper,
-        )?;
-        self.code.emit(|e| {
-            e.asr_imm(Gpr::x(26), Gpr::x(26), 4)?;
-            e.add_reg(
-                Gpr::x(28),
-                Gpr::x(28),
-                Gpr::x(26),
-                arinsal_a64::enc::Shift::Lsl,
-                0,
-            )?;
-            e.sub_imm(Gpr::x(27), Gpr::x(27), 1, false)
-        })?;
-        self.code.cbnz(Gpr::x(27), loop_label)?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(26), Gpr::x(28)))?;
-        Ok(())
-    }
-
-    /// Extracts a byte-multiple binary segment into a heap bitstring or a shared sub-bits.
-    // Port of erts/emulator/beam/erl_bits.c:2635-2668 (erts_build_sub_bitstring) and
-    // erl_bits.h:171-176 (HEAP_BITSTRING), OTP-29.1.1.
-    fn emit_inline_get_binary(
-        &mut self,
-        ctx: ArgVal,
-        fail: u32,
-        bits: ArgVal,
-        unit: u32,
-        dst: ArgVal,
-        helper: BsMatchHelper,
-    ) -> Result<(), ModuleError> {
-        if unit == 0 || unit > 64 {
-            return self.emit_bs_helper(6, ctx, bits, unit, Some(dst), Some(fail), helper);
+        let fail_label = self.label(fail);
+        self.emit_gc_test_preserve(FLOAT_SIZE_OBJECT, live, ctx)?;
+        if !self.emit_bs_field_size(bits, flags >> 3, fail_label)? {
+            return Ok(());
         }
-        let slow = self.code.new_label();
-        let done = self.code.new_label();
-        let heap_bits = self.code.new_label();
-        let copy = self.code.new_label();
-        let copy_done = self.code.new_label();
-        let size_reg = self.source_reg_into(bits, Gpr::x(8))?;
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(8), size_reg)?;
-            e.and_imm(Gpr::x(10), Gpr::x(8), 0xf)?;
-            e.cmp_imm(Gpr::x(10), 0xf, false)
-        })?;
-        self.code.b_cond(Cond::Ne, slow)?;
-        if fail != 0 {
-            let fail_label = self.label(fail);
-            self.code.tbnz(Gpr::x(8), 63, fail_label)?;
-        } else {
-            self.code.tbnz(Gpr::x(8), 63, slow)?;
-        }
-        let shift = unit.trailing_zeros();
-        self.code.emit(|e| e.lsr_imm(FIELD_BITS, Gpr::x(8), 4))?;
-        if !unit.is_power_of_two() {
-            self.code.emit(|e| {
-                e.mov_const(Gpr::x(10), u64::from(unit))?;
-                e.mul(FIELD_BITS, FIELD_BITS, Gpr::x(10))
-            })?;
-        } else if shift > 0 {
-            self.code
-                .emit(|e| e.lsl_imm(FIELD_BITS, FIELD_BITS, shift as u8))?;
-        }
-        self.cursor(ctx)?;
-        self.code.emit(|e| {
-            e.sub_reg(TMP, END, START, arinsal_a64::enc::Shift::Lsl, 0)?;
-            e.cmp_reg(TMP, FIELD_BITS, arinsal_a64::enc::Shift::Lsl, 0)
-        })?;
-        if fail != 0 {
-            let fail_label = self.label(fail);
-            self.code.b_cond(Cond::Cc, fail_label)?;
-        } else {
-            self.code.b_cond(Cond::Cc, slow)?;
-        }
-        self.code.emit(|e| e.tst_imm(START, 7))?;
-        self.code.b_cond(Cond::Ne, slow)?;
-        self.code.emit(|e| e.tst_imm(FIELD_BITS, 7))?;
-        self.code.b_cond(Cond::Ne, slow)?;
-        self.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(10), CTX, 8)?;
-            e.and_imm(Gpr::x(10), Gpr::x(10), !3)?;
-            e.add_reg(
-                Gpr::x(10),
-                Gpr::x(10),
-                START,
-                arinsal_a64::enc::Shift::Lsr,
-                3,
-            )?;
-            e.cmp_imm(FIELD_BITS, 512, false)
-        })?;
-        self.code.b_cond(Cond::Ls, heap_bits)?;
-        // Larger than 64 bytes: five-word sub-bits sharing the original owner.
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(8), Gpr::x(23))?;
-            e.ldr_uoff(Gpr::x(9), CTX, 8)?;
-            e.and_imm(Gpr::x(9), Gpr::x(9), !1)?;
-            e.mov_const(Gpr::x(17), 0x124)?;
-            e.str_uoff(Gpr::x(17), Gpr::x(8), 0)?;
-            e.str_uoff(Gpr::x(9), Gpr::x(8), 8)?;
-            e.str_uoff(START, Gpr::x(8), 16)?;
-            e.add_reg(
-                Gpr::x(14),
-                START,
-                FIELD_BITS,
-                arinsal_a64::enc::Shift::Lsl,
-                0,
-            )?;
-            e.str_uoff(Gpr::x(14), Gpr::x(8), 24)?;
-            e.ldr_uoff(Gpr::x(9), CTX, 32)?;
-            e.str_uoff(Gpr::x(9), Gpr::x(8), 32)?;
-            e.add_reg(START, START, FIELD_BITS, arinsal_a64::enc::Shift::Lsl, 0)?;
-            e.str_uoff(START, CTX, 16)?;
-            e.add_imm(Gpr::x(23), Gpr::x(8), 40, false)?;
-            e.orr_imm(Gpr::x(8), Gpr::x(8), 2)
-        })?;
-        self.store_register(dst, Gpr::x(8))?;
-        self.code.b(done)?;
-        self.code.bind(heap_bits)?;
-        // On-heap copy of at most 64 bytes. The preceding heap test reserved the words.
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(8), Gpr::x(23))?;
-            e.lsr_imm(Gpr::x(17), FIELD_BITS, 3)?;
-            e.add_imm(Gpr::x(9), Gpr::x(17), 7, false)?;
-            e.lsr_imm(Gpr::x(9), Gpr::x(9), 3)?;
-            e.add_imm(Gpr::x(14), Gpr::x(9), 2, false)?;
-            e.str_uoff(FIELD_BITS, Gpr::x(8), 8)?;
-            e.sub_imm(Gpr::x(12), Gpr::x(14), 1, false)?;
-            e.lsl_imm(Gpr::x(12), Gpr::x(12), 6)?;
-            e.orr_imm(Gpr::x(12), Gpr::x(12), 0x20)?;
-            e.str_uoff(Gpr::x(12), Gpr::x(8), 0)
-        })?;
-        // Byte-aligned copy, widest load that fits. Matches copy_binary_to_buffer's
-        // memcpy of an exact byte count (erl_bits.h:549-550): the unread tail of the
-        // last word is not part of the bitstring.
-        let copy8 = self.code.new_label();
-        let copy4 = self.code.new_label();
-        let copy2 = self.code.new_label();
-        let copy1 = self.code.new_label();
         self.code
-            .emit(|e| e.add_imm(Gpr::x(12), Gpr::x(8), 16, false))?;
-        self.code.cbz(Gpr::x(17), copy_done)?;
-        self.code.bind(copy8)?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(17), 8, false))?;
-        self.code.b_cond(Cond::Cc, copy4)?;
-        self.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(9), Gpr::x(10), 0)?;
-            e.str_uoff(Gpr::x(9), Gpr::x(12), 0)?;
-            e.add_imm(Gpr::x(10), Gpr::x(10), 8, false)?;
-            e.add_imm(Gpr::x(12), Gpr::x(12), 8, false)?;
-            e.sub_imm(Gpr::x(17), Gpr::x(17), 8, false)
-        })?;
-        self.code.b(copy8)?;
-        self.code.bind(copy4)?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(17), 4, false))?;
-        self.code.b_cond(Cond::Cc, copy2)?;
-        self.code.emit(|e| {
-            e.ldr_uoff(Gpr::w(9), Gpr::x(10), 0)?;
-            e.str_uoff(Gpr::w(9), Gpr::x(12), 0)?;
-            e.add_imm(Gpr::x(10), Gpr::x(10), 4, false)?;
-            e.add_imm(Gpr::x(12), Gpr::x(12), 4, false)?;
-            e.sub_imm(Gpr::x(17), Gpr::x(17), 4, false)
-        })?;
-        self.code.bind(copy2)?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(17), 2, false))?;
-        self.code.b_cond(Cond::Cc, copy1)?;
-        self.code.emit(|e| {
-            e.ldrh_uoff(Gpr::x(9), Gpr::x(10), 0)?;
-            e.strh_uoff(Gpr::x(9), Gpr::x(12), 0)?;
-            e.add_imm(Gpr::x(10), Gpr::x(10), 2, false)?;
-            e.add_imm(Gpr::x(12), Gpr::x(12), 2, false)?;
-            e.sub_imm(Gpr::x(17), Gpr::x(17), 2, false)
-        })?;
-        self.code.bind(copy1)?;
-        self.code.cbz(Gpr::x(17), copy_done)?;
-        self.code.bind(copy)?;
-        self.code.emit(|e| {
-            e.ldrb_uoff(Gpr::x(9), Gpr::x(10), 0)?;
-            e.strb_uoff(Gpr::x(9), Gpr::x(12), 0)?;
-            e.add_imm(Gpr::x(10), Gpr::x(10), 1, false)?;
-            e.add_imm(Gpr::x(12), Gpr::x(12), 1, false)?;
-            e.sub_imm(Gpr::x(17), Gpr::x(17), 1, false)
-        })?;
-        self.code.cbnz(Gpr::x(17), copy)?;
-        self.code.bind(copy_done)?;
-        self.code.emit(|e| {
-            e.ldr_uoff(FIELD_BITS, Gpr::x(8), 8)?;
-            e.add_reg(START, START, FIELD_BITS, arinsal_a64::enc::Shift::Lsl, 0)?;
-            e.str_uoff(START, CTX, 16)?;
-            e.lsl_imm(Gpr::x(14), Gpr::x(14), 3)?;
-            e.add_reg(
-                Gpr::x(23),
-                Gpr::x(8),
-                Gpr::x(14),
-                arinsal_a64::enc::Shift::Lsl,
-                0,
-            )?;
-            e.orr_imm(Gpr::x(8), Gpr::x(8), 2)
-        })?;
-        self.store_register(dst, Gpr::x(8))?;
-        self.code.b(done)?;
-        self.code.bind(slow)?;
-        self.emit_bs_helper(6, ctx, bits, unit, Some(dst), Some(fail), helper)?;
-        self.code.bind(done)?;
-        Ok(())
+            .emit(|e| e.mov_const(Gpr::x(10), u64::from(flags)))?;
+        let context = self.source_reg(ctx)?;
+        self.code.emit(|e| e.and_imm(CTX, context, !7))?;
+        emit_bs_runtime_call(
+            self,
+            crate::raw::erts_bs_get_float_2 as *const () as usize,
+            live as usize,
+            crate::Update::HEAP,
+            &[Gpr::x(21), FIELD_BITS, Gpr::x(10), CTX],
+        )?;
+        self.code.cbz(Gpr::x(0), fail_label)?;
+        self.store_register(dst, Gpr::x(0))
     }
 
-    /// Byte-aligned UTF-8 scalar. Unaligned input uses the runtime hook.
-    // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:621-700 (emit_bs_get_utf8_short_shared)
-    // and erl_bits.c:580 (UTF-8 match), OTP-29.1.1.
-    fn emit_inline_utf8(
+    fn emit_bs_get_utf8(
         &mut self,
         ctx: ArgVal,
         fail: u32,
         dst: Option<ArgVal>,
-        helper: BsMatchHelper,
     ) -> Result<(), ModuleError> {
-        let slow = self.code.new_label();
-        let done = self.code.new_label();
-        let ascii = self.code.new_label();
-        let two = self.code.new_label();
-        let three = self.code.new_label();
-        let four = self.code.new_label();
-        let store = self.code.new_label();
-        let fail_label = (fail != 0).then(|| self.label(fail));
-        let fail_or_slow = |this: &mut Self, cond: Cond| -> Result<(), ModuleError> {
-            if let Some(label) = fail_label {
-                this.code.b_cond(cond, label)?;
-            } else {
-                this.code.b_cond(cond, slow)?;
-            }
-            Ok(())
-        };
-        self.cursor(ctx)?;
-        self.code.emit(|e| {
-            e.sub_reg(TMP, END, START, arinsal_a64::enc::Shift::Lsl, 0)?;
-            e.cmp_imm(TMP, 8, false)
-        })?;
-        fail_or_slow(self, Cond::Cc)?;
-        self.code.emit(|e| e.tst_imm(START, 7))?;
-        self.code.b_cond(Cond::Ne, slow)?;
-        self.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(10), CTX, 8)?;
-            e.and_imm(Gpr::x(10), Gpr::x(10), !3)?;
-            e.add_reg(
-                Gpr::x(10),
-                Gpr::x(10),
-                START,
-                arinsal_a64::enc::Shift::Lsr,
-                3,
-            )?;
-            e.ldrb_uoff(Gpr::x(8), Gpr::x(10), 0)
-        })?;
-        self.code.tbz(Gpr::x(8), 7, ascii)?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(8), 0xc2, false))?;
-        fail_or_slow(self, Cond::Cc)?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(8), 0xdf, false))?;
-        self.code.b_cond(Cond::Ls, two)?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(8), 0xe0, false))?;
-        fail_or_slow(self, Cond::Cc)?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(8), 0xef, false))?;
-        self.code.b_cond(Cond::Ls, three)?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(8), 0xf0, false))?;
-        fail_or_slow(self, Cond::Cc)?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(8), 0xf4, false))?;
-        fail_or_slow(self, Cond::Hi)?;
-        self.code.b(four)?;
-        self.code.bind(two)?;
-        self.code.emit(|e| e.cmp_imm(TMP, 16, false))?;
-        fail_or_slow(self, Cond::Cc)?;
-        self.emit_utf8_continue(1, fail_label, slow)?;
-        self.code.emit(|e| {
-            e.and_imm(Gpr::x(8), Gpr::x(8), 0x1f)?;
-            e.lsl_imm(Gpr::x(8), Gpr::x(8), 6)?;
-            e.and_imm(Gpr::x(9), Gpr::x(9), 0x3f)?;
-            e.orr_reg(
-                Gpr::x(8),
-                Gpr::x(8),
-                arinsal_a64::enc::Shifted {
-                    reg: Gpr::x(9),
-                    shift: arinsal_a64::enc::Shift::Lsl,
-                    amount: 0,
-                },
-            )?;
-            e.mov_const(Gpr::x(12), 2)
-        })?;
-        self.code.b(store)?;
-        self.code.bind(three)?;
-        self.code.emit(|e| e.cmp_imm(TMP, 24, false))?;
-        fail_or_slow(self, Cond::Cc)?;
-        self.emit_utf8_continue(1, fail_label, slow)?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(17), Gpr::x(9)))?;
-        self.emit_utf8_continue(2, fail_label, slow)?;
-        self.code.emit(|e| {
-            e.and_imm(Gpr::x(8), Gpr::x(8), 0x0f)?;
-            e.lsl_imm(Gpr::x(8), Gpr::x(8), 12)?;
-            e.and_imm(Gpr::x(17), Gpr::x(17), 0x3f)?;
-            e.lsl_imm(Gpr::x(17), Gpr::x(17), 6)?;
-            e.orr_reg(
-                Gpr::x(8),
-                Gpr::x(8),
-                arinsal_a64::enc::Shifted {
-                    reg: Gpr::x(17),
-                    shift: arinsal_a64::enc::Shift::Lsl,
-                    amount: 0,
-                },
-            )?;
-            e.and_imm(Gpr::x(9), Gpr::x(9), 0x3f)?;
-            e.orr_reg(
-                Gpr::x(8),
-                Gpr::x(8),
-                arinsal_a64::enc::Shifted {
-                    reg: Gpr::x(9),
-                    shift: arinsal_a64::enc::Shift::Lsl,
-                    amount: 0,
-                },
-            )?;
-            e.mov_const(Gpr::x(12), 0x800)?;
-            e.cmp_reg(Gpr::x(8), Gpr::x(12), arinsal_a64::enc::Shift::Lsl, 0)
-        })?;
-        fail_or_slow(self, Cond::Cc)?;
-        let three_ok = self.code.new_label();
-        self.code.emit(|e| {
-            e.mov_const(Gpr::x(12), 0xd800)?;
-            e.cmp_reg(Gpr::x(8), Gpr::x(12), arinsal_a64::enc::Shift::Lsl, 0)
-        })?;
-        self.code.b_cond(Cond::Cc, three_ok)?;
-        self.code.emit(|e| {
-            e.mov_const(Gpr::x(12), 0xdfff)?;
-            e.cmp_reg(Gpr::x(8), Gpr::x(12), arinsal_a64::enc::Shift::Lsl, 0)
-        })?;
-        self.code.b_cond(Cond::Hi, three_ok)?;
-        if let Some(label) = fail_label {
-            self.code.b(label)?;
-        } else {
-            self.code.b(slow)?;
-        }
-        self.code.bind(three_ok)?;
-        self.code.emit(|e| e.mov_const(Gpr::x(12), 3))?;
-        self.code.b(store)?;
-        self.code.bind(four)?;
-        self.code.emit(|e| e.cmp_imm(TMP, 32, false))?;
-        fail_or_slow(self, Cond::Cc)?;
-        self.emit_utf8_continue(1, fail_label, slow)?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(17), Gpr::x(9)))?;
-        self.emit_utf8_continue(2, fail_label, slow)?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(12), Gpr::x(9)))?;
-        self.emit_utf8_continue(3, fail_label, slow)?;
-        self.code.emit(|e| {
-            e.and_imm(Gpr::x(8), Gpr::x(8), 0x07)?;
-            e.lsl_imm(Gpr::x(8), Gpr::x(8), 18)?;
-            e.and_imm(Gpr::x(17), Gpr::x(17), 0x3f)?;
-            e.lsl_imm(Gpr::x(17), Gpr::x(17), 12)?;
-            e.orr_reg(
-                Gpr::x(8),
-                Gpr::x(8),
-                arinsal_a64::enc::Shifted {
-                    reg: Gpr::x(17),
-                    shift: arinsal_a64::enc::Shift::Lsl,
-                    amount: 0,
-                },
-            )?;
-            e.and_imm(Gpr::x(12), Gpr::x(12), 0x3f)?;
-            e.lsl_imm(Gpr::x(12), Gpr::x(12), 6)?;
-            e.orr_reg(
-                Gpr::x(8),
-                Gpr::x(8),
-                arinsal_a64::enc::Shifted {
-                    reg: Gpr::x(12),
-                    shift: arinsal_a64::enc::Shift::Lsl,
-                    amount: 0,
-                },
-            )?;
-            e.and_imm(Gpr::x(9), Gpr::x(9), 0x3f)?;
-            e.orr_reg(
-                Gpr::x(8),
-                Gpr::x(8),
-                arinsal_a64::enc::Shifted {
-                    reg: Gpr::x(9),
-                    shift: arinsal_a64::enc::Shift::Lsl,
-                    amount: 0,
-                },
-            )?;
-            e.mov_const(Gpr::x(12), 0x10000)?;
-            e.cmp_reg(Gpr::x(8), Gpr::x(12), arinsal_a64::enc::Shift::Lsl, 0)
-        })?;
-        fail_or_slow(self, Cond::Cc)?;
-        self.code.emit(|e| {
-            e.mov_const(Gpr::x(12), 0x10_ffff)?;
-            e.cmp_reg(Gpr::x(8), Gpr::x(12), arinsal_a64::enc::Shift::Lsl, 0)
-        })?;
-        fail_or_slow(self, Cond::Hi)?;
-        self.code.emit(|e| e.mov_const(Gpr::x(12), 4))?;
-        self.code.b(store)?;
-        self.code.bind(ascii)?;
-        self.code.emit(|e| e.mov_const(Gpr::x(12), 1))?;
-        self.code.bind(store)?;
-        self.code.emit(|e| {
-            e.lsl_imm(Gpr::x(9), Gpr::x(12), 3)?;
-            e.add_reg(START, START, Gpr::x(9), arinsal_a64::enc::Shift::Lsl, 0)?;
-            e.str_uoff(START, CTX, 16)
-        })?;
-        if let Some(dst) = dst {
-            self.code.emit(|e| {
-                e.lsl_imm(Gpr::x(8), Gpr::x(8), 4)?;
-                e.orr_imm(Gpr::x(8), Gpr::x(8), 0xf)
-            })?;
-            self.store_register(dst, Gpr::x(8))?;
-        }
-        self.code.b(done)?;
-        self.code.bind(slow)?;
-        self.emit_bs_helper(
-            11,
-            ctx,
-            ArgVal::Immediate(0),
-            0,
-            dst,
-            (fail != 0).then_some(fail),
-            helper,
+        let context = self.source_reg_into(ctx, Gpr::x(9))?;
+        self.code.emit(|e| e.and_imm(CTX, context, !7))?;
+        emit_bs_runtime_call(
+            self,
+            crate::raw::erts_bs_get_utf8 as *const () as usize,
+            NUM_REGISTER_BACKED_XREGS as usize,
+            crate::Update::NONE,
+            &[CTX],
         )?;
-        self.code.bind(done)?;
+        let fail = self.label(fail);
+        self.code.cbz(Gpr::x(0), fail)?;
+        if let Some(dst) = dst {
+            self.store_register(dst, Gpr::x(0))?;
+        }
         Ok(())
     }
 
-    /// Loads one UTF-8 continuation byte at `offset` into `x9`, failing unless it is `10xxxxxx`.
-    fn emit_utf8_continue(
+    fn emit_bs_get_utf16(
         &mut self,
-        offset: u16,
-        fail: Option<arinsal_a64::buf::Label>,
-        slow: arinsal_a64::buf::Label,
+        ctx: ArgVal,
+        fail: u32,
+        flags: ArgVal,
+        dst: Option<ArgVal>,
     ) -> Result<(), ModuleError> {
-        self.code.emit(|e| {
-            e.ldrb_uoff(Gpr::x(9), Gpr::x(10), offset)?;
-            e.and_imm(END, Gpr::x(9), 0xc0)?;
-            e.cmp_imm(END, 0x80, false)
-        })?;
-        if let Some(fail) = fail {
-            self.code.b_cond(Cond::Ne, fail)?;
-        } else {
-            self.code.b_cond(Cond::Ne, slow)?;
+        let context = self.source_reg_into(ctx, Gpr::x(9))?;
+        let flags = self.source_reg_into(flags, Gpr::x(10))?;
+        self.code.emit(|e| e.and_imm(CTX, context, !7))?;
+        emit_bs_runtime_call(
+            self,
+            crate::raw::erts_bs_get_utf16 as *const () as usize,
+            NUM_REGISTER_BACKED_XREGS as usize,
+            crate::Update::NONE,
+            &[CTX, flags],
+        )?;
+        let fail = self.label(fail);
+        self.code.cbz(Gpr::x(0), fail)?;
+        if let Some(dst) = dst {
+            self.store_register(dst, Gpr::x(0))?;
         }
         Ok(())
     }

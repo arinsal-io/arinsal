@@ -10,7 +10,7 @@
 use crate::bits::RefcBinary;
 use crate::heap::{HeapAlloc, store};
 use crate::literal::{LiteralChunk, allocate_chunk};
-use crate::{ARITY, Term, TermError};
+use crate::{ARITY, Term};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Once};
 
@@ -126,19 +126,61 @@ impl HeapAlloc for GlobalLiteralBuild {
         _writable: bool,
         _overhead_words: u64,
         owner: Option<arinsal_alloc::raw::OwnedBinaryRef>,
-    ) -> Result<(), TermError> {
+    ) {
         // `literal_ohp = &area.off_heap`: the chunk's own off-heap list.
         let slot = self
             .chunks
             .last()
-            .ok_or(TermError::SystemLimit)?
+            .expect("global literal chunk")
             .off_heap_slot();
         store(bin_ref.wrapping_add(2), crate::heap::load(slot));
         store(slot, bin_ref as u64);
         if let Some(owner) = owner {
             owner.transfer_to_bin_ref(bin_ref);
         }
-        Ok(())
+    }
+
+    fn retain_writable_binary(&mut self, binary: Arc<crate::bits::WritableBinary>) {
+        drop(binary);
+    }
+
+    fn supports_writable_binary(&self) -> bool {
+        true
+    }
+
+    fn link_external_binary(
+        &mut self,
+        bin_ref: *mut u64,
+        binary: Arc<crate::bits::ExternalBinary>,
+    ) {
+        let slot = self
+            .chunks
+            .last()
+            .expect("global literal chunk")
+            .off_heap_slot();
+        let mut head = crate::heap::load(slot) as usize;
+        crate::heap::link_external_bin_ref(&mut head, bin_ref, binary);
+        store(slot, head as u64);
+    }
+
+    fn supports_external_binary(&self) -> bool {
+        true
+    }
+
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: crate::MagicBin) {
+        let slot = self
+            .chunks
+            .last()
+            .expect("global literal chunk")
+            .off_heap_slot();
+        let mut head = crate::heap::load(slot) as usize;
+        let mut overhead = 0;
+        crate::heap::link_magic_thing(&mut head, &mut overhead, thing, owner);
+        store(slot, head as u64);
+    }
+
+    fn supports_magic(&self) -> bool {
+        true
     }
 
     fn link_node(&mut self, thing: *mut u64, node: crate::Node) {

@@ -5,39 +5,24 @@
 //! leader advances the global value once every managed thread confirmed it or waits. A
 //! thread that needs every managed thread to pass a point (`block`) sets a flag that the
 //! managed threads honour at their next progress update. Operations scheduled with
-//! [`schedule_later_op`] run once the global value has reached `confirmed + 2`.
+//! [`erts_schedule_thr_prgr_later_op`] run once the global value has reached `confirmed + 2`.
 //!
 //! Unmanaged threads (dirty schedulers, the main thread) may block and unblock thread
-//! progress and schedule later operations, and delay progress while they look at memory that a
-//! later operation frees ([`unmanaged_delay`], erts `erts_thr_progress_unmanaged_delay`).
+//! progress, and delay progress while they look at memory that a later operation frees
+//! ([`unmanaged_delay`], erts `erts_thr_progress_unmanaged_delay`). They do not enqueue later
+//! ops: erts `enqueue_later_op` asserts `esdp && !dirty`; those callers use
+//! `erts_schedule_misc_aux_work` onto a normal scheduler.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
+};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::Thread;
 
-/// An operation that runs once every managed thread passed a thread progress point.
-pub(crate) enum LaterOp {
-    /// `erts_schedule_thr_prgr_later_op` with an allocated closure.
-    Boxed(Box<dyn FnOnce() + Send>),
-    /// `erts_schedule_thr_prgr_later_cleanup_op`: a release function, the address of the
-    /// element it releases, so scheduling it allocates nothing, and the bytes it frees.
-    Cleanup {
-        release: fn(usize),
-        data: usize,
-        size: usize,
-    },
-}
-
-impl LaterOp {
-    fn run(self) {
-        match self {
-            Self::Boxed(op) => op(),
-            Self::Cleanup { release, data, .. } => release(data),
-        }
-    }
-}
+pub(crate) mod raw;
+pub use raw::ErtsThrPrgrLaterOp;
+pub(crate) use raw::LaterOpHandle;
 
 /// A delay of thread progress by an unmanaged thread (erts `ErtsThrPrgrDelayHandle`).
 #[must_use]
@@ -140,8 +125,11 @@ struct UnmanagedWakeupData {
 }
 
 struct UnmanagedTpd {
+    /// Used by `request_wakeup_unmanaged` (tests and erts unmanaged wait).
+    #[allow(dead_code)]
     progress: Arc<ThrProgress>,
     id: usize,
+    #[allow(dead_code)]
     wakeup_request: [u64; WAKEUP_DATA_SIZE],
 }
 
@@ -204,6 +192,8 @@ pub(crate) struct ThrProgress {
     /// The blocker's event (`blocker_event`) and the wait of unmanaged threads for an
     /// unblock.
     event: (Mutex<()>, Condvar),
+    /// `intrnl->misc.data.blocker_event`: the erts_tse the blocker waits on.
+    blocker_event: AtomicPtr<ThreadEvent>,
     wakeup: [WakeupData; WAKEUP_DATA_SIZE],
     unmanaged_wakeup: [UnmanagedWakeupData; WAKEUP_DATA_SIZE],
     unmanaged_callbacks: Box<[UnmanagedWakeupCallbackSlot]>,
@@ -214,9 +204,6 @@ pub(crate) struct ThrProgress {
     sleepers: Arc<[OnceLock<Thread>]>,
     /// TID 0's managed aux thread is in the same thread-progress set but has no run queue.
     aux_event: OnceLock<Arc<ThreadEvent>>,
-    /// Later operations scheduled from unmanaged threads, run by any managed thread.
-    unmanaged_later: Mutex<VecDeque<(u64, LaterOp)>>,
-    unmanaged_later_len: AtomicUsize,
     /// `intrnl->umrefc`: unmanaged threads delaying progress, counted in one of two slots.
     umrefc: [AtomicUsize; 2],
     /// `intrnl->misc.data.umrefc_ix.current`: the slot new delays count in.
@@ -311,27 +298,70 @@ struct ThrPrgrData {
     leader_next: u64,
     chk_next_ix: usize,
     wakeup_request: [u64; WAKEUP_DATA_SIZE],
-    /// The queue is owned by `esdp->aux_work_data.later_op`.
-    later_ops: std::rc::Rc<RefCell<LaterOpState>>,
     /// `leader_state.umrefc_ix.waiting`: the slot this leader waits to drain, `-1` for none.
     leader_umrefc_waiting: i32,
     /// `leader_state.umrefc_ix.current`.
     leader_umrefc_current: usize,
 }
 
-/// `ErtsAuxWorkData.later_op` first..last, size and cleanup progress counters.
+/// `ErtsAuxWorkData.later_op` first..last, size, list_len and cleanup progress counters.
 // Port of erts/emulator/beam/erl_process.h (ErtsAuxWorkData.later_op), OTP-29.1.1.
 #[derive(Default)]
 pub(crate) struct LaterOpState {
-    later_ops: VecDeque<(u64, LaterOp)>,
+    list: raw::LaterOpList,
     size: usize,
     thr_prgr: u64,
-    latest_wakeup: u64,
 }
 
 impl LaterOpState {
-    pub(crate) fn shared() -> std::rc::Rc<RefCell<Self>> {
-        std::rc::Rc::new(RefCell::new(Self::default()))
+    pub(crate) fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn list_len(&self) -> usize {
+        self.list.list_len
+    }
+}
+
+/// `ErtsAuxWorkData.latest_wakeup` next to `later_op` (erl_process.h).
+///
+/// Lives inline in `ErtsAuxWorkData` (`esdp->aux_work_data`). Thread progress reaches it
+/// through that scheduler data, as `enqueue_later_op` / `haw_thr_prgr_wakeup` do in
+/// erl_process.c; `ThrPrgrData` does not hold a copy.
+// Port of erts/emulator/beam/erl_process.h (`ErtsAuxWorkData`), OTP-29.1.1.
+#[derive(Default)]
+pub(crate) struct AuxWorkLater {
+    /// `ErtsAuxWorkData.latest_wakeup` (`ERTS_THR_PRGR_VAL_FIRST` at init).
+    latest_wakeup: u64,
+    /// `ErtsAuxWorkData.current_thr_prgr` (`ERTS_THR_PRGR_INVALID` until first read).
+    current_thr_prgr: u64,
+    /// `ErtsAuxWorkData.later_op`.
+    later_op: LaterOpState,
+}
+
+impl AuxWorkLater {
+    /// erts init_aux_work_data: `latest_wakeup = FIRST`, `current = INVALID`, empty list.
+    pub(crate) fn new() -> Self {
+        Self {
+            latest_wakeup: 0,
+            current_thr_prgr: VAL_WAITING,
+            later_op: LaterOpState::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.later_op.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn list_len(&self) -> usize {
+        self.later_op.list_len()
+    }
+
+    pub(crate) fn current_thr_prgr(&self) -> u64 {
+        self.current_thr_prgr
     }
 }
 
@@ -405,6 +435,7 @@ impl ThrProgress {
             lflgs: AtomicU32::new(LFLG_NO_LEADER),
             block_count: AtomicU32::new(BC_FLG_NOT_BLOCKING | managed as u32),
             event: (Mutex::new(()), Condvar::new()),
+            blocker_event: AtomicPtr::new(std::ptr::null_mut()),
             wakeup,
             unmanaged_wakeup,
             unmanaged_callbacks: (0..unmanaged).map(|_| Mutex::new(None)).collect(),
@@ -412,8 +443,6 @@ impl ThrProgress {
             parked,
             sleepers,
             aux_event: OnceLock::new(),
-            unmanaged_later: Mutex::new(VecDeque::new()),
-            unmanaged_later_len: AtomicUsize::new(0),
             umrefc: [AtomicUsize::new(0), AtomicUsize::new(0)],
             umrefc_current: AtomicUsize::new(0),
             umrefc_waiting: std::sync::atomic::AtomicI32::new(-1),
@@ -441,6 +470,25 @@ impl ThrProgress {
         }
     }
 
+    /// The managed `wait` callback of a thread that saw `LFLG_BLOCK`: waits on the primitive
+    /// [`Self::wakeup_managed`] signals until thr_progress_unblock has cleared the flag.
+    // Port of erts/emulator/beam/erl_process.c:3127-3157 (thr_prgr_prep_wait, thr_prgr_wait:
+    // erts_tse_reset of the thread's SSI event, then erts_tse_wait unless the wakeup already
+    // came), OTP-29.1.1. A scheduler's park token is the event `unpark` sets. The aux thread's
+    // event is reset and `lflgs` read again: thr_progress_unblock clears the flag before it
+    // signals, so the signal after the reset is never lost.
+    fn wait_managed(&self, id: usize) {
+        match self.aux_event.get() {
+            Some(event) if id >= self.parked.len() => {
+                event.reset();
+                if self.lflgs.load(Ordering::SeqCst) & LFLG_BLOCK != 0 {
+                    event.wait();
+                }
+            }
+            _ => std::thread::park(),
+        }
+    }
+
     // Port of erl_thr_progress.c:276 (wakeup_unmanaged), OTP-29.1.1.
     fn wakeup_unmanaged(&self, id: usize) {
         let callback = self.unmanaged_callbacks[id]
@@ -465,7 +513,10 @@ impl ThrProgress {
     fn block_count_dec(&self) -> bool {
         let block_count = self.block_count.fetch_sub(1, Ordering::SeqCst) - 1;
         if block_count == 0 {
-            self.notify_event();
+            let event = raw::blocker_event_load(&self.blocker_event);
+            if !event.is_null() {
+                raw::erts_tse_set(event);
+            }
             return true;
         }
         block_count & BC_FLG_NOT_BLOCKING == 0
@@ -552,16 +603,19 @@ impl ThrProgress {
 }
 
 // Port of erl_thr_progress.c:1308 (block_thread), OTP-29.1.1: the managed `prepare_wait`
-// and `wait` callbacks are the thread's own park.
+// and `wait` callbacks are the thread's own (`cbp = &intrnl->managed.callbacks[tpd->id]`), the
+// ones its `wakeup` callback ends: the aux thread waits on its SSI event, which
+// thr_progress_unblock signals.
 fn block_thread(tpd: &mut ThrPrgrData) -> u32 {
     let progress = Arc::clone(&tpd.progress);
+    let id = tpd.id;
     let mut lflgs;
     loop {
         progress.block_count_dec();
         loop {
             lflgs = progress.lflgs.load(Ordering::Acquire);
             if lflgs & LFLG_BLOCK != 0 {
-                std::thread::park();
+                progress.wait_managed(id);
             } else {
                 break;
             }
@@ -570,7 +624,29 @@ fn block_thread(tpd: &mut ThrPrgrData) -> u32 {
             break;
         }
     }
+    // Port of erl_thr_progress.c:1327 (`erts_code_ix_finalize_wait` in `block_thread`).
+    erts_code_ix_finalize_wait();
     lflgs
+}
+
+/// `outstanding_blocking_code_barriers` (code_ix.c).
+static OUTSTANDING_BLOCKING_CODE_BARRIERS: AtomicI32 = AtomicI32::new(0);
+
+/// Port of erts/emulator/beam/erl_threads.h (`ERTS_THR_INSTRUCTION_BARRIER`), OTP-29.1.1.
+pub fn erts_thr_instruction_barrier() {
+    raw::instruction_barrier();
+}
+
+/// Port of erts/emulator/beam/code_ix.c:642 (`erts_code_ix_finalize_wait`), OTP-29.1.1.
+pub fn erts_code_ix_finalize_wait() {
+    if OUTSTANDING_BLOCKING_CODE_BARRIERS.load(Ordering::Relaxed) != 0 {
+        erts_thr_instruction_barrier();
+    }
+}
+
+/// Port of erts/emulator/beam/code_ix.c:46 (`outstanding_blocking_code_barriers`).
+pub fn outstanding_blocking_code_barriers() -> &'static AtomicI32 {
+    &OUTSTANDING_BLOCKING_CODE_BARRIERS
 }
 
 // Port of erts/emulator/beam/erl_thr_progress.c (leader_update), OTP-29.1.1.
@@ -797,6 +873,7 @@ fn request_wakeup_managed(tpd: &mut ThrPrgrData, mut value: u64) {
 }
 
 // Port of erl_thr_progress.c:1172 (request_wakeup_unmanaged), OTP-29.1.1.
+#[cfg(test)]
 fn request_wakeup_unmanaged(tpd: &mut UnmanagedTpd, value: u64) {
     let progress = Arc::clone(&tpd.progress);
     if progress.has_reached_wakeup(value) {
@@ -850,15 +927,21 @@ fn thr_progress_block(progress: &ThrProgress, tpd: Option<&mut ThrPrgrData>) {
             }
         }
     }
+    // Port of erl_thr_progress.c:1361-1377: `erts_tse_fetch`, publish `blocker_event`, wait.
+    let event = raw::erts_tse_fetch();
+    raw::erts_tse_reset(event);
+    raw::blocker_event_store(&progress.blocker_event, event);
     if managed {
         progress.block_count.fetch_sub(1, Ordering::Relaxed);
     }
-    progress
+    let mut bc = progress
         .block_count
-        .fetch_and(!BC_FLG_NOT_BLOCKING, Ordering::SeqCst);
-    let mut guard = progress.event.0.lock().unwrap();
-    while progress.block_count.load(Ordering::Acquire) != 0 {
-        guard = progress.event.1.wait(guard).unwrap();
+        .fetch_and(!BC_FLG_NOT_BLOCKING, Ordering::SeqCst)
+        & !BC_FLG_NOT_BLOCKING;
+    while bc != 0 {
+        raw::erts_tse_wait(event);
+        raw::erts_tse_reset(event);
+        bc = progress.block_count.load(Ordering::Acquire);
     }
 }
 
@@ -889,12 +972,14 @@ fn thr_progress_unblock(progress: &ThrProgress, tpd: Option<&mut ThrPrgrData>) {
             (0, 0, size != 0)
         }
     };
+    let event = raw::blocker_event_take(&progress.blocker_event);
     progress
         .block_count
         .fetch_or(BC_FLG_NOT_BLOCKING, Ordering::Release);
     progress.lflgs.fetch_and(!LFLG_BLOCK, Ordering::SeqCst);
-    // Unmanaged threads waiting to block wait on the event.
+    // Unmanaged threads waiting to take `LFLG_BLOCK` wait on this event.
     progress.notify_event();
+    raw::erts_tse_return(event);
     if wakeup {
         loop {
             if progress.thr[id].0.load(Ordering::Relaxed) != VAL_WAITING {
@@ -928,16 +1013,7 @@ pub(crate) struct ManagedThread(std::rc::Rc<RefCell<ThrPrgrData>>);
 
 /// Register the calling thread as managed thread `id` of `progress`.
 // Port of erl_thr_progress.c:576 (erts_thr_progress_register_managed_thread), OTP-29.1.1.
-#[cfg(test)]
 pub(crate) fn register_managed_thread(progress: &Arc<ThrProgress>, id: usize) -> ManagedThread {
-    register_managed_thread_with_later_ops(progress, id, LaterOpState::shared())
-}
-
-pub(crate) fn register_managed_thread_with_later_ops(
-    progress: &Arc<ThrProgress>,
-    id: usize,
-    later_ops: std::rc::Rc<RefCell<LaterOpState>>,
-) -> ManagedThread {
     progress.lflgs.fetch_add(1, Ordering::Relaxed);
     let managed = ManagedThread(std::rc::Rc::new(RefCell::new(ThrPrgrData {
         progress: Arc::clone(progress),
@@ -951,7 +1027,6 @@ pub(crate) fn register_managed_thread_with_later_ops(
         chk_next_ix: 0,
         // erl_thr_progress.c:499 (init_wakeup_request_array): no slot matches its index.
         wakeup_request: std::array::from_fn(|ix| (ix as u64).wrapping_sub(1)),
-        later_ops,
         leader_umrefc_waiting: -1,
         leader_umrefc_current: 0,
     })));
@@ -1009,26 +1084,11 @@ impl Drop for UnmanagedRegistration {
     }
 }
 
-/// Drop the calling test thread's registration (a scheduler never ends its loop). Later
-/// operations it still holds move to the shared queue, where another managed thread, or
-/// [`run_remaining_later_ops`] once every managed thread stopped, runs them.
+/// Drop the calling test thread's registration (a scheduler never ends its loop).
 #[cfg(test)]
 pub(crate) fn unregister_managed_thread() {
     MANAGED_OF.with(|of| of.set(0));
-    let Some(managed) = TPD.with(|tpd| tpd.borrow_mut().take()) else {
-        return;
-    };
-    let tpd = &mut *managed.0.borrow_mut();
-    let mut later_ops = tpd.later_ops.borrow_mut();
-    if later_ops.later_ops.is_empty() {
-        return;
-    }
-    let progress = Arc::clone(&tpd.progress);
-    let mut shared = progress.unmanaged_later.lock().unwrap();
-    shared.extend(later_ops.later_ops.drain(..));
-    progress
-        .unmanaged_later_len
-        .store(shared.len(), Ordering::Release);
+    TPD.with(|tpd| tpd.borrow_mut().take());
 }
 
 /// Whether the calling thread is a managed thread of `progress`
@@ -1083,32 +1143,6 @@ fn unmanaged_continue_ix(progress: &ThrProgress, umrefc_ix: usize) {
     }
 }
 
-/// Run every later operation still queued once no managed thread of `progress` runs any more:
-/// the scheduler stopped, so none will reach a progress point. Unmanaged threads that delay
-/// progress are waited for first.
-pub(crate) fn run_remaining_later_ops(progress: &ThrProgress) {
-    loop {
-        while progress
-            .umrefc
-            .iter()
-            .any(|refc| refc.load(Ordering::Acquire) != 0)
-        {
-            std::thread::yield_now();
-        }
-        let ready: Vec<_> = {
-            let mut shared = progress.unmanaged_later.lock().unwrap();
-            progress.unmanaged_later_len.store(0, Ordering::Release);
-            shared.drain(..).map(|(_, op)| op).collect()
-        };
-        if ready.is_empty() {
-            return;
-        }
-        for op in ready {
-            op.run();
-        }
-    }
-}
-
 /// The scheduler's progress point: update, lead and block if requested.
 // Port of erl_process.c:9857-9866 (schedule: erts_thr_progress_update and
 // erts_thr_progress_leader_update), OTP-29.1.1.
@@ -1136,18 +1170,14 @@ pub(crate) fn scheduler_progress(managed: &ManagedThread, run_queue: &mut dyn Ru
 
 /// Drain ready scheduler-owned later operations from `handle_aux_work`.
 // Port of erts/emulator/beam/erl_process.c:2281 (handle_thr_prgr_later_op), OTP-29.1.1.
-pub(crate) fn handle_thr_prgr_later_op(managed: &ManagedThread) -> bool {
-    let limit = managed.0.borrow().later_ops.borrow().later_ops.len() / 8 + MIN_THR_PRGR_LATER_OPS;
-    for _ in 0..limit {
-        let op = next_ready_later_op(&mut managed.0.borrow_mut());
-        let Some(op) = op else {
-            break;
-        };
-        op.run();
-    }
-    let tpd = managed.0.borrow();
-    tpd.later_ops.borrow().later_ops.is_empty()
-        && tpd.progress.unmanaged_later_len.load(Ordering::Acquire) == 0
+pub(crate) fn handle_thr_prgr_later_op(awdp: *mut AuxWorkLater, current: u64) -> LaterOpHandle {
+    raw::handle_thr_prgr_later_op(
+        awdp,
+        current,
+        MIN_THR_PRGR_LATER_OPS,
+        LATER_CLEANUP_OP_THRESHOLD,
+        has_reached_this,
+    )
 }
 
 /// The scheduler's hold on its run queue lock across `erts_schedule`.
@@ -1167,57 +1197,6 @@ impl RunQueueHold for () {
     }
     fn release(&mut self) {}
     fn reacquire(&mut self) {}
-}
-
-/// The next later operation of this thread, or of an unmanaged thread, that thread progress
-/// has reached.
-// Port of erts/emulator/beam/erl_process.c (handle_thr_prgr_later_op runs only when
-// ERTS_SSI_AUX_WORK_THR_PRGR_LATER_OP is set, that is, later operations exist), OTP-29.1.1.
-fn next_ready_later_op(tpd: &mut ThrPrgrData) -> Option<LaterOp> {
-    let shared_len = tpd.progress.unmanaged_later_len.load(Ordering::Acquire);
-    if tpd.later_ops.borrow().later_ops.is_empty() && shared_len == 0 {
-        return None;
-    }
-    let current = tpd.progress.current.load(Ordering::Acquire);
-    let local_op = {
-        let mut state = tpd.later_ops.borrow_mut();
-        if state
-            .later_ops
-            .front()
-            .is_some_and(|(later, _)| has_reached_this(current, *later))
-        {
-            let op = state.later_ops.pop_front().map(|(_, op)| op);
-            if state.later_ops.is_empty() {
-                state.size = LATER_CLEANUP_OP_THRESHOLD;
-            }
-            op
-        } else {
-            None
-        }
-    };
-    if local_op.is_some() {
-        return local_op;
-    }
-    if shared_len == 0 {
-        return None;
-    }
-    let progress = Arc::clone(&tpd.progress);
-    let mut shared = progress.unmanaged_later.lock().unwrap();
-    if shared
-        .front()
-        .is_some_and(|(later, _)| has_reached_this(current, *later))
-    {
-        let op = shared.pop_front().map(|(_, op)| op);
-        progress
-            .unmanaged_later_len
-            .store(shared.len(), Ordering::Release);
-        return op;
-    }
-    if let Some(&(later, _)) = shared.front() {
-        drop(shared);
-        request_wakeup_managed(tpd, later);
-    }
-    None
 }
 
 /// Before a managed thread sleeps: it stops counting as active and waits.
@@ -1267,20 +1246,19 @@ pub(crate) fn unblock(progress: &ThrProgress) {
 }
 
 // Port of erts/emulator/beam/erl_process.c (haw_chk_later_cleanup_op_wakeup), OTP-29.1.1.
-fn haw_chk_later_cleanup_op_wakeup(tpd: &mut ThrPrgrData, val: u64) {
-    let mut state = tpd.later_ops.borrow_mut();
-    if !state.later_ops.is_empty() && cmp(val, state.thr_prgr) != std::cmp::Ordering::Less {
-        state.size = LATER_CLEANUP_OP_THRESHOLD;
+fn haw_chk_later_cleanup_op_wakeup(awdp: &mut AuxWorkLater, val: u64) {
+    if !awdp.later_op.is_empty() && cmp(val, awdp.later_op.thr_prgr) != std::cmp::Ordering::Less {
+        awdp.later_op.size = LATER_CLEANUP_OP_THRESHOLD;
     }
 }
 
 // Port of erts/emulator/beam/erl_process.c (haw_thr_prgr_wakeup), OTP-29.1.1.
-fn haw_thr_prgr_wakeup(tpd: &mut ThrPrgrData, val: u64) {
-    let order = cmp(val, tpd.later_ops.borrow().latest_wakeup);
+fn haw_thr_prgr_wakeup(tpd: &mut ThrPrgrData, awdp: &mut AuxWorkLater, val: u64) {
+    let order = cmp(val, awdp.latest_wakeup);
     if order != std::cmp::Ordering::Equal {
         if order == std::cmp::Ordering::Greater {
-            tpd.later_ops.borrow_mut().latest_wakeup = val;
-            haw_chk_later_cleanup_op_wakeup(tpd, val);
+            awdp.latest_wakeup = val;
+            haw_chk_later_cleanup_op_wakeup(awdp, val);
         }
         request_wakeup_managed(tpd, val);
     }
@@ -1289,78 +1267,101 @@ fn haw_thr_prgr_wakeup(tpd: &mut ThrPrgrData, val: u64) {
 // Port of erts/emulator/beam/erl_process.c (haw_thr_prgr_later_cleanup_op_wakeup), OTP-29.1.1:
 // cleanup operations ask for a wakeup only once their bytes passed the threshold; until then
 // they run when the thread passes its progress points anyway.
-fn haw_thr_prgr_later_cleanup_op_wakeup(tpd: &mut ThrPrgrData, val: u64, size: usize) {
-    let request = {
-        let mut state = tpd.later_ops.borrow_mut();
-        if cmp(val, state.latest_wakeup) == std::cmp::Ordering::Greater {
-            state.thr_prgr = val;
-            if state.size > size {
-                state.size -= size;
-                false
-            } else {
-                state.latest_wakeup = val;
-                state.size = LATER_CLEANUP_OP_THRESHOLD;
-                true
-            }
+fn haw_thr_prgr_later_cleanup_op_wakeup(
+    tpd: &mut ThrPrgrData,
+    awdp: &mut AuxWorkLater,
+    val: u64,
+    size: usize,
+) {
+    if cmp(val, awdp.latest_wakeup) == std::cmp::Ordering::Greater {
+        awdp.later_op.thr_prgr = val;
+        if awdp.later_op.size > size {
+            awdp.later_op.size -= size;
         } else {
-            false
+            awdp.latest_wakeup = val;
+            awdp.later_op.size = LATER_CLEANUP_OP_THRESHOLD;
+            request_wakeup_managed(tpd, val);
         }
-    };
-    if request {
-        request_wakeup_managed(tpd, val);
     }
 }
 
-/// Run `op` once every managed thread passed a thread progress point.
-// Port of erl_process.c:2351 (erts_schedule_thr_prgr_later_op, enqueue_later_op and
-// haw_thr_prgr_wakeup) and erl_thr_progress.h (erts_thr_progress_later), OTP-29.1.1.
-pub(crate) fn schedule_later_op(progress: &ThrProgress, op: LaterOp) {
-    if progress.managed_no() == 0 {
-        let mut shared = progress.unmanaged_later.lock().unwrap();
-        shared.push_back((0, op));
-        progress
-            .unmanaged_later_len
-            .store(shared.len(), Ordering::Release);
-        return;
-    }
-    let fallback = with_tpd(|tpd| {
+/// Port of erts/emulator/beam/erl_process.c:1703 (`haw_thr_prgr_current_reset`).
+pub(crate) fn haw_thr_prgr_current_reset(awdp: *mut AuxWorkLater) {
+    raw::aux_work_later_current_reset(awdp);
+}
+
+/// Port of erts/emulator/beam/erl_process.c:1708 (`haw_thr_prgr_current`).
+pub(crate) fn haw_thr_prgr_current(awdp: *mut AuxWorkLater, progress: &ThrProgress) -> u64 {
+    raw::aux_work_later_current(awdp, progress.current.load(Ordering::Acquire))
+}
+
+/// Port of erts/emulator/beam/erl_process.c:1720 (`haw_thr_prgr_current_check_progress`).
+pub(crate) fn haw_thr_prgr_current_check_progress(cached: u64, progress: &ThrProgress) -> bool {
+    cached != VAL_WAITING && cached != progress.current.load(Ordering::Acquire)
+}
+
+/// Port of erts/emulator/beam/erl_process.c:2351 (`erts_schedule_thr_prgr_later_op`).
+pub(crate) fn erts_schedule_thr_prgr_later_op(
+    progress: &ThrProgress,
+    awdp: &mut AuxWorkLater,
+    aux_work: &AtomicU32,
+    later_func: fn(*mut ()),
+    later_data: *mut (),
+    lop: *mut ErtsThrPrgrLaterOp,
+) {
+    enqueue_later_op(progress, awdp, aux_work, later_func, later_data, lop, None);
+}
+
+/// Port of erts/emulator/beam/erl_process.c:2361 (`erts_schedule_thr_prgr_later_cleanup_op`).
+pub(crate) fn erts_schedule_thr_prgr_later_cleanup_op(
+    progress: &ThrProgress,
+    awdp: &mut AuxWorkLater,
+    aux_work: &AtomicU32,
+    later_func: fn(*mut ()),
+    later_data: *mut (),
+    lop: *mut ErtsThrPrgrLaterOp,
+    size: usize,
+) {
+    enqueue_later_op(
+        progress,
+        awdp,
+        aux_work,
+        later_func,
+        later_data,
+        lop,
+        Some(size),
+    );
+}
+
+// Port of erl_process.c:2324 (`enqueue_later_op`), OTP-29.1.1.
+pub(crate) fn enqueue_later_op(
+    progress: &ThrProgress,
+    awdp: &mut AuxWorkLater,
+    aux_work: &AtomicU32,
+    later_func: fn(*mut ()),
+    later_data: *mut (),
+    lop: *mut ErtsThrPrgrLaterOp,
+    cleanup_size: Option<usize>,
+) {
+    with_tpd(|tpd| {
         let Some(tpd) = tpd.filter(|tpd| std::ptr::eq(Arc::as_ptr(&tpd.progress), progress)) else {
-            return Some(op);
+            debug_assert!(
+                false,
+                "enqueue_later_op requires a normal scheduler (erts ASSERT esdp && !dirty)"
+            );
+            return;
         };
-        // enqueue_later_op: erts_thr_progress_later issues a full barrier, then the value.
-        fence(Ordering::SeqCst);
+        // erts_thr_progress_later: read confirmed, then a full barrier, then current_to_later.
         let later = current_to_later(tpd.confirmed);
-        let cleanup_size = match op {
-            LaterOp::Cleanup { size, .. } => Some(size),
-            LaterOp::Boxed(_) => None,
-        };
-        tpd.later_ops.borrow_mut().later_ops.push_back((later, op));
+        fence(Ordering::SeqCst);
+        raw::enqueue(&mut awdp.later_op.list, later, later_func, later_data, lop);
+        // Port of erl_process.c:2344 (`set_aux_work_flags_wakeup_nob` in `enqueue_later_op`).
+        aux_work.fetch_or(1 << 5, Ordering::Release);
         match cleanup_size {
-            Some(size) => haw_thr_prgr_later_cleanup_op_wakeup(tpd, later, size),
-            None => haw_thr_prgr_wakeup(tpd, later),
+            Some(size) => haw_thr_prgr_later_cleanup_op_wakeup(tpd, awdp, later, size),
+            None => haw_thr_prgr_wakeup(tpd, awdp, later),
         }
-        None
     });
-    if let Some(op) = fallback {
-        // An unmanaged thread: any managed thread runs it once progress reaches it.
-        let later = current_to_later(progress.current.load(Ordering::SeqCst));
-        let mut shared = progress.unmanaged_later.lock().unwrap();
-        shared.push_back((later, op));
-        progress
-            .unmanaged_later_len
-            .store(shared.len(), Ordering::Release);
-        drop(shared);
-        UNMANAGED_TPD.with(|unmanaged| {
-            let mut unmanaged = unmanaged.borrow_mut();
-            if let Some(tpd) = unmanaged
-                .as_mut()
-                .filter(|tpd| std::ptr::eq(Arc::as_ptr(&tpd.progress), progress))
-            {
-                request_wakeup_unmanaged(tpd, later);
-            }
-        });
-        progress.wakeup_managed(0);
-    }
 }
 
 /// Whether `val` was reached (used by tests).
@@ -1369,49 +1370,19 @@ fn reached(progress: &ThrProgress, val: u64) -> bool {
     progress.has_reached(val)
 }
 
-/// Whether the first later operation of this managed thread became runnable: the global
+fn later_list_ready(list: &raw::LaterOpList, current: u64) -> bool {
+    raw::first_later(list).is_some_and(|later| has_reached_this(current, later))
+}
+
+/// Whether the first later operation of this scheduler became runnable: the global
 /// thread progress value reached it.
 ///
 /// Port of erts/emulator/beam/erl_process.c:2285-2320 (handle_thr_prgr_later_op compares the
 /// first operation with `erts_thr_progress_current()`), OTP-29.1.1. `scheduler_wait` publishes
 /// its sleeping flags first and then looks at this again, so a wakeup that came before the
 /// flags were set is not lost.
-pub(crate) fn scheduler_later_op_ready() -> bool {
-    with_tpd(|tpd| {
-        tpd.is_some_and(|tpd| {
-            let current = tpd.progress.current.load(Ordering::Acquire);
-            tpd.later_ops
-                .borrow()
-                .later_ops
-                .front()
-                .is_some_and(|(later, _)| has_reached_this(current, *later))
-                || tpd
-                    .progress
-                    .unmanaged_later
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .front()
-                    .is_some_and(|(later, _)| has_reached_this(current, *later))
-        })
-    })
-}
-
-/// Whether this scheduler's first later operation is ready for its aux-work handler.
-pub(crate) fn later_op_ready(managed: &ManagedThread) -> bool {
-    let tpd = managed.0.borrow();
-    let current = tpd.progress.current.load(Ordering::Acquire);
-    tpd.later_ops
-        .borrow()
-        .later_ops
-        .front()
-        .is_some_and(|(later, _)| has_reached_this(current, *later))
-        || tpd
-            .progress
-            .unmanaged_later
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .front()
-            .is_some_and(|(later, _)| has_reached_this(current, *later))
+pub(crate) fn later_op_ready(awdp: &AuxWorkLater, current: u64) -> bool {
+    later_list_ready(&awdp.later_op.list, current)
 }
 
 /// The next thread-progress value for work scheduled by the calling managed thread.
@@ -1489,6 +1460,51 @@ mod tests {
         assert!(!has_reached_this(6, 7));
     }
 
+    struct FlagOp {
+        later_op: ErtsThrPrgrLaterOp,
+        flag: Arc<AtomicBool>,
+    }
+
+    fn set_flag(data: *mut ()) {
+        // SAFETY: `data` is the live `FlagOp` the test owns until this later op runs.
+        let op = unsafe { &*data.cast::<FlagOp>() };
+        op.flag.store(true, Ordering::SeqCst);
+    }
+
+    static AUX_WORK_FLAGS: AtomicU32 = AtomicU32::new(0);
+
+    fn schedule_flag(progress: &ThrProgress, awdp: &mut AuxWorkLater, op: &mut FlagOp) {
+        erts_schedule_thr_prgr_later_op(
+            progress,
+            awdp,
+            &AUX_WORK_FLAGS,
+            set_flag,
+            std::ptr::from_mut(op).cast(),
+            op.later_op.as_list_node(),
+        );
+    }
+
+    fn schedule_cleanup(
+        progress: &ThrProgress,
+        awdp: &mut AuxWorkLater,
+        node: &mut ErtsThrPrgrLaterOp,
+        size: usize,
+    ) {
+        erts_schedule_thr_prgr_later_cleanup_op(
+            progress,
+            awdp,
+            &AUX_WORK_FLAGS,
+            count_cleanup,
+            std::ptr::null_mut(),
+            node,
+            size,
+        );
+    }
+
+    fn drain(awdp: &mut AuxWorkLater, current: u64) {
+        handle_thr_prgr_later_op(std::ptr::from_mut(awdp), current);
+    }
+
     #[test]
     fn single_managed_thread_leads_and_runs_later_ops() {
         let progress = progress(1);
@@ -1496,17 +1512,17 @@ mod tests {
             scope.spawn(|| {
                 progress.sleepers[0].set(std::thread::current()).unwrap();
                 let managed = register_managed_thread(&progress, 0);
-                let ran = Arc::new(AtomicBool::new(false));
-                let flag = Arc::clone(&ran);
-                schedule_later_op(
-                    &progress,
-                    LaterOp::Boxed(Box::new(move || flag.store(true, Ordering::SeqCst))),
-                );
+                let mut awdp = AuxWorkLater::new();
+                let mut op = FlagOp {
+                    later_op: ErtsThrPrgrLaterOp::new(),
+                    flag: Arc::new(AtomicBool::new(false)),
+                };
+                schedule_flag(&progress, &mut awdp, &mut op);
                 for _ in 0..8 {
                     scheduler_progress(&managed, &mut ());
                 }
-                handle_thr_prgr_later_op(&managed);
-                assert!(ran.load(Ordering::SeqCst));
+                drain(&mut awdp, progress.current.load(Ordering::Acquire));
+                similar_asserts::assert_eq!(op.flag.load(Ordering::SeqCst), true);
                 assert!(reached(&progress, 2));
                 unregister_managed_thread();
             });
@@ -1515,7 +1531,7 @@ mod tests {
 
     static CLEANED: AtomicUsize = AtomicUsize::new(0);
 
-    fn count_cleanup(_: usize) {
+    fn count_cleanup(_: *mut ()) {
         CLEANED.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -1529,17 +1545,11 @@ mod tests {
             scope.spawn(|| {
                 progress.sleepers[0].set(std::thread::current()).unwrap();
                 let managed = register_managed_thread(&progress, 0);
-                let cleanup = |size| LaterOp::Cleanup {
-                    release: count_cleanup,
-                    data: 0,
-                    size,
-                };
-                schedule_later_op(&progress, cleanup(1024));
-                let first = managed.0.borrow().later_ops.borrow().latest_wakeup;
-                assert_eq!(
-                    managed.0.borrow().later_ops.borrow().size,
-                    LATER_CLEANUP_OP_THRESHOLD
-                );
+                let mut awdp = AuxWorkLater::new();
+                let mut nodes = vec![ErtsThrPrgrLaterOp::new(); 403];
+                schedule_cleanup(&progress, &mut awdp, &mut nodes[0], 1024);
+                let first = awdp.latest_wakeup;
+                similar_asserts::assert_eq!(awdp.later_op.size, LATER_CLEANUP_OP_THRESHOLD);
                 // Move progress on so later operations get a later value.
                 for _ in 0..4 {
                     let tpd = &mut *managed.0.borrow_mut();
@@ -1547,30 +1557,25 @@ mod tests {
                         leader_update(tpd);
                     }
                 }
-                schedule_later_op(&progress, cleanup(1024));
-                {
-                    let tpd = managed.0.borrow();
-                    let state = tpd.later_ops.borrow();
-                    assert_eq!(
-                        state.latest_wakeup, first,
-                        "small cleanup requests no wakeup"
-                    );
-                    assert_eq!(state.size, LATER_CLEANUP_OP_THRESHOLD - 1024);
+                schedule_cleanup(&progress, &mut awdp, &mut nodes[1], 1024);
+                similar_asserts::assert_eq!(
+                    awdp.latest_wakeup,
+                    first,
+                    "small cleanup requests no wakeup"
+                );
+                similar_asserts::assert_eq!(awdp.later_op.size, LATER_CLEANUP_OP_THRESHOLD - 1024);
+                schedule_cleanup(
+                    &progress,
+                    &mut awdp,
+                    &mut nodes[2],
+                    LATER_CLEANUP_OP_THRESHOLD,
+                );
+                assert_ne!(awdp.latest_wakeup, first, "the threshold requests a wakeup");
+                similar_asserts::assert_eq!(awdp.later_op.size, LATER_CLEANUP_OP_THRESHOLD);
+                for node in &mut nodes[3..] {
+                    schedule_cleanup(&progress, &mut awdp, node, 8);
                 }
-                schedule_later_op(&progress, cleanup(LATER_CLEANUP_OP_THRESHOLD));
-                {
-                    let tpd = managed.0.borrow();
-                    let state = tpd.later_ops.borrow();
-                    assert_ne!(
-                        state.latest_wakeup, first,
-                        "the threshold requests a wakeup"
-                    );
-                    assert_eq!(state.size, LATER_CLEANUP_OP_THRESHOLD);
-                }
-                for _ in 0..400 {
-                    schedule_later_op(&progress, cleanup(8));
-                }
-                let queued = managed.0.borrow().later_ops.borrow().later_ops.len();
+                let queued = awdp.list_len();
                 CLEANED.store(0, Ordering::SeqCst);
                 for _ in 0..4 {
                     let tpd = &mut *managed.0.borrow_mut();
@@ -1578,15 +1583,15 @@ mod tests {
                         leader_update(tpd);
                     }
                 }
-                handle_thr_prgr_later_op(&managed);
-                assert_eq!(
+                drain(&mut awdp, progress.current.load(Ordering::Acquire));
+                similar_asserts::assert_eq!(
                     CLEANED.load(Ordering::SeqCst),
                     queued / 8 + MIN_THR_PRGR_LATER_OPS
                 );
-                while !managed.0.borrow().later_ops.borrow().later_ops.is_empty() {
-                    handle_thr_prgr_later_op(&managed);
+                while !awdp.is_empty() {
+                    drain(&mut awdp, progress.current.load(Ordering::Acquire));
                 }
-                assert_eq!(CLEANED.load(Ordering::SeqCst), queued);
+                similar_asserts::assert_eq!(CLEANED.load(Ordering::SeqCst), queued);
                 unregister_managed_thread();
             });
         });
@@ -1602,16 +1607,17 @@ mod tests {
             scope.spawn(|| {
                 progress.sleepers[0].set(std::thread::current()).unwrap();
                 let managed = register_managed_thread(&progress, 0);
+                let mut awdp = AuxWorkLater::new();
                 assert!(matches!(unmanaged_delay(&progress), DelayHandle::Managed));
-                let flag = Arc::clone(&ran);
-                schedule_later_op(
-                    &progress,
-                    LaterOp::Boxed(Box::new(move || flag.store(true, Ordering::SeqCst))),
-                );
+                let mut op = FlagOp {
+                    later_op: ErtsThrPrgrLaterOp::new(),
+                    flag: Arc::clone(&ran),
+                };
+                schedule_flag(&progress, &mut awdp, &mut op);
                 for _ in 0..8 {
                     scheduler_progress(&managed, &mut ());
                 }
-                handle_thr_prgr_later_op(&managed);
+                drain(&mut awdp, progress.current.load(Ordering::Acquire));
                 assert!(
                     !ran.load(Ordering::SeqCst),
                     "progress passed an unmanaged delay"
@@ -1620,7 +1626,7 @@ mod tests {
                 for _ in 0..8 {
                     scheduler_progress(&managed, &mut ());
                 }
-                handle_thr_prgr_later_op(&managed);
+                drain(&mut awdp, progress.current.load(Ordering::Acquire));
                 assert!(ran.load(Ordering::SeqCst));
                 unregister_managed_thread();
             });
@@ -1628,32 +1634,31 @@ mod tests {
     }
 
     #[test]
-    fn later_ops_of_a_stopped_thread_run_at_shutdown() {
+    fn later_op_list_is_intrusive_first_last_list_len() {
         let progress = progress(1);
-        let ran = Arc::new(AtomicBool::new(false));
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 progress.sleepers[0].set(std::thread::current()).unwrap();
-                let _managed = register_managed_thread(&progress, 0);
-                let flag = Arc::clone(&ran);
-                schedule_later_op(
-                    &progress,
-                    LaterOp::Cleanup {
-                        release: |_| {},
-                        data: 0,
-                        size: 0,
-                    },
-                );
-                schedule_later_op(
-                    &progress,
-                    LaterOp::Boxed(Box::new(move || flag.store(true, Ordering::SeqCst))),
-                );
+                let managed = register_managed_thread(&progress, 0);
+                let mut awdp = AuxWorkLater::new();
+                let mut nodes = [ErtsThrPrgrLaterOp::new(), ErtsThrPrgrLaterOp::new()];
+                let first = std::ptr::from_mut(&mut nodes[0]);
+                let second = std::ptr::from_mut(&mut nodes[1]);
+                schedule_cleanup(&progress, &mut awdp, &mut nodes[0], 8);
+                schedule_cleanup(&progress, &mut awdp, &mut nodes[1], 8);
+                similar_asserts::assert_eq!(awdp.later_op.list_len(), 2);
+                similar_asserts::assert_eq!(awdp.later_op.list.first, first);
+                similar_asserts::assert_eq!(awdp.later_op.list.last, second);
+                similar_asserts::assert_eq!(raw::first_later(&awdp.later_op.list).is_some(), true);
+                for _ in 0..8 {
+                    scheduler_progress(&managed, &mut ());
+                }
+                while !awdp.is_empty() {
+                    drain(&mut awdp, progress.current.load(Ordering::Acquire));
+                }
                 unregister_managed_thread();
             });
         });
-        assert!(!ran.load(Ordering::SeqCst));
-        run_remaining_later_ops(&progress);
-        assert!(ran.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -1717,5 +1722,65 @@ mod tests {
             unblock(&progress);
             stop.store(true, Ordering::SeqCst);
         });
+    }
+
+    /// erl_thr_progress.c block_thread waits on the blocked thread's own callbacks: the aux
+    /// thread (a managed id past the schedulers) sleeps on its SSI event, the primitive its
+    /// `wakeup` callback signals, so thr_progress_unblock wakes it.
+    #[test]
+    fn blocked_aux_thread_wakes_on_unblock() {
+        let progress = Arc::new(ThrProgress::new_with_managed_extra(
+            Arc::from([]),
+            Arc::from([]),
+            1,
+            0,
+        ));
+        let event = Arc::new(ThreadEvent::new());
+        progress.register_aux_event(Arc::clone(&event));
+        let stop = AtomicBool::new(false);
+        let passes = AtomicU64::new(0);
+        let aux = OnceLock::new();
+        let woke = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                aux.set(std::thread::current()).unwrap();
+                let managed = register_managed_thread(&progress, 0);
+                while !stop.load(Ordering::SeqCst) {
+                    scheduler_progress(&managed, &mut ());
+                    passes.fetch_add(1, Ordering::SeqCst);
+                }
+                scheduler_prepare_wait();
+                unregister_managed_thread();
+            });
+            while passes.load(Ordering::SeqCst) == 0 {
+                std::thread::yield_now();
+            }
+            block(&progress);
+            let frozen = passes.load(Ordering::SeqCst);
+            // block() returns once the aux thread counted itself blocked; let it reach its wait.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            unblock(&progress);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let woke = loop {
+                if passes.load(Ordering::SeqCst) > frozen + 1 {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::yield_now();
+            };
+            stop.store(true, Ordering::SeqCst);
+            if !woke {
+                // Release the lost waiter so the scope can join and the test report.
+                progress.lflgs.fetch_and(!LFLG_BLOCK, Ordering::SeqCst);
+                event.signal();
+                aux.get().unwrap().unpark();
+            }
+            woke
+        });
+        assert!(
+            woke,
+            "the blocked aux thread missed thr_progress_unblock's wakeup"
+        );
     }
 }

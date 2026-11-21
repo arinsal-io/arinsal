@@ -2,17 +2,15 @@ use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
 
-/// The child setup helper is the `arinsal` binary next to the test executable's target directory, as
-/// `erl_child_setup` sits in erts's bindir. Ports with a working directory or a large environment
-/// run through it, so fail with the missing build step named instead of an opaque `badarg`.
+/// The child setup helper is `erl_child_setup` in the cargo bin dir, as it sits in erts's bindir.
+/// Ports with a working directory or a large environment run through it.
 fn require_child_setup_helper() {
-    let mut directory = std::env::current_exe().unwrap();
-    while directory.pop() {
-        if directory.join("arinsal").is_file() {
-            return;
-        }
-    }
-    panic!("build the arinsal binary first: cargo build -p arinsal-cli");
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_erl_child_setup"));
+    assert!(
+        helper.is_file(),
+        "erl_child_setup missing at {}",
+        helper.display()
+    );
 }
 
 const SOURCE: &str = r#"

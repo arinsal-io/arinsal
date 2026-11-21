@@ -648,12 +648,9 @@ fn family(chunked: bool) {
 }
 
 fn both(function: &str, workers: usize) -> (OwnedTerm, OwnedTerm) {
-    let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
-    let source = source();
-    let beam = reference.compile_named(MODULE, &source, &[]).unwrap();
-    reference.load(MODULE, &beam).unwrap();
+    let (reference, beam) = ref_erl_before_runtime();
     let mut vm = crate::common::node();
-    crate::common::load_fresh(&mut vm, &beam);
+    crate::common::load_fresh(&mut vm, beam);
     let CallResult::Ok(expected) = reference.call(MODULE, function, &[]) else {
         panic!("OTP {function} failed");
     };
@@ -661,6 +658,20 @@ fn both(function: &str, workers: usize) -> (OwnedTerm, OwnedTerm) {
         .eval_scheduled_reductions(MODULE, function, &[], workers, 4_000)
         .unwrap();
     (expected, actual.term)
+}
+
+/// Start the reference node before `node()`. The in-process runtime ignores SIGCHLD
+/// (`erts_sys_unix_later_init`); a later `Command::spawn` then fails with ECHILD.
+fn ref_erl_before_runtime() -> (&'static RefErl, &'static [u8]) {
+    static STARTED: std::sync::OnceLock<(RefErl, Vec<u8>)> = std::sync::OnceLock::new();
+    let (reference, beam) = STARTED.get_or_init(|| {
+        let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
+        let source = source();
+        let beam = reference.compile_named(MODULE, &source, &[]).unwrap();
+        reference.load(MODULE, &beam).unwrap();
+        (reference, beam)
+    });
+    (reference, beam)
 }
 
 #[test]

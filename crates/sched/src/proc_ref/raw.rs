@@ -11,13 +11,14 @@ impl<T: Task> TaskCell<T> {
     #[inline(always)]
     pub(crate) fn init_in_place(
         &mut self,
+        pid: crate::Pid,
         init: impl for<'a> FnOnce(&'a mut MaybeUninit<T>) -> &'a mut T,
     ) {
         assert!(!self.initialized, "a task is written once");
         let slot = self.task.as_mut_ptr();
         let task = init(&mut self.task);
         assert!(std::ptr::eq(slot, task));
-        task.init_in_place();
+        task.init_in_place(pid);
         self.initialized = true;
     }
 }
@@ -166,4 +167,27 @@ pub(crate) fn current_process_held<T: Task>(
         lock: std::ptr::from_ref(&current.cell).cast::<()>(),
     };
     (current, held)
+}
+
+/// `ptab_el->u.release`: the later-op node of the process block.
+///
+/// Port of erts/emulator/beam/erl_ptab.h (`ErtsPTabElementCommon.u.release`), OTP-29.1.1.
+pub(crate) fn later_op_node<T: crate::Task>(
+    block: *mut (),
+) -> *mut crate::thr_progress::ErtsThrPrgrLaterOp {
+    debug_assert!(!block.is_null());
+    // SAFETY: `block` is a live `ProcessBlock<T>` from `ProcRef::into_raw`; the later-op
+    // node is a field of that block, used only after the table dropped its slot (erts
+    // overlays `common.u.release` then).
+    unsafe { &raw mut (*block.cast::<super::ProcessBlock<T>>()).later_op }
+}
+
+/// `release_process`: drop the table's reference after thread progress.
+///
+/// Port of erts/emulator/beam/erl_process.c (`release_process` via
+/// `erts_schedule_thr_prgr_later_cleanup_op`), OTP-29.1.1.
+pub(crate) fn release_process<T: crate::Task>(data: *mut ()) {
+    // SAFETY: `data` is `ProcRef::into_raw` of the table slot's reference; this later op runs
+    // once, after every managed thread passed a progress point.
+    drop(unsafe { super::ProcRef::<T>::from_raw(data) });
 }

@@ -478,14 +478,6 @@ unsafe extern "C" {
         instruction: usize,
         registers: *mut u64,
     ) -> i32;
-    /// `void erts_msacc_set_bif_state(ErtsMsAcc *, Eterm, const void *)`.
-    pub safe fn erts_msacc_set_bif_state(msacc: usize, module: u64, function: usize) -> usize;
-    /// `void erts_msacc_update_cache(ErtsMsAcc **)`.
-    pub safe fn erts_msacc_update_cache(cache: *mut usize);
-    /// `void erts_msacc_set_state_m__(ErtsMsAcc *, Uint, int)`.
-    pub safe fn erts_msacc_set_state_m__(msacc: usize, state: usize, active: i32);
-    /// `ErtsMsAcc *erts_msacc_cache`.
-    pub safe static erts_msacc_cache: usize;
     /// `int erts_alcu_enable_code_atags`.
     pub safe static erts_alcu_enable_code_atags: i32;
 }

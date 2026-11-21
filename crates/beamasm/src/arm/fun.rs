@@ -399,14 +399,3 @@ pub(crate) fn emit_call_fun_error(
     asm.branch_error_from_lr()?;
     Ok(())
 }
-
-/// Routes the task-local operation to BeamAsm's shared guard emitter.
-// Port of erts/emulator/beam/jit/arm/instr_common.cpp:1263-1306, OTP-29.1.1
-pub fn emit_is_function2(
-    asm: &mut BeamModuleAssembler,
-    src: ArgVal,
-    arity: ArgVal,
-    helper: crate::guard::GuardHelper,
-) -> Result<(), ModuleError> {
-    asm.emit_is_function2(src, arity, helper)
-}

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 
 use crate::ptab_slot::{Progress, ProgressSlot};
 use crate::sig_queue::{OwnedSignal, SignalQueue};
-use crate::thr_progress;
+use crate::thr_progress::{self, raw};
 
 const SIGNAL_BUFFER_COUNT: usize = 64;
 const BUFFER_CONTENTION_INSTALL_LIMIT: usize = 50;
@@ -124,6 +124,14 @@ pub mod psflg {
     }
 }
 
+/// Extra process-state bits on `p->xstate` besides the dirty-run-queue `IN_PRQ` bits.
+// Port of erts/emulator/beam/erl_process.h:1390-1415, OTP-29.1.1.
+pub mod pxsflg {
+    /// `ERTS_PXSFLG_MAYBE_SELF_SIGS`: outstanding signals from this process to itself.
+    // Port of erts/emulator/beam/erl_process.h:1404-1406, OTP-29.1.1.
+    pub const MAYBE_SELF_SIGS: u32 = 1 << 8;
+}
+
 /// How a queued signal sets the in-queue state bits.
 pub trait InSignal {
     /// A message signal (`ERTS_PSFLG_MSG_SIG_IN_Q`); otherwise a non-message signal
@@ -185,8 +193,6 @@ struct PaddedBuffer<T>(Mutex<SignalBuffer<T>>);
 // Port of erts/emulator/beam/erl_proc_sig_queue.h (ErtsSignalInQueueBufferArray) and
 // erl_proc_sig_queue.c:10600-10718, OTP-29.1.1.
 struct SignalBuffers<T> {
-    /// The thread progress domain that frees this array once it is removed.
-    progress: Progress,
     /// Bit `i` is set while buffer `i` may hold signals (`nonempty_slots`).
     nonempty_slots: AtomicU64,
     /// A boxed slice: the array is 8 KiB and would otherwise be built on a small thread stack.
@@ -225,7 +231,6 @@ pub struct Incoming<T: Send + 'static> {
     /// MSG_SIG_IN_Q/NMSG_SIG_IN_Q bits of the signals still queued (erts re-sets them from
     /// `msgs_in_slots`/`nonmsgs_in_slots` after racing buffer inserts, erl_proc_sig_queue.c:1450).
     buffered_nmsgs: AtomicUsize,
-    buffering_allowed: AtomicBool,
     /// `p->sig_inq_buffers`: null while the buffers are not installed.
     buffers: ProgressSlot<SignalBuffers<T>>,
     contention_count: AtomicUsize,
@@ -249,7 +254,6 @@ impl<T: Send + 'static> Incoming<T> {
             state: AtomicU32::new(state),
             buffered_nmsgs: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
-            buffering_allowed: AtomicBool::new(false),
             buffers: ProgressSlot::new(),
             contention_count: AtomicUsize::new(0),
             buffer_enqueues: AtomicUsize::new(0),
@@ -425,15 +429,40 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
 
     /// Append an event, flushing the sender buffers first so it cannot overtake them.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:712 (signal enqueue), OTP-29.1.1.
-    pub fn push(&self, value: T) {
+    #[cfg(test)]
+    pub(crate) fn push(&self, value: T) -> Option<raw::LaterOpArgs> {
         let signal = OwnedSignal::new(value);
         let nmsg = usize::from(non_message_signal(&signal));
+        let mut queue = self.lock_msgq();
+        let later_op = self
+            .buffers
+            .is_occupied()
+            .then(|| self.flush_buffers_locked(&mut queue, true))
+            .flatten();
+        queue.push_back_node(signal);
+        self.enqueued_locked(1, nmsg);
+        later_op
+    }
+
+    /// Append a signal after flushing every sender buffer (`force_flush_buffers`).
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:1215-1224 (proc_queue_signal with
+    // `force_flush`), OTP-29.1.1.
+    pub(crate) fn push_after_flush_node(
+        &self,
+        signal: OwnedSignal<T>,
+    ) -> Result<u32, OwnedSignal<T>> {
         let mut queue = self.lock_msgq();
         if self.buffers.is_occupied() {
             self.flush_buffers_locked(&mut queue, true);
         }
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(signal);
+        }
+        let nmsg = usize::from(non_message_signal(&signal));
         queue.push_back_node(signal);
-        self.enqueued_locked(1, nmsg);
+        let state = self.enqueued_locked(1, nmsg);
+        drop(queue);
+        Ok(state)
     }
 
     /// Publish a signal through its sender's parallel buffer when buffering is enabled.
@@ -465,7 +494,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
             Err(signal) => signal,
         };
         let mut queue = self.lock_msgq();
-        self.maybe_install_buffers_locked(progress);
+        self.maybe_install_buffers_locked();
         if self.closed.load(Ordering::Relaxed) {
             return Err(signal);
         }
@@ -533,40 +562,40 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         }
     }
 
-    /// Enable the per sender buffers, or flush and disable them.
-    // Port of erts/emulator/beam/erl_proc_sig_queue.c:10600-10694, OTP-29.1.1.
-    pub fn set_buffers_enabled(&self, enabled: bool) {
-        // erts toggles the buffers only when the queue mode changes (process_flag or spawn).
-        if self.buffering_allowed.load(Ordering::Acquire) == enabled
-            && (enabled || !self.buffers.is_occupied())
-        {
-            return;
+    /// Flush the per sender buffers into the queue and remove them, as a process whose message
+    /// queue goes on heap does; returns the later op that releases the buffer array.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:10597 (erts_proc_sig_queue_flush_and_deinstall_buffers),
+    // OTP-29.1.1.
+    pub(crate) fn flush_and_deinstall_buffers(&self) -> Option<raw::LaterOpArgs> {
+        if !self.buffers.is_occupied() {
+            return None;
         }
-        if !enabled {
-            let mut queue = self.msgq.lock();
-            self.uninstall_buffers_locked(&mut queue);
-        }
-        self.buffering_allowed.store(enabled, Ordering::Release);
+        let mut queue = self.msgq.lock();
+        self.uninstall_buffers_locked(&mut queue)
     }
 
-    /// Force installation for the test hook that enables OTP's adaptive optimization.
+    /// Force installation for the test hook that enables OTP's adaptive optimization; a
+    /// process without `ERTS_PSFLG_OFF_HEAP_MSGQ` gets none.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:10700-10718, OTP-29.1.1.
-    pub(crate) fn force_buffers_enabled(&self, progress: &Progress) {
+    pub(crate) fn force_buffers_enabled(&self) -> bool {
         let _queue = self.msgq.lock();
-        self.buffering_allowed.store(true, Ordering::Release);
-        self.install_buffers_locked(progress);
+        if self.state.load(Ordering::Acquire) & psflg::OFF_HEAP_MSGQ == 0 {
+            return false;
+        }
+        self.install_buffers_locked();
+        true
     }
 
     /// Install buffers once enough contention was counted; the caller holds the msgq lock.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:10658 (erts_proc_sig_queue_maybe_install_buffers),
-    // OTP-29.1.1: the off-heap queue flag is `buffering_allowed`; the counter limit is checked
-    // right after the lock is taken, before the signal is enqueued.
-    fn maybe_install_buffers_locked(&self, progress: &Progress) {
-        if self.buffering_allowed.load(Ordering::Acquire)
+    // OTP-29.1.1: `state & ERTS_PSFLG_OFF_HEAP_MSGQ`; the counter limit is checked right after
+    // the lock is taken, before the signal is enqueued.
+    fn maybe_install_buffers_locked(&self) {
+        if self.state.load(Ordering::Acquire) & psflg::OFF_HEAP_MSGQ != 0
             && !self.buffers.is_occupied()
             && self.contention_count.load(Ordering::Relaxed) > BUFFER_CONTENTION_INSTALL_LIMIT
         {
-            self.install_buffers_locked(progress);
+            self.install_buffers_locked();
         }
     }
 
@@ -574,7 +603,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:10661-10694
     // (erts_proc_sig_queue_maybe_install_buffers), OTP-29.1.1: the pointer is published with
     // release order after the array is initialized.
-    fn install_buffers_locked(&self, progress: &Progress) {
+    fn install_buffers_locked(&self) {
         if self.closed.load(Ordering::Relaxed) || self.buffers.is_occupied() {
             return;
         }
@@ -583,21 +612,17 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
             .store(BUFFER_FLUSH_ROUNDS, Ordering::Relaxed);
         self.buffer_enqueues.store(0, Ordering::Relaxed);
         self.enqueues_since_decision.store(0, Ordering::Relaxed);
-        self.buffers.store(
-            Arc::new(SignalBuffers {
-                progress: progress.clone(),
-                nonempty_slots: AtomicU64::new(0),
-                slots: (0..SIGNAL_BUFFER_COUNT)
-                    .map(|_| {
-                        PaddedBuffer(Mutex::new(SignalBuffer {
-                            alive: true,
-                            queue: SignalQueue::default(),
-                        }))
-                    })
-                    .collect(),
-            }),
-            Some(progress),
-        );
+        self.buffers.store(Arc::new(SignalBuffers {
+            nonempty_slots: AtomicU64::new(0),
+            slots: (0..SIGNAL_BUFFER_COUNT)
+                .map(|_| {
+                    PaddedBuffer(Mutex::new(SignalBuffer {
+                        alive: true,
+                        queue: SignalQueue::default(),
+                    }))
+                })
+                .collect(),
+        }));
     }
 
     /// Flush, mark dead and remove the buffers; the caller holds the msgq lock.
@@ -605,8 +630,8 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
     // (erts_proc_sig_queue_flush_and_deinstall_buffers), OTP-29.1.1: only the msgq lock holder
     // installs or removes the array, so it reads the pointer without a reference; the array is
     // freed by a later operation after thread progress (`take`).
-    fn uninstall_buffers_locked(&self, queue: &mut SignalQueue<T>) {
-        let progress = self.buffers.with_managed(|buffers| {
+    fn uninstall_buffers_locked(&self, queue: &mut SignalQueue<T>) -> Option<raw::LaterOpArgs> {
+        self.buffers.with_managed(|buffers| {
             for buffer in &buffers.slots {
                 let mut buffer = buffer.0.lock();
                 buffer.alive = false;
@@ -614,16 +639,15 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
             }
             // Nothing can be enqueued to the buffer array beyond this point.
             buffers.nonempty_slots.store(0, Ordering::SeqCst);
-            buffers.progress.clone()
-        });
-        if let Some(progress) = progress {
-            drop(self.buffers.take(&progress));
-        }
+        })?;
+        let (buffers, later_op) = self.buffers.take_deferred()?;
+        drop(buffers);
         self.contention_count.store(0, Ordering::Relaxed);
         self.buffer_enqueues.store(0, Ordering::Relaxed);
         self.enqueues_since_decision.store(0, Ordering::Relaxed);
         self.flush_rounds_left
             .store(BUFFER_FLUSH_ROUNDS, Ordering::Relaxed);
+        Some(later_op)
     }
 
     /// Move one buffer's signals to the queue tail; the caller holds the msgq lock and the
@@ -643,17 +667,19 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
     /// Move buffered signals to the queue tail; the caller holds the msgq lock.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:10532 (proc_sig_queue_flush_buffers),
     // OTP-29.1.1: the nonempty mask is exchanged to zero and only its buffers are visited.
-    fn flush_buffers_locked(&self, queue: &mut SignalQueue<T>, adapt: bool) {
-        let Some(()) = self.buffers.with_managed(|buffers| {
+    fn flush_buffers_locked(
+        &self,
+        queue: &mut SignalQueue<T>,
+        adapt: bool,
+    ) -> Option<raw::LaterOpArgs> {
+        self.buffers.with_managed(|buffers| {
             let mut nonempty = buffers.nonempty_slots.swap(0, Ordering::SeqCst);
             while nonempty != 0 {
                 let slot = nonempty.trailing_zeros() as usize;
                 nonempty &= nonempty - 1;
                 self.take_buffered(&mut buffers.slots[slot].0.lock(), queue);
             }
-        }) else {
-            return;
-        };
+        })?;
         if adapt {
             let count = self.buffer_enqueues.swap(0, Ordering::AcqRel);
             let total = self
@@ -662,27 +688,29 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
                 + count;
             if self.flush_rounds_left.fetch_sub(1, Ordering::AcqRel) == 1 {
                 if total < BUFFER_ENQUEUES_TO_KEEP {
-                    self.uninstall_buffers_locked(queue);
-                    return;
+                    return self.uninstall_buffers_locked(queue);
                 }
                 self.enqueues_since_decision.store(0, Ordering::Relaxed);
                 self.flush_rounds_left
                     .store(BUFFER_FLUSH_ROUNDS, Ordering::Relaxed);
             }
         }
+        None
     }
 
     /// Publish a sender-ordered block with one enqueue.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:1385 (signal block publication), OTP-29.1.1.
-    pub fn push_block(&self, values: Vec<T>) {
+    #[cfg(test)]
+    pub(crate) fn push_block(&self, values: Vec<T>) -> Option<raw::LaterOpArgs> {
         let mut values = values;
-        self.push_block_reuse(&mut values);
+        self.push_block_reuse(&mut values)
     }
 
     /// Publish a block, leaving the producer's (now empty) vector for reuse.
-    pub fn push_block_reuse(&self, values: &mut Vec<T>) {
+    #[cfg(test)]
+    pub(crate) fn push_block_reuse(&self, values: &mut Vec<T>) -> Option<raw::LaterOpArgs> {
         if values.is_empty() {
-            return;
+            return None;
         }
         let mut block = SignalQueue::default();
         for value in values.drain(..) {
@@ -690,11 +718,14 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         }
         let (count, nmsgs) = (block.len(), block.non_messages());
         let mut queue = self.lock_msgq();
-        if self.buffers.is_occupied() {
-            self.flush_buffers_locked(&mut queue, true);
-        }
+        let later_op = self
+            .buffers
+            .is_occupied()
+            .then(|| self.flush_buffers_locked(&mut queue, true))
+            .flatten();
         queue.append(&mut block);
         self.enqueued_locked(count, nmsgs);
+        later_op
     }
 
     /// Publish a sender ordered block through the matching per sender buffers.
@@ -712,7 +743,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         if !self.buffers.is_occupied() {
             let mut block = SignalQueue::default();
             let mut queue = self.lock_msgq();
-            self.maybe_install_buffers_locked(progress);
+            self.maybe_install_buffers_locked();
             if self.closed.load(Ordering::Relaxed) {
                 return Err(QueueClosed);
             }
@@ -750,7 +781,6 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
     // pending signal to the new one and enqueues both), OTP-29.1.1.
     pub(crate) fn push_pair(
         &self,
-        progress: &Progress,
         first: OwnedSignal<T>,
         second: OwnedSignal<T>,
     ) -> Result<(), (OwnedSignal<T>, OwnedSignal<T>)> {
@@ -760,7 +790,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         let nmsgs =
             usize::from(non_message_signal(&first)) + usize::from(non_message_signal(&second));
         let mut queue = self.lock_msgq();
-        self.maybe_install_buffers_locked(progress);
+        self.maybe_install_buffers_locked();
         if self.closed.load(Ordering::Relaxed) {
             return Err((first, second));
         }
@@ -775,16 +805,19 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
     /// ones included, to `into`; enqueues after this fail.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_handle_exit takes the
     // remaining signals of an exiting process under the msgq lock), OTP-29.1.1.
-    pub fn close_into(&self, into: &mut SignalQueue<T>) -> usize {
+    pub(crate) fn close_into(
+        &self,
+        into: &mut SignalQueue<T>,
+    ) -> (usize, Option<raw::LaterOpArgs>) {
         let mut queue = self.msgq.lock();
         self.closed.store(true, Ordering::Relaxed);
-        self.uninstall_buffers_locked(&mut queue);
+        let later_op = self.uninstall_buffers_locked(&mut queue);
         let count = queue.len();
         if count != 0 {
             into.append(&mut queue);
             self.dequeued(&queue);
         }
-        count
+        (count, later_op)
     }
 
     /// Whether any signal waits in the in-queue or its buffers.
@@ -808,15 +841,19 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
     /// `sig_qs.cont` in use or receive tracing on). `ERTS_PSFLG_SIG_Q` is set in the same
     /// read-modify-write that clears the in-queue bits when the fetch leaves signals to handle:
     /// non-message signals, or messages kept in the middle queue.
-    pub fn take_all(&self, into: &mut SignalQueue<T>, keep_in_cont: bool) {
+    pub(crate) fn take_all(
+        &self,
+        into: &mut SignalQueue<T>,
+        keep_in_cont: bool,
+    ) -> Option<raw::LaterOpArgs> {
         if !self.has_pending() {
-            return;
+            return None;
         }
         let mut queue = self.lock_msgq();
         let buffers = self.buffers.is_occupied();
-        if buffers {
-            self.flush_buffers_locked(&mut queue, true);
-        }
+        let later_op = buffers
+            .then(|| self.flush_buffers_locked(&mut queue, true))
+            .flatten();
         let set = if !queue.is_empty()
             && (keep_in_cont || !into.is_empty() || queue.non_messages() != 0)
         {
@@ -841,26 +878,29 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
                     Some(word & !psflg::SIG_IN_Q | set)
                 });
         }
+        later_op
     }
 
     /// Take the whole in-queue when `accept` takes every queued signal; otherwise leave it.
     /// Returns the number of signals taken.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:1332 (erts_proc_sig_fetch__: an outer
     // queue without non-message signals is spliced onto the message queue), OTP-29.1.1.
-    pub fn take_all_if(
+    pub(crate) fn take_all_if(
         &self,
         _accept: impl Fn(&T) -> bool,
         into: impl FnOnce(&mut SignalQueue<T>),
-    ) -> usize {
+    ) -> (usize, Option<raw::LaterOpArgs>) {
         if !self.has_pending() {
-            return 0;
+            return (0, None);
         }
         let mut queue = self.lock_msgq();
-        if self.buffers.is_occupied() {
-            self.flush_buffers_locked(&mut queue, true);
-        }
+        let later_op = self
+            .buffers
+            .is_occupied()
+            .then(|| self.flush_buffers_locked(&mut queue, true))
+            .flatten();
         if queue.non_messages() != 0 {
-            return 0;
+            return (0, later_op);
         }
         let count = queue.len();
         into(&mut queue);
@@ -868,7 +908,7 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         // `accept` took only messages.
         self.dequeued(&queue);
         drop(queue);
-        count
+        (count, later_op)
     }
 
     /// Fetch the oldest signal when `accept` takes it, for a receiver whose inner queue
@@ -876,24 +916,40 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
     /// the outer queue before matching.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:7730-7790 (erts_proc_sig_receive_helper),
     // OTP-29.1.1.
-    pub fn fetch_first_if(&self, accept: impl FnOnce(&T) -> bool) -> Option<T> {
+    pub(crate) fn fetch_first_if(
+        &self,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> (Option<T>, Option<raw::LaterOpArgs>) {
         let mut queue = self.lock_msgq();
-        if self.buffers.is_occupied() {
-            self.flush_buffers_locked(&mut queue, true);
+        let later_op = self
+            .buffers
+            .is_occupied()
+            .then(|| self.flush_buffers_locked(&mut queue, true))
+            .flatten();
+        let Some(front) = queue.front() else {
+            return (None, later_op);
+        };
+        if !accept(front) {
+            return (None, later_op);
         }
-        if !accept(queue.front()?) {
-            return None;
-        }
-        let signal = queue.pop_front_signal()?;
+        let Some(signal) = queue.pop_front_signal() else {
+            return (None, later_op);
+        };
         self.dequeued(&queue);
         drop(queue);
-        Some(signal.into_value())
+        (Some(signal.into_value()), later_op)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_later_op(args: Option<raw::LaterOpArgs>) {
+        if let Some(args) = args {
+            (args.func)(args.data);
+        }
+    }
 
     fn test_progress() -> Progress {
         Progress(Arc::new(thr_progress::ThrProgress::new(
@@ -920,19 +976,21 @@ mod tests {
         let mut inner = SignalQueue::default();
         let bits = |input: &Incoming<i32>| input.state().load(Ordering::SeqCst) & psflg::SIG_IN_Q;
         assert_eq!(bits(&input), 0);
-        input.push(1);
+        let _ = input.push(1);
         assert_eq!(bits(&input), psflg::MSG_SIG_IN_Q);
-        input.push(-1);
+        let _ = input.push(-1);
         assert_eq!(bits(&input), psflg::SIG_IN_Q);
-        assert_eq!(input.fetch_first_if(|_| true), Some(1));
+        assert_eq!(input.fetch_first_if(|_| true).0, Some(1));
         assert_eq!(bits(&input), psflg::NMSG_SIG_IN_Q);
-        input.push(2);
-        input.take_all(&mut inner, false);
+        let _ = input.push(2);
+        run_later_op(input.take_all(&mut inner, false));
         assert_eq!(bits(&input), 0);
-        input.push_block(vec![3, 4]);
+        run_later_op(input.push_block(vec![3, 4]));
         assert_eq!(bits(&input), psflg::MSG_SIG_IN_Q);
         assert_eq!(
-            input.take_all_if(|value| *value >= 0, |queue| inner.append(queue)),
+            input
+                .take_all_if(|value| *value >= 0, |queue| inner.append(queue))
+                .0,
             2
         );
         assert_eq!(bits(&input), 0);
@@ -944,11 +1002,11 @@ mod tests {
         let input = Incoming::default();
         let mut inner = SignalQueue::default();
         for i in 0..10 {
-            input.push(i);
+            let _ = input.push(i);
         }
-        input.take_all(&mut inner, false);
-        input.push(20);
-        input.take_all(&mut inner, false);
+        run_later_op(input.take_all(&mut inner, false));
+        let _ = input.push(20);
+        run_later_op(input.take_all(&mut inner, false));
         assert_eq!(
             inner.iter().copied().collect::<Vec<_>>(),
             (0..10).chain([20]).collect::<Vec<_>>()
@@ -968,17 +1026,17 @@ mod tests {
                 let done = done.clone();
                 scope.spawn(move || {
                     for sequence in 0..32 {
-                        input.push((sender, sequence));
+                        let _ = input.push((sender, sequence));
                     }
                     done.fetch_add(1, Ordering::Release);
                 });
             }
             while done.load(Ordering::Acquire) < 4 || input.has_pending() {
-                input.take_all(&mut inner, false);
+                run_later_op(input.take_all(&mut inner, false));
                 std::thread::yield_now();
             }
         });
-        input.take_all(&mut inner, false);
+        run_later_op(input.take_all(&mut inner, false));
         let mut expected = [0; 4];
         while let Some((sender, sequence)) = inner.pop_front() {
             assert_eq!(sequence, expected[sender]);
@@ -989,24 +1047,24 @@ mod tests {
 
     #[test]
     fn parallel_sender_buffer_flush_preserves_sender_order() {
-        let input = Incoming::default();
+        let input = Incoming::with_state(psflg::OFF_HEAP_MSGQ);
         let progress = test_progress();
         let mut inner = SignalQueue::default();
-        input.force_buffers_enabled(&progress);
+        input.force_buffers_enabled();
         for sequence in 0..128 {
             input.push_routed(&progress, || 17, sequence).unwrap();
         }
         assert!(input.has_pending());
-        input.take_all(&mut inner, false);
+        run_later_op(input.take_all(&mut inner, false));
         assert_eq!(
             std::iter::from_fn(|| inner.pop_front()).collect::<Vec<_>>(),
             (0..128).collect::<Vec<_>>()
         );
 
         input.push_routed(&progress, || 17, 128).unwrap();
-        input.set_buffers_enabled(false);
+        run_later_op(input.flush_and_deinstall_buffers());
         input.push_routed(&progress, || 17, 129).unwrap();
-        input.take_all(&mut inner, false);
+        run_later_op(input.take_all(&mut inner, false));
         assert_eq!(
             std::iter::from_fn(|| inner.pop_front()).collect::<Vec<_>>(),
             [128, 129]
@@ -1020,11 +1078,12 @@ mod tests {
         use std::sync::atomic::AtomicUsize;
         const SENDERS: usize = 4;
         const PER_SENDER: usize = 20_000;
-        let input = Arc::new(Incoming::<(usize, usize)>::default());
+        let input = Arc::new(Incoming::<(usize, usize)>::with_state(psflg::OFF_HEAP_MSGQ));
         let progress = test_progress();
         let done = Arc::new(AtomicUsize::new(0));
         let mut inner = SignalQueue::default();
         let mut round = 0usize;
+        let mut later_ops = Vec::new();
         std::thread::scope(|scope| {
             for sender in 0..SENDERS {
                 let (input, progress, done) = (input.clone(), progress.clone(), done.clone());
@@ -1041,15 +1100,20 @@ mod tests {
             while done.load(Ordering::Acquire) < SENDERS || input.has_pending() {
                 round += 1;
                 match round % 4 {
-                    0 => input.force_buffers_enabled(&progress),
-                    1 => input.set_buffers_enabled(false),
+                    0 => {
+                        input.force_buffers_enabled();
+                    }
+                    1 => later_ops.extend(input.flush_and_deinstall_buffers()),
                     _ => {}
                 }
-                input.take_all(&mut inner, false);
+                later_ops.extend(input.take_all(&mut inner, false));
                 std::thread::yield_now();
             }
         });
-        input.take_all(&mut inner, false);
+        later_ops.extend(input.take_all(&mut inner, false));
+        for later_op in later_ops {
+            (later_op.func)(later_op.data);
+        }
         let mut expected = [0; SENDERS];
         while let Some((sender, sequence)) = inner.pop_front() {
             assert_eq!(sequence, expected[sender]);

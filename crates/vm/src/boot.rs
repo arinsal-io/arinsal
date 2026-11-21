@@ -79,6 +79,7 @@ pub fn erl_start(
         .max(1) as usize;
     // Port of erts/emulator/beam/erl_init.c:925, 1162-1163 (+A), OTP-29.1.1.
     arinsal_drv::set_async_threads(async_threads);
+    arinsal_drv::init_async_pool();
     // Port of erts/emulator/beam/erl_init.c:303 (erl_init -> erts_init_node_tables), OTP-29.1.1.
     crate::node_tables::init_node_tab_delete_delay(
         arinsal_args::active_emulator_flags().delayed_node_table_gc,
@@ -395,6 +396,71 @@ pub(crate) fn erl_init_atoms() -> Result<(), VmError> {
     Ok(())
 }
 
+/// Insert `+S N:N` into a test-node argv when [`crate::Vm::request_eval_plus_s`] ran first,
+/// the same way `peer_eval(&["+S", "N:N"], …)` and the CLI pass scheduler counts.
+pub fn apply_eval_plus_s_argv(argv: &mut Vec<String>) {
+    if let Some(n) = crate::Vm::requested_eval_plus_s() {
+        argv.splice(1..1, ["+S".to_owned(), format!("{n}:{n}")]);
+    }
+}
+
+/// Scheduler threads for a parsed launch, as the CLI resolves `+S`.
+// Port of erts/emulator/beam/erl_init.c (`+S` / default CPU count), OTP-29.1.1.
+pub fn workers_from_emulator_flags(flags: &arinsal_args::EmulatorFlags) -> usize {
+    let (cpus, online) = arinsal_alloc::cpuinfo::default_schedulers();
+    arinsal_args::resolve_scheduler_count_online(flags.schedulers, cpus.max(1), online.max(1))
+        .map_or(cpus.max(1), |(total, _)| total)
+        .max(1)
+}
+
+/// Directory containing this build's `erl_child_setup` (forker_start's `$BINDIR`).
+/// erlexec always exports BINDIR; cargo tests that skip erlexec must seed it the same way.
+#[cfg(test)]
+fn test_bindir() -> std::path::PathBuf {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let helper = find_erl_child_setup();
+        let dir = std::env::temp_dir().join(format!("arinsal-bindir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test BINDIR");
+        let dest = dir.join("erl_child_setup");
+        if !dest.exists() {
+            std::os::unix::fs::symlink(&helper, &dest).expect("link erl_child_setup into BINDIR");
+        }
+        if let Some(root) = arinsal_difftest::reference::otp_root() {
+            let src = root.join("erts-17.1/bin/inet_gethost");
+            let dest = dir.join("inet_gethost");
+            if src.is_file() && !dest.exists() {
+                let _ = std::os::unix::fs::symlink(src, dest);
+            }
+        }
+        dir
+    })
+    .clone()
+}
+
+#[cfg(test)]
+fn find_erl_child_setup() -> std::path::PathBuf {
+    if let Some(path) = option_env!("CARGO_BIN_EXE_erl_child_setup") {
+        let helper = std::path::PathBuf::from(path);
+        if helper.is_file() {
+            return helper;
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dir = exe.parent();
+        while let Some(parent) = dir {
+            let candidate = parent.join("erl_child_setup");
+            if candidate.is_file() {
+                return candidate;
+            }
+            dir = parent.parent();
+        }
+    }
+    panic!(
+        "erl_child_setup missing; build it with `cargo build -p arinsal-vm --bin erl_child_setup`"
+    );
+}
+
 /// The node of this test process, started as `arinsal -noshell -noinput` ([`erl_start`]) and
 /// returned once `init:get_status()` is `{started, started}`: erts has no bare VM to evaluate
 /// in. Each test runs in its own OS process (nextest), so every test gets a fresh node.
@@ -403,15 +469,22 @@ pub(crate) fn test_node() -> std::sync::MutexGuard<'static, Vm> {
     static NODE: std::sync::OnceLock<std::sync::Mutex<Vm>> = std::sync::OnceLock::new();
     NODE.get_or_init(|| {
         let root = arinsal_difftest::reference::otp_root().expect("OTP root (erl on PATH)");
+        let bindir = test_bindir();
+        seed_environment(&[
+            ("BINDIR".into(), bindir.display().to_string()),
+            ("ERL_ROOTDIR".into(), root.display().to_string()),
+        ]);
         let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
         env.insert("ERL_ROOTDIR".into(), root.display().to_string());
+        env.insert("BINDIR".into(), bindir.display().to_string());
         let mut argv = vec!["arinsal".to_owned(), "-noshell".into(), "-noinput".into()];
+        apply_eval_plus_s_argv(&mut argv);
         let carrier = concat!(env!("CARGO_MANIFEST_DIR"), "/eval_carrier");
         argv.extend(eval_carrier_args(Path::new(carrier)).expect("eval carrier"));
         let launch = arinsal_args::parse(&argv, &env)
             .unwrap_or_else(|error| panic!("test node arguments: {error:?}"));
         arinsal_args::configure_emulator_flags(launch.emulator.clone());
-        let workers = arinsal_alloc::cpuinfo::default_schedulers().0.max(1);
+        let workers = workers_from_emulator_flags(&launch.emulator);
         let mut vm = erl_start(
             Path::new(&launch.root_dir),
             &launch.boot_args,
@@ -425,13 +498,13 @@ pub(crate) fn test_node() -> std::sync::MutexGuard<'static, Vm> {
         for _ in 0..12_000 {
             // `init:get_status/0` calls the registered `init`, which `init:boot/1` registers first.
             let registered = vm
-                .eval_scheduled("erlang", "whereis", &[init], 1)
+                .eval_scheduled("erlang", "whereis", &[init], 0)
                 .expect("erlang:whereis(init)")
                 .text
                 != "undefined";
             if registered
                 && vm
-                    .eval_scheduled("init", "get_status", &[], 1)
+                    .eval_scheduled("init", "get_status", &[], 0)
                     .expect("init:get_status()")
                     .text
                     == "{started,started}"

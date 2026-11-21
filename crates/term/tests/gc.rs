@@ -80,7 +80,7 @@ fn adopted_message_keeps_term_and_off_heap_owner_through_gc() {
     drop(source);
     assert_eq!(receiver.off_heap_count(), 1);
     let mut roots = [copied];
-    receiver.collect(&mut roots, &mut [], 0).unwrap();
+    receiver.collect(&mut roots, &mut [], 0);
     assert_eq!(receiver.off_heap_count(), 1);
     assert_eq!(to_owned(roots[0]).unwrap(), expected);
 }
@@ -104,15 +104,13 @@ fn gc_moves_a_message_built_in_its_node_fragment() {
         Term::NIL,
         Some(arinsal_term::message::MessageHeap::Node(fragment)),
     )];
-    receiver
-        .collect_with_messages(&mut [], &mut [], 0, &mut messages)
-        .unwrap();
+    receiver.collect_with_messages(&mut [], &mut [], 0, &mut messages);
     assert!(messages[0].2.is_none());
     assert_eq!(receiver.off_heap_count(), 1);
     assert_eq!(to_owned(messages[0].0).unwrap(), expected);
 
     let mut roots = [messages[0].0];
-    receiver.collect(&mut roots, &mut [], 0).unwrap();
+    receiver.collect(&mut roots, &mut [], 0);
     assert_eq!(receiver.off_heap_count(), 1);
     assert_eq!(to_owned(roots[0]).unwrap(), expected);
 }
@@ -133,7 +131,7 @@ fn a_received_node_fragment_is_collected_with_the_process() {
     receiver.adopt_message_node(node.into_fragment().unwrap());
     assert_eq!(receiver.off_heap_count(), 1);
     let mut roots = [message];
-    receiver.collect(&mut roots, &mut [], 0).unwrap();
+    receiver.collect(&mut roots, &mut [], 0);
     assert_eq!(receiver.fragment_count(), 0);
     assert_eq!(to_owned(roots[0]).unwrap(), expected);
     assert_eq!(receiver.off_heap_count(), 1);
@@ -158,15 +156,13 @@ fn gc_rebases_message_binary_chains_before_releasing_fragments() {
         Term::NIL,
         Some(arinsal_term::message::MessageHeap::Heap(message_heap)),
     )];
-    receiver
-        .collect_with_messages(&mut [], &mut [], 0, &mut messages)
-        .unwrap();
+    receiver.collect_with_messages(&mut [], &mut [], 0, &mut messages);
     assert!(messages[0].2.is_none());
     assert_eq!(receiver.off_heap_count(), 1);
     assert_eq!(to_owned(messages[0].0).unwrap(), expected);
 
     let mut roots = [messages[0].0];
-    receiver.collect(&mut roots, &mut [], 0).unwrap();
+    receiver.collect(&mut roots, &mut [], 0);
     assert_eq!(receiver.off_heap_count(), 1);
     assert_eq!(to_owned(roots[0]).unwrap(), expected);
 }
@@ -188,11 +184,11 @@ fn magic_reference_survives_copy_and_gc_then_releases() {
     let mut roots = [copy_term(term, &mut heap).unwrap()];
     drop(owner);
     drop(source);
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     // SAFETY: the root and its copied owner remain live on this process heap.
     assert!(unsafe { roots[0].magic_ref() }.is_some());
     assert_eq!(count.load(Ordering::SeqCst), 0);
-    heap.collect(&mut [], &mut [], 0).unwrap();
+    heap.collect(&mut [], &mut [], 0);
     assert_eq!(count.load(Ordering::SeqCst), 1);
 }
 
@@ -209,8 +205,8 @@ fn magic_reference_is_freed_with_its_last_reference() {
         assert!(term.is_magic_ref());
     }
     assert_eq!(count.load(Ordering::SeqCst), 0);
-    heap.collect(&mut [], &mut [], 0).unwrap();
-    heap.collect(&mut [], &mut [], 0).unwrap();
+    heap.collect(&mut [], &mut [], 0);
+    heap.collect(&mut [], &mut [], 0);
     assert_eq!(count.load(Ordering::SeqCst), 10_000);
 }
 
@@ -229,10 +225,10 @@ fn magic_reference_stays_alive_while_any_heap_holds_it() {
     drop(owner);
     drop(source);
     assert_eq!(count.load(Ordering::SeqCst), 0);
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     // SAFETY: the root and its copied owner remain live on this process heap.
     assert_eq!(unsafe { roots[0].magic_ref() }.unwrap().id(), id);
-    heap.collect(&mut [], &mut [], 0).unwrap();
+    heap.collect(&mut [], &mut [], 0);
     assert_eq!(count.load(Ordering::SeqCst), 1);
 }
 
@@ -254,7 +250,7 @@ fn collections_with_many_live_magic_references_stay_linear() {
     let started = std::time::Instant::now();
     let mut roots = [list];
     for _ in 0..4 {
-        heap.collect(&mut roots, &mut [], 0).unwrap();
+        heap.collect(&mut roots, &mut [], 0);
     }
     assert!(
         started.elapsed() < std::time::Duration::from_secs(20),
@@ -264,7 +260,7 @@ fn collections_with_many_live_magic_references_stay_linear() {
     );
     assert_eq!(count.load(Ordering::SeqCst), 0);
     heap.request_full_sweep();
-    heap.collect(&mut [], &mut [], 0).unwrap();
+    heap.collect(&mut [], &mut [], 0);
     assert_eq!(count.load(Ordering::SeqCst), 40_000);
 }
 
@@ -301,12 +297,12 @@ fn external_binary_keeps_resource_through_copy_and_gc() {
     let mut roots = [copy_term(term, &mut heap).unwrap()];
     drop(owner);
     drop(source);
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     // SAFETY: collection retained the external owner for the live root.
     let view = unsafe { roots[0].binary_ref() }.unwrap();
     assert_eq!(view.bytes(), &[1, 2, 3]);
     assert_eq!(count.load(Ordering::SeqCst), 0);
-    heap.collect(&mut [], &mut [], 0).unwrap();
+    heap.collect(&mut [], &mut [], 0);
     assert_eq!(count.load(Ordering::SeqCst), 1);
 }
 
@@ -322,7 +318,7 @@ fn deep_list_is_iterative() {
             .unwrap();
     }
     let mut roots = [root];
-    heap.collect(&mut roots, &mut [], 64).unwrap();
+    heap.collect(&mut roots, &mut [], 64);
     let mut cursor = roots[0];
     let mut seen = 0;
     // SAFETY: The collected heap remains live and stable during traversal.
@@ -345,7 +341,7 @@ fn sharing_and_stack_roots_survive() {
     assert!(heap.reserve_stack(1));
     assert!(heap.stack_set(0, parent));
     let mut roots = [parent];
-    heap.collect(&mut roots, &mut [], 32).unwrap();
+    heap.collect(&mut roots, &mut [], 32);
     // SAFETY: The collected heap remains live and stable during inspection.
     let tuple = unsafe { roots[0].tuple_ref() }.unwrap();
     assert_eq!(tuple.get(0), tuple.get(1));
@@ -358,7 +354,7 @@ fn dead_off_heap_binary_is_released() {
     let mut heap = ProcessHeap::with_words(256);
     let _binary = TermBuilder::new(&mut heap).binary(&[7; 100]).unwrap();
     assert_eq!(heap.off_heap_count(), 1);
-    heap.collect(&mut [], &mut [], 1).unwrap();
+    heap.collect(&mut [], &mut [], 1);
     assert_eq!(heap.off_heap_count(), 0);
 }
 
@@ -374,7 +370,7 @@ fn reachable_fragment_is_merged() {
         std::mem::transmute::<u64, Term>((pointer as u64) | 1)
     };
     let mut roots = [fragment_term];
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     // SAFETY: The collected heap retains the rewritten cons cell.
     let (head, tail) = unsafe { roots[0].cons_ref() }.unwrap();
     assert_eq!(head.as_small(), Some(7));
@@ -393,7 +389,7 @@ fn heap_fragment_is_merged() {
         std::mem::transmute::<u64, Term>((pointer as u64) | 1)
     };
     let mut roots = [fragment_term];
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     // SAFETY: collection moved the cell into the new stable process heap.
     let head = unsafe { roots[0].cons_ref() }.unwrap().0;
     assert_eq!(head.as_small(), Some(11));
@@ -430,7 +426,7 @@ fn collection_moves_fragment_terms_and_keeps_the_global_empty_tuple() {
         std::mem::transmute::<u64, Term>((pointer as u64) | 2)
     };
     let mut roots = [tuple, empty];
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     assert_eq!(heap.fragment_count(), 0);
     assert!(heap.owns_term(roots[0]));
     assert_eq!(roots[1], empty);
@@ -447,7 +443,7 @@ fn sparse_heap_shrinks_after_full_collection() {
     let mut roots = [TermBuilder::new(&mut heap)
         .tuple(&[Term::small(1).unwrap()])
         .unwrap()];
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     assert!(heap.capacity_words() < 10_000);
     // SAFETY: the tuple is still live in the shrunken heap.
     let element = unsafe { roots[0].tuple_ref() }.unwrap().get(0).unwrap();
@@ -462,7 +458,7 @@ fn random_shared_graphs_survive_repeated_collections() {
     let mut seed = 0x1234_5678_u64;
     for step in 0..if cfg!(miri) { 100 } else { 1000 } {
         if heap.free_words() < 64 {
-            heap.collect(&mut roots, &mut [], 64).unwrap();
+            heap.collect(&mut roots, &mut [], 64);
         }
         seed ^= seed << 13;
         seed ^= seed >> 7;
@@ -477,7 +473,7 @@ fn random_shared_graphs_survive_repeated_collections() {
         };
         roots[(seed as usize / 3) % roots.len()] = next;
         if step % 100 == 99 {
-            heap.collect(&mut roots, &mut [], 64).unwrap();
+            heap.collect(&mut roots, &mut [], 64);
         }
     }
     for root in roots {
@@ -519,7 +515,7 @@ fn hamt_sizes_survive_repeated_collections() {
         let words = size_object(map);
         let mut roots = [map];
         for _ in 0..if cfg!(miri) { 2 } else { 8 } {
-            heap.collect(&mut roots, &mut [], 0).unwrap();
+            heap.collect(&mut roots, &mut [], 0);
             assert_eq!(to_owned(roots[0]).unwrap(), expected);
             assert_eq!(make_hash2(roots[0]), hash);
             assert_eq!(size_object(roots[0]), words);
@@ -535,7 +531,7 @@ fn match_context_aliases_keep_one_cursor_and_moved_base() {
     let context = TermBuilder::new(&mut heap).match_context(source).unwrap();
     assert!(set_match_position(context, 19));
     let mut roots = [context, context];
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     assert_eq!(roots[0], roots[1]);
     assert_eq!(match_position(roots[0]), Some(19));
     assert!(set_match_position(roots[0], 37));
@@ -560,7 +556,7 @@ fn writable_append_survives_collections_and_releases_dead_owners() {
         assert!(writable_extend_private(roots[0], end * 8).unwrap());
         // SAFETY: this process owns the active writer and no view is retained.
         unsafe { writable_bytes_mut(roots[0]) }.unwrap()[block * block_size..end].fill(block as u8);
-        heap.collect(&mut roots, &mut [], 0).unwrap();
+        heap.collect(&mut roots, &mut [], 0);
         assert_eq!(writable_capacity(roots[0]), Some(capacity));
     }
     // SAFETY: the collected heap retains the writable owner and no append runs.
@@ -579,7 +575,7 @@ fn writable_append_survives_collections_and_releases_dead_owners() {
             .unwrap();
     }
     assert_eq!(heap.off_heap_count(), 4);
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     assert_eq!(heap.off_heap_count(), 1);
 }
 
@@ -605,11 +601,11 @@ fn external_things_move_their_node_reference_through_collections() {
         .external_pid(node.clone(), 2, 0)
         .unwrap();
     assert_eq!(node.refc(), 5);
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     assert_eq!(node.refc(), 4);
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     heap.set_fullsweep_after(0);
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     assert_eq!(node.refc(), 4);
     drop(heap);
     assert_eq!(node.refc(), 1);
@@ -626,14 +622,14 @@ fn live_binary_keeps_one_reference_per_binref_through_collections() {
     // The BinRef and the token.
     assert_eq!(token.ref_count(), Some(2));
     let mut roots = [binary];
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     assert_eq!(token.ref_count(), Some(2));
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     heap.set_fullsweep_after(0);
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     assert_eq!(token.ref_count(), Some(2));
     assert_eq!(heap.off_heap_count(), 1);
-    heap.collect(&mut [], &mut [], 0).unwrap();
+    heap.collect(&mut [], &mut [], 0);
     assert_eq!(token.ref_count(), Some(1));
 }
 
@@ -672,7 +668,7 @@ fn heaps_do_not_count_fun_or_export_entries() {
         panic!("a 100 byte binary is reference counted");
     };
     assert_eq!(binary_owner.ref_count(), Some(2));
-    heap.collect(&mut [], &mut [], 0).unwrap();
+    heap.collect(&mut [], &mut [], 0);
     assert_eq!(binary_owner.ref_count(), Some(1));
     assert_eq!(heap.off_heap_count(), 0);
     assert_eq!(node.refc(), 1);
@@ -708,8 +704,8 @@ fn fun_entries_survive_heap_owner_drop_and_collection() {
     };
     let mut roots = [local, export];
     heap.set_fullsweep_after(0);
-    heap.collect(&mut roots, &mut [], 0).unwrap();
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
+    heap.collect(&mut roots, &mut [], 0);
     assert!(matches!(
         to_owned(roots[0]).unwrap(),
         arinsal_etf::OwnedTerm::Fun { ref module, .. } if module == "gc_permanent_fun_module"
@@ -734,12 +730,12 @@ fn sub_binary_of_writable_owner_shares_the_binref_and_owner_is_released() {
         .sub_binary(writable, 8, 400)
         .unwrap();
     let mut roots = [writable, sub];
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     let binary_info = heap.off_heap_binary_info();
     assert_eq!(binary_info.len(), 1);
     assert!(binary_info.iter().all(|entry| entry.2 == 2));
     assert_eq!(witness.ref_count(), Some(2));
-    heap.collect(&mut [], &mut [], 0).unwrap();
+    heap.collect(&mut [], &mut [], 0);
     assert_eq!(witness.ref_count(), Some(1));
     assert_eq!(heap.off_heap_count(), 0);
 }
@@ -753,7 +749,7 @@ fn stack_skips_return_addresses_and_catch_markers() {
     let code = unsafe { std::mem::transmute::<u64, Term>(0x1000) };
     assert!(heap.stack_set(0, code));
     assert!(heap.stack_set(1, Term::catch(42)));
-    heap.collect(&mut [], &mut [], 0).unwrap();
+    heap.collect(&mut [], &mut [], 0);
     assert_eq!(heap.stack_get(0), Some(code));
     assert_eq!(heap.stack_get(1), Some(Term::catch(42)));
 }
@@ -844,7 +840,7 @@ fn mixed_boxed_graph_survives_one_hundred_collections() {
     let expected = copy_term(root, &mut reference_heap).unwrap();
     let mut roots = [root];
     for _ in 0..if cfg!(miri) { 10 } else { 100 } {
-        heap.collect(&mut roots, &mut [], 0).unwrap();
+        heap.collect(&mut roots, &mut [], 0);
         assert!(heap.old_generation_is_closed());
         assert!(exact_eq(roots[0], expected));
     }
@@ -862,7 +858,7 @@ fn gc_throughput() {
         let mut nanos = 0_u64;
         let mut copied = 0_u64;
         for _ in 0..5 {
-            let stats = heap.collect(&mut roots, &mut [], 0).unwrap();
+            let stats = heap.collect(&mut roots, &mut [], 0);
             nanos += stats.nanoseconds;
             copied += stats.words_copied;
         }
@@ -913,10 +909,10 @@ fn promotion_closes_old_graph_without_young_references() {
     let mut roots = [TermBuilder::new(&mut heap).tuple(&[leaf, leaf]).unwrap()];
     // erts runs the first collection of a heap without old heap or mature data as a full
     // sweep (erl_gc.c:1461-1488); the second one then tenures the data.
-    let first = heap.collect(&mut roots, &mut [], 0).unwrap();
+    let first = heap.collect(&mut roots, &mut [], 0);
     assert_eq!(first.major_collections, 1);
     assert_eq!(heap.old_used_words(), 0);
-    let second = heap.collect(&mut roots, &mut [], 0).unwrap();
+    let second = heap.collect(&mut roots, &mut [], 0);
     assert!(second.words_promoted >= 5);
     assert!(heap.old_generation_contains(roots[0]));
     assert!(heap.old_generation_is_closed());
@@ -930,7 +926,7 @@ fn promotion_closes_old_graph_without_young_references() {
         .tuple(&[Term::small(99).unwrap()])
         .unwrap();
     let mut extra = [young];
-    heap.collect(&mut roots, &mut extra, 0).unwrap();
+    heap.collect(&mut roots, &mut extra, 0);
     assert_eq!(roots[0], old_parent);
     assert!(!heap.old_generation_contains(extra[0]));
     assert!(heap.old_generation_is_closed());
@@ -948,7 +944,7 @@ fn fullsweep_after_zero_never_builds_old_generation() {
         .tuple(&[Term::small(1).unwrap()])
         .unwrap()];
     for _ in 0..5 {
-        let stats = heap.collect(&mut roots, &mut [], 0).unwrap();
+        let stats = heap.collect(&mut roots, &mut [], 0);
         assert_eq!(stats.major_collections, 1);
         assert_eq!(stats.minor_collections, 0);
         assert_eq!(heap.old_used_words(), 0);
@@ -967,7 +963,7 @@ fn fullsweep_shrinks_heap_with_many_dead_objects() {
         let value = Term::small(i).unwrap();
         let _dead = TermBuilder::new(&mut heap).tuple(&[value, value]).unwrap();
     }
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     assert!(heap.capacity_words() < 1_000);
     // SAFETY: The root was rewritten by the full sweep and remains live.
     let tuple = unsafe { roots[0].tuple_ref() }.unwrap();
@@ -979,19 +975,19 @@ fn young_owners_release_on_minor_and_old_owners_on_major() {
     arinsal_term::init_global_literals();
     let mut heap = ProcessHeap::with_words(1024);
     let mut roots = [TermBuilder::new(&mut heap).binary(&[1; 100]).unwrap()];
-    heap.collect(&mut roots, &mut [], 0).unwrap();
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
+    heap.collect(&mut roots, &mut [], 0);
     assert!(heap.old_generation_contains(roots[0]));
     assert_eq!(heap.off_heap_count(), 1);
     let _dead_young = TermBuilder::new(&mut heap).binary(&[2; 100]).unwrap();
     assert_eq!(heap.off_heap_count(), 2);
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     assert_eq!(heap.off_heap_count(), 1);
     roots[0] = Term::NIL;
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     assert_eq!(heap.off_heap_count(), 1);
     heap.set_fullsweep_after(0);
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     assert_eq!(heap.off_heap_count(), 0);
 }
 
@@ -1006,12 +1002,7 @@ fn trees_like_short_lived_tuples_copy_few_words() {
     let mut roots = [TermBuilder::new(&mut heap).tuple(&leaves).unwrap()];
     // The first collection is a full sweep without an old heap (erl_gc.c:1461-1488);
     // run it up front so the measured loop only sees minor collections.
-    assert_eq!(
-        heap.collect(&mut roots, &mut [], 0)
-            .unwrap()
-            .major_collections,
-        1
-    );
+    assert_eq!(heap.collect(&mut roots, &mut [], 0).major_collections, 1);
     let mut minor = 0;
     let mut major = 0;
     let mut copied = 0;
@@ -1022,7 +1013,7 @@ fn trees_like_short_lived_tuples_copy_few_words() {
             let value = Term::small(i).unwrap();
             let _temporary = TermBuilder::new(&mut heap).tuple(&[value, value]).unwrap();
         }
-        let stats = heap.collect(&mut roots, &mut [], 0).unwrap();
+        let stats = heap.collect(&mut roots, &mut [], 0);
         minor += stats.minor_collections;
         major += stats.major_collections;
         copied += stats.words_copied;
@@ -1052,7 +1043,7 @@ fn repeated_short_lived_bursts_do_not_expand_young_heap() {
                 .tuple(&[Term::small(2).unwrap(), Term::small(3).unwrap()])
                 .unwrap();
         }
-        heap.collect(&mut roots, &mut [], 3).unwrap();
+        heap.collect(&mut roots, &mut [], 3);
         assert!(heap.capacity_words() < 1_000);
     }
 }
@@ -1064,13 +1055,13 @@ fn high_survival_grows_young_without_oversizing_old() {
     heap.set_min_heap_size(512);
     let values = [Term::small(1).unwrap(); 127];
     let mut roots = [TermBuilder::new(&mut heap).tuple(&values).unwrap()];
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     for _ in 0..190 {
         roots[0] = TermBuilder::new(&mut heap)
             .cons(Term::small(2).unwrap(), roots[0])
             .unwrap();
     }
-    let stats = heap.collect(&mut roots, &mut [], 0).unwrap();
+    let stats = heap.collect(&mut roots, &mut [], 0);
     assert_eq!(stats.major_collections, 0);
     assert!(heap.capacity_words() > 512);
     assert_eq!(heap.old_used_words(), 128);
@@ -1083,7 +1074,7 @@ fn high_survival_grows_young_without_oversizing_old() {
 
     roots[0] = Term::NIL;
     heap.set_fullsweep_after(0);
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     assert_eq!(heap.old_used_words(), 0);
     assert_eq!(heap.total_heap_size_words(), heap.capacity_words());
     assert_eq!(heap.capacity_words(), 610);
@@ -1109,7 +1100,7 @@ fn minor_gc_shrinks_a_dead_heap_without_a_presizing_walk() {
     let mut reference = VecHeap::new();
     let expected = copy_term(live, &mut reference).unwrap();
     let mut roots = [live];
-    heap.collect(&mut roots, &mut [], 8).unwrap();
+    heap.collect(&mut roots, &mut [], 8);
     assert!(heap.capacity_words() < 2_000);
     assert!(heap.free_words() >= 8);
     assert_eq!(heap.stack_get(0), Some(roots[0]));

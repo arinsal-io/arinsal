@@ -14,11 +14,16 @@ use arinsal_beamasm::{
     yield_frag::YieldFragments,
 };
 
+extern "C" fn unreachable_gc() {
+    unreachable!("no receive case collects")
+}
+
 fn fragments() -> &'static ReceiveFragments {
     static FRAGMENTS: OnceLock<(YieldFragments, ReceiveFragments)> = OnceLock::new();
     &FRAGMENTS
         .get_or_init(|| {
-            let yields = YieldFragments::new().unwrap();
+            // No case collects: `garbage_collect` is never entered.
+            let yields = YieldFragments::new(unreachable_gc as *const () as usize, 0).unwrap();
             let receive = ReceiveFragments::new(
                 receive_helper,
                 decode_dist,

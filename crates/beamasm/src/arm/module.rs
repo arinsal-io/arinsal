@@ -16,11 +16,6 @@ const E: Gpr = Gpr::x(20);
 const FCALLS: Gpr = Gpr::w(22);
 const C_P: Gpr = Gpr::x(21);
 const SCHEDULER_REGS: Gpr = Gpr::x(19);
-const TMP_MEM_ARITH_ARGS: u32 = crate::arm::beam_asm::tmp_mem_ref(0);
-const TMP_MEM_ARITH_MUL_ADD_PRODUCT: u32 = crate::arm::beam_asm::tmp_mem_ref(2);
-// tmp_mem[7]: tmp_mem[3] (ARITH_ARGS + 24) is the native exit marker, which a stored addend
-// would turn into a bogus exit kind when the raise is caught.
-const TMP_MEM_ARITH_MUL_ADDEND: u32 = crate::arm::beam_asm::tmp_mem_ref(7);
 const XREGS: [Gpr; 6] = [
     Gpr::x(25),
     Gpr::x(26),
@@ -108,8 +103,6 @@ pub struct CatchSite {
 pub struct FinalizedModule {
     /// Owns the executable mapping; entry addresses remain valid while this is alive.
     pub memory: CodeMemory,
-    /// Static operand tables referenced by emitted `i_get_map_elements` instructions.
-    pub map_lookups: Box<[crate::map::MapLookupTable]>,
     /// Native entry address by BEAM label number.
     pub entries: IdMap<*const u8>,
     entry_offsets: IdMap<usize>,
@@ -130,6 +123,15 @@ pub struct FinalizedModule {
     pub line_breakpoint_returns: Vec<(usize, usize)>,
     /// Literal patch sites in `literals[index].patches` order.
     literal_patches: std::collections::HashMap<i64, Vec<usize>>,
+}
+
+/// Where an embedded literal word lives (`literals[index].patches` of a data word).
+#[derive(Clone, Copy)]
+enum LiteralDataSite {
+    /// Byte offset of an inline text-section data word.
+    Text(usize),
+    /// Index of a read-only data word.
+    Rodata(usize),
 }
 
 /// BEAM label ids below this are dense (the labels of the file); the compiler's own labels
@@ -249,13 +251,15 @@ pub struct BeamModuleAssembler {
     pub(super) rodata_pointer_patches: Vec<(usize, usize)>,
     /// `literals[index].patches`: literal table index to literal-pool relocation IDs.
     pub(super) literals: std::collections::HashMap<i64, Vec<usize>>,
+    /// `literals[index].patches` entries that are embedded data words rather than literal-pool
+    /// loads: inline text data (byte offset) or read-only words (word index).
+    literal_data_patches: Vec<(i64, LiteralDataSite)>,
     /// `beam->static_literals` and `beam->dynamic_literals` term words.
     beam_literals: Vec<u64>,
     dynamic_literals: Vec<u64>,
     /// Inline text-data relocations to module code labels.
     pub(super) code_label_patches: Vec<(usize, Label)>,
     pub(super) reg_cache: crate::regcache::RegCache,
-    pub(super) map_lookups: Vec<crate::map::MapLookupTable>,
     /// Failure label of the arithmetic instruction being emitted (0: raise the error).
     pub(super) arith_fail: u32,
     labels: LabelIds,
@@ -279,10 +283,6 @@ pub struct BeamModuleAssembler {
     catch_patches: Vec<(usize, Label)>,
     /// Shared `call_fun` error handler and its resolver, bound in `finalize` when used.
     call_fun_error_stub: Option<(Label, usize)>,
-    /// Shared arithmetic slow-path fragments keyed by hook address and operation code.
-    arith_fragments: Vec<((usize, u32, usize), Label)>,
-    /// Shared garbage-collection fragments of heap and stack checks, keyed by hook address.
-    gc_fragments: Vec<(usize, Label)>,
     /// Module-local dispatch stubs for process-wide executable fragments.
     /// Shared fragment call targets in first-use order: the stubs are emitted in that order, so
     /// the layout does not depend on hash order.
@@ -300,7 +300,7 @@ pub struct BeamModuleAssembler {
     yield_stubs: Vec<(Label, Label, u8)>,
     /// Process-wide yield fragments: `dispatch_return`, `i_test_yield_shared` and
     /// `context_switch_simplified`. Zero addresses are used only by standalone assembler tests.
-    pub(super) yield_fragments: (usize, usize, usize),
+    pub(super) yield_fragments: crate::yield_frag::YieldEntries,
     /// Address of the process-wide `call_nif_yield_helper` fragment that `call_nif` jumps to
     /// (0: not installed).
     call_nif_yield_helper: usize,
@@ -312,6 +312,8 @@ pub struct BeamModuleAssembler {
     /// Process-wide `handle_map_get_badmap`, `handle_map_get_badkey` and
     /// `handle_map_size_error` fragments. Unset in assemblers that run without a VM.
     pub(super) map_error_fragments: Option<(usize, usize, usize)>,
+    /// Process-wide `i_length_*_shared` and `i_bif_*_shared` fragments (0: not installed).
+    pub(super) bif_fragments: crate::raise_frag::BifFragments,
     /// Offset right after the current function's entry label (its `i_breakpoint_trampoline`).
     entry_offset: Option<usize>,
     entry_label: Option<Label>,
@@ -435,6 +437,89 @@ impl BeamModuleAssembler {
         }
     }
 
+    /// `embed_vararg_rodata(args, reg)`: points `reg` at a table of the operands, one 8-byte
+    /// word each: X and Y registers as loader-tagged words (`make_loader_x_reg` /
+    /// `make_loader_y_reg`), literals as patch words, labels as their addresses. Up to six
+    /// operands are inlined in the text section behind a branch.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:104-141 (embed_vararg_rodata),
+    // OTP-29.1.1.
+    pub(super) fn embed_vararg_rodata(
+        &mut self,
+        args: &[ArgVal],
+        reg: Gpr,
+    ) -> Result<(), ModuleError> {
+        // erl_term.h: `make_loader_x_reg`, `make_loader_y_reg`.
+        const LOADER_TAG_SIZE: u32 = 4;
+        const LOADER_X_REG: u64 = 0x3;
+        const LOADER_Y_REG: u64 = 0x7;
+        enum Word {
+            Value(u64),
+            Literal(i64),
+            Label(Label),
+        }
+        let mut words = Vec::with_capacity(args.len());
+        for arg in args {
+            words.push(match *arg {
+                ArgVal::X(val) => Word::Value(
+                    (u64::from(val & crate::common::args::REG_MASK) << LOADER_TAG_SIZE)
+                        | LOADER_X_REG,
+                ),
+                ArgVal::Y(val) => Word::Value(
+                    (u64::from(val & crate::common::args::REG_MASK) << LOADER_TAG_SIZE)
+                        | LOADER_Y_REG,
+                ),
+                ArgVal::Literal(index) => Word::Literal(index),
+                ArgVal::Label(id) => Word::Label(self.label(id)),
+                ArgVal::Immediate(word) | ArgVal::Word(word) => Word::Value(word),
+                _ => return Err(ModuleError::InvalidOperand("vararg rodata operand")),
+            });
+        }
+        if args.len() <= 6 {
+            let data = self.code.new_label();
+            let next = self.code.new_label();
+            self.code.adr(reg, data)?;
+            self.code.b(next)?;
+            self.code.align_data_u64();
+            self.code.bind(data)?;
+            for word in words {
+                let site = self.code.offset();
+                match word {
+                    Word::Value(value) => self.code.data_u64(value),
+                    Word::Literal(index) => {
+                        self.code.data_u64(self.beamfile_get_literal(index));
+                        self.literal_data_patches
+                            .push((index, LiteralDataSite::Text(site)));
+                    }
+                    Word::Label(label) => {
+                        self.code.data_u64(0);
+                        self.code_label_patches.push((site, label));
+                    }
+                }
+            }
+            self.code.bind(next)?;
+        } else {
+            let relocation = self.code.ldr_literal_reloc(reg)?;
+            self.rodata_pointer_patches
+                .push((relocation, self.rodata_words.len()));
+            for word in words {
+                let index = self.rodata_words.len();
+                match word {
+                    Word::Value(value) => self.rodata_words.push(value),
+                    Word::Literal(literal) => {
+                        self.rodata_words.push(self.beamfile_get_literal(literal));
+                        self.literal_data_patches
+                            .push((literal, LiteralDataSite::Rodata(index)));
+                    }
+                    Word::Label(label) => {
+                        self.rodata_words.push(0);
+                        self.rodata_label_patches.push((index, label));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Loads a literal through a patch slot owned by its literal index.
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:118-132, OTP-29.1.1.
     fn load_literal(&mut self, dst: Gpr, index: i64) -> Result<(), ModuleError> {
@@ -478,11 +563,11 @@ impl BeamModuleAssembler {
             rodata_label_patches: Vec::new(),
             rodata_pointer_patches: Vec::new(),
             literals: std::collections::HashMap::new(),
+            literal_data_patches: Vec::new(),
             beam_literals: Vec::new(),
             dynamic_literals: Vec::new(),
             code_label_patches: Vec::new(),
             reg_cache: crate::regcache::RegCache::new(SCHEDULER_REGS, E),
-            map_lookups: Vec::new(),
             labels: LabelIds::default(),
             defined: DefinedLabels::default(),
             lambda_labels: IdMap::default(),
@@ -496,11 +581,9 @@ impl BeamModuleAssembler {
             exception_resolver: 0,
             catch_patches: Vec::new(),
             call_fun_error_stub: None,
-            arith_fragments: Vec::new(),
             dispatch_fragments: Vec::new(),
-            gc_fragments: Vec::new(),
             yield_stubs: Vec::new(),
-            yield_fragments: (0, 0, 0),
+            yield_fragments: crate::yield_frag::YieldEntries::default(),
             call_nif_yield_helper: 0,
             arith_compare_shared: 0,
             eq_exact_list_shared: 0,
@@ -508,6 +591,7 @@ impl BeamModuleAssembler {
             element_error: None,
             raise_fragments: (0, 0, 0),
             map_error_fragments: None,
+            bif_fragments: crate::raise_frag::BifFragments::default(),
             entry_offset: None,
             entry_label: None,
             bs_cold: Vec::new(),
@@ -793,6 +877,11 @@ impl BeamModuleAssembler {
         self.raise_fragments = (raise_shared, raise_exception, func_info_shared);
     }
 
+    /// Installs the process-wide `i_length_*_shared` and `i_bif_*_shared` fragments.
+    pub fn set_bif_fragments(&mut self, fragments: crate::raise_frag::BifFragments) {
+        self.bif_fragments = fragments;
+    }
+
     /// Installs the process-wide `handle_map_get_badmap`, `handle_map_get_badkey` and
     /// `handle_map_size_error` fragments so a failing `map_get/2` or `map_size/1` calls them
     /// instead of carrying the runtime call inline.
@@ -800,15 +889,10 @@ impl BeamModuleAssembler {
         self.map_error_fragments = Some((badmap, badkey, size_error));
     }
 
-    /// Installs the process-wide yield fragments (`dispatch_return`, `i_test_yield_shared`,
-    /// `context_switch_simplified`) so the module keeps no copy of them.
-    pub fn set_yield_fragments(
-        &mut self,
-        dispatch_return: usize,
-        test_yield_shared: usize,
-        context_switch: usize,
-    ) {
-        self.yield_fragments = (dispatch_return, test_yield_shared, context_switch);
+    /// Installs the process-wide fragments (`dispatch_return`, `i_test_yield_shared`,
+    /// `context_switch_simplified`, `garbage_collect`) so the module keeps no copy of them.
+    pub fn set_yield_fragments(&mut self, entries: crate::yield_frag::YieldEntries) {
+        self.yield_fragments = entries;
     }
 
     /// Emits `b.cond` to this module's dispatch stub of the process-wide fragment `target`.
@@ -1276,11 +1360,11 @@ impl BeamModuleAssembler {
     pub fn test_yield(&mut self) -> Result<(), ModuleError> {
         // The yield sequence is out of line so the fall-through path has no taken branch,
         // like erts' `b.le` to the shared context-switch fragment.
-        if self.yield_fragments.1 != 0
+        if self.yield_fragments.i_test_yield_shared != 0
             && let (Some(entry), Some(after_entry)) = (self.entry_label, self.entry_offset)
             && self.code.offset() == after_entry + crate::yield_frag::FUNC_PROLOGUE_SIZE
         {
-            let test_yield_shared = self.yield_fragments.1;
+            let test_yield_shared = self.yield_fragments.i_test_yield_shared;
             self.code.adr(Gpr::x(2), entry)?;
             self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 1, false))?;
             self.fragment_branch_cond(Cond::Le, test_yield_shared)?;
@@ -1447,8 +1531,8 @@ impl BeamModuleAssembler {
         // The yield path is the forward `b.mi`, so a return with reductions left falls
         // through to `ret`. erts keeps that sequence in the shared dispatch_return fragment.
         self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 1, false))?;
-        if self.yield_fragments.0 != 0 {
-            let dispatch_return = self.yield_fragments.0;
+        if self.yield_fragments.dispatch_return != 0 {
+            let dispatch_return = self.yield_fragments.dispatch_return;
             self.fragment_branch_cond(Cond::Mi, dispatch_return)?;
             self.code.emit(|e| e.ret(Gpr::x(30)))?;
             return Ok(());
@@ -1514,13 +1598,8 @@ impl BeamModuleAssembler {
 
     /// Checks stack and heap space before reserving a Y frame.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:218-221, OTP-29.1.1.
-    pub fn allocate_checked(
-        &mut self,
-        words: u32,
-        live: u32,
-        hook: crate::construct::GcHook,
-    ) -> Result<(), ModuleError> {
-        self.emit_stack_check(words, live, hook)?;
+    pub fn allocate_checked(&mut self, words: u32, live: u32) -> Result<(), ModuleError> {
+        self.emit_stack_check(words, live)?;
         self.allocate(words, live)
     }
 
@@ -1533,13 +1612,8 @@ impl BeamModuleAssembler {
 
     /// Checks stack and heap space before reserving and initializing a Y frame.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:218-221, OTP-29.1.1.
-    pub fn allocate_zero_checked(
-        &mut self,
-        words: u32,
-        live: u32,
-        hook: crate::construct::GcHook,
-    ) -> Result<(), ModuleError> {
-        self.emit_stack_check(words, live, hook)?;
+    pub fn allocate_zero_checked(&mut self, words: u32, live: u32) -> Result<(), ModuleError> {
+        self.emit_stack_check(words, live)?;
         self.allocate_zero(words, live)
     }
 
@@ -2022,22 +2096,19 @@ impl BeamModuleAssembler {
         self.source_reg_into(src, TMP)
     }
 
-    /// Emits a `bl` to the module's shared garbage-collection fragment for `hook`.
+    /// Calls the process-wide `garbage_collect` fragment.
     ///
-    /// ARG3 (x8) holds `HTOP` plus the bytes the check needed, ARG4 (x3) the live X count.
-    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:90-122 (`fragment_call` of
-    // `ga->get_garbage_collect()`), OTP-29.1.1.
-    pub(super) fn gc_fragment_call(&mut self, hook: usize) -> Result<(), ModuleError> {
-        let label = match self.gc_fragments.iter().find(|(target, _)| *target == hook) {
-            Some(&(_, label)) => label,
-            None => {
-                let label = self.code.new_label();
-                self.gc_fragments.push((hook, label));
-                label
-            }
-        };
-        self.code.bl(label)?;
-        Ok(())
+    /// ARG3 (x2) holds `HTOP` plus the bytes the check needed, ARG4 (x3) the live X count.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:150-157 (emit_gc_test:
+    // `fragment_call(ga->get_garbage_collect())`), OTP-29.1.1.
+    pub(super) fn gc_fragment_call(&mut self) -> Result<(), ModuleError> {
+        let garbage_collect = self.yield_fragments.garbage_collect;
+        if garbage_collect == 0 {
+            return Err(ModuleError::InvalidOperand(
+                "heap check needs the process-wide garbage_collect fragment",
+            ));
+        }
+        self.fragment_call(garbage_collect)
     }
 
     /// Emits a direct call to a module-local stub for a process-wide executable fragment.
@@ -2104,7 +2175,9 @@ impl BeamModuleAssembler {
     /// Leaves the current instruction through `fail`, or raises `error:badarg` when there is
     /// no failure label.
     // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp (emit_raise_badarg / fail label), OTP-29.1.1.
-    pub(super) fn emit_guard_fail(&mut self, fail: u32) -> Result<(), ModuleError> {
+    /// `mfa` is the guard BIF the raise names (`emit_raise_exception(&mfa)`); it is unused when
+    /// `fail` is a label.
+    pub(super) fn emit_guard_fail(&mut self, fail: u32, mfa: usize) -> Result<(), ModuleError> {
         if fail != 0 {
             let label = self.label(fail);
             self.code.b(label)?;
@@ -2122,14 +2195,7 @@ impl BeamModuleAssembler {
             e.mov_const(Gpr::x(9), badarg)?;
             e.str_uoff(Gpr::x(9), C_P, 48)
         })?;
-        self.code.emit(|e| {
-            e.ldr_uoff(
-                Gpr::x(3),
-                Gpr::x(21),
-                std::mem::offset_of!(crate::ProcessHeader, current) as u32,
-            )
-        })?;
-        self.branch_error_preserving_bif()
+        self.branch_error_with_mfa(mfa)
     }
 
     /// Selects the failure label that arithmetic emitted next branches to instead of raising
@@ -2145,16 +2211,6 @@ impl BeamModuleAssembler {
     /// first use and emitted by `finalize`.
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:114-143 (emit_plus_body_shared and
     // the other *_body_shared fragments), OTP-29.1.1
-    pub(super) fn arith_fragment(&mut self, helper: usize, op: u32, bif_mfa: usize) -> Label {
-        let key = (helper, op, bif_mfa);
-        if let Some((_, label)) = self.arith_fragments.iter().find(|(known, _)| *known == key) {
-            return *label;
-        }
-        let label = self.code.new_label();
-        self.arith_fragments.push((key, label));
-        label
-    }
-
     /// `init_destination`: the cached register of an X destination, otherwise `scratch`.
     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1479-1491, OTP-29.1.1.
     pub(super) fn init_destination(&self, dst: ArgVal, scratch: Gpr) -> Gpr {
@@ -2164,49 +2220,23 @@ impl BeamModuleAssembler {
         }
     }
 
-    /// Branches to the shared error exit when `reg` is nonzero, recording this pc for the
-    /// stacktrace.
-    pub(super) fn error_if_nonzero(&mut self, reg: Gpr) -> Result<(), ModuleError> {
-        let ok = self.code.new_label();
-        self.code.cbz(reg, ok)?;
-        self.branch_error()?;
-        self.code.bind(ok)?;
-        Ok(())
-    }
-
-    /// Raises a failure from a native BIF helper, whose `current` MFA was stored by the helper.
-    pub(super) fn error_if_nonzero_with_bif_context(
-        &mut self,
-        reg: Gpr,
-    ) -> Result<(), ModuleError> {
-        let ok = self.code.new_label();
-        self.code.cbz(reg, ok)?;
-        self.code.emit(|e| {
-            e.ldr_uoff(
-                Gpr::x(3),
-                Gpr::x(21),
-                std::mem::offset_of!(crate::ProcessHeader, current) as u32,
-            )
-        })?;
-        self.branch_error_preserving_bif()?;
-        self.code.bind(ok)?;
-        Ok(())
-    }
-
     /// Calls the module's raise stub, which never returns: the return address of this `bl` is
     /// the pc the raised exception names its source line by.
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp (emit_raise_exception ARG2 = pc), OTP-29.1.1.
     pub(super) fn branch_error(&mut self) -> Result<(), ModuleError> {
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(3), Gpr::xzr())?;
-            e.str_uoff(
-                Gpr::xzr(),
-                Gpr::x(21),
-                std::mem::offset_of!(crate::ProcessHeader, current) as u32,
-            )
-        })?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(3), Gpr::xzr()))?;
         self.code.bl(self.error_pc_label)?;
         // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp, OTP-29.1.1.
+        self.last_error_offset = self.code.offset();
+        Ok(())
+    }
+
+    /// `emit_raise_exception(&mfa)`: the BIF MFA the stacktrace names travels in ARG4.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:243-254
+    // (BeamModuleAssembler::emit_raise_exception), OTP-29.1.1.
+    pub(super) fn branch_error_with_mfa(&mut self, mfa: usize) -> Result<(), ModuleError> {
+        self.code.emit(|e| e.mov_const(Gpr::x(3), mfa as u64))?;
+        self.code.bl(self.error_pc_label)?;
         self.last_error_offset = self.code.offset();
         Ok(())
     }
@@ -2217,25 +2247,9 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
-    /// Calls the shared error exit, which reads the current BIF MFA from the process.
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-151, OTP-29.1.1.
-    pub(super) fn branch_error_with_bif(&mut self) -> Result<(), ModuleError> {
-        self.code.emit(|e| e.mov_reg(Gpr::x(3), Gpr::xzr()))?;
-        self.code.bl(self.error_pc_label)?;
-        self.last_error_offset = self.code.offset();
-        Ok(())
-    }
-
     /// Branches to the shared error exit with LR already holding the raising pc.
     pub(super) fn branch_error_from_lr(&mut self) -> Result<(), ModuleError> {
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(3), Gpr::xzr())?;
-            e.str_uoff(
-                Gpr::xzr(),
-                Gpr::x(21),
-                std::mem::offset_of!(crate::ProcessHeader, current) as u32,
-            )
-        })?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(3), Gpr::xzr()))?;
         self.code.b(self.error_label)?;
         Ok(())
     }
@@ -2341,15 +2355,24 @@ impl BeamModuleAssembler {
         })?;
         self.fragment_call(helper)?;
         crate::emit_leave_runtime(&mut self.code, 6, update)?;
-        self.code.emit(|e| {
-            e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)?;
-            e.ldr_uoff(Gpr::x(9), C_P, 40)
-        })?;
+        self.code
+            .emit(|e| e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16))?;
+        // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:662-679 (emit_bif_nif_epilogue),
+        // OTP-29.1.1: `emit_branch_if_not_value(ARG1, check_trap)` first; only a
+        // THE_NON_VALUE result reads `c_p->freason`, where TRAP yields and anything else
+        // raises.
+        let resume = self.code.new_label();
+        let check_trap = self.code.new_label();
+        self.code.cbz(Gpr::x(0), check_trap)?;
+        self.code.bind(resume)?;
+        self.emit_leave_frame()?;
+        self.code.emit(|e| e.ret(Gpr::x(30)))?;
+        self.code.bind(check_trap)?;
+        self.code.emit(|e| e.ldr_uoff(Gpr::x(9), C_P, 40))?;
         // Port of erts/emulator/beam/erl_nif.c (schedule_dirty_nif), OTP-29.1.1: a dirty NIF
         // called on a normal scheduler traps to the executor, which runs it on a dirty
         // scheduler and resumes at `resume` with the result in x0.
         let not_trap = self.code.new_label();
-        let resume = self.code.new_label();
         self.code
             .emit(|e| e.cmp_imm(Gpr::x(9), crate::dispatch::TRAP_REASON, false))?;
         self.code.b_cond(Cond::Ne, not_trap)?;
@@ -2376,10 +2399,14 @@ impl BeamModuleAssembler {
         // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:709-717 (emit_bif_nif_epilogue):
         // the error path hands `c_p->current`, which beam_jit_call_nif set, to
         // raise_exception_shared as `bif_mfa`.
-        self.error_if_nonzero_with_bif_context(Gpr::x(9))?;
-        self.code.bind(resume)?;
-        self.emit_leave_frame()?;
-        self.code.emit(|e| e.ret(Gpr::x(30)))?;
+        self.code.emit(|e| {
+            e.ldr_uoff(
+                Gpr::x(3),
+                Gpr::x(21),
+                std::mem::offset_of!(crate::ProcessHeader, current) as u32,
+            )
+        })?;
+        self.branch_error_preserving_bif()?;
         Ok(())
     }
 
@@ -2545,115 +2572,10 @@ impl BeamModuleAssembler {
             self.code.bind(label)?;
             crate::fun::emit_call_fun_error(&mut self, helper)?;
         }
-        let gc_fragments = std::mem::take(&mut self.gc_fragments);
-        for (hook, label) in gc_fragments {
-            self.code.bind(label)?;
-            self.emit_garbage_collect_fragment(hook)?;
-        }
-        let fragments = std::mem::take(&mut self.arith_fragments);
-        for ((helper, op, bif_mfa), label) in fragments {
-            self.code.bind(label)?;
-            let update = crate::Update::HEAP_ALLOC.union(crate::Update::REDUCTIONS);
-            let raising = op & 0x100 == 0;
-            let unary = matches!(op & 0xff, 8 | 9);
-            if raising {
-                // Port of erts/emulator/beam/jit/arm/instr_arith.cpp
-                // (`emit_plus_body_shared`), OTP-29.1.1: keep source args in TMP_MEM1q while
-                // the shared helper runs, and restore them only when it raises.
-                self.code.emit(|e| {
-                    e.str_uoff(Gpr::x(14), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS)?;
-                    if !unary {
-                        e.str_uoff(Gpr::x(17), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS + 8)?;
-                    }
-                    if op & 0xff == 13 {
-                        // Port of beam_asm.hpp TMP_MEM4q in `emit_mul_add_body_shared`.
-                        e.str_uoff(Gpr::x(3), SCHEDULER_REGS, TMP_MEM_ARITH_MUL_ADDEND)?;
-                    }
-                    Ok(())
-                })?;
-            }
-            self.code
-                .emit(|e| e.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16))?;
-            crate::emit_enter_runtime(&mut self.code, 6, update)?;
-            self.code.emit(|e| {
-                // x3 is the third operand (mul-add increment, int128 sign); unused ops ignore it.
-                e.mov_reg(Gpr::x(4), Gpr::x(3))?;
-                e.mov_reg(Gpr::x(0), C_P)?;
-                e.mov_const(Gpr::x(1), u64::from(op))?;
-                e.mov_reg(Gpr::x(2), Gpr::x(14))?;
-                e.mov_reg(Gpr::x(3), Gpr::x(17))?;
-                // `reg`: erts passes TMP_MEM addresses inside the scheduler registers.
-                crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(5))
-            })?;
-            self.fragment_call(helper)?;
-            crate::emit_leave_runtime(&mut self.code, 6, update)?;
-            self.code
-                .emit(|e| e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16))?;
-            let returns_non_value = op & 0xff <= 14;
-            if raising {
-                let success = self.code.new_label();
-                if returns_non_value {
-                    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp
-                    // (`emit_plus_body_shared`), OTP-29.1.1: test the helper's value sentinel.
-                    self.code.cbnz(Gpr::x(0), success)?;
-                } else {
-                    self.code.emit(|e| e.ldr_uoff(Gpr::x(9), C_P, 40))?;
-                    self.code.cbz(Gpr::x(9), success)?;
-                }
-                if op & 0xff == 13 {
-                    // Port of erts_mul_add's `pp` result and `emit_mul_add_body_shared`:
-                    // a product failure names `times/2`; otherwise the failing stage is `plus/2`.
-                    let multiply_failed = self.code.new_label();
-                    self.code.emit(|e| {
-                        e.ldr_uoff(Gpr::x(12), SCHEDULER_REGS, TMP_MEM_ARITH_MUL_ADD_PRODUCT)
-                    })?;
-                    self.code.cbz(Gpr::x(12), multiply_failed)?;
-                    self.code.emit(|e| {
-                        e.mov_reg(Gpr::x(25), Gpr::x(12))?;
-                        e.ldr_uoff(Gpr::x(26), SCHEDULER_REGS, TMP_MEM_ARITH_MUL_ADDEND)?;
-                        e.mov_const(
-                            Gpr::x(3),
-                            std::ptr::from_ref(&crate::bif::ERLANG_PLUS_MFA) as u64,
-                        )
-                    })?;
-                    self.code.b(self.error_label)?;
-                    self.code.bind(multiply_failed)?;
-                    self.code.emit(|e| {
-                        e.ldr_uoff(Gpr::x(25), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS)?;
-                        e.ldr_uoff(Gpr::x(26), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS + 8)?;
-                        e.mov_const(
-                            Gpr::x(3),
-                            std::ptr::from_ref(&crate::bif::ERLANG_TIMES_MFA) as u64,
-                        )
-                    })?;
-                    self.code.b(self.error_label)?;
-                } else {
-                    self.code.emit(|e| {
-                        e.ldr_uoff(Gpr::x(10), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS)?;
-                        e.mov_reg(Gpr::x(25), Gpr::x(10))?;
-                        if !unary {
-                            e.ldr_uoff(Gpr::x(11), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS + 8)?;
-                            e.mov_reg(Gpr::x(26), Gpr::x(11))?;
-                        }
-                        if bif_mfa == 0 {
-                            e.mov_reg(Gpr::x(3), Gpr::xzr())?;
-                        } else {
-                            e.mov_const(Gpr::x(3), bif_mfa as u64)?;
-                        }
-                        Ok(())
-                    })?;
-                    self.code.b(self.error_label)?;
-                }
-                self.code.bind(success)?;
-            } else if !returns_non_value {
-                self.code.emit(|e| e.ldr_uoff(Gpr::x(9), C_P, 40))?;
-            }
-            self.code.emit(|e| e.ret(Gpr::x(30)))?;
-        }
         let entry_label = self.yield_label;
         self.code.bind(entry_label)?;
-        if self.yield_fragments.2 != 0 {
-            let context_switch = self.yield_fragments.2;
+        if self.yield_fragments.context_switch != 0 {
+            let context_switch = self.yield_fragments.context_switch;
             self.code.emit(|e| {
                 e.mov_const(Gpr::x(17), context_switch as u64)?;
                 e.br(Gpr::x(17))
@@ -2829,7 +2751,7 @@ impl BeamModuleAssembler {
                 handler: memory.ptr_at(offset + handler),
             })
             .collect();
-        let literal_patches = self
+        let mut literal_patches: std::collections::HashMap<i64, Vec<usize>> = self
             .literals
             .into_iter()
             .map(|(index, relocations)| {
@@ -2842,9 +2764,18 @@ impl BeamModuleAssembler {
                 )
             })
             .collect();
+        for (index, site) in self.literal_data_patches {
+            let site = match site {
+                LiteralDataSite::Text(site) => site,
+                LiteralDataSite::Rodata(word) => rodata_offset + word * 8,
+            };
+            literal_patches
+                .entry(index)
+                .or_default()
+                .push(offset + site);
+        }
         Ok(FinalizedModule {
             memory,
-            map_lookups: self.map_lookups.into_boxed_slice(),
             entries,
             entry_offsets,
             lambda_entries,

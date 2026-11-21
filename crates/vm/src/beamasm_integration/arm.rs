@@ -1,14 +1,12 @@
 //! The arm side of the VM's BeamAsm load: the module environment of the arm emitters,
 //! their fragment sets and the compiled version they produce.
+//!
+//! Port of erts/emulator/beam/jit/arm/instr_bs.cpp and beam_asm_module.cpp, OTP-29.1.1.
 
 use super::*;
 use arinsal_beam::BeamFile;
 use arinsal_beamasm::{
-    arith::ArithHelper,
-    construct::GcHook,
-    dispatch::CompareHelpers,
-    dispatch::DispatchFragments,
-    guard::{CompareShared, GuardHelper, GuardHelper3},
+    dispatch::CompareHelpers, dispatch::DispatchFragments, guard::CompareShared,
 };
 use arinsal_beamjit::{
     BifMfaHelper, MapLookupHelper, ModuleEnv, compile_parsed_module_with_options,
@@ -71,8 +69,7 @@ fn fragments() -> Option<&'static DispatchFragments> {
                         cmp_compound: crate::native_hooks::erts_cmp_compound as *const () as usize,
                     },
                     line_breakpoint: arinsal_beamasm::dispatch::LineBreakpointHelpers {
-                        garbage_collect: crate::native_helpers::arinsal_beamasm_gc_sync as *const ()
-                            as usize,
+                        garbage_collect: yield_fragments()?.garbage_collect(),
                         prepare_call: crate::native_helpers::arinsal_beamasm_line_breakpoint_prepare
                             as *const () as usize,
                         cleanup: crate::native_helpers::arinsal_beamasm_line_breakpoint_cleanup
@@ -87,6 +84,11 @@ fn fragments() -> Option<&'static DispatchFragments> {
                     erts_call_nif_early: crate::natives::nif::erts_call_nif_early as *const ()
                         as usize,
                     context_switch: yield_fragments()?.context_switch(),
+                    erts_generic_breakpoint: crate::trace_bp::erts_generic_breakpoint as *const ()
+                        as usize,
+                    debug_bp_error_handler: crate::beam_common::call_error_handler_abi as *const ()
+                        as usize,
+                    raise_exception_shared: raise_fragments()?.raise_exception_shared(),
                 },
             )
             .ok()?;
@@ -123,7 +125,13 @@ fn yield_fragments() -> Option<&'static arinsal_beamasm::yield_frag::YieldFragme
     static FRAGMENTS: OnceLock<Option<arinsal_beamasm::yield_frag::YieldFragments>> =
         OnceLock::new();
     FRAGMENTS
-        .get_or_init(|| arinsal_beamasm::yield_frag::YieldFragments::new().ok())
+        .get_or_init(|| {
+            arinsal_beamasm::yield_frag::YieldFragments::new(
+                crate::erl_gc::erts_garbage_collect_nobump as *const () as usize,
+                crate::PROCESS_STATE_OFFSET as u32,
+            )
+            .ok()
+        })
         .as_ref()
 }
 
@@ -135,6 +143,7 @@ fn raise_fragments() -> Option<&'static arinsal_beamasm::raise_frag::RaiseFragme
             arinsal_beamasm::raise_frag::RaiseFragments::new(
                 crate::beam_common::handle_error as *const () as usize,
                 crate::beam_common::erts_sanitize_freason as *const () as usize,
+                yield_fragments().map_or(0, |fragments| fragments.context_switch()),
             )
             .ok()
         })
@@ -167,14 +176,7 @@ fn map_fragments() -> Option<&'static arinsal_beamasm::map::MapFragments> {
     static FRAGMENTS: OnceLock<Option<arinsal_beamasm::map::MapFragments>> = OnceLock::new();
     FRAGMENTS
         .get_or_init(|| {
-            arinsal_beamasm::map::MapFragments::with_helpers(
-                crate::native_helpers::arinsal_beamasm_map_get,
-                crate::native_helpers::arinsal_beamasm_map_update_single,
-                crate::native_helpers::arinsal_beamasm_map_put_single,
-                crate::native_helpers::arinsal_beamasm_map_assoc,
-                crate::native_helpers::arinsal_beamasm_map_exact,
-            )
-            .ok()
+            arinsal_beamasm::map::MapFragments::new(raise_fragments()?.raise_exception()).ok()
         })
         .as_ref()
 }
@@ -188,25 +190,6 @@ static CALL_UNPORTED: AtomicU64 = AtomicU64::new(0);
 static CALL_UNPORTED_TARGETS: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 static PRINTED: AtomicBool = AtomicBool::new(false);
-static NEXT_MODULE_HANDLE: AtomicU64 = AtomicU64::new(1);
-static MODULE_HANDLES: OnceLock<RwLock<HashMap<u64, Weak<CompiledVersion>>>> = OnceLock::new();
-
-fn module_handles() -> &'static RwLock<HashMap<u64, Weak<CompiledVersion>>> {
-    MODULE_HANDLES.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-/// Resolves native code identity to the version-specific tables retained with its code header.
-// Port of erts/emulator/beam/jit/asm_load.c:1025-1026 and jit/asm_load.c:1149-1155,
-// OTP-29.1.1: emitted code is tied to its prepared BeamCodeHeader, not a code-table slot.
-pub(crate) fn map_lookup_version(handle: u64) -> Option<Arc<CompiledVersion>> {
-    let mut handles = module_handles().write().ok()?;
-    let version = handles.get(&handle).and_then(Weak::upgrade);
-    if version.is_none() {
-        handles.remove(&handle);
-    }
-    version
-}
-
 fn lifetime_trace_enabled() -> bool {
     crate::native_bridge::lifetime_trace_enabled()
 }
@@ -219,10 +202,7 @@ pub(crate) struct CompiledVersion {
     /// The dispatch entry of each import, put into the export table when the version is
     /// installed (`erts_export_put` of `beam_load_finalize_code`).
     import_bindings: Vec<(Mfa, &'static Arc<arinsal_term::ExportEntry>)>,
-    /// Functions of the module BeamAsm could not compile: they run in the interpreter.
-    module_handle: u64,
     installed: AtomicBool,
-    pub(crate) map_lookups: Box<[arinsal_beamasm::map::MapLookupTable]>,
     memory: std::sync::Mutex<arinsal_a64::exec::CodeMemory>,
     /// The native entry breakpoint of each function: its name atom and arity, the patch site
     /// and the branch the site holds while the breakpoint is off.
@@ -511,10 +491,6 @@ impl CompiledVersion {
             versions.retain(|version| version.strong_count() != 0);
             versions.push(Arc::downgrade(self));
         }
-        if let Ok(mut handles) = module_handles().write() {
-            handles.retain(|_, version| version.strong_count() != 0);
-            handles.insert(self.module_handle, Arc::downgrade(self));
-        }
         self.installed.store(true, Ordering::Release);
         publish_module(
             module,
@@ -686,11 +662,11 @@ struct VmModuleEnv<'a> {
     /// `BIF_TRAP_EXPORT(BIF_send_2)`: the `erlang:send/2` export of the module's code.
     send_export: usize,
     module_name: String,
+    string_table_base: usize,
     /// The module's NIFs are in this runtime (`static_nif_module`).
     static_nifs: bool,
     functions: Vec<(String, u8)>,
     coverage: Option<arinsal_loader::Coverage>,
-    module_handle: u64,
     lambda_targets: std::cell::RefCell<HashMap<u32, usize>>,
     _lifetime: std::marker::PhantomData<&'a BeamFile>,
 }
@@ -703,7 +679,6 @@ impl<'a> VmModuleEnv<'a> {
         export_entries: Vec<usize>,
         send_export: usize,
         fragments: &DispatchFragments,
-        module_handle: u64,
     ) -> Result<Self, String> {
         let mut literals = Vec::with_capacity(beam.literals.len());
         for index in 0..beam.literals.len() {
@@ -750,6 +725,7 @@ impl<'a> VmModuleEnv<'a> {
             line_breakpoint_fragment: fragments.line_breakpoint(),
             send_export,
             module_name: module.name.clone(),
+            string_table_base: module.strings.as_ptr() as usize,
             static_nifs: crate::load::static_nif_module(&module.name),
             functions: if module.awaits_native_functions() {
                 // A module without the interpreter form: its functions in code order, the
@@ -778,7 +754,6 @@ impl<'a> VmModuleEnv<'a> {
                     .collect()
             },
             coverage: module.coverage.clone(),
-            module_handle,
             lambda_targets: std::cell::RefCell::new(HashMap::new()),
             _lifetime: std::marker::PhantomData,
         })
@@ -856,10 +831,6 @@ impl ModuleEnv for VmModuleEnv<'_> {
 
     fn integer_literal(&self, value: i64) -> Result<i64, String> {
         self.add_dynamic_integer_literal(BigInt::from(value))
-    }
-
-    fn match_string(&self, bytes: &[u8]) -> Result<u64, String> {
-        Ok(crate::native_helpers::register_match_string(bytes))
     }
 
     fn bigint_literal(&self, decimal: &str) -> Result<u64, String> {
@@ -990,17 +961,6 @@ impl ModuleEnv for VmModuleEnv<'_> {
             .ok_or_else(|| format!("lambda {index} has no loaded fun entry"))
     }
 
-    fn record_runtime(&self) -> arinsal_beamasm::records::RecordRuntime {
-        arinsal_beamasm::records::RecordRuntime {
-            get_field: crate::native_records::arinsal_beamasm_get_record_field,
-            get_local_field: crate::native_records::arinsal_beamasm_get_local_record_field,
-            create_local: crate::native_records::arinsal_beamasm_create_local_record,
-            create: crate::native_records::arinsal_beamasm_create_record,
-            get_elements: crate::native_records::arinsal_beamasm_get_record_elements,
-            update: crate::native_records::arinsal_beamasm_update_record,
-        }
-    }
-
     fn raise_class_helper(&self) -> usize {
         crate::beam_common::erts_sanitize_freason as *const () as usize
     }
@@ -1010,7 +970,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
     }
 
     fn sys_perf_counter(&self) -> usize {
-        arinsal_bifs::sys_perf_counter as *const () as usize
+        arinsal_sched::sys_time::erts_sys_perf_counter as *const () as usize
     }
 
     fn erts_this_node(&self) -> usize {
@@ -1082,14 +1042,12 @@ impl ModuleEnv for VmModuleEnv<'_> {
     fn line_breakpoint_fragment(&self) -> usize {
         self.line_breakpoint_fragment
     }
-    fn yield_fragments(&self) -> (usize, usize, usize) {
-        let fragments = yield_fragments().expect("VM yield fragments are initialized");
-        (
-            fragments.dispatch_return(),
-            fragments.i_test_yield_shared(),
-            fragments.context_switch(),
-        )
+    fn yield_fragments(&self) -> arinsal_beamasm::yield_frag::YieldEntries {
+        yield_fragments()
+            .expect("VM yield fragments are initialized")
+            .entries()
     }
+
     fn raise_fragments(&self) -> (usize, usize, usize) {
         let fragments = raise_fragments().expect("VM raise fragments are initialized");
         (
@@ -1111,11 +1069,10 @@ impl ModuleEnv for VmModuleEnv<'_> {
         self.send_export
     }
 
-    fn arithmetic_helper(&self) -> ArithHelper {
-        crate::arinsal_beamasm_arith
-    }
-    fn guard_helper(&self) -> GuardHelper {
-        crate::arinsal_beamasm_guard
+    fn bif_fragments(&self) -> arinsal_beamasm::raise_frag::BifFragments {
+        raise_fragments()
+            .expect("VM raise fragments are initialized")
+            .bif_fragments()
     }
     fn compare_shared(&self) -> CompareShared {
         let mut shared = fragments().map_or(CompareShared::default(), |fragments| CompareShared {
@@ -1130,12 +1087,6 @@ impl ModuleEnv for VmModuleEnv<'_> {
         shared.eq = crate::utils::eq as *const () as usize;
         shared
     }
-    fn guard_helper3(&self) -> GuardHelper3 {
-        crate::arinsal_beamasm_guard3
-    }
-    fn gc_hook(&self) -> GcHook {
-        crate::native_helpers::arinsal_beamasm_gc_sync
-    }
     fn map_lookup_helper(&self) -> MapLookupHelper {
         crate::arinsal_beamasm_map_lookup
     }
@@ -1147,37 +1098,10 @@ impl ModuleEnv for VmModuleEnv<'_> {
         bif_mfa_entry(module, function, u32::from(arity))
             .ok_or_else(|| format!("no BIF dispatch slot for {module}:{function}/{arity}"))
     }
-    fn bs_match_helper(&self) -> arinsal_beamasm::bs_match::BsMatchHelper {
-        crate::native_helpers::arinsal_beamasm_bs_match
-    }
     fn map_runtime(&self) -> arinsal_beamasm::map::MapRuntime {
-        arinsal_beamasm::map::MapRuntime {
-            get: crate::native_helpers::arinsal_beamasm_map_get,
-            get_elements: crate::native_helpers::arinsal_beamasm_map_get_elements,
-            lookup_module: self.module_handle,
-            new_map: crate::native_helpers::arinsal_beamasm_map_new,
-            update_assoc: crate::native_helpers::arinsal_beamasm_map_assoc,
-            update_exact: crate::native_helpers::arinsal_beamasm_map_exact,
-            put_single: crate::native_helpers::arinsal_beamasm_map_put_single,
-            update_single_exact_shared: map_fragments().map_or(
-                0,
-                arinsal_beamasm::map::MapFragments::update_single_exact_shared,
-            ),
-            update_single_assoc_shared: map_fragments().map_or(
-                0,
-                arinsal_beamasm::map::MapFragments::update_single_assoc_shared,
-            ),
-            update_assoc_shared: map_fragments()
-                .map_or(0, arinsal_beamasm::map::MapFragments::update_assoc_shared),
-            update_exact_shared: map_fragments()
-                .map_or(0, arinsal_beamasm::map::MapFragments::update_exact_shared),
-            get_element_shared: map_fragments()
-                .map_or(0, arinsal_beamasm::map::MapFragments::get_element_shared),
-            get_element_hash_shared: map_fragments().map_or(
-                0,
-                arinsal_beamasm::map::MapFragments::get_element_hash_shared,
-            ),
-        }
+        map_fragments()
+            .map(arinsal_beamasm::map::MapFragments::runtime)
+            .unwrap_or_default()
     }
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-151 (i_bif*: `mov ARG, bif->f`), OTP-29.1.1:
     // the BIF function is bound when the call site is emitted, never looked up by name per call.
@@ -1192,46 +1116,8 @@ impl ModuleEnv for VmModuleEnv<'_> {
             .bif_table_runs_bif()
             .then_some(identity)
     }
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-151, OTP-29.1.1:
-    // `bif_mfa` is the stable address of the export descriptor's MFA.
-    fn plain_bif_mfa(&self, _beam: &BeamFile, index: u32) -> Option<usize> {
-        let identity = *self.export_entries.get(index as usize)?;
-        let target = target_for_identity(identity)?;
-        Some(std::ptr::from_ref(target.slot.mfa()) as usize)
-    }
-    fn bs_match_cmd_helper(&self) -> arinsal_beamasm::bs_match::BsMatchCmdHelper {
-        crate::native_helpers::arinsal_beamasm_bs_match_command
-    }
-    fn bs_create_bin_helper(&self) -> arinsal_beamasm::bs_construct::BsCreateBinHelpers {
-        arinsal_beamasm::bs_construct::install_bs_append_binary(
-            crate::erl_bits::append_binary as *const () as usize,
-        );
-        arinsal_beamasm::bs_construct::install_bs_append_checked(
-            crate::native_helpers::bs_construct_raw::append_checked as *const () as usize,
-        );
-        arinsal_beamasm::bs_construct::install_bs_gc(self.gc_hook());
-        arinsal_beamasm::bs_construct::install_bs_private_append(
-            crate::raw::erl_bits::erts_bs_private_append_checked as *const () as usize,
-        );
-        use arinsal_beamasm::bs_construct::BsCreateBinHelpers;
-        BsCreateBinHelpers {
-            append_checked: crate::native_helpers::bs_construct_raw::append_checked,
-            private_append: crate::raw::erl_bits::private_append_from_reg,
-            init_bits: crate::native_helpers::bs_construct_raw::init_bits,
-            bit_size: crate::native_helpers::bs_construct_raw::bit_size,
-            utf8_size: crate::native_helpers::bs_construct_raw::utf8_size,
-            utf16_size: crate::native_helpers::bs_construct_raw::utf16_size,
-            utf32_size: crate::native_helpers::bs_construct_raw::utf32_size,
-            fail: crate::native_helpers::bs_construct_raw::fail,
-            put_integer: crate::native_helpers::bs_construct_raw::put_integer,
-            put_binary: crate::native_helpers::bs_construct_raw::put_binary,
-            put_binary_all: crate::native_helpers::bs_construct_raw::put_binary_all,
-            put_float: crate::native_helpers::bs_construct_raw::put_float,
-            put_utf8: crate::native_helpers::bs_construct_raw::put_utf8,
-            put_utf16: crate::native_helpers::bs_construct_raw::put_utf16,
-            put_utf32: crate::native_helpers::bs_construct_raw::put_utf32,
-            put_string: crate::native_helpers::bs_construct_raw::put_string,
-        }
+    fn string_table_base(&self, _beam: &BeamFile) -> usize {
+        self.string_table_base
     }
     fn binary_literal(&self, bytes: &[u8]) -> Result<u64, String> {
         let mut heap = self.literal_heap.borrow_mut();
@@ -1251,9 +1137,6 @@ impl ModuleEnv for VmModuleEnv<'_> {
     }
     fn big_to_float_helper(&self) -> arinsal_beamasm::float::BigToFloat {
         crate::big::big_to_double
-    }
-    fn bs_init_writable_helper(&self) -> arinsal_beamasm::bs_construct::BsInitWritableHelper {
-        crate::erl_bits::erts_bs_init_writable
     }
     fn receive_hooks(&self) -> arinsal_beamasm::receive::ReceiveHooks {
         arinsal_beamasm::receive::ReceiveHooks {
@@ -1318,11 +1201,6 @@ pub(crate) fn compile(
         arinsal_term::atoms::SEND,
         2,
     ))?) as usize;
-    let module_handle = NEXT_MODULE_HANDLE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |handle| {
-            handle.checked_add(1)
-        })
-        .ok()?;
     // Literals no loaded instruction uses; a literal heap so literal checks see them as such.
     let mut literal_heap = Box::new(VecHeap::new_literal());
     let env = VmModuleEnv::new(
@@ -1332,7 +1210,6 @@ pub(crate) fn compile(
         export_entries,
         send_export,
         fragments,
-        module_handle,
     )
     .ok()?;
     let trace = crate::calls::trace_boot_enabled();
@@ -1580,9 +1457,7 @@ pub(crate) fn compile(
             .on_load
             .and_then(|index| compiled.functions.get(index))
             .map(|function| (function.name.to_owned(), function.arity)),
-        module_handle,
         installed: AtomicBool::new(false),
-        map_lookups: compiled.native.map_lookups,
         memory: std::sync::Mutex::new(compiled.native.memory),
         trace_breakpoints,
         line_breakpoints: compiled.native.line_breakpoints.clone(),
@@ -1671,7 +1546,6 @@ pub(crate) fn count_call_unported(
     let name = match target_pc {
         d::RETURN_TO_DISPATCH_IDENTITY => "return_to_dispatch".to_owned(),
         d::DIRTY_NIF_DISPATCH_IDENTITY => "dirty_nif".to_owned(),
-        d::BREAKPOINT_DISPATCH_IDENTITY => "breakpoint".to_owned(),
         pc if d::decode_line_breakpoint_identity(pc).is_some() => "line_breakpoint".to_owned(),
         pc if pc == crate::bif_traps::bif_export_trap_pc() => match trapped {
             Some((m, f, a)) => format!(

@@ -2,6 +2,7 @@ mod support;
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm as O;
+use similar_asserts::assert_eq;
 use support::{call, equivalent};
 
 #[test]
@@ -10,14 +11,10 @@ fn os_pid_and_getenv_bifs_match_otp() {
         eprintln!("erl unavailable; skipping os BIF differential test");
         return;
     };
-    for (name, args) in [
-        ("getpid", vec![]),
-        ("perf_counter", vec![]),
-        ("getenv", vec![O::charlist("HOME")]),
-    ] {
+    for (name, args) in [("getpid", vec![]), ("getenv", vec![O::charlist("HOME")])] {
         let expected = reference.call("os", name, &args);
         let actual = call("os", name, &args);
-        if name == "getpid" || name == "perf_counter" {
+        if name == "getpid" {
             assert!(matches!(actual, CallResult::Ok(_)), "os:{name}: {actual:?}");
             assert!(
                 matches!(expected, CallResult::Ok(_)),

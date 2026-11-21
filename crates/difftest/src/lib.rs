@@ -15,7 +15,7 @@ use num_bigint::BigInt;
 use num_traits::FromPrimitive;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -104,18 +104,9 @@ impl RefErl {
     /// Start the endpoint with emulator arguments such as `+D`.
     pub fn start_with_erl_args(args: &[&str]) -> Result<Self, Error> {
         let erl_args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
-        let output = Command::new("erl").args(&erl_args).args(["-noshell", "-eval",
-            "io:format(\"~s|~s\", [erlang:system_info(otp_release), string:trim(element(2, file:read_file(filename:join([code:root_dir(), \"releases\", erlang:system_info(otp_release), \"OTP_VERSION\"]))))]), halt()."])
-            .output()?;
-        if !output.status.success() {
-            return Err(Error::Protocol(
-                String::from_utf8_lossy(&output.stderr).into(),
-            ));
-        }
-        let version = String::from_utf8_lossy(&output.stdout);
-        let (release, exact) = version
-            .split_once('|')
-            .ok_or_else(|| Error::Protocol(format!("unexpected OTP version: {version}")))?;
+        // Read OTP_VERSION from the install tree. A child `erl -eval` + waitpid fails with
+        // ECHILD once the in-process runtime has `sys_signal(SIGCHLD, SIG_IGN)`.
+        let (release, exact) = otp_release_and_version()?;
         if release != "29" {
             return Err(Error::Protocol(format!("OTP 29 required, found {exact}")));
         }
@@ -157,9 +148,10 @@ impl RefErl {
         let bytes = codec::encode(&OwnedTerm::Tuple(xs))?;
         let (tx, rx) = mpsc::channel();
         let mut process = self.process.lock().unwrap();
-        if let Some(status) = process.child.try_wait()? {
-            let _ = status;
-            *process = spawn(&server_ebin(), &self.erl_args)?;
+        match child_exited(&mut process.child) {
+            Ok(true) => *process = spawn(&server_ebin(), &self.erl_args)?,
+            Ok(false) => {}
+            Err(error) => return Err(error.into()),
         }
         process.pending.lock().unwrap().insert(id, tx);
         let result = process
@@ -338,18 +330,36 @@ fn ensure_server_beam(source: &Path, ebin: &Path) -> Result<(), Error> {
 
     // Each compiler writes a private result; rename publishes only a complete BEAM.
     let build_dir = BuildDir::create(ebin)?;
-    let output = Command::new("erlc")
+    let mut compile = Command::new("erlc")
         .arg("-o")
         .arg(&build_dir.0)
         .arg(source)
-        .output()?;
-    if !output.status.success() {
-        return Err(Error::Protocol(
-            String::from_utf8_lossy(&output.stderr).into(),
-        ));
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    match compile.wait() {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            let mut stderr = Vec::new();
+            if let Some(mut pipe) = compile.stderr.take() {
+                let _ = pipe.read_to_end(&mut stderr);
+            }
+            return Err(Error::Protocol(format!(
+                "erlc exited {:?}: {}",
+                status.code(),
+                String::from_utf8_lossy(&stderr)
+            )));
+        }
+        Err(error) if is_echild(&error) => {}
+        Err(error) => return Err(error.into()),
     }
 
     let compiled_beam = build_dir.0.join("difftest_server.beam");
+    if !compiled_beam.is_file() {
+        return Err(Error::Protocol(
+            "erlc did not write difftest_server.beam".into(),
+        ));
+    }
     let compiled = std::fs::read(&compiled_beam)?;
     match std::fs::read(&beam) {
         Ok(existing) if existing == compiled => {}
@@ -386,6 +396,44 @@ impl Drop for BuildDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// OTP release and patch from `{root}/releases/{rel}/OTP_VERSION`, not from a waited `erl` child.
+fn otp_release_and_version() -> Result<(String, String), Error> {
+    static CACHED: OnceLock<Result<(String, String), String>> = OnceLock::new();
+    match CACHED.get_or_init(|| read_otp_version().map_err(|error| error.to_string())) {
+        Ok(value) => Ok(value.clone()),
+        Err(error) => Err(Error::Protocol(error.clone())),
+    }
+}
+
+fn read_otp_version() -> Result<(String, String), Error> {
+    let root = crate::reference::otp_root()
+        .ok_or_else(|| Error::Protocol("OTP root (erl on PATH) is required".into()))?;
+    let start = std::fs::read_to_string(root.join("releases/start_erl.data"))?;
+    let release = start
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("29")
+        .trim()
+        .to_owned();
+    let exact = std::fs::read_to_string(root.join(format!("releases/{release}/OTP_VERSION")))?
+        .trim()
+        .to_owned();
+    Ok((release, exact))
+}
+
+fn child_exited(child: &mut Child) -> io::Result<bool> {
+    match child.try_wait() {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(error) if is_echild(&error) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_echild(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ECHILD)
 }
 
 fn spawn(ebin: &std::path::Path, erl_args: &[String]) -> Result<Process, Error> {

@@ -4,7 +4,7 @@
 
 use arinsal_beamasm::{ProcessHeader, SchedulerRegisters};
 use arinsal_bits::{SegFlags, SegSize, SegType, Segment, SegmentValue};
-use arinsal_term::Term;
+use arinsal_term::{Term, TermBuilder};
 
 const ERTS_ON_HEAP_BITS_LIMIT: usize = 64 * 8;
 const ERTS_HEAP_BITS_TAG: u64 = 0x20;
@@ -369,7 +369,8 @@ pub extern "C" fn erts_bs_start_match_3(c_p: *mut ProcessHeader, value: u64) -> 
         return core::ptr::null_mut();
     };
     let value = crate::native_hooks::from_raw(value);
-    match arinsal_bits::start_match(value, &mut process.heap) {
+    let mut heap = crate::ProcessHeapHandle(&mut process.heap);
+    match arinsal_bits::start_match(value, &mut heap) {
         Ok(Some(context)) => (context.tagged_word() & !7) as *mut u64,
         Ok(None) | Err(_) => core::ptr::null_mut(),
     }
@@ -418,27 +419,6 @@ pub extern "C" fn erts_bs_private_append_checked(
         crate::native_helpers::bs_private_append_checked(process, state, bin, extra_bits)
     })
     .unwrap_or(0)
-}
-
-/// Private append entry used by the arm emitter, which passes its register base.
-// Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1865-1880 and
-// erts/emulator/beam/erl_bits.c:1928-2017, OTP-29.1.1.
-#[cfg(target_arch = "aarch64")]
-pub(crate) extern "C" fn private_append_from_reg(
-    c_p: *mut ProcessHeader,
-    reg: *mut u64,
-    bin: u64,
-    extra_bits: u64,
-) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(c_p, reg) else {
-        return 0;
-    };
-    crate::native_helpers::bs_private_append_checked(
-        process,
-        &mut registers.erl_bits_state,
-        bin,
-        extra_bits,
-    )
 }
 
 /// `erts_build_sub_bitstring` copies small ranges and otherwise allocates a `SUB_BITS` pointing
@@ -591,36 +571,137 @@ pub extern "C" fn beam_jit_bs_field_size_argument_error(c_p: *mut ProcessHeader,
     };
 }
 
-/// BeamAsm's checked construction initializer shares the arm cursor/allocation implementation.
-// Port of erts/emulator/beam/jit/beam_jit_common.cpp:816-858 (beam_jit_bs_init_bits),
-// OTP-29.1.1.
+/// Initializes `ErlBitsState` for the binary construction emitted by BeamAsm.
+// Port of erts/emulator/beam/jit/beam_jit_common.cpp:816-858 (beam_jit_bs_init_bits), OTP-29.1.1.
 #[unsafe(no_mangle)]
 pub extern "C" fn beam_jit_bs_init_bits(
     c_p: *mut ProcessHeader,
     reg: *mut u64,
-    _ebs: *mut u64,
+    ebs: *mut u64,
     num_bits: u64,
     alloc: u64,
     live: u32,
 ) -> u64 {
-    crate::native_helpers::bs_construct_raw::init_bits(c_p, reg, num_bits, alloc, u64::from(live))
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(c_p, reg) else {
+        return 0;
+    };
+    let (Ok(bits), Ok(alloc)) = (usize::try_from(num_bits), usize::try_from(alloc)) else {
+        crate::native_hooks::set_error(process, "system_limit");
+        return 0;
+    };
+    let heap_words = if bits <= 64 * 8 {
+        2 + bits.div_ceil(8).div_ceil(8)
+    } else {
+        8
+    };
+    let Some(roots) = registers.x_reg_array.get_mut(..live as usize) else {
+        crate::native_hooks::set_error(process, "system_limit");
+        return 0;
+    };
+    process.ensure_native_roots(heap_words.saturating_add(alloc), roots);
+    let mut heap = crate::ProcessHeapHandle(&mut process.heap);
+    let (term, address) = match TermBuilder::new(&mut heap).bitstring_with_address(bits) {
+        Ok(result) => result,
+        Err(_) => {
+            crate::native_hooks::set_error(process, "system_limit");
+            return 0;
+        }
+    };
+    let Some(()) = with_state(ebs, |state| *state = [address as u64, 0]) else {
+        crate::native_hooks::set_error(process, "system_limit");
+        return 0;
+    };
+    crate::native_hooks::raw(term)
 }
 
-/// BeamAsm's packed construction error uses the existing shared error-info implementation.
+/// Returns a bitstring's size in bits or `-1` when the term is not a bitstring.
+// Port of erts/emulator/beam/jit/beam_jit_common.cpp:1011 (`beam_jit_bs_bit_size`), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn beam_jit_bs_bit_size(term: u64) -> i64 {
+    arinsal_bits::bit_size(crate::native_hooks::from_raw(term))
+        .and_then(|bits| i64::try_from(bits).ok())
+        .unwrap_or(-1)
+}
+
+/// Builds `badarg` or `system_limit` extended error info for a binary construction failure.
 // Port of erts/emulator/beam/jit/beam_jit_common.cpp:911-1010
-// (beam_jit_bs_construct_fail_info), OTP-29.1.1.
+// (`beam_jit_bs_construct_fail_info`), OTP-29.1.1.
 #[unsafe(no_mangle)]
 pub extern "C" fn beam_jit_bs_construct_fail_info(
     c_p: *mut ProcessHeader,
-    packed_error_info: u64,
+    packed: u64,
     arg3: u64,
     arg1: u64,
 ) {
-    crate::native_helpers::bs_construct_raw::fail(
-        c_p,
-        core::ptr::null_mut(),
-        packed_error_info,
-        arg3,
-        arg1,
-    );
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return;
+    };
+    let segment = (packed >> 10) as i64;
+    let operation = match (packed >> 7) & 7 {
+        1 => "float",
+        2 => "integer",
+        3 => "utf8",
+        4 => "utf16",
+        5 => "utf32",
+        _ => "binary",
+    };
+    let value = match (packed >> 2) & 3 {
+        0 => crate::native_hooks::from_raw(arg1),
+        1 => crate::native_hooks::from_raw(arg3),
+        _ => crate::native_hooks::from_raw(process.heap.abi.exc.fvalue),
+    };
+    let info = match (packed >> 4) & 7 {
+        0 => arinsal_term::to_owned(crate::native_hooks::from_raw(process.heap.abi.exc.fvalue)),
+        1 => Ok(arinsal_etf::OwnedTerm::atom("type")),
+        2 => Ok(arinsal_etf::OwnedTerm::atom("size")),
+        3 => Ok(arinsal_etf::OwnedTerm::atom("unit")),
+        4 => Ok(arinsal_etf::OwnedTerm::atom(
+            if arinsal_bits::bit_size(value).is_some() {
+                "short"
+            } else {
+                "type"
+            },
+        )),
+        _ => Err(arinsal_term::TermError::BadArg),
+    };
+    let (Ok(value), Ok(info)) = (arinsal_term::to_owned(value), info) else {
+        crate::native_hooks::set_error(process, "badarg");
+        return;
+    };
+    let reason = match packed & 3 {
+        1 => "system_limit",
+        2 => {
+            let nonnegative = match &value {
+                arinsal_etf::OwnedTerm::Int(number) => *number >= 0,
+                arinsal_etf::OwnedTerm::BigInt(number) => number.sign() != num_bigint::Sign::Minus,
+                _ => false,
+            };
+            if nonnegative {
+                "system_limit"
+            } else {
+                "badarg"
+            }
+        }
+        _ => "badarg",
+    };
+    let error_info = arinsal_etf::OwnedTerm::Map(vec![
+        (
+            arinsal_etf::OwnedTerm::atom("cause"),
+            arinsal_etf::OwnedTerm::Tuple(vec![
+                arinsal_etf::OwnedTerm::Int(segment),
+                arinsal_etf::OwnedTerm::atom(operation),
+                info,
+                value,
+            ]),
+        ),
+        (
+            arinsal_etf::OwnedTerm::atom("function"),
+            arinsal_etf::OwnedTerm::atom("format_bs_fail"),
+        ),
+        (
+            arinsal_etf::OwnedTerm::atom("module"),
+            arinsal_etf::OwnedTerm::atom("erl_erts_errors"),
+        ),
+    ]);
+    crate::native_helpers::set_native_error_info(process, reason, Some(Box::new(error_info)));
 }

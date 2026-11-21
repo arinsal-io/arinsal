@@ -79,16 +79,22 @@ fn pool() -> &'static Pool {
     POOL.get_or_init(|| {
         let mut queues = Vec::new();
         let mut threads = Vec::new();
+        let (started, ready) = channel();
         for index in 0..CONFIGURED.load(Ordering::Relaxed) {
             let (tx, rx) = channel::<AsyncMessage>();
+            let started = started.clone();
             let handle = thread::Builder::new()
                 .name(format!("arinsal-drv-async-{}", index + 1))
                 .spawn(move || {
+                    arinsal_sched::erts_msacc_init_thread("async", index + 1, false);
+                    let _ = started.send(());
                     while let Ok(message) = rx.recv() {
                         let AsyncMessage::Job(mut job) = message else {
                             break;
                         };
+                        arinsal_sched::erts_msacc_set_state(arinsal_sched::MsaccState::Port);
                         job.invoke.run();
+                        arinsal_sched::erts_msacc_set_state(arinsal_sched::MsaccState::Other);
                         // Port of erl_async.c:227 (async_reply): the issuing
                         // scheduler runs ready_async as aux work.
                         let port = job.port.clone();
@@ -100,12 +106,25 @@ fn pool() -> &'static Pool {
             queues.push(Mutex::new(tx));
             threads.push(handle);
         }
+        for _ in 0..threads.len() {
+            ready
+                .recv()
+                .expect("async thread initializes its msacc entry");
+        }
         Pool {
             queues,
             threads: Mutex::new(threads),
             stopped: Mutex::new(false),
         }
     })
+}
+
+/// Initialize the configured async pool with the emulator thread set.
+// Port of erts/emulator/beam/erl_async.c (erts_async_init), OTP-29.1.1.
+pub fn init_async_pool() {
+    if CONFIGURED.load(Ordering::Relaxed) > 0 {
+        let _ = pool();
+    }
 }
 
 impl Pool {
@@ -164,7 +183,12 @@ impl Job {
         match &self.invoke {
             Invoke::C { data, .. } => match port.driver.callbacks.ready_async {
                 Some(callback) => {
-                    call2(callback, port.data(), *data as *mut c_void);
+                    {
+                        let _msacc = arinsal_sched::erts_msacc_push_and_set_state(
+                            arinsal_sched::MsaccState::Port,
+                        );
+                        call2(callback, port.data(), *data as *mut c_void);
+                    }
                     port.add_reds(REDS_INPUT);
                     false
                 }
@@ -172,7 +196,12 @@ impl Job {
             },
             Invoke::Native(_) => {
                 if let Some(native) = &port.driver.native {
-                    native.ready_async(port);
+                    {
+                        let _msacc = arinsal_sched::erts_msacc_push_and_set_state(
+                            arinsal_sched::MsaccState::Port,
+                        );
+                        native.ready_async(port);
+                    }
                     port.add_reds(REDS_INPUT);
                 }
                 false
@@ -187,6 +216,8 @@ impl Job {
             ..
         } = &self.invoke
         {
+            let _msacc =
+                arinsal_sched::erts_msacc_push_and_set_state(arinsal_sched::MsaccState::Port);
             call1(*free, *data as *mut c_void);
         }
     }
@@ -240,7 +271,9 @@ fn submit(port: PortRef, key: Option<&mut c_uint>, invoke: Invoke) -> c_long {
         sched_id: arinsal_sched::current_normal_scheduler().unwrap_or(0),
     };
     if threads == 0 {
+        let _msacc = arinsal_sched::erts_msacc_push_and_set_state(arinsal_sched::MsaccState::Port);
         job.invoke.run();
+        drop(_msacc);
         if job.deliver() {
             job.free();
         }
@@ -271,7 +304,9 @@ fn submit(port: PortRef, key: Option<&mut c_uint>, invoke: Invoke) -> c_long {
     }
     port.host.ddll_reference(&port);
     if let Err(mut job) = pool.enqueue(queue, job) {
+        let _msacc = arinsal_sched::erts_msacc_push_and_set_state(arinsal_sched::MsaccState::Port);
         job.invoke.run();
+        drop(_msacc);
         job.ready();
         return 0;
     }

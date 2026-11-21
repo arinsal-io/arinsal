@@ -263,24 +263,21 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapProxy<'_, H> {
         writable: bool,
         overhead_words: u64,
         owner: Option<arinsal_term::OwnedBinaryRef>,
-    ) -> Result<(), TermError> {
+    ) {
         self.0
             .link_bin_ref(bin_ref, writable, overhead_words, owner)
     }
     fn add_bin_vheap(&mut self, words: u64) {
         self.0.add_bin_vheap(words)
     }
-    fn retain_writable_binary(
-        &mut self,
-        binary: Arc<arinsal_term::WritableBinary>,
-    ) -> Result<(), TermError> {
+    fn retain_writable_binary(&mut self, binary: Arc<arinsal_term::WritableBinary>) {
         self.0.retain_writable_binary(binary)
     }
     fn retain_writable_binary_with_apparent_size(
         &mut self,
         binary: Arc<arinsal_term::WritableBinary>,
         apparent_size_bits: usize,
-    ) -> Result<(), TermError> {
+    ) {
         self.0
             .retain_writable_binary_with_apparent_size(binary, apparent_size_bits)
     }
@@ -300,7 +297,7 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapProxy<'_, H> {
         &mut self,
         bin_ref: *mut u64,
         binary: Arc<arinsal_term::ExternalBinary>,
-    ) -> Result<(), TermError> {
+    ) {
         self.0.link_external_binary(bin_ref, binary)
     }
     fn supports_external_binary(&self) -> bool {
@@ -309,11 +306,7 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapProxy<'_, H> {
     fn link_node(&mut self, thing: *mut u64, node: arinsal_term::Node) {
         self.0.link_node(thing, node)
     }
-    fn link_magic_ref(
-        &mut self,
-        thing: *mut u64,
-        owner: arinsal_term::MagicBin,
-    ) -> Result<(), arinsal_term::TermError> {
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: arinsal_term::MagicBin) {
         self.0.link_magic_ref(thing, owner)
     }
     fn supports_magic(&self) -> bool {

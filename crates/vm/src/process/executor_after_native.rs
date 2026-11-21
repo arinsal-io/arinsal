@@ -139,7 +139,7 @@ pub(super) fn context_switch(
                 process.ensure_objv(
                     live + 2 + arinsal_term::S_RESERVED,
                     &mut reg.x_reg_array[..live],
-                )?;
+                );
                 if !process.heap.reserve_stack(1)
                     || !process
                         .heap
@@ -215,89 +215,6 @@ pub(super) fn context_switch(
                         }
                     }
                 }
-                return Ok(Flow::Continue);
-            }
-            if target_pc == arinsal_beamasm::dispatch::BREAKPOINT_DISPATCH_IDENTITY {
-                // Port of erts/emulator/beam/beam_bp.c (erts_generic_breakpoint),
-                // OTP-29.1.1: count, then call/meta events in the interpreter's
-                // order; the trap's CP is the native resume point.
-                let function = crate::native_function_at(resume_pc).ok_or_else(|| {
-                    VmError::Unsupported(format!(
-                        "native breakpoint resume address is unregistered: {resume_pc:#x}"
-                    ))
-                })?;
-                if process
-                    .heap
-                    .stack_get(0)
-                    .is_some_and(|word| word.tagged_word() as usize == resume_pc)
-                {
-                    process.heap.release_stack(1);
-                }
-                // The trace callbacks read every argument from the scheduler
-                // array, which is the process's X file.
-                let arity = usize::from(function.arity).min(reg.x_reg_array.len());
-                let actions = crate::trace::executor_native_call_event(
-                    &mut Vm {},
-                    process,
-                    ctx,
-                    &function,
-                    true,
-                )?;
-                crate::trace::push_native_trace_frame(
-                    process,
-                    resume_pc,
-                    &actions,
-                    &mut reg.x_reg_array[..arity],
-                )?;
-                if crate::trace_bp::debug_breakpoint_enabled(
-                    process,
-                    function.module,
-                    function.function,
-                    function.arity,
-                ) {
-                    // Port of erts/emulator/beam/jit/arm/instr_trace.cpp:90-125
-                    // (`emit_debug_bp`) and beam_common.c:1294-1345
-                    // (`call_error_handler`), OTP-29.1.1: debug breakpoints
-                    // tail-call the process-configured breakpoint handler.
-                    process.gc_live = arity;
-                    super::executor::bump_fcalls(process, 1);
-                    let called = crate::beam_common::call_error_handler(
-                        process,
-                        (function.module, function.function, arity),
-                        &mut reg.x_reg_array,
-                        "breakpoint",
-                        &mut Vm {},
-                        Some(ctx),
-                    )?;
-                    match called {
-                        crate::ImportOutcome::Dispatch => {}
-                        crate::ImportOutcome::Yield => {
-                            if process.native_pc().is_some() && native_transfer_continues(process) {
-                                return Ok(Flow::Continue);
-                            }
-                            return Ok(Flow::Break(Ok(RunState::Yield)));
-                        }
-                        crate::ImportOutcome::Returned(value) => {
-                            reg.x_reg_array[0] = value;
-                            if process.native_pc().is_none() {
-                                return Ok(Flow::Break(Ok(RunState::Done(value))));
-                            }
-                        }
-                    }
-                    return Ok(Flow::Continue);
-                }
-                process.native_continuation_resume = true;
-                // Port of erts/emulator/beam/jit/arm/instr_trace.cpp (the
-                // breakpoint stub saves the function's arguments in
-                // `c_p->arity`), OTP-29.1.1: a collection while the process
-                // is switched out, such as a delayed dirty one, roots them.
-                process.set_native_resume_arity(function.arity);
-                process.gc_live = usize::from(function.arity);
-                process.set_native_pc(Some(resume_pc));
-                // Port of erts/emulator/beam/jit/arm/instr_trace.cpp:62-95
-                // (emit_generic_bp_local), OTP-29.1.1: the breakpoint takes no reduction;
-                // the function's own `i_test_yield`, which runs when the call resumes
-                // behind the trampoline, takes the call's and yields at the budget.
                 return Ok(Flow::Continue);
             }
             if target_pc == crate::bif_traps::bif_export_trap_pc() {

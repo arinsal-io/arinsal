@@ -19,9 +19,7 @@ use super::beam_asm::{AsmError, Update, process, process_ref};
 use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
 pub use super::rt::copy_out_registers;
 
-/// `ERTS_PSFLG_EXITING`: `ERTS_PSFLG_BIT(5)`.
-// Port of erts/emulator/beam/erl_process.h (ERTS_PSFLG_BIT, ERTS_PSFLG_EXITING), OTP-29.1.1.
-pub const ERTS_PSFLG_EXITING: u32 = 1 << (6 + 5);
+pub use crate::common::process_offsets::ERTS_PSFLG_EXITING;
 
 impl BeamGlobalAssembler {
     /// The schedule-out half of `process_main` (see the module documentation): binds the

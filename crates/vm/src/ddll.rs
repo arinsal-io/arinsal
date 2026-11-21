@@ -77,8 +77,6 @@ struct Table {
     drivers: Vec<DriverRow>,
     handles: HashMap<u64, DeHandle>,
     next_handle: u64,
-    /// Handles whose `ddll_no_more_references` is scheduled.
-    pending: Vec<u64>,
 }
 
 /// A monitor message produced under the driver list lock, sent after it.
@@ -105,7 +103,6 @@ fn table() -> &'static Mutex<Table> {
                 .collect(),
             handles: HashMap::new(),
             next_handle: 1,
-            pending: Vec::new(),
         })
     })
 }
@@ -203,15 +200,34 @@ fn reference_driver(table: &mut Table, id: u64) {
     }
 }
 
-fn dereference_driver(table: &mut Table, id: u64) {
+// Port of erts/emulator/beam/erl_bif_ddll.c (erts_ddll_dereference_driver), OTP-29.1.1.
+fn schedule_no_more_references(scheduler: &Arc<Scheduler<Process>>, id: u64) {
+    scheduler.erts_schedule_misc_op(ddll_no_more_references, id as usize);
+}
+
+/// Port of erl_bif_ddll.c:1124 (ddll_no_more_references).
+fn ddll_no_more_references(id: usize) {
+    let runtime = crate::erl_init::erts_runtime().expect("runtime outlives its misc operations");
+    let scheduler = runtime
+        .scheduler_arc()
+        .expect("scheduler outlives its misc operations");
+    let mut notices = Vec::new();
+    {
+        let mut table = table().lock().unwrap();
+        no_more_references(&mut table, id as u64, &mut notices);
+    }
+    deliver(&scheduler, notices);
+}
+
+fn dereference_driver(scheduler: &Arc<Scheduler<Process>>, table: &mut Table, id: u64) {
     let handle = table.handles.get_mut(&id).expect("live handle");
     handle.refc -= 1;
     if handle.refc == 0 {
-        table.pending.push(id);
+        schedule_no_more_references(scheduler, id);
     }
 }
 
-fn dereference_all_processes(table: &mut Table, id: u64) {
+fn dereference_all_processes(scheduler: &Arc<Scheduler<Process>>, table: &mut Table, id: u64) {
     let handle = table.handles.get_mut(&id).expect("live handle");
     let mut drop = 0;
     for entry in &mut handle.procs {
@@ -221,7 +237,7 @@ fn dereference_all_processes(table: &mut Table, id: u64) {
         }
     }
     for _ in 0..drop {
-        dereference_driver(table, id);
+        dereference_driver(scheduler, table, id);
     }
 }
 
@@ -415,12 +431,6 @@ fn no_more_references(table: &mut Table, id: u64, notices: &mut Vec<Notice>) {
     }
 }
 
-fn run_pending(table: &mut Table, notices: &mut Vec<Notice>) {
-    while let Some(id) = table.pending.pop() {
-        no_more_references(table, id, notices);
-    }
-}
-
 // Port of erl_bif_ddll.c:1757-1793 (errcode_tab, build_load_error_hp).
 const ERRCODE_TAB: [(&str, i32); 9] = [
     ("no_error", arinsal_drv::ERL_DE_NO_ERROR),
@@ -571,6 +581,7 @@ pub(crate) fn try_load(
         let mut guard = table().lock().unwrap();
         let table = &mut *guard;
         let outcome = try_load_locked(
+            &scheduler,
             table,
             pid,
             &path,
@@ -586,8 +597,8 @@ pub(crate) fn try_load(
                 // The final reference/dereference pair of the BIF; a zero count
                 // schedules ddll_no_more_references after the monitor exists.
                 reference_driver(table, id);
-                dereference_driver(table, id);
-                let value = if monitor > 0 {
+                dereference_driver(&scheduler, table, id);
+                if monitor > 0 {
                     let reference = add_proc(
                         table.handles.get_mut(&id).expect("live handle"),
                         pid,
@@ -597,9 +608,7 @@ pub(crate) fn try_load(
                     Ok((ok_term, Some(reference)))
                 } else {
                     Ok((ok_term, None))
-                };
-                run_pending(table, &mut notices);
-                value
+                }
             }
             Err(error) => Err(error),
         }
@@ -622,6 +631,7 @@ pub(crate) fn try_load(
 
 #[allow(clippy::too_many_arguments)]
 fn try_load_locked(
+    scheduler: &Arc<Scheduler<Process>>,
     table: &mut Table,
     pid: Pid,
     path: &str,
@@ -684,8 +694,8 @@ fn try_load_locked(
                     return Err(soft("not_loaded_by_this_process"));
                 };
                 handle.procs.remove(old);
-                dereference_driver(table, id);
-                dereference_all_processes(table, id);
+                dereference_driver(scheduler, table, id);
+                dereference_all_processes(scheduler, table, id);
                 // Port of erl_bif_ddll.c:1475 (set_driver_reloading).
                 let handle = table.handles.get_mut(&id).expect("live handle");
                 add_proc(handle, pid, Awaiting::Loaded, true);
@@ -696,7 +706,7 @@ fn try_load_locked(
                     let handle = table.handles.get_mut(&id).expect("live handle");
                     handle.status = Status::ForceReload;
                     to_kill.extend(live_ports(handle));
-                    dereference_driver(table, id);
+                    dereference_driver(scheduler, table, id);
                 }
                 Ok((
                     id,
@@ -818,7 +828,7 @@ pub(crate) fn try_unload(
                 Some(index) => {
                     let entry = handle.procs.remove(index);
                     if !entry.dereferenced {
-                        dereference_driver(table, id);
+                        dereference_driver(&scheduler, table, id);
                     }
                 }
             }
@@ -849,10 +859,10 @@ pub(crate) fn try_unload(
                 let handle = table.handles.get_mut(&id).expect("live handle");
                 handle.status = Status::ForceUnload;
                 to_kill.extend(live_ports(handle));
-                dereference_driver(table, id);
+                dereference_driver(&scheduler, table, id);
             }
             reference_driver(table, id);
-            dereference_driver(table, id);
+            dereference_driver(&scheduler, table, id);
             let reference = (monitor > 0).then(|| {
                 add_proc(
                     table.handles.get_mut(&id).expect("live handle"),
@@ -866,10 +876,6 @@ pub(crate) fn try_unload(
     };
     // Kill ports and run the scheduled unload outside the list lock.
     kill_ports(to_kill);
-    {
-        let mut guard = table().lock().unwrap();
-        run_pending(&mut guard, &mut notices);
-    }
     deliver(&scheduler, notices);
     match result {
         Ok((ok_term, None)) => build(process, &ok_or_error("ok", ok_term)),
@@ -1130,7 +1136,7 @@ pub(crate) fn format_error(process: &mut Process, code: Term) -> Result<Term, Vm
 }
 
 /// Port of erl_bif_ddll.c:958 (erts_ddll_proc_dead).
-pub(crate) fn proc_dead(scheduler: &Scheduler<Process>, pid: Pid) {
+pub(crate) fn proc_dead(scheduler: &Arc<Scheduler<Process>>, pid: Pid) {
     let mut notices = Vec::new();
     let mut to_kill = Vec::new();
     {
@@ -1182,7 +1188,7 @@ pub(crate) fn proc_dead(scheduler: &Scheduler<Process>, pid: Pid) {
                 table.handles.get_mut(&id).expect("live handle").status = Status::Unload;
             }
             for _ in 0..derefs {
-                dereference_driver(table, id);
+                dereference_driver(scheduler, table, id);
             }
             let handle = table.handles.get_mut(&id).expect("live handle");
             if left == 0 && handle.port_count > 0 && kill {
@@ -1190,15 +1196,11 @@ pub(crate) fn proc_dead(scheduler: &Scheduler<Process>, pid: Pid) {
                 let handle = table.handles.get_mut(&id).expect("live handle");
                 handle.status = Status::ForceUnload;
                 to_kill.extend(live_ports(handle));
-                dereference_driver(table, id);
+                dereference_driver(scheduler, table, id);
             }
         }
     }
     kill_ports(to_kill);
-    {
-        let mut guard = table().lock().unwrap();
-        run_pending(&mut guard, &mut notices);
-    }
     deliver(scheduler, notices);
 }
 
@@ -1266,7 +1268,7 @@ pub(crate) fn reference_referenced(driver: &Arc<Driver>) {
 
 /// Port of erl_bif_ddll.c:1103 (erts_ddll_dereference_driver): the reference of
 /// [`reference_referenced`] ends, which may complete a pending unload.
-pub(crate) fn dereference_referenced(scheduler: &Scheduler<Process>, driver: &Arc<Driver>) {
+pub(crate) fn dereference_referenced(scheduler: &Arc<Scheduler<Process>>, driver: &Arc<Driver>) {
     port_freed(scheduler, driver);
 }
 
@@ -1319,8 +1321,7 @@ pub(crate) fn port_closed(driver: &Arc<Driver>) {
 
 /// Port of io.c:489 (erts_port_free, erts_ddll_dereference_driver): the freed port's
 /// reference to the driver handle ends.
-pub(crate) fn port_freed(scheduler: &Scheduler<Process>, driver: &Arc<Driver>) {
-    let mut notices = Vec::new();
+pub(crate) fn port_freed(scheduler: &Arc<Scheduler<Process>>, driver: &Arc<Driver>) {
     {
         let mut guard = table().lock().unwrap();
         let table = &mut *guard;
@@ -1334,10 +1335,8 @@ pub(crate) fn port_freed(scheduler: &Scheduler<Process>, driver: &Arc<Driver>) {
         let Some(id) = id else {
             return;
         };
-        dereference_driver(table, id);
-        run_pending(table, &mut notices);
+        dereference_driver(scheduler, table, id);
     }
-    deliver(scheduler, notices);
 }
 
 /// Port of erts/emulator/beam/io.c:7636 (erts_add_driver_entry): a driver added

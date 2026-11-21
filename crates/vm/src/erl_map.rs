@@ -37,7 +37,9 @@ pub extern "C" fn erts_maps_update(
     let Some(process) = crate::native_hooks::enter_runtime(c_p) else {
         return 0;
     };
-    match arinsal_maps::update(term(map), term(key), term(value), &mut process.heap) {
+    // HAlloc: the young heap, else a heap fragment; erts_maps_update never fails to allocate.
+    let mut heap = crate::ProcessHeapHandle(&mut process.heap);
+    match arinsal_maps::update(term(map), term(key), term(value), &mut heap) {
         Ok(updated) => {
             crate::raw::beam_common_ffi::write_word(result, raw(updated));
             1
@@ -57,7 +59,9 @@ pub extern "C" fn erts_maps_put(c_p: *mut ProcessHeader, key: u64, value: u64, m
     let Some(process) = crate::native_hooks::enter_runtime(c_p) else {
         return Term::NON_VALUE.tagged_word();
     };
-    match arinsal_maps::put(term(map), term(key), term(value), &mut process.heap) {
+    // HAlloc: the young heap, else a heap fragment; erts_maps_put never fails to allocate.
+    let mut heap = crate::ProcessHeapHandle(&mut process.heap);
+    match arinsal_maps::put(term(map), term(key), term(value), &mut heap) {
         Ok(updated) => raw(updated),
         Err(error) => crate::beam_common::set_map_error(process, error),
     }

@@ -4,7 +4,7 @@ use super::*;
 pub(crate) struct Runtime {
     pub(crate) statistics: crate::natives::sys::StatisticsState,
     /// The node's code indexes and their code tables.
-    pub(super) code: Arc<crate::code_ix::CodeIndexes>,
+    pub(crate) code: Arc<crate::code_ix::CodeIndexes>,
     /// Runtime-owned stable exports indexed by the target id interned with each continuation.
     /// The entry remains the indirection when a module replaces code, as in erts' export table.
     pub(super) trap_exports:
@@ -51,6 +51,12 @@ pub(crate) struct Runtime {
     pub(crate) gc_defaults: crate::natives::sys::GcDefaults,
     /// The persistent term store of the node, looked up once.
     pub(crate) persistent_terms: &'static arinsal_pterm::Store,
+    /// `thr_prog_op` of erl_bif_persistent.c: the later-op node of a table update.
+    pub(crate) persistent_term_later_op: arinsal_sched::ErtsThrPrgrLaterOp,
+    /// Pid `table_updater` resumes after thread progress.
+    pub(crate) persistent_term_resume_pid: std::sync::atomic::AtomicU64,
+    /// Owner word `table_updater` passes to `release_update_permission`.
+    pub(crate) persistent_term_resume_owner: std::sync::atomic::AtomicU64,
     /// Multi-scheduling block state of this runtime.
     pub(crate) multi_scheduling: Mutex<MultiScheduling>,
 }
@@ -429,13 +435,15 @@ impl Runtime {
         if self.suspend_active(pid) {
             return "suspended";
         }
-        match self
-            .scheduler()
-            .ok()
-            .and_then(|scheduler| scheduler.is_active(pid))
+        if state
+            & (arinsal_sched::psflg::ACTIVE
+                | arinsal_sched::psflg::ACTIVE_SYS
+                | arinsal_sched::psflg::DIRTY_ACTIVE_SYS)
+            != 0
         {
-            Some(false) => "waiting",
-            Some(true) | None => "runnable",
+            "runnable"
+        } else {
+            "waiting"
         }
     }
 }

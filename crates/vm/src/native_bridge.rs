@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn perf_map_file() -> &'static Mutex<Option<File>> {
     static FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
@@ -540,11 +540,6 @@ fn function_in(range: &ModuleRange, address: usize) -> Option<&NativeFunction> {
     lookup_function_info(range, address, false).mfa
 }
 
-fn native_generation() -> &'static AtomicU64 {
-    static GENERATION: AtomicU64 = AtomicU64::new(0);
-    &GENERATION
-}
-
 /// Port of erts/emulator/beam/beam_catches.c:146 (`beam_catches_car`), OTP-29.1.1.
 /// Indexes `bccix[erts_active_code_ix()]`. The active index is the node's atomic.
 fn catch_slot(index: u32) -> Option<usize> {
@@ -571,20 +566,22 @@ pub(crate) struct LocatedCatch {
     /// Stack index `E` resumes at: the catching frame's first Y slot.
     resume: usize,
     target: usize,
-    /// An exception-trace frame sits above the catch. The scheduler unwind emits
-    /// `exception_from` for those frames; the native resolver leaves them to it.
-    /// Word-sized on purpose: a trailing `bool` made the compiler move this struct with
-    /// overlapping sub-word copies, which stall on store-to-load forwarding at ~25 ns a raise.
+}
+
+/// What `next_catch`'s walk found: the catch, if any, and whether trace frames lie above it
+/// (on the whole stack when there is no catch). Word-sized on purpose: a trailing `bool` made
+/// the compiler move this struct with overlapping sub-word copies, which stall on
+/// store-to-load forwarding at ~25 ns a raise.
+#[derive(Clone, Copy)]
+struct CatchScan {
+    found: Option<LocatedCatch>,
     traced: usize,
 }
 
 /// Port of erts/emulator/beam/beam_common.c:580-648 (`next_catch` up to `found_catch`),
 /// OTP-29.1.1. The scan only reads the stack and the active catch table. It does not move
-/// `stop`, so a miss leaves the scheduler's unwind the same stack erts would walk.
-fn locate_catch(process: &mut Process) -> Option<LocatedCatch> {
-    if process.heap.abi.catches == 0 {
-        return None;
-    }
+/// `stop`.
+fn locate_catch(process: &mut Process) -> CatchScan {
     let heap = &process.heap;
     // Port of erts/emulator/beam/beam_catches.c:146-154 (`beam_catches_car` reads
     // `bccix[erts_active_code_ix()]`), OTP-29.1.1: the slot is read directly, a raise allocates
@@ -595,17 +592,16 @@ fn locate_catch(process: &mut Process) -> Option<LocatedCatch> {
     scan_catch(heap, crate::code_ix::global())
 }
 
-fn scan_catch(
-    heap: &arinsal_term::ProcessHeap,
-    code: &crate::code_ix::CodeIndexes,
-) -> Option<LocatedCatch> {
+fn scan_catch(heap: &arinsal_term::ProcessHeap, code: &crate::code_ix::CodeIndexes) -> CatchScan {
     let mut stack = heap.stack_terms().enumerate();
     let mut previous_cp = 0usize;
     let mut seen_cp = false;
     let mut traced = 0usize;
+    let catches = heap.abi.catches != 0;
     while let Some((index, word)) = stack.next() {
         let raw = word.tagged_word();
-        if raw & 63 == 0x1b
+        if catches
+            && raw & 63 == 0x1b
             && let Some(catch_index) = u32::try_from(raw >> 6).ok()
             && let Some(target) = crate::beam_catches::beam_catches_car(code, catch_index)
         {
@@ -618,17 +614,19 @@ fn scan_catch(
             } else {
                 0
             };
-            return Some(LocatedCatch {
-                index,
-                resume,
-                target,
+            return CatchScan {
+                found: Some(LocatedCatch {
+                    index,
+                    resume,
+                    target,
+                }),
                 traced,
-            });
+            };
         }
         // Port of erl_term.h:1378-1379 (`is_CP`), OTP-29.1.1.
         if arinsal_term::is_cp(raw) {
             // Port of erts/emulator/beam/beam_common.c:604-635 (next_catch), OTP-29.1.1: a
-            // trace frame is a CP followed by its data words. Its events need the scheduler.
+            // trace frame is a CP followed by its data words.
             if let Some(kind) = crate::trace::TraceFrameKind::of(raw as usize) {
                 traced = 1;
                 previous_cp = index;
@@ -647,15 +645,17 @@ fn scan_catch(
             }
         }
     }
-    None
+    CatchScan {
+        found: None,
+        traced,
+    }
 }
 
 /// Port of erts/emulator/beam/beam_common.c:532-678 (`handle_error` once the trace is saved,
-/// `next_catch`, `found_catch`), OTP-29.1.1, for the native resolver: one scan of the stack,
-/// then `found_catch` writes the catch word, `stop`, x0..x3 and the failure words. Returns the
-/// native handler the fragment branches to. `None` leaves the stack unmoved for the scheduler:
-/// no catch, or an exception-trace frame above the catch, which
-/// erts reports from `next_catch` and Arinsal from the scheduler unwind (`exception_from`).
+/// `next_catch`, `found_catch`), OTP-29.1.1: one scan of the stack; the trace frames it
+/// passes report their exception events (`next_catch`), then `found_catch` writes the catch
+/// word, `stop`, x0..x3 and the failure words. Returns the native handler, or `None` when the
+/// stack has no catch and `handle_error` terminates the process.
 #[inline]
 pub(crate) fn native_found_catch(
     process: &mut Process,
@@ -664,13 +664,96 @@ pub(crate) fn native_found_catch(
     reason: Term,
     trace: Term,
 ) -> Option<usize> {
-    let found = locate_catch(process)?;
-    let handler = found.target;
-    if found.traced != 0 {
+    // Port of erts/emulator/beam/beam_common.c:529-530 (handle_error: `(c_p->catches > 0 ||
+    // c_p->return_trace_frames > 0) && !(c_p->freason & EXF_PANIC)`), OTP-29.1.1.
+    if (process.heap.abi.catches == 0 && process.return_trace_frames == 0)
+        || process.heap.abi.exc.freason & arinsal_term::exc::EXF_PANIC != 0
+    {
         return None;
     }
+    let scan = locate_catch(process);
+    if scan.traced != 0 {
+        next_catch_trace(process, class, reason, scan.found);
+    }
+    let Some(found) = scan.found else {
+        // Port of erts/emulator/beam/beam_common.c:568 (handle_error), OTP-29.1.1.
+        assert!(process.heap.abi.catches == 0, "Catch not found");
+        return None;
+    };
     found_catch(process, reg, found, class, reason, trace);
-    Some(handler)
+    Some(found.target)
+}
+
+/// The trace part of `next_catch`: every exception_trace frame between the stack top and the
+/// catch (the whole stack without one) reports `exception_from`, a plain return_trace frame
+/// is released, and the sessions of the return_to frames passed give the catching function
+/// its `return_to` event.
+// Port of erts/emulator/beam/beam_common.c:600-640 (next_catch: erts_trace_exception for
+// exception_trace frames, return_trace_frames--, return_to marking), OTP-29.1.1.
+#[inline(never)]
+fn next_catch_trace(
+    process: &mut Process,
+    class: arinsal_bifs::Class,
+    reason: Term,
+    found: Option<LocatedCatch>,
+) {
+    let upto = found.map_or(process.heap.stack_words(), |found| found.index);
+    arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
+        arinsal_sched::RunCtx::with_current(esdp, |ctx| -> Result<(), VmError> {
+            let vm = &mut Vm {};
+            let mut sessions: Vec<u64> = process
+                .cold
+                .as_mut()
+                .map(|cold| std::mem::take(&mut cold.bif_return_to))
+                .unwrap_or_default();
+            let mut index = 0;
+            while index < upto {
+                let Some((frame, frame_words)) = crate::trace::trace_frame_at(&process.heap, index)
+                else {
+                    index += 1;
+                    continue;
+                };
+                match frame {
+                    crate::trace::TraceFrame::Return {
+                        exception: true,
+                        function_pc,
+                        session,
+                    } => {
+                        let class_reason = exceptions::trace_class_reason(process, class, reason)?;
+                        crate::trace::native_return_event(
+                            vm,
+                            process,
+                            ctx,
+                            function_pc,
+                            session,
+                            class_reason,
+                            true,
+                        )?;
+                    }
+                    crate::trace::TraceFrame::Return { session, .. } => {
+                        crate::trace::release_return_frame(process, session);
+                    }
+                    crate::trace::TraceFrame::ReturnTo { session } => sessions.push(session),
+                    crate::trace::TraceFrame::CallAcc => {}
+                }
+                index += frame_words;
+            }
+            if let Some(found) = found {
+                let target = crate::native_function_at(found.target).map(|function| {
+                    (
+                        function.module.to_owned(),
+                        function.function.to_owned(),
+                        function.arity,
+                    )
+                });
+                crate::trace::unwound_return_to(vm, process, ctx, &sessions, target)?;
+            }
+            Ok(())
+        })
+    })
+    .flatten()
+    .expect("next_catch runs in the process's slice")
+    .expect("next_catch: exception trace event");
 }
 
 fn exception_class_atom(class: arinsal_bifs::Class) -> Term {
@@ -691,8 +774,8 @@ pub(crate) fn next_catch(
     reason: Term,
     trace: Term,
 ) -> Option<usize> {
-    let found = locate_catch(process)?;
-    // The scheduler resumes the handler through `run_native`; the native resolver branches to
+    let found = locate_catch(process).found?;
+    // The scheduler resumes the handler through `native_prepare`; the native resolver branches to
     // it directly, so these Rust-side resume records are this caller's, not `found_catch`'s.
     process.exc_class = Some(class);
     found_catch(process, reg, found, class, reason, trace);
@@ -724,10 +807,11 @@ fn found_catch(
     reg[1] = reason;
     reg[2] = trace;
     reg[3] = exception_class_atom(class);
-    // handle_error clears `fvalue` and `ftrace` once the catch registers own them. Arinsal
-    // also clears `freason`: its native exits read a nonzero `freason` as a pending failure.
+    // handle_error has already set `c_p->freason = PRIMARY_EXCEPTION(..)` and `c_p->fvalue =
+    // NIL`, and keeps freason (beam_common.c:521-565). Arinsal still clears it
+    // (FREASON-TEST-1): bs_construct.rs:716, bs_fast.rs:964, module.rs:2403 and dispatch.rs:1829
+    // test a nonzero `freason` after their runtime calls.
     process.heap.abi.exc.freason = 0;
-    process.heap.abi.exc.fvalue = Term::NIL.tagged_word();
     process.heap.abi.exc.ftrace = 0;
 }
 
@@ -776,7 +860,6 @@ pub fn register_native_function(info: NativeFunction) -> Result<(), &'static str
         );
     }
     publish_native_module_range(range);
-    native_generation().fetch_add(1, Ordering::Release);
     Ok(())
 }
 
@@ -813,7 +896,6 @@ pub(crate) fn register_native_module(
         functions.iter().for_each(update_perf_map);
     }
     publish_native_module_range(range);
-    native_generation().fetch_add(1, Ordering::Release);
     Ok(())
 }
 
@@ -823,11 +905,6 @@ pub(crate) fn unregister_native_module(code_start: usize, code_end: usize) {
     remove_global_ranges(|range| range.start == code_start && range.end() == code_end);
     arinsal_term::unregister_native_code_range(code_start, code_end);
     unpublish_native_module_range(code_start, code_end);
-    native_generation().fetch_add(1, Ordering::Release);
-}
-
-pub(crate) fn native_registry_generation() -> u64 {
-    native_generation().load(Ordering::Acquire)
 }
 
 /// Runtime hook for native code to raise a BEAM exception through the scheduler.
@@ -896,16 +973,85 @@ fn native_frame_at(address: usize) -> Option<NativeStackFrame> {
     frame_in(&all_ranges().load(), address, &HINT)
 }
 
-/// Enter one native function and commit its ABI state before returning to the scheduler.
-///
-/// `CallUnported` returns to the scheduler with the interpreter target in `process.ip()`;
-/// a later native continuation is resumed by calling this function at its saved PC.
-// Port of erts/emulator/beam/jit/arm/process_main.cpp:235-317, OTP-29.1.1
-pub fn run_native(
+/// The native entry [`native_prepare`] set up: what [`native_exit`] needs once the native
+/// code returns to the scheduler loop.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeEntry {
+    /// `c_p->i` the process is entered at.
+    pub(crate) code_address: usize,
+    /// The debug knobs read once for this entry.
+    debug: u8,
+}
+
+/// Set up the entry at `code_address`: everything process_main does between `erts_schedule`
+/// returning and `jmp c_p->i` (copy_in_registers, the heap invariant, `c_p->i`/`c_p->arity`).
+/// A native continuation (`native_arity_set`) with no debug knob set needs no registry
+/// lookup, entry-return peek or bridge registration; a function entry does.
+// Port of erts/emulator/beam/jit/x86/process_main.cpp:265-300 and
+// jit/arm/process_main.cpp:235-317 (copy_in_registers, `br c_p->i`), OTP-29.1.1.
+#[inline(always)]
+pub(crate) fn native_prepare(
     process: &mut Process,
     registers: &mut SchedulerRegisters,
     code_address: usize,
-) -> Result<ExitReason, VmError> {
+) -> Result<NativeEntry, VmError> {
+    let debug = crate::debug_env::slice::get();
+    if !crate::debug_env::slice::plain_entry(debug)
+        || !process.native_continuation_resume
+        || !process.native_arity_set
+    {
+        return native_prepare_entry(process, registers, code_address);
+    }
+    process.native_continuation_resume = false;
+    process.native_arity_set = false;
+    process.native_error_pc = 0;
+    registers.tmp_mem[6] = 0;
+    let arity = process.heap.abi.arity;
+    process.heap.arm_native_redzone();
+    let objv = registers
+        .x_reg_array
+        .get_mut(..usize::from(arity))
+        .ok_or_else(|| VmError::Unsupported("live X register count".into()))?;
+    process.ensure_entry(0, objv);
+    registers.entry_return = 0;
+    process.clear_native_resume();
+    process.heap.abi.i = code_address as *const std::ffi::c_void;
+    process.heap.abi.arity = arity;
+    registers.tmp_mem[3] = 0;
+    process.heap.set_native_allocation(true);
+    Ok(NativeEntry {
+        code_address,
+        debug,
+    })
+}
+
+/// Enter native code at the prepared `c_p->i`; returns when the native code leaves to the
+/// scheduler loop.
+// Port of erts/emulator/beam/jit/x86/process_main.cpp:300 (`jmp c_p->i`), OTP-29.1.1.
+#[inline(always)]
+pub(crate) fn native_enter(
+    process: &mut Process,
+    registers: &mut SchedulerRegisters,
+    entry: &NativeEntry,
+) -> ExitReason {
+    // SAFETY: native_prepare checked that the address is a registered executable function
+    // using the BeamAsm ABI (or a continuation inside one) and set up its entry state.
+    unsafe {
+        arinsal_beamasm::enter_native_raw(
+            &mut process.heap.abi,
+            registers,
+            entry.code_address as *const std::ffi::c_void,
+        )
+    }
+}
+
+/// [`native_prepare`] for a function entry or a debug-knob run.
+// Port of erts/emulator/beam/jit/arm/process_main.cpp:235-317, OTP-29.1.1
+fn native_prepare_entry(
+    process: &mut Process,
+    registers: &mut SchedulerRegisters,
+    code_address: usize,
+) -> Result<NativeEntry, VmError> {
     debug_assert!(
         process.x.is_attached(),
         "native code runs on the scheduler's X array: attach the registers first"
@@ -969,7 +1115,7 @@ pub fn run_native(
         .x_reg_array
         .get_mut(..live)
         .ok_or_else(|| VmError::Unsupported("live X register count".into()))?;
-    process.ensure_entry(0, objv)?;
+    process.ensure_entry(0, objv);
     // Port of erts/emulator/beam/jit/arm/instr_call.cpp:256-261 (emit_i_apply_only),
     // OTP-29.1.1: a call the scheduler performs for native code (fun/apply, BIF traps,
     // breakpoint handlers) pops the caller's continuation into LR, so the callee's frame
@@ -1010,30 +1156,42 @@ pub fn run_native(
             crate::beamasm_integration::owns_native_address(code_address)
         );
     }
-    // Native hooks add their thread-local context setup here; keep this bridge
-    // entry call structurally isolated from that setup.
-    // SAFETY: The caller supplies a registered executable function using the BeamAsm ABI.
-    let exit =
-        unsafe { arinsal_beamasm::enter_native_raw(&mut process.heap.abi, registers, code_ptr) };
-    process.heap.set_native_allocation(false);
-    native_exit(process, registers, code_address, code_ptr, exit, debug)
+    Ok(NativeEntry {
+        code_address,
+        debug,
+    })
+}
+
+/// Whether `erts_do_exit_process` ran in this slice (handle_error's terminate_proc): the exit
+/// yielded with `p->u.terminate` set, or the process is FREE in `p->state`.
+fn terminated_in_slice(process: &mut Process) -> bool {
+    process.has_exit_cont()
+        || arinsal_sched::erts_proc_sched_data(process, |_, esdp| {
+            arinsal_sched::RunCtx::with_current(esdp, |ctx| {
+                ctx.proc_state().load(Ordering::Acquire) & arinsal_sched::psflg::FREE != 0
+            })
+        })
+        .flatten()
+        .unwrap_or(false)
 }
 
 /// Leaves native code: classifies the exit, raises the exception it carries, or sets the
 /// continuation the process resumes at.
 // Port of erts/emulator/beam/jit/arm/process_main.cpp (the code after a native call returns
 // to `process_main`) and beam_common.c (handle_error), OTP-29.1.1.
-fn native_exit(
+pub(crate) fn native_exit(
     process: &mut Process,
     registers: &mut SchedulerRegisters,
-    code_address: usize,
-    code_ptr: *const std::ffi::c_void,
+    entry: NativeEntry,
     exit: ExitReason,
-    debug: u8,
 ) -> Result<ExitReason, VmError> {
+    let NativeEntry {
+        code_address,
+        debug,
+    } = entry;
+    process.heap.set_native_allocation(false);
     let return_trace = debug & crate::debug_env::slice::RETURN_TRACE != 0;
     let exception_trace = debug & crate::debug_env::slice::EXCEPTION_TRACE != 0;
-    let native_ftrace = process.heap.abi.exc.ftrace;
     if exception_trace {
         let (base, end) = process.heap.heap_bounds();
         let (_, current_stop) = process.heap.heap_cursor();
@@ -1061,7 +1219,9 @@ fn native_exit(
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:533-540, OTP-29.1.1.
     // A VM-backed light BIF leaves TRAP for the scheduler when it exits native code.
     // A call handed to the scheduler keeps its call site too, for a BIF that raises there.
-    if process.heap.abi.exc.freason != 0 || matches!(exit, ExitReason::CallUnported { .. }) {
+    if process.heap.abi.exc.freason == arinsal_term::exc::TRAP
+        || matches!(exit, ExitReason::CallUnported { .. })
+    {
         process.native_error_pc = registers.tmp_mem[6] as usize;
     }
     if process.heap.abi.exc.freason != 0
@@ -1082,148 +1242,19 @@ fn native_exit(
             ))
         );
     }
-    // Port of erts/emulator/beam/beam_common.c (handle_error), OTP-29.1.1:
-    // save the raw trace before reducing the failure state to its primary class or clearing it.
     // TRAP is not an exception class: erts' bif/nif epilogue (jit/arm/instr_bif.cpp:676-700,
     // emit_bif_nif_epilogue) only uses it to pick the context switch, and nothing reads it
-    // after `context_switch_simplified`, so a trap that yields here never reaches handle_error.
-    let trapped_bif = process.heap.abi.exc.freason == 1 << 10;
-    if trapped_bif {
+    // after `context_switch_simplified`.
+    if process.heap.abi.exc.freason == arinsal_term::exc::TRAP {
         process.heap.abi.exc.freason = 0;
-    } else if process.heap.abi.exc.freason == arinsal_term::exc::EXC_FUNCTION_CLAUSE {
-        // Port of erts/emulator/beam/beam_common.c (save_stacktrace, EXC_FUNCTION_CLAUSE):
-        // the top frame carries c_p->current and the argument registers; the pc is ignored.
-        // raw_raise marks its serialized trace locationless on rethrow.
-        let (module, function, arity) =
-            crate::raw::beam_common_ffi::code_mfa(process.heap.abi.current as usize as u64)
-                .ok_or_else(|| {
-                    VmError::Unsupported(format!(
-                        "function_clause current MFA at {:#x}",
-                        process.heap.abi.current as usize
-                    ))
-                })?;
-        let arity = u8::try_from(arity)
-            .map_err(|_| VmError::Unsupported("function_clause arity exceeds u8".into()))?;
-        let arity_usize = usize::from(arity);
-        let args = registers.x_reg_array[..arity_usize].to_vec();
-        if exception_trace {
-            eprintln!(
-                "native function_clause in {:?} args={:?}",
-                Some(format!(
-                    "{}:{}/{}",
-                    arinsal_term::global_atoms().text(module).unwrap_or("?"),
-                    arinsal_term::global_atoms().text(function).unwrap_or("?"),
-                    arity_usize
-                )),
-                args.iter()
-                    .map(|arg| format!("{:#x}", arg.tagged_word()))
-                    .collect::<Vec<_>>()
-            );
-        }
-        let args = arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
-            .list_from_iter(args)
-            .map_err(|error| VmError::Unsupported(format!("function_clause args {error:?}")))?;
-        let reason = crate::native_helpers::expand_error_value(process)
-            .ok_or_else(|| VmError::Unsupported("function_clause reason".into()))?;
-        let mut trap = exceptions::native_trap(
-            arinsal_beamasm::exc::EXC_ERROR,
-            crate::native_hooks::raw(reason),
-        )?;
-        trap.top = Some(crate::stacktrace::TopFrame::CurrentArgsNoLocation {
-            module,
-            function,
-            arity,
-            args,
-        });
-        return Err(VmError::Trap(trap));
-    } else if process.heap.abi.exc.freason & arinsal_beamasm::exc::EXF_ARGLIST != 0
-        && process.heap.abi.exc.ftrace != 0
-    {
-        // `raise/3` with an immediate stacktrace left everything in the failure words; for
-        // error/2,3 (EXC_ERROR_2/3) handle_error first unpacks `{Reason, Args[, Info]}`.
-        let freason = process.heap.abi.exc.freason;
-        let reason = if crate::native_helpers::is_error_arglist(process, 0, freason)
-            && let Some((reason, _args)) =
-                crate::native_helpers::unpack_error_arglist(process, freason)
-        {
-            reason
-        } else {
-            crate::native_hooks::from_raw(process.heap.abi.exc.fvalue)
-        };
-        let trace = crate::native_hooks::from_raw(process.heap.abi.exc.ftrace);
-        process.heap.abi.exc.ftrace = 0;
-        let class =
-            crate::stacktrace::class_from_freason(freason).unwrap_or(arinsal_bifs::Class::Error);
-        return Err(exceptions::raise_from_ftrace(process, class, reason, trace));
-    } else if process.heap.abi.exc.freason != 0
-        && process.heap.abi.exc.freason & arinsal_beamasm::exc::EXF_SAVETRACE != 0
-        && process.heap.abi.exc.ftrace != 0
-    {
-        let freason = process.heap.abi.exc.freason;
-        let trace = crate::native_hooks::from_raw(process.heap.abi.exc.ftrace);
-        let reason = crate::native_helpers::expand_error_value(process)
-            .unwrap_or_else(|| crate::native_hooks::from_raw(process.heap.abi.exc.fvalue));
-        process.heap.abi.exc.ftrace = 0;
-        process.heap.abi.exc.fvalue = 0;
-        let class =
-            crate::stacktrace::class_from_freason(freason).unwrap_or(arinsal_bifs::Class::Error);
-        return Err(exceptions::raise_from_ftrace(process, class, reason, trace));
-    } else if process.heap.abi.exc.freason != 0
-        && arinsal_term::exc::primary_exception(process.heap.abi.exc.freason)
-            == process.heap.abi.exc.freason & !arinsal_beamasm::exc::EXF_RESTORE_NFUNC
-        && native_ftrace != 0
-    {
-        // Port of erts/emulator/beam/beam_common.c (`handle_error`), OTP-29.1.1:
-        // `raw_raise` and `i_raise` retain primary freason bits and the saved trace.
-        let freason = process.heap.abi.exc.freason;
-        let reason = crate::native_hooks::from_raw(process.heap.abi.exc.fvalue);
-        let trace = crate::native_hooks::from_raw(native_ftrace);
-        process.heap.abi.exc.freason = 0;
-        process.heap.abi.exc.ftrace = 0;
-        let class =
-            crate::stacktrace::class_from_freason(freason).unwrap_or(arinsal_bifs::Class::Error);
-        return Err(exceptions::raise_from_ftrace(process, class, reason, trace));
-    } else if process.heap.abi.exc.freason > 3 && process.heap.abi.exc.freason & 0x3ff == 0x50 {
-        // Port of erts/emulator/beam/beam_common.c:742-775 (expand_error_value), OTP-29.1.1.
-        let index = process.heap.abi.exc.freason >> 10;
-        let Some(reason) = crate::native_helpers::expand_error_value(process) else {
-            return Err(VmError::Unsupported(format!(
-                "native exception index {index}"
-            )));
-        };
-        process.heap.abi.exc.freason = 0;
-        return Err(VmError::Trap(exceptions::native_trap(
-            arinsal_beamasm::exc::EXC_ERROR,
-            crate::native_hooks::raw(reason),
-        )?));
-    } else if process.heap.abi.exc.freason != 0 {
-        let class = process.heap.abi.exc.freason;
-        let has_ext_info = class & arinsal_beamasm::exc::EXF_HAS_EXT_INFO != 0;
-        let arglist = if crate::native_helpers::is_error_arglist(process, 0, class) {
-            crate::native_helpers::unpack_error_arglist(process, class)
-        } else {
-            None
-        };
-        let info = crate::native_hooks::from_raw(process.heap.abi.exc.fvalue);
-        let reason = if let Some((reason, _args)) = arglist {
-            reason
-        } else if has_ext_info {
-            crate::native_helpers::expand_error_value(process)
-                .ok_or_else(|| VmError::Unsupported("native error_info reason".into()))?
-        } else {
-            info
-        };
-        let mut trap = exceptions::native_trap(class, crate::native_hooks::raw(reason))?;
-        if let Some((_reason, args)) = arglist {
-            trap.top = Some(if has_ext_info {
-                crate::stacktrace::TopFrame::CurrentArgsInfoTerm(Some(args), info)
-            } else {
-                crate::stacktrace::TopFrame::CurrentArgs(args)
-            });
-        } else if has_ext_info && info.classify() == arinsal_term::TermKind::Map {
-            trap.top = Some(crate::stacktrace::TopFrame::CurrentArgsInfoTerm(None, info));
-        }
-        return Err(VmError::Trap(trap));
+    }
+    // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:304-385 (process_exit /
+    // raise_exception_shared), OTP-29.1.1: every raise in generated code calls handle_error,
+    // which branches to the catch or terminates the process in place and returns NULL; the
+    // code then goes to `do_schedule`. A failure word left nonzero here is the
+    // PRIMARY_EXCEPTION a caught exception keeps, not a pending failure.
+    if terminated_in_slice(process) {
+        return Err(VmError::Yield);
     }
     let outcome = match exit {
         ExitReason::CallUnported { .. } => {
@@ -1245,11 +1276,7 @@ fn native_exit(
                 // The yield site stored its live X register count in `c_p->arity`.
                 process.native_arity_set = true;
                 process.gc_live = usize::from(process.heap.abi.arity);
-                process.set_native_pc(Some(if resume == 0 {
-                    code_ptr as usize
-                } else {
-                    resume
-                }));
+                process.set_native_pc(Some(if resume == 0 { code_address } else { resume }));
                 ExitReason::Yield
             }
         }
@@ -1263,51 +1290,6 @@ fn native_exit(
         }
     };
     Ok(outcome)
-}
-
-/// [`run_native`] for the slice fast path: a native continuation (`native_arity_set`) with no
-/// debug knob set. The registry lookup, the entry-return peek and the bridge registration
-/// belong to function entries and to the first native call of the process; a continuation
-/// has none of them.
-// Port of erts/emulator/beam/jit/arm/process_main.cpp (process_main: copy_in_registers and
-// `br c_p->i`, no per-entry bookkeeping), OTP-29.1.1.
-// Inlined into the scheduler's slice: see `Executor::run`.
-#[inline(always)]
-pub fn run_native_resume(
-    process: &mut Process,
-    registers: &mut SchedulerRegisters,
-    code_address: usize,
-) -> Result<ExitReason, VmError> {
-    let debug = crate::debug_env::slice::get();
-    if !crate::debug_env::slice::plain_entry(debug)
-        || !process.native_continuation_resume
-        || !process.native_arity_set
-    {
-        return run_native(process, registers, code_address);
-    }
-    process.native_continuation_resume = false;
-    process.native_arity_set = false;
-    process.native_error_pc = 0;
-    registers.tmp_mem[6] = 0;
-    let arity = process.heap.abi.arity;
-    process.heap.arm_native_redzone();
-    let objv = registers
-        .x_reg_array
-        .get_mut(..usize::from(arity))
-        .ok_or_else(|| VmError::Unsupported("live X register count".into()))?;
-    process.ensure_entry(0, objv)?;
-    registers.entry_return = 0;
-    let code_ptr = code_address as *const std::ffi::c_void;
-    process.clear_native_resume();
-    process.heap.abi.i = code_ptr;
-    process.heap.abi.arity = arity;
-    registers.tmp_mem[3] = 0;
-    process.heap.set_native_allocation(true);
-    // SAFETY: The caller supplies a registered executable function using the BeamAsm ABI.
-    let exit =
-        unsafe { arinsal_beamasm::enter_native_raw(&mut process.heap.abi, registers, code_ptr) };
-    process.heap.set_native_allocation(false);
-    native_exit(process, registers, code_address, code_ptr, exit, debug)
 }
 
 /// `ARINSAL_BEAMASM_RETURN_TRACE`: log native entries and exits.

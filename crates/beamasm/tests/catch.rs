@@ -9,13 +9,33 @@ use arinsal_beamasm::{
 };
 use similar_asserts::assert_eq;
 
+/// The process native code runs on: the native prefix at `c_p` and the `ERTS_PSFLG_*` word
+/// at `offsetof(Process, state)`, which the garbage-collection fragment reads.
+#[repr(C)]
+struct TestProcess {
+    header: ProcessHeader,
+    state: u32,
+}
+
+const STATE_OFFSET: u32 = std::mem::offset_of!(TestProcess, state) as u32;
+
 extern "C" fn raise_class_for_test(_header: *mut ProcessHeader, trace: u64, _value: u64) -> u64 {
     trace
 }
 use arinsal_term::{ProcessHeap, Term, TermBuilder, global_atoms};
 
-extern "C" fn gc_stub(_: *mut ProcessHeader, _: *mut u64, _: usize, _: usize, _: i32) -> i32 {
+/// `erts_garbage_collect_nobump` of these cases: the heap always has room.
+extern "C" fn gc_stub(_: *mut ProcessHeader, _: usize, _: *mut u64, _: i32, _: i32) -> i32 {
     0
+}
+
+/// The process-wide fragments (`ga`), built once as the VM builds them.
+fn yield_entries() -> arinsal_beamasm::yield_frag::YieldEntries {
+    use arinsal_beamasm::yield_frag::YieldFragments;
+    static FRAGMENTS: std::sync::OnceLock<YieldFragments> = std::sync::OnceLock::new();
+    FRAGMENTS
+        .get_or_init(|| YieldFragments::new(gc_stub as *const () as usize, STATE_OFFSET).unwrap())
+        .entries()
 }
 
 extern "C" fn add_stacktrace_stub(_: *mut ProcessHeader, reason: u64, _: u64) -> u64 {
@@ -71,26 +91,37 @@ fn execute(
     let module = asm.finalize().expect("module finalize");
     let mut heap = [0u64; 64];
     let mut stack = [0u64; 64];
-    let mut header = ProcessHeader {
-        htop: heap.as_mut_ptr(),
-        heap: heap.as_mut_ptr(),
-        hend: heap.as_mut_ptr().wrapping_add(heap.len()),
-        stop: stack.as_mut_ptr().wrapping_add(stack.len()),
-        fcalls: 100,
-        ..ProcessHeader::default()
+    let mut process = TestProcess {
+        header: ProcessHeader {
+            htop: heap.as_mut_ptr(),
+            heap: heap.as_mut_ptr(),
+            hend: heap.as_mut_ptr().wrapping_add(heap.len()),
+            stop: stack.as_mut_ptr().wrapping_add(stack.len()),
+            fcalls: 100,
+            ..ProcessHeader::default()
+        },
+        state: 0,
     };
     let mut regs = SchedulerRegisters::default();
     #[cfg(target_arch = "aarch64")]
     assert_eq!(
-        enter_native(&mut header, &mut regs, &module.entry(label).unwrap()),
+        enter_native(
+            &mut process.header,
+            &mut regs,
+            &module.entry(label).unwrap()
+        ),
         ExitReason::Returned
     );
     #[cfg(not(target_arch = "aarch64"))]
     assert_eq!(
-        enter_native(&mut header, &mut regs, &module.entry(label).unwrap()),
+        enter_native(
+            &mut process.header,
+            &mut regs,
+            &module.entry(label).unwrap()
+        ),
         ExitReason::Unsupported
     );
-    (module, header, regs, stack)
+    (module, process.header, regs, stack)
 }
 
 fn finish(asm: &mut BeamModuleAssembler) {
@@ -104,10 +135,11 @@ fn finish(asm: &mut BeamModuleAssembler) {
 #[test]
 fn native_catch() {
     let mut asm = BeamModuleAssembler::new();
+    asm.set_yield_fragments(yield_entries());
     asm.emit_i_func_label(1).unwrap();
     asm.allocate(3, 0).unwrap();
     asm.emit_catch(ArgVal::Y(0), 2).unwrap();
-    asm.emit_catch_end(ArgVal::Y(0), gc_stub, add_stacktrace_stub)
+    asm.emit_catch_end(ArgVal::Y(0), add_stacktrace_stub)
         .unwrap();
     asm.deallocate(3).unwrap();
     finish(&mut asm);
@@ -121,6 +153,7 @@ fn native_catch() {
 #[test]
 fn native_try_catches_throw_and_returns_catch_value() {
     let mut asm = BeamModuleAssembler::new();
+    asm.set_yield_fragments(yield_entries());
     asm.emit_i_func_label(1).unwrap();
     asm.allocate(3, 0).unwrap();
     asm.emit_try(ArgVal::Y(0), 2).unwrap();
@@ -138,30 +171,34 @@ fn native_try_catches_throw_and_returns_catch_value() {
     let module = asm.finalize().unwrap();
     let mut heap = [0u64; 64];
     let mut stack = [0u64; 64];
-    let mut header = ProcessHeader {
-        htop: heap.as_mut_ptr(),
-        heap: heap.as_mut_ptr(),
-        hend: heap.as_mut_ptr().wrapping_add(heap.len()),
-        stop: stack.as_mut_ptr().wrapping_add(stack.len()),
-        self_pid: module.entries[&2] as usize as u64,
-        fcalls: 100,
-        ..ProcessHeader::default()
+    let mut process = TestProcess {
+        header: ProcessHeader {
+            htop: heap.as_mut_ptr(),
+            heap: heap.as_mut_ptr(),
+            hend: heap.as_mut_ptr().wrapping_add(heap.len()),
+            stop: stack.as_mut_ptr().wrapping_add(stack.len()),
+            self_pid: module.entries[&2] as usize as u64,
+            fcalls: 100,
+            ..ProcessHeader::default()
+        },
+        state: 0,
     };
     let mut regs = SchedulerRegisters::default();
     regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(77);
     #[cfg(target_arch = "aarch64")]
     assert_eq!(
-        enter_native(&mut header, &mut regs, &module.entry(1).unwrap()),
+        enter_native(&mut process.header, &mut regs, &module.entry(1).unwrap()),
         ExitReason::Returned
     );
     // try_case leaves the reason in X1 (the harness routes to the handler directly).
     assert_eq!(regs.x_reg_array[1], arinsal_beamasm::rt::fixture_term(77));
-    assert_eq!(header.catches, 0);
+    assert_eq!(process.header.catches, 0);
 }
 
 #[test]
 fn native_callee_error_unwinds_to_caller_try() {
     let mut asm = BeamModuleAssembler::new();
+    asm.set_yield_fragments(yield_entries());
     asm.emit_i_func_label(1).unwrap();
     asm.emit_enter_frame().unwrap();
     asm.allocate(3, 0).unwrap();
@@ -187,22 +224,25 @@ fn native_callee_error_unwinds_to_caller_try() {
     let module = asm.finalize().unwrap();
     let mut heap = [0u64; 64];
     let mut stack = [0u64; 64];
-    let mut header = ProcessHeader {
-        htop: heap.as_mut_ptr(),
-        heap: heap.as_mut_ptr(),
-        hend: heap.as_mut_ptr().wrapping_add(heap.len()),
-        stop: stack.as_mut_ptr().wrapping_add(stack.len()),
-        self_pid: module.entries[&2] as usize as u64,
-        fcalls: 100,
-        ..ProcessHeader::default()
+    let mut process = TestProcess {
+        header: ProcessHeader {
+            htop: heap.as_mut_ptr(),
+            heap: heap.as_mut_ptr(),
+            hend: heap.as_mut_ptr().wrapping_add(heap.len()),
+            stop: stack.as_mut_ptr().wrapping_add(stack.len()),
+            self_pid: module.entries[&2] as usize as u64,
+            fcalls: 100,
+            ..ProcessHeader::default()
+        },
+        state: 0,
     };
     let mut regs = SchedulerRegisters::default();
     #[cfg(target_arch = "aarch64")]
     assert_eq!(
-        enter_native(&mut header, &mut regs, &module.entry(1).unwrap()),
+        enter_native(&mut process.header, &mut regs, &module.entry(1).unwrap()),
         ExitReason::Returned
     );
-    assert_eq!(header.catches, 0);
+    assert_eq!(process.header.catches, 0);
 }
 
 #[test]
@@ -216,6 +256,8 @@ fn native_catch_returns_exit_tuple_from_handler() {
     let result_bits = arinsal_beamasm::rt::term_bits(result);
 
     let mut asm = BeamModuleAssembler::new();
+
+    asm.set_yield_fragments(yield_entries());
     asm.emit_i_func_label(1).unwrap();
     asm.allocate(3, 0).unwrap();
     asm.emit_catch(ArgVal::Y(0), 2).unwrap();
@@ -227,27 +269,30 @@ fn native_catch_returns_exit_tuple_from_handler() {
     )
     .unwrap();
     asm.emit_i_func_label(2).unwrap();
-    asm.emit_catch_end(ArgVal::Y(0), gc_stub, add_stacktrace_stub)
+    asm.emit_catch_end(ArgVal::Y(0), add_stacktrace_stub)
         .unwrap();
     asm.deallocate(3).unwrap();
     finish(&mut asm);
     let module = asm.finalize().unwrap();
     let mut heap = [0u64; 64];
     let mut stack = [0u64; 64];
-    let mut header = ProcessHeader {
-        htop: heap.as_mut_ptr(),
-        heap: heap.as_mut_ptr(),
-        hend: heap.as_mut_ptr().wrapping_add(heap.len()),
-        stop: stack.as_mut_ptr().wrapping_add(stack.len()),
-        self_pid: module.entries[&2] as usize as u64,
-        fcalls: 100,
-        ..ProcessHeader::default()
+    let mut process = TestProcess {
+        header: ProcessHeader {
+            htop: heap.as_mut_ptr(),
+            heap: heap.as_mut_ptr(),
+            hend: heap.as_mut_ptr().wrapping_add(heap.len()),
+            stop: stack.as_mut_ptr().wrapping_add(stack.len()),
+            self_pid: module.entries[&2] as usize as u64,
+            fcalls: 100,
+            ..ProcessHeader::default()
+        },
+        state: 0,
     };
     let mut regs = SchedulerRegisters::default();
     regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(result_bits);
     #[cfg(target_arch = "aarch64")]
     assert_eq!(
-        enter_native(&mut header, &mut regs, &module.entry(1).unwrap()),
+        enter_native(&mut process.header, &mut regs, &module.entry(1).unwrap()),
         ExitReason::Returned
     );
     assert_eq!(
@@ -259,10 +304,11 @@ fn native_catch_returns_exit_tuple_from_handler() {
 #[test]
 fn native_catch_end() {
     let mut asm = BeamModuleAssembler::new();
+    asm.set_yield_fragments(yield_entries());
     asm.emit_i_func_label(1).unwrap();
     asm.allocate(3, 0).unwrap();
     asm.emit_catch(ArgVal::Y(0), 2).unwrap();
-    asm.emit_catch_end(ArgVal::Y(0), gc_stub, add_stacktrace_stub)
+    asm.emit_catch_end(ArgVal::Y(0), add_stacktrace_stub)
         .unwrap();
     asm.deallocate(3).unwrap();
     finish(&mut asm);
@@ -274,6 +320,7 @@ fn native_catch_end() {
 #[test]
 fn native_try() {
     let mut asm = BeamModuleAssembler::new();
+    asm.set_yield_fragments(yield_entries());
     asm.emit_i_func_label(1).unwrap();
     asm.allocate(3, 0).unwrap();
     asm.emit_try(ArgVal::Y(0), 2).unwrap();
@@ -288,6 +335,7 @@ fn native_try() {
 #[test]
 fn native_try_end() {
     let mut asm = BeamModuleAssembler::new();
+    asm.set_yield_fragments(yield_entries());
     asm.emit_i_func_label(1).unwrap();
     asm.allocate(3, 0).unwrap();
     asm.emit_try(ArgVal::Y(0), 2).unwrap();
@@ -302,6 +350,7 @@ fn native_try_end() {
 #[test]
 fn native_try_case() {
     let mut asm = BeamModuleAssembler::new();
+    asm.set_yield_fragments(yield_entries());
     asm.emit_i_func_label(1).unwrap();
     asm.allocate(3, 0).unwrap();
     asm.emit_try(ArgVal::Y(0), 2).unwrap();
@@ -316,6 +365,7 @@ fn native_try_case() {
 #[test]
 fn native_try_case_end() {
     let mut asm = BeamModuleAssembler::new();
+    asm.set_yield_fragments(yield_entries());
     asm.emit_i_func_label(1).unwrap();
     asm.allocate(3, 0).unwrap();
     asm.emit_try(ArgVal::Y(0), 2).unwrap();
@@ -334,6 +384,7 @@ fn native_try_case_end() {
 #[test]
 fn native_i_raise() {
     let mut asm = BeamModuleAssembler::new();
+    asm.set_yield_fragments(yield_entries());
     asm.emit_i_func_label(1).unwrap();
     asm.emit_i_raise(
         ArgVal::Immediate(0x5b),
@@ -350,6 +401,7 @@ fn native_i_raise() {
 #[test]
 fn native_raise() {
     let mut asm = BeamModuleAssembler::new();
+    asm.set_yield_fragments(yield_entries());
     asm.emit_i_func_label(1).unwrap();
     asm.emit_raise(
         ArgVal::Immediate(0x5b),
@@ -393,6 +445,7 @@ extern "C" fn raw_raise_for_test(
 #[test]
 fn native_raw_raise() {
     let mut asm = BeamModuleAssembler::new();
+    asm.set_yield_fragments(yield_entries());
     asm.emit_i_func_label(1).unwrap();
     asm.move_(ArgVal::Immediate(atom_word("exit")), ArgVal::X(0))
         .unwrap();
@@ -415,6 +468,7 @@ fn native_raw_raise() {
 #[test]
 fn native_raw_raise_invalid_class_continues_with_badarg() {
     let mut asm = BeamModuleAssembler::new();
+    asm.set_yield_fragments(yield_entries());
     asm.emit_i_func_label(1).unwrap();
     asm.move_(ArgVal::Immediate(atom_word("nonclass")), ArgVal::X(0))
         .unwrap();
@@ -435,6 +489,7 @@ fn native_build_stacktrace() {
         raw ^ 0x100
     }
     let mut asm = BeamModuleAssembler::new();
+    asm.set_yield_fragments(yield_entries());
     asm.emit_i_func_label(1).unwrap();
     asm.emit_enter_frame().unwrap();
     asm.move_(ArgVal::Immediate(9), ArgVal::X(0)).unwrap();
@@ -467,6 +522,7 @@ fn native_badrecord() {
 #[test]
 fn native_try_end_deallocate() {
     let mut asm = BeamModuleAssembler::new();
+    asm.set_yield_fragments(yield_entries());
     asm.emit_i_func_label(1).unwrap();
     asm.allocate(3, 0).unwrap();
     asm.emit_try(ArgVal::Y(0), 2).unwrap();
@@ -481,6 +537,7 @@ fn error_test(
     emit: impl FnOnce(&mut BeamModuleAssembler) -> Result<(), arinsal_beamasm::module::ModuleError>,
 ) {
     let mut asm = BeamModuleAssembler::new();
+    asm.set_yield_fragments(yield_entries());
     asm.emit_i_func_label(1).unwrap();
     emit(&mut asm).unwrap();
     finish(&mut asm);

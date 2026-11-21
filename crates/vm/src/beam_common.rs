@@ -131,7 +131,7 @@ pub(crate) fn fixed_apply(
         let words = arity
             .checked_mul(2)
             .ok_or_else(|| vm.exception(c_p, "system_limit"))?;
-        c_p.ensure_objv(words, &mut reg[..arity + 2])?;
+        c_p.ensure_objv(words, &mut reg[..arity + 2]);
         let module_term = reg[arity];
         let function_term = reg[arity + 1];
         let arguments = TermBuilder::new(&mut c_p.heap)
@@ -386,7 +386,7 @@ pub(crate) fn call_error_handler(
             frame: format!("{module}:{function}/{arity}"),
         });
     }
-    c_p.ensure_objv(arity.saturating_mul(2).saturating_add(8), &mut reg[..arity])?;
+    c_p.ensure_objv(arity.saturating_mul(2).saturating_add(8), &mut reg[..arity]);
     let args = reg[..arity].to_vec();
     let list = TermBuilder::new(&mut c_p.heap)
         .list_from_iter(args)
@@ -451,7 +451,8 @@ fn ensure_x_roots(
     let Some(roots) = registers.x_reg_array.get_mut(..live) else {
         return false;
     };
-    process.ensure_objv(need, roots).is_ok()
+    process.ensure_objv(need, roots);
+    true
 }
 
 /// Resolves the exception of `c_p` to its catch handler, or returns zero when the scheduler
@@ -486,51 +487,90 @@ pub extern "C" fn handle_error(
         );
     }
     process.heap.abi.i = pc as *const core::ffi::c_void;
+    // Port of erts/emulator/beam/beam_common.c:470-495 (handle_error: an EXF_ARGLIST Value
+    // is `{Reason, Args[, ErrorInfo]}`), OTP-29.1.1.
+    let mut value = if process.heap.abi.exc.freason & arinsal_beamasm::exc::EXF_ARGLIST != 0 {
+        crate::native_helpers::unpack_error_arglist(process).0
+    } else {
+        crate::native_hooks::from_raw(process.heap.abi.exc.fvalue)
+    };
+    // Port of erts/emulator/beam/beam_common.c:505-507 (handle_error: save_stacktrace when
+    // EXF_SAVETRACE is set), OTP-29.1.1.
     let freason = process.heap.abi.exc.freason;
-    let error_arglist = crate::native_helpers::is_error_arglist(process, bif_info, freason);
-    let Some(class) = crate::native_helpers::native_exception_class(freason, error_arglist) else {
-        return 0;
-    };
-    let arglist = if error_arglist {
-        let Some(arglist) = crate::native_helpers::unpack_error_arglist(process, freason) else {
-            return 0;
-        };
-        Some(arglist)
-    } else {
-        None
-    };
-    let trace = if freason & arinsal_beamasm::exc::EXF_SAVETRACE == 0 {
-        crate::native_hooks::from_raw(process.heap.abi.exc.ftrace)
-    } else {
+    if freason & arinsal_beamasm::exc::EXF_SAVETRACE != 0 {
+        // `save_stacktrace(c_p, pc, reg, bif_mfa, Args)`: erlang:error/2,3 take Args (x1) and
+        // their error_info from the argument registers in `native_bif_top`.
         let top = crate::native_helpers::native_bif_top(process, bif_info, registers);
         let input = crate::stacktrace::StackTraceSave {
-            class,
+            class: crate::native_helpers::get_exc_class(freason),
             depth: crate::erl_init::erts_backtrace_depth(),
             freason,
             native_pc: (pc != 0).then_some(pc),
             top: top.as_ref().map(crate::stacktrace::SaveTop::Live),
         };
-        let Ok(trace) = crate::stacktrace::save_stacktrace(process, input, registers) else {
-            return 0;
-        };
-        trace
-    };
-    process.heap.abi.exc.ftrace = crate::native_hooks::raw(trace);
-    let reason = if let Some((reason, _args)) = arglist {
-        reason
-    } else if freason
-        & (arinsal_beamasm::exc::EXC_INDEXBITS | arinsal_beamasm::exc::EXF_HAS_EXT_INFO)
-        == 0
-    {
-        crate::native_hooks::from_raw(process.heap.abi.exc.fvalue)
-    } else {
-        let Some(reason) = crate::native_helpers::expand_error_value(process) else {
-            return 0;
-        };
-        reason
-    };
+        let trace = crate::stacktrace::save_stacktrace(process, input, registers);
+        process.heap.abi.exc.ftrace = crate::native_hooks::raw(trace);
+    }
+    // Port of erts/emulator/beam/beam_common.c:509-515 (handle_error: throws that are not
+    // caught are turned into 'nocatch' errors), OTP-29.1.1.
+    if process.heap.abi.exc.freason & exc::EXF_THROWN != 0 && process.heap.abi.catches == 0 {
+        value = crate::native_helpers::halloc_tuple2(
+            process,
+            Term::atom(arinsal_term::atoms::NOCATCH),
+            value,
+        );
+        process.heap.abi.exc.freason = exc::EXC_ERROR;
+    }
+    // Port of erts/emulator/beam/beam_common.c:517-525 (handle_error: expand the error term,
+    // stabilize the flags with PRIMARY_EXCEPTION, clear fvalue), OTP-29.1.1.
+    let reason =
+        crate::native_helpers::expand_error_value(process, process.heap.abi.exc.freason, value);
+    process.heap.abi.exc.freason = exc::primary_exception(process.heap.abi.exc.freason);
+    process.heap.abi.exc.fvalue = Term::NIL.tagged_word();
+    let class = crate::native_helpers::get_exc_class(process.heap.abi.exc.freason);
     let trace = crate::native_hooks::from_raw(process.heap.abi.exc.ftrace);
-    crate::native_bridge::native_found_catch(process, registers, class, reason, trace).unwrap_or(0)
+    if let Some(handler) =
+        crate::native_bridge::native_found_catch(process, registers, class, reason, trace)
+    {
+        return handler;
+    }
+    terminate_proc(process, class, reason);
+    0
+}
+
+/// Terminates `c_p`, whose exception found no catch: an error gets its symbolic stacktrace
+/// (`add_stacktrace`), an EXF_LOG exception is logged, then `erts_do_exit_process`. The
+/// generated code goes to `do_schedule` once `handle_error` returns NULL.
+// Port of erts/emulator/beam/beam_common.c:685-725 (terminate_proc), OTP-29.1.1.
+#[inline(never)]
+fn terminate_proc(process: &mut Process, class: arinsal_bifs::Class, value: Term) {
+    process.heap.abi.exc.fvalue = raw(value);
+    let stack = if class == arinsal_bifs::Class::Error {
+        crate::exceptions::materialize(
+            process,
+            crate::native_hooks::from_raw(process.heap.abi.exc.ftrace),
+        )
+        .and_then(|trace| {
+            arinsal_term::to_owned(trace)
+                .map_err(|e| crate::VmError::Unsupported(format!("exception stack {e:?}")))
+        })
+        .unwrap_or(arinsal_etf::OwnedTerm::Nil)
+    } else {
+        arinsal_etf::OwnedTerm::Nil
+    };
+    let value = crate::native_hooks::from_raw(process.heap.abi.exc.fvalue);
+    let reason = arinsal_term::to_owned(value)
+        .unwrap_or(arinsal_etf::OwnedTerm::Atom("system_limit".into()));
+    let raised = crate::VmError::Raised(Box::new(crate::exceptions::Raised {
+        class,
+        reason,
+        stack,
+    }));
+    arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
+        arinsal_sched::RunCtx::with_current(esdp, |ctx| process.terminate_proc(ctx, raised))
+    })
+    .flatten()
+    .expect("terminate_proc runs in the process's slice");
 }
 
 /// Finds the error-handler export and builds its three arguments in the X registers.
@@ -588,14 +628,11 @@ pub(crate) fn call_error_handler_core(
         return 0;
     };
     let arity = mfa.2 as usize;
-    if registers.x_reg_array.len() < arity
-        || process
-            .ensure_objv(arity.saturating_mul(2), &mut registers.x_reg_array[..arity])
-            .is_err()
-    {
+    if registers.x_reg_array.len() < arity {
         set_system_limit(process);
         return 0;
     }
+    process.ensure_objv(arity.saturating_mul(2), &mut registers.x_reg_array[..arity]);
     let args: smallvec::SmallVec<[Term; 8]> =
         smallvec::SmallVec::from_slice(&registers.x_reg_array[..arity]);
     let Ok(args) =
@@ -695,7 +732,7 @@ pub extern "C" fn erts_gc_new_map(
                 raw::read_operand(data, index, reg, stack).unwrap_or(Term::NON_VALUE.tagged_word()),
             )
         },
-        &mut process.heap,
+        &mut crate::ProcessHeapHandle(&mut process.heap),
     ) {
         Ok(map) => raw(map),
         Err(error) => set_map_error(process, error),
@@ -780,7 +817,7 @@ pub extern "C" fn erts_gc_update_map_assoc(
                 raw::read_operand(data, index, reg, stack).unwrap_or(Term::NON_VALUE.tagged_word()),
             )
         },
-        &mut process.heap,
+        &mut crate::ProcessHeapHandle(&mut process.heap),
     ) {
         Ok(map) => raw(map),
         Err(error) => set_map_error(process, error),
@@ -821,7 +858,7 @@ pub extern "C" fn erts_gc_update_map_exact(
                 raw::read_operand(data, index, reg, stack).unwrap_or(Term::NON_VALUE.tagged_word()),
             )
         },
-        &mut process.heap,
+        &mut crate::ProcessHeapHandle(&mut process.heap),
     ) {
         Ok(map) => raw(map),
         Err(error) => set_map_error(process, error),

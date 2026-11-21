@@ -132,7 +132,7 @@ pub(super) fn decode_count(
         let slot = small(items[1]).ok_or_else(badarg)?;
         ScanPosition::Slot(if slot < 0 { usize::MAX } else { slot as usize })
     } else {
-        ScanPosition::After(SavedKey::new(items[1]).map_err(super::err)?)
+        ScanPosition::After(SavedKey::new(items[1]).map_err(super::saved_key_error)?)
     };
     Ok(Run {
         count: true,
@@ -167,7 +167,7 @@ pub(super) fn decode_tree(
     if chunk < 0 || got < 0 {
         return Err(badarg());
     }
-    let key = SavedKey::new(items[1]).map_err(super::err)?;
+    let key = SavedKey::new(items[1]).map_err(super::saved_key_error)?;
     let accum = accumulator(items[5], got as usize)?;
     Ok(Run {
         count: false,

@@ -7,7 +7,7 @@ use arinsal_term::{FunRef, Term, TermBuilder, global_atoms};
 /// Return `{Module, Function, Arity}` for a local or external fun.
 // Port of erts/emulator/beam/erl_bif_info.c:4011 (`fun_info_mfa_1`), OTP-29.1.1.
 pub(crate) fn fun_info_mfa_1(c_p: &mut Process, reg: &mut [Term]) -> Result<Term, VmError> {
-    c_p.ensure_objv(4, &mut reg[..1])?;
+    c_p.ensure_objv(4, &mut reg[..1]);
     let fun = reg[0];
     // SAFETY: `reg[0]` roots the fun while its MFA tuple is allocated.
     let view = unsafe { fun.fun_ref() }.ok_or_else(|| {
@@ -123,7 +123,8 @@ fn fun_info_2_body(c_p: &mut Process, reg: &mut [Term]) -> Result<Term, VmError>
 }
 
 fn p_ensure_fun_info_roots(c_p: &mut Process, reg: &mut [Term]) -> Result<(), VmError> {
-    c_p.ensure_objv(1024, &mut reg[..2])
+    c_p.ensure_objv(1024, &mut reg[..2]);
+    Ok(())
 }
 
 fn atom(name: &str) -> Result<Term, VmError> {

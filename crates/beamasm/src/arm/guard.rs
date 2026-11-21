@@ -13,22 +13,6 @@ use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
 use crate::types::{ArgType, TypedArg, type_id};
 use crate::{Update, emit_enter_runtime, emit_leave_runtime};
 
-/// Runtime hook used for guards that need term-aware runtime behavior.
-pub type GuardHelper = unsafe extern "C" fn(
-    process: *mut crate::ProcessHeader,
-    op: u32,
-    first: u64,
-    second: u64,
-) -> u64;
-/// Runtime hook carrying three term operands, used for tagged tuple checks.
-pub type GuardHelper3 = unsafe extern "C" fn(
-    process: *mut crate::ProcessHeader,
-    op: u32,
-    first: u64,
-    second: u64,
-    third: u64,
-) -> u64;
-
 /// Addresses of the process-wide comparison fragments.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CompareShared {
@@ -128,31 +112,13 @@ const NIL_WORD: u64 = 0x3b;
 pub const MAP_SIZE_MFA_INDEX: u8 = 5;
 /// Index of `erlang:map_get/2` in the guard BIF MFA table.
 pub const MAP_GET_MFA_INDEX: u8 = 7;
+/// Index of `erlang:length/1` in the guard BIF MFA table.
+pub const LENGTH_MFA_INDEX: u8 = 8;
 /// `freason` of a missing key in exact map update: `{badkey, Key}` (erts `EXC_BADKEY`).
 // Port of erts/emulator/beam/error.h:168, OTP-29.1.1.
 pub use crate::exc::EXC_BADKEY;
 /// `freason` of an inline `map_size/1` failure: `{badmap, Value}` (erts `EXC_BADMAP`).
 pub use crate::exc::EXC_BADMAP;
-
-/// Target mode accepted by the function arity guard adapter.
-pub enum Function2TestTarget {
-    /// Branch to a BEAM failure label when the test does not match.
-    FailLabel(u32),
-    /// Preserve the older boolean result used by the fun module adapter.
-    LegacyBoolean(GuardHelper),
-}
-
-impl From<u32> for Function2TestTarget {
-    fn from(value: u32) -> Self {
-        Self::FailLabel(value)
-    }
-}
-
-impl From<GuardHelper> for Function2TestTarget {
-    fn from(helper: GuardHelper) -> Self {
-        Self::LegacyBoolean(helper)
-    }
-}
 
 #[derive(Clone, Copy)]
 enum InlineType {
@@ -177,15 +143,6 @@ enum InlineType {
     Map,
 }
 
-#[derive(Clone, Copy)]
-enum RelativeComparison {
-    Less,
-    GreaterEqual,
-}
-
-/// Guard helper op flag for an instruction with a failure label (see the VM guard hook).
-const QUIET_GUARD: u32 = 0x100;
-
 fn small_operand(value: ArgVal) -> Result<i64, ModuleError> {
     let operand = TypedArg::new(value, ArgType::ANY);
     if operand.is_small() {
@@ -207,137 +164,6 @@ fn arity_header(value: ArgVal) -> Result<u64, ModuleError> {
 }
 
 impl BeamModuleAssembler {
-    fn emit_boolean_result(
-        &mut self,
-        yes: Label,
-        no: Label,
-        fail: Label,
-    ) -> Result<(), ModuleError> {
-        let done = self.code.new_label();
-        self.code.bind(yes)?;
-        self.code.b(done)?;
-        self.code.bind(no)?;
-        self.code.b(fail)?;
-        self.code.bind(done)?;
-        Ok(())
-    }
-
-    fn emit_inline_type_to_label(
-        &mut self,
-        op: InlineType,
-        src: ArgVal,
-        second: Option<ArgVal>,
-        third: Option<ArgVal>,
-        fail: Label,
-    ) -> Result<(), ModuleError> {
-        let yes = self.code.new_label();
-        let no = self.code.new_label();
-        let value = self.source_reg(src)?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(11), value))?;
-        if matches!(
-            op,
-            InlineType::Arity | InlineType::TaggedTuple | InlineType::Function2
-        ) {
-            let arity_reg = self
-                .source_reg(second.ok_or(ModuleError::InvalidOperand("arity operand required"))?)?;
-            self.code.emit(|e| e.mov_reg(Gpr::x(13), arity_reg))?;
-        }
-        if matches!(op, InlineType::TaggedTuple) {
-            let tag_reg =
-                self.source_reg(third.ok_or(ModuleError::InvalidOperand("tag operand required"))?)?;
-            self.code.emit(|e| e.mov_reg(Gpr::x(14), tag_reg))?;
-        }
-        self.code.emit(|e| match op {
-            InlineType::Integer | InlineType::Number | InlineType::Pid | InlineType::Port => {
-                e.ands_imm(Gpr::x(8), Gpr::x(11), 15)?;
-                e.cmp_imm(
-                    Gpr::x(8),
-                    match op {
-                        InlineType::Pid => 3,
-                        InlineType::Port => 7,
-                        _ => 15,
-                    },
-                    false,
-                )
-            }
-            InlineType::Atom => {
-                e.ands_imm(Gpr::x(8), Gpr::x(11), 63)?;
-                e.cmp_imm(Gpr::x(8), 11, false)
-            }
-            InlineType::List | InlineType::NonemptyList => {
-                e.ands_imm(Gpr::x(8), Gpr::x(11), 3)?;
-                e.cmp_imm(Gpr::x(8), 1, false)
-            }
-            InlineType::Nil => e.cmp_imm(Gpr::x(11), 0x3b, false),
-            InlineType::Tuple
-            | InlineType::Arity
-            | InlineType::TaggedTuple
-            | InlineType::Binary
-            | InlineType::Bitstring
-            | InlineType::Float
-            | InlineType::Map
-            | InlineType::Reference
-            | InlineType::Function
-            | InlineType::Function2 => {
-                e.ands_imm(Gpr::x(8), Gpr::x(11), 3)?;
-                e.cmp_imm(Gpr::x(8), 2, false)
-            }
-            InlineType::Boolean => {
-                e.and_imm(Gpr::x(8), Gpr::x(11), !(1 << 6))?;
-                e.cmp_imm(Gpr::x(8), 11, false)
-            }
-        })?;
-        match op {
-            InlineType::Integer => {
-                self.code.b_cond(Cond::Eq, yes)?;
-                self.code.emit(|e| {
-                    e.ands_imm(Gpr::x(8), Gpr::x(11), 3)?;
-                    e.cmp_imm(Gpr::x(8), 2, false)
-                })?;
-                self.code.b_cond(Cond::Ne, no)?;
-                self.load_boxed_header(Gpr::x(11), Gpr::x(10))?;
-                self.code
-                    .emit(|e| e.and_imm(Gpr::x(10), Gpr::x(10), 0x38))?;
-                self.code.emit(|e| e.cmp_imm(Gpr::x(10), 8, false))?;
-                self.code.b_cond(Cond::Eq, yes)?;
-                self.code.b(no)?;
-            }
-            InlineType::Number => {
-                self.code.b_cond(Cond::Eq, yes)?;
-                self.code.emit(|e| {
-                    e.ands_imm(Gpr::x(8), Gpr::x(11), 3)?;
-                    e.cmp_imm(Gpr::x(8), 2, false)
-                })?;
-                self.code.b_cond(Cond::Ne, no)?;
-                self.emit_inline_type_tail(op, yes, no)?;
-            }
-            InlineType::Pid | InlineType::Port => {
-                self.code.b_cond(Cond::Eq, yes)?;
-                self.code.emit(|e| {
-                    e.ands_imm(Gpr::x(8), Gpr::x(11), 3)?;
-                    e.cmp_imm(Gpr::x(8), 2, false)
-                })?;
-                self.code.b_cond(Cond::Ne, no)?;
-                self.emit_inline_type_tail(op, yes, no)?;
-            }
-            InlineType::Atom | InlineType::NonemptyList | InlineType::Nil | InlineType::Boolean => {
-                self.code.b_cond(Cond::Eq, yes)?;
-                self.code.b(no)?;
-            }
-            InlineType::List => {
-                self.code.b_cond(Cond::Eq, yes)?;
-                self.code.emit(|e| e.cmp_imm(Gpr::x(11), 0x3b, false))?;
-                self.code.b_cond(Cond::Eq, yes)?;
-                self.code.b(no)?;
-            }
-            _ => {
-                self.code.b_cond(Cond::Ne, no)?;
-                self.emit_inline_type_tail(op, yes, no)?;
-            }
-        }
-        self.emit_boolean_result(yes, no, fail)
-    }
-
     /// Emits erts' type tests directly to the failure label instead of materializing a Boolean.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1121-1403, 1529-1664, OTP-29.1.1.
     fn emit_inline_type(
@@ -623,330 +449,6 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
-    fn load_boxed_header(&mut self, tagged: Gpr, out: Gpr) -> Result<(), ModuleError> {
-        self.code.emit(|e| {
-            e.and_imm(Gpr::x(17), tagged, !7)?;
-            e.ldur(out, Gpr::x(17), 0)
-        })?;
-        Ok(())
-    }
-
-    fn emit_inline_type_tail(
-        &mut self,
-        op: InlineType,
-        yes: Label,
-        no: Label,
-    ) -> Result<(), ModuleError> {
-        self.load_boxed_header(Gpr::x(11), Gpr::x(10))?;
-        match op {
-            InlineType::Tuple => {
-                self.code.emit(|e| e.ands_imm(Gpr::x(10), Gpr::x(10), 63))?;
-                self.code.emit(|e| e.cmp_imm(Gpr::x(10), 0, false))?;
-                self.code.b_cond(Cond::Eq, yes)?;
-                self.code.b(no)?;
-            }
-            InlineType::Arity | InlineType::TaggedTuple => {
-                self.code.emit(|e| e.mov_reg(Gpr::x(12), Gpr::x(10)))?;
-                self.code.emit(|e| e.and_imm(Gpr::x(12), Gpr::x(12), 63))?;
-                self.code.emit(|e| e.cmp_imm(Gpr::x(12), 0, false))?;
-                self.code.b_cond(Cond::Ne, no)?;
-                self.code
-                    .emit(|e| e.cmp_reg(Gpr::x(10), Gpr::x(13), arinsal_a64::enc::Shift::Lsl, 0))?;
-                self.code.b_cond(Cond::Ne, no)?;
-                if matches!(op, InlineType::TaggedTuple) {
-                    self.code.emit(|e| {
-                        e.ldur(Gpr::x(12), Gpr::x(17), 8)?;
-                        e.cmp_reg(Gpr::x(12), Gpr::x(14), arinsal_a64::enc::Shift::Lsl, 0)
-                    })?;
-                    self.code.b_cond(Cond::Eq, yes)?;
-                    self.code.b(no)?;
-                } else {
-                    self.code.b(yes)?;
-                }
-            }
-            InlineType::Boolean => unreachable!(),
-            InlineType::Binary | InlineType::Bitstring => {
-                self.code.emit(|e| e.and_imm(Gpr::x(12), Gpr::x(10), 63))?;
-                self.code.emit(|e| e.cmp_imm(Gpr::x(12), 0x20, false))?;
-                let heap_bits = self.code.new_label();
-                let sub_bits = self.code.new_label();
-                self.code.b_cond(Cond::Eq, heap_bits)?;
-                self.code.emit(|e| e.cmp_imm(Gpr::x(12), 0x24, false))?;
-                self.code.b_cond(Cond::Eq, sub_bits)?;
-                self.code.b(no)?;
-                self.code.bind(heap_bits)?;
-                if matches!(op, InlineType::Bitstring) {
-                    self.code.b(yes)?;
-                } else {
-                    self.code.emit(|e| e.ldur(Gpr::x(12), Gpr::x(17), 8))?;
-                    self.code.emit(|e| e.tst_imm(Gpr::x(12), 7))?;
-                    self.code.b_cond(Cond::Eq, yes)?;
-                    self.code.b(no)?;
-                }
-                self.code.bind(sub_bits)?;
-                if matches!(op, InlineType::Bitstring) {
-                    self.code.b(yes)?;
-                } else {
-                    self.code.emit(|e| {
-                        e.ldur(Gpr::x(12), Gpr::x(17), 24)?;
-                        e.ldur(Gpr::x(9), Gpr::x(17), 16)?;
-                        e.sub_reg(
-                            Gpr::x(12),
-                            Gpr::x(12),
-                            Gpr::x(9),
-                            arinsal_a64::enc::Shift::Lsl,
-                            0,
-                        )?;
-                        e.tst_imm(Gpr::x(12), 7)
-                    })?;
-                    self.code.b_cond(Cond::Eq, yes)?;
-                    self.code.b(no)?;
-                }
-            }
-            InlineType::Float | InlineType::Function => {
-                let expected = match op {
-                    InlineType::Float => 0x18,
-                    InlineType::Function => 0x14,
-                    _ => unreachable!(),
-                };
-                self.code.emit(|e| e.and_imm(Gpr::x(10), Gpr::x(10), 63))?;
-                self.code.emit(|e| e.cmp_imm(Gpr::x(10), expected, false))?;
-                self.code.b_cond(Cond::Eq, yes)?;
-                self.code.b(no)?;
-            }
-            InlineType::Map => {
-                self.code.emit(|e| e.and_imm(Gpr::x(10), Gpr::x(10), 63))?;
-                self.code.emit(|e| e.cmp_imm(Gpr::x(10), 0x2c, false))?;
-                self.code.b_cond(Cond::Eq, yes)?;
-                self.code.b(no)?;
-            }
-            InlineType::Number => {
-                self.code
-                    .emit(|e| e.and_imm(Gpr::x(12), Gpr::x(10), 0x38))?;
-                self.code.emit(|e| e.cmp_imm(Gpr::x(12), 8, false))?;
-                let not_integer = self.code.new_label();
-                self.code.b_cond(Cond::Ne, not_integer)?;
-                self.code.b(yes)?;
-                self.code.bind(not_integer)?;
-                self.code.emit(|e| e.cmp_imm(Gpr::x(12), 0x18, false))?;
-                self.code.b_cond(Cond::Eq, yes)?;
-                self.code.b(no)?;
-            }
-            InlineType::Pid | InlineType::Port => {
-                let header = if matches!(op, InlineType::Pid) {
-                    0x30
-                } else {
-                    0x34
-                };
-                self.code.emit(|e| e.and_imm(Gpr::x(10), Gpr::x(10), 63))?;
-                self.code.emit(|e| e.cmp_imm(Gpr::x(10), header, false))?;
-                self.code.b_cond(Cond::Eq, yes)?;
-                self.code.b(no)?;
-            }
-            InlineType::Reference => {
-                self.code.emit(|e| e.and_imm(Gpr::x(10), Gpr::x(10), 63))?;
-                // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1517-1521 (is_ref), OTP-29.1.1.
-                for header in [0x10, 0x38] {
-                    self.code.emit(|e| e.cmp_imm(Gpr::x(10), header, false))?;
-                    self.code.b_cond(Cond::Eq, yes)?;
-                }
-                self.code.b(no)?;
-            }
-            InlineType::Function2 => {
-                self.code.emit(|e| e.and_imm(Gpr::x(12), Gpr::x(10), 63))?;
-                self.code.emit(|e| e.cmp_imm(Gpr::x(12), 0x14, false))?;
-                self.code.b_cond(Cond::Ne, no)?;
-                self.code.emit(|e| e.ubfx(Gpr::x(12), Gpr::x(10), 8, 8))?;
-                self.code.emit(|e| e.asr_imm(Gpr::x(13), Gpr::x(13), 4))?;
-                self.code
-                    .emit(|e| e.cmp_reg(Gpr::x(12), Gpr::x(13), arinsal_a64::enc::Shift::Lsl, 0))?;
-                self.code.b_cond(Cond::Eq, yes)?;
-                self.code.b(no)?;
-            }
-            InlineType::Integer
-            | InlineType::Atom
-            | InlineType::List
-            | InlineType::NonemptyList
-            | InlineType::Nil => unreachable!(),
-        }
-        Ok(())
-    }
-
-    fn emit_guard_helper(
-        &mut self,
-        op: u32,
-        first: ArgVal,
-        second: ArgVal,
-        fail: u32,
-        helper: GuardHelper,
-    ) -> Result<(), ModuleError> {
-        let lhs = self.source_reg(first)?;
-        let rhs = self.source_reg_into(second, Gpr::x(17))?;
-        self.code.emit(|e| e.mov_const(Gpr::x(8), u64::from(op)))?;
-        self.emit_guard_runtime_call(helper as usize, &[Gpr::x(8), lhs, rhs])?;
-        let fail = self.label(fail);
-        self.code.cbz(Gpr::x(0), fail)?;
-        Ok(())
-    }
-
-    fn emit_guard_value_helper(
-        &mut self,
-        op: u32,
-        first: ArgVal,
-        second: ArgVal,
-        destination: ArgVal,
-        helper: GuardHelper,
-    ) -> Result<(), ModuleError> {
-        let lhs = self.source_reg(first)?;
-        let rhs = self.source_reg_into(second, Gpr::x(17))?;
-        self.code.emit(|e| e.mov_const(Gpr::x(8), u64::from(op)))?;
-        self.emit_guard_helper_call_raising(helper as usize, lhs, rhs, first, second)?;
-        self.store_guard_result(destination, Gpr::x(0))
-    }
-
-    /// Like `emit_guard_value_helper`, but a failure branches to `fail` instead of raising when
-    /// the instruction has a failure label.
-    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp (guard BIFs with a Fail label:
-    // THE_NON_VALUE branches to Fail), OTP-29.1.1.
-    #[allow(clippy::too_many_arguments)]
-    fn emit_guard_value_helper_fail(
-        &mut self,
-        fail: u32,
-        boolean: bool,
-        op: u32,
-        first: ArgVal,
-        second: ArgVal,
-        destination: ArgVal,
-        helper: GuardHelper,
-    ) -> Result<(), ModuleError> {
-        if fail == 0 && boolean {
-            return self.emit_guard_boolean_value_helper(op, first, second, destination, helper);
-        }
-        if fail == 0 {
-            return self.emit_guard_value_helper(op, first, second, destination, helper);
-        }
-        let lhs = self.source_reg(first)?;
-        let rhs = self.source_reg_into(second, Gpr::x(17))?;
-        // The runtime records no BIF frame for a failure that branches to the label.
-        self.code
-            .emit(|e| e.mov_const(Gpr::x(8), u64::from(op | QUIET_GUARD)))?;
-        let update = Update::HEAP_ALLOC;
-        emit_enter_runtime(&mut self.code, 6, update)?;
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(0), Gpr::x(21))?;
-            e.mov_reg(Gpr::x(1), Gpr::x(8))?;
-            e.mov_reg(Gpr::x(2), lhs)?;
-            e.mov_reg(Gpr::x(3), rhs)?;
-            e.mov_const(Gpr::x(17), helper as usize as u64)?;
-            e.str_uoff(Gpr::x(30), Gpr::x(21), 72)?;
-            e.blr(Gpr::x(17))
-        })?;
-        emit_leave_runtime(&mut self.code, 6, update)?;
-        let ok = self.code.new_label();
-        self.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
-            e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)
-        })?;
-        self.code.cbz(Gpr::x(9), ok)?;
-        self.code.emit(|e| e.str_uoff(Gpr::xzr(), Gpr::x(21), 40))?;
-        let fail = self.label(fail);
-        self.code.b(fail)?;
-        self.code.bind(ok)?;
-        if boolean {
-            self.code.emit(|e| {
-                e.cmp_imm(Gpr::x(0), 0, false)?;
-                e.mov_const(Gpr::x(10), 0x0b)?;
-                e.mov_const(Gpr::x(11), 0x4b)?;
-                e.csel(Gpr::x(0), Gpr::x(11), Gpr::x(10), Cond::Ne)
-            })?;
-        }
-        self.store_guard_result(destination, Gpr::x(0))
-    }
-
-    fn emit_guard_boolean_value_helper(
-        &mut self,
-        op: u32,
-        first: ArgVal,
-        second: ArgVal,
-        destination: ArgVal,
-        helper: GuardHelper,
-    ) -> Result<(), ModuleError> {
-        let lhs = self.source_reg(first)?;
-        let rhs = self.source_reg_into(second, Gpr::x(17))?;
-        self.code.emit(|e| e.mov_const(Gpr::x(8), u64::from(op)))?;
-        self.emit_guard_helper_call_raising(helper as usize, lhs, rhs, first, second)?;
-        self.code.emit(|e| {
-            e.cmp_imm(Gpr::x(0), 0, false)?;
-            e.mov_const(Gpr::x(10), 0x0b)?;
-            e.mov_const(Gpr::x(11), 0x4b)?;
-            e.csel(Gpr::x(0), Gpr::x(11), Gpr::x(10), Cond::Ne)
-        })?;
-        self.store_guard_result(destination, Gpr::x(0))
-    }
-
-    /// Calls a guard BIF helper outside a guard. On failure the BIF's arguments are moved
-    /// into the cached X0/X1 before raising: the raise stub spills the cached registers over
-    /// the register array, so arguments the helper published only in memory would be lost
-    /// (and a trapping BIF such as `length/1`, whose original argument sits in the trap state
-    /// above the live registers, would report a stale X0).
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (emit_i_length_body_shared: "Move the
-    // original argument to x0" before emit_raise_exception) and instr_guard_bifs.cpp
-    // (mov_arg(XREG0/XREG1, ...) before the badarg/badmap raise), OTP-29.1.1.
-    fn emit_guard_helper_call_raising(
-        &mut self,
-        target: usize,
-        lhs: Gpr,
-        rhs: Gpr,
-        first: ArgVal,
-        second: ArgVal,
-    ) -> Result<(), ModuleError> {
-        let update = Update::HEAP_ALLOC;
-        emit_enter_runtime(&mut self.code, 6, update)?;
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(0), Gpr::x(21))?;
-            e.mov_reg(Gpr::x(1), Gpr::x(8))?;
-            e.mov_reg(Gpr::x(2), lhs)?;
-            e.mov_reg(Gpr::x(3), rhs)?;
-            e.mov_const(Gpr::x(17), target as u64)?;
-            e.str_uoff(Gpr::x(30), Gpr::x(21), 72)?;
-            e.blr(Gpr::x(17))
-        })?;
-        emit_leave_runtime(&mut self.code, 6, update)?;
-        self.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
-            e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)
-        })?;
-        let ok = self.code.new_label();
-        self.code.cbz(Gpr::x(9), ok)?;
-        // The call clobbered the caller-saved scratch registers: reload the operands from
-        // their homes. X0..X3 kept their callee-saved registers, X4/X5 were reloaded, Y and
-        // memory X registers are untouched by the helper.
-        let a = self.source_reg_into(first, Gpr::x(10))?;
-        if a != Gpr::x(10) {
-            self.code.emit(|e| e.mov_reg(Gpr::x(10), a))?;
-        }
-        let b = self.source_reg_into(second, Gpr::x(11))?;
-        if b != Gpr::x(11) {
-            self.code.emit(|e| e.mov_reg(Gpr::x(11), b))?;
-        }
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(25), Gpr::x(10))?;
-            e.mov_reg(Gpr::x(26), Gpr::x(11))
-        })?;
-        self.cache_invalidate_reg(Gpr::x(25));
-        self.cache_invalidate_reg(Gpr::x(26));
-        self.code.emit(|e| {
-            e.ldr_uoff(
-                Gpr::x(3),
-                Gpr::x(21),
-                std::mem::offset_of!(crate::ProcessHeader, current) as u32,
-            )
-        })?;
-        self.branch_error_preserving_bif()?;
-        self.code.bind(ok)?;
-        Ok(())
-    }
-
     // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:78-84,818-820,911-913, OTP-29.1.1
     pub(super) fn emit_guard_runtime_call(
         &mut self,
@@ -965,11 +467,20 @@ impl BeamModuleAssembler {
             e.blr(Gpr::x(17))
         })?;
         emit_leave_runtime(&mut self.code, 6, update)?;
-        self.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
-            e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)
-        })?;
-        self.error_if_nonzero_with_bif_context(Gpr::x(9))?;
+        // The caller tests the result (`cmp ARG1, am_true` / THE_NON_VALUE), as each erts
+        // emitter does after `runtime_call`.
+        self.code.emit(|e| e.ldr_uoff(Gpr::x(30), Gpr::x(21), 72))?;
+        Ok(())
+    }
+
+    fn emit_cmp_immediate_or_register(&mut self, left: Gpr, value: u64) -> Result<(), ModuleError> {
+        if value <= 4095 {
+            self.code.emit(|e| e.cmp_imm(left, value as u16, false))?;
+        } else {
+            self.code.emit(|e| e.mov_const(Gpr::x(12), value))?;
+            self.code
+                .emit(|e| e.cmp_reg(left, Gpr::x(12), arinsal_a64::enc::Shift::Lsl, 0))?;
+        }
         Ok(())
     }
 
@@ -1009,180 +520,6 @@ impl BeamModuleAssembler {
                 ));
             }
         }
-        Ok(())
-    }
-
-    fn emit_comparison(
-        &mut self,
-        op: u32,
-        equal_result: bool,
-        lhs: ArgVal,
-        rhs: ArgVal,
-        fail: u32,
-        runtime: GuardHelper,
-    ) -> Result<(), ModuleError> {
-        let left = self.source_reg(lhs)?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(11), left))?;
-        let right = self.source_reg_into(rhs, Gpr::x(17))?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(12), right))?;
-        self.code
-            .emit(|e| e.cmp_reg(Gpr::x(11), Gpr::x(12), arinsal_a64::enc::Shift::Lsl, 0))?;
-        let done = self.code.new_label();
-        let fail_label = self.label(fail);
-        if equal_result {
-            // Same word: == and =:= both succeed.
-            self.code.b_cond(Cond::Eq, done)?;
-        } else {
-            // Same word: /= and =/= both fail.
-            self.code.b_cond(Cond::Eq, fail_label)?;
-        }
-        // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1941-1955
-        // (emit_are_both_immediate) and instr_common.cpp:2064-2071, OTP-29.1.1.
-        // Two immediates that are not the same word are neither == nor =:=
-        // (1 == 1.0 stays on the helper path: a float is boxed).
-        let both = Shifted {
-            reg: Gpr::x(12),
-            shift: arinsal_a64::enc::Shift::Lsl,
-            amount: 0,
-        };
-        self.code.emit(|e| {
-            e.and_reg(Gpr::x(8), Gpr::x(11), both)?;
-            e.and_imm(Gpr::x(8), Gpr::x(8), 3)?;
-            e.cmp_imm(Gpr::x(8), 3, false)
-        })?;
-        if equal_result {
-            self.code.b_cond(Cond::Eq, fail_label)?;
-        } else {
-            self.code.b_cond(Cond::Eq, done)?;
-        }
-        self.emit_guard_helper(op, lhs, rhs, fail, runtime)?;
-        self.code.bind(done)?;
-        Ok(())
-    }
-
-    fn emit_cmp_immediate_or_register(&mut self, left: Gpr, value: u64) -> Result<(), ModuleError> {
-        if value <= 4095 {
-            self.code.emit(|e| e.cmp_imm(left, value as u16, false))?;
-        } else {
-            self.code.emit(|e| e.mov_const(Gpr::x(12), value))?;
-            self.code
-                .emit(|e| e.cmp_reg(left, Gpr::x(12), arinsal_a64::enc::Shift::Lsl, 0))?;
-        }
-        Ok(())
-    }
-
-    fn emit_small_immediate_comparison(
-        &mut self,
-        other: ArgVal,
-        immediate: u64,
-        immediate_is_lhs: bool,
-        comparison: RelativeComparison,
-        fail: u32,
-        helper: GuardHelper,
-    ) -> Result<(), ModuleError> {
-        let term = self.source_reg(other)?;
-        let slow = self.code.new_label();
-        let done = self.code.new_label();
-        self.code.emit(|e| {
-            e.ands_imm(Gpr::x(8), term, 15)?;
-            e.cmp_imm(Gpr::x(8), 15, false)
-        })?;
-        self.code.b_cond(Cond::Ne, slow)?;
-        self.emit_cmp_immediate_or_register(term, immediate)?;
-        let (op, fail_cond) = match (comparison, immediate_is_lhs) {
-            (RelativeComparison::Less, false) => (23, Cond::Ge),
-            (RelativeComparison::Less, true) => (23, Cond::Le),
-            (RelativeComparison::GreaterEqual, false) => (24, Cond::Lt),
-            (RelativeComparison::GreaterEqual, true) => (24, Cond::Gt),
-        };
-        let fail_label = self.label(fail);
-        self.code.b_cond(fail_cond, fail_label)?;
-        self.code.b(done)?;
-        self.code.bind(slow)?;
-        let (lhs, rhs) = if immediate_is_lhs {
-            (ArgVal::Immediate(immediate), other)
-        } else {
-            (other, ArgVal::Immediate(immediate))
-        };
-        self.emit_guard_helper(op, lhs, rhs, fail, helper)?;
-        self.code.bind(done)?;
-        Ok(())
-    }
-
-    fn emit_small_compare(
-        &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
-        cond: Cond,
-        op: u32,
-        fail: u32,
-        runtime: GuardHelper,
-    ) -> Result<(), ModuleError> {
-        let left = self.source_reg(lhs)?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(11), left))?;
-        let right = self.source_reg_into(rhs, Gpr::x(17))?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(12), right))?;
-        let generic = self.code.new_label();
-        self.code.emit(|e| {
-            e.ands_imm(Gpr::x(8), Gpr::x(11), 15)?;
-            e.cmp_imm(Gpr::x(8), 15, false)
-        })?;
-        self.code.b_cond(Cond::Ne, generic)?;
-        self.code.emit(|e| {
-            e.ands_imm(Gpr::x(8), Gpr::x(12), 15)?;
-            e.cmp_imm(Gpr::x(8), 15, false)
-        })?;
-        self.code.b_cond(Cond::Ne, generic)?;
-        self.code
-            .emit(|e| e.cmp_reg(Gpr::x(11), Gpr::x(12), arinsal_a64::enc::Shift::Lsl, 0))?;
-        let done = self.code.new_label();
-        let opposite = match cond {
-            Cond::Lt => Cond::Ge,
-            Cond::Ge => Cond::Lt,
-            _ => return Err(ModuleError::InvalidOperand("unsupported small comparison")),
-        };
-        let fail_label = self.label(fail);
-        self.code.b_cond(opposite, fail_label)?;
-        self.code.b(done)?;
-        self.code.bind(generic)?;
-        self.emit_guard_helper(op, lhs, rhs, fail, runtime)?;
-        self.code.bind(done)?;
-        Ok(())
-    }
-
-    fn emit_min_max(
-        &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
-        cond: Cond,
-        op: u32,
-        destination: ArgVal,
-        runtime: GuardHelper,
-    ) -> Result<(), ModuleError> {
-        let output = self.guard_destination(destination)?;
-        let left = self.source_reg(lhs)?;
-        let right = self.source_reg_into(rhs, Gpr::x(17))?;
-        let slow = self.code.new_label();
-        let done = self.code.new_label();
-        self.code.emit(|e| {
-            e.ands_imm(Gpr::x(8), left, 15)?;
-            e.cmp_imm(Gpr::x(8), 15, false)
-        })?;
-        self.code.b_cond(Cond::Ne, slow)?;
-        self.code.emit(|e| {
-            e.ands_imm(Gpr::x(8), right, 15)?;
-            e.cmp_imm(Gpr::x(8), 15, false)
-        })?;
-        self.code.b_cond(Cond::Ne, slow)?;
-        self.code.emit(|e| {
-            e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0)?;
-            e.csel(output, right, left, cond)
-        })?;
-        self.store_guard_result(destination, output)?;
-        self.code.b(done)?;
-        self.code.bind(slow)?;
-        self.emit_guard_value_helper(op, lhs, rhs, destination, runtime)?;
-        self.code.bind(done)?;
         Ok(())
     }
 
@@ -1424,60 +761,31 @@ impl BeamModuleAssembler {
         self.emit_inline_type(InlineType::Function2, src.into(), Some(arity), None, fail)
     }
 
-    /// Emits the function arity guard, using OTP's runtime path for a non-small arity operand.
-    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1263-1306, OTP-29.1.1.
-    pub fn emit_is_function2_guard_with_helper(
+    /// Emits `is_function2` with a non-literal arity: `erl_is_function` decides.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1263-1283 (emit_is_function2,
+    // `!Arity.isSmall()`), OTP-29.1.1.
+    pub fn emit_is_function2_dynamic(
         &mut self,
         src: impl Into<TypedArg>,
         arity: ArgVal,
         fail: u32,
-        helper: GuardHelper,
-    ) -> Result<(), ModuleError> {
-        if TypedArg::from(arity).is_small() {
-            self.emit_is_function2_guard(src, arity, fail)
-        } else {
-            self.emit_guard_helper(43, src.into().val, arity, fail, helper)
-        }
-    }
-
-    /// Emits a function arity guard or the older boolean form used by the fun adapter.
-    pub fn emit_is_function2(
-        &mut self,
-        src: impl Into<TypedArg>,
-        arity: ArgVal,
-        fail: impl Into<Function2TestTarget>,
     ) -> Result<(), ModuleError> {
         let src = src.into();
-        match fail.into() {
-            Function2TestTarget::FailLabel(label) => {
-                self.emit_is_function2_guard(src, arity, label)
-            }
-            Function2TestTarget::LegacyBoolean(helper) => {
-                if !TypedArg::from(arity).is_small() {
-                    let source = self.source_reg(src.val)?;
-                    let arity = self.source_reg_into(arity, Gpr::x(17))?;
-                    self.code.emit(|e| e.mov_const(Gpr::x(8), 43))?;
-                    self.emit_guard_runtime_call(helper as usize, &[Gpr::x(8), source, arity])?;
-                    self.code.emit(|e| e.mov_reg(Gpr::x(25), Gpr::x(0)))?;
-                    return Ok(());
-                }
-                let no = self.code.new_label();
-                let done = self.code.new_label();
-                self.emit_inline_type_to_label(
-                    InlineType::Function2,
-                    src.val,
-                    Some(arity),
-                    None,
-                    no,
-                )?;
-                self.code.emit(|e| e.mov_const(Gpr::x(25), 1))?;
-                self.code.b(done)?;
-                self.code.bind(no)?;
-                self.code.emit(|e| e.mov_const(Gpr::x(25), 0))?;
-                self.code.bind(done)?;
-                Ok(())
-            }
+        if TypedArg::from(arity).is_small() {
+            return self.emit_is_function2_guard(src, arity, fail);
         }
+        let source = self.source_reg(src.val)?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(8), source))?;
+        let arity = self.source_reg_into(arity, Gpr::x(17))?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(9), arity))?;
+        self.emit_guard_runtime_call(
+            crate::rt::erl_is_function as *const () as usize,
+            &[Gpr::x(8), Gpr::x(9)],
+        )?;
+        self.code.emit(|e| e.cmp_imm(Gpr::x(0), 0x4b, false))?;
+        let fail = self.label(fail);
+        self.code.b_cond(Cond::Ne, fail)?;
+        Ok(())
     }
 
     /// Emits an exact equality guard; `eq` is the C `eq` helper (`CompareShared::eq`).
@@ -1793,25 +1101,14 @@ impl BeamModuleAssembler {
     }
 
     /// Emits a loose equality guard.
-    // Port of erts/emulator/beam/jit/arm/instr_common.cpp (emit_is_eq), OTP-29.1.1. Without the
-    // process-wide `arith_compare_shared` fragment (assemblers without a VM) the comparison
-    // goes through `helper`.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp (emit_is_eq), OTP-29.1.1.
     pub fn emit_is_eq(
         &mut self,
         lhs: impl Into<TypedArg>,
         rhs: impl Into<TypedArg>,
         fail: u32,
-        helper: GuardHelper,
     ) -> Result<(), ModuleError> {
-        let (lhs, rhs) = (lhs.into(), rhs.into());
-        if self.has_arith_compare_shared() {
-            return self.emit_is_eq_shared(lhs, rhs, fail);
-        }
-        let left = self.source_reg(lhs.val)?;
-        let right = self.source_reg_into(rhs.val, Gpr::x(17))?;
-        self.code
-            .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
-        self.emit_comparison(21, true, lhs.val, rhs.val, fail, helper)
+        self.emit_is_eq_shared(lhs.into(), rhs.into(), fail)
     }
 
     /// Emits a loose inequality guard.
@@ -1821,17 +1118,8 @@ impl BeamModuleAssembler {
         lhs: impl Into<TypedArg>,
         rhs: impl Into<TypedArg>,
         fail: u32,
-        helper: GuardHelper,
     ) -> Result<(), ModuleError> {
-        let (lhs, rhs) = (lhs.into(), rhs.into());
-        if self.has_arith_compare_shared() {
-            return self.emit_is_ne_shared(lhs, rhs, fail);
-        }
-        let left = self.source_reg(lhs.val)?;
-        let right = self.source_reg_into(rhs.val, Gpr::x(17))?;
-        self.code
-            .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
-        self.emit_comparison(22, false, lhs.val, rhs.val, fail, helper)
+        self.emit_is_ne_shared(lhs.into(), rhs.into(), fail)
     }
 
     /// Emits a less-than guard.
@@ -1841,28 +1129,8 @@ impl BeamModuleAssembler {
         lhs: impl Into<TypedArg>,
         rhs: impl Into<TypedArg>,
         fail: u32,
-        helper: GuardHelper,
     ) -> Result<(), ModuleError> {
-        let (lhs, rhs) = (lhs.into(), rhs.into());
-        if self.has_arith_compare_shared() {
-            return self.emit_is_lt_shared(lhs, rhs, fail);
-        }
-        let (lhs, rhs) = (lhs.val, rhs.val);
-        if let Some((other, immediate, immediate_is_lhs)) = small_comparison_immediate(lhs, rhs) {
-            return self.emit_small_immediate_comparison(
-                other,
-                immediate,
-                immediate_is_lhs,
-                RelativeComparison::Less,
-                fail,
-                helper,
-            );
-        }
-        let left = self.source_reg(lhs)?;
-        let right = self.source_reg_into(rhs, Gpr::x(17))?;
-        self.code
-            .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
-        self.emit_small_compare(lhs, rhs, Cond::Lt, 23, fail, helper)
+        self.emit_is_lt_shared(lhs.into(), rhs.into(), fail)
     }
 
     /// Emits a greater-or-equal guard.
@@ -1872,28 +1140,8 @@ impl BeamModuleAssembler {
         lhs: impl Into<TypedArg>,
         rhs: impl Into<TypedArg>,
         fail: u32,
-        helper: GuardHelper,
     ) -> Result<(), ModuleError> {
-        let (lhs, rhs) = (lhs.into(), rhs.into());
-        if self.has_arith_compare_shared() {
-            return self.emit_is_ge_shared(lhs, rhs, fail);
-        }
-        let (lhs, rhs) = (lhs.val, rhs.val);
-        if let Some((other, immediate, immediate_is_lhs)) = small_comparison_immediate(lhs, rhs) {
-            return self.emit_small_immediate_comparison(
-                other,
-                immediate,
-                immediate_is_lhs,
-                RelativeComparison::GreaterEqual,
-                fail,
-                helper,
-            );
-        }
-        let left = self.source_reg(lhs)?;
-        let right = self.source_reg_into(rhs, Gpr::x(17))?;
-        self.code
-            .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
-        self.emit_small_compare(lhs, rhs, Cond::Ge, 24, fail, helper)
+        self.emit_is_ge_shared(lhs.into(), rhs.into(), fail)
     }
 
     /// Emits `is_int_ge`: fails unless the source is an integer not below `min`.
@@ -1903,13 +1151,8 @@ impl BeamModuleAssembler {
         src: TypedArg,
         min: ArgVal,
         fail: u32,
-        helper: GuardHelper,
     ) -> Result<(), ModuleError> {
-        if self.has_arith_compare_shared() {
-            return self.emit_is_int_ge_shared(src, min, fail);
-        }
-        self.emit_is_integer(src, fail)?;
-        self.emit_is_ge(src, min, fail, helper)
+        self.emit_is_int_ge_shared(src, min, fail)
     }
 
     /// Emits `is_int_in_range`: fails unless the source is a small integer in `min..=max`.
@@ -1920,14 +1163,8 @@ impl BeamModuleAssembler {
         min: ArgVal,
         max: ArgVal,
         fail: u32,
-        helper: GuardHelper,
     ) -> Result<(), ModuleError> {
-        if self.has_arith_compare_shared() {
-            return self.emit_is_int_in_range_shared(src, min, max, fail);
-        }
-        self.emit_is_integer(src, fail)?;
-        self.emit_is_ge(src, min, fail, helper)?;
-        self.emit_is_ge(max, src, fail, helper)
+        self.emit_is_int_in_range_shared(src, min, max, fail)
     }
 
     /// Emits a value-producing comparison BIF (`bif_is_eq_exact`, `bif_is_ne_exact`,
@@ -2087,13 +1324,12 @@ impl BeamModuleAssembler {
         index: impl Into<TypedArg>,
         tuple: impl Into<TypedArg>,
         destination: ArgVal,
-        runtime: GuardHelper,
     ) -> Result<(), ModuleError> {
         let (index, tuple) = (index.into(), tuple.into());
         if self.element_guard_shared != 0 {
             return self.emit_bif_element_shared(fail, index, tuple, destination);
         }
-        self.emit_bif_element_inline(fail, index.val, tuple.val, destination, runtime)
+        self.emit_bif_element_inline(fail, index.val, tuple.val, destination)
     }
 
     /// Emits `element/2` without the shared fragment (assemblers without a VM).
@@ -2106,7 +1342,6 @@ impl BeamModuleAssembler {
         index: ArgVal,
         tuple: ArgVal,
         destination: ArgVal,
-        _runtime: GuardHelper,
     ) -> Result<(), ModuleError> {
         let output = self.guard_destination(destination)?;
         let index = self.source_reg(index)?;
@@ -2151,9 +1386,9 @@ impl BeamModuleAssembler {
                 e.mov_reg(Gpr::x(25), Gpr::x(12))?;
                 e.mov_reg(Gpr::x(26), Gpr::x(13))
             })?;
-            self.set_badarg_mfa(0)?;
         }
-        self.emit_guard_fail(fail)?;
+        let mfa = if fail == 0 { self.guard_mfa(0)? } else { 0 };
+        self.emit_guard_fail(fail, mfa)?;
         self.code.bind(ok)?;
         self.store_guard_result(destination, output)?;
         Ok(())
@@ -2182,54 +1417,30 @@ impl BeamModuleAssembler {
                 }
             }
             e.mov_const(Gpr::x(9), crate::exc::EXC_BADARG)?;
-            e.str_uoff(Gpr::x(9), Gpr::x(21), 40)?;
-            e.mov_const(Gpr::x(3), mfa as u64)?;
-            e.str_uoff(
-                Gpr::x(3),
-                Gpr::x(21),
-                std::mem::offset_of!(crate::ProcessHeader, current) as u32,
-            )
+            e.str_uoff(Gpr::x(9), Gpr::x(21), 40)
         })?;
-        self.branch_error_preserving_bif()
+        self.branch_error_with_mfa(mfa)
     }
 
-    pub(super) fn set_badarg_mfa(&mut self, index: u64) -> Result<(), ModuleError> {
+    /// The `ErtsCodeMFA` of guard BIF `index`, embedded as erts' `emit_raise_exception(&mfa)`
+    /// constant.
+    pub(super) fn guard_mfa(&self, index: u64) -> Result<usize, ModuleError> {
         let index = usize::try_from(index)
             .map_err(|_| ModuleError::InvalidOperand("guard BIF MFA index"))?;
-        let mfa = crate::bif::guard_bif_mfa(index)
-            .ok_or(ModuleError::InvalidOperand("guard BIF MFA index"))?;
-        self.code.emit(|e| {
-            e.mov_const(Gpr::x(9), mfa as u64)?;
-            e.str_uoff(
-                Gpr::x(9),
-                Gpr::x(21),
-                std::mem::offset_of!(crate::ProcessHeader, current) as u32,
-            )
-        })?;
-        Ok(())
+        crate::bif::guard_bif_mfa(index).ok_or(ModuleError::InvalidOperand("guard BIF MFA index"))
     }
 
     /// Emits `hd/1`.
     // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:768-797, OTP-29.1.1: anything
     // but a cons cell raises badarg.
-    pub fn emit_bif_hd(
-        &mut self,
-        list: ArgVal,
-        destination: ArgVal,
-        runtime: GuardHelper,
-    ) -> Result<(), ModuleError> {
-        self.emit_cons_field(list, destination, 0, runtime)
+    pub fn emit_bif_hd(&mut self, list: ArgVal, destination: ArgVal) -> Result<(), ModuleError> {
+        self.emit_cons_field(list, destination, 0)
     }
 
     /// Emits `tl/1`.
     // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:1261-1290, OTP-29.1.1.
-    pub fn emit_bif_tl(
-        &mut self,
-        list: ArgVal,
-        destination: ArgVal,
-        runtime: GuardHelper,
-    ) -> Result<(), ModuleError> {
-        self.emit_cons_field(list, destination, 8, runtime)
+    pub fn emit_bif_tl(&mut self, list: ArgVal, destination: ArgVal) -> Result<(), ModuleError> {
+        self.emit_cons_field(list, destination, 8)
     }
 
     fn emit_cons_field(
@@ -2237,7 +1448,6 @@ impl BeamModuleAssembler {
         list: ArgVal,
         destination: ArgVal,
         offset: i16,
-        _runtime: GuardHelper,
     ) -> Result<(), ModuleError> {
         let output = self.guard_destination(destination)?;
         let list = self.source_reg(list)?;
@@ -2245,8 +1455,8 @@ impl BeamModuleAssembler {
         // A cons cell has primary tag 0b01; boxed, immediate and header words all have bit 1 set.
         self.code.tbz(list, 1, good)?;
         self.code.emit(|e| e.mov_reg(Gpr::x(25), list))?;
-        self.set_badarg_mfa(if offset == 0 { 1 } else { 2 })?;
-        self.emit_guard_fail(0)?;
+        let mfa = self.guard_mfa(if offset == 0 { 1 } else { 2 })?;
+        self.emit_guard_fail(0, mfa)?;
         self.code.bind(good)?;
         self.code.emit(|e| {
             e.and_imm(Gpr::x(10), list, !7)?;
@@ -2263,7 +1473,6 @@ impl BeamModuleAssembler {
         fail: u32,
         tuple: ArgVal,
         destination: ArgVal,
-        _runtime: GuardHelper,
     ) -> Result<(), ModuleError> {
         let output = self.guard_destination(destination)?;
         let tuple = self.source_reg(tuple)?;
@@ -2291,9 +1500,9 @@ impl BeamModuleAssembler {
             // Port of instr_guard_bifs.cpp:1310-1321 (emit_bif_tuple_size_body): badarg with
             // erlang:tuple_size/1 as the top frame.
             self.code.emit(|e| e.mov_reg(Gpr::x(25), tuple))?;
-            self.set_badarg_mfa(6)?;
         }
-        self.emit_guard_fail(fail)?;
+        let mfa = if fail == 0 { self.guard_mfa(6)? } else { 0 };
+        self.emit_guard_fail(fail, mfa)?;
         self.code.bind(ok)?;
         self.store_guard_result(destination, output)?;
         Ok(())
@@ -2306,14 +1515,8 @@ impl BeamModuleAssembler {
         fail: u32,
         map: ArgVal,
         destination: ArgVal,
-        _runtime: GuardHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_bif_map_size_typed(
-            fail,
-            TypedArg::new(map, ArgType::ANY),
-            destination,
-            _runtime,
-        )
+        self.emit_bif_map_size_typed(fail, TypedArg::new(map, ArgType::ANY), destination)
     }
 
     /// Emits `map_size/1`, eliding checks proven redundant by the `Type` chunk.
@@ -2323,7 +1526,6 @@ impl BeamModuleAssembler {
         fail: u32,
         map: TypedArg,
         destination: ArgVal,
-        _runtime: GuardHelper,
     ) -> Result<(), ModuleError> {
         let output = self.guard_destination(destination)?;
         let map_reg = self.source_reg(map.val)?;
@@ -2404,10 +1606,10 @@ impl BeamModuleAssembler {
                     e.str_uoff(Gpr::x(9), Gpr::x(21), 40)?;
                     e.str_uoff(Gpr::x(25), Gpr::x(21), 48)
                 })?;
-                self.set_badarg_mfa(5)?;
-                self.branch_error()?;
+                let mfa = self.guard_mfa(5)?;
+                self.branch_error_with_mfa(mfa)?;
             } else {
-                self.emit_guard_fail(fail)?;
+                self.emit_guard_fail(fail, 0)?;
             }
             self.code.bind(ok)?;
         }
@@ -2415,85 +1617,29 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
-    /// Emits the body fast path of `is_map_key/2` through the shared map lookup fragment.
-    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:799-830, OTP-29.1.1
-    #[allow(clippy::too_many_arguments)]
-    pub fn emit_bif_is_map_key(
-        &mut self,
-        fail: u32,
-        key: ArgVal,
-        map: ArgVal,
-        destination: ArgVal,
-        helper: GuardHelper,
-        exact_map: bool,
-        key_maybe_immediate: bool,
-        map_runtime: crate::map::MapRuntime,
-    ) -> Result<(), ModuleError> {
-        if !exact_map {
-            self.set_badarg_mfa(9)?;
-            let slow = self.code.new_label();
-            let done = self.code.new_label();
-            self.emit_map_is_key_fast(
-                map,
-                key,
-                destination,
-                false,
-                key_maybe_immediate,
-                Some(slow),
-                map_runtime,
-            )?;
-            self.code.b(done)?;
-            self.code.bind(slow)?;
-            self.emit_guard_value_helper_fail(fail, true, 30, key, map, destination, helper)?;
-            self.code.bind(done)?;
-            return Ok(());
-        }
-        self.emit_map_is_key_fast(
-            map,
-            key,
-            destination,
-            true,
-            key_maybe_immediate,
-            None,
-            map_runtime,
-        )
-    }
-
-    /// Emits `is_map_key/2`, using map and key types to select the shared lookup fragment.
-    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:799-830, OTP-29.1.1.
+    /// Emits the inlined `is_map_key/2` for a source known to be a map. Any other source is
+    /// the `i_bif2` call of the loader (`emit_bif_by_identity`).
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:799-825 (emit_bif_is_map_key),
+    // OTP-29.1.1.
     pub fn emit_bif_is_map_key_typed(
         &mut self,
-        fail: u32,
         key: TypedArg,
         map: TypedArg,
         destination: ArgVal,
-        helper: GuardHelper,
         map_runtime: crate::map::MapRuntime,
     ) -> Result<(), ModuleError> {
         if !map.exact_type(type_id::MAP) {
-            return self.emit_bif_is_map_key(
-                fail,
-                key.val,
-                map.val,
-                destination,
-                helper,
-                false,
-                key.maybe_one_of(type_id::MAYBE_IMMEDIATE),
-                map_runtime,
-            );
+            return Err(ModuleError::InvalidOperand(
+                "is_map_key/2 on a source not known to be a map is an i_bif2 call",
+            ));
         }
-
         let output = self.guard_destination(destination)?;
         let map_reg = self.source_reg(map.val)?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(0), map_reg))?;
         let key_reg = self.source_reg_into(key.val, Gpr::x(17))?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(1), key_reg))?;
         if key.maybe_one_of(type_id::MAYBE_IMMEDIATE) {
-            self.code.emit(|e| {
-                e.mov_reg(Gpr::x(0), map_reg)?;
-                e.mov_reg(Gpr::x(1), key_reg)
-            })?;
-            self.code
-                .emit(|e| e.mov_const(Gpr::x(17), map_runtime.get_element_shared as u64))?;
-            self.code.emit(|e| e.blr(Gpr::x(17)))?;
+            self.fragment_call(map_runtime.get_element_shared)?;
             self.code.emit(|e| {
                 e.mov_const(Gpr::x(10), 0x4b)?;
                 e.mov_const(Gpr::x(11), 0x0b)?;
@@ -2501,18 +1647,7 @@ impl BeamModuleAssembler {
             })?;
             return self.store_guard_result(destination, output);
         }
-
-        // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:811-819, OTP-29.1.1: the
-        // sources go to their own argument registers; x0 is rewritten with `c_p` first.
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(8), map_reg)?;
-            e.mov_reg(Gpr::x(9), key_reg)?;
-            e.mov_reg(Gpr::x(10), Gpr::xzr())
-        })?;
-        self.emit_guard_runtime_call(
-            map_runtime.get as usize,
-            &[Gpr::x(8), Gpr::x(9), Gpr::x(10)],
-        )?;
+        self.emit_get_map_element_call(crate::rt::get_map_element as *const () as usize)?;
         self.code.emit(|e| {
             e.cmp_imm(Gpr::x(0), 0, false)?;
             e.mov_const(Gpr::x(10), 0x4b)?;
@@ -2522,8 +1657,10 @@ impl BeamModuleAssembler {
         self.store_guard_result(destination, output)
     }
 
-    /// Emits `map_get/2`: shared-fragment lookup, the runtime hook for a miss or non-map.
-    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:854-936, OTP-29.1.1
+    /// Emits `map_get/2`: a failing guard branches to its label, a failing body call raises
+    /// through the process-wide `handle_map_get_badmap` / `handle_map_get_badkey` fragments.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:854-936 (emit_bif_map_get),
+    // OTP-29.1.1.
     #[allow(clippy::too_many_arguments)]
     pub fn emit_bif_map_get(
         &mut self,
@@ -2531,36 +1668,20 @@ impl BeamModuleAssembler {
         key: ArgVal,
         map: ArgVal,
         destination: ArgVal,
-        helper: GuardHelper,
         exact_map: bool,
         key_maybe_immediate: bool,
         map_runtime: crate::map::MapRuntime,
     ) -> Result<(), ModuleError> {
-        if let Some((badmap, badkey, _)) = self.map_error_fragments {
-            return self.emit_bif_map_get_fragments(
-                fail,
-                (key, map, destination),
-                (exact_map, key_maybe_immediate),
-                map_runtime,
-                (badmap, badkey),
-            );
-        }
-        let slow = self.code.new_label();
-        let done = self.code.new_label();
-        self.emit_map_get_fast(
-            map,
-            key,
-            destination,
-            slow,
-            exact_map,
-            key_maybe_immediate,
+        let (badmap, badkey, _) = self.map_error_fragments.ok_or(ModuleError::InvalidOperand(
+            "map_get/2 needs the map error fragments",
+        ))?;
+        self.emit_bif_map_get_fragments(
+            fail,
+            (key, map, destination),
+            (exact_map, key_maybe_immediate),
             map_runtime,
-        )?;
-        self.code.b(done)?;
-        self.code.bind(slow)?;
-        self.emit_guard_value_helper_fail(fail, false, 31, key, map, destination, helper)?;
-        self.code.bind(done)?;
-        Ok(())
+            (badmap, badkey),
+        )
     }
 
     /// `map_get/2` with the process-wide `handle_map_get_badmap` and `handle_map_get_badkey`
@@ -2640,7 +1761,6 @@ impl BeamModuleAssembler {
         fail: u32,
         term: ArgVal,
         destination: ArgVal,
-        _runtime: GuardHelper,
     ) -> Result<(), ModuleError> {
         self.emit_bitstring_size(fail, term, destination, true)
     }
@@ -2653,7 +1773,6 @@ impl BeamModuleAssembler {
         fail: u32,
         term: ArgVal,
         destination: ArgVal,
-        _runtime: GuardHelper,
     ) -> Result<(), ModuleError> {
         self.emit_bitstring_size(fail, term, destination, false)
     }
@@ -2713,9 +1832,13 @@ impl BeamModuleAssembler {
         self.code.bind(bad)?;
         if fail == 0 {
             self.code.emit(|e| e.mov_reg(Gpr::x(25), term))?;
-            self.set_badarg_mfa(if bytes { 4 } else { 3 })?;
         }
-        self.emit_guard_fail(fail)?;
+        let mfa = if fail == 0 {
+            self.guard_mfa(if bytes { 4 } else { 3 })?
+        } else {
+            0
+        };
+        self.emit_guard_fail(fail, mfa)?;
         self.code.bind(ok)?;
         self.store_guard_result(destination, output)?;
         Ok(())
@@ -2723,54 +1846,99 @@ impl BeamModuleAssembler {
 
     /// Emits `self/0` through the runtime hook.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:844-857, OTP-29.1.1
-    pub fn emit_bif_self(
-        &mut self,
-        destination: ArgVal,
-        _runtime: GuardHelper,
-    ) -> Result<(), ModuleError> {
+    pub fn emit_bif_self(&mut self, destination: ArgVal) -> Result<(), ModuleError> {
         let output = self.guard_destination(destination)?;
         self.code.emit(|e| e.ldr_uoff(output, Gpr::x(21), 104))?;
         self.store_guard_result(destination, output)?;
         Ok(())
     }
 
-    /// Emits `node/1` through the runtime hook.
-    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:1089-1170, OTP-29.1.1
+    /// Emits `node/1`: the node of an internal identifier is `erts_this_node`, of an
+    /// external one the `ExternalThing`'s `node`; anything else fails or raises badarg.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:1084-1170 (emit_handle_node_error,
+    // emit_bif_node), OTP-29.1.1.
     pub fn emit_bif_node(
         &mut self,
         fail: u32,
         term: ArgVal,
         destination: ArgVal,
-        helper: GuardHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_guard_value_helper_fail(
-            fail,
-            false,
-            39,
-            term,
-            ArgVal::Immediate(0),
-            destination,
-            helper,
-        )
-    }
-
-    /// Emits `length/1` through the runtime hook, for a `bif_length` that has no `i_length` state.
-    pub fn emit_bif_length_helper(
-        &mut self,
-        fail: u32,
-        list: ArgVal,
-        destination: ArgVal,
-        helper: GuardHelper,
-    ) -> Result<(), ModuleError> {
-        self.emit_guard_value_helper_fail(
-            fail,
-            false,
-            35,
-            list,
-            ArgVal::Immediate(0),
-            destination,
-            helper,
-        )
+        const TAG_HEADER_MASK: u64 = 0x3f;
+        const TAG_HEADER_REF: u16 = 0x10;
+        const TAG_HEADER_EXTERNAL_PID: u16 = 0x30;
+        const TAG_HEADER_EXTERNAL_REF: u16 = 0x38;
+        const TAG_IMMED1_MASK: u64 = 0xf;
+        const TAG_IMMED1_PID: u16 = 0x3;
+        const TAG_IMMED1_PORT: u16 = 0x7;
+        let output = self.guard_destination(destination)?;
+        let src = self.source_reg_into(term, Gpr::x(1))?;
+        if src != Gpr::x(1) {
+            self.code.emit(|e| e.mov_reg(Gpr::x(1), src))?;
+        }
+        let src = Gpr::x(1);
+        let test_internal = self.code.new_label();
+        let internal = self.code.new_label();
+        let next = self.code.new_label();
+        let external = self.code.new_label();
+        let fail_label = if fail != 0 {
+            self.label(fail)
+        } else {
+            self.code.new_label()
+        };
+        // emit_is_boxed: an immediate goes to the internal pid/port test.
+        self.code.tbnz(src, 0, test_internal)?;
+        self.code.emit(|e| {
+            e.ldur(Gpr::x(11), src, -2)?;
+            e.and_imm(Gpr::x(11), Gpr::x(11), TAG_HEADER_MASK)?;
+            e.cmp_imm(Gpr::x(11), TAG_HEADER_REF, false)
+        })?;
+        self.code.b_cond(Cond::Eq, internal)?;
+        self.code.emit(|e| {
+            e.sub_imm(Gpr::x(12), Gpr::x(11), TAG_HEADER_EXTERNAL_PID, false)?;
+            e.cmp_imm(
+                Gpr::x(12),
+                TAG_HEADER_EXTERNAL_REF - TAG_HEADER_EXTERNAL_PID,
+                false,
+            )
+        })?;
+        if fail != 0 {
+            self.code.b_cond(Cond::Hi, fail_label)?;
+        } else {
+            self.code.b_cond(Cond::Ls, external)?;
+            self.code.bind(fail_label)?;
+            // `mov_var(XREG0, src); fragment_call(ga->get_handle_node_error())`.
+            self.code.emit(|e| e.mov_reg(Gpr::x(25), Gpr::x(1)))?;
+            self.cache_invalidate_reg(Gpr::x(25));
+            let mfa = self.guard_mfa(13)?;
+            self.emit_guard_fail(0, mfa)?;
+        }
+        self.code.bind(external)?;
+        // `ExternalThing.node`, the word after the header.
+        self.code.emit(|e| e.ldur(Gpr::x(10), src, 6))?;
+        self.code.b(next)?;
+        self.code.bind(test_internal)?;
+        self.code.emit(|e| {
+            e.and_imm(Gpr::x(10), src, TAG_IMMED1_MASK)?;
+            e.cmp_imm(Gpr::x(10), TAG_IMMED1_PID, false)
+        })?;
+        self.code.b_cond(Cond::Eq, internal)?;
+        self.code
+            .emit(|e| e.cmp_imm(Gpr::x(10), TAG_IMMED1_PORT, false))?;
+        self.code.b_cond(Cond::Ne, fail_label)?;
+        self.code.bind(internal)?;
+        self.code.emit(|e| {
+            e.mov_const(Gpr::x(10), arinsal_term::erts_this_node_addr() as u64)?;
+            e.ldr_uoff(Gpr::x(10), Gpr::x(10), 0)
+        })?;
+        self.code.bind(next)?;
+        self.code.emit(|e| {
+            e.ldr_uoff(
+                output,
+                Gpr::x(10),
+                arinsal_term::ERL_NODE_SYSNAME_OFFSET as u32,
+            )
+        })?;
+        self.store_guard_result(destination, output)
     }
 
     /// Emits the trap state `i_length` walks: the list, the length so far and, outside
@@ -2794,196 +1962,63 @@ impl BeamModuleAssembler {
         self.store_operand(x_slot(live)?, Gpr::x(10))
     }
 
-    /// Emits `length/1`: `erts_trapping_length_1` walks at most 16 elements per reduction
-    /// left, then charges the elements it walked or, past that, takes the rest of the
-    /// reductions and yields, to resume at this instruction with the state in the registers
-    /// above the live ones.
-    // Port of erts/emulator/beam/erl_bif_guard.c:270-320 (erts_trapping_length_1), OTP-29.1.1.
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:230-335 (emit_i_length_common,
-    // emit_i_length), OTP-29.1.1.
+    /// Emits `length/1`: the `i_length_{body,guard}_shared` fragment calls
+    /// `erts_trapping_length_1`, which walks the trap state above the live registers; on TRAP
+    /// it yields through `context_switch_simplified` and the instruction runs again at `entry`.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:323-339 (emit_i_length), OTP-29.1.1.
     pub fn emit_bif_length(
         &mut self,
         fail: u32,
         live: u32,
         destination: ArgVal,
-        helper: GuardHelper,
     ) -> Result<(), ModuleError> {
-        let output = self.guard_destination(destination)?;
-        let list_slot = x_slot(live)?;
-        let acc_slot = x_slot(live + 1)?;
+        let (body_shared, guard_shared) = (
+            self.bif_fragments.i_length_body,
+            self.bif_fragments.i_length_guard,
+        );
+        if body_shared == 0 || guard_shared == 0 {
+            return Err(ModuleError::InvalidOperand(
+                "length/1 without the i_length_*_shared fragments",
+            ));
+        }
         let entry = self.code.new_label();
-        let loop_label = self.code.new_label();
-        let not_list = self.code.new_label();
-        let slow = self.code.new_label();
-        let trap = self.code.new_label();
-        let finished = self.code.new_label();
         self.code.bind(entry)?;
-        let list_reg = self.source_reg_into(list_slot, Gpr::x(11))?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(11), list_reg))?;
-        let acc_reg = self.source_reg_into(acc_slot, Gpr::x(12))?;
-        self.code.emit(|e| {
-            e.asr_imm(Gpr::x(12), acc_reg, 4)?;
-            e.mov_const(Gpr::x(13), 0)?;
-            e.cmp_imm(Gpr::w(22), 0, false)?;
-            e.csel(Gpr::w(13), Gpr::w(22), Gpr::w(13), Cond::Gt)?;
-            e.lsl_imm(Gpr::x(13), Gpr::x(13), 4)?;
-            e.mov_reg(Gpr::x(14), Gpr::x(13))
-        })?;
-        self.code.bind(loop_label)?;
-        self.code.emit(|e| {
-            e.ands_imm(Gpr::x(8), Gpr::x(11), 3)?;
-            e.cmp_imm(Gpr::x(8), 1, false)
-        })?;
-        self.code.b_cond(Cond::Ne, not_list)?;
-        self.code.cbz(Gpr::x(13), trap)?;
-        // CDR(list_val(list)): a list tag of 1 puts the tail word at tagged+7.
-        self.code.emit(|e| {
-            e.ldur(Gpr::x(11), Gpr::x(11), 7)?;
-            e.add_imm(Gpr::x(12), Gpr::x(12), 1, false)?;
-            e.sub_imm(Gpr::x(13), Gpr::x(13), 1, false)
-        })?;
-        self.code.b(loop_label)?;
-        self.code.bind(not_list)?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(11), 0x3b, false))?;
-        self.code.b_cond(Cond::Ne, slow)?;
-        // BUMP_REDS(p, (saved_max_iter - max_iter) / 16); BUMP_REDS clamps FCALLS at zero.
-        self.code.emit(|e| {
-            e.sub_reg(
-                Gpr::x(9),
-                Gpr::x(14),
-                Gpr::x(13),
-                arinsal_a64::enc::Shift::Lsl,
-                0,
-            )?;
-            e.lsr_imm(Gpr::x(9), Gpr::x(9), 4)?;
-            e.sub_reg(
-                Gpr::w(22),
-                Gpr::w(22),
-                Gpr::w(9),
-                arinsal_a64::enc::Shift::Lsl,
-                0,
-            )?;
-            e.cmp_imm(Gpr::w(22), 0, false)?;
-            e.csel(Gpr::x(22), Gpr::xzr(), Gpr::x(22), Cond::Lt)?;
-            e.lsl_imm(output, Gpr::x(12), 4)?;
-            e.orr_imm(output, output, 15)
-        })?;
-        self.store_guard_result(destination, output)?;
-        self.code.b(finished)?;
-        self.code.bind(slow)?;
-        let original = if fail == 0 {
-            x_slot(live + 2)?
+        // ARG2 = live registers, ARG3 = entry address; the result comes back in ARG1.
+        self.code
+            .emit(|e| e.mov_const(Gpr::x(1), u64::from(live)))?;
+        self.code.adr(Gpr::x(2), entry)?;
+        if fail != 0 {
+            self.fragment_call(guard_shared)?;
+            let fail_label = self.label(fail);
+            self.code.cbz(Gpr::x(0), fail_label)?;
         } else {
-            list_slot
-        };
-        self.emit_guard_value_helper_fail(
-            fail,
-            false,
-            35,
-            original,
-            ArgVal::Immediate(0),
-            destination,
-            helper,
-        )?;
-        self.code.b(finished)?;
-        // The allotted iterations are used up: save the walk, take the rest of the
-        // reductions (BUMP_ALL_REDS) and yield. The instruction runs again on resume.
-        self.code.bind(trap)?;
-        self.code.emit(|e| {
-            e.lsl_imm(Gpr::x(9), Gpr::x(12), 4)?;
-            e.orr_imm(Gpr::x(9), Gpr::x(9), 15)
-        })?;
-        self.store_operand(list_slot, Gpr::x(11))?;
-        self.store_operand(acc_slot, Gpr::x(9))?;
-        self.code.emit(|e| e.mov_const(Gpr::x(22), 0))?;
-        self.code.adr(Gpr::x(8), entry)?;
-        self.code.emit(|e| {
-            e.str_uoff(Gpr::x(8), Gpr::x(21), 72)?;
-            e.mov_reg(Gpr::x(2), Gpr::x(8))
-        })?;
-        self.emit_yield_live((live + if fail == 0 { 3 } else { 2 }) as u8)?;
-        self.code.b(self.yield_label)?;
-        self.code.bind(finished)?;
-        Ok(())
+            self.fragment_call(body_shared)?;
+        }
+        self.store_guard_result(destination, Gpr::x(0))
     }
 
-    /// Emits `min/2` through the runtime hook.
-    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:999-1065, OTP-29.1.1
+    /// Emits `min/2`.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:1073-1077 (emit_bif_min),
+    // OTP-29.1.1.
     pub fn emit_bif_min(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         destination: ArgVal,
-        helper: GuardHelper,
     ) -> Result<(), ModuleError> {
-        let left = self.source_reg(lhs)?;
-        let right = self.source_reg_into(rhs, Gpr::x(17))?;
-        self.code
-            .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
-        self.emit_min_max(lhs, rhs, Cond::Gt, 36, destination, helper)
+        self.emit_bif_min_max(Cond::Gt, lhs, rhs, destination)
     }
 
-    /// Emits `max/2` through the runtime hook.
-    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:999-1065, OTP-29.1.1
+    /// Emits `max/2`.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:1067-1071 (emit_bif_max),
+    // OTP-29.1.1.
     pub fn emit_bif_max(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         destination: ArgVal,
-        helper: GuardHelper,
     ) -> Result<(), ModuleError> {
-        let left = self.source_reg(lhs)?;
-        let right = self.source_reg_into(rhs, Gpr::x(17))?;
-        self.code
-            .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
-        self.emit_min_max(lhs, rhs, Cond::Lt, 37, destination, helper)
-    }
-
-    /// Emits `abs/1` through the runtime hook.
-    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:246-333, OTP-29.1.1
-    pub fn emit_bif_abs(
-        &mut self,
-        fail: u32,
-        value: ArgVal,
-        destination: ArgVal,
-        helper: GuardHelper,
-    ) -> Result<(), ModuleError> {
-        let output = self.guard_destination(destination)?;
-        let value_reg = self.source_reg(value)?;
-        let slow = self.code.new_label();
-        let done = self.code.new_label();
-        self.code.emit(|e| {
-            e.ands_imm(Gpr::x(8), value_reg, 15)?;
-            e.cmp_imm(Gpr::x(8), 15, false)
-        })?;
-        self.code.b_cond(Cond::Ne, slow)?;
-        self.code
-            .emit(|e| e.mov_const(Gpr::x(8), 0x8000_0000_0000_000f))?;
-        self.code
-            .emit(|e| e.cmp_reg(value_reg, Gpr::x(8), arinsal_a64::enc::Shift::Lsl, 0))?;
-        self.code.b_cond(Cond::Eq, slow)?;
-        self.code.emit(|e| {
-            e.asr_imm(Gpr::x(8), value_reg, 4)?;
-            e.cmp_imm(Gpr::x(8), 0, false)?;
-            e.neg(Gpr::x(9), Gpr::x(8))?;
-            e.csel(Gpr::x(8), Gpr::x(9), Gpr::x(8), Cond::Mi)?;
-            e.lsl_imm(output, Gpr::x(8), 4)?;
-            e.orr_imm(output, output, 15)
-        })?;
-        self.store_guard_result(destination, output)?;
-        self.code.b(done)?;
-        self.code.bind(slow)?;
-        self.emit_guard_value_helper_fail(
-            fail,
-            false,
-            38,
-            value,
-            ArgVal::Immediate(0),
-            destination,
-            helper,
-        )?;
-        self.code.bind(done)?;
-        Ok(())
+        self.emit_bif_min_max(Cond::Lt, lhs, rhs, destination)
     }
 }
 
@@ -2997,18 +2032,6 @@ impl BeamModuleAssembler {
         self.exact_immediate(rhs)
             .map(|word| (lhs, word))
             .or_else(|| self.exact_immediate(lhs).map(|word| (rhs, word)))
-    }
-}
-
-fn small_comparison_immediate(lhs: ArgVal, rhs: ArgVal) -> Option<(ArgVal, u64, bool)> {
-    match (lhs, rhs) {
-        (ArgVal::X(_) | ArgVal::Y(_), ArgVal::Immediate(word)) if word & 15 == 15 => {
-            Some((lhs, word, false))
-        }
-        (ArgVal::Immediate(word), ArgVal::X(_) | ArgVal::Y(_)) if word & 15 == 15 => {
-            Some((rhs, word, true))
-        }
-        _ => None,
     }
 }
 

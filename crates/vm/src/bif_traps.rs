@@ -360,9 +360,7 @@ mod export_trap_tests {
         assert!(process.heap.gc_enabled(), "export traps keep GC enabled");
 
         // A collection while the process is scheduled out: the live X registers are the roots.
-        process
-            .collect_arg_reg(process.gc_live, &mut [], 0)
-            .unwrap();
+        process.collect_arg_reg(process.gc_live, &mut [], 0);
 
         let Some(resumed) = take_export_trap(&mut process) else {
             panic!("the export trap resumes as an export call");

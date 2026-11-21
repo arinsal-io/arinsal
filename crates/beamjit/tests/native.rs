@@ -41,29 +41,48 @@ extern "C" fn raise_class_for_compile(_header: *mut ProcessHeader, _trace: u64) 
 
 struct TestEnv;
 
-impl ModuleEnv for TestEnv {
-    fn yield_fragments(&self) -> (usize, usize, usize) {
-        let fragments = YIELD_FRAGMENTS.get_or_init(|| YieldFragments::new().unwrap());
-        (
-            fragments.dispatch_return(),
-            fragments.i_test_yield_shared(),
-            fragments.context_switch(),
+/// The process native code runs on: the native prefix at `c_p` and the `ERTS_PSFLG_*` word
+/// at `offsetof(Process, state)`, as the VM's process struct lays them out.
+#[repr(C)]
+struct TestProcess {
+    header: ProcessHeader,
+    state: u32,
+}
+
+impl TestProcess {
+    fn new(header: ProcessHeader) -> Box<Self> {
+        Box::new(Self { header, state: 0 })
+    }
+}
+
+/// The process-wide fragments (`ga`), built once as the VM builds them, with [`gc_hook`] as
+/// `erts_garbage_collect_nobump` and the `state` word of [`TestProcess`].
+fn yield_fragments() -> &'static YieldFragments {
+    YIELD_FRAGMENTS.get_or_init(|| {
+        YieldFragments::new(
+            gc_hook as *const () as usize,
+            std::mem::offset_of!(TestProcess, state) as u32,
         )
+        .unwrap()
+    })
+}
+
+impl ModuleEnv for TestEnv {
+    fn yield_fragments(&self) -> arinsal_beamasm::yield_frag::YieldEntries {
+        yield_fragments().entries()
     }
 
     fn raise_fragments(&self) -> (usize, usize, usize) {
-        let fragments = RAISE_FRAGMENTS.get_or_init(|| {
-            RaiseFragments::new(
-                exception_resolver as *const () as usize,
-                raise_class_for_compile as *const () as usize,
-            )
-            .unwrap()
-        });
+        let fragments = raise_fragments();
         (
             fragments.raise_shared(),
             fragments.raise_exception_shared(),
             fragments.func_info_shared(),
         )
+    }
+
+    fn bif_fragments(&self) -> arinsal_beamasm::raise_frag::BifFragments {
+        raise_fragments().bif_fragments()
     }
 
     fn raise_class_helper(&self) -> usize {
@@ -141,22 +160,6 @@ impl ModuleEnv for TestEnv {
         0x0F00
     }
 
-    fn arithmetic_helper(&self) -> arinsal_beamasm::arith::ArithHelper {
-        arithmetic_helper
-    }
-
-    fn guard_helper(&self) -> arinsal_beamasm::guard::GuardHelper {
-        guard_helper
-    }
-
-    fn guard_helper3(&self) -> arinsal_beamasm::guard::GuardHelper3 {
-        guard_helper3
-    }
-
-    fn gc_hook(&self) -> arinsal_beamasm::construct::GcHook {
-        gc_hook
-    }
-
     fn map_lookup_helper(&self) -> arinsal_beamjit::MapLookupHelper {
         map_lookup_helper
     }
@@ -165,54 +168,8 @@ impl ModuleEnv for TestEnv {
         bif_mfa_helper
     }
 
-    fn bs_match_helper(&self) -> arinsal_beamasm::bs_match::BsMatchHelper {
-        bs_match_helper
-    }
-
     fn map_runtime(&self) -> arinsal_beamasm::map::MapRuntime {
-        arinsal_beamasm::map::MapRuntime {
-            get: map_get_helper,
-            get_elements: map_get_elements_helper,
-            lookup_module: 0,
-            new_map: map_update_helper,
-            update_assoc: map_update_helper,
-            update_exact: map_update_helper,
-            put_single: map_update_helper,
-            update_single_assoc_shared: map_fragments(map_get_helper, map_update_helper)
-                .update_single_assoc_shared(),
-            update_assoc_shared: map_fragments(map_get_helper, map_update_helper)
-                .update_assoc_shared(),
-            update_exact_shared: map_fragments(map_get_helper, map_update_helper)
-                .update_exact_shared(),
-            update_single_exact_shared: map_fragments(map_get_helper, map_update_helper)
-                .update_single_exact_shared(),
-            get_element_shared: map_fragments(map_get_helper, map_update_helper)
-                .get_element_shared(),
-            get_element_hash_shared: map_fragments(map_get_helper, map_update_helper)
-                .get_element_hash_shared(),
-        }
-    }
-
-    fn bs_create_bin_helper(&self) -> arinsal_beamasm::bs_construct::BsCreateBinHelpers {
-        use arinsal_beamasm::bs_construct::BsCreateBinHelpers;
-        BsCreateBinHelpers {
-            append_checked: bs_create_bin_append,
-            private_append: bs_create_bin_private_append,
-            init_bits: bs_create_bin_init,
-            bit_size: bs_create_bin_size,
-            utf8_size: bs_create_bin_size,
-            utf16_size: bs_create_bin_size,
-            utf32_size: bs_create_bin_size,
-            fail: bs_create_bin_fail,
-            put_integer: bs_create_bin_put,
-            put_binary: bs_create_bin_put,
-            put_binary_all: bs_create_bin_put,
-            put_float: bs_create_bin_put,
-            put_utf8: bs_create_bin_put,
-            put_utf16: bs_create_bin_put,
-            put_utf32: bs_create_bin_put,
-            put_string: bs_create_bin_put,
-        }
+        map_fragments().runtime()
     }
 
     fn exception_resolver(&self) -> arinsal_beamasm::catch::ExceptionResolver {
@@ -222,109 +179,6 @@ impl ModuleEnv for TestEnv {
     fn fun_resolver(&self) -> arinsal_beamasm::fun::FunResolver {
         fun_resolver
     }
-}
-
-extern "C" fn bs_match_helper(
-    _process: *mut ProcessHeader,
-    _op: u32,
-    _context: u64,
-    _value: u64,
-    _unit: u64,
-) -> u64 {
-    0
-}
-
-extern "C" fn map_get_helper(
-    _process: *mut ProcessHeader,
-    _map: u64,
-    _key: u64,
-    _hash: u64,
-) -> u64 {
-    0
-}
-
-extern "C" fn map_get_elements_helper(
-    _process: *mut ProcessHeader,
-    _map: u64,
-    _module: u64,
-    _table: u64,
-    _stack: u64,
-    _reg: *mut u64,
-) -> u64 {
-    0
-}
-
-extern "C" fn map_update_helper(
-    _process: *mut ProcessHeader,
-    _map: u64,
-    _registers: u64,
-    _live: u64,
-    _count: u64,
-    _reg: *mut u64,
-) -> u64 {
-    0
-}
-
-extern "C" fn bs_create_bin_init(
-    _process: *mut ProcessHeader,
-    _registers: *mut u64,
-    _bits: u64,
-    _alloc: u64,
-    _live: u64,
-) -> u64 {
-    0
-}
-
-extern "C" fn bs_create_bin_append(
-    _process: *mut arinsal_beamasm::ProcessHeader,
-    _registers: *mut u64,
-    _source: u64,
-    _bits: u64,
-    _unit: u64,
-    _live: u64,
-    _alloc: u64,
-) -> u64 {
-    0
-}
-
-extern "C" fn bs_create_bin_private_append(
-    _process: *mut arinsal_beamasm::ProcessHeader,
-    _registers: *mut u64,
-    _source: u64,
-    _bits: u64,
-) -> u64 {
-    0
-}
-
-extern "C" fn bs_create_bin_size(
-    _process: *mut ProcessHeader,
-    _registers: *mut u64,
-    _source: u64,
-    _index: u64,
-) -> u64 {
-    u64::MAX
-}
-
-extern "C" fn bs_create_bin_fail(
-    _process: *mut ProcessHeader,
-    _registers: *mut u64,
-    _packed: u64,
-    _arg3: u64,
-    _arg1: u64,
-) -> u64 {
-    0
-}
-
-extern "C" fn bs_create_bin_put(
-    _process: *mut ProcessHeader,
-    _registers: *mut u64,
-    _source: u64,
-    _bits: u64,
-    _flags: u64,
-    _index: u64,
-    _total_bits: u64,
-) -> u64 {
-    0
 }
 
 extern "C" fn exception_resolver(
@@ -367,41 +221,12 @@ extern "C" fn bif_mfa_helper(
     0
 }
 
-extern "C" fn arithmetic_helper(
-    _process: *mut ProcessHeader,
-    _op: u32,
-    _lhs: u64,
-    _rhs: u64,
-    _extra: u64,
-    _reg: *mut u64,
-) -> u64 {
-    0
-}
-
-extern "C" fn guard_helper(
-    _process: *mut ProcessHeader,
-    _op: u32,
-    _first: u64,
-    _second: u64,
-) -> u64 {
-    0
-}
-
-extern "C" fn guard_helper3(
-    _process: *mut ProcessHeader,
-    _op: u32,
-    _first: u64,
-    _second: u64,
-    _third: u64,
-) -> u64 {
-    0
-}
-
+/// `erts_garbage_collect_nobump` of these cases: the heap always has room.
 extern "C" fn gc_hook(
-    _header: *mut ProcessHeader,
-    _registers: *mut u64,
-    _words: usize,
-    _live: usize,
+    _c_p: *mut ProcessHeader,
+    _need: usize,
+    _objv: *mut u64,
+    _nobj: i32,
     _fcalls: i32,
 ) -> i32 {
     0
@@ -440,14 +265,15 @@ fn erlc_add_function_runs_through_native_bridge() {
 
     let mut stack = [0_u64; 64];
     let mut heap = [0_u64; 64];
-    let mut header = ProcessHeader {
+    let mut process = TestProcess::new(ProcessHeader {
         htop: heap.as_mut_ptr(),
         stop: stack.as_mut_ptr().wrapping_add(stack.len()),
         heap: heap.as_mut_ptr(),
         hend: heap.as_mut_ptr().wrapping_add(heap.len()),
         fcalls: 100,
         ..ProcessHeader::default()
-    };
+    });
+    let header = &mut process.header;
     let mut registers = SchedulerRegisters::default();
     registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(tagged_small(19));
     registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(tagged_small(23));
@@ -455,7 +281,7 @@ fn erlc_add_function_runs_through_native_bridge() {
         + arinsal_beamasm::common::beam_asm_h::FUNC_INFO_BYTES;
     let caller = caller_module(target, 0xffff_fffe);
     let caller_entry = caller.entry(0xffff_fffe).unwrap();
-    let result = arinsal_beamasm::enter_native(&mut header, &mut registers, &caller_entry);
+    let result = arinsal_beamasm::enter_native(header, &mut registers, &caller_entry);
     assert_eq!(result, ExitReason::Returned);
     assert_eq!(
         registers.x_reg_array[0],
@@ -504,14 +330,15 @@ fn erlc_list_tuple_guards_run_natively() {
     let mut heap = [0_u64; 64];
     heap[0] = tagged_small(77);
     heap[1] = 0x3b;
-    let mut header = ProcessHeader {
+    let mut process = TestProcess::new(ProcessHeader {
         htop: heap.as_mut_ptr().wrapping_add(2),
         stop: stack.as_mut_ptr().wrapping_add(stack.len()),
         heap: heap.as_mut_ptr(),
         hend: heap.as_mut_ptr().wrapping_add(heap.len()),
         fcalls: 100,
         ..ProcessHeader::default()
-    };
+    });
+    let header = &mut process.header;
     let mut registers = SchedulerRegisters::default();
     registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(tagged_small(0));
     registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(heap.as_mut_ptr() as u64 + 1);
@@ -519,7 +346,7 @@ fn erlc_list_tuple_guards_run_natively() {
         + arinsal_beamasm::common::beam_asm_h::FUNC_INFO_BYTES;
     let list_caller = caller_module(list_target, 0xffff_fffe);
     let list_entry = list_caller.entry(0xffff_fffe).unwrap();
-    let result = arinsal_beamasm::enter_native(&mut header, &mut registers, &list_entry);
+    let result = arinsal_beamasm::enter_native(header, &mut registers, &list_entry);
     assert_eq!(result, ExitReason::Returned);
     assert_eq!(
         registers.x_reg_array[0],
@@ -536,7 +363,7 @@ fn erlc_list_tuple_guards_run_natively() {
         + arinsal_beamasm::common::beam_asm_h::FUNC_INFO_BYTES;
     let tuple_caller = caller_module(tuple_target, 0xffff_fffe);
     let tuple_entry = tuple_caller.entry(0xffff_fffe).unwrap();
-    let result = arinsal_beamasm::enter_native(&mut header, &mut registers, &tuple_entry);
+    let result = arinsal_beamasm::enter_native(header, &mut registers, &tuple_entry);
     assert_eq!(result, ExitReason::Returned);
     assert_eq!(
         registers.x_reg_array[0],
@@ -609,14 +436,15 @@ fn recursive_sum_and_fib_run_natively() {
     let mut stack = [0_u64; 64];
     let mut heap = [0_u64; 64];
     let stack_end = stack.as_mut_ptr().wrapping_add(stack.len());
-    let mut header = ProcessHeader {
+    let mut process = TestProcess::new(ProcessHeader {
         htop: heap.as_mut_ptr(),
         stop: stack_end,
         heap: heap.as_mut_ptr(),
         hend: heap.as_mut_ptr().wrapping_add(heap.len()),
         fcalls: 100_000,
         ..ProcessHeader::default()
-    };
+    });
+    let header = &mut process.header;
     let mut registers = SchedulerRegisters::default();
     registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(tagged_small(10_000_000));
     registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(tagged_small(0));
@@ -627,7 +455,7 @@ fn recursive_sum_and_fib_run_natively() {
     let started = Instant::now();
     let mut yields = 0_u32;
     loop {
-        match arinsal_beamasm::enter_native(&mut header, &mut registers, &entry) {
+        match arinsal_beamasm::enter_native(header, &mut registers, &entry) {
             ExitReason::Returned => break,
             ExitReason::Yield => {
                 yields += 1;
@@ -654,7 +482,7 @@ fn recursive_sum_and_fib_run_natively() {
     let started = Instant::now();
     let mut yields = 0_u32;
     loop {
-        match arinsal_beamasm::enter_native(&mut header, &mut registers, &entry) {
+        match arinsal_beamasm::enter_native(header, &mut registers, &entry) {
             ExitReason::Returned => break,
             ExitReason::Yield => {
                 yields += 1;
@@ -705,21 +533,22 @@ fn otp_logger_reply_return_returns_the_reply_map() {
     let htop = heap_start.wrapping_add(6);
     let stop = heap_start.wrapping_add(heap.len());
     let heap_end = stop;
-    let mut header = ProcessHeader {
+    let mut process = TestProcess::new(ProcessHeader {
         htop,
         stop,
         heap: heap_start,
         hend: heap_end,
         fcalls: 100,
         ..ProcessHeader::default()
-    };
+    });
+    let header = &mut process.header;
     let reply = tagged_small(77);
     MAP_LOOKUP_RESULT.store(atom("true"), Ordering::SeqCst);
     MAP_LOOKUP_KEY.store(0, Ordering::SeqCst);
     let mut registers = SchedulerRegisters::default();
     registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(reply);
     registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(state);
-    let exit = arinsal_beamjit::enter_native(&module, function, &mut header, &mut registers);
+    let exit = arinsal_beamjit::enter_native(&module, function, header, &mut registers);
     assert_eq!(
         exit,
         ExitReason::Returned,
@@ -838,13 +667,10 @@ fn extended_x_fixtures_cover_op_families() {
     }
 }
 
-fn map_fragments(
-    get: arinsal_beamasm::map::MapGetHelper,
-    update: arinsal_beamasm::map::MapUpdateHelper,
-) -> &'static arinsal_beamasm::map::MapFragments {
-    Box::leak(Box::new(
-        arinsal_beamasm::map::MapFragments::new(get, update).unwrap(),
-    ))
+fn map_fragments() -> &'static arinsal_beamasm::map::MapFragments {
+    static FRAGMENTS: std::sync::OnceLock<arinsal_beamasm::map::MapFragments> =
+        std::sync::OnceLock::new();
+    FRAGMENTS.get_or_init(|| arinsal_beamasm::map::MapFragments::new(0).unwrap())
 }
 
 /// What the emitter reports of the functions (names, arities, entry labels, NIF stubs and the
@@ -911,4 +737,15 @@ fn emitter_reports_functions_entry_labels_nif_stubs_and_on_load() {
         expected.iter().any(|function| function.3),
         "the fixture has a NIF stub"
     );
+}
+
+fn raise_fragments() -> &'static RaiseFragments {
+    RAISE_FRAGMENTS.get_or_init(|| {
+        RaiseFragments::new(
+            exception_resolver as *const () as usize,
+            raise_class_for_compile as *const () as usize,
+            yield_fragments().context_switch(),
+        )
+        .unwrap()
+    })
 }

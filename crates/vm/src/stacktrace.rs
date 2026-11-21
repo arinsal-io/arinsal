@@ -115,10 +115,21 @@ impl HeapAlloc for TraceHeap<'_> {
         HeapAlloc::retain_binary(self.heap, binary);
     }
 
-    fn retain_writable_binary(
+    fn link_bin_ref(
         &mut self,
-        binary: Arc<WritableBinary>,
-    ) -> Result<(), arinsal_term::TermError> {
+        bin_ref: *mut u64,
+        writable: bool,
+        overhead_words: u64,
+        owner: Option<arinsal_term::OwnedBinaryRef>,
+    ) {
+        HeapAlloc::link_bin_ref(self.heap, bin_ref, writable, overhead_words, owner)
+    }
+
+    fn add_bin_vheap(&mut self, words: u64) {
+        HeapAlloc::add_bin_vheap(self.heap, words)
+    }
+
+    fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) {
         HeapAlloc::retain_writable_binary(self.heap, binary)
     }
 
@@ -126,11 +137,7 @@ impl HeapAlloc for TraceHeap<'_> {
         true
     }
 
-    fn link_external_binary(
-        &mut self,
-        bin_ref: *mut u64,
-        binary: Arc<ExternalBinary>,
-    ) -> Result<(), arinsal_term::TermError> {
+    fn link_external_binary(&mut self, bin_ref: *mut u64, binary: Arc<ExternalBinary>) {
         HeapAlloc::link_external_binary(self.heap, bin_ref, binary)
     }
 
@@ -142,11 +149,7 @@ impl HeapAlloc for TraceHeap<'_> {
         HeapAlloc::link_node(self.heap, thing, node);
     }
 
-    fn link_magic_ref(
-        &mut self,
-        thing: *mut u64,
-        owner: MagicBin,
-    ) -> Result<(), arinsal_term::TermError> {
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: MagicBin) {
         HeapAlloc::link_magic_ref(self.heap, thing, owner)
     }
 
@@ -628,7 +631,23 @@ fn push_frame(raw: &mut RawTrace, continuation: Continuation) {
 /// slots and always keeps the current function (beam_common.c:885).
 /// Port of erts/emulator/beam/beam_common.c:880-1010 (`save_stacktrace`), OTP-29.1.1.
 /// The trace block is sized and allocated before the stack walk, then filled in place.
+///
+/// erts' `save_stacktrace` cannot fail: every store goes through `HAlloc`, which falls back to
+/// a heap fragment. `TraceHeap` has the same contract (`alloc` never returns `None`), so the
+/// `TermBuilder` results below are never errors; the `Result` belongs to the generic builder
+/// API, not to this function.
 pub(super) fn save_stacktrace(
+    p: &mut Process,
+    input: StackTraceSave<'_>,
+    registers: &[Term],
+) -> Term {
+    match fill_stacktrace(p, input, registers) {
+        Ok(ftrace) => ftrace,
+        Err(error) => unreachable!("save_stacktrace allocates with HAlloc semantics: {error:?}"),
+    }
+}
+
+fn fill_stacktrace(
     p: &mut Process,
     input: StackTraceSave<'_>,
     registers: &[Term],

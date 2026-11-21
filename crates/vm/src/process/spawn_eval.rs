@@ -1,4 +1,8 @@
 use super::*;
+use std::sync::OnceLock;
+
+/// `+S` for the in-process test node, recorded before `erl_start`.
+static EVAL_PLUS_S: OnceLock<usize> = OnceLock::new();
 
 impl Runtime {
     /// Create a distributed child with its remote monitor (and optional link) installed before
@@ -57,8 +61,7 @@ impl Runtime {
         let heap_words = arinsal_term::spawned_heap_words(
             arg_size.saturating_add(arinsal_term::S_RESERVED),
             min_heap,
-        )
-        .map_err(|error| VmError::Unsupported(format!("spawn heap: {error:?}")))?;
+        );
         let mut child =
             Process::with_spawn_registers_sized(args.len().max(3), heap_words, min_heap);
         child.set_runtime(Some(self));
@@ -181,6 +184,19 @@ impl Vm {
         Ok(pid)
     }
 
+    /// Record `+S N:N` for the in-process test node. erts sizes schedulers in
+    /// `erl_start` from `+S`; this must run before [`crate::boot::erl_start`].
+    pub fn request_eval_plus_s(workers: usize) {
+        if workers > 0 {
+            let _ = EVAL_PLUS_S.get_or_init(|| workers);
+        }
+    }
+
+    /// `+S` recorded by [`Self::request_eval_plus_s`] or [`Self::eval_scheduled`].
+    pub fn requested_eval_plus_s() -> Option<usize> {
+        EVAL_PLUS_S.get().copied()
+    }
+
     /// Run an exported function with schedulable BEAM processes.
     pub fn eval_scheduled(
         &mut self,
@@ -245,9 +261,12 @@ impl Vm {
         module: &str,
         function: &str,
         args: &[Term],
-        _workers: usize,
+        workers: usize,
         _reductions: u32,
     ) -> Result<ScheduledResult, VmError> {
+        // Port of erlexec `+S` for the node: honour the workers argument as
+        // `+S N:N` when the node has not started yet (nextest: one node per OS process).
+        Self::request_eval_plus_s(workers);
         self.spawn_entry(module, function, args)?.wait()
     }
 
@@ -380,6 +399,9 @@ impl Runtime {
             system_flags: Mutex::new(crate::natives::sys::SystemFlags::boot()),
             gc_defaults: crate::natives::sys::GcDefaults::boot(),
             persistent_terms: arinsal_pterm::global_store(),
+            persistent_term_later_op: arinsal_sched::ErtsThrPrgrLaterOp::new(),
+            persistent_term_resume_pid: AtomicU64::new(0),
+            persistent_term_resume_owner: AtomicU64::new(0),
             multi_scheduling: Mutex::new(MultiScheduling::default()),
         }))
     }
@@ -438,7 +460,7 @@ impl Runtime {
         let scheduler = Arc::downgrade(self.scheduler()?);
         self.code.set_retire_hook(move |retired| {
             if let Some(scheduler) = scheduler.upgrade() {
-                scheduler.thread_progress_later(move || retired.release());
+                retired.schedule(&scheduler);
             } else {
                 // The scheduler is gone only after shutdown joined its workers.
                 retired.release();

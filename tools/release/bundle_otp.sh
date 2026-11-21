@@ -56,7 +56,7 @@ mkdir -p "$staging/erts-17.1" "$staging/usr"
 if [ -d "$otp_root/erts-17.1/include" ]; then
     cp -R "$otp_root/erts-17.1/include" "$staging/erts-17.1/"
 fi
-for helper in erl_child_setup inet_gethost; do
+for helper in inet_gethost; do
     source="$otp_root/erts-17.1/bin/$helper"
     if [ ! -x "$source" ]; then
         echo "bundle_otp.sh: required OTP helper is missing: $source" >&2

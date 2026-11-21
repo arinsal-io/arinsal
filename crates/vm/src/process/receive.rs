@@ -30,8 +30,21 @@ impl Process {
     // Port of erts/emulator/beam/erl_message.c (erts_change_message_queue_management) and
     // erl_process.c (erl_create_process: state flag from the spawn options), OTP-29.1.1.
     pub(crate) fn set_off_heap_msgq(&mut self, off_heap: bool) {
+        let was_off_heap = self.cold.as_ref().is_some_and(|cold| cold.off_heap_msgq);
         self.cold_mut().off_heap_msgq = off_heap;
-        let (Some(pid), Some(runtime)) = (self.self_pid, self.runtime.as_ref()) else {
+        // Going on heap: erts_proc_sig_queue_flush_and_deinstall_buffers (erl_message.c:1059).
+        if was_off_heap
+            && !off_heap
+            && let (Some(probe), Some(scheduler)) = (
+                self.signal_probe(),
+                self.runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.scheduler_if_started()),
+            )
+        {
+            probe.flush_and_deinstall_buffers(scheduler);
+        }
+        let (Some(pid), Some(runtime)) = (self.self_pid(), self.runtime.as_ref()) else {
             return;
         };
         if let Ok(scheduler) = runtime.scheduler() {

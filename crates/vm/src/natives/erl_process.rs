@@ -311,7 +311,7 @@ pub(crate) fn erl_create_process(
     args: Term,
     so: &mut ErlSpawnOpts,
 ) -> Result<Term, CreateError> {
-    let parent_pid = parent.self_pid.ok_or(CreateError::SystemLimit)?;
+    let parent_pid = parent.self_pid().ok_or(CreateError::SystemLimit)?;
     let alias = so.monitor.as_ref().and_then(|monitor| monitor.alias);
     // The reference is made before the arguments are checked, as erts does.
     let mut monitor_id = None;
@@ -578,8 +578,7 @@ fn create_child(
         if let Some(off_heap) = so.off_heap_msgq {
             child.cold_mut().off_heap_msgq = off_heap;
         }
-        // `p->i = beam_run_process`: the child's first run installs it (Executor::run) and
-        // applies X0..X2.
+        // `p->current = &p->u.initial`.
         child.initial_mfa = Some((m, f, arity as u8));
         child.group_leader = Some(group_leader);
         child.parent = Some(parent_pid);
@@ -593,6 +592,9 @@ fn create_child(
         child.x[0] = module;
         child.x[1] = function;
         child.x[2] = copied_args;
+        // Port of erts/emulator/beam/erl_process.c:12616 (erl_create_process: `p->i =
+        // beam_run_process; p->arity = 3`), OTP-29.1.1: the stub applies X0..X2.
+        child.set_run_process_entry()?;
         // The link must be on the child before it becomes schedulable.
         if so.link {
             child
@@ -629,8 +631,7 @@ fn create_child(
             let size = arinsal_term::size_object_litopt(args, &literals);
             arg_size.set(size);
             let heap_need = size.saturating_add(arinsal_term::S_RESERVED);
-            arinsal_term::spawned_heap_words(heap_need, min_heap)
-                .map_err(|error| VmError::Unsupported(format!("spawn heap: {error:?}")))
+            Ok(arinsal_term::spawned_heap_words(heap_need, min_heap))
         },
         |heap_words, slot| {
             crate::proc_create::raw::initialize_spawned(

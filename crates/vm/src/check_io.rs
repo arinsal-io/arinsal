@@ -26,71 +26,17 @@ enum PollState {
     Sleep,
 }
 
-struct PollMsacc {
-    enabled: bool,
-    state: PollState,
-    started: Instant,
-    check_io_ns: u64,
-    sleep_ns: u64,
-    window_ns: u64,
-}
-
-impl PollMsacc {
-    fn update(&mut self, now: Instant) {
-        if self.enabled {
-            let elapsed = u64::try_from(now.saturating_duration_since(self.started).as_nanos())
-                .unwrap_or(u64::MAX);
-            let counter = match self.state {
-                PollState::CheckIo => &mut self.check_io_ns,
-                PollState::Sleep => &mut self.sleep_ns,
-            };
-            *counter = counter.saturating_add(elapsed);
-            self.window_ns = self.window_ns.saturating_add(elapsed);
-        }
-        self.started = now;
-    }
-}
-
-static POLL_MSACC: OnceLock<Mutex<PollMsacc>> = OnceLock::new();
-
-fn poll_msacc() -> &'static Mutex<PollMsacc> {
-    POLL_MSACC.get_or_init(|| {
-        Mutex::new(PollMsacc {
-            enabled: false,
-            state: PollState::Sleep,
-            started: Instant::now(),
-            check_io_ns: 0,
-            sleep_ns: 0,
-            window_ns: 0,
-        })
-    })
-}
-
-/// Enable or disable accounting for the dedicated poll thread.
-// Port of erts/emulator/sys/common/erl_poll.c (erts_poll_wait), OTP-29.1.1.
-pub(crate) fn set_msacc_enabled(enabled: bool) {
-    let _ = poller();
-    let mut msacc = poll_msacc().lock().expect("poll microstate");
-    let now = Instant::now();
-    msacc.update(now);
-    msacc.enabled = enabled;
-    msacc.started = now;
-}
-
-/// Snapshot the poll thread's check-I/O, sleep and accounted-time counters in nanoseconds.
-// Port of erts/emulator/sys/common/erl_check_io.c (erts_check_io), OTP-29.1.1.
-pub(crate) fn msacc_snapshot() -> [u64; 3] {
-    let mut msacc = poll_msacc().lock().expect("poll microstate");
-    msacc.update(Instant::now());
-    [msacc.check_io_ns, msacc.sleep_ns, msacc.window_ns]
-}
-
 fn set_poll_state(state: PollState) {
-    let mut msacc = poll_msacc().lock().expect("poll microstate");
-    let now = Instant::now();
-    msacc.update(now);
-    msacc.state = state;
-    msacc.started = now;
+    arinsal_sched::erts_msacc_set_state(match state {
+        PollState::CheckIo => arinsal_sched::MsaccState::CheckIo,
+        PollState::Sleep => arinsal_sched::MsaccState::Sleep,
+    });
+}
+
+/// Start the poll thread so it owns its unmanaged ErtsMsAcc entry.
+// Port of erl_process.c:3356 (poll_thread calls erts_msacc_init_thread), OTP-29.1.1.
+pub(crate) fn ensure_msacc_thread() {
+    let _ = poller();
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -187,10 +133,14 @@ fn poller() -> &'static Poller {
         crate::erl_poll::erts_poll_fallback_sink(fallback_event);
         let states = Arc::new(FdStateTable::default());
         let worker_states = Arc::clone(&states);
+        let (started, ready) = std::sync::mpsc::channel();
         thread::Builder::new()
             .name("arinsal-check-io".into())
-            .spawn(move || poll_loop(poll, worker_states))
+            .spawn(move || poll_loop(poll, worker_states, started))
             .expect("start shared ERTS poll thread");
+        ready
+            .recv()
+            .expect("poll thread initializes its msacc entry");
         Poller {
             next_registration: AtomicUsize::new(1),
             states,
@@ -361,6 +311,8 @@ pub(crate) fn register(
 /// set in line with the directions the drivers armed (`erts_io_control`). The result is the mask
 /// of directions the poller rejected (`ERTS_POLL_EV_NVAL`).
 pub(crate) fn with_sel(fd: RawFd, f: &mut dyn FnMut(&mut arinsal_drv::SelSlot)) -> i32 {
+    // Port of erts/emulator/sys/common/erl_check_io.c:1007 (`driver_select`), OTP-29.1.1.
+    let _msacc = arinsal_sched::erts_msacc_push_and_set_state(arinsal_sched::MsaccState::CheckIo);
     let poller = poller();
     let Ok(mut state) = poller.states.lock_slots(fd) else {
         // A descriptor the table cannot hold is never polled.
@@ -474,15 +426,25 @@ pub(crate) fn deregister(registration: Registration) {
     let _ = sync_pollset(registration.fd, &mut state);
 }
 
-fn poll_loop(mut poll: ErtsPollSet, states: Arc<FdStateTable>) {
-    // Port of erts/emulator/sys/common/erl_check_io.c (erts_check_io), OTP-29.1.1.
+fn poll_loop(
+    mut poll: ErtsPollSet,
+    states: Arc<FdStateTable>,
+    started: std::sync::mpsc::Sender<()>,
+) {
+    // Port of erts/emulator/sys/common/erl_check_io.c:1940 (`erts_check_io`) and
+    // erl_poll.c:1956-2003 (`erts_poll_wait`), OTP-29.1.1.
+    arinsal_sched::erts_msacc_init_thread("poll", 0, false);
+    arinsal_sched::erts_msacc_set_state(arinsal_sched::MsaccState::Other);
+    let _ = started.send(());
     let mut events = Vec::with_capacity(EVENT_CAPACITY);
     loop {
         set_poll_state(PollState::Sleep);
         if let Err(error) = erts_poll_wait(&mut poll, None, &mut events) {
             if error.kind() == io::ErrorKind::Interrupted {
+                arinsal_sched::erts_msacc_set_state(arinsal_sched::MsaccState::Other);
                 continue;
             }
+            arinsal_sched::erts_msacc_set_state(arinsal_sched::MsaccState::Other);
             thread::sleep(Duration::from_millis(2));
             continue;
         }
@@ -492,6 +454,7 @@ fn poll_loop(mut poll: ErtsPollSet, states: Arc<FdStateTable>) {
                 check_event(&states, fd, event, PollSetKind::Main);
             }
         }
+        arinsal_sched::erts_msacc_set_state(arinsal_sched::MsaccState::Other);
     }
 }
 

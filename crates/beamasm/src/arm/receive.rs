@@ -186,32 +186,22 @@ impl BeamModuleAssembler {
         dest: u32,
         hooks: ReceiveHooks,
     ) -> Result<(), ModuleError> {
-        let start = self.code.offset();
-        self.emit_wait(hooks.wait_unlocked_shared, dest, start)
+        self.emit_wait(hooks.wait_unlocked_shared, dest)
     }
 
     /// Waits with the queue lock held, then returns to the scheduler.
     // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:182-198, OTP-29.1.1
     pub fn emit_wait_locked(&mut self, dest: u32, hooks: ReceiveHooks) -> Result<(), ModuleError> {
-        let start = self.code.offset();
-        self.emit_wait(hooks.wait_locked_shared, dest, start)
+        self.emit_wait(hooks.wait_locked_shared, dest)
     }
 
     // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:166-198 (emit_wait_unlocked,
     // emit_wait_locked), OTP-29.1.1.
     // The process-wide fragment records the wait for the scheduler; the process then leaves
     // native code as a yield that resumes at `dest` (the `loop_rec` label of the receive).
-    //
-    // A receive without clauses targets the wait itself: its queued messages never match,
-    // so it sleeps until a new message arrives. Bit 0 of the resume address tells the hook.
-    fn emit_wait(&mut self, shared: usize, dest: u32, start: usize) -> Result<(), ModuleError> {
+    fn emit_wait(&mut self, shared: usize, dest: u32) -> Result<(), ModuleError> {
         let dest = self.label(dest);
-        let self_target = self.code.label_offset(dest) == Some(start);
         self.code.adr(Gpr::x(0), dest)?;
-        if self_target {
-            self.code
-                .emit(|e| e.add_imm(Gpr::x(0), Gpr::x(0), 1, false))?;
-        }
         self.fragment_call(shared)
     }
 
@@ -223,9 +213,8 @@ impl BeamModuleAssembler {
         dest: u32,
         hooks: ReceiveHooks,
     ) -> Result<(), ModuleError> {
-        let start = self.code.offset();
         self.emit_receive_runtime_call(hooks.take_receive_lock as usize, &[])?;
-        self.emit_wait_timeout_at(timeout, dest, hooks, start)
+        self.emit_wait_timeout_at(timeout, dest, hooks)
     }
 
     /// Waits for a message or timeout while holding the receive lock.
@@ -236,8 +225,7 @@ impl BeamModuleAssembler {
         dest: u32,
         hooks: ReceiveHooks,
     ) -> Result<(), ModuleError> {
-        let start = self.code.offset();
-        self.emit_wait_timeout_at(timeout, dest, hooks, start)
+        self.emit_wait_timeout_at(timeout, dest, hooks)
     }
 
     // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:312-334, OTP-29.1.1.
@@ -246,7 +234,6 @@ impl BeamModuleAssembler {
         timeout: ArgVal,
         dest: u32,
         hooks: ReceiveHooks,
-        start: usize,
     ) -> Result<(), ModuleError> {
         let timeout = self.source_reg(timeout)?;
         self.code.emit(|e| e.mov_reg(Gpr::x(9), timeout))?;
@@ -260,7 +247,7 @@ impl BeamModuleAssembler {
         self.code.b_cond(Cond::Lt, next)?;
         self.branch_error()?;
         self.code.bind(wait)?;
-        self.emit_wait(hooks.wait_locked_shared, dest, start)?;
+        self.emit_wait(hooks.wait_locked_shared, dest)?;
         self.code.bind(next)?;
         Ok(())
     }

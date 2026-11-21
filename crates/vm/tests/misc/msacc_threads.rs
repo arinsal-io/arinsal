@@ -2,6 +2,8 @@
 //! invariants only, never raw timings.
 
 use arinsal_difftest::{CallResult, RefErl};
+use arinsal_term::{Term, global_atoms};
+use similar_asserts::assert_eq;
 
 const SOURCE: &str = r##"
 -module(msacc_threads).
@@ -80,6 +82,33 @@ fn assert_load(load: &str) {
         &CallResult::Ok(actual),
         "{load}: reference {expected_term:?}"
     );
+}
+
+#[test]
+fn eval_scheduled_workers_are_plus_s() {
+    let Ok(reference) = RefErl::start_with_erl_args(&["+S", "2:2"]) else {
+        eprintln!("erl unavailable; skipping eval_scheduled +S test");
+        return;
+    };
+    let expected = match reference.call(
+        "erlang",
+        "system_info",
+        &[arinsal_etf::OwnedTerm::atom("schedulers")],
+    ) {
+        CallResult::Ok(term) => term,
+        other => panic!("reference system_info(schedulers): {other:?}"),
+    };
+    arinsal_vm::Vm::request_eval_plus_s(2);
+    let mut vm = crate::common::node();
+    let schedulers = Term::atom(
+        global_atoms()
+            .intern("schedulers")
+            .expect("intern schedulers"),
+    );
+    let actual = vm
+        .eval_scheduled("erlang", "system_info", &[schedulers], 2)
+        .expect("system_info(schedulers)");
+    assert_eq!(expected, actual.term);
 }
 
 #[test]

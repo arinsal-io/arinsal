@@ -200,54 +200,65 @@ pub(super) fn fast_entry_ok_before_signals(
 /// continuation, and handle the two exits every receive-driven process takes (a yield and a
 /// wait) and the signal fetch of `loop_rec`. `None` hands the slice to the full loop with
 /// the process state untouched; every other exit goes through `after_native`, the same
-/// dispatch the full loop uses.
+/// dispatch the full loop uses. `native` is the exit of the entry this loop handed out.
 // Port of erts/emulator/beam/jit/arm/process_main.cpp (process_main: the scheduler enters
 // `c_p->i` directly), OTP-29.1.1.
-// Inlined into the slice: see `Executor::run`.
 #[inline(always)]
 pub(super) fn process_main_dispatch(
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     reg: &mut SchedulerRegisters,
-    ran: &mut bool,
-    sys_task_run: bool,
-) -> Option<Result<RunState, VmError>> {
-    let mut first = true;
+    slice: &mut super::executor_run::Slice,
+    mut native: Option<(
+        Result<arinsal_beamasm::ExitReason, VmError>,
+        super::executor_run::Pending,
+    )>,
+) -> Option<super::executor_run::SliceStep> {
+    use super::executor_run::SliceStep;
     loop {
-        let code_ptr = process.native_pc()?;
-        if !first && !fast_entry_ok(process, ctx, sys_task_run) {
-            return None;
-        }
-        // `jmp c_p->i` at beam_exit: the process was made exiting during this slice.
-        if super::executor_run::at_beam_exit(process) {
-            return Some(super::executor_run::error_action_code(process));
-        }
-        if first {
-            first = false;
-            match collect_on_schedule_in(process) {
-                Ok(false) => {}
-                Ok(true) => return Some(Ok(RunState::Yield)),
-                Err(error) => return Some(Err(error)),
+        let (native, code_ptr) = match native.take() {
+            Some((native, pending)) => (native, pending.entry.code_address),
+            None => {
+                let code_ptr = process.native_pc()?;
+                let first = slice.fast_first();
+                if !first && !fast_entry_ok(process, ctx, slice.sys_task_run()) {
+                    return None;
+                }
+                // `jmp c_p->i` at beam_exit: the process was made exiting during this slice.
+                if super::executor_run::at_beam_exit(process) {
+                    return Some(SliceStep::End(super::executor_run::error_action_code(
+                        process, reg,
+                    )));
+                }
+                if first {
+                    slice.clear_fast_first();
+                    if collect_on_schedule_in(process) {
+                        return Some(SliceStep::End(Ok(RunState::Yield)));
+                    }
+                }
+                #[cfg(target_arch = "aarch64")]
+                crate::beamasm_integration::count_native_call();
+                process.native_transfer = false;
+                process.set_native_pc(None);
+                if crate::code_ix::take_code_barrier() {
+                    ctx.block_thread_progress(std::time::Duration::ZERO);
+                }
+                reg.active_code_ix = crate::code_ix::global()
+                    .process_code_ix(crate::trace::saves_calls(process))
+                    as u64;
+                match crate::native_bridge::native_prepare(process, &mut *reg, code_ptr) {
+                    Ok(entry) => return Some(slice.enter(entry)),
+                    Err(error) => (Err(error), code_ptr),
+                }
             }
-        }
-        #[cfg(target_arch = "aarch64")]
-        crate::beamasm_integration::count_native_call();
-        *ran = true;
-        process.native_transfer = false;
-        process.set_native_pc(None);
-        if crate::code_ix::take_code_barrier() {
-            ctx.block_thread_progress(std::time::Duration::ZERO);
-        }
-        reg.active_code_ix =
-            crate::code_ix::global().process_code_ix(crate::trace::saves_calls(process)) as u64;
-        let native = crate::native_bridge::run_native_resume(process, &mut *reg, code_ptr);
+        };
         let outcome = match native {
             Ok(outcome) => outcome,
             Err(VmError::Trap(trap)) => {
                 match crate::exceptions::resume(&mut Vm {}, process, Some(ctx), trap) {
-                    Err(error) => return Some(Err(error)),
+                    Err(error) => return Some(SliceStep::End(Err(error))),
                     Ok(Some(error)) => {
-                        return Some(Err(error));
+                        return Some(SliceStep::End(Err(error)));
                     }
                     Ok(None) => {
                         process.heap.abi.exc.freason = 0;
@@ -257,20 +268,20 @@ pub(super) fn process_main_dispatch(
                     }
                 }
             }
-            Err(error) => return Some(Err(error)),
+            Err(error) => return Some(SliceStep::End(Err(error))),
         };
         if matches!(outcome, arinsal_beamasm::ExitReason::Returned) {
             // The entry function returned: the process continues in its caller or is done.
             if !resume_after_native_return(process) {
-                return Some(Ok(RunState::Done(reg.x_reg_array[0])));
+                return Some(SliceStep::End(Ok(RunState::Done(reg.x_reg_array[0]))));
             }
             continue;
         }
         if !matches!(outcome, arinsal_beamasm::ExitReason::Yield) {
             match context_switch(process, ctx, reg, outcome, code_ptr) {
                 Ok(Flow::Continue) => continue,
-                Ok(Flow::Break(result)) => return Some(result),
-                Err(error) => return Some(Err(error)),
+                Ok(Flow::Break(result)) => return Some(SliceStep::End(result)),
+                Err(error) => return Some(SliceStep::End(Err(error))),
             }
         }
         #[cfg(target_arch = "aarch64")]
@@ -282,14 +293,14 @@ pub(super) fn process_main_dispatch(
         // else is a context switch.
         let state = ctx.proc_state().load(std::sync::atomic::Ordering::Acquire);
         if state & arinsal_sched::psflg::ACTIVE == 0 {
-            return Some(Ok(RunState::Wait));
+            return Some(SliceStep::End(Ok(RunState::Wait)));
         }
         if !ctx.scheduler_type().is_dirty()
             && let Some(kind) = super::executor_run::dirty_proc_kind(ctx.proc_state())
         {
-            return Some(Err(VmError::Dirty(kind)));
+            return Some(SliceStep::End(Err(VmError::Dirty(kind))));
         }
-        return Some(Ok(RunState::Yield));
+        return Some(SliceStep::End(Ok(RunState::Yield)));
     }
 }
 
@@ -436,6 +447,6 @@ impl Process {
         self.gc_live = 3;
         self.heap.abi.arity = 3;
         self.initial_mfa = Some((module, function, arity));
-        Ok(())
+        self.set_run_process_entry()
     }
 }

@@ -16,34 +16,44 @@ use arinsal_term::{MagicBin, Term, TermBuilder, atoms};
 /// `BIF_RET` / `BIF_ERROR` of an ETS body. A failure that is not an exception is an outcome only the
 /// scheduler completes (a yield).
 #[inline(always)]
-fn finish(
-    c_p: *mut ProcessHeader,
-    i: u64,
-    function: &str,
-    args: &[arinsal_term::Term],
-    result: Result<arinsal_term::Term, VmError>,
-) -> u64 {
+fn finish(c_p: *mut ProcessHeader, i: u64, result: Result<arinsal_term::Term, VmError>) -> u64 {
     match result {
         Ok(value) => crate::native_hooks::raw(value),
-        Err(error) => finish_error(c_p, i, function, args, error),
+        Err(error) => finish_error(c_p, i, error),
     }
 }
 
 #[cold]
 #[inline(never)]
-fn finish_error(
-    c_p: *mut ProcessHeader,
-    i: u64,
-    function: &str,
-    args: &[arinsal_term::Term],
-    error: VmError,
-) -> u64 {
-    match ets::bif_failure("ets", function, args, Err(error)) {
-        Err(error @ VmError::Trap(_)) => crate::native_helpers::bif_return_current(c_p, i, error),
-        Ok(value) => crate::native_hooks::raw(value),
-        // BIF_YIELD of a busy table, or an outcome only the scheduler completes.
-        Err(error) => crate::native_helpers::bif_return_current(c_p, i, error),
+fn finish_error(c_p: *mut ProcessHeader, i: u64, error: VmError) -> u64 {
+    match error {
+        VmError::Trap(_) => db_bif_fail(c_p, error),
+        error => crate::native_helpers::bif_return_current(c_p, i, error),
     }
+}
+
+/// `db_bif_fail`: `p->freason = freason; return THE_NON_VALUE`.
+/// `freason == TRAP` is a continuation (`ERTS_BIF_PREP_TRAP`); those arrive as `Yield` /
+/// `TrapExport` and go through `bif_return_current`, not here.
+// Port of erts/emulator/beam/erl_db.c (`db_bif_fail`) and bif.h (`BIF_ERROR`), OTP-29.1.1.
+fn db_bif_fail(c_p: *mut ProcessHeader, error: VmError) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return arinsal_term::THE_NON_VALUE;
+    };
+    let (freason, fvalue) = match error {
+        VmError::Trap(trap) if trap.reason == Term::atom(atoms::SYSTEM_LIMIT) => {
+            (arinsal_term::exc::EXC_SYSTEM_LIMIT, trap.reason)
+        }
+        VmError::Trap(trap) if trap.reason != Term::atom(atoms::BADARG) => (
+            arinsal_term::exc::EXC_BADARG | arinsal_term::exc::EXF_HAS_EXT_INFO,
+            trap.reason,
+        ),
+        VmError::Trap(trap) => (arinsal_term::exc::EXC_BADARG, trap.reason),
+        _ => (arinsal_term::exc::EXC_BADARG, Term::atom(atoms::BADARG)),
+    };
+    process.heap.abi.exc.freason = freason;
+    process.heap.abi.exc.fvalue = crate::native_hooks::raw(fvalue);
+    arinsal_term::THE_NON_VALUE
 }
 
 fn insert_body<const NEW: bool>(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
@@ -57,13 +67,7 @@ fn insert_body<const NEW: bool>(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) 
         return ets_insert_2_list_driver::<NEW>(c_p, reg, i, process, x);
     }
     let result = ets::ets_insert_2::<NEW>(process, &x);
-    finish(
-        c_p,
-        i,
-        if NEW { "insert_new" } else { "insert" },
-        &x,
-        result,
-    )
+    finish(c_p, i, result)
 }
 
 /// `ets_insert_2_list_info` in the magic binary a trapped list insert keeps: the slice state and
@@ -107,10 +111,10 @@ fn ets_insert_2_list_driver<const NEW: bool>(
     if let Err(error) = ets::help_busy_table(process, tid, own_list_insert) {
         return match state {
             Some(state) => trap_list(c_p, reg, i, process, NEW, tid, objects, state, state_mref),
-            None => finish_error(c_p, i, function_name::<NEW>(), &x, error),
+            None => finish_error(c_p, i, error),
         };
     }
-    let Some(caller) = process.self_pid.and_then(|pid| pid.to_term()) else {
+    let Some(caller) = process.self_pid().and_then(|pid| pid.to_term()) else {
         return crate::natives::bif::bif_badarg(c_p);
     };
     match ets::insert_list(process, caller, NEW, tid, objects, state) {
@@ -121,13 +125,9 @@ fn ets_insert_2_list_driver<const NEW: bool>(
         Err(error) => {
             // `ERTS_BIF_ERROR_TRAPPED2(p, freason, BIF_TRAP_EXPORT(bix), ctx->tid, ctx->list)`.
             crate::bif_table::set_bif_arg(reg, 1, objects);
-            finish_error(c_p, i, function_name::<NEW>(), &[tid, objects], error)
+            finish_error(c_p, i, error)
         }
     }
-}
-
-const fn function_name<const NEW: bool>() -> &'static str {
-    if NEW { "insert_new" } else { "insert" }
 }
 
 /// `erts_create_magic_binary` and `erts_mk_magic_ref` of the first trap, then
@@ -213,12 +213,13 @@ pub(crate) extern "C" fn ets_lookup_2(c_p: *mut ProcessHeader, reg: *mut u64, i:
     process.heap.note_bif_entry();
     let x = bif_args::<2>(reg);
     let result = ets::ets_lookup_2(process, &x);
-    finish(c_p, i, "lookup", &x, result)
+    finish(c_p, i, result)
 }
 
 /// One ETS BIF body: the table operation on the scheduler's data, `BIF_ERROR` on failure.
 macro_rules! ets_bif {
     ($name:ident, $kind:ident, $module:literal, $function:literal, $arity:literal) => {
+        #[doc = concat!($module, ":", $function)]
         pub(crate) extern "C" fn $name(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
             let Some(process) = crate::native_hooks::process_from_header(c_p) else {
                 return 0;
@@ -226,7 +227,7 @@ macro_rules! ets_bif {
             process.heap.note_bif_entry();
             let x = bif_args::<$arity>(reg);
             let result = ets_body(process, ets::EtsBif::$kind, &x);
-            finish_in(c_p, i, $module, $function, &x, result)
+            finish(c_p, i, result)
         }
     };
 }
@@ -251,37 +252,6 @@ fn ets_body(process: &mut Process, kind: ets::EtsBif, x: &[Term]) -> Result<Term
     }
 }
 
-#[inline(always)]
-fn finish_in(
-    c_p: *mut ProcessHeader,
-    i: u64,
-    module: &str,
-    function: &str,
-    args: &[Term],
-    result: Result<Term, VmError>,
-) -> u64 {
-    match result {
-        Ok(value) => crate::native_hooks::raw(value),
-        Err(error) => finish_error_in(c_p, i, module, function, args, error),
-    }
-}
-
-#[cold]
-#[inline(never)]
-fn finish_error_in(
-    c_p: *mut ProcessHeader,
-    i: u64,
-    module: &str,
-    function: &str,
-    args: &[Term],
-    error: VmError,
-) -> u64 {
-    match ets::bif_failure(module, function, args, Err(error)) {
-        Err(error) => crate::native_helpers::bif_return_current(c_p, i, error),
-        Ok(value) => crate::native_hooks::raw(value),
-    }
-}
-
 pub(crate) extern "C" fn ets_member_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
@@ -289,7 +259,7 @@ pub(crate) extern "C" fn ets_member_2(c_p: *mut ProcessHeader, reg: *mut u64, i:
     process.heap.note_bif_entry();
     let x = bif_args::<2>(reg);
     let result = ets::ets_member_2(process, &x);
-    finish_in(c_p, i, "ets", "member", &x, result)
+    finish(c_p, i, result)
 }
 
 ets_bif!(

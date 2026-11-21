@@ -188,8 +188,10 @@ fn pending_purge_lambda(
         crate::native_hooks::set_error(process, "undef");
         return 0;
     };
-    if let (Some(pid), Some(name)) = (process.self_pid, arinsal_term::global_atoms().text(module))
-        && crate::natives::code::erts_purge_state().suspend_on_pending_lambda(name, pid)
+    if let (Some(pid), Some(name)) = (
+        process.self_pid(),
+        arinsal_term::global_atoms().text(module),
+    ) && crate::natives::code::erts_purge_state().suspend_on_pending_lambda(name, pid)
     {
         crate::suspend::suspend_self(process);
         // ERTS_VBUMP_ALL_REDS: the callee's reduction check leaves the scheduler.
@@ -228,13 +230,7 @@ fn lambda_handler_call(
     let arity = arity as usize;
     // The fun is rooted above the arguments while the list is built.
     registers.x_reg_array[arity] = fun;
-    if process
-        .ensure_objv(arity * 2, &mut registers.x_reg_array[..arity + 1])
-        .is_err()
-    {
-        crate::native_hooks::set_error(process, "system_limit");
-        return 0;
-    }
+    process.ensure_objv(arity * 2, &mut registers.x_reg_array[..arity + 1]);
     let fun = registers.x_reg_array[arity];
     let list = beam_jit_build_argument_list(
         std::ptr::from_mut(process).cast(),
@@ -310,33 +306,31 @@ fn remove_message_leave_reds(process: &mut crate::Process, fcalls: i32) -> i32 {
 // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1192-1201 (beam_jit_wait_locked) and
 // emu/msg_instrs.tab:110 (wait clears F_DELAY_GC), OTP-29.1.1.
 #[unsafe(no_mangle)]
-pub extern "C" fn beam_jit_wait_locked(header: *mut ProcessHeader, resume: usize) {
+pub extern "C" fn beam_jit_wait_locked(header: *mut ProcessHeader, _cp: usize) {
     let Some(process) = crate::native_hooks::enter_runtime(header) else {
         return;
     };
     process.set_delay_gc(false);
     process.gc_live = 0;
     process.set_native_resume_arity(0);
-    // A receive without clauses (the arm emitter tags its self-targeting wait with bit 0)
-    // never matches the messages queued so far; they are fetched so the outer queue's
-    // ERTS_PSFLG_SIG_IN_Q does not wake the process again at schedule-out.
-    if resume & 1 != 0 {
-        let exiting = arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
+    if process.receive_timer_timed_out() {
+        return;
+    }
+    let Some(probe) = process.signal_probe() else {
+        return;
+    };
+    // erts clears ERTS_PSFLG_ACTIVE holding the msgq lock, which every sender takes before it
+    // reads the state to decide on scheduling: a message enqueued after the receive's last
+    // fetch finds the process inactive and schedules it. The lock-free outer queue gives the
+    // same order on the state word: the clear fails while `ERTS_PSFLG_MSG_SIG_IN_Q` says
+    // messages arrived since that fetch. They are fetched (erts_proc_sig_fetch) and the
+    // process stays active, so the receive resumed at `cp` looks at them.
+    if !arinsal_sched::erts_wait_clear_active(probe.proc_state()) {
+        let _exiting = arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
             arinsal_sched::RunCtx::with_current(esdp, |ctx| process.wait_fetch_signals(ctx))
         })
         .flatten()
         .expect("native code runs inside an executor slice, which publishes its scheduler data");
-        if exiting {
-            return;
-        }
-    }
-    if !process.receive_timer_timed_out()
-        && let Some(probe) = process.signal_probe()
-    {
-        probe.proc_state().fetch_and(
-            !arinsal_sched::psflg::ACTIVE,
-            std::sync::atomic::Ordering::Release,
-        );
     }
 }
 
@@ -655,7 +649,7 @@ pub extern "C" fn beam_jit_load_nif(
     let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(c_p, reg) else {
         return BeamJitNifLoadRet::Error;
     };
-    let (Some(runtime), Some(pid)) = (process.runtime, process.self_pid) else {
+    let (Some(runtime), Some(pid)) = (process.runtime, process.self_pid()) else {
         return BeamJitNifLoadRet::Error;
     };
     if !crate::natives::code::try_seize_code_mod_permission(runtime, process, pid) {
@@ -722,4 +716,29 @@ pub extern "C" fn beam_jit_decode_dist(
         return std::ptr::null_mut();
     }
     msgp
+}
+
+/// `Eterm beam_jit_int128_to_big(Process *p, Uint sign, Uint low, Uint high)`: the integer
+/// `(-1)^sign * (high:low)`, the result of a 128-bit product that is not a small.
+// Port of erts/emulator/beam/jit/beam_jit_common.cpp:1025-1040, OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn beam_jit_int128_to_big(
+    c_p: *mut ProcessHeader,
+    sign: u64,
+    low: u64,
+    high: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::enter_runtime(c_p) else {
+        return arinsal_term::THE_NON_VALUE;
+    };
+    let mut magnitude = num_bigint::BigInt::from((u128::from(high) << 64) | u128::from(low));
+    if sign != 0 {
+        magnitude = -magnitude;
+    }
+    // erts allocates with HeapFragOnlyAlloc, which cannot fail; a 128-bit magnitude needs at
+    // most three words.
+    arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
+        .int_from_bigint(&magnitude)
+        .map(crate::native_hooks::raw)
+        .unwrap_or(arinsal_term::THE_NON_VALUE)
 }

@@ -247,6 +247,11 @@ impl Process {
                 // Port of erl_proc_sig_queue.c:7418 (erts_proc_exit_handle_signal,
                 // ERTS_SIG_Q_OP_DIST_SPAWN_REPLY), OTP-29.1.1.
                 Payload::Signal(Signal::DistSpawnReply(shared)) => spawn_replies.push(shared),
+                // Port of erl_proc_sig_queue.c:7439-7443 (`ERTS_SIG_Q_OP_FLUSH` while exiting).
+                Payload::Signal(Signal::Flush) => {
+                    debug_assert!(self.inbox.flags & crate::receive::FS_FLUSHING_SIGS != 0);
+                    self.inbox.flags |= crate::receive::FS_FLUSHED_SIGS;
+                }
                 _ => {}
             }
         }

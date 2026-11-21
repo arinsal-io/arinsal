@@ -1,9 +1,11 @@
-//! Native record checks and helper-backed record operations.
+//! Native record checks and operations.
+//!
+//! Port of erts/emulator/beam/jit/arm/instr_records.cpp, OTP-29.1.1.
 
 use arinsal_a64::enc::{Cond, Gpr};
 
 use crate::{
-    ProcessHeader, Update, emit_enter_runtime, emit_leave_runtime,
+    Update, emit_enter_runtime, emit_leave_runtime,
     module::{ArgVal, BeamModuleAssembler, ModuleError},
 };
 
@@ -18,53 +20,23 @@ const X: [Gpr; 6] = [
     logical_xreg(16),
 ];
 const SCHEDULER_REGS: Gpr = Gpr::x(19);
+// erts' ARG1..ARG6 (arm/beam_asm.hpp).
+const ARG1: Gpr = Gpr::x(0);
+const ARG2: Gpr = Gpr::x(1);
+const ARG3: Gpr = Gpr::x(2);
+const ARG4: Gpr = Gpr::x(3);
+const ARG5: Gpr = Gpr::x(4);
+const ARG6: Gpr = Gpr::x(5);
 const TMP: Gpr = Gpr::x(8);
 const TMP2: Gpr = Gpr::x(9);
 const TMP3: Gpr = Gpr::x(10);
 const TAG_BOXED: u16 = 2;
 const HEADER_MASK: u16 = 0x3f;
 const HEADER_RECORD: u16 = 0x1c;
-/// Scratch X register of OTP (`SCRATCH_X_REG`): a destination whose value is not wanted.
-const SCRATCH_X: u32 = 1023;
-/// Top of the key staging area of `get_record_elements`, which has no live count.
-const ELEMENTS_STAGING_TOP: u32 = 1020;
 
 // These entries map logical XREG4/5 to their caller-saved hardware registers.
 const fn logical_xreg(index: u8) -> Gpr {
     Gpr::x(index)
-}
-
-/// Runtime helper for `get_record_field` and `get_local_record_field`: process, record, id,
-/// field and a flag that is nonzero when a failure must raise instead of returning zero.
-pub type GetRecordFieldHook = extern "C" fn(*mut ProcessHeader, u64, u64, u64, u64) -> u64;
-/// Runtime helper for record creation: process, registers, id (or definition literal), live
-/// registers, staged word count and the first staged X register. Zero means an error was set.
-pub type CreateNativeRecordHook =
-    extern "C" fn(*mut ProcessHeader, *mut u64, u64, u64, u64, u64) -> u64;
-/// Runtime helper for record element extraction: process, registers, record, key count and
-/// the first staged X register, which holds the keys on entry and the values on success.
-/// Zero means the operation failed.
-pub type GetRecordElementsHook = extern "C" fn(*mut ProcessHeader, *mut u64, u64, u64, u64) -> u64;
-/// Runtime helper for native record updates, same arguments as [`CreateNativeRecordHook`] but
-/// receiving the source record.
-pub type UpdateNativeRecordHook =
-    extern "C" fn(*mut ProcessHeader, *mut u64, u64, u64, u64, u64) -> u64;
-
-/// Helpers corresponding to OTP's native record runtime entry points.
-#[derive(Clone, Copy)]
-pub struct RecordRuntime {
-    /// `erl_get_record_field`.
-    pub get_field: GetRecordFieldHook,
-    /// `erl_get_local_record_field`.
-    pub get_local_field: GetRecordFieldHook,
-    /// `erl_create_local_native_record`.
-    pub create_local: CreateNativeRecordHook,
-    /// `erl_create_native_record`.
-    pub create: CreateNativeRecordHook,
-    /// `erl_get_record_elements`.
-    pub get_elements: GetRecordElementsHook,
-    /// `erl_update_native_record`.
-    pub update: UpdateNativeRecordHook,
 }
 
 impl BeamModuleAssembler {
@@ -148,8 +120,10 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
-    /// Looks up a record field using the local or external OTP helper selected by the ID tag.
-    // Port of erts/emulator/beam/jit/arm/instr_records.cpp:241-274, OTP-29.1.1.
+    /// `get_record_field`: `erl_get_local_record_field` for an immediate ID, otherwise
+    /// `erl_get_record_field`; THE_NON_VALUE branches to `fail` or raises.
+    // Port of erts/emulator/beam/jit/arm/instr_records.cpp:241-274 (emit_get_record_field),
+    // OTP-29.1.1.
     pub fn emit_get_record_field(
         &mut self,
         fail: u32,
@@ -157,47 +131,31 @@ impl BeamModuleAssembler {
         id: ArgVal,
         name: ArgVal,
         dst: ArgVal,
-        runtime: RecordRuntime,
     ) -> Result<(), ModuleError> {
-        for (register, value) in [(Gpr::x(1), src), (Gpr::x(2), id), (Gpr::x(3), name)] {
-            let value = self.source_reg(value)?;
-            self.code.emit(|e| e.mov_reg(register, value))?;
-        }
-        // With a failure label the helper only reports failure; without one it raises.
-        let raise = u64::from(fail == 0);
-        self.code.emit(|e| e.mov_const(Gpr::x(4), raise))?;
-        let helper = if match id {
+        self.mov_arg(ARG2, src)?;
+        self.mov_arg(ARG3, id)?;
+        self.mov_arg(ARG4, name)?;
+        let local = match id {
             ArgVal::Immediate(_) => true,
             ArgVal::Literal(index) => !matches!(self.beamfile_get_literal(index) & 7, 1 | 2),
             _ => false,
-        } {
-            runtime.get_local_field
-        } else {
-            runtime.get_field
         };
-        emit_record_runtime(
-            self,
-            helper as usize,
-            &[Gpr::x(1), Gpr::x(2), Gpr::x(3), Gpr::x(4)],
-            6,
-            Update::HEAP_ALLOC,
-            Update::HEAP_ALLOC,
-        )?;
+        let target = if local {
+            crate::rt::erl_get_local_record_field as *const () as usize
+        } else {
+            crate::rt::erl_get_record_field as *const () as usize
+        };
+        self.emit_record_call(target, 6, Update::HEAP_ALLOC, Update::HEAP_ALLOC)?;
         if fail != 0 {
             let fail = self.label(fail);
-            self.code.emit(|e| e.cmp_imm(Gpr::x(0), 0, false))?;
-            self.code.b_cond(Cond::Eq, fail)?;
+            self.code.cbz(ARG1, fail)?;
         } else {
-            let next = self.code.new_label();
-            self.code.emit(|e| e.cmp_imm(Gpr::x(0), 0, false))?;
-            self.code.b_cond(Cond::Ne, next)?;
-            self.branch_error()?;
-            self.code.bind(next)?;
+            self.emit_raise_if_not_value()?;
         }
         self.store_record_result(dst)
     }
 
-    /// Creates a local native record from the supplied staged values.
+    /// `i_create_local_native_record`.
     // Port of erts/emulator/beam/jit/arm/instr_records.cpp:145-180, OTP-29.1.1.
     pub fn emit_i_create_local_native_record(
         &mut self,
@@ -205,12 +163,17 @@ impl BeamModuleAssembler {
         dst: ArgVal,
         live: u32,
         args: &[ArgVal],
-        runtime: RecordRuntime,
     ) -> Result<(), ModuleError> {
-        self.emit_create(definition, dst, live, args, runtime.create_local)
+        self.emit_create(
+            crate::rt::erl_create_local_native_record as *const () as usize,
+            definition,
+            dst,
+            live,
+            args,
+        )
     }
 
-    /// Creates a native record by its record ID.
+    /// `i_create_native_record`.
     // Port of erts/emulator/beam/jit/arm/instr_records.cpp:182-207, OTP-29.1.1.
     pub fn emit_i_create_native_record(
         &mut self,
@@ -218,65 +181,43 @@ impl BeamModuleAssembler {
         dst: ArgVal,
         live: u32,
         args: &[ArgVal],
-        runtime: RecordRuntime,
     ) -> Result<(), ModuleError> {
-        self.emit_create(id, dst, live, args, runtime.create)
+        self.emit_create(
+            crate::rt::erl_create_native_record as *const () as usize,
+            id,
+            dst,
+            live,
+            args,
+        )
     }
 
-    /// Extracts the requested fields into their destination registers. `keys` are sorted by
-    /// the loader (`map_key_sort`) and `dsts` holds the destination of each key.
+    /// `i_get_record_elements`: `args` are the loader-sorted `{Key, Dst}` pairs, flattened.
     // Port of erts/emulator/beam/jit/arm/instr_records.cpp:117-143, OTP-29.1.1.
     pub fn emit_i_get_record_elements(
         &mut self,
         fail: u32,
         src: ArgVal,
-        keys: &[ArgVal],
-        dsts: &[ArgVal],
-        runtime: RecordRuntime,
+        args: &[ArgVal],
     ) -> Result<(), ModuleError> {
-        if keys.len() != dsts.len() || keys.is_empty() {
-            return Err(ModuleError::InvalidOperand(
-                "get_record_elements needs one destination per key",
-            ));
-        }
-        let base = ELEMENTS_STAGING_TOP
-            .checked_sub(keys.len() as u32)
-            .filter(|base| *base > 6)
-            .ok_or(ModuleError::InvalidOperand(
-                "too many native record elements",
-            ))?;
-        self.stage_args(keys, base)?;
-        let source = self.source_reg(src)?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(2), source))?;
-        self.code
-            .emit(|e| crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(1)))?;
-        self.code
-            .emit(|e| e.mov_const(Gpr::x(3), keys.len() as u64))?;
-        self.code
-            .emit(|e| e.mov_const(Gpr::x(4), u64::from(base)))?;
-        emit_record_runtime(
-            self,
-            runtime.get_elements as usize,
-            &[Gpr::x(1), Gpr::x(2), Gpr::x(3), Gpr::x(4)],
+        self.mov_arg(ARG3, src)?;
+        self.code.emit(|e| {
+            e.mov_reg(ARG1, C_P)?;
+            crate::arm::beam_asm::load_x_reg_array(e, ARG2)?;
+            e.mov_const(ARG4, args.len() as u64)
+        })?;
+        self.embed_vararg_rodata(args, ARG5)?;
+        self.emit_record_call(
+            crate::rt::erl_get_record_elements as *const () as usize,
             6,
             Update::STACK.union(Update::X_REGS),
             Update::X_REGS,
         )?;
         let fail = self.label(fail);
         self.code.tbz(Gpr::w(0), 0, fail)?;
-        for (index, dst) in dsts.iter().copied().enumerate() {
-            if matches!(dst, ArgVal::X(SCRATCH_X)) {
-                continue;
-            }
-            let offset = crate::arm::beam_asm::x_ref(base + index as u32);
-            self.code
-                .emit(|e| e.ldr_uoff(Gpr::x(0), SCHEDULER_REGS, offset))?;
-            self.store_record_result(dst)?;
-        }
         Ok(())
     }
 
-    /// Copies a native record and applies its staged field updates.
+    /// `i_update_native_record`.
     // Port of erts/emulator/beam/jit/arm/instr_records.cpp:209-239, OTP-29.1.1.
     pub fn emit_i_update_native_record(
         &mut self,
@@ -284,99 +225,90 @@ impl BeamModuleAssembler {
         dst: ArgVal,
         live: u32,
         args: &[ArgVal],
-        runtime: RecordRuntime,
     ) -> Result<(), ModuleError> {
-        let base = live.max(6);
-        self.stage_args(args, base)?;
-        let source = self.source_reg(src)?;
-        self.code
-            .emit(|e| crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(1)))?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(2), source))?;
-        self.code
-            .emit(|e| e.mov_const(Gpr::x(3), u64::from(live)))?;
-        self.code
-            .emit(|e| e.mov_const(Gpr::x(4), args.len() as u64))?;
-        self.code
-            .emit(|e| e.mov_const(Gpr::x(5), u64::from(base)))?;
-        emit_record_runtime(
-            self,
-            runtime.update as usize,
-            &[Gpr::x(1), Gpr::x(2), Gpr::x(3), Gpr::x(4), Gpr::x(5)],
+        self.mov_arg(ARG3, src)?;
+        self.emit_vector_args(live, args)?;
+        let update = Update::HEAP_ALLOC
+            .union(Update::X_REGS)
+            .union(Update::REDUCTIONS);
+        self.emit_record_call(
+            crate::rt::erl_update_native_record as *const () as usize,
             6,
-            Update::HEAP_ALLOC
-                .union(Update::X_REGS)
-                .union(Update::REDUCTIONS),
-            Update::HEAP_ALLOC
-                .union(Update::X_REGS)
-                .union(Update::REDUCTIONS),
+            update,
+            update,
         )?;
-        self.emit_helper_result(dst)
+        self.emit_raise_if_not_value()?;
+        self.store_record_result(dst)
     }
 
+    // Port of erts/emulator/beam/jit/arm/instr_records.cpp:145-207
+    // (emit_i_create_local_native_record, emit_i_create_native_record), OTP-29.1.1.
     fn emit_create(
         &mut self,
+        target: usize,
         id: ArgVal,
         dst: ArgVal,
         live: u32,
         args: &[ArgVal],
-        hook: CreateNativeRecordHook,
     ) -> Result<(), ModuleError> {
-        let base = live.max(6);
-        self.stage_args(args, base)?;
-        let id = self.source_reg(id)?;
-        self.code
-            .emit(|e| crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(1)))?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(2), id))?;
-        self.code
-            .emit(|e| e.mov_const(Gpr::x(3), u64::from(live)))?;
-        self.code
-            .emit(|e| e.mov_const(Gpr::x(4), args.len() as u64))?;
-        self.code
-            .emit(|e| e.mov_const(Gpr::x(5), u64::from(base)))?;
-        emit_record_runtime(
-            self,
-            hook as usize,
-            &[Gpr::x(1), Gpr::x(2), Gpr::x(3), Gpr::x(4), Gpr::x(5)],
-            6,
-            Update::HEAP_ALLOC
-                .union(Update::X_REGS)
-                .union(Update::REDUCTIONS),
-            Update::HEAP_ALLOC
-                .union(Update::X_REGS)
-                .union(Update::REDUCTIONS),
-        )?;
-        self.emit_helper_result(dst)
-    }
-
-    fn emit_helper_result(&mut self, dst: ArgVal) -> Result<(), ModuleError> {
-        let next = self.code.new_label();
-        self.code.emit(|e| e.cmp_imm(Gpr::x(0), 0, false))?;
-        self.code.b_cond(Cond::Ne, next)?;
-        self.branch_error()?;
-        self.code.bind(next)?;
+        self.mov_arg(ARG3, id)?;
+        self.emit_vector_args(live, args)?;
+        let update = Update::HEAP_ALLOC
+            .union(Update::X_REGS)
+            .union(Update::REDUCTIONS);
+        let live = live as usize;
+        self.emit_record_call(target, live, update, update)?;
+        self.emit_raise_if_not_value()?;
         self.store_record_result(dst)
     }
 
-    /// Stores operands as consecutive words of the scheduler X register array from `base`.
-    fn stage_args(&mut self, args: &[ArgVal], base: u32) -> Result<(), ModuleError> {
-        if args.len() + base as usize > 1022 {
-            return Err(ModuleError::InvalidOperand(
-                "native record operands exceed scheduler register capacity",
-            ));
-        }
-        for (index, arg) in args.iter().copied().enumerate() {
-            let value = self.source_reg(arg)?;
-            let offset = crate::arm::beam_asm::x_ref(
-                u32::try_from(base as usize + index)
-                    .map_err(|_| ModuleError::InvalidOperand("record operand offset overflow"))?,
-            );
-            self.code
-                .emit(|e| e.str_uoff(value, SCHEDULER_REGS, offset))?;
+    /// `a.mov(ARG1, c_p); load_x_reg_array(ARG2); mov_arg(ARG4, Live);
+    /// mov_imm(ARG5, args.size()); embed_vararg_rodata(args, ARG6)`.
+    fn emit_vector_args(&mut self, live: u32, args: &[ArgVal]) -> Result<(), ModuleError> {
+        self.code.emit(|e| {
+            e.mov_reg(ARG1, C_P)?;
+            crate::arm::beam_asm::load_x_reg_array(e, ARG2)?;
+            e.mov_const(ARG4, u64::from(live))?;
+            e.mov_const(ARG5, args.len() as u64)
+        })?;
+        self.embed_vararg_rodata(args, ARG6)
+    }
+
+    /// `mov_arg(reg, src)`.
+    fn mov_arg(&mut self, reg: Gpr, src: ArgVal) -> Result<(), ModuleError> {
+        let value = self.source_reg_into(src, reg)?;
+        if value != reg {
+            self.code.emit(|e| e.mov_reg(reg, value))?;
         }
         Ok(())
     }
 
-    /// Writes x0 to an X or Y register.
+    /// `emit_enter_runtime<enter>(live); runtime_call<target>(); emit_leave_runtime<leave>(live)`
+    /// with `c_p` in ARG1.
+    fn emit_record_call(
+        &mut self,
+        target: usize,
+        live: usize,
+        enter: Update,
+        leave: Update,
+    ) -> Result<(), ModuleError> {
+        emit_enter_runtime(&mut self.code, live, enter)?;
+        self.code.emit(|e| e.mov_reg(ARG1, C_P))?;
+        self.fragment_call(target)?;
+        emit_leave_runtime(&mut self.code, live, leave)?;
+        Ok(())
+    }
+
+    /// `emit_branch_if_value(ARG1, next); emit_raise_exception(); next:`.
+    fn emit_raise_if_not_value(&mut self) -> Result<(), ModuleError> {
+        let next = self.code.new_label();
+        self.code.cbnz(ARG1, next)?;
+        self.branch_error()?;
+        self.code.bind(next)?;
+        Ok(())
+    }
+
+    /// `mov_arg(Dst, ARG1)`.
     fn store_record_result(&mut self, dst: ArgVal) -> Result<(), ModuleError> {
         match dst {
             ArgVal::X(index) if index < 6 => {
@@ -406,33 +338,4 @@ impl BeamModuleAssembler {
             )),
         }
     }
-}
-
-// Port of erts/emulator/beam/jit/arm/beam_asm.hpp:459-601, OTP-29.1.1.
-fn emit_record_runtime(
-    asm: &mut BeamModuleAssembler,
-    helper: usize,
-    args: &[Gpr],
-    live: usize,
-    enter_update: Update,
-    leave_update: Update,
-) -> Result<(), ModuleError> {
-    if args.len() > 5 {
-        return Err(ModuleError::InvalidOperand(
-            "runtime hook has too many arguments",
-        ));
-    }
-    emit_enter_runtime(&mut asm.code, live, enter_update)?;
-    asm.code.emit(|e| {
-        e.mov_reg(Gpr::x(0), C_P)?;
-        for (index, arg) in args.iter().copied().enumerate() {
-            e.mov_reg(Gpr::x(index as u8 + 1), arg)?;
-        }
-        Ok(())
-    })?;
-    asm.fragment_call(helper)?;
-    emit_leave_runtime(&mut asm.code, live, leave_update)?;
-    asm.code.emit(|e| e.ldr_uoff(Gpr::x(9), C_P, 40))?;
-    asm.error_if_nonzero(Gpr::x(9))?;
-    Ok(())
 }

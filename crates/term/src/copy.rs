@@ -70,7 +70,6 @@ pub fn copy_term<H: HeapAlloc + ?Sized>(root: Term, dst: &mut H) -> Result<Term,
     if root.is_immed() {
         return Ok(root);
     }
-    validate_destination(root, dst)?;
     let size = size_object(root);
     copy_struct_x(root, size, dst, None)
 }
@@ -85,7 +84,6 @@ pub fn copy_struct<H: HeapAlloc + ?Sized>(
     if root.is_immed() || size == 0 {
         return Ok(root);
     }
-    validate_destination(root, dst)?;
     copy_struct_x(root, size, dst, None)
 }
 
@@ -100,7 +98,6 @@ pub fn copy_ets_element<H: HeapAlloc + ?Sized>(
     if root.is_immed() || size == 0 {
         return Ok(root);
     }
-    validate_destination(root, dst)?;
     let base = dst.alloc(size).ok_or(TermError::HeapFull)?;
     copy_struct_into(root, base, size, dst, None, true)
 }
@@ -222,7 +219,6 @@ pub fn copy_term_litopt<H: HeapAlloc + ?Sized>(
     if root.is_immed() {
         return Ok(root);
     }
-    validate_destination(root, dst)?;
     let size = crate::size_object_litopt(root, literals);
     copy_struct_x(root, size, dst, Some(literals))
 }
@@ -239,7 +235,6 @@ pub fn copy_struct_litopt<H: HeapAlloc + ?Sized>(
     if root.is_immed() || size == 0 {
         return Ok(root);
     }
-    validate_destination(root, dst)?;
     copy_struct_x(root, size, dst, Some(literals))
 }
 
@@ -252,7 +247,6 @@ pub fn copy_shared<H: HeapAlloc + ?Sized>(
     dst: &mut H,
     copy_literals: bool,
 ) -> Result<Term, TermError> {
-    validate_destination(root, dst)?;
     let literals = LiteralAreas::current();
     let skip = if copy_literals {
         LiteralSkip::None
@@ -293,7 +287,6 @@ pub fn copy_term_preserving_sharing_with_cache<H: HeapAlloc + ?Sized>(
     dst: &mut H,
     cache: &mut SharedCopyCache,
 ) -> Result<Term, TermError> {
-    validate_destination(root, dst)?;
     let size = size_object_with_prior(
         root,
         true,
@@ -520,7 +513,7 @@ fn copy_struct_into_layout<H: HeapAlloc + ?Sized>(
                             *argp = Term::from_ptr(dst_fun, 2).0;
                         }
                         EXTERNAL_PID | EXTERNAL_PORT | EXTERNAL_REF => {
-                            copy_off_heap_thing(objp, hdr, argp, &mut htop, dst, false)?;
+                            copy_off_heap_thing(objp, hdr, argp, &mut htop, dst, false);
                         }
                         MAP => {
                             copy_map(objp, hdr, argp, &mut htop);
@@ -528,8 +521,8 @@ fn copy_struct_into_layout<H: HeapAlloc + ?Sized>(
                         REF if crate::is_magic_ref_thing_with_hdr(hdr, *objp.add(1)) => {
                             let owner = crate::MagicBin::thing_owner(*objp.add(1), true);
                             let thing = htop;
-                            copy_off_heap_thing(objp, hdr, argp, &mut htop, dst, true)?;
-                            dst.link_magic_ref(thing, owner)?;
+                            copy_off_heap_thing(objp, hdr, argp, &mut htop, dst, true);
+                            dst.link_magic_ref(thing, owner);
                         }
                         _ => {
                             let words = ((hdr >> 6) as usize) + 1;
@@ -621,7 +614,7 @@ fn copy_off_heap_thing<H: HeapAlloc + ?Sized>(
     htop: &mut *mut u64,
     dst: &mut H,
     magic_already_retained: bool,
-) -> Result<(), TermError> {
+) {
     // Port of copy.c:882-908 (`L_off_heap_node_container_common`).
     let words = ((hdr >> 6) as usize) + 1;
     let tp = *htop;
@@ -637,7 +630,6 @@ fn copy_off_heap_thing<H: HeapAlloc + ?Sized>(
             dst.link_node(tp, node);
         }
     }
-    Ok(())
 }
 
 fn copy_sub_bits<H: HeapAlloc + ?Sized>(
@@ -668,7 +660,7 @@ fn copy_sub_bits<H: HeapAlloc + ?Sized>(
             *argp = Term::from_ptr(to_sb, 2).0;
             let (ptr, flags, overhead, owner) =
                 crate::bits::clone_binary_owner(Term::from_ptr(underlying.cast_mut(), 2))?;
-            crate::bits::retain_cloned_binary_owner(dst, to_br, ptr, flags, overhead, owner)?;
+            crate::bits::retain_cloned_binary_owner(dst, to_br, ptr, flags, overhead, owner);
             return Ok(());
         }
         let start = *objp.add(2) as usize;
@@ -748,21 +740,6 @@ pub(crate) fn copy_scan_skip(hdr: u64) -> usize {
 fn heap_bits_words(num_bits: usize) -> usize {
     let nbytes = num_bits.div_ceil(8);
     2 + nbytes.div_ceil(8)
-}
-
-fn validate_destination<H: HeapAlloc + ?Sized>(root: Term, dst: &H) -> Result<(), TermError> {
-    if dst.supports_writable_binary() {
-        return Ok(());
-    }
-    let mut stack: crate::stack::EStack<32> = crate::stack::EStack::new();
-    stack.push(root);
-    while let Some(term) = stack.pop() {
-        if crate::bits::binary_owner_is_writable(term) {
-            return Err(TermError::Unsupported("writable binary heap owner"));
-        }
-        stack.extend(crate::ops::children(term).filter(|child| child.is_pointer()));
-    }
-    Ok(())
 }
 
 fn copy_term_body<H: HeapAlloc + ?Sized>(
@@ -902,7 +879,7 @@ fn copy_term_body<H: HeapAlloc + ?Sized>(
                         }
                     }
                     EXTERNAL_PID | EXTERNAL_PORT | EXTERNAL_REF => {
-                        copy_off_heap_thing(from, header, resp, &mut hp, dst, false)?;
+                        copy_off_heap_thing(from, header, resp, &mut hp, dst, false);
                         if preserve_sharing {
                             cache
                                 .copied
@@ -922,7 +899,7 @@ fn copy_term_body<H: HeapAlloc + ?Sized>(
                                 crate::bits::clone_binary_owner(source)?;
                             crate::bits::retain_cloned_binary_owner(
                                 dst, to, ptr, flags, overhead, owner,
-                            )?;
+                            );
                         }
                     }
                     REF if crate::is_magic_ref_thing_with_hdr(
@@ -934,8 +911,8 @@ fn copy_term_body<H: HeapAlloc + ?Sized>(
                             crate::heap::load(from.wrapping_add(1)),
                             true,
                         );
-                        copy_off_heap_thing(from, header, resp, &mut hp, dst, true)?;
-                        dst.link_magic_ref(to, owner)?;
+                        copy_off_heap_thing(from, header, resp, &mut hp, dst, true);
+                        dst.link_magic_ref(to, owner);
                         if preserve_sharing {
                             cache
                                 .copied

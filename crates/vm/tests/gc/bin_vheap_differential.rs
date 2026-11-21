@@ -295,31 +295,21 @@ fn resource_magic_orig_sizes_match_otp() {
         panic!("expected resource size deltas: {value:?}");
     };
     assert!(matches!(tail.as_ref(), OwnedTerm::Nil));
-    assert_eq!(
-        elems,
-        &vec![
-            OwnedTerm::Tuple(vec![
-                OwnedTerm::Tuple(vec![OwnedTerm::Int(6), OwnedTerm::Atom("ref".into())]),
-                OwnedTerm::Atom("ref".into()),
-            ]),
-            OwnedTerm::Tuple(vec![
-                OwnedTerm::Tuple(vec![OwnedTerm::Int(92), OwnedTerm::Atom("ref".into())]),
-                OwnedTerm::Atom("ref".into()),
-            ]),
-            OwnedTerm::Tuple(vec![
-                OwnedTerm::Tuple(vec![OwnedTerm::Int(267), OwnedTerm::Atom("tuple".into())]),
-                OwnedTerm::Atom("tuple".into()),
-            ]),
-            OwnedTerm::Tuple(vec![
-                OwnedTerm::Tuple(vec![OwnedTerm::Int(4), OwnedTerm::Atom("tuple".into())]),
-                OwnedTerm::Atom("tuple".into()),
-            ]),
-            OwnedTerm::Tuple(vec![
-                OwnedTerm::Tuple(vec![OwnedTerm::Int(19), OwnedTerm::Atom("ref".into())]),
-                OwnedTerm::Atom("ref".into()),
-            ]),
-        ]
-    );
+    // The sizes are erl's (assert_equal): the counters resource holds one cache line per
+    // scheduler plus one (erl_bif_counters.c ATOMICS_PER_COUNTER), so they depend on the host.
+    let tags = ["ref", "ref", "tuple", "tuple", "ref"];
+    assert_eq!(elems.len(), tags.len());
+    for (elem, tag) in elems.iter().zip(tags) {
+        let OwnedTerm::Tuple(pair) = elem else {
+            panic!("expected {{Delta, Tag}}: {elem:?}");
+        };
+        assert!(
+            matches!(pair.as_slice(), [OwnedTerm::Tuple(inner), OwnedTerm::Atom(t)]
+                if t == tag
+                    && matches!(inner.as_slice(), [OwnedTerm::Int(n), _] if *n > 0)),
+            "{elem:?}"
+        );
+    }
 }
 
 #[test]

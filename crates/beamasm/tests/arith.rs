@@ -2,9 +2,7 @@
 
 use arinsal_a64::enc::Gpr;
 use arinsal_beamasm::{
-    ExitReason, ProcessHeader, SchedulerRegisters,
-    arith::ArithHelper,
-    enter_native,
+    ExitReason, ProcessHeader, SchedulerRegisters, enter_native,
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
     types::{ArgType, TypedArg},
 };
@@ -22,46 +20,9 @@ fn tagged(value: i64) -> Option<u64> {
         .then_some(((value as u64) << 4) | 15)
 }
 
-extern "C" fn runtime_arith(
-    _process: *mut ProcessHeader,
-    op: u32,
-    lhs: u64,
-    rhs: u64,
-    extra: u64,
-    _reg: *mut u64,
-) -> u64 {
-    if op == 15 {
-        return OVERFLOW;
-    }
-    if op == 13 {
-        let product = runtime_arith(_process, 2, lhs, rhs, 0, std::ptr::null_mut());
-        if product == OVERFLOW || product == BADARITH {
-            return product;
-        }
-        return runtime_arith(_process, 0, product, extra, 0, std::ptr::null_mut());
-    }
-    if matches!(op, 16 | 17) {
-        return lhs;
-    }
-    if op == 18 {
-        return small(lhs).map_or(BADARITH, |value| (value as f64).to_bits());
-    }
-    if (19..=23).contains(&op) {
-        let a = f64::from_bits(lhs);
-        let b = f64::from_bits(rhs);
-        let result = match op {
-            19 => a + b,
-            20 => a - b,
-            21 => a * b,
-            22 => a / b,
-            _ => -a,
-        };
-        return if result.is_finite() {
-            result.to_bits()
-        } else {
-            BADARITH
-        };
-    }
+/// Reference model of the arithmetic ops on smalls (OVERFLOW: the result is not a small,
+/// which the emitted code hands to the erts runtime).
+fn runtime_arith(op: u32, lhs: u64, rhs: u64) -> u64 {
     let Some(a) = small(lhs) else { return BADARITH };
     if op == 8 {
         return tagged(!a).unwrap_or(OVERFLOW);
@@ -109,13 +70,43 @@ extern "C" fn runtime_arith(
     result.and_then(tagged).unwrap_or(OVERFLOW)
 }
 
-#[cfg(target_arch = "aarch64")]
-fn run_binary(emit: impl FnOnce(&mut BeamModuleAssembler, ArithHelper), lhs: u64, rhs: u64) -> u64 {
+type BinaryRun = dyn Fn(u64, u64) -> u64;
+
+/// An assembler with the process-wide fragments installed. The byte tests run only the inline
+/// fast paths: the slow paths call the erts runtime (erl_arith.c), which needs the VM, and are
+/// tested by the VM's arithmetic differentials.
+fn new_asm() -> BeamModuleAssembler {
+    use arinsal_beamasm::{raise_frag::RaiseFragments, yield_frag::YieldFragments};
+    use std::sync::OnceLock;
+    static YIELD: OnceLock<YieldFragments> = OnceLock::new();
+    static RAISE: OnceLock<RaiseFragments> = OnceLock::new();
+    extern "C" fn unused() {
+        unreachable!("byte tests run only fast paths")
+    }
+    let raise = RAISE.get_or_init(|| {
+        let context_switch = YIELD
+            // No case collects: `garbage_collect` is never entered.
+            .get_or_init(|| YieldFragments::new(unused as *const () as usize, 0).unwrap())
+            .context_switch();
+        RaiseFragments::new(
+            unused as *const () as usize,
+            unused as *const () as usize,
+            context_switch,
+        )
+        .unwrap()
+    });
     let mut asm = BeamModuleAssembler::new();
+    asm.set_bif_fragments(raise.bif_fragments());
+    asm
+}
+
+#[cfg(target_arch = "aarch64")]
+fn run_binary(emit: impl FnOnce(&mut BeamModuleAssembler), lhs: u64, rhs: u64) -> u64 {
+    let mut asm = new_asm();
     asm.emit_i_func_label(1).unwrap();
     asm.emit_raw(|e| e.str_pre(Gpr::x(30), Gpr::sp(), -16))
         .unwrap();
-    emit(&mut asm, runtime_arith);
+    emit(&mut asm);
     asm.emit_raw(|e| {
         e.ldr_post(Gpr::x(30), Gpr::sp(), 16)?;
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
@@ -139,12 +130,12 @@ fn run_binary(emit: impl FnOnce(&mut BeamModuleAssembler, ArithHelper), lhs: u64
 }
 
 #[cfg(target_arch = "aarch64")]
-fn run_unary(emit: impl FnOnce(&mut BeamModuleAssembler, ArithHelper), input: u64) -> u64 {
-    let mut asm = BeamModuleAssembler::new();
+fn run_unary(emit: impl FnOnce(&mut BeamModuleAssembler), input: u64) -> u64 {
+    let mut asm = new_asm();
     asm.emit_i_func_label(1).unwrap();
     asm.emit_raw(|e| e.str_pre(Gpr::x(30), Gpr::sp(), -16))
         .unwrap();
-    emit(&mut asm, runtime_arith);
+    emit(&mut asm);
     asm.emit_raw(|e| {
         e.ldr_post(Gpr::x(30), Gpr::sp(), 16)?;
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
@@ -168,15 +159,14 @@ fn run_unary(emit: impl FnOnce(&mut BeamModuleAssembler, ArithHelper), input: u6
 
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
+fn integer_ops_on_smalls_use_the_inline_fast_paths() {
     let add = |a, b| {
         run_binary(
-            |m, h| {
+            |m| {
                 m.emit_i_plus(
                     TypedArg::new(ArgVal::X(0), ArgType::ANY),
                     TypedArg::new(ArgVal::X(1), ArgType::ANY),
                     ArgVal::X(1),
-                    h,
                 )
                 .unwrap()
             },
@@ -186,12 +176,11 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     };
     let sub = |a, b| {
         run_binary(
-            |m, h| {
+            |m| {
                 m.emit_i_minus(
                     TypedArg::new(ArgVal::X(0), ArgType::ANY),
                     TypedArg::new(ArgVal::X(1), ArgType::ANY),
                     ArgVal::X(1),
-                    h,
                 )
                 .unwrap()
             },
@@ -201,12 +190,11 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     };
     let mul = |a, b| {
         run_binary(
-            |m, h| {
+            |m| {
                 m.emit_i_times(
                     TypedArg::new(ArgVal::X(0), ArgType::ANY),
                     TypedArg::new(ArgVal::X(1), ArgType::ANY),
                     ArgVal::X(1),
-                    h,
                 )
                 .unwrap()
             },
@@ -216,12 +204,11 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     };
     let div = |a, b| {
         run_binary(
-            |m, h| {
+            |m| {
                 m.emit_i_int_div(
                     TypedArg::new(ArgVal::X(0), ArgType::ANY),
                     TypedArg::new(ArgVal::X(1), ArgType::ANY),
                     ArgVal::X(1),
-                    h,
                 )
                 .unwrap()
             },
@@ -231,12 +218,11 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     };
     let rem = |a, b| {
         run_binary(
-            |m, h| {
+            |m| {
                 m.emit_i_rem(
                     TypedArg::new(ArgVal::X(0), ArgType::ANY),
                     TypedArg::new(ArgVal::X(1), ArgType::ANY),
                     ArgVal::X(1),
-                    h,
                 )
                 .unwrap()
             },
@@ -246,12 +232,11 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     };
     let band = |a, b| {
         run_binary(
-            |m, h| {
+            |m| {
                 m.emit_i_band(
                     TypedArg::new(ArgVal::X(0), ArgType::ANY),
                     TypedArg::new(ArgVal::X(1), ArgType::ANY),
                     ArgVal::X(1),
-                    h,
                 )
                 .unwrap()
             },
@@ -261,12 +246,11 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     };
     let bor = |a, b| {
         run_binary(
-            |m, h| {
+            |m| {
                 m.emit_i_bor(
                     TypedArg::new(ArgVal::X(0), ArgType::ANY),
                     TypedArg::new(ArgVal::X(1), ArgType::ANY),
                     ArgVal::X(1),
-                    h,
                 )
                 .unwrap()
             },
@@ -276,12 +260,11 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     };
     let bxor = |a, b| {
         run_binary(
-            |m, h| {
+            |m| {
                 m.emit_i_bxor(
                     TypedArg::new(ArgVal::X(0), ArgType::ANY),
                     TypedArg::new(ArgVal::X(1), ArgType::ANY),
                     ArgVal::X(1),
-                    h,
                 )
                 .unwrap()
             },
@@ -291,12 +274,11 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     };
     let bsl = |a, b| {
         run_binary(
-            |m, h| {
+            |m| {
                 m.emit_i_bsl(
                     TypedArg::new(ArgVal::X(0), ArgType::ANY),
                     TypedArg::new(ArgVal::X(1), ArgType::ANY),
                     ArgVal::X(1),
-                    h,
                 )
                 .unwrap()
             },
@@ -306,12 +288,11 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     };
     let bsr = |a, b| {
         run_binary(
-            |m, h| {
+            |m| {
                 m.emit_i_bsr(
                     TypedArg::new(ArgVal::X(0), ArgType::ANY),
                     TypedArg::new(ArgVal::X(1), ArgType::ANY),
                     ArgVal::X(1),
-                    h,
                 )
                 .unwrap()
             },
@@ -329,39 +310,48 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     for (a, b) in cases {
         let ta = tagged(a).unwrap();
         let tb = tagged(b).unwrap();
-        let expected =
-            |op: u32| runtime_arith(std::ptr::null_mut(), op, ta, tb, 0, std::ptr::null_mut());
-        assert_eq!(add(ta, tb), expected(0));
-        assert_eq!(sub(ta, tb), expected(1));
-        assert_eq!(mul(ta, tb), expected(2));
-        assert_eq!(div(ta, tb), expected(3));
-        assert_eq!(rem(ta, tb), expected(4));
-        assert_eq!(band(ta, tb), expected(5));
-        assert_eq!(bor(ta, tb), expected(6));
-        assert_eq!(bxor(ta, tb), expected(7));
-        assert_eq!(bsl(ta, tb), expected(10));
-        assert_eq!(bsr(ta, tb), expected(11));
+        let ops: [(u32, &BinaryRun); 10] = [
+            (0, &add),
+            (1, &sub),
+            (2, &mul),
+            (3, &div),
+            (4, &rem),
+            (5, &band),
+            (6, &bor),
+            (7, &bxor),
+            (10, &bsl),
+            (11, &bsr),
+        ];
+        for (op, run) in ops {
+            let expected = runtime_arith(op, ta, tb);
+            // A result that is not a small, a zero divisor, MIN_SMALL divided by -1 and a
+            // negative shift count take the runtime slow path (erts_mixed_*, erts_int_div_rem,
+            // erts_bsl/erts_bsr).
+            let runtime = matches!(expected, OVERFLOW | BADARITH)
+                || (matches!(op, 3 | 4) && (b == 0 || (a == -(1 << 59) && b == -1)))
+                || (matches!(op, 10 | 11) && b < 0);
+            if !runtime {
+                assert_eq!(run(ta, tb), expected, "op {op} on {a}, {b}");
+            }
+        }
     }
-    assert_eq!(add(tagged(2).unwrap(), 0x0b), BADARITH);
     assert_eq!(
         run_unary(
-            |m, h| m.emit_i_unary_minus(ArgVal::X(0), ArgVal::X(1), h).unwrap(),
+            |m| m.emit_i_unary_minus(ArgVal::X(0), ArgVal::X(1)).unwrap(),
             tagged(7).unwrap()
         ),
         tagged(-7).unwrap()
     );
     assert_eq!(
         run_unary(
-            |m, h| m.emit_i_bnot(ArgVal::X(0), ArgVal::X(1), h).unwrap(),
+            |m| m.emit_i_bnot(ArgVal::X(0), ArgVal::X(1)).unwrap(),
             tagged(7).unwrap()
         ),
         tagged(!7).unwrap()
     );
     assert_eq!(
         run_unary(
-            |m, h| m
-                .emit_i_increment(ArgVal::X(0), 1, ArgVal::X(1), h)
-                .unwrap(),
+            |m| m.emit_i_increment(ArgVal::X(0), 1, ArgVal::X(1)).unwrap(),
             tagged(7).unwrap()
         ),
         tagged(8).unwrap()
@@ -372,7 +362,7 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
 #[test]
 fn guard_arithmetic_emits_fail_label_handling() {
     let code_size = |with_fail_label| {
-        let mut asm = BeamModuleAssembler::new();
+        let mut asm = new_asm();
         asm.emit_i_func_label(1).unwrap();
         asm.emit_raw(|e| e.str_pre(Gpr::x(30), Gpr::sp(), -16))
             .unwrap();
@@ -382,7 +372,6 @@ fn guard_arithmetic_emits_fail_label_handling() {
                 TypedArg::new(ArgVal::X(1), ArgType::ANY),
                 ArgVal::X(1),
                 2,
-                runtime_arith,
             )
             .unwrap();
         } else {
@@ -390,7 +379,6 @@ fn guard_arithmetic_emits_fail_label_handling() {
                 TypedArg::new(ArgVal::X(0), ArgType::ANY),
                 TypedArg::new(ArgVal::X(1), ArgType::ANY),
                 ArgVal::X(1),
-                runtime_arith,
             )
             .unwrap();
         }
@@ -405,15 +393,14 @@ fn guard_arithmetic_emits_fail_label_handling() {
 
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn immediate_add_sub_cover_small_boundary_overflow_and_non_integer_fallbacks() {
+fn immediate_add_sub_stay_on_the_small_fast_path() {
     let add = |lhs, immediate| {
         run_binary(
-            |m, h| {
+            |m| {
                 m.emit_i_plus(
                     TypedArg::new(ArgVal::X(0), ArgType::ANY),
                     TypedArg::new(ArgVal::Immediate(immediate), ArgType::ANY),
                     ArgVal::X(1),
-                    h,
                 )
                 .unwrap()
             },
@@ -423,12 +410,11 @@ fn immediate_add_sub_cover_small_boundary_overflow_and_non_integer_fallbacks() {
     };
     let sub = |lhs, immediate| {
         run_binary(
-            |m, h| {
+            |m| {
                 m.emit_i_minus(
                     TypedArg::new(ArgVal::X(0), ArgType::ANY),
                     TypedArg::new(ArgVal::Immediate(immediate), ArgType::ANY),
                     ArgVal::X(1),
-                    h,
                 )
                 .unwrap()
             },
@@ -439,80 +425,13 @@ fn immediate_add_sub_cover_small_boundary_overflow_and_non_integer_fallbacks() {
     let one = tagged(1).unwrap();
     assert_eq!(add(tagged(40).unwrap(), one), tagged(41).unwrap());
     assert_eq!(sub(tagged(40).unwrap(), one), tagged(39).unwrap());
-    assert_eq!(add(tagged((1 << 59) - 1).unwrap(), one), OVERFLOW);
-    assert_eq!(sub(tagged(-(1 << 59)).unwrap(), one), OVERFLOW);
-    assert_eq!(add(0x0b, one), BADARITH);
-}
-
-#[cfg(target_arch = "aarch64")]
-#[test]
-fn float_ops_preserve_ieee_results_and_reject_non_finite_values() {
-    for (op, expected) in [(19, 3.5), (20, 0.5), (21, 3.0), (22, 4.0 / 3.0)] {
-        let result = run_binary(
-            |m, h| match op {
-                19 => m
-                    .emit_fadd(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), h)
-                    .unwrap(),
-                20 => m
-                    .emit_fsub(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), h)
-                    .unwrap(),
-                21 => m
-                    .emit_fmul(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), h)
-                    .unwrap(),
-                _ => m
-                    .emit_fdiv(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), h)
-                    .unwrap(),
-            },
-            2.0f64.to_bits(),
-            1.5f64.to_bits(),
-        );
-        assert_eq!(f64::from_bits(result), expected);
-    }
-    assert_eq!(
-        run_binary(
-            |m, h| m
-                .emit_fdiv(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), h)
-                .unwrap(),
-            1f64.to_bits(),
-            0f64.to_bits()
-        ),
-        BADARITH
-    );
-    assert_eq!(
-        run_unary(
-            |m, h| m.emit_fnegate(ArgVal::X(0), ArgVal::X(1), h).unwrap(),
-            2.5f64.to_bits()
-        ),
-        (-2.5f64).to_bits()
-    );
-    assert_eq!(
-        run_unary(
-            |m, h| m.emit_fload(ArgVal::X(0), ArgVal::X(1), h).unwrap(),
-            2.5f64.to_bits()
-        ),
-        2.5f64.to_bits()
-    );
-    assert_eq!(
-        run_unary(
-            |m, h| m.emit_fstore(ArgVal::X(0), ArgVal::X(1), h).unwrap(),
-            2.5f64.to_bits()
-        ),
-        2.5f64.to_bits()
-    );
-    assert_eq!(
-        run_unary(
-            |m, h| m.emit_fconv(ArgVal::X(0), ArgVal::X(1), h).unwrap(),
-            tagged(12).unwrap()
-        ),
-        12.0f64.to_bits()
-    );
 }
 
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn adjacent_y_registers_subtract_in_address_order() {
     let sub = |left: u32, right: u32, a: i64, b: i64| {
-        let mut asm = BeamModuleAssembler::new();
+        let mut asm = new_asm();
         asm.emit_i_func_label(1).unwrap();
         asm.emit_raw(|e| e.str_pre(Gpr::x(30), Gpr::sp(), -16))
             .unwrap();
@@ -520,7 +439,6 @@ fn adjacent_y_registers_subtract_in_address_order() {
             TypedArg::new(ArgVal::Y(left), ArgType::ANY),
             TypedArg::new(ArgVal::Y(right), ArgType::ANY),
             ArgVal::X(0),
-            runtime_arith,
         )
         .unwrap();
         asm.emit_raw(|e| {
@@ -551,16 +469,6 @@ fn adjacent_y_registers_subtract_in_address_order() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn typed_power_of_two_multiply_and_mul_add_stay_on_the_fast_path() {
-    extern "C" fn slow_path(
-        _process: *mut ProcessHeader,
-        _op: u32,
-        _lhs: u64,
-        _rhs: u64,
-        _extra: u64,
-        _reg: *mut u64,
-    ) -> u64 {
-        1
-    }
     let integer = |min, max| arinsal_beamasm::types::ArgType {
         union_bits: arinsal_beamasm::types::type_id::INTEGER,
         min: Some(min),
@@ -568,7 +476,7 @@ fn typed_power_of_two_multiply_and_mul_add_stay_on_the_fast_path() {
         unit: 1,
     };
     let eight = tagged(8).unwrap();
-    let mut asm = BeamModuleAssembler::new();
+    let mut asm = new_asm();
     asm.emit_i_func_label(1).unwrap();
     asm.emit_raw(|e| e.str_pre(Gpr::x(30), Gpr::sp(), -16))
         .unwrap();
@@ -576,7 +484,6 @@ fn typed_power_of_two_multiply_and_mul_add_stay_on_the_fast_path() {
         TypedArg::new(ArgVal::X(0), integer(0, 50)),
         TypedArg::new(ArgVal::Immediate(eight), ArgType::ANY),
         ArgVal::X(1),
-        slow_path,
     )
     .unwrap();
     asm.emit_raw(|e| {
@@ -603,7 +510,7 @@ fn typed_power_of_two_multiply_and_mul_add_stay_on_the_fast_path() {
 
     let three = tagged(3).unwrap();
     let five = tagged(5).unwrap();
-    let mut asm = BeamModuleAssembler::new();
+    let mut asm = new_asm();
     asm.emit_i_func_label(1).unwrap();
     asm.emit_raw(|e| e.str_pre(Gpr::x(30), Gpr::sp(), -16))
         .unwrap();
@@ -613,7 +520,6 @@ fn typed_power_of_two_multiply_and_mul_add_stay_on_the_fast_path() {
         TypedArg::new(ArgVal::X(0), integer(0, 100)),
         TypedArg::new(ArgVal::Immediate(five), ArgType::ANY),
         ArgVal::X(1),
-        slow_path,
     )
     .unwrap();
     asm.emit_raw(|e| {

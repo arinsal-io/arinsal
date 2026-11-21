@@ -197,6 +197,15 @@ extern "C" fn apply_fun_hook(
     arinsal_beamasm::rt::process_header_mut(process, |header| header.self_pid as usize)
 }
 
+/// The `bif_mfa` (ARG4) the last raise handed to `handle_error`.
+static RAISED_BIF_MFA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `handle_error(c_p, pc, reg, bif_mfa)` stand-in: records ARG4 and finds no catch.
+extern "C" fn capture_bif_mfa(_: *mut ProcessHeader, _: u64, _: *mut u64, bif_mfa: u64) -> u64 {
+    RAISED_BIF_MFA.store(bif_mfa, std::sync::atomic::Ordering::Relaxed);
+    0
+}
+
 fn apply_fun_module(fragments: &DispatchFragments) -> FinalizedModule {
     let runtime = ApplyRuntime {
         apply_fun_shared: fragments.apply_fun_shared(),
@@ -204,6 +213,7 @@ fn apply_fun_module(fragments: &DispatchFragments) -> FinalizedModule {
         ..runtime()
     };
     let mut asm = BeamModuleAssembler::new();
+    asm.set_exception_resolver(capture_bif_mfa as *const () as usize);
     asm.emit_i_func_label(1).unwrap();
     asm.emit_enter_frame().unwrap();
     misc::emit_apply_call(&mut asm, ApplyKind::Apply2, runtime).unwrap();
@@ -255,8 +265,9 @@ fn native_apply_fun_unpacks_arguments() {
     }
 }
 
-// An improper argument list raises badarg with erlang:apply/2 as the current MFA and X0/X1
-// intact (erts emit_apply_fun_shared, `raise_error`).
+// An improper argument list raises badarg with erlang:apply/2 in ARG4 and X0/X1 intact
+// (erts emit_apply_fun_shared, `raise_error`: `ARG4 = &apply_mfa`); `c_p->current` is not
+// touched.
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn native_apply_fun_improper_list_raises_badarg() {
@@ -266,7 +277,10 @@ fn native_apply_fun_improper_list_raises_badarg() {
     let list = cells.as_ptr() as u64 | 1;
     let (header, regs, _) = execute(&module, ProcessHeader::default(), [tagged(1), list, 0]);
     assert_eq!(header.exc.freason, arinsal_beamasm::exc::EXC_BADARG);
-    let mfa = arinsal_beamasm::bif::static_bif_mfa(header.current as usize as u64);
+    assert!(header.current.is_null());
+    let mfa = arinsal_beamasm::bif::static_bif_mfa(
+        RAISED_BIF_MFA.load(std::sync::atomic::Ordering::Relaxed),
+    );
     assert_eq!(
         mfa,
         Some((arinsal_term::atoms::ERLANG, arinsal_term::atoms::APPLY, 2))

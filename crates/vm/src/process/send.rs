@@ -242,7 +242,7 @@ impl Process {
         suspend: bool,
     ) -> Result<PortSend, VmError> {
         let sender = self
-            .self_pid
+            .self_pid()
             .ok_or_else(|| VmError::Unsupported("send requires a scheduled process".into()))?;
         if target.as_port().is_some() {
             crate::trace::emit_process(self, sender, crate::trace::SEND, "send", &[value, target]);
@@ -410,7 +410,7 @@ impl Process {
     // Port of erts/emulator/beam/bif.c (do_send) and erl_message.c (erts_send_message), OTP-29.1.1.
     pub(crate) fn send_to_pid_idle(&mut self, pid: Pid, value: Term) -> Result<Term, VmError> {
         let sender = self
-            .self_pid
+            .self_pid()
             .ok_or_else(|| VmError::Unsupported("send requires a scheduled process".into()))?;
         // A sender without a token sends `Nil`: the message clears a token its receiver holds.
         let seq_token = SendMeta {

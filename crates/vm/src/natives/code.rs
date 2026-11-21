@@ -66,7 +66,7 @@ pub(crate) fn try_seize_code_mod_permission(
         perm.queue.retain(|waiter| *waiter != pid);
         return false;
     }
-    if process.self_pid == Some(pid) {
+    if process.self_pid() == Some(pid) {
         crate::suspend::suspend_self(process);
     }
     false
@@ -132,6 +132,36 @@ fn signal_resumed(runtime: &Runtime, pids: &[Pid]) {
 /// Resumes `pid` after an internal suspend, rescheduling it when no suspend remains.
 pub(crate) fn resume_suspended(runtime: &Runtime, pid: Pid) {
     resume_waiters(runtime, vec![pid]);
+}
+
+/// Port of erts/emulator/beam/beam_bif_load.c (`erts_schedule_code_barrier` of
+/// `committer_state.barrier`, `commit_code_ix`), OTP-29.1.1.
+fn schedule_commit_code_ix(
+    ctx: &mut RunCtx<'_, crate::Process>,
+    runtime: &'static Runtime,
+    pid: Pid,
+    ended: Option<crate::code_ix::EndedStaging>,
+) {
+    let ticket = ended.map(|ended| ended.disarm()).unwrap_or(0);
+    runtime.code.commit_ticket.store(ticket, Ordering::Release);
+    runtime.code.commit_pid.store(pid.data(), Ordering::Release);
+    crate::code_ix::erts_schedule_code_barrier_from_ctx(
+        ctx,
+        &runtime.code.barrier,
+        commit_code_ix,
+        runtime as *const Runtime as *mut (),
+    );
+}
+
+fn commit_code_ix(data: *mut ()) {
+    let runtime = crate::code_ix::later_data::<Runtime>(data);
+    let ticket = runtime.code.commit_ticket.swap(0, Ordering::AcqRel);
+    if ticket != 0 {
+        runtime.code.commit_ended(ticket);
+    }
+    release_code_mod_permission(runtime);
+    let pid = Pid::from_data(runtime.code.commit_pid.swap(0, Ordering::AcqRel));
+    resume_suspended(runtime, pid);
 }
 
 /// Gives up a permission handed to `pid` that it has not taken yet, so it goes to the next
@@ -815,7 +845,7 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
 
 // Port of erts/emulator/beam/beam_load.c:372-414 (beam_load_report_error), OTP-29.1.1.
 fn report_beam_load_error(process: &Process, module: &str, reason: BeamLoadReason) {
-    let Some((runtime, pid)) = process.runtime.zip(process.self_pid) else {
+    let Some((runtime, pid)) = process.runtime.zip(process.self_pid()) else {
         return;
     };
     let group_leader = process.group_leader_pid(pid).to_term().unwrap_or(Term::NIL);
@@ -1023,13 +1053,7 @@ fn finish_stage(
             // ERTS_BIF_YIELD_RETURN.
             let ended = staged.ended;
             crate::suspend::suspend_self(process);
-            ctx.thread_progress_later(move || {
-                if let Some(ended) = ended {
-                    ended.commit();
-                }
-                release_code_mod_permission(runtime);
-                resume_suspended(runtime, pid);
-            });
+            schedule_commit_code_ix(ctx, runtime, pid, ended);
             *barrier = true;
             crate::bif_traps::vbump_all_reds(process);
             Err(VmError::TrapExport(crate::ExportTrap::new(
@@ -1337,7 +1361,7 @@ fn delete(
     match outcome {
         Outcome::NotPurged => {
             staging.abort();
-            if let (Some(runtime), Some(pid)) = (process.runtime, process.self_pid) {
+            if let (Some(runtime), Some(pid)) = (process.runtime, process.self_pid()) {
                 let group_leader = process.group_leader_pid(pid).to_term().unwrap_or(Term::NIL);
                 crate::utils::send_error_to_logger_str(
                     runtime,
@@ -1867,11 +1891,7 @@ fn call_values(
                         let pid = ctx.pid();
                         process.cold_mut().delete_module_result = Some(result);
                         crate::suspend::suspend_self(process);
-                        ctx.thread_progress_later(move || {
-                            ended.commit();
-                            release_code_mod_permission(runtime);
-                            resume_suspended(runtime, pid);
-                        });
+                        schedule_commit_code_ix(ctx, runtime, pid, Some(ended));
                         Err(VmError::Yield)
                     } else {
                         ctx.block_thread_progress(std::time::Duration::ZERO);

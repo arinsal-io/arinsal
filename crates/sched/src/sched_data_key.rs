@@ -49,6 +49,16 @@ impl<T: Task> Default for ProcSchedData<T> {
 }
 
 impl<T: Task> ProcSchedData<T> {
+    /// `c_p->scheduler_data != NULL`: the process is scheduled in on a normal scheduler (erts
+    /// sets it for no other type), whose thread is a managed thread; code acting for `c_p`
+    /// reads the process table without a thread-progress delay (`erts_proc_lookup_raw`).
+    // Port of erts/emulator/beam/erl_process.c:10232 and erl_process.h:2595
+    // (erts_proc_sched_data), OTP-29.1.1.
+    #[inline(always)]
+    pub fn on_normal_scheduler(&self) -> bool {
+        self.is_set()
+    }
+
     /// `p->scheduler_data = esdp` when a normal scheduler selects the process to run, `NULL`
     /// at its schedule-out.
     // Port of erts/emulator/beam/erl_process.c:10232 and :9756 (erts_schedule), OTP-29.1.1.

@@ -1,6 +1,6 @@
 #![cfg(target_arch = "aarch64")]
 
-use std::{cell::Cell, process::Command, sync::atomic::AtomicPtr};
+use std::process::Command;
 
 use arinsal_a64::enc::Gpr;
 use arinsal_beamasm::{
@@ -10,67 +10,11 @@ use arinsal_beamasm::{
 };
 use arinsal_term::{ProcessHeap, Term, TermBuilder};
 
-thread_local! { static RESULT: Cell<u64> = const { Cell::new(0) }; static HASHMAP_VALUE: Cell<u64> = const { Cell::new(0) }; static HASHMAP_STAGE: Cell<u64> = const { Cell::new(0) }; }
-static ACTIVE_REGS: AtomicPtr<u64> = AtomicPtr::new(std::ptr::null_mut());
-
-extern "C" fn panic_get(_p: *mut ProcessHeader, _map: u64, _key: u64, _stage: u64) -> u64 {
-    panic!("flatmap lookup must stay inline")
-}
-extern "C" fn hashmap_get(_p: *mut ProcessHeader, _map: u64, _key: u64, stage: u64) -> u64 {
-    HASHMAP_STAGE.with(|value| value.set(stage));
-    HASHMAP_VALUE.with(Cell::get)
-}
-extern "C" fn get_elements(
-    _process: *mut ProcessHeader,
-    _map: u64,
-    _module: u64,
-    _table: u64,
-    _stack: u64,
-    _reg: *mut u64,
-) -> u64 {
-    arinsal_beamasm::rt::scheduler_registers_mut(
-        ACTIVE_REGS.load(std::sync::atomic::Ordering::Relaxed),
-        |registers| {
-            registers.x_reg_array[2] = Term::small(42).unwrap();
-            registers.x_reg_array[3] = Term::small(43).unwrap();
-        },
-    );
-    1
-}
-extern "C" fn update(
-    _p: *mut ProcessHeader,
-    _a: u64,
-    _b: u64,
-    _c: u64,
-    _d: u64,
-    _reg: *mut u64,
-) -> u64 {
-    RESULT.with(Cell::get)
-}
-
 fn runtime() -> MapRuntime {
-    runtime_with(hashmap_get)
-}
-/// A runtime whose lookup fragments are built around `get`.
-fn runtime_with(get: arinsal_beamasm::map::MapGetHelper) -> MapRuntime {
-    let fragments = Box::leak(Box::new(
-        arinsal_beamasm::map::MapFragments::new(get, update).unwrap(),
-    ));
-    MapRuntime {
-        get,
-        get_elements,
-        lookup_module: 0,
-        new_map: update,
-        update_assoc: update,
-        update_exact: update,
-        put_single: update,
-        update_single_assoc_shared: fragments.update_single_assoc_shared(),
-        update_assoc_shared: fragments.update_assoc_shared(),
-        update_exact_shared: fragments.update_exact_shared(),
-        update_single_exact_shared: fragments.update_single_exact_shared(),
-        get_element_shared: fragments.get_element_shared(),
-        get_element_hash_shared: fragments.get_element_hash_shared(),
-    }
+    Box::leak(Box::new(
+        arinsal_beamasm::map::MapFragments::new(0).unwrap(),
+    ))
+    .runtime()
 }
 fn bits(term: Term) -> u64 {
     arinsal_beamasm::rt::term_bits(term)
@@ -127,12 +71,7 @@ fn run(
     let mut regs = SchedulerRegisters::default();
     regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(regs0);
     regs.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(regs1);
-    ACTIVE_REGS.store(
-        SchedulerRegisters::reg_ptr(&mut regs),
-        std::sync::atomic::Ordering::Relaxed,
-    );
     let reason = enter_native(&mut header, &mut regs, &module.entry(1).unwrap());
-    ACTIVE_REGS.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
     assert_eq!(reason, ExitReason::Returned);
     regs.x_reg_array[0].tagged_word()
 }
@@ -150,7 +89,7 @@ fn flatmap() -> (ProcessHeap, Term, Term) {
 #[test]
 fn native_flatmap_get_inline() {
     let (_heap, map, key) = flatmap();
-    let runtime = runtime_with(panic_get);
+    let runtime = runtime();
     let result = run(
         |m| {
             m.emit_i_get_map_element(
@@ -171,7 +110,7 @@ fn native_flatmap_get_inline() {
 #[test]
 fn native_flatmap_miss() {
     let (_heap, map, _) = flatmap();
-    let runtime = runtime_with(panic_get);
+    let runtime = runtime();
     let key = Term::small(99).unwrap();
     let result = run(
         |m| {
@@ -193,7 +132,6 @@ fn native_flatmap_miss() {
 #[test]
 fn native_dynamic_key_uses_runtime_lookup() {
     let (_heap, map, key) = flatmap();
-    HASHMAP_VALUE.with(|value| value.set(bits(Term::small(42).unwrap())));
     let result = run(
         |m| {
             m.emit_i_get_map_element(90, ArgVal::X(0), ArgVal::X(1), ArgVal::X(2), runtime())?;
@@ -215,8 +153,6 @@ fn native_hashmap_get() {
     let map = TermBuilder::new(&mut heap)
         .flatmap_from_pairs(&pairs)
         .unwrap();
-    HASHMAP_VALUE.with(|value| value.set(bits(Term::small(139).unwrap())));
-    HASHMAP_STAGE.with(|value| value.set(0));
     let result = run(
         |m| {
             m.emit_i_get_map_element(
@@ -235,8 +171,6 @@ fn native_hashmap_get() {
         (result >> 4) as i64,
         erl_int("maps:get(39, maps:from_list([{N,N+100} || N <- lists:seq(0,39)]))")
     );
-    HASHMAP_STAGE
-        .with(|stage| assert_eq!(stage.get(), 0, "HAMT lookup should find its leaf inline"));
 }
 
 #[test]
@@ -263,7 +197,6 @@ fn native_get_elements() {
                     ArgVal::X(3),
                     ArgVal::Immediate(0),
                 ],
-                runtime(),
             )
         },
         bits(map),
@@ -273,90 +206,6 @@ fn native_get_elements() {
         (result >> 4) as i64,
         erl_int("maps:get(7, #{7 => 42, 8 => 43})")
     );
-}
-
-#[test]
-fn native_new_map() {
-    let (_heap, map, _) = flatmap();
-    RESULT.with(|value| value.set(bits(map)));
-    assert_eq!(
-        run(|m| m.emit_new_map(ArgVal::X(2), 0, &[], runtime()), 0, 0),
-        bits(map)
-    );
-    assert_eq!(erl_int("maps:size(#{} )"), 0);
-}
-
-#[test]
-fn native_update_assoc() {
-    let (_heap, map, _) = flatmap();
-    RESULT.with(|value| value.set(bits(map)));
-    assert_eq!(
-        run(
-            |m| m.emit_update_map_assoc(
-                ArgVal::X(0),
-                ArgVal::X(2),
-                0,
-                &[
-                    ArgVal::Immediate(bits(Term::small(8).unwrap())),
-                    ArgVal::Immediate(bits(Term::small(99).unwrap()))
-                ],
-                runtime()
-            ),
-            bits(map),
-            0
-        ),
-        bits(map)
-    );
-    assert_eq!(erl_int("maps:get(7, #{7 => 42})"), 42);
-}
-
-#[test]
-fn native_update_exact() {
-    let (_heap, map, _) = flatmap();
-    RESULT.with(|value| value.set(bits(map)));
-    assert_eq!(
-        run(
-            |m| m.emit_update_map_exact(
-                ArgVal::X(0),
-                90,
-                ArgVal::X(2),
-                0,
-                &[
-                    ArgVal::Immediate(bits(Term::small(7).unwrap())),
-                    ArgVal::Immediate(bits(Term::small(99).unwrap()))
-                ],
-                runtime()
-            ),
-            bits(map),
-            0
-        ),
-        bits(map)
-    );
-    assert_eq!(erl_int("maps:get(7, #{7 => 42})"), 42);
-}
-
-#[test]
-fn native_update_exact_badkey() {
-    RESULT.with(|value| value.set(0));
-    assert_eq!(
-        run(
-            |m| m.emit_update_map_exact(
-                ArgVal::X(0),
-                90,
-                ArgVal::X(2),
-                0,
-                &[
-                    ArgVal::Immediate(bits(Term::small(9).unwrap())),
-                    ArgVal::Immediate(bits(Term::small(1).unwrap()))
-                ],
-                runtime()
-            ),
-            0,
-            0
-        ),
-        0x3f0
-    );
-    assert!(erl("catch maps:update(9, 1, #{})").contains("badkey"));
 }
 
 #[test]

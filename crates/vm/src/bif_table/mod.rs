@@ -263,6 +263,7 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "system_time", 1) => bif!(erl_time_sup::system_time_1),
         ("os", "system_time", 0) => bif!(erl_time_sup::os_system_time_0),
         ("os", "system_time", 1) => bif!(erl_time_sup::os_system_time_1),
+        ("os", "perf_counter", 0) => bif!(erl_time_sup::os_perf_counter_0),
         ("erlang", "time_offset", 0) => bif!(erl_time_sup::time_offset_0),
         ("erlang", "time_offset", 1) => bif!(erl_time_sup::time_offset_1),
         ("erlang", "timestamp", 0) => bif!(erl_time_sup::timestamp_0),
@@ -620,6 +621,7 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "load_nif", 2) => sched_entry::<LoadNif2>(),
         ("erlang", "nodes", 2) => sched_entry::<Nodes2>(),
         ("erlang", "bif_return_trap", 2) => sched_entry::<BifReturnTrap2>(),
+        ("erlang", "bif_handle_signals_return", 2) => sched_entry::<BifHandleSignalsReturn2>(),
         ("persistent_term", "put", 2) => sched_entry::<PersistentTermPut2>(),
         ("persistent_term", "put_new", 2) => sched_entry::<PersistentTermPutNew2>(),
         ("persistent_term", "erase", 1) => sched_entry::<PersistentTermErase1>(),
@@ -638,6 +640,9 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
 // fixed here when the export is created.
 pub(crate) fn trap_function(module: &str, function: &str, arity: u8) -> Option<usize> {
     Some(match (module, function, arity) {
+        ("erlang", "bif_handle_signals_return", 2) => {
+            bif!(crate::native_helpers::sched_bif_light::<BifHandleSignalsReturn2>)
+        }
         ("erlang", "re_run_trap", 3) => bif!(erl_bif_re::re_run_trap_3),
         ("erlang", "ptab_list_continue", 2) => bif!(erl_ptab::ptab_list_continue_2),
         ("erlang", "md5_trap", 2) => bif!(erl_bif_chksum::md5_trap_2),
@@ -744,6 +749,14 @@ struct BifReturnTrap2;
 impl crate::native_helpers::SchedBif for BifReturnTrap2 {
     const ARITY: usize = 2;
     const BODY: crate::natives::DirectNative = crate::natives::sys::bif_return_trap_2;
+}
+
+/// `erlang:bif_handle_signals_return/2`. Port of erts/emulator/beam/bif.c
+/// (`bif_handle_signals_return`), OTP-29.1.1.
+struct BifHandleSignalsReturn2;
+impl crate::native_helpers::SchedBif for BifHandleSignalsReturn2 {
+    const ARITY: usize = 2;
+    const BODY: crate::natives::DirectNative = crate::natives::sys::bif_handle_signals_return_2;
 }
 
 /// A [`crate::native_helpers::SchedBif`] named by its body.

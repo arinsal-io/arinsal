@@ -11,7 +11,7 @@ use crate::bits::{binary_data, writable_gc_visit};
 use crate::hamt::{boxed_object_words, boxed_term_range};
 use crate::{
     ARITY, BIN_REF, ExternalBinary, FUN, HEAP_BITS, HeapAlloc, MAP, MagicBin, Node, ProcessHeap,
-    RECORD, RefcBinary, S_RESERVED, SUB_BITS, StackWord, Term, TermError, WritableBinary,
+    RECORD, RefcBinary, S_RESERVED, SUB_BITS, StackWord, Term, WritableBinary,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,7 +108,7 @@ pub trait GcMessageQueue {
     /// Copy the attached data of each queued message onto `heap` and free it
     /// (`erts_proc_sig_move_msgs_to_heap`), with [`ProcessHeap::move_message_heap`] and
     /// [`ProcessHeap::move_node_fragment`].
-    fn move_msgs_to_heap(&mut self, heap: &mut ProcessHeap) -> Result<(), TermError>;
+    fn move_msgs_to_heap(&mut self, heap: &mut ProcessHeap);
 }
 
 /// A process without queued messages.
@@ -117,9 +117,7 @@ impl GcMessageQueue for () {
         0
     }
     fn for_each_heap_root(&mut self, _visit: &mut dyn FnMut(&mut Term)) {}
-    fn move_msgs_to_heap(&mut self, _heap: &mut ProcessHeap) -> Result<(), TermError> {
-        Ok(())
-    }
+    fn move_msgs_to_heap(&mut self, _heap: &mut ProcessHeap) {}
 }
 
 /// Messages as `(term, seq_trace token, attached data)`: the data is `None` once on the heap.
@@ -138,38 +136,29 @@ impl GcMessageQueue for &mut [(Term, Term, Option<crate::message::MessageHeap>)]
             }
         }
     }
-    fn move_msgs_to_heap(&mut self, heap: &mut ProcessHeap) -> Result<(), TermError> {
+    fn move_msgs_to_heap(&mut self, heap: &mut ProcessHeap) {
         for (term, token, data) in self.iter_mut() {
             if let Some(data) = data.take() {
                 let mut refs = [*term, *token];
-                heap.move_message_heap(data, &mut refs)?;
+                heap.move_message_heap(data, &mut refs);
                 [*term, *token] = refs;
             }
         }
-        Ok(())
     }
 }
 
 /// `erts_system_monitor_long_gc`: the collector reads the clock only while this is set.
 // Port of erts/emulator/beam/erl_gc.c:803, OTP-29.1.1.
 static GC_CLOCK_LONG: AtomicBool = AtomicBool::new(false);
-/// `erts_msacc_enabled`: microstate accounting times the collector the same way.
-// Port of erts/emulator/beam/erl_msacc.h:240 (`ERTS_MSACC_IS_ENABLED`), OTP-29.1.1.
-static GC_CLOCK_MSACC: AtomicBool = AtomicBool::new(false);
 
 /// Enable the monotonic clock around collections while `long_gc` monitoring is on.
 pub fn set_gc_clock_for_long_gc(enabled: bool) {
     GC_CLOCK_LONG.store(enabled, Ordering::Relaxed);
 }
 
-/// Enable the monotonic clock around collections while microstate accounting is on.
-pub fn set_gc_clock_for_msacc(enabled: bool) {
-    GC_CLOCK_MSACC.store(enabled, Ordering::Relaxed);
-}
-
 #[inline]
 fn gc_clock_active() -> bool {
-    GC_CLOCK_LONG.load(Ordering::Relaxed) || GC_CLOCK_MSACC.load(Ordering::Relaxed)
+    GC_CLOCK_LONG.load(Ordering::Relaxed)
 }
 
 /// Location and sizes of an abandoned young heap.
@@ -233,17 +222,17 @@ impl HeapAlloc for FragmentAlloc<'_> {
         writable: bool,
         overhead_words: u64,
         owner: Option<arinsal_alloc::raw::OwnedBinaryRef>,
-    ) -> Result<(), TermError> {
+    ) {
         HeapAlloc::link_bin_ref(self.0, bin_ref, writable, overhead_words, owner)
     }
-    fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
+    fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) {
         HeapAlloc::retain_writable_binary(self.0, binary)
     }
     fn retain_writable_binary_with_apparent_size(
         &mut self,
         binary: Arc<WritableBinary>,
         apparent_size_bits: usize,
-    ) -> Result<(), TermError> {
+    ) {
         HeapAlloc::retain_writable_binary_with_apparent_size(self.0, binary, apparent_size_bits)
     }
     fn update_writable_binary_overhead(
@@ -257,11 +246,7 @@ impl HeapAlloc for FragmentAlloc<'_> {
     fn supports_writable_binary(&self) -> bool {
         true
     }
-    fn link_external_binary(
-        &mut self,
-        bin_ref: *mut u64,
-        binary: Arc<ExternalBinary>,
-    ) -> Result<(), TermError> {
+    fn link_external_binary(&mut self, bin_ref: *mut u64, binary: Arc<ExternalBinary>) {
         HeapAlloc::link_external_binary(self.0, bin_ref, binary)
     }
     fn supports_external_binary(&self) -> bool {
@@ -270,7 +255,7 @@ impl HeapAlloc for FragmentAlloc<'_> {
     fn link_node(&mut self, thing: *mut u64, node: Node) {
         HeapAlloc::link_node(self.0, thing, node);
     }
-    fn link_magic_ref(&mut self, thing: *mut u64, owner: MagicBin) -> Result<(), TermError> {
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: MagicBin) {
         HeapAlloc::link_magic_ref(self.0, thing, owner)
     }
     fn supports_magic(&self) -> bool {
@@ -1487,8 +1472,7 @@ impl ProcessHeap {
     pub fn set_min_heap_size(&mut self, words: usize) {
         // Port of erl_gc.c:345-349 (`next_heap_size`) and bif.c:2120-2129
         // (`min_heap_size`), OTP-29.1.1.
-        self.min_heap_size =
-            u32::try_from(erts_next_heap_size(words, 0).unwrap_or(words)).unwrap_or(u32::MAX);
+        self.min_heap_size = u32::try_from(erts_next_heap_size(words, 0)).unwrap_or(u32::MAX);
     }
 
     /// Number of live stack words.
@@ -1552,12 +1536,7 @@ impl ProcessHeap {
 
     /// Copy reachable objects and rewrite X, stack, and extra roots.
     /// Literal and shared allocations retain their addresses.
-    pub fn collect(
-        &mut self,
-        roots: &mut [Term],
-        extra: &mut [Term],
-        min_free: usize,
-    ) -> Result<GcStats, TermError> {
+    pub fn collect(&mut self, roots: &mut [Term], extra: &mut [Term], min_free: usize) -> GcStats {
         let mut root_slots = GcRootSet::new();
         root_slots.push(roots);
         let mut extra_slots = GcRootSet::new();
@@ -1577,7 +1556,7 @@ impl ProcessHeap {
         extra: &mut [Term],
         min_free: usize,
         messages: &mut [(Term, Term, Option<crate::message::MessageHeap>)],
-    ) -> Result<GcStats, TermError> {
+    ) -> GcStats {
         let mut root_slots = GcRootSet::new();
         root_slots.push(roots);
         let mut extra_slots = GcRootSet::new();
@@ -1602,7 +1581,7 @@ impl ProcessHeap {
         min_free: usize,
         msgq: &mut dyn GcMessageQueue,
         on_heap_msgq: bool,
-    ) -> Result<GcStats, TermError> {
+    ) -> GcStats {
         crate::validate::check_heap_bits_if_active(self, "before collection");
         // Port of erl_gc.c:803-804: the clock is read only for long_gc monitoring.
         // Microstate accounting uses the same sample (`ERTS_MSACC_IS_ENABLED`).
@@ -1639,10 +1618,7 @@ impl ProcessHeap {
         let off_heap_overhead = self.owners.overhead();
         let major = self.collection_is_major() || self.minor_attempt_fails(mature_words);
         let stack = self.stack_words();
-        let source_words = self
-            .htop_index()
-            .checked_add(fragments)
-            .ok_or(TermError::SystemLimit)?;
+        let source_words = self.htop_index() + fragments;
         // Port of erl_gc.c:642 (`young_gen_usage` heap top) and erl_gc.c:1875
         // (`major_collection` adds the old heap). Usage is an upper bound on
         // survivors: a copying collector cannot move more words than are allocated.
@@ -1662,10 +1638,10 @@ impl ProcessHeap {
         } else {
             size_before.max(min_free.saturating_add(S_RESERVED))
         });
-        let mut capacity = next_heap_size(new_sz, 0, self.min_heap_size as usize)?;
+        let mut capacity = next_heap_size(new_sz, 0, self.min_heap_size as usize);
         if major && self.has_flag(crate::pflags::F_HEAP_GROW) && capacity == self.heap_size_words()
         {
-            capacity = next_heap_size(capacity, 1, self.min_heap_size as usize)?;
+            capacity = next_heap_size(capacity, 1, self.min_heap_size as usize);
         }
         // Match the embedded ERTS vheap state without materializing an empty owner
         // box when a previous collection left only default values behind.
@@ -1679,7 +1655,7 @@ impl ProcessHeap {
         if !major && self.old_words.is_empty() && mature_words > 0 {
             // Port of erl_gc.c:1471 (`erts_next_heap_size(size_before, 1)`):
             // the first old heap is one step larger than the mature data.
-            let old_capacity = next_heap_size(source_words, 1, 0)?;
+            let old_capacity = next_heap_size(source_words, 1, 0);
             self.old_words =
                 self.new_block(old_capacity, arinsal_alloc::typed::ErtsAlcType::OLD_HEAP);
         }
@@ -1860,14 +1836,14 @@ impl ProcessHeap {
         // erl_gc.c:1500-1501 and 1947-1948, OTP-29.1.1: after the copy, before the resize.
         if on_heap_msgq {
             let pre_overhead = self.bin_vheap;
-            msgq.move_msgs_to_heap(self)?;
+            msgq.move_msgs_to_heap(self);
             if pre_overhead != self.bin_vheap {
                 self.bin_vheap_size =
                     next_vheap_size(self.bin_vheap, self.bin_vheap_size, self.owners.vheap_min());
             }
         }
         // erts resize_new_heap offsets the on-heap queue with the rest of the root set.
-        let adjusted = self.adjust_young_heap(major, min_free, roots, extra, msgq)?;
+        let adjusted = self.adjust_young_heap(major, min_free, roots, extra, msgq);
         // erl_gc.c:1506/1952: `size_after` includes the moved message data.
         let copied = self.htop_index() as u64;
         #[cfg(debug_assertions)]
@@ -1915,7 +1891,7 @@ impl ProcessHeap {
         self.bin_vheap_size =
             next_vheap_size(self.bin_vheap, self.bin_vheap_size, self.owners.vheap_min());
         crate::validate::check_heap_bits_if_active(self, "after collection");
-        Ok(stats)
+        stats
     }
 
     /// Return the heap-size checks OTP performs before this collection can proceed.
@@ -1929,77 +1905,55 @@ impl ProcessHeap {
         &self,
         min_free: usize,
         message_words: usize,
-    ) -> Result<(usize, Option<usize>), TermError> {
-        let source_words = self
-            .young_gen_usage()
-            .checked_add(message_words)
-            .ok_or(TermError::SystemLimit)?;
+    ) -> (usize, Option<usize>) {
+        let source_words = self.young_gen_usage() + message_words;
         let young_free = self.stop_index().saturating_sub(self.htop_index());
         if self.collection_is_major() {
-            return Ok((self.major_max_heap_size(source_words)?, None));
+            return (self.major_max_heap_size(source_words), None);
         }
 
         let mature_words = self.mature_words();
         let old_heap_capacity = if self.old_words.is_empty() && mature_words != 0 {
-            next_heap_size(source_words, 1, 0)?
+            next_heap_size(source_words, 1, 0)
         } else {
             self.old_words.len()
         };
-        let need = min_free
-            .checked_add(S_RESERVED)
-            .ok_or(TermError::SystemLimit)?;
+        let need = min_free + S_RESERVED;
         let young_capacity = next_heap_size(
-            young_free
-                .checked_add(source_words.max(need))
-                .ok_or(TermError::SystemLimit)?,
+            young_free + source_words.max(need),
             0,
             self.min_heap_size as usize,
-        )?;
-        let minor_size = source_words
-            .checked_add(young_free)
-            .and_then(|size| size.checked_add(old_heap_capacity))
-            .and_then(|size| size.checked_add(young_capacity))
-            .ok_or(TermError::SystemLimit)?;
+        );
+        let minor_size = source_words + young_free + old_heap_capacity + young_capacity;
         let major_size = self
             .minor_falls_back_to_major()
-            .then(|| self.major_max_heap_size(source_words))
-            .transpose()?;
-        Ok((minor_size, major_size))
+            .then(|| self.major_max_heap_size(source_words));
+        (minor_size, major_size)
     }
 
-    fn major_max_heap_size(&self, source_words: usize) -> Result<usize, TermError> {
-        let size_before = source_words
-            .checked_add(self.old_htop)
-            .ok_or(TermError::SystemLimit)?;
+    fn major_max_heap_size(&self, source_words: usize) -> usize {
+        let size_before = source_words + self.old_htop;
         let capacity = next_heap_size(
-            self.stack_words()
-                .checked_add(size_before)
-                .and_then(|size| size.checked_add(S_RESERVED))
-                .ok_or(TermError::SystemLimit)?,
+            self.stack_words() + size_before + S_RESERVED,
             0,
             self.min_heap_size as usize,
-        )?;
+        );
         let capacity =
             if capacity == self.heap_size_words() && self.has_flag(crate::pflags::F_HEAP_GROW) {
-                next_heap_size(capacity, 1, self.min_heap_size as usize)?
+                next_heap_size(capacity, 1, self.min_heap_size as usize)
             } else {
                 capacity
             };
         size_before
-            .checked_add(self.old_words.len().saturating_sub(self.old_htop))
-            .and_then(|size| size.checked_add(self.stop_index().saturating_sub(self.htop_index())))
-            .and_then(|size| size.checked_add(capacity))
-            .ok_or(TermError::SystemLimit)
+            + self.old_words.len().saturating_sub(self.old_htop)
+            + self.stop_index().saturating_sub(self.htop_index())
+            + capacity
     }
 
     /// Full sweep that leaves the young heap exactly as large as the live data,
     /// the stack, and `S_RESERVED`, with no old heap.
     // Port of erts/emulator/beam/erl_gc.c:1004 (garbage_collect_hibernate), OTP-29.1.1.
-    pub fn collect_hibernate(
-        &mut self,
-        roots: &mut [Term],
-        extra: &mut [Term],
-    ) -> Result<GcStats, TermError> {
+    pub fn collect_hibernate(&mut self, roots: &mut [Term], extra: &mut [Term]) -> GcStats {
         let mut root_slots = GcRootSet::new();
         root_slots.push(roots);
         let mut extra_slots = GcRootSet::new();
@@ -2013,9 +1967,9 @@ impl ProcessHeap {
         roots: &mut GcRootSet<'a>,
         extra: &mut GcRootSet<'a>,
         msgq: &mut dyn GcMessageQueue,
-    ) -> Result<GcStats, TermError> {
+    ) -> GcStats {
         self.request_full_sweep();
-        let stats = self.collect_with_root_slots(roots, extra, 0, msgq, false)?;
+        let stats = self.collect_with_root_slots(roots, extra, 0, msgq, false);
         let exact = self
             .htop_index()
             .saturating_add(S_RESERVED)
@@ -2024,7 +1978,7 @@ impl ProcessHeap {
             self.relocate_young(exact, roots, extra, msgq);
         }
         self.set_flag(crate::pflags::F_HEAP_GROW, false);
-        Ok(stats)
+        stats
     }
 
     /// Apply the post-copy heap policy used by erts.
@@ -2035,7 +1989,7 @@ impl ProcessHeap {
         roots: &mut GcRootSet<'a>,
         extra: &mut GcRootSet<'a>,
         msgq: &mut dyn GcMessageQueue,
-    ) -> Result<bool, TermError> {
+    ) -> bool {
         let stack = self.stack_words();
         let need_after = self
             .htop_index()
@@ -2048,7 +2002,7 @@ impl ProcessHeap {
             self.set_flag(crate::pflags::F_HEAP_GROW, false);
             if need_after > capacity {
                 // Port of erl_gc.c:2073 (`adjust_after_fullsweep`).
-                Some(next_heap_size(need_after, 0, self.min_heap_size as usize)?)
+                Some(next_heap_size(need_after, 0, self.min_heap_size as usize))
             } else if need_after.saturating_mul(4) > capacity.saturating_mul(3) {
                 // Port of erl_gc.c:2076 (`adjust_after_fullsweep`): defer growth.
                 self.set_flag(crate::pflags::F_HEAP_GROW, true);
@@ -2061,13 +2015,13 @@ impl ProcessHeap {
                     need_after.saturating_mul(2),
                     0,
                     self.min_heap_size as usize,
-                )?)
+                ))
             } else {
                 None
             }
         } else if need_after > capacity {
             // Port of erl_gc.c:1552 (`grow_new_heap`).
-            Some(next_heap_size(need_after, 0, self.min_heap_size as usize)?)
+            Some(next_heap_size(need_after, 0, self.min_heap_size as usize))
         } else if capacity > 3000
             && need_after.saturating_mul(4) < capacity
             && (capacity > 8000 || capacity > old_len)
@@ -2079,7 +2033,7 @@ impl ProcessHeap {
                 wanted = wanted.max(old_len / 8);
             }
             let minimum = wanted.max(self.min_heap_size as usize);
-            let minimum = next_heap_size(minimum, 0, self.min_heap_size as usize)?;
+            let minimum = next_heap_size(minimum, 0, self.min_heap_size as usize);
             (minimum < capacity).then_some(minimum)
         } else {
             None
@@ -2088,9 +2042,9 @@ impl ProcessHeap {
             && wanted != capacity
         {
             self.relocate_young(wanted, roots, extra, msgq);
-            return Ok(true);
+            return true;
         }
-        Ok(false)
+        false
     }
 
     /// Copy the attached data of a queued message onto the heap top, rebase `refs` (the
@@ -2098,19 +2052,15 @@ impl ProcessHeap {
     /// freed. The collection sized the heap to hold it.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:8851-8880 (move_msg_to_heap) and
     // erl_gc.c:2514-2611 (erts_copy_one_frag), OTP-29.1.1.
-    pub fn move_message_heap(
-        &mut self,
-        mut data: crate::message::MessageHeap,
-        refs: &mut [Term],
-    ) -> Result<(), TermError> {
+    pub fn move_message_heap(&mut self, mut data: crate::message::MessageHeap, refs: &mut [Term]) {
         match &mut data {
             crate::message::MessageHeap::Heap(fragment) => {
-                let range = self.copy_one_frag(fragment.words(), refs)?;
+                let range = self.copy_one_frag(fragment.words(), refs);
                 rebase_binref_chains_to_range(&mut fragment.off_heap, range);
                 self.absorb_off_heap(std::mem::take(&mut fragment.off_heap), fragment.bin_vheap);
             }
             crate::message::MessageHeap::Node(fragment) => {
-                let range = self.copy_one_frag(fragment.words(), refs)?;
+                let range = self.copy_one_frag(fragment.words(), refs);
                 rebase_binref_chains_to_range(fragment.owners_mut(), range);
                 let (off_heap, bin_vheap) = fragment.take_owners();
                 self.absorb_off_heap(off_heap, bin_vheap);
@@ -2118,7 +2068,6 @@ impl ProcessHeap {
         }
         // free_message_buffer
         drop(data);
-        Ok(())
     }
 
     /// [`ProcessHeap::move_message_heap`] for data in the inline fragment of a queued node:
@@ -2129,20 +2078,24 @@ impl ProcessHeap {
         &mut self,
         mut fragment: crate::message::FragmentMut<'_>,
         refs: &mut [Term],
-    ) -> Result<(), TermError> {
-        let range = self.copy_one_frag(fragment.words(), refs)?;
+    ) {
+        let range = self.copy_one_frag(fragment.words(), refs);
         rebase_binref_chains_to_range(fragment.owners_mut(), range);
         let (off_heap, bin_vheap) = fragment.take_data();
         self.absorb_off_heap(off_heap, bin_vheap);
-        Ok(())
     }
 
     /// Copy `block` onto the heap top and offset its pointers and `refs` by the distance.
     // Port of erts/emulator/beam/erl_gc.c:2514-2611 (erts_copy_one_frag), OTP-29.1.1.
-    fn copy_one_frag(&mut self, block: &[u64], refs: &mut [Term]) -> Result<MoveRange, TermError> {
+    fn copy_one_frag(&mut self, block: &[u64], refs: &mut [Term]) -> MoveRange {
         let words = block.len();
-        if self.htop_index().saturating_add(words) > self.stop_index() {
-            return Err(TermError::SystemLimit);
+        // The collection sized the heap for the queue (`young_gen_usage`); a block past the
+        // stack is erl_gc.c `OverRunCheck`.
+        if self.htop_index() + words > self.stop_index() {
+            crate::erl_init::erts_exit(
+                crate::erl_init::ExitMode::Abort,
+                "erl_gc.c: Overrun stack and heap",
+            );
         }
         let at = self.htop_index();
         self.words.words_mut()[at..at + words].copy_from_slice(block);
@@ -2162,7 +2115,7 @@ impl ProcessHeap {
         for term in refs {
             term.0 = offset_word(term.0, range);
         }
-        Ok(range)
+        range
     }
 
     /// Resize the young heap with `ERTS_HEAP_REALLOC`. When the block stays put, only
@@ -2510,62 +2463,61 @@ fn heap_sizes() -> &'static [usize] {
 /// `heap_need`, with `min_heap` the process's minimum heap size.
 ///
 /// Port of erts/emulator/beam/erl_process.c:12587-12591 (erl_create_process), OTP-29.1.1.
-pub fn spawned_heap_words(heap_need: usize, min_heap: usize) -> Result<usize, TermError> {
+pub fn spawned_heap_words(heap_need: usize, min_heap: usize) -> usize {
     if heap_need < min_heap {
-        Ok(min_heap)
+        min_heap
     } else {
-        next_heap_size(heap_need, 0, 0)
+        erts_next_heap_size(heap_need, 0)
     }
 }
 
-/// Rounds a requested minimum through the process heap size table used by erts.
+/// Rounds a requested size through the process heap size table; `offset == 1` returns the next
+/// larger size. A size past the table ends the node, as erts does.
 ///
-/// Port of erts/emulator/beam/erl_gc.c:311-335 (`erts_next_heap_size`), OTP-29.1.1.
-pub fn erts_next_heap_size(size: usize, offset: usize) -> Result<usize, TermError> {
-    next_heap_size(size, offset, 0)
-}
-
-/// Rounds a heap minimum and applies the caller's erts minimum-size floor.
-pub fn normalize_heap_minimum(minimum: usize, floor: usize) -> usize {
-    let minimum = minimum.max(floor);
-    erts_next_heap_size(minimum, 0).unwrap_or(minimum)
-}
-
-/// Select the table size at or above `minimum`, applying OTP's optional offset.
-///
-/// Port of erl_gc.c:311-335 (`erts_next_heap_size`) and erl_gc.c:345-349
-/// (`next_heap_size`), OTP-29.1.1.
-fn next_heap_size(minimum: usize, offset: usize, min_heap_size: usize) -> Result<usize, TermError> {
+/// Port of erts/emulator/beam/erl_gc.c:311-338 (`erts_next_heap_size`), OTP-29.1.1.
+pub fn erts_next_heap_size(size: usize, offset: usize) -> usize {
     let sizes = heap_sizes();
-    if minimum < sizes[0] {
-        return Ok(sizes[0].max(min_heap_size));
+    if size < sizes[0] {
+        return sizes[0];
     }
     let mut low = 0;
     let mut high = sizes.len();
     while low < high {
         let mid = low + (high - low) / 2;
-        if minimum < sizes[mid] {
+        let index = if size < sizes[mid] {
             high = mid;
-        } else if minimum == sizes[mid] {
-            let index = mid.checked_add(offset).ok_or(TermError::SystemLimit)?;
-            return match sizes.get(index) {
-                Some(size) => Ok((*size).max(min_heap_size)),
-                None => Err(TermError::SystemLimit),
-            };
-        } else if mid + 1 < sizes.len() && minimum < sizes[mid + 1] {
-            let index = mid
-                .checked_add(offset)
-                .and_then(|index| index.checked_add(1))
-                .ok_or(TermError::SystemLimit)?;
-            return match sizes.get(index) {
-                Some(size) => Ok((*size).max(min_heap_size)),
-                None => Err(TermError::SystemLimit),
-            };
+            continue;
+        } else if size == sizes[mid] {
+            mid + offset
+        } else if mid + 1 < sizes.len() && size < sizes[mid + 1] {
+            mid + offset + 1
         } else {
             low = mid + 1;
+            continue;
+        };
+        // erl_gc.c ASSERT(mid+offset-heap_sizes < num_heap_sizes): the table always has a
+        // larger entry for a size the collector reached.
+        if let Some(&next) = sizes.get(index) {
+            return next;
         }
+        break;
     }
-    Err(TermError::SystemLimit)
+    crate::erl_init::erts_exit(
+        crate::erl_init::ExitMode::Error,
+        &format!("No next heap size found: {size}, offset {offset}"),
+    )
+}
+
+/// Rounds a heap minimum and applies the caller's erts minimum-size floor.
+pub fn normalize_heap_minimum(minimum: usize, floor: usize) -> usize {
+    erts_next_heap_size(minimum.max(floor), 0)
+}
+
+/// `erts_next_heap_size` raised to the process's `min_heap_size`.
+///
+/// Port of erl_gc.c:345-350 (`next_heap_size`), OTP-29.1.1.
+fn next_heap_size(minimum: usize, offset: usize, min_heap_size: usize) -> usize {
+    erts_next_heap_size(minimum, offset).max(min_heap_size)
 }
 
 // Port of erts/emulator/beam/erl_gc.c:2915-2958 (do_next_vheap_size), OTP-29.1.1.
@@ -2604,7 +2556,8 @@ mod tests {
             let index = sizes.partition_point(|&size| size < target);
             let expected = sizes.get(index).copied();
             assert_eq!(
-                next_heap_size(target, 0, 0).ok(),
+                // Past the table erts_next_heap_size ends the node.
+                expected.map(|_| next_heap_size(target, 0, 0)),
                 expected,
                 "target {target}"
             );
@@ -2616,7 +2569,7 @@ mod tests {
                     .and_then(|next| sizes.get(next).copied())
             };
             assert_eq!(
-                next_heap_size(target, 1, 0).ok(),
+                expected_offset.map(|_| next_heap_size(target, 1, 0)),
                 expected_offset,
                 "offset target {target}"
             );
@@ -2688,7 +2641,7 @@ mod tests {
         heap.old_words = std::mem::take(&mut ProcessHeap::with_words(128).words);
         heap.owners.vheap.old = 0;
 
-        heap.collect(&mut [], &mut [], 0).unwrap();
+        heap.collect(&mut [], &mut [], 0);
 
         assert!(!heap.collection_is_major());
         similar_asserts::assert_eq!(heap.owners.chain_heads(), (0, 0));

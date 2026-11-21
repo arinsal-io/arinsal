@@ -13,7 +13,7 @@ use arinsal_term::{
 };
 use std::collections::HashSet;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -29,8 +29,6 @@ const FUN: u64 = 0x14;
 const RECORD: u64 = 0x1c;
 const SUB_BITS: u64 = 0x24;
 const MAP: u64 = 0x2c;
-
-type MicrostateBaseline = (Instant, Vec<[u64; 7]>, [u64; 3]);
 
 #[derive(Clone)]
 struct SchedBase {
@@ -192,10 +190,10 @@ pub(crate) fn copy_literal_area(
         let hibernated = process.hibernated();
         let copied = rewrite_roots(process, live_x, std::slice::from_ref(&area))?;
         process.heap.request_full_sweep();
-        process.force_gc_live(live_x)?;
+        process.force_gc_live(live_x);
         if hibernated {
             // Port of erts/emulator/beam/erl_gc.c:1387 (`erts_garbage_collect_literals`), OTP-29.1.1.
-            process.garbage_collect_hibernate(live_x)?;
+            process.garbage_collect_hibernate(live_x);
         }
         store.acknowledge_copied(area_id, u64::from(copied));
     } else {
@@ -386,6 +384,7 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erlang", "dt_spread_tag", 1),
     ("erlang", "dt_restore_tag", 1),
     ("erlang", "bif_return_trap", 2),
+    ("erlang", "bif_handle_signals_return", 2),
 ];
 
 pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
@@ -410,6 +409,7 @@ pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler
         ("erlang", "dt_spread_tag", 1) => Some(call_dt_spread_tag),
         ("erlang", "dt_restore_tag", 1) => Some(call_dt_restore_tag),
         ("erlang", "bif_return_trap", 2) => Some(bif_return_trap_2),
+        ("erlang", "bif_handle_signals_return", 2) => Some(bif_handle_signals_return_2),
         _ => None,
     }
 }
@@ -823,6 +823,21 @@ pub(crate) fn bif_return_trap_2(
 /// The continuation of `ERTS_BIF_YIELD_RETURN`.
 pub(crate) const BIF_RETURN_TRAP: &str = "erlang:bif_return_trap/2";
 
+/// `erlang:bif_handle_signals_return/2`, the trap export of `ERTS_BIF_HANDLE_SIGNALS_FROM_RETURN`.
+// Port of erts/emulator/beam/bif.c:5452-5498 (`bif_handle_signals_return`) and bif.h:527-528,
+// OTP-29.1.1.
+pub(crate) fn bif_handle_signals_return_2(
+    _vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, crate::Process>,
+    args: &[Term],
+) -> Result<Term, VmError> {
+    process.bif_handle_signals_return(ctx, args[0], args[1])
+}
+
+/// The continuation of `ERTS_BIF_HANDLE_SIGNALS_FROM_RETURN`.
+pub(crate) const BIF_HANDLE_SIGNALS_RETURN: &str = "erlang:bif_handle_signals_return/2";
+
 /// The export of a persistent-term BIF that updates the table: it yields to itself while
 /// another process holds the update permission.
 fn persistent_update_export(module: &str, function: &str, arity: u8) -> Option<&'static str> {
@@ -894,17 +909,39 @@ fn persistent_update(
         return Ok(value);
     };
     crate::suspend::suspend_self(process);
-    ctx.thread_progress_later(move || {
-        store.reclaim_old_tables();
-        store.release_update_permission(owner);
-        crate::natives::code::resume_suspended(runtime, pid);
-    });
+    runtime
+        .persistent_term_resume_pid
+        .store(pid.data(), std::sync::atomic::Ordering::Release);
+    runtime
+        .persistent_term_resume_owner
+        .store(owner, std::sync::atomic::Ordering::Release);
+    ctx.erts_schedule_thr_prgr_later_op(
+        persistent_table_updater,
+        runtime as *const crate::process::Runtime as *mut (),
+        runtime.persistent_term_later_op.as_list_node(),
+    );
     crate::bif_traps::vbump_all_reds(process);
     Err(VmError::TrapExport(crate::ExportTrap::new(
         process,
         BIF_RETURN_TRAP,
         vec![value, Term::atom(arinsal_term::atoms::UNDEFINED)],
     )))
+}
+
+/// Port of erts/emulator/beam/erl_bif_persistent.c (`table_updater`), OTP-29.1.1.
+fn persistent_table_updater(data: *mut ()) {
+    let runtime = crate::code_ix::later_data::<crate::process::Runtime>(data);
+    let owner = runtime
+        .persistent_term_resume_owner
+        .swap(0, std::sync::atomic::Ordering::AcqRel);
+    runtime.persistent_terms.reclaim_old_tables();
+    runtime.persistent_terms.release_update_permission(owner);
+    let pid = arinsal_sched::Pid::from_data(
+        runtime
+            .persistent_term_resume_pid
+            .swap(0, std::sync::atomic::Ordering::AcqRel),
+    );
+    crate::natives::code::resume_suspended(runtime, pid);
 }
 
 macro_rules! persistent_update_bif {
@@ -4186,11 +4223,9 @@ pub(crate) struct StatisticsState {
     last_wall_ms: AtomicU64,
     cpu_origin_ns: u64,
     wall_origin: Instant,
-    microstate: AtomicBool,
     cpu_topology: Mutex<Option<arinsal_etf::OwnedTerm>>,
     cpu_bind_order: Mutex<Option<String>>,
     sched_wall: Mutex<Option<SchedBase>>,
-    microstate_base: Mutex<Option<MicrostateBaseline>>,
     system_logger: Mutex<Term>,
 }
 
@@ -4218,11 +4253,9 @@ impl StatisticsState {
             last_wall_ms: AtomicU64::new(0),
             cpu_origin_ns: origins.cpu_ns,
             wall_origin: origins.wall,
-            microstate: AtomicBool::new(false),
             cpu_topology: Mutex::new(None),
             cpu_bind_order: Mutex::new(None),
             sched_wall: Mutex::new(None),
-            microstate_base: Mutex::new(None),
             system_logger: Mutex::new(Term::atom(arinsal_term::atoms::LOGGER)),
         }
     }
@@ -4287,7 +4320,7 @@ impl GcDefaults {
                     .min_heap_size
                     .map(|words| {
                         let requested = usize::try_from(words).unwrap_or(usize::MAX);
-                        arinsal_term::erts_next_heap_size(requested, 0).unwrap_or(requested) as i64
+                        arinsal_term::erts_next_heap_size(requested, 0) as i64
                     })
                     .unwrap_or(233),
             ),
@@ -4296,7 +4329,7 @@ impl GcDefaults {
                     .min_binary_heap_size
                     .map(|words| {
                         let requested = usize::try_from(words).unwrap_or(usize::MAX);
-                        arinsal_term::erts_next_heap_size(requested, 0).unwrap_or(requested) as i64
+                        arinsal_term::erts_next_heap_size(requested, 0) as i64
                     })
                     .unwrap_or(46_422),
             ),
@@ -4338,7 +4371,6 @@ impl GcDefaults {
             kill: word & MAX_HEAP_KILL != 0,
             log: word & MAX_HEAP_LOG != 0,
             include_shared_binaries: word & MAX_HEAP_INCLUDE_SHARED_BINARIES != 0,
-            reported: false,
         }
     }
 
@@ -4660,7 +4692,7 @@ fn fullsweep_after(process: &Process, value: Term) -> Result<Term, VmError> {
 fn heap_minimum(process: &Process, value: Term, heap: bool) -> Result<Term, VmError> {
     let requested = value.as_small().filter(|n| *n >= 0).ok_or_else(badarg)?;
     let requested = usize::try_from(requested).unwrap_or(usize::MAX);
-    let rounded = arinsal_term::erts_next_heap_size(requested, 0).unwrap_or(requested) as i64;
+    let rounded = arinsal_term::erts_next_heap_size(requested, 0) as i64;
     let defaults = gc_defaults(process.runtime);
     let slot = if heap {
         &defaults.min_heap_size
@@ -4845,80 +4877,61 @@ fn max_heap_map(process: &mut Process, limit: crate::process::MaxHeap) -> Result
         .map_err(|error| VmError::Unsupported(format!("max_heap_size map: {error:?}")))
 }
 
-// Port of erts/emulator/beam/erl_msacc.c:329 (microstate accounting actions), OTP-29.1.1.
+/// `static erts_atomic32_t msacc` in bif.c: the BIF-visible previous enable/disable.
+// Port of erts/emulator/beam/bif.c:77, OTP-29.1.1.
+static MSACC: AtomicI32 = AtomicI32::new(0);
+
+// Port of erts/emulator/beam/bif.c:5226 (am_microstate_accounting) and
+// erl_msacc.c:341 (erts_msacc_request), OTP-29.1.1.
 fn set_microstate(
-    process: &Process,
+    process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     value: Term,
 ) -> Result<Term, VmError> {
-    let previous = runtime_state(process).microstate.load(Ordering::Relaxed);
-    match atom_name(value) {
-        Some("true") => {
-            runtime_state(process)
-                .microstate
-                .store(true, Ordering::Relaxed);
-            set_microstate_workers(process, true);
-            ctx.set_msacc_accounting_enabled(true);
-            ctx.set_msacc_state(arinsal_sched::MsaccState::Emulator);
-            if !previous {
-                ctx.set_gc_accounting_baseline(process.stats.gc.nanoseconds);
-                if runtime_state(process)
-                    .microstate_base
-                    .lock()
-                    .expect("microstate baseline")
-                    .is_none()
-                {
-                    reset_microstate_baseline(process, ctx);
-                }
-            }
-        }
-        Some("false") => {
-            runtime_state(process)
-                .microstate
-                .store(false, Ordering::Relaxed);
-            ctx.account_gc_total(process.stats.gc.nanoseconds);
-            ctx.set_msacc_accounting_enabled(false);
-            set_microstate_workers(process, false);
-        }
-        Some("reset") => {
-            set_microstate_workers(process, previous);
-            if previous {
-                ctx.account_gc_total(process.stats.gc.nanoseconds);
-            }
-            ctx.set_gc_accounting_baseline(process.stats.gc.nanoseconds);
-            reset_microstate_baseline(process, ctx);
-        }
+    let action = match atom_name(value) {
+        Some("true") => arinsal_sched::MsAccAction::Enable,
+        Some("false") => arinsal_sched::MsAccAction::Disable,
+        Some("reset") => arinsal_sched::MsAccAction::Reset,
         _ => return Err(badarg()),
-    }
-    set_runtime_accounting(process, ctx);
-    Ok(Term::atom(if previous {
+    };
+    crate::check_io::ensure_msacc_thread();
+    let previous = if action == arinsal_sched::MsAccAction::Reset {
+        MSACC.load(Ordering::Relaxed)
+    } else {
+        // ERTS_MSACC_ENABLE = 1, ERTS_MSACC_DISABLE = 0 (erl_msacc.h).
+        MSACC.swap(
+            if action == arinsal_sched::MsAccAction::Enable {
+                1
+            } else {
+                0
+            },
+            Ordering::Relaxed,
+        )
+    };
+    let previous_atom = Term::atom(if previous != 0 {
         arinsal_term::atoms::TRUE
     } else {
         arinsal_term::atoms::FALSE
-    }))
-}
-
-// Port of erts/emulator/beam/erl_msacc.c:367 (managed scheduler requests), OTP-29.1.1.
-fn set_microstate_workers(process: &Process, enabled: bool) {
-    crate::check_io::set_msacc_enabled(enabled);
-    if let Some(scheduler) = process
-        .runtime
-        .as_ref()
-        .and_then(|runtime| runtime.scheduler().ok())
-    {
-        scheduler.set_microstate_enabled(enabled);
-    }
-}
-
-// Port of erts/emulator/beam/erl_msacc.c:425 (counter reset), OTP-29.1.1.
-fn reset_microstate_baseline(process: &Process, ctx: &RunCtx<'_, crate::Process>) {
-    let stats = scheduler_stats(process, Some(ctx));
-    let counters = stats.as_ref().map_or_else(Vec::new, all_msacc_ns);
-    let poll_baseline = crate::check_io::msacc_snapshot();
-    *runtime_state(process)
-        .microstate_base
-        .lock()
-        .expect("microstate baseline") = Some((Instant::now(), counters, poll_baseline));
+    });
+    let reference = msacc_reference(process);
+    let owned_reference = arinsal_term::to_owned(reference)
+        .map_err(|error| VmError::Unsupported(format!("msacc reference: {error:?}")))?;
+    let reply_reference = owned_reference.clone();
+    let Some(threads) = ctx.erts_msacc_request(action, move || {
+        crate::process::Message::from_owned(&reply_reference)
+            .expect("microstate request reference fits in a message")
+    }) else {
+        return Ok(previous_atom);
+    };
+    Err(VmError::TrapExport(crate::ExportTrap::new(
+        process,
+        "erts_internal:await_microstate_accounting_modifications/3",
+        vec![
+            reference,
+            previous_atom,
+            small(i64::try_from(threads).unwrap_or(i64::MAX)),
+        ],
+    )))
 }
 
 /// `erts_internal:garbage_collect/1` from native code, on the light BIF path.
@@ -4956,9 +4969,8 @@ fn garbage_collect(process: &mut Process, arg: Term) -> Result<Term, VmError> {
     }
     // Port of bif.c:4084 (`erts_garbage_collect(BIF_P, 0, NULL, 0)`), OTP-29.1.1:
     // the caller spilled live X registers, so this BIF passes no register roots.
-    let collected = process.collect_heap_roots_objv(&mut [], &mut [], 0);
+    let gc = process.collect_heap_roots_objv(&mut [], &mut [], 0);
     process.heap.set_fullsweep_after(fullsweep_after);
-    let gc = collected.map_err(|error| VmError::Unsupported(format!("GC {error:?}")))?;
     after_collection(process, gc.collections, gc.words_reclaimed);
     // Port of erts/emulator/beam/erl_gc.c (`erts_garbage_collect`: BUMP_REDS(p, reds) with the
     // cost `garbage_collect` returns), OTP-29.1.1.
@@ -5336,14 +5348,6 @@ fn all_active_ns(stats: &arinsal_sched::SchedulerStats) -> Vec<u64> {
     all
 }
 
-/// Microstate counters of the normal, then dirty CPU, then dirty I/O scheduler threads.
-fn all_msacc_ns(stats: &arinsal_sched::SchedulerStats) -> Vec<[u64; 7]> {
-    let mut all = stats.msacc_ns.clone();
-    all.extend_from_slice(&stats.dirty_msacc_ns[0]);
-    all.extend_from_slice(&stats.dirty_msacc_ns[1]);
-    all
-}
-
 fn scheduler_wall(
     process: &mut Process,
     ctx: Option<&RunCtx<'_, crate::Process>>,
@@ -5407,132 +5411,54 @@ fn scheduler_wall(
 
 fn microstate(
     process: &mut Process,
-    mut ctx: Option<&mut RunCtx<'_, crate::Process>>,
+    ctx: Option<&mut RunCtx<'_, crate::Process>>,
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_msacc.c result layout, OTP-29.1.1.
-    // erts keeps msacc counters from boot, so the list exists even if accounting was never on.
-    if runtime_state(process)
-        .microstate_base
-        .lock()
-        .expect("microstate baseline")
-        .is_none()
-        && let Some(ctx) = ctx.as_deref()
-    {
-        reset_microstate_baseline(process, ctx);
-    }
-    let baseline = runtime_state(process)
-        .microstate_base
-        .lock()
-        .expect("microstate baseline")
-        .clone();
-    let Some((_, baseline, poll_baseline)) = baseline else {
-        return Ok(Term::atom(arinsal_term::atoms::UNDEFINED));
-    };
-    if let Some(ctx) = ctx.as_deref_mut() {
-        ctx.account_gc_total(process.stats.gc.nanoseconds);
-    }
-    let stats = scheduler_stats(process, ctx.as_deref());
-    let (online, dirty_cpu, dirty_io) = with_flags(process, |flags| {
-        (
-            flags.schedulers_online,
-            flags.dirty_cpu_total,
-            flags.dirty_io_total,
-        )
-    });
-    let mut entries = Vec::new();
-    for id in 0..online {
-        let mut counters = stats
-            .as_ref()
-            .and_then(|stats| stats.msacc_ns.get(id))
-            .copied()
-            .unwrap_or([0; 7]);
-        for (state, counter) in counters.iter_mut().enumerate() {
-            *counter = counter.saturating_sub(baseline.get(id).map_or(0, |prior| prior[state]));
-        }
-        entries.push(msacc_entry(
+    if let Some(ctx) = ctx {
+        crate::check_io::ensure_msacc_thread();
+        let reference = msacc_reference(process);
+        let owned_reference = arinsal_term::to_owned(reference)
+            .map_err(|error| VmError::Unsupported(format!("msacc reference: {error:?}")))?;
+        let reply_reference = owned_reference.clone();
+        let threads = ctx.erts_msacc_gather(move |snapshot| {
+            let reply = arinsal_etf::OwnedTerm::tuple(vec![
+                reply_reference.clone(),
+                msacc_snapshot_owned(snapshot),
+            ]);
+            crate::process::Message::from_owned(&reply)
+                .expect("microstate snapshot fits in a message")
+        });
+        return Err(VmError::TrapExport(crate::ExportTrap::new(
             process,
-            (id + 1) as i64,
-            "scheduler",
-            counters,
-        )?);
+            "erts_internal:gather_microstate_accounting_result/2",
+            vec![reference, small(i64::try_from(threads).unwrap_or(i64::MAX))],
+        )));
     }
-    // Port of erts/emulator/beam/erl_msacc.c:211 (dirty scheduler thread counters), OTP-29.1.1.
-    let all = stats.as_ref().map_or_else(Vec::new, all_msacc_ns);
-    let normal_len = stats.as_ref().map_or(0, |stats| stats.msacc_ns.len());
-    let counters_of = |index: usize| {
-        let mut counters = all.get(index).copied().unwrap_or([0; 7]);
-        for (state, counter) in counters.iter_mut().enumerate() {
-            *counter = counter.saturating_sub(baseline.get(index).map_or(0, |prior| prior[state]));
-        }
-        counters
-    };
-    for id in 0..dirty_cpu {
-        let counters = counters_of(normal_len + id);
-        entries.push(msacc_entry(
-            process,
-            (id + 1) as i64,
-            "dirty_cpu_scheduler",
-            counters,
-        )?);
-    }
-    for id in 0..dirty_io {
-        let counters = counters_of(normal_len + dirty_cpu + id);
-        entries.push(msacc_entry(
-            process,
-            (id + 1) as i64,
-            "dirty_io_scheduler",
-            counters,
-        )?);
-    }
-    let poll_ns = crate::check_io::msacc_snapshot();
-    // The aux and async threads only sleep here: they accrue the time accounting was on.
-    let elapsed = poll_ns[2].saturating_sub(poll_baseline[2]);
-    entries.push(msacc_entry(process, 1, "aux", [0, 0, 0, 0, 0, 0, elapsed])?);
-    let poll_check_io_ns = poll_ns[0].saturating_sub(poll_baseline[0]);
-    let poll_sleep_ns = poll_ns[1].saturating_sub(poll_baseline[1]);
-    entries.push(msacc_entry(
-        process,
-        0,
-        "poll",
-        [0, poll_check_io_ns, 0, 0, 0, 0, poll_sleep_ns],
-    )?);
-    entries.push(msacc_entry(
-        process,
-        0,
-        "async",
-        [0, 0, 0, 0, 0, 0, elapsed],
-    )?);
-    cons_list(process, &entries)
+    Ok(Term::atom(arinsal_term::atoms::UNDEFINED))
 }
 
-fn msacc_entry(
-    process: &mut Process,
-    id: i64,
-    kind: &str,
-    values: [u64; 7],
-) -> Result<Term, VmError> {
-    // Perf-counter ticks on this host are nanoseconds; msacc:stats/0 performs
-    // the same perf_counter-to-microsecond conversion as OTP.
-    let counters = map(
-        process,
-        &[
-            ("aux", small(values[0].min(i64::MAX as u64) as i64)),
-            ("check_io", small(values[1].min(i64::MAX as u64) as i64)),
-            ("emulator", small(values[2].min(i64::MAX as u64) as i64)),
-            ("gc", small(values[3].min(i64::MAX as u64) as i64)),
-            ("other", small(values[4].min(i64::MAX as u64) as i64)),
-            ("port", small(values[5].min(i64::MAX as u64) as i64)),
-            ("sleep", small(values[6].min(i64::MAX as u64) as i64)),
-        ],
-    )?;
-    map(
-        process,
-        &[
-            ("counters", counters),
-            ("id", small(id)),
-            ("type", crate::atom_cache::put(kind)),
-        ],
-    )
+fn msacc_reference(process: &mut Process) -> Term {
+    Term::local_ref_with_process_heap(&mut process.heap, arinsal_sched::unique::next_ref_words)
+}
+
+fn msacc_snapshot_owned(snapshot: arinsal_sched::MsAccSnapshot) -> arinsal_etf::OwnedTerm {
+    use arinsal_etf::OwnedTerm as O;
+
+    let states = [
+        "aux", "check_io", "emulator", "gc", "other", "port", "sleep",
+    ];
+    let counters = O::Map(
+        states
+            .into_iter()
+            .zip(snapshot.counters)
+            .map(|(state, value)| (O::atom(state), O::Int(value.min(i64::MAX as u64) as i64)))
+            .collect(),
+    );
+    O::Map(vec![
+        (O::atom("counters"), counters),
+        (O::atom("id"), O::Int(snapshot.id)),
+        (O::atom("type"), O::atom(&snapshot.thread_type)),
+    ])
 }
 
 fn io_counters(process: &mut Process) -> Result<Term, VmError> {
@@ -5678,15 +5604,6 @@ fn int_tuple(process: &mut Process, values: &[u64]) -> Result<Term, VmError> {
         terms.push(non_neg(process, *value)?);
     }
     tuple(process, &terms)
-}
-
-fn map(process: &mut Process, pairs: &[(&str, Term)]) -> Result<Term, VmError> {
-    let pairs: Vec<(Term, Term)> = pairs
-        .iter()
-        .map(|(key, value)| (crate::atom_cache::put(key), *value))
-        .collect();
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    arinsal_maps::from_list(&pairs, &mut heap).map_err(|_| badarg())
 }
 
 fn badarg() -> VmError {

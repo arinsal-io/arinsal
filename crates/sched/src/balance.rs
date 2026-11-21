@@ -37,7 +37,8 @@ const FULL_REDS_HISTORY_SIZE: usize = (1 << FULL_REDS_HISTORY_AVG_SHFT) - 1;
 
 // Port of erts/emulator/beam/erl_process.h:136-187 (run queue flags), OTP-29.1.1.
 const QMASK: u32 = (1 << PRIO_LEVELS) - 1;
-const EMIGRATE_SHFT: u32 = 0;
+// Port of erl_process.h:140-172 (run-queue qmask and migration flag layout), OTP-29.1.1.
+const EMIGRATE_SHFT: u32 = PRIO_LEVELS as u32;
 const IMMIGRATE_SHFT: u32 = EMIGRATE_SHFT + PRIO_LEVELS as u32;
 const EVACUATE_SHFT: u32 = IMMIGRATE_SHFT + PRIO_LEVELS as u32;
 const FLG_BASE2: u32 = EVACUATE_SHFT + PRIO_LEVELS as u32;
@@ -51,6 +52,10 @@ pub(crate) const FLG_INACTIVE: u32 = 1 << (FLG_BASE2 + 4);
 pub(crate) const FLG_NONEMPTY: u32 = 1 << (FLG_BASE2 + 5);
 /// The scheduler of this run queue is executing (`ERTS_RUNQ_FLG_EXEC`).
 pub(crate) const FLG_EXEC: u32 = 1 << (FLG_BASE2 + 6);
+pub(crate) const FLG_MISC_OP: u32 = 1 << (FLG_BASE2 + 8);
+pub(crate) const RUNQ_QMASK: u32 = (1 << PRIO_LEVELS) - 1;
+pub(crate) const PROC_QMASK: u32 = (1 << PROC_PRIO_LEVELS) - 1;
+pub(crate) const PORT_BIT: u32 = 1 << PORT_PRIO_LEVEL;
 const MIGRATION_QMASKS: u32 = EMIGRATE_QMASK | IMMIGRATE_QMASK | EVACUATE_QMASK;
 const MIGRATION_INFO: u32 =
     MIGRATION_QMASKS | FLG_INACTIVE | FLG_OUT_OF_WORK | FLG_HALFTIME_OUT_OF_WORK;
@@ -118,6 +123,30 @@ impl RunQueueBalance {
     pub(crate) fn sub_len(&self, prio: usize, n: i32) {
         self.total_len.fetch_sub(n, Ordering::Relaxed);
         self.len[prio].fetch_sub(n, Ordering::Relaxed);
+    }
+
+    /// Publish one priority bit in `rq->flags` while the run-queue mutex is held.
+    #[inline]
+    pub(crate) fn set_rq_flag(&self, flag: u32) {
+        self.flags.fetch_or(flag, Ordering::Release);
+    }
+
+    /// Clear one priority bit in `rq->flags` while the run-queue mutex is held.
+    #[inline]
+    pub(crate) fn clear_rq_flag(&self, flag: u32) {
+        self.flags.fetch_and(!flag, Ordering::Release);
+    }
+
+    /// The process-priority part of `rq->flags` (`ERTS_RUNQ_FLGS_PROCS_QMASK`).
+    #[inline]
+    pub(crate) fn process_qmask(&self) -> u32 {
+        self.flags.load(Ordering::Acquire) & PROC_QMASK
+    }
+
+    /// Whether `runq_got_work_to_execute_flags` sees a process, port, or misc op.
+    #[inline]
+    pub(crate) fn has_runnable_work(&self) -> bool {
+        self.flags.load(Ordering::Acquire) & (RUNQ_QMASK | FLG_MISC_OP) != 0
     }
 
     /// Port of erts/emulator/beam/erl_process.c:2977 (empty_runq / empty_runq_aux), OTP-29.1.1:
@@ -422,6 +451,14 @@ impl<T: Task> Balance<T> {
 
     pub(crate) fn path_flags(&self, ix: usize) -> u32 {
         self.paths.flags(ix)
+    }
+
+    /// Read misc-op evacuation from the active migration path.
+    /// Port of erts/emulator/beam/erl_process.c (erts_schedule_misc_op), OTP-29.1.1.
+    pub(crate) fn misc_evac_run_queue(&self, ix: usize) -> Option<usize> {
+        self.paths
+            .with_path(ix, |path| path.misc_evac_runq)
+            .flatten()
     }
 
     /// Port of erts/emulator/beam/erl_process.c:2930 (sched_waiting) and erl_process.c:2942
@@ -967,8 +1004,7 @@ mod tests {
             _calls: &mut u32,
         ) {
             {
-                c_p.state()
-                    .fetch_and(!crate::psflg::ACTIVE, std::sync::atomic::Ordering::Release);
+                let _ = crate::erts_wait_clear_active(c_p.state());
             }
         }
     }

@@ -800,7 +800,7 @@ impl Vm {
     /// `lib/*/ebin`.
     pub(crate) fn new_with_otp_root(otp: PathBuf) -> Self {
         #[cfg(target_os = "linux")]
-        crate::raw::sys_time::init();
+        arinsal_sched::sys_time::initialize();
         Self::for_node(otp)
     }
 

@@ -42,9 +42,9 @@ pub(crate) fn open_forker(runtime: &'static crate::process::Runtime) -> Result<(
         // Port of sys_drivers.c:1589 (forker_start).
         // erts never waits for erl_child_setup: it exits on end of file of its socket when
         // the node's OS process ends.
-        let (fd, _helper) = crate::child_setup::start()
-            .map_err(|error| VmError::Load(format!("cannot start erl_child_setup: {error}")))?;
-        let fd = fd.into_raw_fd();
+        let fd = crate::child_setup::start()
+            .map_err(|error| VmError::Load(format!("cannot start erl_child_setup: {error}")))?
+            .into_raw_fd();
         sys::set_nonblocking(fd);
         port.start_native(Arc::new(ForkerData {
             fd,

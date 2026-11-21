@@ -532,16 +532,11 @@ impl<F: HashFunctions<Entry: IndexEntry>> IndexWriteGuard<'_, F> {
 }
 
 fn index_exhausted(name: &str, limit: i32) -> ! {
-    // Port of index.c:89 and erl_init.c:2718 (`ERTS_DUMP_EXIT` then exit status 1).
-    // erl_crash_dump.c:509 and :697 print the banner. The dump body is left for
-    // the crash-dump agent; the message and status match erts on this platform
-    // (`erts_fprintf` writes `\r\n`).
-    let message = format!(
-        "no more index entries in {name} (max={limit})\r\n\r\nCrash dump is being written to: erl_crash.dump...done\r\n"
-    );
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), message.as_bytes());
-    let _ = std::io::Write::flush(&mut std::io::stderr());
-    std::process::exit(1);
+    // Port of index.c:89 (`erts_exit(ERTS_DUMP_EXIT, ...)`).
+    crate::erl_init::erts_exit(
+        crate::erl_init::ExitMode::Dump,
+        &format!("no more index entries in {name} (max={limit})"),
+    )
 }
 
 /// `erts_alloc(type, words * 8)` followed by `memzero`; returns the address. `erts_alloc` exits

@@ -60,7 +60,7 @@ pub(super) fn gc_after_bif(
     if let Ok(value) = result {
         let mut roots = [*value];
         let collected = process.collect_heap_roots_objv(&mut [], &mut roots, 0);
-        let stats = collected?;
+        let stats = collected;
         *value = roots[0];
         // Port of erl_gc.c:922-932 (`garbage_collect` records scheduler GC statistics), OTP-29.1.1.
         crate::natives::sys::after_collection(process, stats.collections, stats.words_reclaimed);
@@ -99,7 +99,7 @@ pub(super) fn gc_after_bif(
         None
     };
     // `arguments` is the `reg[..arity]` the caller holds (erts' `regs`, `arity`).
-    let stats = process.collect_heap_roots_objv(arguments, &mut roots, 0)?;
+    let stats = process.collect_heap_roots_objv(arguments, &mut roots, 0);
     if let Some(error_roots) = error_roots
         && let Err(error) = result
     {
@@ -155,7 +155,7 @@ pub(crate) fn gc_after_native_parts(
     }
     if let Some(value) = value {
         let mut roots = [*value];
-        let stats = process.collect_heap_roots_objv(&mut [], &mut roots, 0)?;
+        let stats = process.collect_heap_roots_objv(&mut [], &mut roots, 0);
         *value = roots[0];
         // Port of erl_gc.c:922-932 (`garbage_collect` records scheduler GC statistics), OTP-29.1.1.
         crate::natives::sys::after_collection(process, stats.collections, stats.words_reclaimed);
@@ -200,7 +200,7 @@ pub(crate) fn gc_after_native_parts(
     };
     // The arguments are rooted in `roots` (copied from the caller's registers, which it
     // writes back), so the collection takes no other register roots.
-    let stats = process.collect_heap_roots_objv(&mut [], &mut roots, 0)?;
+    let stats = process.collect_heap_roots_objv(&mut [], &mut roots, 0);
     arguments.copy_from_slice(&roots[..arguments.len()]);
     if let Some(NativeErrorRoots::Trap { reason, trace, top }) = error_roots
         && let Some(trap) = raised

@@ -956,7 +956,9 @@ fn code_mod_permission_waiter_yields_to_the_lock_owner() {
                 true = erts_debug:set_internal_state(code_mod_permission, false)
             end),
             receive {attempting, Pid} -> ok end,
-            timer:sleep(10),
+            %% Not timer:sleep/1: loading `timer` needs the code mod permission this
+            %% process holds, so erl deadlocks when `timer` is not loaded yet.
+            receive after 10 -> ok end,
             {status, suspended} = process_info(Pid, status),
             erlang:bump_reductions(100000),
             true = erts_debug:set_internal_state(code_mod_permission, false),

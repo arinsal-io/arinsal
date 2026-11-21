@@ -10,19 +10,9 @@ use crate::types::{
     is_product_small_if_args_are_small, is_sum_small_if_args_are_small, type_id,
 };
 
-/// Runtime fallback for arithmetic that cannot return a small integer.
-///
-/// The VM supplies this hook. Arguments and the result use OTP tagged-term words; `reg` is the
-/// scheduler's register array (`x19`), whose TMP_MEM slots carry `erts_mul_add`'s `pp` and the
-/// remainder of `erts_int_div_rem`.
-pub type ArithHelper = unsafe extern "C" fn(
-    process: *mut crate::ProcessHeader,
-    op: u32,
-    lhs: u64,
-    rhs: u64,
-    extra: u64,
-    reg: *mut u64,
-) -> u64;
+// erts publishes only `Update::eReductions` around the arithmetic runtime (erl_arith.c uses
+// `HeapFragOnlyAlloc`); see `raise_frag::ARITH_UPDATE` for why HTOP and E are published too.
+const ARITH_UPDATE: crate::Update = crate::Update::HEAP_ALLOC.union(crate::Update::REDUCTIONS);
 
 const ARG1: Gpr = Gpr::x(0);
 const ARG2: Gpr = Gpr::x(14);
@@ -30,16 +20,13 @@ const ARG3: Gpr = Gpr::x(17);
 const TMP1: Gpr = Gpr::x(8);
 const TMP: Gpr = Gpr::x(9);
 
-/// erts register names used by `emit_i_mul_add` (ARG2/ARG3 here are x1/x2, not the helper ABI).
+/// erts register names (ARG2..ARG4 = x1..x3); this file's ARG2/ARG3 are x14/x17.
 const M_ARG2: Gpr = Gpr::x(1);
 const M_ARG3: Gpr = Gpr::x(2);
 const M_ARG4: Gpr = Gpr::x(3);
 const M_TMP2: Gpr = Gpr::x(9);
 const M_TMP3: Gpr = Gpr::x(10);
 const M_TMP4: Gpr = Gpr::x(11);
-
-/// Scheduler `tmp_mem[1]`, where the fused div/rem helper publishes the remainder.
-const TMP_MEM_REM: u32 = crate::arm::beam_asm::tmp_mem_ref(1);
 
 /// Base and byte offset of an operand that lives in memory (not a cached X register).
 fn mem_operand(arg: ArgVal) -> Option<(Gpr, i64)> {
@@ -67,44 +54,16 @@ fn small_factor(src: &TypedArg) -> (i64, i32) {
     }
 }
 
-#[derive(Clone, Copy)]
-enum BinaryOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Rem,
-    And,
-    Or,
-    Xor,
-}
-
-impl BinaryOp {
-    const fn id(self) -> u32 {
-        match self {
-            Self::Add => 0,
-            Self::Sub => 1,
-            Self::Mul => 2,
-            Self::Div => 3,
-            Self::Rem => 4,
-            Self::And => 5,
-            Self::Or => 6,
-            Self::Xor => 7,
-        }
-    }
-}
-
 impl BeamModuleAssembler {
-    /// Emits `i_plus`; non-small operands and small overflow use the VM hook.
+    /// Emits `i_plus`; non-small operands and small overflow call the erts runtime.
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:145-244, OTP-29.1.1
     pub fn emit_i_plus(
         &mut self,
         lhs: TypedArg,
         rhs: TypedArg,
         dst: ArgVal,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_i_plus_with_fail(lhs, rhs, dst, 0, helper)
+        self.emit_i_plus_with_fail(lhs, rhs, dst, 0)
     }
 
     /// Emits `i_plus`, branching to the BEAM failure label when guard arithmetic fails.
@@ -115,21 +74,19 @@ impl BeamModuleAssembler {
         rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_add_sub(true, lhs, rhs, dst, helper, fail)
+        self.emit_add_sub(true, lhs, rhs, dst, fail)
     }
 
-    /// Emits `i_minus`; non-small operands and small overflow use the VM hook.
+    /// Emits `i_minus`; non-small operands and small overflow call the erts runtime.
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:334-456, OTP-29.1.1
     pub fn emit_i_minus(
         &mut self,
         lhs: TypedArg,
         rhs: TypedArg,
         dst: ArgVal,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_i_minus_with_fail(lhs, rhs, dst, 0, helper)
+        self.emit_i_minus_with_fail(lhs, rhs, dst, 0)
     }
 
     /// Emits `i_minus` with the BEAM guard failure behavior.
@@ -140,9 +97,8 @@ impl BeamModuleAssembler {
         rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_add_sub(false, lhs, rhs, dst, helper, fail)
+        self.emit_add_sub(false, lhs, rhs, dst, fail)
     }
 
     /// Emits `i_times` with a 60-bit result check.
@@ -153,9 +109,8 @@ impl BeamModuleAssembler {
         lhs: TypedArg,
         rhs: TypedArg,
         dst: ArgVal,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_i_times_with_fail(lhs, rhs, dst, 0, helper)
+        self.emit_i_times_with_fail(lhs, rhs, dst, 0)
     }
 
     /// Emits `i_times` with the BEAM guard failure behavior.
@@ -166,7 +121,6 @@ impl BeamModuleAssembler {
         rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
         // `i_mul_add Fail S1 S2 Dst i Dst`: the addend is the small integer 0.
         self.emit_i_mul_add_with_fail(
@@ -176,7 +130,6 @@ impl BeamModuleAssembler {
             TypedArg::new(ArgVal::Immediate(0xf), ArgType::ANY),
             dst,
             fail,
-            helper,
         )
     }
 
@@ -189,9 +142,8 @@ impl BeamModuleAssembler {
         src3: TypedArg,
         src4: TypedArg,
         dst: ArgVal,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_i_mul_add_with_fail(src1, src2, src3, src4, dst, 0, helper)
+        self.emit_i_mul_add_with_fail(src1, src2, src3, src4, dst, 0)
     }
 
     /// Emits `i_mul_add` with the BEAM guard failure behavior.
@@ -205,9 +157,8 @@ impl BeamModuleAssembler {
         src4: TypedArg,
         dst: ArgVal,
         fail: u32,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_mul_add(src1, src2, src3, src4, dst, helper, fail)
+        self.emit_mul_add(src1, src2, src3, src4, dst, fail)
     }
 
     /// Emits `i_int_div`, including divide-by-zero and minimum-value overflow fallback.
@@ -217,9 +168,8 @@ impl BeamModuleAssembler {
         lhs: TypedArg,
         rhs: TypedArg,
         dst: ArgVal,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_i_int_div_with_fail(lhs, rhs, dst, 0, helper)
+        self.emit_i_int_div_with_fail(lhs, rhs, dst, 0)
     }
 
     /// Emits `i_int_div` with the BEAM guard failure behavior.
@@ -230,14 +180,12 @@ impl BeamModuleAssembler {
         rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
         self.emit_div_rem(
             lhs,
             rhs,
             dst,
             ArgVal::X(0),
-            helper,
             fail,
             true,
             false,
@@ -253,9 +201,8 @@ impl BeamModuleAssembler {
         rhs: TypedArg,
         quotient: ArgVal,
         remainder: ArgVal,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_i_div_rem_with_fail(lhs, rhs, quotient, remainder, 0, helper)
+        self.emit_i_div_rem_with_fail(lhs, rhs, quotient, remainder, 0)
     }
 
     /// Emits fused `i_div_rem` with the BEAM guard failure behavior.
@@ -267,7 +214,6 @@ impl BeamModuleAssembler {
         quotient: ArgVal,
         remainder: ArgVal,
         fail: u32,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
         let need_div = quotient != remainder;
         self.emit_div_rem(
@@ -275,7 +221,6 @@ impl BeamModuleAssembler {
             rhs,
             quotient,
             remainder,
-            helper,
             fail,
             need_div,
             true,
@@ -291,9 +236,8 @@ impl BeamModuleAssembler {
         rhs: TypedArg,
         remainder: ArgVal,
         quotient: ArgVal,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_i_rem_div_with_fail(lhs, rhs, remainder, quotient, 0, helper)
+        self.emit_i_rem_div_with_fail(lhs, rhs, remainder, quotient, 0)
     }
 
     /// Emits fused `i_rem_div` with the BEAM guard failure behavior.
@@ -305,7 +249,6 @@ impl BeamModuleAssembler {
         remainder: ArgVal,
         quotient: ArgVal,
         fail: u32,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
         let need_rem = quotient != remainder;
         self.emit_div_rem(
@@ -313,7 +256,6 @@ impl BeamModuleAssembler {
             rhs,
             quotient,
             remainder,
-            helper,
             fail,
             true,
             need_rem,
@@ -328,9 +270,8 @@ impl BeamModuleAssembler {
         lhs: TypedArg,
         rhs: TypedArg,
         dst: ArgVal,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_i_m_div_with_fail(lhs, rhs, dst, 0, helper)
+        self.emit_i_m_div_with_fail(lhs, rhs, dst, 0)
     }
 
     /// Emits `i_m_div` with the BEAM guard failure behavior.
@@ -341,19 +282,33 @@ impl BeamModuleAssembler {
         rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        let left = self.source_reg(lhs.val)?;
-        let right = self.source_reg_into(rhs.val, Gpr::x(17))?;
-        self.emit_arith_call_with_mfa(
-            12,
-            left,
-            right,
-            helper,
-            fail,
-            std::ptr::from_ref(&crate::bif::ERLANG_DIV_MFA) as usize,
+        let next = self.code.new_label();
+        let (left, right) = self.load_sources(&lhs, &rhs)?;
+        let update = crate::Update::HEAP_ALLOC;
+        self.emit_runtime_hook(
+            crate::rt::erts_mixed_div as *const () as usize,
+            &[left, right],
+            6,
+            update,
         )?;
-        self.store_result(dst, Gpr::x(0))
+        if let Some(fail) = self.arith_fail_label(fail) {
+            let fail = self.label(fail);
+            self.code.cbz(ARG1, fail)?;
+        } else {
+            self.code.cbnz(ARG1, next)?;
+            // mov_arg(XREG0, LHS); mov_arg(XREG1, RHS), through scratch registers so that
+            // an operand already in X0 or X1 is read before either is written.
+            self.load_operand(lhs.val, TMP1)?;
+            self.load_operand(rhs.val, TMP)?;
+            self.code.emit(|e| {
+                e.mov_reg(Gpr::x(25), TMP1)?;
+                e.mov_reg(Gpr::x(26), TMP)
+            })?;
+            self.branch_error_with_mfa(std::ptr::from_ref(&crate::bif::ERLANG_DIV_2_MFA) as usize)?;
+        }
+        self.code.bind(next)?;
+        self.store_result(dst, ARG1)
     }
 
     /// Emits `i_rem` with the Erlang remainder sign rule.
@@ -363,9 +318,8 @@ impl BeamModuleAssembler {
         lhs: TypedArg,
         rhs: TypedArg,
         dst: ArgVal,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_i_rem_with_fail(lhs, rhs, dst, 0, helper)
+        self.emit_i_rem_with_fail(lhs, rhs, dst, 0)
     }
 
     /// Emits `i_rem` with the BEAM guard failure behavior.
@@ -376,14 +330,12 @@ impl BeamModuleAssembler {
         rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
         self.emit_div_rem(
             lhs,
             rhs,
             ArgVal::X(0),
             dst,
-            helper,
             fail,
             false,
             true,
@@ -398,9 +350,8 @@ impl BeamModuleAssembler {
         lhs: TypedArg,
         rhs: TypedArg,
         dst: ArgVal,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_i_band_with_fail(lhs, rhs, dst, 0, helper)
+        self.emit_i_band_with_fail(lhs, rhs, dst, 0)
     }
 
     /// Emits `i_band` with the BEAM guard failure behavior.
@@ -411,9 +362,8 @@ impl BeamModuleAssembler {
         rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_band(lhs, rhs, dst, helper, fail)
+        self.emit_band(lhs, rhs, dst, fail)
     }
 
     /// Emits `i_bor`.
@@ -423,9 +373,8 @@ impl BeamModuleAssembler {
         lhs: TypedArg,
         rhs: TypedArg,
         dst: ArgVal,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_i_bor_with_fail(lhs, rhs, dst, 0, helper)
+        self.emit_i_bor_with_fail(lhs, rhs, dst, 0)
     }
 
     /// Emits `i_bor` with the BEAM guard failure behavior.
@@ -436,9 +385,8 @@ impl BeamModuleAssembler {
         rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_bor(lhs, rhs, dst, helper, fail)
+        self.emit_bor(lhs, rhs, dst, fail)
     }
 
     /// Emits `i_bxor`.
@@ -448,9 +396,8 @@ impl BeamModuleAssembler {
         lhs: TypedArg,
         rhs: TypedArg,
         dst: ArgVal,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_i_bxor_with_fail(lhs, rhs, dst, 0, helper)
+        self.emit_i_bxor_with_fail(lhs, rhs, dst, 0)
     }
 
     /// Emits `i_bxor` with the BEAM guard failure behavior.
@@ -461,21 +408,19 @@ impl BeamModuleAssembler {
         rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_bxor(lhs, rhs, dst, helper, fail)
+        self.emit_bxor(lhs, rhs, dst, fail)
     }
 
-    /// Emits `i_bsl` through the VM helper, which handles arbitrary precision shifts.
+    /// Emits `i_bsl`; the runtime (`erts_bsl`) handles arbitrary precision shifts.
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1628-1771, OTP-29.1.1
     pub fn emit_i_bsl(
         &mut self,
         lhs: TypedArg,
         rhs: TypedArg,
         dst: ArgVal,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_i_bsl_with_fail(lhs, rhs, dst, 0, helper)
+        self.emit_i_bsl_with_fail(lhs, rhs, dst, 0)
     }
 
     /// Emits `i_bsl` with the BEAM guard failure behavior.
@@ -486,21 +431,19 @@ impl BeamModuleAssembler {
         rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_bsl(lhs, rhs, dst, helper, fail)
+        self.emit_bsl(lhs, rhs, dst, fail)
     }
 
-    /// Emits `i_bsr` through the VM helper, preserving arithmetic right-shift semantics.
+    /// Emits `i_bsr`; the runtime (`erts_bsr`) handles non-small operands.
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1507-1608, OTP-29.1.1
     pub fn emit_i_bsr(
         &mut self,
         lhs: TypedArg,
         rhs: TypedArg,
         dst: ArgVal,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_i_bsr_with_fail(lhs, rhs, dst, 0, helper)
+        self.emit_i_bsr_with_fail(lhs, rhs, dst, 0)
     }
 
     /// Emits `i_bsr` with the BEAM guard failure behavior.
@@ -511,20 +454,14 @@ impl BeamModuleAssembler {
         rhs: TypedArg,
         dst: ArgVal,
         fail: u32,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_bsr(lhs, rhs, dst, helper, fail)
+        self.emit_bsr(lhs, rhs, dst, fail)
     }
 
-    /// Emits `i_bnot` through the arithmetic hook, which also handles bignums.
+    /// Emits `i_bnot`; non-small operands call `erts_bnot`.
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1456-1490, OTP-29.1.1
-    pub fn emit_i_bnot(
-        &mut self,
-        src: ArgVal,
-        dst: ArgVal,
-        helper: ArithHelper,
-    ) -> Result<(), ModuleError> {
-        self.emit_i_bnot_with_fail(src, dst, 0, helper)
+    pub fn emit_i_bnot(&mut self, src: ArgVal, dst: ArgVal) -> Result<(), ModuleError> {
+        self.emit_i_bnot_with_fail(src, dst, 0)
     }
 
     /// Emits `i_bnot` with the BEAM guard failure behavior.
@@ -534,20 +471,14 @@ impl BeamModuleAssembler {
         src: ArgVal,
         dst: ArgVal,
         fail: u32,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_unary_small(8, src, dst, helper, false, fail)
+        self.emit_unary_small(src, dst, false, fail)
     }
 
     /// Emits `i_unary_minus` with small-integer overflow fallback.
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:246-333, OTP-29.1.1
-    pub fn emit_i_unary_minus(
-        &mut self,
-        src: ArgVal,
-        dst: ArgVal,
-        helper: ArithHelper,
-    ) -> Result<(), ModuleError> {
-        self.emit_i_unary_minus_with_fail(src, dst, 0, helper)
+    pub fn emit_i_unary_minus(&mut self, src: ArgVal, dst: ArgVal) -> Result<(), ModuleError> {
+        self.emit_i_unary_minus_with_fail(src, dst, 0)
     }
 
     /// Emits `i_unary_minus` with the BEAM guard failure behavior.
@@ -557,9 +488,8 @@ impl BeamModuleAssembler {
         src: ArgVal,
         dst: ArgVal,
         fail: u32,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_unary_small(9, src, dst, helper, true, fail)
+        self.emit_unary_small(src, dst, true, fail)
     }
 
     /// Emits `i_increment` for a source and immediate BEAM small integer.
@@ -569,122 +499,12 @@ impl BeamModuleAssembler {
         src: ArgVal,
         amount: i64,
         dst: ArgVal,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
         self.emit_i_plus(
             TypedArg::new(src, ArgType::ANY),
             TypedArg::new(ArgVal::Immediate(((amount as u64) << 4) | 15), ArgType::ANY),
             dst,
-            helper,
         )
-    }
-
-    /// Emits a float load using the VM hook to validate and unbox the source term.
-    // Port of erts/emulator/beam/jit/arm/instr_float.cpp:71-79, OTP-29.1.1
-    pub fn emit_fload(
-        &mut self,
-        source: ArgVal,
-        destination: ArgVal,
-        helper: ArithHelper,
-    ) -> Result<(), ModuleError> {
-        self.emit_unary_fallback(16, source, destination, helper)
-    }
-
-    /// Emits float storage through the VM hook, which allocates a boxed flonum.
-    // Port of erts/emulator/beam/jit/arm/instr_float.cpp:81-94, OTP-29.1.1
-    pub fn emit_fstore(
-        &mut self,
-        source: ArgVal,
-        destination: ArgVal,
-        helper: ArithHelper,
-    ) -> Result<(), ModuleError> {
-        self.emit_unary_fallback(17, source, destination, helper)
-    }
-
-    /// Emits numeric conversion through the VM hook.
-    // Port of erts/emulator/beam/jit/arm/instr_float.cpp:138-195, OTP-29.1.1
-    pub fn emit_fconv(
-        &mut self,
-        source: ArgVal,
-        destination: ArgVal,
-        helper: ArithHelper,
-    ) -> Result<(), ModuleError> {
-        self.emit_unary_fallback(18, source, destination, helper)
-    }
-
-    /// Emits `fadd` through the VM arithmetic hook; operands/results are IEEE-754 bits.
-    // Port of erts/emulator/beam/jit/arm/instr_float.cpp:198-202, OTP-29.1.1
-    pub fn emit_fadd(
-        &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
-        destination: ArgVal,
-        helper: ArithHelper,
-    ) -> Result<(), ModuleError> {
-        self.emit_helper_operation(19, lhs, rhs, destination, helper)
-    }
-
-    /// Emits `fsub` through the VM arithmetic hook; operands/results are IEEE-754 bits.
-    // Port of erts/emulator/beam/jit/arm/instr_float.cpp:204-208, OTP-29.1.1
-    pub fn emit_fsub(
-        &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
-        destination: ArgVal,
-        helper: ArithHelper,
-    ) -> Result<(), ModuleError> {
-        self.emit_helper_operation(20, lhs, rhs, destination, helper)
-    }
-
-    /// Emits `fmul` through the VM arithmetic hook; operands/results are IEEE-754 bits.
-    // Port of erts/emulator/beam/jit/arm/instr_float.cpp:210-214, OTP-29.1.1
-    pub fn emit_fmul(
-        &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
-        destination: ArgVal,
-        helper: ArithHelper,
-    ) -> Result<(), ModuleError> {
-        self.emit_helper_operation(21, lhs, rhs, destination, helper)
-    }
-
-    /// Emits `fdiv` through the VM arithmetic hook; operands/results are IEEE-754 bits.
-    // Port of erts/emulator/beam/jit/arm/instr_float.cpp:216-220, OTP-29.1.1
-    pub fn emit_fdiv(
-        &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
-        destination: ArgVal,
-        helper: ArithHelper,
-    ) -> Result<(), ModuleError> {
-        self.emit_helper_operation(22, lhs, rhs, destination, helper)
-    }
-
-    /// Emits `fnegate` through the VM hook; the input must be a finite float.
-    // Port of erts/emulator/beam/jit/arm/instr_float.cpp:222-232, OTP-29.1.1
-    pub fn emit_fnegate(
-        &mut self,
-        source: ArgVal,
-        destination: ArgVal,
-        helper: ArithHelper,
-    ) -> Result<(), ModuleError> {
-        self.emit_unary_fallback(23, source, destination, helper)
-    }
-
-    fn emit_helper_operation(
-        &mut self,
-        op: u32,
-        lhs: ArgVal,
-        rhs: ArgVal,
-        dst: ArgVal,
-        helper: ArithHelper,
-    ) -> Result<(), ModuleError> {
-        let left = self.source_reg(lhs)?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(14), left))?;
-        let right = self.source_reg_into(rhs, Gpr::x(17))?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(17), right))?;
-        self.emit_helper(op, Gpr::x(14), Gpr::x(17), helper, None)?;
-        self.store_result(dst, Gpr::x(0))
     }
 
     /// `load_sources(LHS, ARG2, RHS, ARG3)`, pairing adjacent memory operands with `ldp`.
@@ -820,28 +640,54 @@ impl BeamModuleAssembler {
         }
     }
 
-    /// Calls the arithmetic hook for the slow path (`erts_mixed_*`, `erts_band`, ...).
-    fn emit_arith_call(
-        &mut self,
-        op: u32,
-        lhs: Gpr,
-        rhs: Gpr,
-        helper: ArithHelper,
-        fail: u32,
-    ) -> Result<(), ModuleError> {
-        self.emit_helper(op, lhs, rhs, helper, (fail != 0).then_some(fail))
+    /// The failure label of a guard instruction, or of the enclosing guard context.
+    fn arith_fail_label(&self, fail: u32) -> Option<u32> {
+        if fail != 0 {
+            Some(fail)
+        } else {
+            (self.arith_fail != 0).then_some(self.arith_fail)
+        }
     }
 
-    fn emit_arith_call_with_mfa(
+    /// An installed global fragment address, or an error when the VM installed none.
+    fn arith_fragment_address(address: usize) -> Result<usize, ModuleError> {
+        if address == 0 {
+            return Err(ModuleError::InvalidOperand(
+                "arithmetic fragments are not installed",
+            ));
+        }
+        Ok(address)
+    }
+
+    /// The slow path of a binary arithmetic instruction: with a failure label the runtime
+    /// function is called inline and THE_NON_VALUE branches to the label; otherwise the body
+    /// fragment raises from the instruction's BIF. The result is in ARG1.
+    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:185-208 (emit_i_plus), the same tail
+    // in emit_i_minus, emit_i_band, emit_i_bor, emit_i_bxor, emit_i_bsr and emit_i_bsl,
+    // OTP-29.1.1.
+    fn emit_binary_fallback(
         &mut self,
-        op: u32,
         lhs: Gpr,
         rhs: Gpr,
-        helper: ArithHelper,
         fail: u32,
-        bif_mfa: usize,
+        function: usize,
+        body: usize,
     ) -> Result<(), ModuleError> {
-        self.emit_helper_with_mfa(op, lhs, rhs, helper, (fail != 0).then_some(fail), bif_mfa)
+        if let Some(fail) = self.arith_fail_label(fail) {
+            self.emit_runtime_hook(function, &[lhs, rhs], 6, ARITH_UPDATE)?;
+            let fail = self.label(fail);
+            self.code.cbz(ARG1, fail)?;
+        } else {
+            let body = Self::arith_fragment_address(body)?;
+            crate::emit_enter_runtime(&mut self.code, 6, ARITH_UPDATE)?;
+            self.code.emit(|e| {
+                e.mov_reg(M_ARG2, lhs)?;
+                e.mov_reg(M_ARG3, rhs)
+            })?;
+            self.fragment_call(body)?;
+            crate::emit_leave_runtime(&mut self.code, 6, ARITH_UPDATE)?;
+        }
+        Ok(())
     }
 
     /// `i_plus` / `i_minus`.
@@ -853,7 +699,6 @@ impl BeamModuleAssembler {
         lhs: TypedArg,
         rhs: TypedArg,
         dst: ArgVal,
-        helper: ArithHelper,
         fail: u32,
     ) -> Result<(), ModuleError> {
         let (l, r) = (lhs, rhs);
@@ -914,8 +759,18 @@ impl BeamModuleAssembler {
             })?;
         }
         self.emit_add_sub_types(is_small_result, &l, left, &r, right, next)?;
-        let op = if add { BinaryOp::Add } else { BinaryOp::Sub };
-        self.emit_arith_call(op.id(), left, right, helper, fail)?;
+        let (function, body) = if add {
+            (
+                crate::rt::erts_mixed_plus as *const () as usize,
+                self.bif_fragments.arith.plus_body,
+            )
+        } else {
+            (
+                crate::rt::erts_mixed_minus as *const () as usize,
+                self.bif_fragments.arith.minus_body,
+            )
+        };
+        self.emit_binary_fallback(left, right, fail, function, body)?;
         self.code.bind(next)?;
         self.store_result(dst, ARG1)
     }
@@ -927,7 +782,6 @@ impl BeamModuleAssembler {
         lhs: TypedArg,
         rhs: TypedArg,
         dst: ArgVal,
-        helper: ArithHelper,
         fail: u32,
     ) -> Result<(), ModuleError> {
         let (l, r) = (lhs, rhs);
@@ -980,7 +834,13 @@ impl BeamModuleAssembler {
                 self.code.b_cond(Cond::Eq, next)?;
             }
         }
-        self.emit_arith_call(BinaryOp::And.id(), left, right, helper, fail)?;
+        self.emit_binary_fallback(
+            left,
+            right,
+            fail,
+            crate::rt::erts_band as *const () as usize,
+            self.bif_fragments.arith.band_body,
+        )?;
         self.code.bind(next)?;
         self.store_result_via(dst, d, ARG1)
     }
@@ -992,7 +852,6 @@ impl BeamModuleAssembler {
         lhs: TypedArg,
         rhs: TypedArg,
         dst: ArgVal,
-        helper: ArithHelper,
         fail: u32,
     ) -> Result<(), ModuleError> {
         let (l, r) = (lhs, rhs);
@@ -1035,7 +894,13 @@ impl BeamModuleAssembler {
             )
         })?;
         self.emit_are_both_small(&l, left, &r, right, next)?;
-        self.emit_arith_call(BinaryOp::Or.id(), left, right, helper, fail)?;
+        self.emit_binary_fallback(
+            left,
+            right,
+            fail,
+            crate::rt::erts_bor as *const () as usize,
+            self.bif_fragments.arith.bor_body,
+        )?;
         self.code.bind(next)?;
         self.store_result_via(dst, d, ARG1)
     }
@@ -1047,7 +912,6 @@ impl BeamModuleAssembler {
         lhs: TypedArg,
         rhs: TypedArg,
         dst: ArgVal,
-        helper: ArithHelper,
         fail: u32,
     ) -> Result<(), ModuleError> {
         let (l, r) = (lhs, rhs);
@@ -1083,7 +947,13 @@ impl BeamModuleAssembler {
             e.orr_imm(ARG1, ARG1, 15)
         })?;
         self.emit_are_both_small(&l, left, &r, right, next)?;
-        self.emit_arith_call(BinaryOp::Xor.id(), left, right, helper, fail)?;
+        self.emit_binary_fallback(
+            left,
+            right,
+            fail,
+            crate::rt::erts_bxor as *const () as usize,
+            self.bif_fragments.arith.bxor_body,
+        )?;
         self.code.bind(next)?;
         self.store_result_via(dst, d, ARG1)
     }
@@ -1095,7 +965,6 @@ impl BeamModuleAssembler {
         lhs: TypedArg,
         rhs: TypedArg,
         dst: ArgVal,
-        helper: ArithHelper,
         fail: u32,
     ) -> Result<(), ModuleError> {
         let (l, r) = (lhs, rhs);
@@ -1171,7 +1040,13 @@ impl BeamModuleAssembler {
         self.code.bind(generic)?;
         if need_generic {
             let right = self.source_reg_into(r.val, ARG3)?;
-            self.emit_arith_call(11, left, right, helper, fail)?;
+            self.emit_binary_fallback(
+                left,
+                right,
+                fail,
+                crate::rt::erts_bsr as *const () as usize,
+                self.bif_fragments.arith.bsr_body,
+            )?;
             self.mov_if_needed(d, ARG1)?;
         }
         self.code.bind(next)?;
@@ -1185,7 +1060,6 @@ impl BeamModuleAssembler {
         lhs: TypedArg,
         rhs: TypedArg,
         dst: ArgVal,
-        helper: ArithHelper,
         fail: u32,
     ) -> Result<(), ModuleError> {
         let (l, r) = (lhs, rhs);
@@ -1305,7 +1179,13 @@ impl BeamModuleAssembler {
         }
 
         self.code.bind(generic)?;
-        self.emit_arith_call(10, left, right, helper, fail)?;
+        self.emit_binary_fallback(
+            left,
+            right,
+            fail,
+            crate::rt::erts_bsl as *const () as usize,
+            self.bif_fragments.arith.bsl_body,
+        )?;
         self.mov_if_needed(d, ARG1)?;
         self.code.bind(next)?;
         self.store_result(dst, d)
@@ -1321,7 +1201,6 @@ impl BeamModuleAssembler {
         rhs: TypedArg,
         quotient_dst: ArgVal,
         remainder_dst: ArgVal,
-        helper: ArithHelper,
         fail: u32,
         need_div: bool,
         need_rem: bool,
@@ -1374,7 +1253,7 @@ impl BeamModuleAssembler {
             self.code.b(done)?;
         }
         self.code.bind(generic)?;
-        self.emit_int_div_rem_shared(need_div, need_rem, left, right, helper, fail, bif_mfa)?;
+        self.emit_int_div_rem_shared(left, right, fail, bif_mfa)?;
         self.code.bind(done)?;
         if need_div {
             self.store_result(quotient_dst, ARG1)?;
@@ -1385,107 +1264,33 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
-    /// The shared `int_div_rem` fragment inlined: quotient in ARG1, remainder in ARG2.
-    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:740-875 (emit_int_div_rem_guard_shared,
-    // emit_int_div_rem_body_shared), OTP-29.1.1
-    #[allow(clippy::too_many_arguments)]
+    /// The generic division: quotient in ARG1, remainder in ARG2.
+    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1022-1031 (emit_div_rem, generic
+    // label), OTP-29.1.1.
     fn emit_int_div_rem_shared(
         &mut self,
-        need_div: bool,
-        need_rem: bool,
         lhs: Gpr,
         rhs: Gpr,
-        helper: ArithHelper,
         fail: u32,
         bif_mfa: &'static crate::bif::ErtsCodeMfa,
     ) -> Result<(), ModuleError> {
-        let slow = self.code.new_label();
-        let done = self.code.new_label();
-        let quotient = Gpr::x(12);
-        let remainder = Gpr::x(13);
-        // Speculatively go ahead with the division.
         self.code.emit(|e| {
-            e.asr_imm(TMP1, lhs, 4)?;
-            e.asr_imm(TMP, rhs, 4)?;
-            e.sdiv(quotient, TMP1, TMP)?;
-            e.msub(remainder, quotient, TMP, TMP1)?;
-            e.cmp_imm(rhs, 15, false)
+            e.mov_reg(M_ARG2, lhs)?;
+            e.mov_reg(M_ARG3, rhs)
         })?;
-        self.code.b_cond(Cond::Eq, slow)?;
-        // Check whether both operands are small integers.
-        self.code.emit(|e| {
-            e.and_reg(
-                TMP1,
-                lhs,
-                Shifted {
-                    reg: rhs,
-                    shift: Shift::Lsl,
-                    amount: 0,
-                },
-            )?;
-            e.and_imm(TMP1, TMP1, 15)?;
-            e.cmp_imm(TMP1, 15, false)
-        })?;
-        self.code.b_cond(Cond::Ne, slow)?;
-        // MIN_SMALL divided by -1 overflows; the generic handler produces the bignum.
-        self.code.emit(|e| {
-            e.asr_imm(TMP1, quotient, 59)?;
-            e.cmp_imm(TMP1, 1, false)
-        })?;
-        self.code.b_cond(Cond::Ge, slow)?;
-        self.code.emit(|e| {
-            e.mov_const(TMP1, 15)?;
-            e.orr_reg(
-                ARG1,
-                TMP1,
-                Shifted {
-                    reg: quotient,
-                    shift: Shift::Lsl,
-                    amount: 4,
-                },
-            )?;
-            e.orr_reg(
-                ARG2,
-                TMP1,
-                Shifted {
-                    reg: remainder,
-                    shift: Shift::Lsl,
-                    amount: 4,
-                },
-            )
-        })?;
-        self.code.b(done)?;
-        self.code.bind(slow)?;
-        if need_div && need_rem {
-            // Quotient comes back in x0; the helper stores the remainder in tmp_mem[1].
-            self.emit_arith_call_with_mfa(
-                14,
-                lhs,
-                rhs,
-                helper,
-                fail,
-                std::ptr::from_ref(bif_mfa) as usize,
-            )?;
-            self.code
-                .emit(|e| e.ldr_uoff(ARG2, Gpr::x(19), TMP_MEM_REM))?;
+        if let Some(fail) = self.arith_fail_label(fail) {
+            let guard = Self::arith_fragment_address(self.bif_fragments.arith.int_div_rem_guard)?;
+            self.fragment_call(guard)?;
+            let fail = self.label(fail);
+            self.code.b_cond(Cond::Eq, fail)?;
         } else {
-            let op = if need_div {
-                BinaryOp::Div
-            } else {
-                BinaryOp::Rem
-            };
-            self.emit_arith_call_with_mfa(
-                op.id(),
-                lhs,
-                rhs,
-                helper,
-                fail,
-                std::ptr::from_ref(bif_mfa) as usize,
-            )?;
-            self.mov_if_needed(if need_div { ARG1 } else { ARG2 }, ARG1)?;
+            let body = Self::arith_fragment_address(self.bif_fragments.arith.int_div_rem_body)?;
+            self.code
+                .emit(|e| e.mov_const(M_ARG4, std::ptr::from_ref(bif_mfa) as u64))?;
+            self.fragment_call(body)?;
         }
-        self.code.bind(done)?;
-        Ok(())
+        // The fragments return the remainder in erts ARG2 (x1).
+        self.mov_if_needed(ARG2, M_ARG2)
     }
 
     /// Division or remainder by a constant; the dividend is checked unless `generic` is `None`.
@@ -1659,7 +1464,6 @@ impl BeamModuleAssembler {
         src3: TypedArg,
         src4: TypedArg,
         dst: ArgVal,
-        helper: ArithHelper,
         fail: u32,
     ) -> Result<(), ModuleError> {
         let is_product_small = is_product_small_if_args_are_small(&src1, &src2);
@@ -1739,15 +1543,24 @@ impl BeamModuleAssembler {
                     self.code.b_cond(Cond::Eq, small)?;
                 }
             }
+            self.mov_if_needed(M_ARG2, left)?;
+            self.mov_if_needed(M_ARG3, right)?;
             if !is_increment_zero {
                 self.mov_if_needed(M_ARG4, increment)?;
             }
-            let op = if is_increment_zero {
-                BinaryOp::Mul.id()
-            } else {
-                13
+            let arith = self.bif_fragments.arith;
+            let fail = self.arith_fail_label(fail);
+            let fragment = match (fail.is_some(), is_increment_zero) {
+                (true, true) => arith.mul_guard,
+                (true, false) => arith.mul_add_guard,
+                (false, true) => arith.mul_body,
+                (false, false) => arith.mul_add_body,
             };
-            self.emit_helper(op, left, right, helper, (fail != 0).then_some(fail))?;
+            self.fragment_call(Self::arith_fragment_address(fragment)?)?;
+            if let Some(fail) = fail {
+                let fail = self.label(fail);
+                self.code.cbz(ARG1, fail)?;
+            }
             if sometimes_small {
                 self.code.b(store_result)?;
             }
@@ -1781,7 +1594,6 @@ impl BeamModuleAssembler {
                 left_shift,
                 is_increment_zero,
                 store_result,
-                helper,
             )?;
         }
 
@@ -1801,7 +1613,6 @@ impl BeamModuleAssembler {
         left_shift: i32,
         is_increment_zero: bool,
         store_result: Label,
-        helper: ArithHelper,
     ) -> Result<(), ModuleError> {
         let min_increment = src4.clamped_range().0;
         self.code.emit(|e| e.and_imm(M_TMP3, left, !15u64))?;
@@ -1843,32 +1654,8 @@ impl BeamModuleAssembler {
             e.cmp_reg(M_TMP2, M_TMP3, Shift::Lsl, 0)
         })?;
         self.code.b_cond(Cond::Eq, store_result)?;
-        self.emit_int128_to_big(helper)
-    }
-
-    /// Converts the 128-bit tagged product in x0:x9 into a bignum.
-    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:403-428 (emit_int128_to_big_shared),
-    // OTP-29.1.1.
-    fn emit_int128_to_big(&mut self, helper: ArithHelper) -> Result<(), ModuleError> {
-        self.code.emit(|e| {
-            e.extr(Gpr::x(2), M_TMP2, ARG1, 4)?;
-            e.asr_imm(Gpr::x(3), M_TMP2, 4)?;
-            e.cmp_imm(Gpr::x(3), 0, false)?;
-            e.cset(Gpr::x(1), Cond::Mi)
-        })?;
-        let positive = self.code.new_label();
-        self.code.b_cond(Cond::Pl, positive)?;
-        self.code.emit(|e| {
-            e.negs(Gpr::x(2), Gpr::x(2))?;
-            e.ngc(Gpr::x(3), Gpr::x(3))
-        })?;
-        self.code.bind(positive)?;
-        self.code.emit(|e| {
-            e.mov_reg(ARG2, Gpr::x(2))?;
-            e.mov_reg(ARG3, Gpr::x(3))?;
-            e.mov_reg(M_ARG4, Gpr::x(1))
-        })?;
-        self.emit_helper(15, ARG2, ARG3, helper, None)
+        let int128_to_big = Self::arith_fragment_address(self.bif_fragments.arith.int128_to_big)?;
+        self.fragment_call(int128_to_big)
     }
 
     fn emit_small_range_check(&mut self, slow: arinsal_a64::buf::Label) -> Result<(), ModuleError> {
@@ -1883,10 +1670,8 @@ impl BeamModuleAssembler {
 
     fn emit_unary_small(
         &mut self,
-        op: u32,
         src: ArgVal,
         dst: ArgVal,
-        helper: ArithHelper,
         negate: bool,
         fail: u32,
     ) -> Result<(), ModuleError> {
@@ -1920,86 +1705,50 @@ impl BeamModuleAssembler {
         self.store_result(dst, Gpr::x(12))?;
         self.code.b(done)?;
         self.code.bind(slow)?;
-        self.emit_helper(
-            op,
-            Gpr::x(14),
-            Gpr::xzr(),
-            helper,
-            (fail != 0).then_some(fail),
-        )?;
-        self.store_result(dst, Gpr::x(0))?;
+        self.emit_unary_fallback(negate, fail)?;
+        self.store_result(dst, ARG1)?;
         self.code.bind(done)?;
         Ok(())
     }
 
-    fn emit_unary_fallback(
-        &mut self,
-        op: u32,
-        src: ArgVal,
-        dst: ArgVal,
-        helper: ArithHelper,
-    ) -> Result<(), ModuleError> {
-        let value = self.source_reg(src)?;
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(10), value)?;
-            e.mov_reg(Gpr::x(14), value)
-        })?;
-        self.emit_helper(op, Gpr::x(14), Gpr::xzr(), helper, None)?;
-        self.store_result(dst, Gpr::x(0))
-    }
-
-    /// Calls the shared slow-path fragment for `op`: ARG2/ARG3 = operands, result in ARG1.
-    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:145-213 (fragment_call of the
-    // *_body_shared fragments), OTP-29.1.1
-    fn emit_helper(
-        &mut self,
-        op: u32,
-        lhs: Gpr,
-        rhs: Gpr,
-        helper: ArithHelper,
-        fail: Option<u32>,
-    ) -> Result<(), ModuleError> {
-        let bif_mfa = crate::bif::arithmetic_bif_mfa(op).unwrap_or(0);
-        self.emit_helper_with_mfa(op, lhs, rhs, helper, fail, bif_mfa)
-    }
-
-    fn emit_helper_with_mfa(
-        &mut self,
-        op: u32,
-        lhs: Gpr,
-        rhs: Gpr,
-        helper: ArithHelper,
-        fail: Option<u32>,
-        bif_mfa: usize,
-    ) -> Result<(), ModuleError> {
-        // The failure label comes from the instruction (guard arithmetic) or the emitting
-        // context; with one the runtime records no BIF frame (QUIET_GUARD in the VM hook).
-        let fail = fail.or((self.arith_fail != 0).then_some(self.arith_fail));
-        let op = if fail.is_none() { op } else { op | 0x100 };
-        let bif_mfa = if fail.is_none() { bif_mfa } else { 0 };
-        let fragment = self.arith_fragment(helper as usize, op, bif_mfa);
-        self.mov_if_needed(ARG2, lhs)?;
-        self.mov_if_needed(ARG3, rhs)?;
-        self.code.bl(fragment)?;
-        let Some(fail) = fail else {
+    /// The slow path of `i_unary_minus` / `i_bnot`, the operand in x14; the result is in ARG1.
+    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:271-284 (emit_i_unary_minus) and
+    // :1477-1486 (emit_i_bnot), OTP-29.1.1.
+    fn emit_unary_fallback(&mut self, negate: bool, fail: u32) -> Result<(), ModuleError> {
+        let fail = self.arith_fail_label(fail);
+        let arith = self.bif_fragments.arith;
+        if negate {
+            if let Some(fail) = fail {
+                self.emit_runtime_hook(
+                    crate::rt::erts_unary_minus as *const () as usize,
+                    &[Gpr::x(14)],
+                    6,
+                    ARITH_UPDATE,
+                )?;
+                let fail = self.label(fail);
+                return Ok(self.code.cbz(ARG1, fail)?);
+            }
+            let body = Self::arith_fragment_address(arith.unary_minus_body)?;
+            crate::emit_enter_runtime(&mut self.code, 6, ARITH_UPDATE)?;
+            self.code.emit(|e| e.mov_reg(M_ARG2, Gpr::x(14)))?;
+            self.fragment_call(body)?;
+            crate::emit_leave_runtime(&mut self.code, 6, ARITH_UPDATE)?;
             return Ok(());
-        };
-        // Guard context: the failure clears the pending exception and falls to the label.
-        let ok = self.code.new_label();
-        if op & 0xff <= 14 {
-            // Port of erts/emulator/beam/jit/arm/instr_arith.cpp,
-            // OTP-29.1.1: arithmetic BIF helpers return THE_NON_VALUE on failure.
-            self.code.cbnz(Gpr::x(0), ok)?;
-        } else {
-            self.code.cbz(Gpr::x(9), ok)?;
         }
-        self.code.emit(|e| {
-            e.str_uoff(Gpr::xzr(), Gpr::x(21), 40)?;
-            e.str_uoff(Gpr::xzr(), Gpr::x(21), 48)
+        // Invert everything except the tag, as the module code of erts does before the test.
+        let fragment = Self::arith_fragment_address(if fail.is_some() {
+            arith.bnot_guard
+        } else {
+            arith.bnot_body
         })?;
-        let fail = self.label(fail);
-        self.code.b(fail)?;
-        self.code.bind(ok)?;
+        self.code.emit(|e| e.eor_imm(ARG1, Gpr::x(14), !15u64))?;
+        crate::emit_enter_runtime(&mut self.code, 6, ARITH_UPDATE)?;
+        self.fragment_call(fragment)?;
+        crate::emit_leave_runtime(&mut self.code, 6, ARITH_UPDATE)?;
+        if let Some(fail) = fail {
+            let fail = self.label(fail);
+            self.code.cbz(ARG1, fail)?;
+        }
         Ok(())
     }
 

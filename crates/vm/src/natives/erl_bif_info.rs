@@ -45,10 +45,10 @@ pub(crate) extern "C" fn is_process_alive_1(c_p: *mut ProcessHeader, reg: *mut u
         };
         // erts_proc_lookup_raw, then `rp->state`: an exiting process or one with signals in
         // its queue traps to `is_process_alive_trap`, which orders the answer after them.
-        let found = if process.on_managed {
+        let found = if process.on_normal_scheduler() {
             scheduler.is_quiet_word(arg.tagged_word())
         } else {
-            scheduler.is_quiet_from(pid, false)
+            scheduler.is_quiet(pid)
         };
         let result = match found {
             None => atoms::FALSE,
@@ -56,17 +56,27 @@ pub(crate) extern "C" fn is_process_alive_1(c_p: *mut ProcessHeader, reg: *mut u
             Some(false) => return bif_ret(c_p, i, Err(alive_trap(process, arg))),
         };
         // ERTS_PROC_HAS_INCOMING_SIGNALS(BIF_P): signals from the inspected process to us must
-        // be handled before the answer. erts traps to `erts_bif_handle_signals_return/2`
-        // (ERTS_BIF_HANDLE_SIGNALS_FROM_RETURN), which has no port here; the alive request
-        // orders the answer after them too.
-        let own_quiet = match process.signal_probe() {
-            Some(probe) => probe.is_quiet(),
-            None => process
-                .self_pid
-                .is_some_and(|me| scheduler.is_quiet_from(me, process.on_managed) == Some(true)),
+        // be handled before the answer.
+        // Port of erts/emulator/beam/erl_bif_info.c:4096-4102
+        // (`ERTS_BIF_HANDLE_SIGNALS_FROM_RETURN`), OTP-29.1.1.
+        let incoming = match process.signal_probe() {
+            Some(probe) => probe.has_incoming_signals(),
+            None => process.self_pid().is_some_and(|me| {
+                scheduler
+                    .with_proc_state(me, |state| {
+                        state.load(std::sync::atomic::Ordering::Acquire)
+                            & (arinsal_sched::psflg::SIG_Q | arinsal_sched::psflg::SIG_IN_Q)
+                            != 0
+                    })
+                    .unwrap_or(false)
+            }),
         };
-        if !own_quiet {
-            return bif_ret(c_p, i, Err(alive_trap(process, arg)));
+        if incoming {
+            return bif_ret(
+                c_p,
+                i,
+                Err(handle_signals_from_return(process, arg, Term::atom(result))),
+            );
         }
         return crate::native_hooks::raw(Term::atom(result));
     }
@@ -87,6 +97,18 @@ fn alive_trap(process: &mut crate::Process, pid: Term) -> VmError {
         process,
         IS_PROCESS_ALIVE_TRAP,
         vec![pid],
+    ))
+}
+
+/// `ERTS_BIF_HANDLE_SIGNALS_FROM_RETURN`: `BIF_TRAP2` to `bif_handle_signals_return/2`.
+// Port of erts/emulator/beam/bif.h:527-528, OTP-29.1.1.
+#[cold]
+#[inline(never)]
+fn handle_signals_from_return(process: &mut crate::Process, from: Term, value: Term) -> VmError {
+    VmError::TrapExport(crate::ExportTrap::new(
+        process,
+        crate::natives::sys::BIF_HANDLE_SIGNALS_RETURN,
+        vec![from, value],
     ))
 }
 
@@ -317,12 +339,12 @@ fn system_info_with_heap<H: HeapAlloc + ?Sized>(heap: &mut H, key: &str) -> Resu
         "min_heap_size" => tagged_integer(
             heap,
             "min_heap_size",
-            arinsal_term::erts_next_heap_size(233, 0).unwrap() as i64,
+            arinsal_term::erts_next_heap_size(233, 0) as i64,
         ),
         "min_bin_vheap_size" => tagged_integer(
             heap,
             "min_bin_vheap_size",
-            arinsal_term::erts_next_heap_size(46_422, 0).unwrap() as i64,
+            arinsal_term::erts_next_heap_size(46_422, 0) as i64,
         ),
         "max_heap_size" => {
             let map_items = [
@@ -353,11 +375,11 @@ fn system_info_with_heap<H: HeapAlloc + ?Sized>(heap: &mut H, key: &str) -> Resu
                 ("max_heap_size", 0),
                 (
                     "min_bin_vheap_size",
-                    arinsal_term::erts_next_heap_size(46_422, 0).unwrap() as i64,
+                    arinsal_term::erts_next_heap_size(46_422, 0) as i64,
                 ),
                 (
                     "min_heap_size",
-                    arinsal_term::erts_next_heap_size(233, 0).unwrap() as i64,
+                    arinsal_term::erts_next_heap_size(233, 0) as i64,
                 ),
                 ("fullsweep_after", 65_535),
             ];

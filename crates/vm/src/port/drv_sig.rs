@@ -222,7 +222,7 @@ pub(crate) fn output(
         if let Some(runtime) = process.runtime.as_ref() {
             crate::utils::send_error_to_logger_nogl(
                 runtime,
-                process.self_pid,
+                process.self_pid(),
                 &format!("Bad value on output port '{}'\n", handle.port_name()),
             );
         }
@@ -370,7 +370,7 @@ pub(crate) fn command_light(
     if *flags != Term::NIL || crate::trace::tracing_enabled() || crate::trace::active() {
         return None;
     }
-    let caller = process.self_pid?;
+    let caller = process.self_pid()?;
     let id = port_id(process, *port)?;
     let handle = process.runtime.as_ref()?.ports.get(id)?;
     let drv = handle.driver.as_ref()?;
@@ -526,7 +526,7 @@ pub(crate) fn control_light(
     if crate::trace::active() {
         return None;
     }
-    let caller = process.self_pid?;
+    let caller = process.self_pid()?;
     let opcode = u32::try_from(op.as_small()?).ok()?;
     let id = port_id(process, *port)?;
     let runtime = process.runtime?;

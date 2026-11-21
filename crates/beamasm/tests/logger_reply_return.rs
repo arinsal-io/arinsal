@@ -2,37 +2,10 @@
 
 use arinsal_beamasm::{
     ExitReason, ProcessHeader, SchedulerRegisters, enter_native,
-    map::MapRuntime,
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
     rt::{read_heap_word, term_bits},
 };
 use arinsal_term::{ProcessHeap, Term, TermBuilder, global_atoms};
-
-extern "C" fn unused_map_get(_p: *mut ProcessHeader, _map: u64, _key: u64, _hash: u64) -> u64 {
-    atom("true")
-}
-
-extern "C" fn unused_get_elements(
-    _p: *mut ProcessHeader,
-    _map: u64,
-    _module: u64,
-    _table: u64,
-    _stack: u64,
-    _reg: *mut u64,
-) -> u64 {
-    panic!("reply_return uses the inline flatmap lookup")
-}
-
-extern "C" fn unused_map_update(
-    _p: *mut ProcessHeader,
-    _source: u64,
-    _registers: u64,
-    _live: u64,
-    _count: u64,
-    _reg: *mut u64,
-) -> u64 {
-    0
-}
 
 fn atom(name: &str) -> u64 {
     Term::atom(global_atoms().intern(name).unwrap()).tagged_word()
@@ -60,27 +33,7 @@ fn reply_return(idle: bool) -> (u64, u64, u64) {
         ArgVal::Immediate(atom("idle")),
         ArgVal::Immediate(0),
         ArgVal::X(2),
-        MapRuntime {
-            get: unused_map_get,
-            get_elements: unused_get_elements,
-            lookup_module: 0,
-            new_map: unused_map_update,
-            update_assoc: unused_map_update,
-            update_exact: unused_map_update,
-            put_single: unused_map_update,
-            update_single_assoc_shared: map_fragments(unused_map_get, unused_map_update)
-                .update_single_assoc_shared(),
-            update_assoc_shared: map_fragments(unused_map_get, unused_map_update)
-                .update_assoc_shared(),
-            update_exact_shared: map_fragments(unused_map_get, unused_map_update)
-                .update_exact_shared(),
-            update_single_exact_shared: map_fragments(unused_map_get, unused_map_update)
-                .update_single_exact_shared(),
-            get_element_shared: map_fragments(unused_map_get, unused_map_update)
-                .get_element_shared(),
-            get_element_hash_shared: map_fragments(unused_map_get, unused_map_update)
-                .get_element_hash_shared(),
-        },
+        map_fragments().runtime(),
     )
     .unwrap();
     let mut alternatives = [
@@ -158,11 +111,8 @@ fn reply_return_preserves_reply_and_state_for_both_idle_states() {
     assert_ne!(state, 0);
 }
 
-fn map_fragments(
-    get: arinsal_beamasm::map::MapGetHelper,
-    update: arinsal_beamasm::map::MapUpdateHelper,
-) -> &'static arinsal_beamasm::map::MapFragments {
+fn map_fragments() -> &'static arinsal_beamasm::map::MapFragments {
     Box::leak(Box::new(
-        arinsal_beamasm::map::MapFragments::new(get, update).unwrap(),
+        arinsal_beamasm::map::MapFragments::new(0).unwrap(),
     ))
 }

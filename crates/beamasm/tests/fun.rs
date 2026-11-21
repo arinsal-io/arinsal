@@ -4,7 +4,6 @@ use arinsal_a64::enc::Gpr;
 use arinsal_beamasm::{
     ExitReason, ProcessHeader, SchedulerRegisters, enter_native,
     fun::{FunCallTag, FunResolver},
-    guard::GuardHelper,
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
 };
 use arinsal_term::{ExportEntry, ProcessHeap, TermBuilder, global_atoms};
@@ -56,10 +55,6 @@ fn resolve(fun: u64, arity: u32, target: usize) -> usize {
         return 0;
     }
     target
-}
-
-extern "C" fn guard_helper(_: *mut ProcessHeader, op: u32, _: u64, _: u64) -> u64 {
-    u64::from(op == 43)
 }
 
 fn target_code(asm: &mut BeamModuleAssembler, label: u32, pop_frame: bool, sum_captures: bool) {
@@ -395,35 +390,6 @@ fn native_i_call_fun2_last() {
     let mut stack = [0u64; 64];
     execute(&module, &mut header, &mut regs, &mut stack);
     assert_eq!(regs.x_reg_array[0], arinsal_beamasm::rt::fixture_term(31));
-}
-
-#[cfg(target_arch = "aarch64")]
-#[test]
-fn native_is_function2() {
-    let mut asm = BeamModuleAssembler::new();
-    asm.emit_i_func_label(1).unwrap();
-    arinsal_beamasm::fun::emit_is_function2(
-        &mut asm,
-        ArgVal::X(0),
-        ArgVal::X(1),
-        guard_helper as GuardHelper,
-    )
-    .unwrap();
-    asm.emit_raw(|e| {
-        e.mov_reg(Gpr::x(0), Gpr::xzr())?;
-        e.ret(Gpr::x(30))
-    })
-    .unwrap();
-    let module = asm.finalize().unwrap();
-    let mut heap = [0u64; 2];
-    heap[0] = 1 << 8 | 0x14;
-    let mut header = ProcessHeader::default();
-    let mut regs = SchedulerRegisters::default();
-    regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64 | 2);
-    regs.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(31);
-    let mut stack = [0u64; 64];
-    execute(&module, &mut header, &mut regs, &mut stack);
-    assert_eq!(regs.x_reg_array[0], arinsal_beamasm::rt::fixture_term(1));
 }
 
 #[cfg(target_arch = "aarch64")]

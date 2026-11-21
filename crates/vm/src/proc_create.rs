@@ -396,8 +396,6 @@ pub struct Process {
     /// `p->return_trace_frames`: live return and exception trace frames on the stack.
     // Port of erts/emulator/beam/erl_process.h:1099, OTP-29.1.1.
     pub(crate) return_trace_frames: isize,
-    /// Largest total heap size seen at a collection entry since the last `max_heap_size` check.
-    pub(crate) max_heap_peak: usize,
     /// `esdp->virtual_reds`: reductions the slice gave up through `ERTS_VBUMP_ALL_REDS` since
     /// the scheduler last folded them. They end the slice but are not the process's own work.
     pub(crate) virtual_reds: u32,
@@ -409,10 +407,6 @@ pub struct Process {
     pub(crate) final_exit_reason: Option<Term>,
     // ---- processes and messages ----
     pub(crate) runtime: Option<&'static process::Runtime>,
-    pub(crate) self_pid: Option<arinsal_sched::Pid>,
-    /// The running turn is on a managed (normal) scheduler thread, so table lookups need no
-    /// thread-progress delay. Set at the start of every run.
-    pub(crate) on_managed: bool,
     /// The running scheduler's native sender (`c_p->scheduler_data` of erts), fetched on first
     /// use in a run and dropped when the run ends.
     pub(crate) native: Option<arinsal_sched::NativeHandle<process::Message>>,
@@ -420,10 +414,6 @@ pub struct Process {
     /// process, set and cleared by `erts_schedule`; read through
     /// [`arinsal_sched::erts_proc_sched_data`].
     pub(crate) scheduler_data: arinsal_sched::ProcSchedData<Process>,
-    /// `RunCtx::scheduler_key` the scheduler-derived state of `Process::run` was set up for.
-    pub(crate) run_key: u64,
-    /// The same for `Executor::run`'s scheduler-derived PID words.
-    pub(crate) exec_key: u64,
     /// The process's outer signal queue: native `loop_rec` probes it and fetches messages.
     signal_probe: Option<arinsal_sched::SignalProbe<crate::process::Message>>,
     /// Export dispatch to redo after the process wakes from a parked native BIF call.
@@ -1691,6 +1681,20 @@ pub(crate) struct BifTrapPending {
 pub(crate) const ERTS_STC_FLG_SYSTEM_PROC: u8 = 1 << 0;
 
 impl Process {
+    /// `p->common.id`, the one copy of the process's own pid: the word native code reads at
+    /// `ProcessHeader.self_pid`, set at creation (`init_in_place`). `None` before that.
+    // Port of erts/emulator/beam/erl_ptab.h (ErtsPTabElementCommon.id) and erl_process.c
+    // (erl_create_process: `p->common.id` from erts_ptab_new_element), OTP-29.1.1.
+    #[inline]
+    pub(crate) fn self_pid(&self) -> Option<arinsal_sched::Pid> {
+        let word = self.heap.abi.self_pid;
+        (word & 15 == 3).then(|| {
+            arinsal_sched::Pid::from_data(
+                arinsal_term::ptab::process_table_layout().pixdata2data(word >> 4),
+            )
+        })
+    }
+
     /// The call site a pending BIF trap belongs to: the interpreter's position. The JIT flavor
     /// has no such position (its native code never keeps one), so every site is the same one
     /// and the trapped import alone names the call.
@@ -1745,6 +1749,12 @@ impl Process {
     #[inline(always)]
     pub(crate) fn delay_gc(&self) -> bool {
         self.heap.has_flag(arinsal_term::pflags::F_DELAY_GC)
+    }
+    /// `c_p->scheduler_data != NULL`: this process is scheduled in on a normal scheduler, a
+    /// managed thread (its table lookups need no thread-progress delay).
+    #[inline(always)]
+    pub(crate) fn on_normal_scheduler(&self) -> bool {
+        self.scheduler_data.on_normal_scheduler()
     }
     /// Set or clear `F_DELAY_GC`.
     #[inline(always)]
@@ -2103,7 +2113,9 @@ impl Process {
     #[inline(always)]
     pub(crate) fn probe_fetch_messages(&mut self) -> Option<usize> {
         let probe = self.signal_probe.as_ref()?;
+        let scheduler = self.runtime?.scheduler_if_started()?;
         let fetched = probe.fetch_messages_if(
+            scheduler,
             |message| !message.is_altact_msg(),
             |queue| self.sig_cont.append(queue),
         );
@@ -2116,8 +2128,10 @@ impl Process {
     #[inline(always)]
     pub(crate) fn probe_fetch_messages_into_inbox(&mut self) -> Option<usize> {
         let probe = self.signal_probe.as_ref()?;
+        let scheduler = self.runtime?.scheduler_if_started()?;
         let inbox = &mut self.inbox;
         Some(probe.fetch_messages_if(
+            scheduler,
             |message| !message.is_altact_msg(),
             |queue| inbox.fetch_target().append(queue),
         ))
@@ -2128,8 +2142,14 @@ impl Process {
         let Some(probe) = self.signal_probe.as_ref() else {
             return false;
         };
+        let Some(scheduler) = self
+            .runtime
+            .and_then(|runtime| runtime.scheduler_if_started())
+        else {
+            return false;
+        };
         // The fetch sets `ERTS_PSFLG_SIG_Q` itself when it leaves signals to handle.
-        probe.fetch_all(&mut self.sig_cont);
+        probe.fetch_all(scheduler, &mut self.sig_cont);
         let busy = !self.sig_cont.is_empty();
         self.set_slow(Self::SLOW_SIG_CONT, busy);
         true
@@ -2262,7 +2282,6 @@ impl Process {
             entry_started: false,
             gc_live: 0,
             return_trace_frames: 0,
-            max_heap_peak: 0,
             virtual_reds: 0,
             reductions_used: 0,
             gc_deferred: false,
@@ -2270,12 +2289,8 @@ impl Process {
             stats: ProcessStats::default(),
             final_exit_reason: None,
             runtime: None,
-            self_pid: None,
-            on_managed: false,
             native: None,
             scheduler_data: arinsal_sched::ProcSchedData::default(),
-            run_key: 0,
-            exec_key: 0,
             signal_probe: None,
             native_light_bif_call: false,
             native_retry: None,
@@ -2320,25 +2335,21 @@ impl Process {
     // Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED), OTP-29.1.1: the
     // entry check only reads the heap cursors unless a collection is wanted.
     #[inline]
-    pub(crate) fn ensure_entry(&mut self, words: usize, objv: &mut [Term]) -> Result<(), VmError> {
+    pub(crate) fn ensure_entry(&mut self, words: usize, objv: &mut [Term]) {
         if self.heap.free_words() >= words + self.heap.check_reserve()
             && !self.heap.bin_vheap_gc_due()
             && !crate::interp::gc_stress_enabled()
         {
             self.gc_live = objv.len();
-            return Ok(());
+            return;
         }
-        self.ensure_objv(words, objv)
+        self.ensure_objv(words, objv);
     }
     /// [`Process::ensure_objv`] that returns the collection's reduction cost instead of charging it,
     /// for `arinsal_beamasm_gc_sync`, whose generated code subtracts the cost from FCALLS.
     #[cold]
     #[inline(never)]
-    pub(crate) fn ensure_uncharged(
-        &mut self,
-        words: usize,
-        objv: &mut [Term],
-    ) -> Result<u32, VmError> {
+    pub(crate) fn ensure_uncharged(&mut self, words: usize, objv: &mut [Term]) -> u32 {
         self.ensure_objv_cost(words, objv)
     }
     /// Charge `cost` reductions for a collection against FCALLS, which stops at zero.
@@ -2368,34 +2379,30 @@ impl Process {
     /// a collection when the heap has room.
     ///
     /// Port of erts/emulator/beam/erl_bits.c:1769-1840 (`erts_bs_append_checked`), OTP-29.1.1.
-    pub(crate) fn ensure_native_roots(
-        &mut self,
-        words: usize,
-        objv: &mut [Term],
-    ) -> Result<bool, VmError> {
+    pub(crate) fn ensure_native_roots(&mut self, words: usize, objv: &mut [Term]) -> bool {
         let allocation_words = words + self.heap.check_reserve();
         if self.heap.free_words() >= allocation_words
             && !self.heap.bin_vheap_gc_due()
             && !gc_stress_enabled()
         {
-            return Ok(false);
+            return false;
         }
-        self.ensure_objv(words, objv).map(|()| true)
+        self.ensure_objv(words, objv);
+        true
     }
     /// [`Process::ensure_objv`] rooting `objv`, the register array prefix the caller holds
     /// (`erts_garbage_collect(p, need, reg, live)`).
     // Port of erts/emulator/beam/erl_gc.c (erts_garbage_collect), OTP-29.1.1.
     #[cold]
     #[inline(never)]
-    pub(crate) fn ensure_objv(&mut self, words: usize, objv: &mut [Term]) -> Result<(), VmError> {
-        let cost = self.ensure_objv_cost(words, objv)?;
+    pub(crate) fn ensure_objv(&mut self, words: usize, objv: &mut [Term]) {
+        let cost = self.ensure_objv_cost(words, objv);
         if cost != 0 {
             self.bump_gc_reds(cost);
         }
-        Ok(())
     }
 
-    fn ensure_objv_cost(&mut self, words: usize, objv: &mut [Term]) -> Result<u32, VmError> {
+    fn ensure_objv_cost(&mut self, words: usize, objv: &mut [Term]) -> u32 {
         let live = objv.len();
         self.gc_live = live;
         let allocation_words = words + self.heap.check_reserve();
@@ -2404,29 +2411,32 @@ impl Process {
             && !self.heap.bin_vheap_gc_due()
             && !gc_stress_enabled()
         {
-            return Ok(0);
+            return 0;
         }
         if !self.heap.gc_enabled() {
             // Port of erts/emulator/beam/erl_gc.c:780-783 (garbage_collect with F_DISABLE_GC):
             // the need is satisfied in a fresh heap fragment and the collection is delayed.
             self.delay_heap_collection(words);
-            return Ok(0);
+            return 0;
         }
         // Port of erts/emulator/beam/jit/arm/instr_common.cpp:94-99, OTP-29.1.1:
         // the native heap check uses S_RESERVED, but GC receives the raw `need`.
-        let gc = self.collect_heap_roots_objv(objv, &mut [], words)?;
+        let gc = self.collect_heap_roots_objv(objv, &mut [], words);
         // Port of erl_gc.c:501-513 (`delay_garbage_collection`): a zero-need
         // delayed collection forces rescheduling without manufacturing heap space.
         if words == 0 && gc.collections == 0 {
-            return Ok(0);
+            return 0;
         }
         // Port of erts/emulator/beam/erl_gc.c (setup_rootset nobj), OTP-29.1.1: the collector
         // rewrites only the live prefix and leaves the other X words as they are.
         natives::sys::after_collection(self, gc.collections, gc.words_reclaimed);
-        if self.heap.free_words() < allocation_words {
-            return Err(VmError::Unsupported("heap exhausted after GC".into()));
-        }
-        Ok(gc.reductions)
+        // erl_gc.c:961 (garbage_collect): `ASSERT(need <= HEAP_LIMIT(p) - HEAP_TOP(p))`; the
+        // collection (or the delayed collection's fresh heap) always leaves room for `need`.
+        debug_assert!(
+            self.heap.free_words() >= words,
+            "garbage_collect left less than need on the heap"
+        );
+        gc.reductions
     }
     #[cfg(target_arch = "aarch64")]
     pub(crate) fn tick(&mut self) {
@@ -2907,10 +2917,6 @@ mod layout_report {
         );
         eprintln!("  Process.gc_live {}", size_of_val(&process.gc_live));
         eprintln!(
-            "  Process.max_heap_peak {}",
-            size_of_val(&process.max_heap_peak)
-        );
-        eprintln!(
             "  Process.reductions {}",
             size_of_val(&process.heap.abi.fcalls)
         );
@@ -2936,7 +2942,6 @@ mod layout_report {
             size_of_val(&process.final_exit_reason)
         );
         eprintln!("  Process.runtime {}", size_of_val(&process.runtime));
-        eprintln!("  Process.self_pid {}", size_of_val(&process.self_pid));
         eprintln!(
             "  Process.signal_probe {}",
             size_of_val(&process.signal_probe)

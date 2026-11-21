@@ -32,7 +32,7 @@ pub use pure::{
     with_binary_bytes,
 };
 
-pub use sys::{os_info_init, os_type, os_version, sys_perf_counter};
+pub use sys::{os_info_init, os_type, os_version};
 
 /// Exception class, as in `erlang:raise/3`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -652,23 +652,20 @@ impl HeapAlloc for ProcessHeapHandle<'_> {
         writable: bool,
         overhead_words: u64,
         owner: Option<arinsal_term::OwnedBinaryRef>,
-    ) -> Result<(), arinsal_term::TermError> {
+    ) {
         HeapAlloc::link_bin_ref(self.0, bin_ref, writable, overhead_words, owner)
     }
     fn add_bin_vheap(&mut self, words: u64) {
         HeapAlloc::add_bin_vheap(self.0, words)
     }
-    fn retain_writable_binary(
-        &mut self,
-        binary: Arc<arinsal_term::WritableBinary>,
-    ) -> Result<(), arinsal_term::TermError> {
+    fn retain_writable_binary(&mut self, binary: Arc<arinsal_term::WritableBinary>) {
         HeapAlloc::retain_writable_binary(self.0, binary)
     }
     fn retain_writable_binary_with_apparent_size(
         &mut self,
         binary: Arc<arinsal_term::WritableBinary>,
         apparent_size_bits: usize,
-    ) -> Result<(), arinsal_term::TermError> {
+    ) {
         HeapAlloc::retain_writable_binary_with_apparent_size(self.0, binary, apparent_size_bits)
     }
     fn update_writable_binary_overhead(
@@ -682,11 +679,7 @@ impl HeapAlloc for ProcessHeapHandle<'_> {
     fn supports_writable_binary(&self) -> bool {
         HeapAlloc::supports_writable_binary(self.0)
     }
-    fn link_external_binary(
-        &mut self,
-        bin_ref: *mut u64,
-        binary: Arc<ExternalBinary>,
-    ) -> Result<(), arinsal_term::TermError> {
+    fn link_external_binary(&mut self, bin_ref: *mut u64, binary: Arc<ExternalBinary>) {
         HeapAlloc::link_external_binary(self.0, bin_ref, binary)
     }
     fn supports_external_binary(&self) -> bool {
@@ -695,11 +688,7 @@ impl HeapAlloc for ProcessHeapHandle<'_> {
     fn link_node(&mut self, thing: *mut u64, node: Node) {
         HeapAlloc::link_node(self.0, thing, node)
     }
-    fn link_magic_ref(
-        &mut self,
-        thing: *mut u64,
-        owner: MagicBin,
-    ) -> Result<(), arinsal_term::TermError> {
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: MagicBin) {
         HeapAlloc::link_magic_ref(self.0, thing, owner)
     }
     fn supports_magic(&self) -> bool {

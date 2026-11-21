@@ -21,11 +21,11 @@ fn live_off_heap_chain_longer_than_one_million_survives_heap_resize() {
                     break;
                 }
                 Err(_) => {
-                    heap.collect(&mut roots, &mut [], 10).unwrap();
+                    heap.collect(&mut roots, &mut [], 10);
                 }
             }
         }
     }
-    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0);
     assert_eq!(heap.off_heap_count(), BINARIES);
 }

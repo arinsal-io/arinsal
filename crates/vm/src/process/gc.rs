@@ -42,17 +42,17 @@ pub(crate) fn begin_hibernate(
 // Port of erts/emulator/beam/erl_process.c:10415-10418 and 9558 (`scheduler_gc_proc`),
 // OTP-29.1.1.
 #[inline]
-pub(super) fn collect_on_schedule_in(process: &mut Process) -> Result<bool, VmError> {
+pub(super) fn collect_on_schedule_in(process: &mut Process) -> bool {
     // ERTS_IS_GC_DESIRED is tested before anything about the saved registers is computed.
     if !process.heap.gc_after_bif_desired() {
-        return Ok(false);
+        return false;
     }
     let live = switched_out_live(process);
-    process.collect_bin_vheap_if_due(live)?;
+    process.collect_bin_vheap_if_due(live);
     // `calls += cost; reds -= cost; if (reds <= 0) goto sched_out_proc;` and
     // `if (p->flags & (F_DIRTY_MAJOR_GC|F_DIRTY_MINOR_GC)) goto sched_out_proc;`: a delayed
     // collection leaves at once, before the process runs an instruction on this scheduler.
-    Ok(process.heap.abi.fcalls <= 0 || process.slice().is_some_and(|work| work.dirty_sys_gc))
+    process.heap.abi.fcalls <= 0 || process.slice().is_some_and(|work| work.dirty_sys_gc)
 }
 
 // g_proc_sched
@@ -75,7 +75,7 @@ pub(super) fn hibernate_fetch_collect(
     if !process.inbox.is_empty() {
         return Ok(false);
     }
-    hibernate_collect(process)?;
+    hibernate_collect(process);
     process.fetch_signals(ctx)?;
     Ok(process.inbox.is_empty())
 }
@@ -83,7 +83,7 @@ pub(super) fn hibernate_fetch_collect(
 /// `hibernate/3` with no waiting messages: shrink the heap to the `apply(M, F, A)`
 /// arguments in X0..X2. Run after the BIF has unwound so no caller keeps stale terms.
 // Port of erts/emulator/beam/beam_common.c:1584-1592 (erts_hibernate), OTP-29.1.1.
-fn hibernate_collect(process: &mut Process) -> Result<(), VmError> {
+fn hibernate_collect(process: &mut Process) {
     // hibernate/0 reaches erts_hibernate with arity 0: no X register is live and the
     // stack stays a root. hibernate/3 keeps apply(M, F, A) in X0..X2.
     let live = if hibernate_resumes_in_place(process) {
@@ -94,9 +94,9 @@ fn hibernate_collect(process: &mut Process) -> Result<(), VmError> {
     process.gc_live = live;
     process.heap.abi.arity = live as u8;
     if !process.heap.gc_enabled() {
-        return Ok(());
+        return;
     }
-    process.garbage_collect_hibernate(live).map(|_| ())
+    process.garbage_collect_hibernate(live);
 }
 
 // Port of erts/emulator/beam/beam_common.c:1568 (erts_hibernate), OTP-29.1.1: the parked
@@ -161,30 +161,29 @@ impl Process {
     /// Port of erts/emulator/beam/erl_gc.c:418 (`erts_gc_after_bif_call_lhf`), OTP-29.1.1:
     /// the BIF result is the only live register.
     #[inline]
-    pub(crate) fn gc_after_bif(&mut self, result: Term) -> Result<Term, VmError> {
+    pub(crate) fn gc_after_bif(&mut self, result: Term) -> Term {
         // ERTS_IS_GC_AFTER_BIF_DESIRED: heap fragments or a virtual binary heap over its size;
         // `F_DISABLE_GC` returns before any collection (erl_gc.c:403-415).
         if !self.heap.gc_after_bif_desired() {
-            return Ok(result);
+            return result;
         }
         let mut roots = [result];
-        let gc = self.collect_heap_roots_objv(&mut [], &mut roots, 0)?;
+        let gc = self.collect_heap_roots_objv(&mut [], &mut roots, 0);
         crate::natives::sys::after_collection(self, gc.collections, gc.words_reclaimed);
         self.charge_gc_stats(&gc);
-        Ok(roots[0])
+        roots[0]
     }
 
     /// Force collection with the current BEAM live-register count.
     // Port of erts/emulator/beam/erl_gc.c:1136 (`erts_garbage_collect_literals`), OTP-29.1.1.
-    pub(crate) fn force_gc_live(&mut self, live: usize) -> Result<(), VmError> {
+    pub(crate) fn force_gc_live(&mut self, live: usize) {
         if !self.heap.gc_enabled() {
             self.gc_deferred = true;
-            return Ok(());
+            return;
         }
         let live = live.min(self.x.len());
-        let gc = self.collect_arg_reg(live, &mut [], 0)?;
+        let gc = self.collect_arg_reg(live, &mut [], 0);
         crate::natives::sys::after_collection(self, gc.collections, gc.words_reclaimed);
-        Ok(())
     }
 
     /// Emit a `garbage_collection` trace event with the GC info list and `{wordsize, Size}`.
@@ -245,7 +244,7 @@ impl Process {
         live_x: usize,
         extra: &mut [Term],
         min_free: usize,
-    ) -> Result<arinsal_term::GcStats, VmError> {
+    ) -> arinsal_term::GcStats {
         let mut x = self.take_arg_reg();
         let collected = self.collect_heap_roots_objv(&mut x[..live_x], extra, min_free);
         self.x = x;
@@ -260,7 +259,7 @@ impl Process {
         objv: &mut [Term],
         extra: &mut [Term],
         min_free: usize,
-    ) -> Result<arinsal_term::GcStats, VmError> {
+    ) -> arinsal_term::GcStats {
         self.set_hibernated(false);
         self.collect_roots(objv, extra, min_free, false)
     }
@@ -272,16 +271,12 @@ impl Process {
 
     /// Shrink the heap to the live data of `x[..live_x]` and the mailbox.
     // Port of erts/emulator/beam/erl_gc.c:1004 (garbage_collect_hibernate), OTP-29.1.1.
-    pub(crate) fn garbage_collect_hibernate(
-        &mut self,
-        live_x: usize,
-    ) -> Result<arinsal_term::GcStats, VmError> {
+    pub(crate) fn garbage_collect_hibernate(&mut self, live_x: usize) -> arinsal_term::GcStats {
         let mut x = self.take_arg_reg();
-        let collected = self.collect_roots(&mut x[..live_x], &mut [], 0, true);
+        let stats = self.collect_roots(&mut x[..live_x], &mut [], 0, true);
         self.x = x;
-        let stats = collected?;
         self.set_hibernated(true);
-        Ok(stats)
+        stats
     }
 
     /// A message copied onto the heap when it was sent is counted by `call_memory` when it is
@@ -298,12 +293,12 @@ impl Process {
     /// tracing or priority handling) stops the fetch and is left for the scheduler.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:7730-7790 (erts_proc_sig_receive_helper)
     // and the message case of erts_proc_sig_handle_incoming, OTP-29.1.1.
-    pub(crate) fn fetch_messages_in_place(&mut self) -> Result<usize, VmError> {
+    pub(crate) fn fetch_messages_in_place(&mut self) -> usize {
         // Only the `erts_proc_sig_fetch` case that splices messages straight onto the message
         // queue runs here: no unhandled signal in the middle queue, no receive tracing, and
         // an outer queue of ordinary messages only.
         if !self.sig_cont_empty() || crate::trace::active() {
-            return Ok(0);
+            return 0;
         }
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:1332 (erts_proc_sig_fetch__): the outer
         // queue, messages only, is spliced onto the message queue as a whole.
@@ -315,16 +310,16 @@ impl Process {
             .is_some_and(|entries| !entries.is_empty());
         if !traced_words {
             let Some(fetched) = self.probe_fetch_messages_into_inbox() else {
-                return Ok(0);
+                return 0;
             };
             if fetched != 0 {
                 self.inbox.spliced();
                 crate::natives::erts_debug::after_message_queue_change(self);
             }
-            return Ok(fetched);
+            return fetched;
         }
         let Some(fetched) = self.probe_fetch_messages() else {
-            return Ok(0);
+            return 0;
         };
         while let Some(node) = self.pop_sig_cont_signal() {
             debug_assert!(
@@ -338,7 +333,7 @@ impl Process {
         if fetched != 0 {
             crate::natives::erts_debug::after_message_queue_change(self);
         }
-        Ok(fetched)
+        fetched
     }
 
     /// Fetch the outer signal queue before an on-heap collection: messages a sender
@@ -348,15 +343,14 @@ impl Process {
     /// to the middle queue, whose on-heap messages are roots too.
     // Port of erts/emulator/beam/erl_gc.c:987-990 (`erts_garbage_collect` fetches when
     // `FS_ON_HEAP_MSGQ`) and erl_proc_sig_queue.c:1332 (erts_proc_sig_fetch__), OTP-29.1.1.
-    pub(super) fn fetch_outer_queue_for_gc(&mut self) -> Result<(), VmError> {
+    pub(super) fn fetch_outer_queue_for_gc(&mut self) {
         if self.message_queue_data() != MessageQueueData::OnHeap {
-            return Ok(());
+            return;
         }
-        if self.fetch_messages_in_place()? != 0 {
-            return Ok(());
+        if self.fetch_messages_in_place() != 0 {
+            return;
         }
         self.probe_fetch_all();
-        Ok(())
     }
 
     pub(super) fn sig_cont_message_mut(payload: &mut Payload<Message>) -> Option<&mut Message> {
@@ -396,19 +390,17 @@ impl Process {
     // Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED), OTP-29.1.1: the test
     // is three compares inline, the collection itself is out of line.
     #[inline(always)]
-    pub(crate) fn collect_bin_vheap_if_due(&mut self, live_x: usize) -> Result<(), VmError> {
+    pub(crate) fn collect_bin_vheap_if_due(&mut self, live_x: usize) {
         if self.heap.gc_after_bif_desired() {
-            return self.collect_bin_vheap_now(live_x);
+            self.collect_bin_vheap_now(live_x);
         }
-        Ok(())
     }
 
     #[inline(never)]
-    fn collect_bin_vheap_now(&mut self, live_x: usize) -> Result<(), VmError> {
+    fn collect_bin_vheap_now(&mut self, live_x: usize) {
         let live_x = live_x.min(self.x.len());
-        let stats = self.collect_arg_reg(live_x, &mut [], 0)?;
+        let stats = self.collect_arg_reg(live_x, &mut [], 0);
         crate::natives::sys::after_collection(self, stats.collections, stats.words_reclaimed);
         self.charge_gc_stats(&stats);
-        Ok(())
     }
 }

@@ -4303,7 +4303,7 @@ fn dist_cmd(runtime: &crate::process::Runtime, port_id: u64, initial_reds: i32) 
 /// Suspends a dist sender: the running process takes it on itself, another process receives it as a
 /// signal (erts_suspend on a busy sender). True when the suspend was taken or sent.
 fn suspend_dist_sender(process: &mut Process, sender: Pid) -> bool {
-    if process.self_pid == Some(sender) {
+    if process.self_pid() == Some(sender) {
         return crate::suspend::suspend_self_true(process);
     }
     process
@@ -4567,11 +4567,15 @@ pub(crate) extern "C" fn node_0(
 pub(crate) extern "C" fn node_1(
     c_p: *mut arinsal_beamasm::ProcessHeader,
     reg: *mut u64,
-    i: u64,
+    _i: u64,
 ) -> u64 {
     let [term] = crate::bif_table::bif_args::<1>(reg);
-    let result = crate::natives::node::node(term);
-    crate::natives::bif::bif_ret(c_p, i, result)
+    // Port of erts/emulator/beam/dist.c:6219-6225 (node_1): BIF_ERROR(BIF_P, BADARG) for a
+    // term that is not a node container. `i_bif` calls this with no `c_p->current`.
+    match crate::natives::node::node(term) {
+        Ok(name) => crate::native_hooks::raw(name),
+        Err(_) => crate::natives::bif::bif_badarg(c_p),
+    }
 }
 
 #[cfg(test)]

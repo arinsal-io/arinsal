@@ -7,6 +7,24 @@ pub(super) const SIG_REDS_CNT_FACTOR: i32 = 4;
 /// OTP-29.1.1.
 pub(crate) const SIG_HANDLE_REDS_MAX_PREFERED: i32 = CONTEXT_REDS / 40;
 
+/// `ERTS_PROC_SIG_FLUSH_FLG_FROM_ALL`.
+// Port of erts/emulator/beam/erl_proc_sig_queue.h:1345, OTP-29.1.1.
+pub(crate) const ERTS_PROC_SIG_FLUSH_FLG_FROM_ALL: i32 = 1 << 1;
+/// `ERTS_PROC_SIG_FLUSH_FLG_FROM_ID`.
+// Port of erts/emulator/beam/erl_proc_sig_queue.h:1350, OTP-29.1.1.
+pub(crate) const ERTS_PROC_SIG_FLUSH_FLG_FROM_ID: i32 = 1 << 2;
+
+/// Result of `pi_maybe_flush_signals`.
+// Port of erts/emulator/beam/erl_bif_info.c:1198-1271, OTP-29.1.1.
+pub(crate) enum FlushSignals {
+    /// All relevant signals handled (or none needed flushing).
+    Done,
+    /// Out of reductions: yield and retry the BIF.
+    Yield,
+    /// An exit signal made the process exiting.
+    Exiting,
+}
+
 impl Process {
     /// Handle the signals left in the middle queue without fetching.
     pub(crate) fn handle_local_signals(
@@ -38,6 +56,152 @@ impl Process {
             }
             local_only = true;
         }
+    }
+
+    /// Insert a flush signal and set `FS_FLUSHING_SIGS`.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:3520-3560
+    // (`erts_proc_sig_init_flush_signals`), OTP-29.1.1.
+    pub(crate) fn erts_proc_sig_init_flush_signals(
+        &mut self,
+        ctx: &mut RunCtx<'_, crate::Process>,
+        flags: i32,
+        from: Term,
+    ) {
+        debug_assert!(
+            self.inbox.flags & (crate::receive::FS_FLUSHING_SIGS | crate::receive::FS_FLUSHED_SIGS)
+                == 0
+        );
+        let (from_pid, force_flush, slot) = match flags {
+            ERTS_PROC_SIG_FLUSH_FLG_FROM_ALL => (ctx.pid(), true, None),
+            ERTS_PROC_SIG_FLUSH_FLG_FROM_ID => {
+                if let Some(pid) = Pid::from_term(from) {
+                    (pid, false, None)
+                } else {
+                    // Port identifier: hash the port term for the sender buffer slot.
+                    (
+                        ctx.pid(),
+                        false,
+                        Some(arinsal_term::internal_hash(from) as usize),
+                    )
+                }
+            }
+            _ => {
+                self.set_gc_enabled(false);
+                let _ = self.fetch_signals(ctx);
+                self.inbox.flags |= crate::receive::FS_FLUSHING_SIGS;
+                return;
+            }
+        };
+        ctx.queue_self_flush(from_pid, force_flush, slot)
+            .expect("Failed to send flush signal to ourselves");
+        self.set_gc_enabled(false);
+        let _ = self.fetch_signals(ctx);
+        self.inbox.flags |= crate::receive::FS_FLUSHING_SIGS;
+    }
+
+    /// Flush signals the caller may have sent to itself before gathering `process_info`.
+    // Port of erts/emulator/beam/erl_bif_info.c:1198-1271 (`pi_maybe_flush_signals`),
+    // OTP-29.1.1.
+    pub(crate) fn pi_maybe_flush_signals(
+        &mut self,
+        ctx: &mut RunCtx<'_, crate::Process>,
+    ) -> Result<FlushSignals, VmError> {
+        use crate::receive::{FS_FLUSHED_SIGS, FS_FLUSHING_SIGS};
+        if self.inbox.flags & FS_FLUSHED_SIGS != 0 {
+            debug_assert!(self.inbox.flags & FS_FLUSHING_SIGS != 0);
+            self.inbox.flags &= !(FS_FLUSHED_SIGS | FS_FLUSHING_SIGS);
+            self.set_gc_enabled(true);
+            return Ok(FlushSignals::Done);
+        }
+        if self.inbox.flags & FS_FLUSHING_SIGS == 0 {
+            if !ctx.maybe_self_sigs() {
+                if ctx.proc_state().load(Ordering::Acquire) & arinsal_sched::psflg::MSG_SIG_IN_Q
+                    != 0
+                {
+                    self.fetch_signals(ctx)?;
+                }
+                return Ok(FlushSignals::Done);
+            }
+            self.erts_proc_sig_init_flush_signals(
+                ctx,
+                ERTS_PROC_SIG_FLUSH_FLG_FROM_ID,
+                ctx.pid().to_term().unwrap_or(Term::NIL),
+            );
+            if self.inbox.flags & FS_FLUSHED_SIGS != 0 {
+                self.inbox.flags &= !(FS_FLUSHED_SIGS | FS_FLUSHING_SIGS);
+                self.set_gc_enabled(true);
+                return Ok(FlushSignals::Done);
+            }
+        }
+        debug_assert!(self.inbox.flags & FS_FLUSHING_SIGS != 0);
+        let mut reds_left = self.heap.abi.fcalls;
+        while reds_left > 0 {
+            let mut sreds = reds_left;
+            let max = sreds;
+            let _ = self.handle_incoming(ctx, &mut sreds, max, true)?;
+            super::executor::bump_fcalls(self, sreds);
+            if Self::erts_proc_is_exiting(ctx) {
+                return Ok(FlushSignals::Exiting);
+            }
+            if self.inbox.flags & FS_FLUSHED_SIGS != 0 {
+                self.inbox.flags &= !(FS_FLUSHED_SIGS | FS_FLUSHING_SIGS);
+                self.set_gc_enabled(true);
+                return Ok(FlushSignals::Done);
+            }
+            reds_left -= sreds;
+        }
+        Ok(FlushSignals::Yield)
+    }
+
+    /// `bif_handle_signals_return/2`: flush signals from `from` then return `value`.
+    // Port of erts/emulator/beam/bif.c:5452-5498 (`bif_handle_signals_return`), OTP-29.1.1.
+    pub(crate) fn bif_handle_signals_return(
+        &mut self,
+        ctx: &mut RunCtx<'_, crate::Process>,
+        from: Term,
+        value: Term,
+    ) -> Result<Term, VmError> {
+        use crate::receive::{FS_FLUSHED_SIGS, FS_FLUSHING_SIGS};
+        if self.inbox.flags & FS_FLUSHED_SIGS != 0 {
+            debug_assert!(self.inbox.flags & FS_FLUSHING_SIGS != 0);
+            self.inbox.flags &= !(FS_FLUSHED_SIGS | FS_FLUSHING_SIGS);
+            self.set_gc_enabled(true);
+            return Ok(value);
+        }
+        if self.inbox.flags & FS_FLUSHING_SIGS == 0 {
+            let flags = if from.is_pid() || from.is_port() {
+                ERTS_PROC_SIG_FLUSH_FLG_FROM_ID
+            } else {
+                ERTS_PROC_SIG_FLUSH_FLG_FROM_ALL
+            };
+            self.erts_proc_sig_init_flush_signals(ctx, flags, from);
+            if self.inbox.flags & FS_FLUSHED_SIGS != 0 {
+                self.inbox.flags &= !(FS_FLUSHED_SIGS | FS_FLUSHING_SIGS);
+                self.set_gc_enabled(true);
+                return Ok(value);
+            }
+        }
+        debug_assert!(self.inbox.flags & FS_FLUSHING_SIGS != 0);
+        let mut reds_left = self.heap.abi.fcalls;
+        while reds_left > 0 {
+            let mut sreds = reds_left;
+            let max = sreds;
+            let _ = self.handle_incoming(ctx, &mut sreds, max, true)?;
+            super::executor::bump_fcalls(self, sreds);
+            Self::erts_bif_chk_exited(self, ctx)?;
+            if self.inbox.flags & FS_FLUSHED_SIGS != 0 {
+                self.inbox.flags &= !(FS_FLUSHED_SIGS | FS_FLUSHING_SIGS);
+                self.set_gc_enabled(true);
+                return Ok(value);
+            }
+            reds_left -= sreds;
+        }
+        crate::bif_traps::vbump_all_reds(self);
+        Err(VmError::TrapExport(crate::ExportTrap::new(
+            self,
+            crate::natives::sys::BIF_HANDLE_SIGNALS_RETURN,
+            vec![from, value],
+        )))
     }
 
     /// `ERTS_BIF_CHK_EXITED(c_p)` of a BIF that handled its own signals: a process an exit
@@ -156,8 +320,11 @@ impl Process {
         max_reds: i32,
         local_only: bool,
     ) -> Result<bool, VmError> {
-        if !local_only {
-            self.fetch_signals(ctx)?;
+        if !local_only && self.inbox.flags & crate::receive::FS_FLUSHING_SIGS == 0 {
+            let state = ctx.proc_state().load(Ordering::Acquire);
+            if state & arinsal_sched::psflg::SIG_IN_Q != 0 {
+                self.fetch_signals(ctx)?;
+            }
         }
         let limit_in = *reds;
         *reds = 0;
@@ -173,6 +340,7 @@ impl Process {
         // The end of the message queue before this call: erts moves the handled part of the
         // middle queue there only when it stops, so `stretch_limit` looks at what precedes.
         let msgq_end = self.inbox.entries.last_field();
+        let queued = self.inbox.len();
         let mut cnt = 0_i32;
         let mut yield_ = false;
         let mut handled = false;
@@ -243,6 +411,13 @@ impl Process {
                 }
             }
             ctx.consume_fetched();
+            if matches!(node.payload, Payload::Signal(Signal::Flush)) {
+                // Port of erl_proc_sig_queue.c:6853-6865 (`ERTS_SIG_Q_OP_FLUSH`): set
+                // `FS_FLUSHED_SIGS` and `goto stop`. No `cnt++`.
+                debug_assert!(self.inbox.flags & crate::receive::FS_FLUSHING_SIGS != 0);
+                self.inbox.flags |= crate::receive::FS_FLUSHED_SIGS;
+                break Ok(self.sig_cont_empty());
+            }
             if !node.is_lazy() && !matches!(node.payload, Payload::Signal(_)) {
                 // ERTS_SIG_Q_OP_ALTACT_MSG: a priority message enters the priority queue.
                 match self.move_message(ctx, node) {
@@ -356,6 +531,23 @@ impl Process {
             *reds = max_reds;
         }
         ctx.set_sig_q(!self.sig_cont_empty());
+        // Port of erl_proc_sig_queue.c:7114-7122: no outstanding signals from ourselves.
+        let state = ctx.proc_state().load(Ordering::Acquire);
+        if state & (arinsal_sched::psflg::SIG_Q | arinsal_sched::psflg::SIG_IN_Q) == 0 {
+            ctx.clear_maybe_self_sigs();
+        }
+        // A signal converted into a message (an exit or monitor down for a process trapping
+        // them, a reply) makes the process active, so a process scheduled for its signals
+        // alone (ERTS_PSFLG_RUNNING_SYS) goes on to run the receive that takes it.
+        // Port of erts/emulator/beam/erl_proc_sig_queue.c:4790, 5058, 5115, 5257, 5910, 6219,
+        // 6957, 7153 (`erts_proc_notify_new_message(c_p, ERTS_PROC_LOCK_MAIN)` after each
+        // conversion: ERTS_PSFLG_ACTIVE set on the running process, no enqueue), OTP-29.1.1.
+        if self.inbox.len() > queued {
+            let state = ctx.proc_state();
+            if state.load(Ordering::Relaxed) & arinsal_sched::psflg::ACTIVE == 0 {
+                state.fetch_or(arinsal_sched::psflg::ACTIVE, Ordering::AcqRel);
+            }
+        }
         let done = result?;
         crate::natives::erts_debug::after_message_queue_change(self);
         Ok(done)
@@ -812,6 +1004,9 @@ impl Process {
             }
             arinsal_sched::Signal::LiteralAreaCopy(_) => {
                 unreachable!("handle_cla preserves the literal-copy signal while it yields")
+            }
+            arinsal_sched::Signal::Flush => {
+                unreachable!("FLUSH is handled in handle_incoming before handle_signal")
             }
         };
         Ok(cost)

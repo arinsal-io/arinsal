@@ -17,7 +17,7 @@ use crate::bits::{ExternalBinary, RefcBinary, WritableBinary};
 use crate::heap::{
     HeapAlloc, OffHeapLists, link_external_bin_ref, link_magic_thing, link_node_thing, store,
 };
-use crate::{Node, Term, TermError};
+use crate::{Node, Term};
 use arinsal_alloc::typed::{AllocBlock, ErtsAlcType, FixOrBox};
 use std::num::NonZeroUsize;
 
@@ -126,7 +126,7 @@ impl HeapAlloc for MessageHeapBlock {
         writable: bool,
         overhead_words: u64,
         owner: Option<arinsal_alloc::raw::OwnedBinaryRef>,
-    ) -> Result<(), TermError> {
+    ) {
         let head = if writable {
             &mut self.off_heap.wrt_bins
         } else {
@@ -138,35 +138,27 @@ impl HeapAlloc for MessageHeapBlock {
             owner.transfer_to_bin_ref(bin_ref);
         }
         self.off_heap.overhead = self.off_heap.overhead.saturating_add(overhead_words);
-        Ok(())
     }
     fn add_bin_vheap(&mut self, words: u64) {
         self.bin_vheap = self.bin_vheap.saturating_add(words);
     }
-    fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
+    fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) {
         self.bin_vheap = self
             .bin_vheap
             .saturating_add((binary.capacity() / 8) as u64);
-        Ok(())
     }
     fn retain_writable_binary_with_apparent_size(
         &mut self,
         _binary: Arc<WritableBinary>,
         bits: usize,
-    ) -> Result<(), TermError> {
+    ) {
         self.bin_vheap = self.bin_vheap.saturating_add((bits.div_ceil(8) / 8) as u64);
-        Ok(())
     }
     fn supports_writable_binary(&self) -> bool {
         true
     }
-    fn link_external_binary(
-        &mut self,
-        bin_ref: *mut u64,
-        binary: Arc<ExternalBinary>,
-    ) -> Result<(), TermError> {
+    fn link_external_binary(&mut self, bin_ref: *mut u64, binary: Arc<ExternalBinary>) {
         link_external_bin_ref(&mut self.off_heap.off_heap_first, bin_ref, binary);
-        Ok(())
     }
     fn supports_external_binary(&self) -> bool {
         true
@@ -174,14 +166,13 @@ impl HeapAlloc for MessageHeapBlock {
     fn link_node(&mut self, thing: *mut u64, node: Node) {
         link_node_thing(&mut self.off_heap.off_heap_first, thing, node);
     }
-    fn link_magic_ref(&mut self, thing: *mut u64, owner: crate::MagicBin) -> Result<(), TermError> {
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: crate::MagicBin) {
         link_magic_thing(
             &mut self.off_heap.off_heap_first,
             &mut self.off_heap.overhead,
             thing,
             owner,
         );
-        Ok(())
     }
     fn supports_magic(&self) -> bool {
         true
@@ -244,17 +235,15 @@ impl HeapAlloc for InlineHeapAlloc<'_> {
         drop(binary);
     }
     fn add_bin_vheap(&mut self, _words: u64) {}
-    fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
+    fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) {
         self.add_bin_vheap((binary.capacity() / 8) as u64);
-        Ok(())
     }
     fn retain_writable_binary_with_apparent_size(
         &mut self,
         _binary: Arc<WritableBinary>,
         bits: usize,
-    ) -> Result<(), TermError> {
+    ) {
         self.add_bin_vheap((bits.div_ceil(8) / 8) as u64);
-        Ok(())
     }
     fn link_bin_ref(
         &mut self,
@@ -262,7 +251,7 @@ impl HeapAlloc for InlineHeapAlloc<'_> {
         writable: bool,
         overhead_words: u64,
         owner: Option<arinsal_alloc::raw::OwnedBinaryRef>,
-    ) -> Result<(), TermError> {
+    ) {
         let head = if writable {
             &mut self.owners.0.wrt_bins
         } else {
@@ -274,18 +263,12 @@ impl HeapAlloc for InlineHeapAlloc<'_> {
             owner.transfer_to_bin_ref(bin_ref);
         }
         self.owners.0.overhead = self.owners.0.overhead.saturating_add(overhead_words);
-        Ok(())
     }
     fn supports_writable_binary(&self) -> bool {
         true
     }
-    fn link_external_binary(
-        &mut self,
-        bin_ref: *mut u64,
-        binary: Arc<ExternalBinary>,
-    ) -> Result<(), TermError> {
+    fn link_external_binary(&mut self, bin_ref: *mut u64, binary: Arc<ExternalBinary>) {
         link_external_bin_ref(&mut self.owners.0.off_heap_first, bin_ref, binary);
-        Ok(())
     }
     fn supports_external_binary(&self) -> bool {
         true
@@ -293,14 +276,13 @@ impl HeapAlloc for InlineHeapAlloc<'_> {
     fn link_node(&mut self, thing: *mut u64, node: Node) {
         link_node_thing(&mut self.owners.0.off_heap_first, thing, node);
     }
-    fn link_magic_ref(&mut self, thing: *mut u64, owner: crate::MagicBin) -> Result<(), TermError> {
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: crate::MagicBin) {
         link_magic_thing(
             &mut self.owners.0.off_heap_first,
             &mut self.owners.0.overhead,
             thing,
             owner,
         );
-        Ok(())
     }
     fn supports_magic(&self) -> bool {
         true
@@ -951,7 +933,7 @@ impl HeapAlloc for FragmentMut<'_> {
         writable: bool,
         overhead_words: u64,
         owner: Option<arinsal_alloc::raw::OwnedBinaryRef>,
-    ) -> Result<(), TermError> {
+    ) {
         let owners = &mut self.fragment().off_heap;
         let head = if writable {
             &mut owners.wrt_bins
@@ -964,7 +946,6 @@ impl HeapAlloc for FragmentMut<'_> {
             owner.transfer_to_bin_ref(bin_ref);
         }
         owners.overhead = owners.overhead.saturating_add(overhead_words);
-        Ok(())
     }
 
     fn add_bin_vheap(&mut self, words: u64) {
@@ -972,25 +953,23 @@ impl HeapAlloc for FragmentMut<'_> {
         fragment.bin_vheap = fragment.bin_vheap.saturating_add(words);
     }
 
-    fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
+    fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) {
         let fragment = self.fragment();
         fragment.bin_vheap = fragment
             .bin_vheap
             .saturating_add((binary.capacity() / 8) as u64);
-        Ok(())
     }
 
     fn retain_writable_binary_with_apparent_size(
         &mut self,
         _binary: Arc<WritableBinary>,
         apparent_size_bits: usize,
-    ) -> Result<(), TermError> {
+    ) {
         // Port of erl_bits.c (`build_writable_bitstring`), OTP-29.1.1.
         let fragment = self.fragment();
         fragment.bin_vheap = fragment
             .bin_vheap
             .saturating_add((apparent_size_bits.div_ceil(8) / 8) as u64);
-        Ok(())
     }
 
     fn update_writable_binary_overhead(
@@ -1024,17 +1003,12 @@ impl HeapAlloc for FragmentMut<'_> {
         true
     }
 
-    fn link_external_binary(
-        &mut self,
-        bin_ref: *mut u64,
-        binary: Arc<ExternalBinary>,
-    ) -> Result<(), TermError> {
+    fn link_external_binary(&mut self, bin_ref: *mut u64, binary: Arc<ExternalBinary>) {
         link_external_bin_ref(
             &mut self.fragment().off_heap.off_heap_first,
             bin_ref,
             binary,
         );
-        Ok(())
     }
 
     fn supports_external_binary(&self) -> bool {
@@ -1045,7 +1019,7 @@ impl HeapAlloc for FragmentMut<'_> {
         link_node_thing(&mut self.fragment().off_heap.off_heap_first, thing, node);
     }
 
-    fn link_magic_ref(&mut self, thing: *mut u64, owner: crate::MagicBin) -> Result<(), TermError> {
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: crate::MagicBin) {
         let owners = &mut self.fragment().off_heap;
         link_magic_thing(
             &mut owners.off_heap_first,
@@ -1053,7 +1027,6 @@ impl HeapAlloc for FragmentMut<'_> {
             thing,
             owner,
         );
-        Ok(())
     }
 
     fn supports_magic(&self) -> bool {

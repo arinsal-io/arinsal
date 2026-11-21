@@ -6,14 +6,16 @@
 
 use arinsal_difftest::RefErl;
 use arinsal_term::{Term, global_atoms};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 const CHILD: &str = "ARINSAL_SCHED_PROFILE_HANG_CHILD";
 const MODULE: &str = "sched_profile_hang";
 const RUNS: usize = 10;
 const OPS: i64 = 300_000;
-const LIMIT: Duration = Duration::from_secs(240);
+// Hang detector, not a native-speed SLA. qemu-user finishes ~7 of these
+// 300k monitor/demonitor runs in 240s; erts also uses clock_gettime on arm.
+const LIMIT: Duration = Duration::from_secs(540);
 
 const SOURCE: &str = r#"-module(sched_profile_hang).
 -export([run/1]).
@@ -38,13 +40,26 @@ fn child() -> bool {
         return false;
     };
     let beam = std::fs::read(&beam_path).unwrap();
+    let progress = std::path::Path::new(&beam_path).with_file_name("progress");
+    let t0 = Instant::now();
     for run in 0..RUNS {
+        std::fs::write(
+            &progress,
+            format!("start {run} {}\n", t0.elapsed().as_millis()),
+        )
+        .unwrap();
+        arinsal_vm::Vm::request_eval_plus_s(2);
         let mut vm = crate::common::node();
         vm.load_bytes(&beam).unwrap();
         let arg = Term::small(OPS).unwrap();
         vm.eval_scheduled(MODULE, "run", &[arg], 2)
             .expect("scheduled run");
-        println!("RUN:{run}:done");
+        std::fs::write(
+            &progress,
+            format!("done {run} {}\n", t0.elapsed().as_millis()),
+        )
+        .unwrap();
+        println!("RUN:{run}:done {}", t0.elapsed().as_millis());
     }
     true
 }
@@ -67,6 +82,10 @@ fn monitor_demonitor_loop_with_msacc_does_not_hang() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{MODULE}.beam"));
     std::fs::write(&path, &beam).unwrap();
+    let stdout_path = dir.join("child.stdout");
+    let stderr_path = dir.join("child.stderr");
+    let stdout = std::fs::File::create(&stdout_path).unwrap();
+    let stderr = std::fs::File::create(&stderr_path).unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "monitor_demonitor_loop_with_msacc_does_not_hang",
@@ -74,8 +93,9 @@ fn monitor_demonitor_loop_with_msacc_does_not_hang() {
             "--test-threads=1",
         ])
         .env(CHILD, &path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .env("RUST_BACKTRACE", "1")
+        .stdout(stdout)
+        .stderr(stderr)
         .spawn()
         .unwrap();
     let started = Instant::now();
@@ -91,8 +111,17 @@ fn monitor_demonitor_loop_with_msacc_does_not_hang() {
         }
         std::thread::sleep(Duration::from_millis(100));
     };
+    let progress = std::fs::read_to_string(dir.join("progress")).unwrap_or_default();
+    let child_stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+    let child_stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
     let _ = std::fs::remove_dir_all(&dir);
-    let status =
-        status.expect("the monitor/demonitor loop with msacc did not finish: scheduler hang");
-    assert!(status.success(), "child failed: {status}");
+    let status = status.unwrap_or_else(|| {
+        panic!(
+            "the monitor/demonitor loop with msacc did not finish: scheduler hang\nprogress:{progress}\nstdout:\n{child_stdout}\nstderr:\n{child_stderr}"
+        )
+    });
+    assert!(
+        status.success(),
+        "child failed: {status}\nprogress:{progress}\nstdout:\n{child_stdout}\nstderr:\n{child_stderr}"
+    );
 }

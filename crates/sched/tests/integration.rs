@@ -1,4 +1,4 @@
-use arinsal_sched::{Config, Event, Payload, Pid, Scheduler, Signal, Task};
+use arinsal_sched::{Config, ErtsThrPrgrLaterOp, Event, Payload, Pid, Scheduler, Signal, Task};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -26,10 +26,7 @@ impl Task for Collector {
                 this.output.lock().unwrap().push(entry);
             }
             {
-                ctx.proc_state().fetch_and(
-                    !arinsal_sched::psflg::ACTIVE,
-                    std::sync::atomic::Ordering::Release,
-                );
+                let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
             }
         })
     }
@@ -120,10 +117,7 @@ impl Task for CountTask {
                 this.0.fetch_add(1, Ordering::Relaxed);
             }
             {
-                ctx.proc_state().fetch_and(
-                    !arinsal_sched::psflg::ACTIVE,
-                    std::sync::atomic::Ordering::Release,
-                );
+                let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
             }
         })
     }
@@ -328,10 +322,7 @@ fn hot_mailbox_repeated_waits_do_not_lose_wakes() {
                     this.0.fetch_add(1, Ordering::Relaxed);
                 }
                 {
-                    ctx.proc_state().fetch_and(
-                        !arinsal_sched::psflg::ACTIVE,
-                        std::sync::atomic::Ordering::Release,
-                    );
+                    let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
                 }
             })
         }
@@ -398,10 +389,7 @@ fn worker_blocks_preserve_sender_message_signal_order() {
                         output.lock().unwrap().push((event.from, sequence));
                     }
                     {
-                        ctx.proc_state().fetch_and(
-                            !arinsal_sched::psflg::ACTIVE,
-                            std::sync::atomic::Ordering::Release,
-                        );
+                        let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
                     }
                 }
             })
@@ -458,10 +446,7 @@ fn ping_pong_gives_external_work_a_turn() {
                         }
                     }
                     {
-                        ctx.proc_state().fetch_and(
-                            !arinsal_sched::psflg::ACTIVE,
-                            std::sync::atomic::Ordering::Release,
-                        );
+                        let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
                     }
                 }
                 Work::Observe(count, observed) => {
@@ -663,6 +648,13 @@ struct LaterWaiter {
     release: Arc<AtomicBool>,
     scheduled: Arc<AtomicBool>,
     fired: Arc<AtomicBool>,
+    later_op: ErtsThrPrgrLaterOp,
+}
+
+fn later_waiter_fired(data: *mut ()) {
+    // SAFETY: `data` is `Arc::into_raw` of the waiter's `fired` flag.
+    let fired = unsafe { Arc::from_raw(data as *const AtomicBool) };
+    fired.store(true, Ordering::Release);
 }
 
 impl Task for LaterWaiter {
@@ -692,8 +684,12 @@ impl Task for LaterWaiter {
             if !this.spinning.load(Ordering::Acquire) {
                 return;
             }
-            let fired = Arc::clone(&this.fired);
-            ctx.thread_progress_later(move || fired.store(true, Ordering::Release));
+            let fired = Arc::into_raw(Arc::clone(&this.fired)) as *mut ();
+            ctx.erts_schedule_thr_prgr_later_op(
+                later_waiter_fired,
+                fired,
+                this.later_op.as_list_node(),
+            );
             this.scheduled.store(true, Ordering::Release);
             {
                 ctx.erts_proc_exit_free(this);
@@ -722,6 +718,7 @@ fn thread_progress_later_waits_for_running_slices_without_blocking() {
                 release: Arc::clone(&release),
                 scheduled: Arc::clone(&scheduled),
                 fired: Arc::clone(&fired),
+                later_op: ErtsThrPrgrLaterOp::new(),
             })
             .unwrap();
     }
@@ -755,10 +752,7 @@ impl Task for Idle {
         esdp.with_ctx(c_p, |_, ctx| {
             while ctx.receive().is_some() {}
             {
-                ctx.proc_state().fetch_and(
-                    !arinsal_sched::psflg::ACTIVE,
-                    std::sync::atomic::Ordering::Release,
-                );
+                let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
             }
         })
     }
@@ -778,7 +772,7 @@ fn progress_slot_releases_after_thread_progress() {
     let slot = ProgressSlot::<u32>::new();
     assert!(slot.with(&progress, false, |value| *value).is_none());
     let value = Arc::new(7u32);
-    slot.store(Arc::clone(&value), Some(&progress));
+    slot.store(Arc::clone(&value));
     assert_eq!(slot.with(&progress, false, |value| *value), Some(7));
     assert_eq!(*slot.load_arc(&progress, false).unwrap(), 7);
     assert!(
@@ -786,7 +780,7 @@ fn progress_slot_releases_after_thread_progress() {
             .is_none()
     );
     assert_eq!(Arc::strong_count(&value), 2);
-    let taken = slot.take(&progress).unwrap();
+    let taken = slot.take(&sched).unwrap();
     assert_eq!(*taken, 7);
     assert!(!slot.is_occupied());
     assert!(slot.with(&progress, false, |value| *value).is_none());
@@ -833,10 +827,7 @@ fn wait_timer_keeps_its_position_across_reentry() {
                 }
                 {
                     arinsal_sched::erts_set_proc_timer_term(ctx.esdp(), pos);
-                    ctx.proc_state().fetch_and(
-                        !arinsal_sched::psflg::ACTIVE,
-                        std::sync::atomic::Ordering::Release,
-                    );
+                    let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
                 }
             })
         }

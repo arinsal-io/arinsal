@@ -109,7 +109,7 @@ fn send_signal(
         .ok_or(arinsal_sched::Error::NoProcess)?
         .scheduler()
         .map_err(|_| arinsal_sched::Error::NoProcess)?;
-    scheduler.signal_ordered_from(me, to, signal, process.on_managed)
+    scheduler.signal_ordered(me, to, signal)
 }
 
 /// What `erts_internal_suspend_process_2` decided (erl_process.c:9013-9163).
@@ -413,7 +413,7 @@ pub(crate) fn suspend_self(process: &mut Process) {
     let cold = process.cold_mut();
     cold.suspend_count += 1;
     let first = cold.suspend_count == 1;
-    if let (Some(runtime), Some(pid), true) = (process.runtime, process.self_pid, first) {
+    if let (Some(runtime), Some(pid), true) = (process.runtime, process.self_pid(), first) {
         mirror_bit(runtime, pid, true);
     }
 }
@@ -433,7 +433,8 @@ pub(crate) fn resume_self(process: &mut Process) {
         return;
     }
     cold.suspend_count -= 1;
-    if let (0, Some(runtime), Some(pid)) = (cold.suspend_count, process.runtime, process.self_pid) {
+    if let (0, Some(runtime), Some(pid)) = (cold.suspend_count, process.runtime, process.self_pid())
+    {
         mirror_bit(runtime, pid, false);
     }
 }

@@ -177,3 +177,35 @@ fn port_start_results_match_otp() {
         .expect("run port start differential");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
+
+/// `erl_child_setup` with no `max_files` argument ABORTs, as OTP's helper does.
+#[test]
+fn erl_child_setup_rejects_missing_max_files_like_otp() {
+    let Some(root) = arinsal_difftest::reference::otp_root() else {
+        eprintln!("erl unavailable; skipping erl_child_setup argv test");
+        return;
+    };
+    let reference = root.join("erts-17.1/bin/erl_child_setup");
+    if !reference.is_file() {
+        eprintln!("OTP erl_child_setup missing; skipping argv test");
+        return;
+    }
+    let ours = std::path::Path::new(env!("CARGO_BIN_EXE_erl_child_setup"));
+    let expected = std::process::Command::new(&reference)
+        .output()
+        .expect("OTP helper");
+    let actual = std::process::Command::new(ours)
+        .output()
+        .expect("arinsal erl_child_setup");
+    similar_asserts::assert_eq!(expected.status.code(), actual.status.code());
+    let expected_err = String::from_utf8_lossy(&expected.stderr);
+    let actual_err = String::from_utf8_lossy(&actual.stderr);
+    assert!(
+        expected_err.contains("Invalid arguments to child_setup"),
+        "{expected_err}"
+    );
+    assert!(
+        actual_err.contains("Invalid arguments to child_setup"),
+        "{actual_err}"
+    );
+}

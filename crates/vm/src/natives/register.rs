@@ -47,7 +47,7 @@ fn erts_register_name(
     if let Some(pid) = Pid::from_term(id) {
         let scheduler = rt.scheduler().map_err(|_| none)?;
         let mut table = rt.reg.write();
-        if !scheduler.lookup_from(pid, process.on_managed) {
+        if !scheduler.lookup(pid) {
             return Err(crate::atom_cache::put("notalive").as_atom().ok_or(none)?);
         }
         if scheduler.registered_atom_index(pid).is_some() {

@@ -1686,7 +1686,7 @@ impl<H: HeapAlloc> HeapAlloc for ObjectAndListHeap<'_, H> {
         writable: bool,
         overhead_words: u64,
         owner: Option<arinsal_term::OwnedBinaryRef>,
-    ) -> Result<(), TermError> {
+    ) {
         self.dst
             .link_bin_ref(bin_ref, writable, overhead_words, owner)
     }
@@ -1695,11 +1695,34 @@ impl<H: HeapAlloc> HeapAlloc for ObjectAndListHeap<'_, H> {
         self.dst.add_bin_vheap(words);
     }
 
-    fn link_external_binary(
+    fn retain_writable_binary(&mut self, binary: Arc<arinsal_term::WritableBinary>) {
+        self.dst.retain_writable_binary(binary)
+    }
+
+    fn retain_writable_binary_with_apparent_size(
         &mut self,
-        bin_ref: *mut u64,
-        binary: Arc<ExternalBinary>,
-    ) -> Result<(), TermError> {
+        binary: Arc<arinsal_term::WritableBinary>,
+        apparent_size_bits: usize,
+    ) {
+        self.dst
+            .retain_writable_binary_with_apparent_size(binary, apparent_size_bits)
+    }
+
+    fn supports_writable_binary(&self) -> bool {
+        self.dst.supports_writable_binary()
+    }
+
+    fn update_writable_binary_overhead(
+        &mut self,
+        source: Term,
+        old_size_bits: usize,
+        new_size_bits: usize,
+    ) {
+        self.dst
+            .update_writable_binary_overhead(source, old_size_bits, new_size_bits)
+    }
+
+    fn link_external_binary(&mut self, bin_ref: *mut u64, binary: Arc<ExternalBinary>) {
         self.dst.link_external_binary(bin_ref, binary)
     }
 
@@ -1707,7 +1730,7 @@ impl<H: HeapAlloc> HeapAlloc for ObjectAndListHeap<'_, H> {
         self.dst.supports_external_binary()
     }
 
-    fn link_magic_ref(&mut self, thing: *mut u64, owner: MagicBin) -> Result<(), TermError> {
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: MagicBin) {
         self.dst.link_magic_ref(thing, owner)
     }
 

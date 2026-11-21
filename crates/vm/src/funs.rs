@@ -25,7 +25,7 @@ pub(super) fn call_error_reason(
     args: Term,
 ) -> Result<Term, VmError> {
     let is_fun = fun.classify() == TermKind::Fun;
-    p.ensure_objv(6 + arity * 2, &mut reg[..arity + 1])?;
+    p.ensure_objv(6 + arity * 2, &mut reg[..arity + 1]);
     let fun = reg[arity];
     let mut builder = TermBuilder::new(&mut p.heap);
     let kind = global_atoms()
@@ -180,7 +180,7 @@ impl Vm {
                 .ok_or_else(|| VmError::Unsupported("lambda module atom".into()))?;
             // Port of erts/emulator/beam/beam_bif_load.c:1977
             // (erts_suspend_process_on_pending_purge_lambda), OTP-29.1.1.
-            if let Some(pid) = p.self_pid
+            if let Some(pid) = p.self_pid()
                 && crate::natives::code::erts_purge_state().suspend_on_pending_lambda(&name, pid)
             {
                 crate::suspend::suspend_self(p);
@@ -210,7 +210,7 @@ impl Vm {
         p.ensure_objv(
             arity.saturating_mul(2).saturating_add(4),
             self.reg_prefix(arity + 1)?,
-        )?;
+        );
         let fun = self.x_regs()?[arity];
         let args: Vec<Term> = self.x_regs()?[..arity].to_vec();
         let list = TermBuilder::new(&mut p.heap)
@@ -620,7 +620,7 @@ impl Vm {
                 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:730-776
                 // (call_bif_shared, ERTS_IS_GC_AFTER_BIF_DESIRED), OTP-29.1.1: the export
                 // trampoline an apply reaches collects after the BIF as a static call does.
-                self.x_regs()?[0] = p.gc_after_bif(result?)?;
+                self.x_regs()?[0] = p.gc_after_bif(result?);
                 return Ok(Self::return_value_after_dirty(p, self.x_regs()?[0]));
             }
         }
@@ -831,7 +831,7 @@ impl Vm {
 
     /// `fun_info/1` is the OTP-level list wrapper around the keyed `fun_info/2` BIF.
     pub(super) fn fun_info(&self, p: &mut Process) -> Result<Term, VmError> {
-        p.ensure_objv(1024, self.reg_prefix(1)?)?;
+        p.ensure_objv(1024, self.reg_prefix(1)?);
         let fun = self.x_regs()?[0];
         // SAFETY: X0 retains the fun throughout construction; no collection follows.
         let view = unsafe { fun.fun_ref() }.ok_or_else(|| self.exception(p, "badarg"))?;
@@ -929,7 +929,7 @@ impl Vm {
 
 /// `{badfun, Fun}` for a fun whose code is no longer loaded.
 fn badfun_reason(p: &mut Process, reg: &mut [Term], arity: usize) -> Result<Term, VmError> {
-    p.ensure_objv(3, &mut reg[..arity + 1])?;
+    p.ensure_objv(3, &mut reg[..arity + 1]);
     let fun = reg[arity];
     let kind = global_atoms()
         .intern("badfun")

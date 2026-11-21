@@ -530,7 +530,7 @@ mod tests {
         };
         assert!(reference.is_magic_ref());
         assert_eq!(dropped.load(Ordering::SeqCst), 0);
-        heap.collect(&mut [], &mut [], 0).unwrap();
+        heap.collect(&mut [], &mut [], 0);
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 }

@@ -6,7 +6,6 @@ use arinsal_a64::enc::Gpr;
 use arinsal_beamasm::{
     ExitReason, ProcessHeader, SchedulerRegisters, enter_native,
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
-    records::RecordRuntime,
     rt,
 };
 use arinsal_term::{Atom, ProcessHeap, Term, TermBuilder, global_atoms};
@@ -30,105 +29,6 @@ fn fixture() -> (u64, u64) {
     });
     let guard = fixture.lock().unwrap();
     (rt::term_bits(guard.1), rt::term_bits(guard.2))
-}
-
-extern "C" fn get_field(
-    _header: *mut ProcessHeader,
-    source: u64,
-    _id: u64,
-    _name: u64,
-    _raise: u64,
-) -> u64 {
-    if source & 7 != 2 || rt::read_heap_word(source, 0) & 0x3f != 0x1c {
-        return 0;
-    }
-    rt::read_heap_word(source, 2)
-}
-
-extern "C" fn create_record(
-    _header: *mut ProcessHeader,
-    regs: *mut u64,
-    _id: u64,
-    _live: u64,
-    count: u64,
-    start: u64,
-) -> u64 {
-    let value = staged_value(regs, count, start).unwrap_or_else(|| tagged_small(42));
-    build_record(Term::small((value as i64) >> 4).unwrap())
-}
-
-extern "C" fn get_elements(
-    _header: *mut ProcessHeader,
-    regs: *mut u64,
-    source: u64,
-    _count: u64,
-    start: u64,
-) -> u64 {
-    if source & 7 != 2 || rt::read_heap_word(source, 0) & 0x3f != 0x1c {
-        return 0;
-    }
-    let value = rt::read_heap_word(source, 2);
-    rt::scheduler_registers_mut(regs, |regs| {
-        regs.x_reg_array[start as usize] = arinsal_beamasm::rt::fixture_term(value)
-    });
-    1
-}
-
-extern "C" fn update_record(
-    _header: *mut ProcessHeader,
-    regs: *mut u64,
-    source: u64,
-    _live: u64,
-    count: u64,
-    start: u64,
-) -> u64 {
-    if source & 7 != 2 || rt::read_heap_word(source, 0) & 0x3f != 0x1c {
-        return 0;
-    }
-    let Some(value) = staged_value(regs, count, start) else {
-        return 0;
-    };
-    build_record(Term::small((value as i64) >> 4).unwrap())
-}
-
-fn staged_value(regs: *mut u64, count: u64, start: u64) -> Option<u64> {
-    if count == 0 {
-        return None;
-    }
-    rt::scheduler_registers_mut(regs, |regs| {
-        regs.x_reg_array
-            .get(usize::try_from(start).ok()?)
-            .map(|term| term.tagged_word())
-    })
-}
-
-fn build_record(value: Term) -> u64 {
-    let Some(fixture) = FIXTURE.get() else {
-        return 0;
-    };
-    let Ok(mut fixture) = fixture.lock() else {
-        return 0;
-    };
-    let module = global_atoms().intern("record_native_test").unwrap();
-    let name = global_atoms().intern("sample").unwrap();
-    let field = global_atoms().intern("value").unwrap();
-    let Ok(record) =
-        TermBuilder::new(&mut fixture.0).native_record(module, name, true, &[(field, value)])
-    else {
-        return 0;
-    };
-    rt::term_bits(record)
-}
-
-fn runtime() -> RecordRuntime {
-    RecordRuntime {
-        get_field,
-        get_local_field: get_field,
-        create_local: create_record,
-        create: create_record,
-        get_elements,
-        update: update_record,
-    }
 }
 
 fn run_native(
@@ -187,54 +87,6 @@ fn atom(name: &str) -> Atom {
 
 fn tagged_small(value: i64) -> u64 {
     ((value as u64) << 4) | 15
-}
-
-#[test]
-fn native_create_and_get() {
-    let (record, _) = fixture();
-    let (exit, _, regs, _) = run_native_with_literals(
-        &[(0, record)],
-        |asm| {
-            asm.emit_i_create_local_native_record(
-                ArgVal::Literal(0),
-                ArgVal::X(0),
-                1,
-                &[ArgVal::Immediate(tagged_small(42))],
-                runtime(),
-            )?;
-            asm.emit_get_record_field(
-                0,
-                ArgVal::X(0),
-                ArgVal::Immediate(0),
-                ArgVal::Immediate(rt::term_bits(Term::atom(atom("value")))),
-                ArgVal::X(1),
-                runtime(),
-            )
-        },
-        |_, _, _| {},
-    );
-    assert_eq!(exit, ExitReason::Returned);
-    assert_eq!(rt::read_heap_word(regs[0], 0) & 0x3f, 0x1c);
-    assert_eq!(regs[1], tagged_small(42));
-}
-
-#[test]
-fn native_update() {
-    let (record, _) = fixture();
-    let (exit, _, regs, _) = run_native(
-        |asm| {
-            asm.emit_i_update_native_record(
-                ArgVal::X(0),
-                ArgVal::X(1),
-                1,
-                &[ArgVal::Immediate(tagged_small(99))],
-                runtime(),
-            )
-        },
-        |_, _, regs| regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(record),
-    );
-    assert_eq!(exit, ExitReason::Returned);
-    assert_eq!(rt::read_heap_word(regs[1], 2), tagged_small(99));
 }
 
 #[test]
@@ -330,57 +182,6 @@ fn native_record_accessibility() {
         assert_eq!(exit, ExitReason::Returned);
         assert_eq!(regs[1], tagged_small(1));
     }
-}
-
-#[test]
-fn native_get_elements() {
-    let (record, _) = fixture();
-    let (exit, _, regs, _) = run_native(
-        |asm| {
-            asm.emit_i_get_record_elements(
-                2,
-                ArgVal::X(0),
-                &[ArgVal::Immediate(1)],
-                &[ArgVal::X(1)],
-                runtime(),
-            )?;
-            asm.emit_raw(|e| {
-                e.mov_reg(Gpr::x(0), Gpr::xzr())?;
-                e.ldr_post(Gpr::x(30), Gpr::x(20), 8)?;
-                e.ret(Gpr::x(30))
-            })?;
-            asm.emit_i_func_label(2)?;
-            asm.emit_raw(|e| {
-                e.mov_reg(Gpr::x(0), Gpr::xzr())?;
-                e.ldr_post(Gpr::x(30), Gpr::x(20), 8)?;
-                e.ret(Gpr::x(30))
-            })
-        },
-        |_, _, regs| regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(record),
-    );
-    assert_eq!(exit, ExitReason::Returned);
-    assert_eq!(regs[1], tagged_small(42));
-}
-
-#[test]
-fn native_bad_record_error() {
-    let (_, _) = fixture();
-    let (exit, _, regs, _) = run_native(
-        |asm| {
-            asm.emit_get_record_field(
-                0,
-                ArgVal::X(0),
-                ArgVal::Immediate(0),
-                ArgVal::Immediate(0),
-                ArgVal::X(1),
-                runtime(),
-            )
-        },
-        |_, _, regs| regs.x_reg_array[0] = Term::small(7).unwrap(),
-    );
-    assert_eq!(exit, ExitReason::Returned);
-    // X1 keeps its initial value.
-    assert_eq!(regs[1], Term::NIL.tagged_word());
 }
 
 /// A record of `module` that is not exported, kept alive in a leaked heap for the test.

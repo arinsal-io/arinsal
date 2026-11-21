@@ -24,11 +24,6 @@ const TAG_HEADER_POS_BIG: u16 = 0x08;
 const NEG_BIG_BIT: u8 = 2;
 
 impl BeamModuleAssembler {
-    /// Whether the process-wide `arith_compare_shared` fragment is installed.
-    pub(crate) fn has_arith_compare_shared(&self) -> bool {
-        self.arith_compare_shared != 0
-    }
-
     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp (emit_is_boxed), OTP-29.1.1:
     // branches when the value is not boxed.
     fn emit_is_boxed(&mut self, label: Label, reg: Gpr) -> Result<(), ModuleError> {
@@ -93,6 +88,85 @@ impl BeamModuleAssembler {
 
     fn cons_or_boxed(arg: &TypedArg) -> bool {
         arg.always_one_of(type_id::CONS | type_id::ALWAYS_BOXED)
+    }
+
+    /// Emits `min/2` (`cc` = gt) or `max/2` (`cc` = lt): small operands are compared
+    /// inline, the rest through `arith_compare_shared`; the result is selected by the flags.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:999-1065 (emit_bif_min_max),
+    // OTP-29.1.1.
+    pub(crate) fn emit_bif_min_max(
+        &mut self,
+        cc: Cond,
+        lhs: TypedArg,
+        rhs: TypedArg,
+        dst: ArgVal,
+    ) -> Result<(), ModuleError> {
+        let (l, r) = self.load_two_sources(lhs.val, ARG1, rhs.val, ARG2)?;
+        let out = self.guard_destination(dst)?;
+        let both_small = lhs.always_small() && rhs.always_small();
+        let need_generic = !both_small;
+        let generic = self.code.new_label();
+        let next = self.code.new_label();
+        let int_or_boxed = type_id::INTEGER | type_id::ALWAYS_BOXED;
+        if both_small {
+        } else if rhs.always_small() && lhs.always_one_of(int_or_boxed) {
+            self.emit_is_not_boxed(generic, l)?;
+        } else if lhs.always_small() && rhs.always_one_of(int_or_boxed) {
+            self.emit_is_not_boxed(generic, r)?;
+        } else if lhs.always_one_of(int_or_boxed) && rhs.always_one_of(int_or_boxed) {
+            self.code.emit(|e| {
+                e.and_reg(
+                    TMP1,
+                    l,
+                    Shifted {
+                        reg: r,
+                        shift: Shift::Lsl,
+                        amount: 0,
+                    },
+                )
+            })?;
+            self.emit_is_not_boxed(generic, TMP1)?;
+        } else {
+            if rhs.is_small() {
+                self.code.emit(|e| e.and_imm(TMP1, l, TAG_IMMED1_MASK))?;
+            } else if lhs.is_small() {
+                self.code.emit(|e| e.and_imm(TMP1, r, TAG_IMMED1_MASK))?;
+            } else {
+                // Avoid the expensive generic comparison for equal terms.
+                self.cmp_regs(l, r)?;
+                self.code.b_cond(Cond::Eq, next)?;
+                self.code.emit(|e| {
+                    e.and_reg(
+                        TMP1,
+                        l,
+                        Shifted {
+                            reg: r,
+                            shift: Shift::Lsl,
+                            amount: 0,
+                        },
+                    )?;
+                    e.and_imm(TMP1, TMP1, TAG_IMMED1_MASK)
+                })?;
+            }
+            self.code
+                .emit(|e| e.cmp_imm(TMP1, TAG_IMMED1_SMALL, false))?;
+            self.code.b_cond(Cond::Ne, generic)?;
+        }
+        // Both arguments are smalls.
+        self.cmp_regs(l, r)?;
+        if need_generic {
+            self.code.b(next)?;
+        }
+        self.code.bind(generic)?;
+        let (l, r) = if need_generic {
+            self.call_arith_compare(l, r)?;
+            self.load_two_sources(lhs.val, ARG1, rhs.val, ARG2)?
+        } else {
+            (l, r)
+        };
+        self.code.bind(next)?;
+        self.code.emit(|e| e.csel(out, r, l, cc))?;
+        self.store_guard_result(dst, out)
     }
 
     /// Emits `is_eq` (`==`).
@@ -474,19 +548,14 @@ impl BeamModuleAssembler {
             e.mov_reg(Gpr::x(25), ARG1)?;
             e.mov_reg(Gpr::x(26), ARG2)
         })?;
-        self.set_badarg_mfa(0)?;
+        let mfa = self.guard_mfa(0)?;
         self.code.emit(|e| {
             e.mov_const(TMP2, crate::exc::EXC_BADARG)?;
             e.str_uoff(TMP2, Gpr::x(21), 40)?;
             e.mov_const(TMP2, badarg)?;
-            e.str_uoff(TMP2, Gpr::x(21), 48)
-        })?;
-        self.code.emit(|e| {
-            e.ldr_uoff(
-                Gpr::x(3),
-                Gpr::x(21),
-                std::mem::offset_of!(crate::ProcessHeader, current) as u32,
-            )
+            e.str_uoff(TMP2, Gpr::x(21), 48)?;
+            // `emit_raise_exception(&element_mfa)`: the MFA travels in ARG4.
+            e.mov_const(Gpr::x(3), mfa as u64)
         })?;
         self.branch_error_from_lr_preserving_bif()
     }

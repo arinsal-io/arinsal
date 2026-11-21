@@ -94,7 +94,6 @@ impl BeamModuleAssembler {
     pub fn emit_catch_end(
         &mut self,
         y: ArgVal,
-        gc: crate::construct::GcHook,
         add_stacktrace: AddStacktraceHook,
     ) -> Result<(), ModuleError> {
         let done = self.code.new_label();
@@ -128,7 +127,7 @@ impl BeamModuleAssembler {
         self.code.emit(|e| e.mov_reg(XREGS[0], Gpr::x(0)))?;
         self.code.bind(have_reason)?;
         // The reason or {Reason, Stacktrace} stays live in X0 across the possible GC.
-        self.emit_test_heap(3, 1, gc)?;
+        self.emit_test_heap(3, 1)?;
         let exit_atom = atom_word("EXIT");
         self.code.emit(|e| {
             e.mov_reg(TMP2, XREGS[0])?;

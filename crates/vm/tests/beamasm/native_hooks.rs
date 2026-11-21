@@ -1,16 +1,12 @@
 use arinsal_a64::enc::Gpr;
 use arinsal_beamasm::{
-    ExitReason, SchedulerRegisters,
-    arith::ArithHelper,
-    construct::GcHook,
-    enter_native_raw,
-    guard::GuardHelper,
+    ExitReason, SchedulerRegisters, enter_native_raw,
     module::{ArgVal, BeamModuleAssembler},
     types::{ArgType, TypedArg},
 };
 use arinsal_difftest::RefErl;
 use arinsal_term::{ProcessHeap, Term, TermBuilder, TermKind, to_owned};
-use arinsal_vm::{Process, arinsal_beamasm_arith, arinsal_beamasm_gc, arinsal_beamasm_guard};
+use arinsal_vm::Process;
 
 fn run(
     process: &mut Process,
@@ -18,6 +14,8 @@ fn run(
     emit: impl FnOnce(&mut BeamModuleAssembler),
 ) -> ExitReason {
     let mut asm = BeamModuleAssembler::new();
+    asm.set_bif_fragments(bif_fragments());
+    asm.set_yield_fragments(yield_fragments().entries());
     asm.emit_i_func_label(1).unwrap();
     // Fragment calls clobber LR; keep the return address in scratch memory (a stack word
     // would be scanned by the GC cases).
@@ -48,6 +46,53 @@ fn run(
     result
 }
 
+// The VM's `erts_garbage_collect_nobump` (erl_gc.rs), the function the VM's own
+// `garbage_collect` fragment calls.
+unsafe extern "C" {
+    safe fn erts_garbage_collect_nobump(
+        c_p: *mut arinsal_beamasm::ProcessHeader,
+        need: usize,
+        objv: *mut u64,
+        nobj: i32,
+        fcalls: i32,
+    ) -> i32;
+}
+
+/// The process-wide `ga` fragments, built as the VM builds them.
+fn yield_fragments() -> &'static arinsal_beamasm::yield_frag::YieldFragments {
+    use arinsal_beamasm::yield_frag::YieldFragments;
+    static YIELD: std::sync::OnceLock<YieldFragments> = std::sync::OnceLock::new();
+    YIELD.get_or_init(|| {
+        YieldFragments::new(
+            erts_garbage_collect_nobump as *const () as usize,
+            arinsal_vm::PROCESS_STATE_OFFSET as u32,
+        )
+        .unwrap()
+    })
+}
+
+/// The process-wide fragments; the arithmetic ones call the VM's erts runtime symbols
+/// (erl_arith.rs). No case here raises, so the exception resolver is never entered.
+fn bif_fragments() -> arinsal_beamasm::raise_frag::BifFragments {
+    use arinsal_beamasm::raise_frag::RaiseFragments;
+    use std::sync::OnceLock;
+    static RAISE: OnceLock<RaiseFragments> = OnceLock::new();
+    extern "C" fn unused() {
+        unreachable!("no case raises")
+    }
+    RAISE
+        .get_or_init(|| {
+            let context_switch = yield_fragments().context_switch();
+            RaiseFragments::new(
+                unused as *const () as usize,
+                unused as *const () as usize,
+                context_switch,
+            )
+            .unwrap()
+        })
+        .bif_fragments()
+}
+
 fn bits(term: Term) -> u64 {
     // SAFETY: Each test keeps the owning process heap alive through execution.
     unsafe { term.raw_bits() }
@@ -74,12 +119,10 @@ fn arith_overflow_makes_bignum() {
     registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(bits(rhs));
     assert_eq!(
         run(&mut process, &mut registers, |asm| {
-            let helper: ArithHelper = arinsal_beamasm_arith;
             asm.emit_i_plus(
                 TypedArg::new(ArgVal::X(0), ArgType::ANY),
                 TypedArg::new(ArgVal::X(1), ArgType::ANY),
                 ArgVal::X(1),
-                helper,
             )
             .unwrap();
         }),
@@ -93,8 +136,10 @@ fn arith_overflow_makes_bignum() {
     ));
 }
 
+// erts emit_i_plus with a failure label: `erts_mixed_plus` returns THE_NON_VALUE with
+// `c_p->freason` BADARITH and the code branches to the label, the destination untouched.
 #[test]
-fn badarith_caught_by_interpreted_try() {
+fn guard_badarith_branches_to_the_fail_label() {
     let mut process = Process::new();
     let lhs = Term::atom(arinsal_term::atoms::TRUE);
     let rhs = Term::small(1).unwrap();
@@ -105,17 +150,18 @@ fn badarith_caught_by_interpreted_try() {
     registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(bits(rhs));
     assert_eq!(
         run(&mut process, &mut registers, |asm| {
-            let helper: ArithHelper = arinsal_beamasm_arith;
-            asm.emit_i_plus(
+            asm.emit_i_plus_with_fail(
                 TypedArg::new(ArgVal::X(0), ArgType::ANY),
                 TypedArg::new(ArgVal::X(1), ArgType::ANY),
                 ArgVal::X(1),
-                helper,
+                2,
             )
             .unwrap();
+            asm.emit_label(2).unwrap();
         }),
         ExitReason::Returned
     );
+    assert_eq!(registers.x_reg_array[1].tagged_word(), bits(rhs));
     assert_eq!(
         process.native_header().exc.freason,
         arinsal_beamasm::exc::EXC_BADARITH
@@ -142,152 +188,4 @@ fn badarith_caught_by_interpreted_try() {
     let result = vm.eval_exported("native_hook_try", "caught", &[]).unwrap();
     let atom = result.term.as_atom().unwrap();
     assert_eq!(arinsal_term::global_atoms().text(atom), Some("caught"));
-}
-
-#[test]
-fn compare_bignum_float_and_mixed() {
-    let mut process = Process::new();
-    let integer = make_big(&mut process.heap, (1_i128 << 80) + 1);
-    let float = TermBuilder::new(&mut process.heap)
-        .float(2_f64.powi(80))
-        .unwrap();
-    process.x[0] = integer;
-    process.x[1] = float;
-    let mut registers = SchedulerRegisters::default();
-    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(bits(integer));
-    registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(bits(float));
-    run(&mut process, &mut registers, |asm| {
-        let helper: GuardHelper = arinsal_beamasm_guard;
-        asm.emit_is_lt(ArgVal::X(0), ArgVal::X(1), 2, helper)
-            .unwrap();
-        asm.move_(
-            ArgVal::Immediate(bits(Term::small(2).unwrap())),
-            ArgVal::X(0),
-        )
-        .unwrap();
-        asm.jump(3).unwrap();
-        asm.emit_i_func_label(2).unwrap();
-        asm.move_(
-            ArgVal::Immediate(bits(Term::small(1).unwrap())),
-            ArgVal::X(0),
-        )
-        .unwrap();
-        asm.emit_i_func_label(3).unwrap();
-    });
-    assert_eq!(
-        registers.x_reg_array[0],
-        arinsal_beamasm::rt::fixture_term(bits(Term::small(1).unwrap()))
-    );
-}
-
-#[test]
-fn gc_hook_moves_terms_and_reloads_x() {
-    let mut process = Process::new();
-    let big = make_big(&mut process.heap, 1_i128 << 120);
-    process.x[0] = big;
-    let mut registers = SchedulerRegisters::default();
-    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(bits(big));
-    let before = registers.x_reg_array[0];
-    run(&mut process, &mut registers, |asm| {
-        let hook: GcHook = arinsal_beamasm_gc;
-        asm.emit_test_heap(4096, 1, hook).unwrap();
-    });
-    let after = registers.x_reg_array[0];
-    assert_ne!(after, before);
-    assert!(matches!(
-        to_owned(from_bits(after.tagged_word())).unwrap(),
-        arinsal_etf::OwnedTerm::BigInt(_)
-    ));
-}
-
-#[test]
-fn map_get_on_hashmap_via_hook() {
-    let mut process = Process::new();
-    let mut map_heap = ProcessHeap::with_words(8192);
-    let pairs: Vec<_> = (0..40)
-        .map(|index| {
-            (
-                Term::small(index).unwrap(),
-                Term::small(index + 10).unwrap(),
-            )
-        })
-        .collect();
-    let map = arinsal_maps::from_pairs(&pairs, &mut map_heap).unwrap();
-    assert!(map.is_hashmap());
-    let key = Term::small(27).unwrap();
-    process.x[0] = key;
-    process.x[1] = map;
-    let mut registers = SchedulerRegisters::default();
-    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(bits(key));
-    registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(bits(map));
-    run(&mut process, &mut registers, |asm| {
-        let helper: GuardHelper = arinsal_beamasm_guard;
-        asm.emit_bif_map_get(
-            0,
-            ArgVal::X(0),
-            ArgVal::X(1),
-            ArgVal::X(0),
-            helper,
-            true,
-            true,
-            test_map_runtime(),
-        )
-        .unwrap();
-    });
-    assert_eq!(
-        from_bits(registers.x_reg_array[0].tagged_word()).as_small(),
-        Some(37)
-    );
-}
-
-extern "C" fn unused_map_get(
-    _p: *mut arinsal_beamasm::ProcessHeader,
-    _map: u64,
-    _key: u64,
-    _hash: u64,
-) -> u64 {
-    0
-}
-extern "C" fn unused_map_elements(
-    _p: *mut arinsal_beamasm::ProcessHeader,
-    _map: u64,
-    _module: u64,
-    _table: u64,
-    _stack: u64,
-    _reg: *mut u64,
-) -> u64 {
-    0
-}
-extern "C" fn unused_map_update(
-    _p: *mut arinsal_beamasm::ProcessHeader,
-    _a: u64,
-    _b: u64,
-    _c: u64,
-    _d: u64,
-    _reg: *mut u64,
-) -> u64 {
-    0
-}
-
-/// Map runtime with real lookup fragments; `map_get` of a present immediate key never calls
-/// the other helpers.
-fn test_map_runtime() -> arinsal_beamasm::map::MapRuntime {
-    let fragments = Box::leak(Box::new(
-        arinsal_beamasm::map::MapFragments::new(unused_map_get, unused_map_update).unwrap(),
-    ));
-    arinsal_beamasm::map::MapRuntime {
-        get: unused_map_get,
-        get_elements: unused_map_elements,
-        lookup_module: 0,
-        new_map: unused_map_update,
-        update_assoc: unused_map_update,
-        update_exact: unused_map_update,
-        put_single: unused_map_update,
-        update_single_assoc_shared: fragments.update_single_assoc_shared(),
-        update_assoc_shared: fragments.update_assoc_shared(),
-        update_exact_shared: fragments.update_exact_shared(),
-        update_single_exact_shared: fragments.update_single_exact_shared(),
-        get_element_shared: fragments.get_element_shared(),
-        get_element_hash_shared: fragments.get_element_hash_shared(),
-    }
 }

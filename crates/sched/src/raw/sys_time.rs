@@ -215,6 +215,26 @@ pub(crate) fn init() {
     }
 }
 
+/// Read the configured `erts_sys_perf_counter` callback.
+// Port of erts/emulator/sys/unix/erl_unix_sys.h (erts_sys_perf_counter), OTP-29.1.1.
+pub(crate) fn perf_counter() -> u64 {
+    // SAFETY: the table is initialized before worker threads start and remains immutable after.
+    unsafe {
+        let data = core::ptr::addr_of!(erts_sys_time_data__).cast::<ErtsSysTimeReadOnlyData>();
+        ((*data).perf_counter)() as u64
+    }
+}
+
+/// Return the configured `erts_sys_perf_counter_unit` value.
+// Port of erts/emulator/sys/unix/erl_unix_sys.h (erts_sys_perf_counter_unit), OTP-29.1.1.
+pub(crate) fn perf_counter_unit() -> u64 {
+    // SAFETY: the table is initialized before worker threads start and remains immutable after.
+    unsafe {
+        let data = core::ptr::addr_of!(erts_sys_time_data__).cast::<ErtsSysTimeReadOnlyData>();
+        (*data).perf_counter_unit as u64
+    }
+}
+
 /// Cache-line-aligned callbacks read by x86 BeamAsm's `i_perf_counter` fragment.
 #[unsafe(no_mangle)]
 pub static mut erts_sys_time_data__: CacheAlignedSysTimeData = CacheAlignedSysTimeData {

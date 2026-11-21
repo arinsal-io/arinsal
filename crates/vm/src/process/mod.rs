@@ -38,6 +38,7 @@ mod runtime;
 mod schedule;
 mod send;
 mod sig_queue;
+pub(crate) use sig_queue::FlushSignals;
 mod spawn_eval;
 pub(crate) use self::spawn_eval::eval_carrier_args;
 

@@ -8,13 +8,15 @@ use arinsal_beamasm::ProcessHeader;
 use arinsal_term::{Term, exc};
 
 /// Applies an arithmetic operation to a process heap and records its erts failure words.
+// erl_arith.c allocates its results with HAlloc: the young heap, or a heap fragment
+// (erts_heap_alloc, utils.c) when it is full, so a result never fails for lack of heap.
 fn arithmetic(
     process: &mut Process,
     operation: &str,
     args: &[Term],
-    f: impl FnOnce(&mut arinsal_term::ProcessHeap) -> ArithResult,
+    f: impl FnOnce(&mut crate::ProcessHeapHandle<'_>) -> ArithResult,
 ) -> u64 {
-    let result = f(&mut process.heap);
+    let result = f(&mut crate::ProcessHeapHandle(&mut process.heap));
     let charge = arinsal_arith::reduction_charge(operation, args);
     process.heap.abi.fcalls = process
         .heap
@@ -50,7 +52,11 @@ fn mixed_plus(process: &mut Process, arg1: Term, arg2: Term) -> u64 {
 }
 
 fn mixed_times(process: &mut Process, arg1: Term, arg2: Term) -> u64 {
-    let (result, charge) = arinsal_arith::mul_with_charge(arg1, arg2, &mut process.heap);
+    let (result, charge) = arinsal_arith::mul_with_charge(
+        arg1,
+        arg2,
+        &mut crate::ProcessHeapHandle(&mut process.heap),
+    );
     process.heap.abi.fcalls = process
         .heap
         .abi
@@ -145,7 +151,11 @@ pub extern "C" fn erts_int_div_rem(
         crate::native_hooks::from_raw(arg1),
         crate::native_hooks::from_raw(arg2),
     );
-    let (result, charge) = arinsal_arith::integer_div_rem(arg1, arg2, &mut process.heap);
+    let (result, charge) = arinsal_arith::integer_div_rem(
+        arg1,
+        arg2,
+        &mut crate::ProcessHeapHandle(&mut process.heap),
+    );
     process.heap.abi.fcalls = process
         .heap
         .abi
@@ -288,7 +298,12 @@ pub extern "C" fn erts_mul_add(
         crate::native_hooks::from_raw(arg3),
     );
     if is_integer(arg1) && is_integer(arg2) && is_integer(arg3) {
-        let result = arinsal_arith::integer_mul_add(arg1, arg2, arg3, &mut process.heap);
+        let result = arinsal_arith::integer_mul_add(
+            arg1,
+            arg2,
+            arg3,
+            &mut crate::ProcessHeapHandle(&mut process.heap),
+        );
         let charge = arinsal_arith::mul_add_reduction_charge(arg1, arg2);
         process.heap.abi.fcalls = process
             .heap

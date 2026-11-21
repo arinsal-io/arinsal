@@ -145,22 +145,6 @@ impl Trap {
     }
 }
 
-/// Decode an exception raised by a native runtime hook after native state is committed.
-pub(super) fn native_trap(class: u64, reason: u64) -> Result<Trap, VmError> {
-    let reason = crate::raw::beam_common_ffi::term_from_raw_bits(reason);
-    // `class` is a `freason` (error.h `EXC_*`): the class is its low bits.
-    let class = stacktrace::class_from_freason(class)
-        .ok_or_else(|| VmError::Unsupported("native exception class".into()))?;
-    Ok(Trap {
-        class,
-        reason,
-        trace: None,
-        top: None,
-        raw_rethrow: false,
-        untrappable: false,
-    })
-}
-
 fn atom(name: &str) -> Result<Term, VmError> {
     static COMMON: std::sync::OnceLock<[Atom; 5]> = std::sync::OnceLock::new();
     let common = COMMON.get_or_init(|| {
@@ -266,27 +250,6 @@ pub(super) fn dirty_bif_exception(
         info: stacktrace::BifErrorInfo::Plain,
     });
     Ok(result)
-}
-
-/// The exception of a `raise/3` whose stacktrace is already in `ftrace`.
-// Port of erts/emulator/beam/bif.c (raise_3 stores the stacktrace in `c_p->ftrace`), OTP-29.1.1.
-pub(crate) fn raise_from_ftrace(
-    p: &mut Process,
-    class: Class,
-    reason: Term,
-    trace: Term,
-) -> VmError {
-    if let Some(pending) = p.take_work(|w| w.bif_trap.take()) {
-        p.set_gc_enabled(pending.gc_was_enabled);
-    }
-    VmError::Trap(Trap {
-        class,
-        reason,
-        trace: Some(trace),
-        top: None,
-        raw_rethrow: false,
-        untrappable: false,
-    })
 }
 
 pub(super) fn bif_error_with_atoms(
@@ -652,12 +615,14 @@ fn save_raw(
     // `handle_error` passes its `pc` directly to `save_stacktrace`; frame identity is
     // resolved later by `build_stacktrace` through the active ranges table.
     let native_pc = (error_pc != 0).then_some(error_pc);
-    stacktrace::save_stacktrace(
+    Ok(stacktrace::save_stacktrace(
         p,
         stacktrace::StackTraceSave {
             class,
             depth,
-            freason: if p.heap.abi.exc.freason != 0 {
+            // A freason of another class is the PRIMARY_EXCEPTION an earlier caught exception
+            // kept (handle_error); erts raisers set `c_p->freason` before raising.
+            freason: if stacktrace::class_from_freason(p.heap.abi.exc.freason) == Some(class) {
                 p.heap.abi.exc.freason
             } else {
                 stacktrace::class_to_freason(Some(class))
@@ -666,7 +631,7 @@ fn save_raw(
             top: top.map(stacktrace::SaveTop::Live),
         },
         registers,
-    )
+    ))
 }
 
 fn save_explicit(p: &mut Process, trace: Term, class: Class) -> Result<Term, VmError> {

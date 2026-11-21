@@ -163,7 +163,7 @@ fn monitor(
         (Term::atom(atoms::DOWN), None, false)
     };
     let (kind, target) = (args[0], args[1]);
-    let me = process.self_pid.ok_or_else(badarg)?;
+    let me = process.self_pid().ok_or_else(badarg)?;
     if kind == Term::atom(atoms::PROCESS) {
         // `is_internal_pid`, then `is_atom` (a local name).
         if let Some(pid) = Pid::from_term(target) {
@@ -281,14 +281,13 @@ fn monitor_process(
         process.monitors.insert(origin);
         // proc_queue_signal on a normal scheduler holds the monitor as the scheduler's
         // pending signal.
-        let sent = scheduler.signal_ordered_from(
+        let sent = scheduler.signal_ordered(
             me,
             pid,
             arinsal_sched::Signal::Monitor {
                 reference: id,
                 shared: target_half.into_shared(),
             },
-            process.on_managed,
         );
         if let Err(error) = sent {
             process.monitors.remove(id);
@@ -367,7 +366,7 @@ fn demonitor(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
         None => (false, false),
     };
     let id = crate::signals::ref_id(reference).ok_or_else(badarg)?;
-    let me = process.self_pid.ok_or_else(badarg)?;
+    let me = process.self_pid().ok_or_else(badarg)?;
     // `am_true` / `am_false` of erts `demonitor`: whether a monitor was removed.
     let was_active = match crate::signals::demonitor_origin(process, id) {
         OriginDemonitor::Alias | OriginDemonitor::Missing => false,
@@ -376,11 +375,10 @@ fn demonitor(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
         OriginDemonitor::Process(origin) => {
             let target = Pid::from_data(origin.view().other());
             let scheduler = process.runtime.ok_or_else(badarg)?.scheduler()?;
-            let _ = scheduler.signal_ordered_from(
+            let _ = scheduler.signal_ordered(
                 me,
                 target,
                 arinsal_sched::Signal::DemonitorOrigin(origin.into_shared()),
-                process.on_managed,
             );
             true
         }
@@ -450,7 +448,7 @@ pub(crate) extern "C" fn group_leader_0(c_p: *mut ProcessHeader, _reg: *mut u64,
         return 0;
     };
     let result = process
-        .self_pid
+        .self_pid()
         .and_then(|me| process.group_leader_pid(me).to_term())
         .ok_or_else(badarg);
     bif_ret(c_p, i, result)
@@ -478,7 +476,7 @@ fn group_leader_2(process: &mut Process, leader: Term, target: Term) -> Result<T
     let (Some(leader), Some(pid)) = (Pid::from_term(leader), Pid::from_term(target)) else {
         return Ok(Term::atom(atoms::BADARG));
     };
-    if Some(pid) == process.self_pid {
+    if Some(pid) == process.self_pid() {
         crate::natives::proc::set_group_leader(process, leader)?;
         return Ok(Term::atom(atoms::TRUE));
     }
@@ -560,9 +558,6 @@ fn process_flag(process: &mut Process, flag: Term, value: Term) -> Result<Term, 
             };
             let previous = process.cold.as_ref().is_some_and(|cold| cold.off_heap_msgq);
             process.set_off_heap_msgq(off_heap);
-            if let Some(probe) = process.signal_probe() {
-                probe.set_parallel_signal_buffers(off_heap);
-            }
             Ok(Term::atom(if previous {
                 atoms::OFF_HEAP
             } else {
@@ -629,7 +624,7 @@ fn monitor_nodes(
             crate::node_tables::parse_nodes_monitor_options(&options).map_err(|_| badarg())?
         }
     };
-    let me = process.self_pid.ok_or_else(badarg)?;
+    let me = process.self_pid().ok_or_else(badarg)?;
     let mut nodes = crate::node_tables::lock();
     let previous = nodes.monitor_nodes(me, options, enabled);
     if enabled
@@ -714,7 +709,7 @@ pub(crate) extern "C" fn dsend_continue_trap_1(
     };
     process.heap.note_bif_entry();
     let [context] = bif_args::<1>(reg);
-    let Some(sender) = process.self_pid else {
+    let Some(sender) = process.self_pid() else {
         return bif_ret(c_p, i, Err(badarg()));
     };
     let outcome = context
@@ -1115,7 +1110,7 @@ fn link_opt(
     opts: Term,
     arity: usize,
 ) -> Result<Term, VmError> {
-    let me = process.self_pid.ok_or_else(badarg)?;
+    let me = process.self_pid().ok_or_else(badarg)?;
     if crate::trace::active() {
         trace_procs(process, reg, me, "link", other);
     }
@@ -1134,7 +1129,7 @@ fn link_opt(
         }
         let runtime = process.runtime.ok_or_else(badarg)?;
         let scheduler = runtime.scheduler()?;
-        if !process.trap_exit() && !scheduler.lookup_from(pid, process.on_managed) {
+        if !process.trap_exit() && !scheduler.lookup(pid) {
             return link_no_proc(process);
         }
         // erts_link_internal_tree_lookup_create; a link that exists and is not unlinking sends
@@ -1150,8 +1145,7 @@ fn link_opt(
         if crate::trace::active() {
             send_link_trace_changes(process, me, pid);
         }
-        let sent =
-            scheduler.signal_ordered_from(me, pid, arinsal_sched::Signal::Link, process.on_managed);
+        let sent = scheduler.signal_ordered(me, pid, arinsal_sched::Signal::Link);
         match sent {
             Ok(()) => {}
             // erts_proc_sig_send_link_exit(NULL, other, rlnk, am_noproc, NIL): the target is
@@ -1296,10 +1290,7 @@ fn send_link_trace_changes(process: &mut Process, me: Pid, pid: Pid) {
         let signal = arinsal_sched::Signal::TraceChangeState(arinsal_sched::SharedPayload(
             std::sync::Arc::new(change),
         ));
-        if scheduler
-            .signal_ordered_from(me, pid, signal, process.on_managed)
-            .is_err()
-        {
+        if scheduler.signal_ordered(me, pid, signal).is_err() {
             break;
         }
     }
@@ -1333,7 +1324,7 @@ pub(crate) extern "C" fn unlink_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64
 /// The arms of `unlink_1`.
 // Port of erts/emulator/beam/bif.c (unlink_1), OTP-29.1.1.
 fn unlink(process: &mut Process, reg: *mut u64, other: Term) -> Result<Term, VmError> {
-    let me = process.self_pid.ok_or_else(badarg)?;
+    let me = process.self_pid().ok_or_else(badarg)?;
     let ok = Ok(Term::atom(atoms::TRUE));
     if crate::trace::active() && other.as_port().is_none() {
         trace_procs(process, reg, me, "unlink", other);
@@ -1350,12 +1341,7 @@ fn unlink(process: &mut Process, reg: *mut u64, other: Term) -> Result<Term, VmE
         let id = process.next_ref();
         let scheduler = process.runtime.ok_or_else(badarg)?.scheduler()?;
         let sent = scheduler
-            .signal_ordered_from(
-                me,
-                pid,
-                arinsal_sched::Signal::Unlink(id),
-                process.on_managed,
-            )
+            .signal_ordered(me, pid, arinsal_sched::Signal::Unlink(id))
             .is_ok();
         // unlink_clear_prio, then `ilnk->unlinking = id`, or the link deleted when the target
         // is gone (erts_proc_sig_send_unlink returned 0).
@@ -1471,7 +1457,7 @@ fn send_exit_signal_bif(
         ));
     };
     let ok = Ok(Term::atom(atoms::TRUE));
-    let me = process.self_pid.ok_or_else(badarg)?;
+    let me = process.self_pid().ok_or_else(badarg)?;
     // is_internal_pid(id) || is_internal_ref(id): an alias names its creator.
     let target = if let Some(pid) = Pid::from_term(id) {
         Some((pid, 0))
@@ -1511,12 +1497,7 @@ fn send_exit_signal_bif(
             }
         }
         let scheduler = process.runtime.ok_or_else(badarg)?.scheduler()?;
-        let _ = scheduler.signal_ordered_from(
-            me,
-            pid,
-            arinsal_sched::Signal::Exit(Box::new(message)),
-            process.on_managed,
-        );
+        let _ = scheduler.signal_ordered(me, pid, arinsal_sched::Signal::Exit(Box::new(message)));
         return ok;
     }
     if let Some(port_id) = id.as_port() {
@@ -1689,7 +1670,10 @@ fn spawn_request(
     // send_error: `{Tag, Ref, error, Error}` to the caller unless SPO_NO_EMSG.
     let reference = crate::signals::reference(process, process.next_ref())?;
     if !so.no_emsg {
-        let me = process.self_pid.and_then(Pid::to_term).ok_or_else(badarg)?;
+        let me = process
+            .self_pid()
+            .and_then(Pid::to_term)
+            .ok_or_else(badarg)?;
         let message = {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             arinsal_term::TermBuilder::new(&mut heap)
@@ -1759,7 +1743,7 @@ fn alias(process: &mut Process, opts: Term) -> Result<Term, VmError> {
     if bad {
         return Err(badarg());
     }
-    let me = process.self_pid.ok_or_else(badarg)?;
+    let me = process.self_pid().ok_or_else(badarg)?;
     let id = process.next_ref();
     let reference = crate::signals::pid_reference(process, id, me)?;
     process
@@ -1789,7 +1773,7 @@ pub(crate) extern "C" fn unalias_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u6
     } else {
         let mine = reference
             .local_pid_ref_pid_data()
-            .is_some_and(|pid| Some(pid) == process.self_pid.map(Pid::data));
+            .is_some_and(|pid| Some(pid) == process.self_pid().map(Pid::data));
         let unaliased = mine
             && crate::signals::ref_id(reference)
                 .is_some_and(|id| crate::signals::unalias_origin(process, id));

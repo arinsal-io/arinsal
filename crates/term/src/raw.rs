@@ -64,7 +64,7 @@ pub(crate) fn copy_shallow<H: HeapAlloc + ?Sized>(
                             )?;
                             crate::bits::retain_cloned_binary_owner(
                                 dst, thing, ptr, flags, overhead, owner,
-                            )?;
+                            );
                         }
                     }
                     crate::EXTERNAL_PID | crate::EXTERNAL_PORT | crate::EXTERNAL_REF => {
@@ -75,7 +75,7 @@ pub(crate) fn copy_shallow<H: HeapAlloc + ?Sized>(
                     crate::REF if crate::is_magic_ref_thing_with_hdr(value, block[index + 1]) => {
                         let owner = crate::MagicBin::thing_owner(block[index + 1], true);
                         crate::heap::store(thing.wrapping_add(2), 0);
-                        dst.link_magic_ref(thing, owner)?;
+                        dst.link_magic_ref(thing, owner);
                     }
                     _ => {}
                 }

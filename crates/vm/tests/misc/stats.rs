@@ -7,7 +7,8 @@ use arinsal_etf::OwnedTerm;
 
 const SOURCE: &str = r#"
 -module(stats_diff).
--export([logger_time/0, shapes/0, errors/0, enabled/0, toggle/0, gc_snapshot/0, grow/0, retire/0]).
+-export([logger_time/0, shapes/0, errors/0, enabled/0, toggle/0, gc_snapshot/0, grow/0, retire/0,
+         double_enable/0, default_states/0]).
 
 shapes() ->
     ensure_kernel_refc(),
@@ -136,6 +137,22 @@ logger_time() ->
     end,
     erlang:system_flag(system_logger, Old),
     Res.
+
+double_enable() ->
+    False = erlang:system_flag(microstate_accounting, false),
+    False2 = erlang:system_flag(microstate_accounting, false),
+    True = erlang:system_flag(microstate_accounting, true),
+    True2 = erlang:system_flag(microstate_accounting, true),
+    erlang:system_flag(microstate_accounting, false),
+    {False, False2, True, True2}.
+
+default_states() ->
+    erlang:system_flag(microstate_accounting, true),
+    Available = msacc:available(),
+    Keys = lists:usort([lists:sort(maps:keys(maps:get(counters, E))) ||
+                        E <- erlang:statistics(microstate_accounting)]),
+    erlang:system_flag(microstate_accounting, false),
+    {Available, Keys}.
 
 retire() ->
     Key = {stats_retire, 1},
@@ -362,6 +379,28 @@ fn sched_acct_statistics_and_memory_errors_match_otp() {
     // The retired-area count is not observable from Erlang in erts (erl_bif_persistent.c keeps
     // it in C only) and the booted peer is another OS process: the observable contract is the
     // value read before the replacement staying valid through the major GC.
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
+}
+
+#[test]
+fn sched_acct_msacc_double_enable_disable_matches_otp() {
+    let _guard = guard();
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping msacc double enable test");
+        return;
+    };
+    let (expected, actual) = run(&reference, "double_enable");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
+}
+
+#[test]
+fn sched_acct_msacc_default_states_match_otp() {
+    let _guard = guard();
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping msacc default states test");
+        return;
+    };
+    let (expected, actual) = run(&reference, "default_states");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }
 

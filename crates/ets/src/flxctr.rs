@@ -125,11 +125,25 @@ pub trait SnapshotHost {
 }
 
 /// A raw array pointer handed to a thread progress operation.
+#[derive(Clone, Copy)]
 struct ArrayPtr(*mut CtrArray);
 
 // SAFETY: the pointer is owned by the operation that carries it (see `snapshot`); the array is
 // only made of atomics.
 unsafe impl Send for ArrayPtr {}
+// SAFETY: as for `Send`: the array is only atomics, and thread progress excludes adders before
+// the later op reads it.
+unsafe impl Sync for ArrayPtr {}
+
+/// The arrays of a decentralized snapshot after the pointer swap, before thread progress.
+// Port of erl_flxctr.c (`DecentralizedReadSnapshotInfo` array/next_array fields), OTP-29.1.1.
+#[derive(Clone, Copy)]
+pub struct BegunSnapshot {
+    old: ArrayPtr,
+    new: ArrayPtr,
+    /// `nr_of_counters`.
+    pub nr_of_counters: usize,
+}
 
 impl FlxCtr {
     /// `erts_flxctr_init`.
@@ -288,11 +302,35 @@ impl FlxCtr {
             }
             return SnapshotResult::Done(result);
         }
+        match self.try_begin_snapshot() {
+            None => {
+                suspend_until_thr_prg(host);
+                SnapshotResult::TryAgainAfterTrap
+            }
+            Some(work) => {
+                let state = Arc::new(SnapshotState::default());
+                let info_state = Arc::clone(&state);
+                host.suspend_and_run_later(Box::new(move || {
+                    let mut result = [0; ATOMICS_PER_CACHE_LINE];
+                    work.complete(&mut result);
+                    for (counter_nr, value) in result.iter().enumerate() {
+                        info_state.result[counter_nr].store(*value, Ordering::Release);
+                    }
+                }));
+                SnapshotResult::GetResultAfterTrap(state)
+            }
+        }
+    }
+
+    /// Swap in a fresh array for a snapshot, or `None` when the caller must trap and retry.
+    // Port of erts/emulator/beam/erl_flxctr.c:268 (`erts_flxctr_snapshot` swap), OTP-29.1.1.
+    pub fn try_begin_snapshot(&self) -> Option<BegunSnapshot> {
+        if !self.is_decentralized {
+            return None;
+        }
         let array = self.counters_ptr.load(Ordering::Acquire);
         if self.is_snapshot_ongoing() {
-            // Let the caller try again later.
-            suspend_until_thr_prg(host);
-            return SnapshotResult::TryAgainAfterTrap;
+            return None;
         }
         let new_array = create_decentralized_ctr_array(self.nr_of_counters);
         if self
@@ -300,19 +338,22 @@ impl FlxCtr {
             .compare_exchange(array, new_array, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            // Let the caller try again later.
-            suspend_until_thr_prg(host);
             free_array(new_array);
-            return SnapshotResult::TryAgainAfterTrap;
+            return None;
         }
-        let state = Arc::new(SnapshotState::default());
-        let nr_of_counters = self.nr_of_counters;
-        let info_state = Arc::clone(&state);
-        let (array, next) = (ArrayPtr(array), ArrayPtr(new_array));
-        host.suspend_and_run_later(Box::new(move || {
-            thr_prg_wake_up_and_count(&info_state, array, next, nr_of_counters);
-        }));
-        SnapshotResult::GetResultAfterTrap(state)
+        Some(BegunSnapshot {
+            old: ArrayPtr(array),
+            new: ArrayPtr(new_array),
+            nr_of_counters: self.nr_of_counters,
+        })
+    }
+}
+
+impl BegunSnapshot {
+    /// `thr_prg_wake_up_and_count` without the process resume: fill `result` and free arrays.
+    // Port of erts/emulator/beam/erl_flxctr.c:75 (`thr_prg_wake_up_and_count`), OTP-29.1.1.
+    pub fn complete(self, result: &mut [isize]) {
+        thr_prg_wake_up_and_count(self.old, self.new, self.nr_of_counters, result);
     }
 }
 
@@ -323,27 +364,25 @@ fn suspend_until_thr_prg(host: &mut dyn SnapshotHost) {
 
 /// `thr_prg_wake_up_and_count`, run once thread progress made the old `array` quiescent.
 fn thr_prg_wake_up_and_count(
-    state: &SnapshotState,
     array: ArrayPtr,
     next: ArrayPtr,
     nr_of_counters: usize,
+    result: &mut [isize],
 ) {
     // SAFETY: both arrays are alive: `array` is freed below, and `next` is freed by whoever
     // loses the status exchange below.
     let (old, new) = unsafe { (&*array.0, &*next.0) };
-    // Reset the result array and read the result from the snapshot.
-    let mut sums = [0isize; ATOMICS_PER_CACHE_LINE];
+    for slot in result.iter_mut() {
+        *slot = 0;
+    }
     for elem in &old.array {
-        for (sum, counter) in sums.iter_mut().zip(&elem.counters).take(nr_of_counters) {
+        for (sum, counter) in result.iter_mut().zip(&elem.counters).take(nr_of_counters) {
             *sum = sum.wrapping_add(counter.load(Ordering::Relaxed));
         }
     }
-    for (counter_nr, sum) in sums.iter().enumerate().take(nr_of_counters) {
-        state.result[counter_nr].store(*sum, Ordering::Release);
-        // Update the next decentralized counter array.
+    for (counter_nr, sum) in result.iter().enumerate().take(nr_of_counters) {
         new.array[0].counters[counter_nr].fetch_add(*sum, Ordering::Relaxed);
     }
-    // Announce that the snapshot is done.
     if new
         .snapshot_status
         .compare_exchange(
@@ -354,10 +393,8 @@ fn thr_prg_wake_up_and_count(
         )
         .is_err()
     {
-        // The counter was destroyed meanwhile, so this thread frees the next array.
         free_array(next.0);
     }
-    // Free the memory that is no longer needed.
     free_array(array.0);
 }
 

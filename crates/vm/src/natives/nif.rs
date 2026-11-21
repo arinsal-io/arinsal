@@ -156,6 +156,8 @@ pub(crate) struct ModuleNif {
     scheduler: Weak<Scheduler<Process>>,
     /// `finish` under `load_mtx`: the stubs of a load whose finishers have not all run.
     finish: Mutex<Option<ErtsNifFinish>>,
+    /// `lib->barrier` of erl_nif.c: the later-op node of each load-nif code barrier.
+    barrier: crate::code_ix::ErtsCodeBarrier,
 }
 
 impl ModuleNif {
@@ -1302,7 +1304,7 @@ impl DirtyNifJob {
         let lib = crate::natives::raw::nif_mod(ep.m);
         let args = process.x.get(..arity)?.to_vec();
         // erts_atomic32_read_band_mb(&c_p->state, ~(DIRTY_CPU_PROC | DIRTY_IO_PROC)).
-        bset_dirty_psflg(process.runtime, process.self_pid, 0);
+        bset_dirty_psflg(process.runtime, process.self_pid(), 0);
         refresh_hub_native(process);
         Some(Self {
             nep: crate::erl_nfunc_sched::NfuncPtr(nep),
@@ -1311,7 +1313,7 @@ impl DirtyNifJob {
             args,
             current: process.heap.abi.current as usize,
             runtime: process.runtime,
-            pid: process.self_pid,
+            pid: process.self_pid(),
         })
     }
 
@@ -1595,6 +1597,7 @@ fn install_stubs(
         publishing: std::sync::atomic::AtomicBool::new(true),
         scheduler,
         finish: Mutex::new(None),
+        barrier: crate::code_ix::ErtsCodeBarrier::new(),
     });
     let result = finish_stubs(module_id, &lib, binds);
     match result {
@@ -1733,10 +1736,15 @@ fn beam_stub(
 // Port of erts/emulator/beam/code_ix.c:558-575 (erts_schedule_code_barrier, scheduled as a
 // thread progress later op), OTP-29.1.1. Without schedulers (`Vm::eval`) nothing else runs
 // code, so the function runs at once.
-fn erts_schedule_code_barrier(lib: &Arc<ModuleNif>, later_function: fn(Arc<ModuleNif>)) {
-    let later_data = Arc::clone(lib);
+fn erts_schedule_code_barrier(lib: &ModuleNif, later_function: fn(*mut ())) {
+    let later_data = lib as *const ModuleNif as *mut ();
     match lib.scheduler.upgrade() {
-        Some(scheduler) => scheduler.thread_progress_later(move || later_function(later_data)),
+        Some(scheduler) => crate::code_ix::erts_schedule_code_barrier(
+            &scheduler,
+            &lib.barrier,
+            later_function,
+            later_data,
+        ),
         None => later_function(later_data),
     }
 }
@@ -1744,7 +1752,8 @@ fn erts_schedule_code_barrier(lib: &Arc<ModuleNif>, later_function: fn(Arc<Modul
 /// Copies the `call_nif` code of every stub over the body of its function, behind the
 /// breakpoint trampoline.
 // Port of erts/emulator/beam/erl_nif.c:5124-5203 (load_nif_1st_finisher), OTP-29.1.1.
-fn load_nif_1st_finisher(lib: Arc<ModuleNif>) {
+fn load_nif_1st_finisher(data: *mut ()) {
+    let lib = crate::code_ix::later_data::<ModuleNif>(data);
     let fin = lib
         .finish
         .lock()
@@ -1763,13 +1772,14 @@ fn load_nif_1st_finisher(lib: Arc<ModuleNif>) {
     // Unloaded: the Arc of the later op is the reference erts drops with deref_nifmod.
     if !unloaded {
         // The `call_nif` code is visible before the breakpoints are disabled.
-        erts_schedule_code_barrier(&lib, load_nif_2nd_finisher);
+        erts_schedule_code_barrier(lib, load_nif_2nd_finisher);
     }
 }
 
 /// Clears the `call_nif_early` breakpoint flag of every function.
 // Port of erts/emulator/beam/erl_nif.c:5205-5275 (load_nif_2nd_finisher), OTP-29.1.1.
-fn load_nif_2nd_finisher(lib: Arc<ModuleNif>) {
+fn load_nif_2nd_finisher(data: *mut ()) {
+    let lib = crate::code_ix::later_data::<ModuleNif>(data);
     let fin = lib
         .finish
         .lock()
@@ -1786,13 +1796,14 @@ fn load_nif_2nd_finisher(lib: Arc<ModuleNif>) {
     drop(fin);
     if !unloaded {
         // The breakpoints are gone and nobody executes them before the stubs are freed.
-        erts_schedule_code_barrier(&lib, load_nif_3rd_finisher);
+        erts_schedule_code_barrier(lib, load_nif_3rd_finisher);
     }
 }
 
 // Port of erts/emulator/beam/erl_nif.c:5277-5283 (load_nif_3rd_finisher), OTP-29.1.1.
-fn load_nif_3rd_finisher(lib: Arc<ModuleNif>) {
-    release_beam_stubs(&lib);
+fn load_nif_3rd_finisher(data: *mut ()) {
+    let lib = crate::code_ix::later_data::<ModuleNif>(data);
+    release_beam_stubs(lib);
 }
 
 /// Erases the stubs of `lib` from the call table and frees them.
@@ -1885,7 +1896,7 @@ fn load_dynamic(
     // previous code of the module has a NIF library the new one is upgraded from it, else
     // loaded. erts runs the upgrade with thread progress blocked; Arinsal does not block the
     // other schedulers.
-    let pid = process.self_pid.and_then(|pid| pid.to_term());
+    let pid = process.self_pid().and_then(|pid| pid.to_term());
     let prev = prev_id.and_then(instance_nif);
     let committed = match &prev {
         Some(prev) => image.upgrade(info, &prev.library, pid),
@@ -1920,7 +1931,7 @@ fn intern_load_atoms(module: &str) -> Result<(), VmError> {
 // modification permission; a caller that is not given it yields and retries the call.
 fn load_nif(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     let runtime = process.runtime;
-    let pid = process.self_pid;
+    let pid = process.self_pid();
     if let (Some(runtime), Some(pid)) = (&runtime, pid)
         && !crate::natives::code::try_seize_code_mod_permission(runtime, process, pid)
     {
@@ -2238,11 +2249,53 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapAdapter<'_, H> {
         writable: bool,
         overhead_words: u64,
         owner: Option<arinsal_term::OwnedBinaryRef>,
-    ) -> Result<(), arinsal_term::TermError> {
+    ) {
         HeapAlloc::link_bin_ref(self.0, bin_ref, writable, overhead_words, owner)
+    }
+    fn retain_writable_binary(&mut self, binary: std::sync::Arc<arinsal_term::WritableBinary>) {
+        self.0.retain_writable_binary(binary)
+    }
+    fn retain_writable_binary_with_apparent_size(
+        &mut self,
+        binary: std::sync::Arc<arinsal_term::WritableBinary>,
+        apparent_size_bits: usize,
+    ) {
+        self.0
+            .retain_writable_binary_with_apparent_size(binary, apparent_size_bits)
+    }
+    fn add_bin_vheap(&mut self, words: u64) {
+        self.0.add_bin_vheap(words)
+    }
+    fn update_writable_binary_overhead(
+        &mut self,
+        source: Term,
+        old_size_bits: usize,
+        new_size_bits: usize,
+    ) {
+        self.0
+            .update_writable_binary_overhead(source, old_size_bits, new_size_bits)
+    }
+    fn supports_writable_binary(&self) -> bool {
+        self.0.supports_writable_binary()
+    }
+    fn link_external_binary(
+        &mut self,
+        bin_ref: *mut u64,
+        binary: std::sync::Arc<arinsal_term::ExternalBinary>,
+    ) {
+        self.0.link_external_binary(bin_ref, binary)
+    }
+    fn supports_external_binary(&self) -> bool {
+        self.0.supports_external_binary()
     }
     fn link_node(&mut self, thing: *mut u64, node: arinsal_term::Node) {
         self.0.link_node(thing, node);
+    }
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: arinsal_term::MagicBin) {
+        self.0.link_magic_ref(thing, owner)
+    }
+    fn supports_magic(&self) -> bool {
+        self.0.supports_magic()
     }
 }
 
@@ -2285,7 +2338,7 @@ fn install_hub(process: &Process, ctx: &RunCtx<'_, crate::Process>) {
 
 #[inline(never)]
 pub(crate) fn refresh_hub_native(process: &Process) {
-    let Some(pid) = process.self_pid.as_ref() else {
+    let Some(ref pid) = process.self_pid() else {
         return;
     };
     // Every native BIF call lands here: when this thread already serves this process the
@@ -2320,7 +2373,7 @@ pub(crate) fn bind_scheduler_hub(process: &Process) {
     if runtime == 0 || HUB_RUNTIME.get() == runtime {
         return;
     }
-    if let Some(pid) = process.self_pid {
+    if let Some(pid) = process.self_pid() {
         install_hub_for(process, pid);
     }
 }

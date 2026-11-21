@@ -63,12 +63,31 @@ ping() -> persistent_term:get(ol_sched, not_loaded).
         "path load via eval_scheduled"
     );
 
+    // A bare erlang:load_module/2 (`Vm::load_file`) leaves on_load code pending and the module
+    // uncallable (`undef` in erl too); code_server runs the on_load handshake
+    // (code_server.erl handle_loader/schedule_on_load), so load through code:load_abs/1.
     let mut loaded = crate::common::node();
-    loaded.load_file(&beam).unwrap();
+    let abs = dir.join("ol_sched");
+    let abs = arinsal_term::Term::atom(
+        arinsal_term::global_atoms()
+            .intern(abs.to_str().unwrap())
+            .expect("path atom"),
+    );
+    let load = loaded
+        .eval_scheduled("code", "load_abs", &[abs], 1)
+        .expect("code:load_abs");
+    similar_asserts::assert_eq!(
+        load.term,
+        OwnedTerm::Tuple(vec![
+            OwnedTerm::Atom("module".into()),
+            OwnedTerm::Atom("ol_sched".into())
+        ]),
+        "code:load_abs"
+    );
     let from_file = loaded
         .eval_scheduled("ol_sched", "ping", &[], 1)
-        .expect("load_file on_load");
-    similar_asserts::assert_eq!(from_file.text, "ran", "Vm::load_file then eval_scheduled");
+        .expect("load_abs on_load");
+    similar_asserts::assert_eq!(from_file.text, "ran", "code:load_abs then eval_scheduled");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -760,7 +760,7 @@ pub(crate) fn take_origin_monitor_down(
 
 /// The alias a monitor with `explicit_unalias` leaves behind once it is gone.
 fn insert_explicit_unalias(process: &mut Process, id: u64) {
-    let creator = process.self_pid.map_or(0, Pid::data);
+    let creator = process.self_pid().map_or(0, Pid::data);
     process
         .monitors
         .insert(crate::proc_create::origin_monitor_with_reference(
@@ -987,9 +987,11 @@ pub(crate) fn monitor_port(
     );
     process.monitors.insert(origin);
     let registered = port_id.and_then(|id| {
-        runtime.ports.with_from(id, process.on_managed, |handle| {
-            crate::port::monitor(process, id, handle, target_half, true)
-        })
+        runtime
+            .ports
+            .with_from(id, process.on_normal_scheduler(), |handle| {
+                crate::port::monitor(process, id, handle, target_half, true)
+            })
     });
     // `!prt || erts_port_monitor(..) == ERTS_PORT_OP_DROPPED`: the origin half stays in the
     // tree and the DOWN goes to this process as a signal.
@@ -1235,13 +1237,6 @@ fn proc_is_exiting_runtime(runtime: &crate::process::Runtime, pid: Pid) -> bool 
             })
         })
         .unwrap_or(false)
-}
-
-pub(crate) fn is_waiting(process: &Process, pid: Pid) -> bool {
-    process
-        .runtime
-        .as_ref()
-        .is_some_and(|runtime| runtime.remote_status(pid) == "waiting")
 }
 
 /// Queue a process system task on `target` at `priority`; the reply goes to `requester`.
@@ -1987,6 +1982,18 @@ fn is_process_alive_2(
                 .map_err(|_| system_limit())?;
             ctx.send(ctx.pid(), Message::copy_from(reply)?)
                 .map_err(|error| VmError::Unsupported(format!("alive reply: {error}")))?;
+            // Port of erl_bif_info.c:4053-4056: if we have incoming signals, handle them
+            // before returning `ok`.
+            if ctx.has_incoming_signals() {
+                return Err(VmError::TrapExport(crate::ExportTrap::new(
+                    process,
+                    crate::natives::sys::BIF_HANDLE_SIGNALS_RETURN,
+                    vec![
+                        pid.to_term().unwrap_or(Term::NIL),
+                        Term::atom(arinsal_term::atoms::OK),
+                    ],
+                )));
+            }
             Ok(Term::atom(arinsal_term::atoms::OK))
         }
         Err(error) => Err(VmError::Unsupported(format!("alive request: {error}"))),

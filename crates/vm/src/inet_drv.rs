@@ -22,7 +22,7 @@ use arinsal_term::{HeapAlloc, Term, TermBuilder, global_atoms};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::ops::Range;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -932,27 +932,13 @@ fn open_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     if data[2] != 0 && data[2] != 1 {
         return err_bytes("eprotonosupport");
     }
-    // SAFETY: socket returns a fresh descriptor; set close-on-exec before publishing it.
-    let (fd, cloexec_error) = crate::port::cloexec_publish(|| unsafe {
-        let fd = libc::socket(domain, libc::SOCK_STREAM, 0);
-        if fd >= 0 && libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
-            let error = last_errno();
-            libc::close(fd);
-            (-1, Some(error))
-        } else {
-            (fd, None)
-        }
-    });
-    if let Some(error) = cloexec_error {
-        return err_bytes(errno_name(error));
-    }
-    if fd < 0 {
-        return err_bytes(errno_name(last_errno()));
-    }
-    set_nonblock(fd);
-    set_nosigpipe(fd);
-    // SAFETY: fd was just created and is moved into OwnedFd.
-    inner.fd = Some(SockFd::new(unsafe { OwnedFd::from_raw_fd(fd) }));
+    let fd = match crate::port::socket_cloexec(domain, libc::SOCK_STREAM, 0) {
+        Ok(fd) => fd,
+        Err(error) => return err_bytes(errno_name(error.raw_os_error().unwrap_or(libc::EIO))),
+    };
+    set_nonblock(fd.as_raw_fd());
+    set_nosigpipe(fd.as_raw_fd());
+    inner.fd = Some(SockFd::new(fd));
     inner.domain = domain;
     inner.family_code = data[0];
     inner.phase = Phase::Open;
@@ -1206,38 +1192,20 @@ fn acceptor_exited(sock: &Arc<Sock>, monitor: u64) {
 }
 
 fn try_accept(inner: &Inner) -> Option<Result<OwnedFd, i32>> {
-    let fd = inner.fd.as_ref()?.as_raw_fd();
-    let mut storage: libc::sockaddr_storage = zeroed();
-    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    // SAFETY: accept returns a fresh descriptor; set close-on-exec before publishing it.
-    let (got, cloexec_error) = crate::port::cloexec_publish(|| unsafe {
-        let got = libc::accept(
-            fd,
-            (&mut storage as *mut libc::sockaddr_storage).cast(),
-            &mut len,
-        );
-        if got >= 0 && libc::fcntl(got, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
-            let error = last_errno();
-            libc::close(got);
-            (-1, Some(error))
-        } else {
-            (got, None)
+    let listening = inner.fd.as_ref()?;
+    match crate::port::accept_cloexec(listening) {
+        Ok(accepted) => {
+            set_nonblock(accepted.as_raw_fd());
+            set_nosigpipe(accepted.as_raw_fd());
+            Some(Ok(accepted))
         }
-    });
-    if let Some(error) = cloexec_error {
-        return Some(Err(error));
-    }
-    if got >= 0 {
-        set_nonblock(got);
-        set_nosigpipe(got);
-        // SAFETY: accept returned a fresh descriptor.
-        Some(Ok(unsafe { OwnedFd::from_raw_fd(got) }))
-    } else {
-        let err = last_errno();
-        if err == libc::EAGAIN || err == libc::EWOULDBLOCK || err == libc::EINTR {
-            None
-        } else {
-            Some(Err(err))
+        Err(error) => {
+            let err = error.raw_os_error().unwrap_or(libc::EIO);
+            if err == libc::EAGAIN || err == libc::EWOULDBLOCK || err == libc::EINTR {
+                None
+            } else {
+                Some(Err(err))
+            }
         }
     }
 }
@@ -2094,27 +2062,13 @@ pub(crate) fn getiflist() -> Vec<u8> {
 }
 
 fn ifconf_buf() -> Result<Vec<u8>, i32> {
-    // SAFETY: a datagram socket is used only as an ioctl target; close-on-exec is
-    // set before another scheduler can spawn a child while this descriptor is open.
-    let fd = crate::port::cloexec_publish(|| unsafe {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
-        if fd >= 0 && libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
-            libc::close(fd);
-            -2
-        } else {
-            fd
-        }
-    });
-    if fd == -2 {
-        return Err(libc::EIO);
-    }
-    if fd < 0 {
-        return Err(last_errno());
-    }
+    let socket = crate::port::socket_cloexec(libc::AF_INET, libc::SOCK_DGRAM, 0)
+        .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))?;
+    let fd = socket.as_raw_fd();
     let mut buflen = 100 * std::mem::size_of::<libc::ifreq>();
     let mut buf = vec![0u8; buflen];
     let mut prev = 0i32;
-    let result = loop {
+    loop {
         let mut ifc = libc::ifconf {
             ifc_len: buf.len() as i32,
             ifc_ifcu: libc::__c_anonymous_ifc_ifcu {
@@ -2136,10 +2090,7 @@ fn ifconf_buf() -> Result<Vec<u8>, i32> {
         }
         buflen += 10 * std::mem::size_of::<libc::ifreq>();
         buf.resize(buflen, 0);
-    };
-    // SAFETY: fd is the socket this function opened.
-    unsafe { libc::close(fd) };
-    result
+    }
 }
 
 pub(crate) fn ifget(data: &[u8]) -> Vec<u8> {
@@ -2226,23 +2177,8 @@ fn ifreq_flags(name: &[u8]) -> Option<i32> {
 }
 
 fn ifreq_ioctl(name: &[u8], req: u64, read: impl FnOnce(libc::ifreq)) -> Option<()> {
-    // SAFETY: a datagram socket is used only as an ioctl target; close-on-exec is
-    // set before another scheduler can spawn a child while this descriptor is open.
-    let fd = crate::port::cloexec_publish(|| unsafe {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
-        if fd >= 0 && libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
-            libc::close(fd);
-            -2
-        } else {
-            fd
-        }
-    });
-    if fd == -2 {
-        return None;
-    }
-    if fd < 0 {
-        return None;
-    }
+    let socket = crate::port::socket_cloexec(libc::AF_INET, libc::SOCK_DGRAM, 0).ok()?;
+    let fd = socket.as_raw_fd();
     let mut ifr = zeroed::<libc::ifreq>();
     let n = name.len().min(libc::IFNAMSIZ - 1);
     // SAFETY: ifr_name is IFNAMSIZ bytes and n leaves a trailing NUL.
@@ -2251,8 +2187,6 @@ fn ifreq_ioctl(name: &[u8], req: u64, read: impl FnOnce(libc::ifreq)) -> Option<
     }
     // SAFETY: fd is the socket just opened; ifr is a writable ifreq.
     let rc = unsafe { libc::ioctl(fd, req, &mut ifr) };
-    // SAFETY: fd is the socket just opened.
-    unsafe { libc::close(fd) };
     if rc < 0 {
         return None;
     }
@@ -2889,8 +2823,7 @@ fn sendfile_req(inner: &mut Inner, data: &[u8], end: &mut Option<SendfileEnd>) -
         return err_bytes("einval");
     }
     let raw_file_fd = i32::from_ne_bytes(data[0..4].try_into().unwrap());
-    // inet_drv.c:12409 dups the handle; Arinsal's dup also sets FD_CLOEXEC under
-    // `cloexec_publish` so a port child cannot inherit it.
+    // inet_drv.c:12409 dups the handle with close-on-exec already set.
     let dup_file_fd = match crate::port::duplicate_fd(raw_file_fd) {
         Ok(fd) => fd,
         Err(error) => return err_bytes(errno_name(error.raw_os_error().unwrap_or(libc::EINVAL))),
@@ -3226,6 +3159,12 @@ impl SockFd {
 impl AsRawFd for SockFd {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+}
+
+impl AsFd for SockFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 }
 

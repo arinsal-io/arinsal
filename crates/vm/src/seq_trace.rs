@@ -126,7 +126,7 @@ fn token(process: &mut Process) -> Option<Token> {
     sync_epoch(process);
     if process.seq_trace_spawn_pending {
         process.seq_trace_spawn_pending = false;
-        if let (Some(pid), Some(mut token)) = (process.self_pid, process.seq_trace_token.take()) {
+        if let (Some(pid), Some(mut token)) = (process.self_pid(), process.seq_trace_token.take()) {
             // The spawn reply the child sent (erl_process.c:12960-12965) bumped its serial.
             token.sender = pid
                 .to_term()
@@ -700,7 +700,7 @@ fn emit(
     {
         if let Some(ctx) = ctx.as_deref_mut() {
             let _ = ctx.send(target_pid, message);
-        } else if let (Some(runtime), Some(sender)) = (&process.runtime, process.self_pid)
+        } else if let (Some(runtime), Some(sender)) = (&process.runtime, process.self_pid())
             && let Ok(scheduler) = runtime.scheduler()
         {
             let _ = scheduler.send(sender, target_pid, message);
@@ -715,7 +715,7 @@ fn emit(
         if let Some(ctx) = ctx {
             crate::natives::nif::refresh_hub(process, ctx);
         }
-        let Some(tracee) = process.self_pid.and_then(Pid::to_term) else {
+        let Some(tracee) = process.self_pid().and_then(Pid::to_term) else {
             return;
         };
         let tag = Term::atom(arinsal_term::atoms::SEQ_TRACE);

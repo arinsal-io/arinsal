@@ -412,9 +412,6 @@ pub(crate) type FastHash = std::hash::BuildHasherDefault<FnvHasher>;
 // Port of erts/emulator/beam/beam_bp.h:85-94 (ErtsCodeInfo.u.gen_bp), OTP-29.1.1.
 pub(crate) struct FunctionBp {
     id: u32,
-    module: String,
-    function: String,
-    arity: u8,
     /// One `GenericBp` per runtime and session. Readers only use the active slot, writers
     /// (serialized by the node's `writer`) only the staging slot, as in erts; the lock only
     /// guards the chain itself.
@@ -783,6 +780,10 @@ pub(crate) enum FinishStage {
 /// A breakpoint update that a trace BIF caller, suspended between code barriers, finishes
 /// stage by stage (erts `finish_bp` and `trace_info_state`).
 pub(crate) struct TraceFinish {
+    /// `finish_bp.barrier` of erl_bif_trace.c: the later-op node of a code-barrier wait.
+    pub(crate) later_op: arinsal_sched::ErtsThrPrgrLaterOp,
+    pub(crate) resume_runtime: Option<&'static crate::process::Runtime>,
+    pub(crate) resume_pid: arinsal_sched::Pid,
     pub(crate) functions: Vec<BpFunction>,
     pub(crate) stages: std::collections::VecDeque<FinishStage>,
     /// Session whose active call counters are being collected by a trace-info barrier.
@@ -809,6 +810,9 @@ impl TraceFinish {
             FinishStage::Consolidate,
         ]);
         TraceFinish {
+            later_op: arinsal_sched::ErtsThrPrgrLaterOp::new(),
+            resume_runtime: None,
+            resume_pid: arinsal_sched::Pid::from_data(0),
             functions,
             stages,
             timem_session: None,
@@ -823,6 +827,9 @@ impl TraceFinish {
     /// Only waits for `barriers` code barriers.
     pub(crate) fn wait(barriers: usize, result: Option<i64>) -> Self {
         TraceFinish {
+            later_op: arinsal_sched::ErtsThrPrgrLaterOp::new(),
+            resume_runtime: None,
+            resume_pid: arinsal_sched::Pid::from_data(0),
             functions: Vec::new(),
             stages: std::iter::repeat_n(FinishStage::Wait, barriers.saturating_sub(1)).collect(),
             timem_session: None,
@@ -837,6 +844,9 @@ impl TraceFinish {
     /// The three barrier phases of `trace_info_finisher` for active call counters.
     pub(crate) fn timem(function: BpFunction, session: u64) -> Self {
         TraceFinish {
+            later_op: arinsal_sched::ErtsThrPrgrLaterOp::new(),
+            resume_runtime: None,
+            resume_pid: arinsal_sched::Pid::from_data(0),
             functions: vec![function],
             stages: [
                 FinishStage::Commit,
@@ -1085,94 +1095,6 @@ pub(crate) const HIT_META: u32 = BPF_META_TRACE;
 /// `Hit::flags` bits: an active call counter.
 pub(crate) const HIT_COUNT_ACTIVE: u32 = BPF_COUNT_ACTIVE;
 
-/// The breakpoints a native trampoline hit finds in its function, for one runtime and code
-/// scope; valid while the function's chain (`version`), the node's active index and the native
-/// code are unchanged.
-struct SiteBreakpoints {
-    site: usize,
-    runtime: usize,
-    /// The function's breakpoint chain (erts: the code info the trampoline belongs to).
-    cell: Arc<FunctionBp>,
-    version: u64,
-    ix: usize,
-    generation: u64,
-    bps: Vec<SiteBp>,
-    /// The traced function's `func_id`.
-    ci: u32,
-}
-
-struct SiteBp {
-    session: u64,
-    /// Active flags without the export entry's global trace, which a code entry never runs.
-    flags: u32,
-    count: Option<Arc<AtomicU64>>,
-    time: Option<Arc<TimemTrace>>,
-    memory: Option<Arc<TimemTrace>>,
-}
-
-const SITE_CACHE_SIZE: usize = 64;
-
-thread_local! {
-    /// Direct-mapped, per scheduler thread: a hit costs three atomic loads and a compare.
-    static SITE_CACHE: std::cell::RefCell<[Option<Arc<SiteBreakpoints>>; SITE_CACHE_SIZE]> =
-        const { std::cell::RefCell::new([const { None }; SITE_CACHE_SIZE]) };
-}
-
-fn site_breakpoints(process: &Process, site: usize) -> Option<Arc<SiteBreakpoints>> {
-    let runtime = runtime_id(process);
-    let slot = (site >> 2) % SITE_CACHE_SIZE;
-    let ix = bp_node(process).active_bp_ix();
-    let generation = crate::native_bridge::native_registry_generation();
-    if let Some(found) = SITE_CACHE.with(|cache| {
-        cache.borrow()[slot]
-            .as_ref()
-            .filter(|entry| {
-                entry.site == site
-                    && entry.runtime == runtime
-                    && entry.ix == ix
-                    && entry.generation == generation
-                    && entry.version == entry.cell.version.load(Ordering::Acquire)
-            })
-            .cloned()
-    }) {
-        return Some(found);
-    }
-    let (module, function_name, arity) =
-        crate::native_bridge::with_native_function_at(site, |function| {
-            (
-                function.module.to_owned(),
-                function.function.to_owned(),
-                function.arity,
-            )
-        })?;
-    let cell = function_cell(&module, &function_name, arity);
-    let (version, bps) = {
-        let chain = cell.read();
-        let bps = function_bps(&chain, runtime)
-            .map(|g| SiteBp {
-                session: g.session,
-                flags: g.data[ix].flags & !BPF_GLOBAL_TRACE,
-                count: g.data[ix].count.clone(),
-                time: g.data[ix].time.clone(),
-                memory: g.data[ix].memory.clone(),
-            })
-            .collect::<Vec<_>>();
-        (cell.version.load(Ordering::Acquire), bps)
-    };
-    let entry = Arc::new(SiteBreakpoints {
-        site,
-        runtime,
-        ci: cell.id,
-        cell,
-        version,
-        ix,
-        generation,
-        bps,
-    });
-    SITE_CACHE.with(|cache| cache.borrow_mut()[slot] = Some(entry.clone()));
-    Some(entry)
-}
-
 /// `erts_generic_breakpoint` after the code info is resolved: runs every session breakpoint
 /// of the call (events, counters, call time and memory), pushes the return frames below the
 /// caller's return address and tells whether a debug breakpoint takes the call.
@@ -1259,136 +1181,6 @@ pub extern "C" fn erts_generic_breakpoint(
     } else {
         function_pc
     }
-}
-
-/// What a native trampoline hit did when it needs no trace event: the counters are
-/// incremented and the call time or memory accounted. `actions` are the return frames to push.
-pub(crate) struct NativeBreakpointHit {
-    pub(crate) action: Option<crate::trace::NativeTraceAction>,
-    pub(crate) arity: u8,
-}
-
-/// Native-code `erts_generic_breakpoint` of the trampoline at `site` for a function whose
-/// breakpoints for this process only count and account call time or memory. `None` means a
-/// trace event, a debug breakpoint or a frame the native code cannot judge is involved, and
-/// nothing has been touched: the executor must run the breakpoint.
-// Port of erts/emulator/beam/beam_bp.c:994-1160 (erts_generic_breakpoint, do_session_breakpoint
-// for ERTS_BPF_COUNT_ACTIVE, ERTS_BPF_TIME_TRACE_ACTIVE and ERTS_BPF_MEM_TRACE_ACTIVE),
-// OTP-29.1.1, as the JIT trampoline fragment calls it without leaving native code.
-pub(crate) fn native_breakpoint_accounting(
-    process: &mut Process,
-    pid: Pid,
-    site: usize,
-) -> Option<NativeBreakpointHit> {
-    if crate::trace::is_sensitive(process, pid) {
-        return Some(NativeBreakpointHit {
-            action: None,
-            arity: 0,
-        });
-    }
-    let entry = site_breakpoints(process, site)?;
-    let acc = BPF_TIME_TRACE_ACTIVE | BPF_MEM_TRACE_ACTIVE;
-    if DEBUG_BREAKPOINTS_USED.load(Ordering::Relaxed)
-        && debug_breakpoint_enabled(
-            process,
-            &entry.cell.module,
-            &entry.cell.function,
-            entry.cell.arity,
-        )
-        || crate::trace::return_to_enabled(process)
-    {
-        return None;
-    }
-    // A session that does not trace calls of this process runs nothing but the counters.
-    let mut traced = [false; 4];
-    let mut any_acc = false;
-    if entry.bps.len() > traced.len() {
-        return None;
-    }
-    for (index, bp) in entry.bps.iter().enumerate() {
-        if bp.flags & BPF_META_TRACE != 0 {
-            return None;
-        }
-        if bp.flags & (BPF_LOCAL_TRACE | acc) != 0 {
-            traced[index] = crate::trace::session_flags_cached(process, bp.session, pid)
-                & crate::trace::CALL
-                != 0;
-            if traced[index] && bp.flags & BPF_LOCAL_TRACE != 0 {
-                return None;
-            }
-            any_acc |= traced[index] && bp.flags & acc != 0;
-        }
-    }
-    // The call acc frame is not pushed on top of another trace frame (tail recursion).
-    let mut frame_on_top = false;
-    if any_acc {
-        let top = process.heap.stack_get(0)?.tagged_word() as usize;
-        if crate::trace::TraceFrameKind::of(top).is_some() {
-            frame_on_top = true;
-        } else if !crate::native_bridge::is_native_function_at(top) {
-            return None;
-        }
-        if entry.cell.arity > 6 {
-            return None;
-        }
-    }
-    let mut action = None;
-    for (index, bp) in entry.bps.iter().enumerate() {
-        let bp_flags = if traced[index] || bp.flags & (BPF_LOCAL_TRACE | acc) == 0 {
-            bp.flags
-        } else {
-            bp.flags & !(BPF_LOCAL_TRACE | acc)
-        };
-        if bp_flags & BPF_COUNT_ACTIVE != 0
-            && let Some(count) = &bp.count
-        {
-            count.fetch_add(1, Ordering::Relaxed);
-        }
-        if bp_flags & acc == 0 {
-            continue;
-        }
-        let mut prev = None;
-        if bp_flags & BPF_TIME_TRACE_ACTIVE != 0
-            && let Some(bdt) = bp.time.as_ref()
-        {
-            let time = arinsal_sched::erl_time_sup::monotonic_time_raw_nanos();
-            prev = trace_call_acc(process, pid, bp.session, false, entry.ci, time, bdt);
-        }
-        if bp_flags & BPF_MEM_TRACE_ACTIVE != 0
-            && let Some(bdt) = bp.memory.as_ref()
-        {
-            let adjustment = call_memory_adjustment(process, bp.session);
-            // The initial call of a process starts counting from zero.
-            let allocated = if adjustment.is_none()
-                && crate::trace::is_initial_call(
-                    process,
-                    &entry.cell.module,
-                    &entry.cell.function,
-                    entry.cell.arity,
-                ) {
-                0
-            } else {
-                process.allocated_words(adjustment.unwrap_or(0))
-            };
-            prev = trace_call_acc(process, pid, bp.session, true, entry.ci, allocated, bdt);
-        }
-        if !frame_on_top && action.is_none() {
-            action = Some(crate::trace::NativeTraceAction {
-                session: bp.session,
-                return_trace: false,
-                exception_trace: false,
-                return_to: false,
-                acc: Some(crate::trace::CallAcc {
-                    flags: bp_flags & acc,
-                    prev,
-                }),
-            });
-        }
-    }
-    Some(NativeBreakpointHit {
-        action,
-        arity: entry.cell.arity,
-    })
 }
 
 /// The functions among `functions` that have a breakpoint of any session: clearing, pausing or
@@ -2055,9 +1847,6 @@ fn function_cell(module: &str, function: &str, arity: u8) -> Arc<FunctionBp> {
     let id = ids.cells.len() as u32;
     let cell = Arc::new(FunctionBp {
         id,
-        module: module.to_owned(),
-        function: function.to_owned(),
-        arity,
         bps: RwLock::new(Vec::new()),
         version: AtomicU64::new(0),
     });

@@ -57,15 +57,6 @@ pub(crate) const ERL_BITS_STATE_REF: u32 = sched_ref(std::mem::offset_of!(
 /// `f_reg_array` from x19 (`getFRef(0)`).
 pub(crate) const F_REG_ARRAY_REF: u32 =
     sched_ref(std::mem::offset_of!(crate::SchedulerRegisters, f_reg_array));
-/// `match_staging` from x19.
-pub(crate) const MATCH_STAGING_REF: u32 = sched_ref(std::mem::offset_of!(
-    crate::SchedulerRegisters,
-    match_staging
-));
-/// `trap_return` from x19.
-pub(crate) const TRAP_RETURN_REF: u32 =
-    sched_ref(std::mem::offset_of!(crate::SchedulerRegisters, trap_return));
-
 /// `load_x_reg_array(to)`: `reg` for a runtime helper, the address of `getXRef(0)`.
 // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:276-282 (load_x_reg_array), OTP-29.1.1.
 pub(crate) fn load_x_reg_array(

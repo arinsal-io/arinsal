@@ -10,68 +10,6 @@ use std::sync::{Arc, OnceLock};
 static YIELD_FRAGMENTS: OnceLock<YieldFragments> = OnceLock::new();
 static RAISE_FRAGMENTS: OnceLock<RaiseFragments> = OnceLock::new();
 
-extern "C" fn bs_create_bin_append(
-    _header: *mut ProcessHeader,
-    _registers: *mut u64,
-    _source: u64,
-    _bits: u64,
-    _unit: u64,
-    _live: u64,
-    _alloc: u64,
-) -> u64 {
-    0
-}
-
-extern "C" fn bs_create_bin_private_append(
-    _header: *mut ProcessHeader,
-    _registers: *mut u64,
-    _source: u64,
-    _bits: u64,
-) -> u64 {
-    0
-}
-
-extern "C" fn bs_create_bin_init(
-    _header: *mut ProcessHeader,
-    _registers: *mut u64,
-    _bits: u64,
-    _alloc: u64,
-    _live: u64,
-) -> u64 {
-    1
-}
-
-extern "C" fn bs_create_bin_size(
-    _header: *mut ProcessHeader,
-    _registers: *mut u64,
-    _source: u64,
-    _index: u64,
-) -> u64 {
-    u64::MAX
-}
-
-extern "C" fn bs_create_bin_fail(
-    _header: *mut ProcessHeader,
-    _registers: *mut u64,
-    _packed: u64,
-    _arg3: u64,
-    _arg1: u64,
-) -> u64 {
-    0
-}
-
-extern "C" fn bs_create_bin_put(
-    _header: *mut ProcessHeader,
-    _registers: *mut u64,
-    _source: u64,
-    _bits: u64,
-    _flags: u64,
-    _index: u64,
-    _total_bits: u64,
-) -> u64 {
-    1
-}
-
 #[cfg(feature = "bench-alloc-count")]
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 #[cfg(feature = "bench-alloc-count")]
@@ -137,23 +75,12 @@ extern "C" fn raw_raise_for_compile(
 extern "C" fn raise_class_for_compile(_: *mut ProcessHeader, _: u64) {}
 
 impl ModuleEnv for CorpusEnv {
-    fn yield_fragments(&self) -> (usize, usize, usize) {
-        let fragments = YIELD_FRAGMENTS.get_or_init(|| YieldFragments::new().unwrap());
-        (
-            fragments.dispatch_return(),
-            fragments.i_test_yield_shared(),
-            fragments.context_switch(),
-        )
+    fn yield_fragments(&self) -> arinsal_beamasm::yield_frag::YieldEntries {
+        yield_fragments().entries()
     }
 
     fn raise_fragments(&self) -> (usize, usize, usize) {
-        let fragments = RAISE_FRAGMENTS.get_or_init(|| {
-            RaiseFragments::new(
-                exception as *const () as usize,
-                raise_class_for_compile as *const () as usize,
-            )
-            .unwrap()
-        });
+        let fragments = raise_fragments();
         (
             fragments.raise_shared(),
             fragments.raise_exception_shared(),
@@ -161,13 +88,13 @@ impl ModuleEnv for CorpusEnv {
         )
     }
 
+    fn bif_fragments(&self) -> arinsal_beamasm::raise_frag::BifFragments {
+        raise_fragments().bif_fragments()
+    }
+
     fn integer_literal(&self, _value: i64) -> Result<i64, String> {
         // Dynamic literals are complemented indices; the corpus only compiles, so every one maps to NIL below.
         Ok(!0)
-    }
-
-    fn match_string(&self, _bytes: &[u8]) -> Result<u64, String> {
-        Ok(0)
     }
 
     fn bigint_literal(&self, _decimal: &str) -> Result<u64, String> {
@@ -312,23 +239,11 @@ impl ModuleEnv for CorpusEnv {
         1
     }
 
-    fn arithmetic_helper(&self) -> arinsal_beamasm::arith::ArithHelper {
-        arith
-    }
-    fn guard_helper(&self) -> arinsal_beamasm::guard::GuardHelper {
-        guard
-    }
     fn compare_shared(&self) -> arinsal_beamasm::guard::CompareShared {
         arinsal_beamasm::guard::CompareShared {
             eq: (eq as extern "C" fn(u64, u64) -> i32) as usize,
             ..Default::default()
         }
-    }
-    fn guard_helper3(&self) -> arinsal_beamasm::guard::GuardHelper3 {
-        guard3
-    }
-    fn gc_hook(&self) -> arinsal_beamasm::construct::GcHook {
-        gc
     }
     fn map_lookup_helper(&self) -> arinsal_beamjit::MapLookupHelper {
         map_lookup
@@ -336,50 +251,8 @@ impl ModuleEnv for CorpusEnv {
     fn bif_mfa_helper(&self) -> arinsal_beamjit::BifMfaHelper {
         bif_mfa
     }
-    fn bs_match_helper(&self) -> arinsal_beamasm::bs_match::BsMatchHelper {
-        bs_match
-    }
-
     fn map_runtime(&self) -> arinsal_beamasm::map::MapRuntime {
-        arinsal_beamasm::map::MapRuntime {
-            get: map_get,
-            get_elements: map_many,
-            lookup_module: 0,
-            new_map: map_many,
-            update_assoc: map_many,
-            update_exact: map_many,
-            put_single: map_many,
-            update_single_assoc_shared: map_fragments(map_get, map_many)
-                .update_single_assoc_shared(),
-            update_assoc_shared: map_fragments(map_get, map_many).update_assoc_shared(),
-            update_exact_shared: map_fragments(map_get, map_many).update_exact_shared(),
-            update_single_exact_shared: map_fragments(map_get, map_many)
-                .update_single_exact_shared(),
-            get_element_shared: map_fragments(map_get, map_many).get_element_shared(),
-            get_element_hash_shared: map_fragments(map_get, map_many).get_element_hash_shared(),
-        }
-    }
-
-    fn bs_create_bin_helper(&self) -> arinsal_beamasm::bs_construct::BsCreateBinHelpers {
-        use arinsal_beamasm::bs_construct::BsCreateBinHelpers;
-        BsCreateBinHelpers {
-            append_checked: bs_create_bin_append,
-            private_append: bs_create_bin_private_append,
-            init_bits: bs_create_bin_init,
-            bit_size: bs_create_bin_size,
-            utf8_size: bs_create_bin_size,
-            utf16_size: bs_create_bin_size,
-            utf32_size: bs_create_bin_size,
-            fail: bs_create_bin_fail,
-            put_integer: bs_create_bin_put,
-            put_binary: bs_create_bin_put,
-            put_binary_all: bs_create_bin_put,
-            put_float: bs_create_bin_put,
-            put_utf8: bs_create_bin_put,
-            put_utf16: bs_create_bin_put,
-            put_utf32: bs_create_bin_put,
-            put_string: bs_create_bin_put,
-        }
+        map_fragments().runtime()
     }
 
     fn binary_literal(&self, bytes: &[u8]) -> Result<u64, String> {
@@ -398,16 +271,8 @@ impl ModuleEnv for CorpusEnv {
     }
 }
 
-extern "C" fn arith(_: *mut ProcessHeader, _: u32, _: u64, _: u64, _: u64, _: *mut u64) -> u64 {
-    0
-}
-extern "C" fn guard(_: *mut ProcessHeader, _: u32, _: u64, _: u64) -> u64 {
-    0
-}
-extern "C" fn guard3(_: *mut ProcessHeader, _: u32, _: u64, _: u64, _: u64) -> u64 {
-    0
-}
-extern "C" fn gc(_: *mut ProcessHeader, _: *mut u64, _: usize, _: usize, _: i32) -> i32 {
+/// `erts_garbage_collect_nobump` of the corpus: the modules are compiled, never run.
+extern "C" fn gc(_: *mut ProcessHeader, _: usize, _: *mut u64, _: i32, _: i32) -> i32 {
     0
 }
 extern "C" fn map_lookup(
@@ -421,22 +286,6 @@ extern "C" fn map_lookup(
     0
 }
 extern "C" fn bif_mfa(_: *mut ProcessHeader, _: *mut u64, _: u64, _: u64, _: u64) -> u64 {
-    0
-}
-extern "C" fn bs_match(_: *mut ProcessHeader, _: u32, _: u64, _: u64, _: u64) -> u64 {
-    0
-}
-extern "C" fn map_get(_: *mut ProcessHeader, _: u64, _: u64, _: u64) -> u64 {
-    0
-}
-extern "C" fn map_many(
-    _: *mut ProcessHeader,
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-    _reg: *mut u64,
-) -> u64 {
     0
 }
 extern "C" fn exception(
@@ -598,14 +447,11 @@ fn extended_x_fixtures_compile_with_beamasm() {
     }
 }
 
-fn map_fragments(
-    get: arinsal_beamasm::map::MapGetHelper,
-    update: arinsal_beamasm::map::MapUpdateHelper,
-) -> &'static arinsal_beamasm::map::MapFragments {
+fn map_fragments() -> &'static arinsal_beamasm::map::MapFragments {
     // One set per process, as the runtime keeps one: the emitters ask for it per instruction.
     static FRAGMENTS: std::sync::OnceLock<arinsal_beamasm::map::MapFragments> =
         std::sync::OnceLock::new();
-    FRAGMENTS.get_or_init(|| arinsal_beamasm::map::MapFragments::new(get, update).unwrap())
+    FRAGMENTS.get_or_init(|| arinsal_beamasm::map::MapFragments::new(0).unwrap())
 }
 
 /// Per-module BeamAsm compile time over 200 Elixir modules (`--run-ignored all`, release).
@@ -729,4 +575,26 @@ fn beamasm_compile_time_per_module() {
             allocation_samples.iter().sum::<usize>() as f64 / total_raw_ops as f64,
         );
     }
+}
+
+/// The process-wide fragments (`ga`), built once as the VM builds them.
+fn yield_fragments() -> &'static YieldFragments {
+    YIELD_FRAGMENTS.get_or_init(|| {
+        YieldFragments::new(
+            gc as *const () as usize,
+            arinsal_vm::PROCESS_STATE_OFFSET as u32,
+        )
+        .unwrap()
+    })
+}
+
+fn raise_fragments() -> &'static RaiseFragments {
+    RAISE_FRAGMENTS.get_or_init(|| {
+        RaiseFragments::new(
+            exception as *const () as usize,
+            raise_class_for_compile as *const () as usize,
+            yield_fragments().context_switch(),
+        )
+        .unwrap()
+    })
 }

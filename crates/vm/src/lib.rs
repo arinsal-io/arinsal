@@ -48,12 +48,6 @@ mod monitor_link;
 mod process;
 mod raw;
 mod register;
-/// Run the persistent child-setup helper mode selected by the CLI.
-#[doc(hidden)]
-pub use child_setup::run_child_setup;
-/// Run one staged child exec request selected by the CLI.
-#[doc(hidden)]
-pub use child_setup::run_child_setup_exec;
 pub use process::{
     ERTS_MESSAGE_TERM_OFFSET, EntryProcess, PROCESS_FLAGS_OFFSET, PROCESS_MBUF_OFFSET,
     PROCESS_MBUF_SZ_OFFSET, PROCESS_SIGQ_CONT_OFFSET, PROCESS_SIGQ_FIRST_OFFSET,
@@ -76,7 +70,6 @@ mod trace;
 mod trace_bp;
 mod utils;
 // ---- vm_maps_bits ----
-mod bits;
 mod native_helpers;
 mod native_hooks;
 mod native_records;
@@ -85,10 +78,7 @@ pub use bif_table::has_function as bif_table_has_function;
 pub use calls::call_bif;
 pub use native_bridge::install_crash_dump;
 #[cfg(target_arch = "aarch64")]
-pub use native_hooks::{
-    arinsal_beamasm_arith, arinsal_beamasm_bif_mfa, arinsal_beamasm_gc, arinsal_beamasm_guard,
-    arinsal_beamasm_guard3, arinsal_beamasm_map_lookup,
-};
+pub use native_hooks::{arinsal_beamasm_bif_mfa, arinsal_beamasm_map_lookup};
 pub use natives::implemented_natives;
 #[doc(hidden)]
 pub use natives::tty::registered_callers as tty_registered_callers;
@@ -110,7 +100,7 @@ pub(crate) use interp::{RunState, XREG_POISON, gc_stress_enabled, xreg_poison_en
 pub(crate) use load::CodeMeta;
 pub use native_bridge::{
     NativeFile, NativeFunction, NativeLine, NativeLines, arinsal_native_raise, native_function_at,
-    register_native_function, run_native,
+    register_native_function,
 };
 pub use proc_create::Process;
 #[cfg(feature = "instr-count")]
@@ -127,25 +117,21 @@ mod boot_loop1_shared_tests {
         let mut process = Process::new();
         // `reg`, the register array the caller holds.
         let mut reg = [Term::NIL; 2];
-        process.ensure_objv(2, &mut reg[..0]).unwrap();
+        process.ensure_objv(2, &mut reg[..0]);
         let value = TermBuilder::new(&mut process.heap)
             .tuple(&[Term::NIL])
             .unwrap();
         reg[0] = value;
         reg[1] = value;
         let allocation_to_force_gc = process.heap.free_words() + 1;
-        process
-            .ensure_objv(allocation_to_force_gc, &mut reg[..1])
-            .unwrap();
+        process.ensure_objv(allocation_to_force_gc, &mut reg[..1]);
         assert_ne!(reg[0], Term::NIL);
         // Port of erts/emulator/beam/erl_gc.c (setup_rootset), OTP-29.1.1: only the live prefix
         // is rewritten and the dead registers above it are left as they are, so the stale x1 must
         // be made live again before the next, wider collection.
         reg[1] = reg[0];
         let allocation_to_force_wider_gc = process.heap.free_words() + 1;
-        process
-            .ensure_objv(allocation_to_force_wider_gc, &mut reg)
-            .unwrap();
+        process.ensure_objv(allocation_to_force_wider_gc, &mut reg);
     }
 
     #[test]

@@ -91,10 +91,7 @@ impl Task for Dummy {
                 }
             }
             {
-                ctx.proc_state().fetch_and(
-                    !arinsal_sched::psflg::ACTIVE,
-                    std::sync::atomic::Ordering::Release,
-                );
+                let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
             }
         })
     }

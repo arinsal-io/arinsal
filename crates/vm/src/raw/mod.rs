@@ -7,5 +7,3 @@ pub(crate) mod erl_process_ffi;
 pub(crate) mod gc_ffi;
 pub(crate) mod jit_ffi;
 pub(crate) mod runtime_ffi;
-#[cfg(target_os = "linux")]
-pub(crate) mod sys_time;

@@ -24,10 +24,7 @@ impl Task for Sink {
                 }
             }
             {
-                ctx.proc_state().fetch_and(
-                    !arinsal_sched::psflg::ACTIVE,
-                    std::sync::atomic::Ordering::Release,
-                );
+                let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
             }
         })
     }
@@ -321,10 +318,7 @@ impl Task for Victim {
                 };
             }
             {
-                ctx.proc_state().fetch_and(
-                    !arinsal_sched::psflg::ACTIVE,
-                    std::sync::atomic::Ordering::Release,
-                );
+                let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
             }
         })
     }

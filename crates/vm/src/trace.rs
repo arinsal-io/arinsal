@@ -678,7 +678,7 @@ pub(crate) fn clear_save_calls(process: &mut Process) {
 // Port of erts/emulator/beam/erl_trace.c:1409 (save_calls), OTP-29.1.1.
 pub(crate) fn save_call(process: &mut Process, call: SavedCall) {
     if process
-        .self_pid
+        .self_pid()
         .is_some_and(|pid| is_sensitive(process, pid))
     {
         return;
@@ -3006,7 +3006,7 @@ pub(crate) fn return_through_trace_frame(
                 .stack_get(0)
                 .and_then(Term::as_small)
                 .map(|prev| prev as u32);
-            if let Some(pid) = process.self_pid {
+            if let Some(pid) = process.self_pid() {
                 call_acc_return(process, pid, session, flags, prev);
             }
             None
@@ -3078,7 +3078,7 @@ pub(crate) fn push_native_trace_frame(
         // the need is satisfied in a fresh heap fragment and the collection is left for later.
         process.delay_heap_collection(frame_words);
     } else {
-        process.ensure_objv(frame_words, objv)?;
+        process.ensure_objv(frame_words, objv);
     }
     if !process.heap.reserve_stack(frame_words) {
         return Err(VmError::Unsupported("native trace stack limit".into()));
@@ -3716,7 +3716,7 @@ pub(crate) fn emit_process(
 fn native_trace_return(process: &mut Process, mfa: u64, value: Term, tracer: Term, session: Term) {
     // Port of erl_trace.c:1069-1070: consume the frame before resolving its tracer.
     consume_return_trace_frame(process);
-    let Some(pid) = process.self_pid else {
+    let Some(pid) = process.self_pid() else {
         return;
     };
     if tracer == Term::NIL {
@@ -3865,7 +3865,7 @@ pub extern "C" fn beam_jit_return_to_trace(
     let Some(process) = crate::native_hooks::enter_runtime(header) else {
         return;
     };
-    let Some(pid) = process.self_pid else {
+    let Some(pid) = process.self_pid() else {
         return;
     };
     let Some(weak_id) = crate::native_hooks::from_raw(session_weak_id).as_small() else {
@@ -3936,7 +3936,7 @@ pub extern "C" fn erts_call_trace_return(
     let Some(process) = crate::native_hooks::enter_runtime(header) else {
         return;
     };
-    let Some(pid) = process.self_pid else {
+    let Some(pid) = process.self_pid() else {
         return;
     };
     let Some(weak_id) = crate::native_hooks::from_raw(session_weak_id).as_small() else {

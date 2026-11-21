@@ -373,7 +373,7 @@ impl Process {
         if crate::erl_nfunc_sched::i_is_call_nif(self) {
             let job = crate::natives::nif::DirtyNifJob::new(self)?;
             let runtime = self.runtime;
-            let pid = self.self_pid;
+            let pid = self.self_pid();
             let mfa = crate::erl_nfunc_sched::trampoline_mfa(self);
             return Some(Box::new(move || {
                 let mut heap = shadow_heap();

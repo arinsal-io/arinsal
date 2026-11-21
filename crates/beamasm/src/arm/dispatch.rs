@@ -14,7 +14,6 @@ const RUNTIME_UPDATE: Update = Update::HEAP_ALLOC
     .union(Update::STACK)
     .union(Update::REDUCTIONS)
     .union(Update::X_REGS);
-const THE_NON_VALUE: u16 = 0;
 /// Port of erts/emulator/beam/erl_vm.h, OTP-29.1.1: maximum arity of a BIF written in C.
 const MAX_BIF_ARITY: usize = 4;
 pub(crate) const TRAP_REASON: u16 = 1 << 10;
@@ -61,7 +60,8 @@ pub struct CompareHelpers {
 /// Runtime helpers used by the shared native line-breakpoint fragment.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LineBreakpointHelpers {
-    /// Performs the heap check used before spilling live X registers.
+    /// The process-wide `garbage_collect` fragment (`YieldFragments::garbage_collect`), called
+    /// when the live X registers do not fit on the stack.
     pub garbage_collect: usize,
     /// Resolves the current source location and returns `erts_internal:breakpoint/4`.
     pub prepare_call: usize,
@@ -105,11 +105,13 @@ pub struct DispatchRuntimeHelpers {
     pub erts_call_nif_early: usize,
     /// Entry of `context_switch_simplified` (`YieldFragments::context_switch`).
     pub context_switch: usize,
+    /// `erts_generic_breakpoint(c_p, ci, reg)`, called by `generic_bp_local`.
+    pub erts_generic_breakpoint: usize,
+    /// erts `call_error_handler(c_p, mfa, reg, func)`, called by `debug_bp`.
+    pub debug_bp_error_handler: usize,
+    /// Entry of `raise_exception_shared` (`RaiseFragments::raise_exception_shared`).
+    pub raise_exception_shared: usize,
 }
-
-/// Identity sent through the light-BIF fragment to hand a native entry breakpoint to the
-/// executor, which owns the VM and run context that tracer modules and meta tracing need.
-pub const BREAKPOINT_DISPATCH_IDENTITY: usize = usize::MAX - 0xF5;
 
 /// Top byte of the identity a native line-breakpoint site sends through the light-BIF
 /// fragment; bits 32..48 hold the live X register count and bits 0..32 the source line.
@@ -210,6 +212,9 @@ impl DispatchFragments {
             beam_jit_call_nif: 0,
             erts_call_nif_early: 0,
             context_switch: 0,
+            erts_generic_breakpoint: 0,
+            debug_bp_error_handler: 0,
+            raise_exception_shared: 0,
         })
     }
 
@@ -233,13 +238,15 @@ impl DispatchFragments {
             beam_jit_call_nif,
             erts_call_nif_early,
             context_switch,
+            erts_generic_breakpoint,
+            debug_bp_error_handler,
+            raise_exception_shared,
         } = helpers;
         let mut code = CodeBuffer::new();
         let export = code.new_label();
         let light_bif = code.new_label();
         let light_bif_without_pointer = code.new_label();
         let breakpoint = code.new_label();
-        let breakpoint_helper = code.new_label();
         let line_breakpoint = code.new_label();
         let raise_exception = code.new_label();
         let run_process = code.new_label();
@@ -293,14 +300,18 @@ impl DispatchFragments {
         // (emit_i_breakpoint_trampoline_shared), OTP-29.1.1: the trampoline only calls this
         // fragment; it passes (c_p, identity, site) and a trap return to the helper. That is the
         // helper ABI, not ARG3/ARG4 of call_light_bif_shared.
-        code.bind(breakpoint_helper)
-            .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
-        emit_helper_fragment(&mut code, light_bif_helper, 6)
-            .map_err(|_| ExecError::InvalidSize("breakpoint fragment"))?;
         code.bind(breakpoint)
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
-        emit_breakpoint_shared(&mut code, breakpoint_helper, nif.call_nif_early)
-            .map_err(|_| ExecError::InvalidSize("breakpoint fragment"))?;
+        emit_breakpoint_shared(
+            &mut code,
+            BreakpointRuntime {
+                generic_breakpoint: erts_generic_breakpoint,
+                call_error_handler: debug_bp_error_handler,
+                raise_exception_shared,
+            },
+            nif.call_nif_early,
+        )
+        .map_err(|_| ExecError::InvalidSize("breakpoint fragment"))?;
         code.bind(line_breakpoint)
             .map_err(|_error| ExecError::InvalidSize("dispatch fragment"))?;
         let line_breakpoint_cleanup =
@@ -1593,30 +1604,59 @@ fn emit_call_light_bif_shared(
     Ok(())
 }
 
-/// Shared body of every enabled `i_breakpoint_trampoline`.
+/// Runtime functions of the breakpoint fragments.
+#[derive(Clone, Copy)]
+struct BreakpointRuntime {
+    /// `BeamInstr erts_generic_breakpoint(Process *, ErtsCodeInfo *, Eterm *)`.
+    generic_breakpoint: usize,
+    /// `const Export *call_error_handler(Process *, const ErtsCodeMFA *, Eterm *, Eterm)`.
+    call_error_handler: usize,
+    /// Entry of `raise_exception_shared` (ARG2 = pc, ARG4 = MFA).
+    raise_exception_shared: usize,
+}
+
+/// `i_breakpoint_trampoline_shared`, `generic_bp_local` and `debug_bp`.
 ///
-/// Entered by `bl` from the trampoline, so `x30` is the address behind it. The breakpoint runs
-/// through the helper fragment, then control returns to `x30`. A trapping breakpoint resumes
-/// at that address too, after the executor delivered the events.
-// Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:176-229
-// (emit_i_breakpoint_trampoline_shared) and :231-250, OTP-29.1.1.
+/// The trampoline is entered by `bl` from the function prologue, after
+/// `emit_enter_erlang_frame`, so `x30` is the address behind it.
+// Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:174-229
+// (emit_i_breakpoint_trampoline_shared) and instr_trace.cpp:60-131 (emit_generic_bp_local,
+// emit_debug_bp), OTP-29.1.1.
 fn emit_breakpoint_shared(
     code: &mut CodeBuffer,
-    helper: arinsal_a64::buf::Label,
+    runtime: BreakpointRuntime,
     call_nif_early: arinsal_a64::buf::Label,
 ) -> Result<(), BufferError> {
     const UPDATE: Update = Update::HEAP_ALLOC
         .union(Update::REDUCTIONS)
         .union(Update::X_REGS);
-    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:176-229
-    // (emit_i_breakpoint_trampoline_shared), OTP-29.1.1: dispatch on the `breakpoint_flag`
-    // of the caller's ErtsCodeInfo; x30 is the address behind the trampoline's `bl`.
     const FLAG_OFFSET: i16 = (crate::common::beam_asm_h::FUNC_INFO_BYTES
         + crate::common::beam_asm_h::BEAM_ASM_FUNC_PROLOGUE_SIZE
         - BREAKPOINT_FLAG_OFFSET) as i16;
+    // `BEAM_ASM_FUNC_PROLOGUE_SIZE + sizeof(ErtsCodeInfo)` and `+ sizeof(ErtsCodeMFA)`.
+    const TO_CODE_INFO: u16 = (crate::common::beam_asm_h::BEAM_ASM_FUNC_PROLOGUE_SIZE
+        + crate::common::beam_asm_h::FUNC_INFO_BYTES) as u16;
+    const TO_CODE_MFA: u16 = (crate::common::beam_asm_h::BEAM_ASM_FUNC_PROLOGUE_SIZE
+        + std::mem::size_of::<arinsal_term::ErtsCodeMfa>()) as u16;
+    let tmp_mem1 = crate::arm::beam_asm::tmp_mem_ref(0);
     let bp_and_nif = code.new_label();
     let nif_only = code.new_label();
     let bp_only = code.new_label();
+    let generic_bp_local = code.new_label();
+    let debug_bp = code.new_label();
+    let enter_runtime_frame = |code: &mut CodeBuffer| {
+        code.emit(|encoder| {
+            encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16)?;
+            encoder.mov_reg(Gpr::x(29), Gpr::sp())
+        })
+    };
+    let leave_runtime_frame = |code: &mut CodeBuffer| {
+        code.emit(|encoder| {
+            encoder.mov_reg(Gpr::sp(), Gpr::x(29))?;
+            encoder.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)
+        })
+    };
+
     code.emit(|encoder| {
         encoder.ldurb(Gpr::w(0), Gpr::x(30), -FLAG_OFFSET)?;
         encoder.cmp_imm(
@@ -1629,56 +1669,82 @@ fn emit_breakpoint_shared(
     code.tbnz(Gpr::x(0), 0, nif_only)?;
     code.tbnz(Gpr::x(0), 1, bp_only)?;
     code.emit(|encoder| encoder.ret(Gpr::x(30)))?;
+
     code.bind(bp_and_nif)?;
-    // emit_enter_runtime_frame, generic_bp_local, emit_leave_runtime_frame; then fall through.
-    code.emit(|encoder| {
-        encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16)?;
-        encoder.mov_reg(Gpr::x(29), Gpr::sp())
-    })?;
-    code.bl(bp_only)?;
-    code.emit(|encoder| encoder.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16))?;
+    enter_runtime_frame(code)?;
+    code.bl(generic_bp_local)?;
+    leave_runtime_frame(code)?;
+    // !! FALL THROUGH !!
     code.bind(nif_only)?;
     // call_nif_early returns on its own, unlike generic_bp_local.
     code.b(call_nif_early)?;
+
     code.bind(bp_only)?;
+    enter_runtime_frame(code)?;
+    code.bl(generic_bp_local)?;
+    leave_runtime_frame(code)?;
+    code.emit(|encoder| encoder.ret(Gpr::x(30)))?;
+
+    // generic_bp_local: the real return address is at SP+8 (the trampoline's frame).
+    code.bind(generic_bp_local)?;
+    code.emit(|encoder| {
+        encoder.ldr_uoff(Gpr::x(1), Gpr::sp(), 8)?;
+        // Stash the return address for `debug_bp`.
+        encoder.str_uoff(Gpr::x(1), Gpr::x(19), tmp_mem1)?;
+        encoder.sub_imm(Gpr::x(1), Gpr::x(1), TO_CODE_INFO, false)
+    })?;
+    enter_runtime_frame(code)?;
+    emit_enter_runtime(code, 6, UPDATE)?;
+    code.emit(|encoder| {
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        crate::arm::beam_asm::load_x_reg_array(encoder, Gpr::x(2))?;
+        encoder.mov_const(Gpr::x(17), runtime.generic_breakpoint as u64)?;
+        encoder.blr(Gpr::x(17))
+    })?;
+    emit_leave_runtime(code, 6, UPDATE)?;
+    code.emit(|encoder| {
+        encoder.cmp_imm(Gpr::x(0), arinsal_term::OP_I_DEBUG_BREAKPOINT as u16, false)
+    })?;
+    code.b_cond(Cond::Eq, debug_bp)?;
+    leave_runtime_frame(code)?;
+    code.emit(|encoder| encoder.ret(Gpr::x(30)))?;
+
+    // debug_bp: reached only from generic_bp_local, with both runtime frames entered.
+    code.bind(debug_bp)?;
     let error = code.new_label();
     code.emit(|encoder| {
-        encoder.str_uoff(
-            Gpr::x(30),
-            Gpr::x(19),
-            crate::arm::beam_asm::TRAP_RETURN_REF,
-        )?;
-        encoder.mov_const(Gpr::x(13), BREAKPOINT_DISPATCH_IDENTITY as u64)?;
-        encoder.mov_reg(Gpr::x(14), Gpr::x(30))
+        encoder.ldr_uoff(Gpr::x(1), Gpr::x(19), tmp_mem1)?;
+        encoder.sub_imm(Gpr::x(1), Gpr::x(1), TO_CODE_MFA, false)
     })?;
     emit_enter_runtime(code, 6, UPDATE)?;
     code.emit(|encoder| {
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
-        encoder.mov_reg(Gpr::x(1), Gpr::x(13))?;
-        encoder.mov_reg(Gpr::x(2), Gpr::x(14))?;
-        encoder.mov_reg(Gpr::x(3), Gpr::xzr())?;
-        encoder.str_uoff(Gpr::x(30), Gpr::x(21), 72)
-    })?;
-    code.bl(helper)?;
-    emit_leave_runtime(code, 6, UPDATE)?;
-    code.emit(|encoder| {
-        encoder.str_uoff(
-            Gpr::xzr(),
-            Gpr::x(19),
-            crate::arm::beam_asm::TRAP_RETURN_REF,
+        crate::arm::beam_asm::load_x_reg_array(encoder, Gpr::x(2))?;
+        encoder.mov_const(
+            Gpr::x(3),
+            arinsal_term::Term::atom(arinsal_term::atoms::BREAKPOINT).word(),
         )?;
-        encoder.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
-        encoder.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)
+        encoder.mov_const(Gpr::x(17), runtime.call_error_handler as u64)?;
+        encoder.blr(Gpr::x(17))
     })?;
-    code.cbnz(Gpr::x(9), error)?;
-    code.emit(|encoder| encoder.ret(Gpr::x(30)))?;
+    emit_leave_runtime(code, 6, UPDATE)?;
+    // Skip both runtime frames (ours and the trampoline's) so that the error handler's code
+    // runs instead of `call_nif_early`.
+    leave_runtime_frame(code)?;
+    leave_runtime_frame(code)?;
+    code.cbz(Gpr::x(0), error)?;
+    // emit_leave_erlang_frame; branch(emit_setup_dispatchable_call(ARG1)).
+    code.emit(|encoder| {
+        encoder.ldr_post(Gpr::x(30), Gpr::x(20), 8)?;
+        encoder.ldr_regoff(Gpr::x(8), Gpr::x(0), Gpr::x(24), 3)?;
+        encoder.br(Gpr::x(8))
+    })?;
     code.bind(error)?;
     code.emit(|encoder| {
-        encoder.sub_imm(Gpr::x(30), Gpr::x(30), 4, false)?;
-        encoder.str_uoff(Gpr::x(30), Gpr::x(19), crate::arm::beam_asm::tmp_mem_ref(6))?;
-        encoder.mov_reg(Gpr::x(0), Gpr::xzr())?;
-        encoder.ldr_uoff(Gpr::x(30), Gpr::x(19), crate::arm::beam_asm::tmp_mem_ref(4))?;
-        encoder.br(Gpr::x(30))
+        encoder.ldr_uoff(Gpr::x(1), Gpr::x(19), tmp_mem1)?;
+        encoder.mov_const(Gpr::x(3), 0)?;
+        encoder.mov_const(Gpr::x(17), runtime.raise_exception_shared as u64)?;
+        encoder.br(Gpr::x(17))
     })
 }
 
@@ -1819,77 +1885,6 @@ fn emit_nif_fragments(
     Ok(())
 }
 
-// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:527-540, OTP-29.1.1.
-fn emit_helper_fragment(
-    code: &mut CodeBuffer,
-    helper: usize,
-    live: usize,
-) -> Result<(), BufferError> {
-    code.emit(|encoder| {
-        encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16)?;
-        encoder.mov_reg(Gpr::x(29), Gpr::sp())?;
-        Ok(())
-    })?;
-    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:459-601, OTP-29.1.1.
-    emit_enter_runtime(code, live, RUNTIME_UPDATE)?;
-    code.emit(|encoder| {
-        // Port of beam_asm.hpp:437-440 (emit_enter_runtime_frame), OTP-29.1.1.
-        // `reg` after the helper's (c_p, identity, site, export).
-        crate::arm::beam_asm::load_x_reg_array(encoder, Gpr::x(4))?;
-        encoder.mov_const(Gpr::x(17), helper as u64)?;
-        encoder.blr(Gpr::x(17))?;
-        Ok(())
-    })?;
-    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:539-601, OTP-29.1.1.
-    emit_leave_runtime(code, live, RUNTIME_UPDATE)?;
-    let normal = code.new_label();
-    let trap = code.new_label();
-    code.emit(|encoder| encoder.cmp_imm(Gpr::x(0), THE_NON_VALUE, false))?;
-    code.b_cond(arinsal_a64::enc::Cond::Ne, normal)?;
-    code.emit(|encoder| {
-        encoder.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)?;
-        encoder.cmp_imm(Gpr::x(9), TRAP_REASON, false)
-    })?;
-    code.b_cond(arinsal_a64::enc::Cond::Ne, normal)?;
-    code.bind(trap)?;
-    code.emit(|encoder| {
-        // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:533-540, OTP-29.1.1.
-        // The context switch resumes at c_p->i; its caller continuation stays on E.
-        // That continuation is the call site's trap return, where the trap target
-        // returns its result in XREG0; sites without one resume behind this call.
-        encoder.ldr_uoff(
-            Gpr::x(17),
-            Gpr::x(19),
-            crate::arm::beam_asm::TRAP_RETURN_REF,
-        )?;
-        encoder.str_uoff(
-            Gpr::xzr(),
-            Gpr::x(19),
-            crate::arm::beam_asm::TRAP_RETURN_REF,
-        )?;
-        Ok(())
-    })?;
-    let continuation = code.new_label();
-    code.cbnz(Gpr::x(17), continuation)?;
-    code.emit(|encoder| encoder.ldr_uoff(Gpr::x(17), Gpr::sp(), 8))?;
-    code.bind(continuation)?;
-    code.emit(|encoder| {
-        encoder.str_pre(Gpr::x(17), Gpr::x(20), -8)?;
-        encoder.ldr_uoff(Gpr::x(1), Gpr::x(21), 72)?;
-        encoder.mov_reg(Gpr::x(2), Gpr::x(17))?;
-        encoder.mov_reg(Gpr::x(9), Gpr::xzr())?;
-        encoder.str_uoff(Gpr::x(9), Gpr::x(21), 40)?;
-        encoder.mov_const(Gpr::x(0), 2)
-    })?;
-    emit_restore_and_exit(code)?;
-    code.bind(normal)?;
-    code.emit(|encoder| {
-        encoder.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)?;
-        encoder.ret(Gpr::x(30))
-    })?;
-    Ok(())
-}
-
 // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:257-334
 // (emit_i_line_breakpoint_trampoline_shared), OTP-29.1.1.
 fn emit_line_breakpoint_shared(
@@ -1899,7 +1894,6 @@ fn emit_line_breakpoint_shared(
     let after_gc = code.new_label();
     let no_handler = code.new_label();
     let cleanup = code.new_label();
-    let error = code.new_label();
     let exit = code.new_label();
     let live_slot = tmp_mem_offset(0);
     let pc_slot = tmp_mem_offset(1);
@@ -1916,37 +1910,25 @@ fn emit_line_breakpoint_shared(
         encoder.str_uoff(Gpr::x(0), Gpr::x(19), native_error_pc_slot)?;
         encoder.lsl_imm(Gpr::x(9), Gpr::x(8), 3)?;
         encoder.str_uoff(Gpr::x(9), Gpr::x(19), stack_needed_slot)?;
+        // ARG4 = live; ARG3 = stack-needed + S_RESERVED * sizeof(Eterm) + HTOP.
+        encoder.mov_reg(Gpr::x(3), Gpr::x(8))?;
         encoder.add_imm(
-            Gpr::x(10),
+            Gpr::x(2),
             Gpr::x(9),
             (arinsal_term::S_RESERVED * 8) as u16,
             false,
         )?;
-        encoder.add_reg(Gpr::x(10), Gpr::x(10), Gpr::x(23), Shift::Lsl, 0)?;
-        encoder.cmp_reg(Gpr::x(10), Gpr::x(20), Shift::Lsl, 0)
+        encoder.add_reg(Gpr::x(2), Gpr::x(2), Gpr::x(23), Shift::Lsl, 0)?;
+        encoder.cmp_reg(Gpr::x(2), Gpr::x(20), Shift::Lsl, 0)
     })?;
     code.b_cond(Cond::Ls, after_gc)?;
-
-    // The global assembler always emits this fragment (beam_asm_global.hpp.pl lists
-    // `i_line_breakpoint_trampoline_shared`). Helper addresses are immediates filled by
-    // the VM; unit tests that never enter the fragment pass zeros.
-    emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:288-292
+    // (`aligned_call(labels[garbage_collect])`), OTP-29.1.1: the global fragment collects, and
+    // a process the collection made exit leaves through `do_schedule` from inside it.
     code.emit(|encoder| {
-        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
-        crate::arm::beam_asm::load_x_reg_array(encoder, Gpr::x(1))?;
-        encoder.ldr_uoff(Gpr::x(2), Gpr::x(19), live_slot)?;
-        encoder.mov_reg(Gpr::x(3), Gpr::x(2))?;
-        encoder.mov_reg(Gpr::w(4), Gpr::w(22))?;
         encoder.mov_const(Gpr::x(17), helpers.garbage_collect as u64)?;
         encoder.blr(Gpr::x(17))
     })?;
-    emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
-    code.emit(|encoder| {
-        encoder.sub_reg(Gpr::w(22), Gpr::w(22), Gpr::w(0), Shift::Lsl, 0)?;
-        encoder.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)?;
-        encoder.cmp_imm(Gpr::x(9), 0, false)
-    })?;
-    code.b_cond(Cond::Ne, error)?;
 
     code.bind(after_gc)?;
     code.emit(|encoder| {
@@ -1995,23 +1977,11 @@ fn emit_line_breakpoint_shared(
         encoder.ret(Gpr::x(30))
     })?;
 
-    code.bind(error)?;
-    code.emit(|encoder| {
-        encoder.mov_reg(Gpr::x(0), Gpr::xzr())?;
-        encoder.mov_const(Gpr::x(17), arinsal_enter_native_return as *const () as u64)?;
-        encoder.br(Gpr::x(17))
-    })?;
     Ok(cleanup)
 }
 
 fn tmp_mem_offset(index: usize) -> u32 {
     crate::arm::beam_asm::tmp_mem_ref(index)
-}
-
-// Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:context_switch_simplified,
-// OTP-29.1.1.
-fn emit_restore_and_exit(code: &mut CodeBuffer) -> Result<(), BufferError> {
-    emit_restore_and_exit_frame(code, 16)
 }
 
 /// [`emit_restore_and_exit`] for a host frame of `frame_bytes`.

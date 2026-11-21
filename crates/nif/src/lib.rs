@@ -405,23 +405,20 @@ impl HeapAlloc for EnvHeap {
         writable: bool,
         overhead_words: u64,
         owner: Option<arinsal_term::OwnedBinaryRef>,
-    ) -> Result<(), arinsal_term::TermError> {
+    ) {
         env_heap_forward!(self, h => h.link_bin_ref(bin_ref, writable, overhead_words, owner))
     }
     fn add_bin_vheap(&mut self, words: u64) {
         env_heap_forward!(self, h => h.add_bin_vheap(words))
     }
-    fn retain_writable_binary(
-        &mut self,
-        x: Arc<WritableBinary>,
-    ) -> Result<(), arinsal_term::TermError> {
+    fn retain_writable_binary(&mut self, x: Arc<WritableBinary>) {
         env_heap_forward!(self, h => h.retain_writable_binary(x))
     }
     fn retain_writable_binary_with_apparent_size(
         &mut self,
         x: Arc<WritableBinary>,
         apparent_size_bits: usize,
-    ) -> Result<(), arinsal_term::TermError> {
+    ) {
         env_heap_forward!(self, h => h.retain_writable_binary_with_apparent_size(x, apparent_size_bits))
     }
     fn update_writable_binary_overhead(
@@ -435,11 +432,7 @@ impl HeapAlloc for EnvHeap {
     fn supports_writable_binary(&self) -> bool {
         env_heap_forward_ref!(self, h => h.supports_writable_binary())
     }
-    fn link_external_binary(
-        &mut self,
-        bin_ref: *mut u64,
-        x: Arc<ExternalBinary>,
-    ) -> Result<(), arinsal_term::TermError> {
+    fn link_external_binary(&mut self, bin_ref: *mut u64, x: Arc<ExternalBinary>) {
         env_heap_forward!(self, h => h.link_external_binary(bin_ref, x))
     }
     fn supports_external_binary(&self) -> bool {
@@ -448,11 +441,7 @@ impl HeapAlloc for EnvHeap {
     fn link_node(&mut self, thing: *mut u64, x: Node) {
         env_heap_forward!(self, h => h.link_node(thing, x))
     }
-    fn link_magic_ref(
-        &mut self,
-        thing: *mut u64,
-        x: MagicBin,
-    ) -> Result<(), arinsal_term::TermError> {
+    fn link_magic_ref(&mut self, thing: *mut u64, x: MagicBin) {
         env_heap_forward!(self, h => h.link_magic_ref(thing, x))
     }
     fn supports_magic(&self) -> bool {

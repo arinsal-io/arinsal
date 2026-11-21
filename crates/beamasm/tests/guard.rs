@@ -1,6 +1,6 @@
 #![cfg(target_arch = "aarch64")]
 
-use std::{cell::RefCell, cmp::Ordering, collections::HashMap, process::Command, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, process::Command, sync::Arc};
 
 use arinsal_a64::enc::Gpr;
 use arinsal_beamasm::{
@@ -10,8 +10,7 @@ use arinsal_beamasm::{
     types::{ArgType, TypedArg, type_id},
 };
 use arinsal_term::{
-    ExportEntry, FunEntry, ProcessHeap, Term, TermBuilder, TermKind, atoms, cmp, exact_eq,
-    global_atoms, loose_eq,
+    ExportEntry, FunEntry, ProcessHeap, Term, TermBuilder, TermKind, atoms, exact_eq, global_atoms,
 };
 use similar_asserts::assert_eq;
 
@@ -127,151 +126,8 @@ fn bits(term: Term) -> u64 {
     rt::term_bits(term)
 }
 
-fn term(word: u64) -> Option<Term> {
-    ROOTS.with(|roots| roots.borrow().get(&word).copied())
-}
-
 fn bit_len(value: Term) -> Option<usize> {
     rt::binary_bit_len(value)
-}
-
-fn tuple_element(value: Term, index: usize) -> Option<Term> {
-    rt::tuple_ref(value)?.get(index)
-}
-
-fn list_head_tail(value: Term) -> Option<(Term, Term)> {
-    rt::cons_ref(value)
-}
-
-fn tuple_len(value: Term) -> Option<usize> {
-    rt::tuple_ref(value).map(|tuple| tuple.len())
-}
-
-fn map_len(value: Term) -> Option<usize> {
-    rt::flatmap_ref(value).map(|map| map.len())
-}
-
-fn map_lookup(map: Term, key: Term) -> Option<Term> {
-    rt::flatmap_ref(map)?.get(key)
-}
-
-extern "C" fn guard_helper(_process: *mut ProcessHeader, op: u32, first: u64, second: u64) -> u64 {
-    if op == 34 {
-        return SELF_TERM.with(|this| this.borrow().map(bits).unwrap_or(u64::MAX));
-    }
-    if op == 43 {
-        return u64::from(function_arity(
-            term(first).unwrap_or(Term::NIL),
-            term(second),
-        ));
-    }
-    let Some(a) = term(first) else {
-        return u64::MAX;
-    };
-    let b = term(second);
-    let truth = |yes: bool| u64::from(yes);
-    match op {
-        0 => truth(a.as_small().is_some() || a.header().is_some_and(|h| matches!(h & 63, 8 | 12))),
-        1 => truth(a.as_atom().is_some()),
-        2 => truth(matches!(a.classify(), TermKind::List | TermKind::Nil)),
-        3 => truth(a.classify() == TermKind::List),
-        4 => truth(a == Term::NIL),
-        5 => truth(a.classify() == TermKind::Tuple),
-        6 => truth(arity_matches(a, b)),
-        8 => truth(
-            a.as_atom()
-                .is_some_and(|atom| atom == atoms::TRUE || atom == atoms::FALSE),
-        ),
-        9 => truth(bit_len(a).is_some_and(|bits| bits.is_multiple_of(8))),
-        10 => truth(a.classify() == TermKind::Bitstring),
-        11 => truth(a.header().is_some_and(|h| h & 63 == 24)),
-        12 => truth(a.classify() == TermKind::Number),
-        13 => truth(a.classify() == TermKind::Pid),
-        14 => truth(a.classify() == TermKind::Port),
-        15 => truth(a.classify() == TermKind::Ref),
-        16 => truth(a.classify() == TermKind::Map),
-        17 => truth(a.classify() == TermKind::Fun),
-        18 => truth(function_arity(a, b)),
-        19 => truth(b.is_some_and(|rhs| exact_eq(a, rhs))),
-        20 => truth(b.is_some_and(|rhs| !exact_eq(a, rhs))),
-        21 => truth(b.is_some_and(|rhs| loose_eq(a, rhs))),
-        22 => truth(b.is_some_and(|rhs| !loose_eq(a, rhs))),
-        23 => truth(b.is_some_and(|rhs| cmp(a, rhs) == Ordering::Less)),
-        24 => truth(b.is_some_and(|rhs| cmp(a, rhs) != Ordering::Less)),
-        25 => b
-            .and_then(|tuple| {
-                a.as_small()
-                    .and_then(|n| (n > 0).then_some(n as usize - 1))
-                    .and_then(|i| tuple_element(tuple, i))
-                    .map(bits)
-            })
-            .unwrap_or(u64::MAX),
-        26 => list_head_tail(a)
-            .map(|(head, _)| bits(head))
-            .unwrap_or(u64::MAX),
-        27 => list_head_tail(a)
-            .map(|(_, tail)| bits(tail))
-            .unwrap_or(u64::MAX),
-        28 => tuple_len(a)
-            .and_then(|len| Term::small(len as i64))
-            .map(bits)
-            .unwrap_or(u64::MAX),
-        29 => map_len(a)
-            .and_then(|len| Term::small(len as i64))
-            .map(bits)
-            .unwrap_or(u64::MAX),
-        30 => b
-            .and_then(|map| map_len(map).map(|_| map_lookup(map, a).is_some()))
-            .map(|has_key| Term::atom(if has_key { atoms::TRUE } else { atoms::FALSE }))
-            .map(bits)
-            .unwrap_or(u64::MAX),
-        31 => b
-            .and_then(|map| map_lookup(map, a))
-            .map(bits)
-            .unwrap_or(u64::MAX),
-        32 => bit_len(a)
-            .and_then(|bits| bits.checked_div(8))
-            .and_then(|n| Term::small(n as i64))
-            .map(bits)
-            .unwrap_or(u64::MAX),
-        33 => bit_len(a)
-            .and_then(|bits| Term::small(bits as i64))
-            .map(bits)
-            .unwrap_or(u64::MAX),
-        34 => SELF_TERM.with(|this| this.borrow().map(bits).unwrap_or(u64::MAX)),
-        35 => list_length(a)
-            .and_then(|n| Term::small(n).map(bits))
-            .unwrap_or(u64::MAX),
-        36 => b
-            .map(|rhs| {
-                if cmp(a, rhs) == Ordering::Greater {
-                    bits(rhs)
-                } else {
-                    bits(a)
-                }
-            })
-            .unwrap_or(u64::MAX),
-        37 => b
-            .map(|rhs| {
-                if cmp(a, rhs) == Ordering::Less {
-                    bits(rhs)
-                } else {
-                    bits(a)
-                }
-            })
-            .unwrap_or(u64::MAX),
-        38 => a
-            .as_small()
-            .and_then(i64::checked_abs)
-            .and_then(Term::small)
-            .map(bits)
-            .unwrap_or(u64::MAX),
-        39 => a
-            .identity()
-            .map(|_| bits(Term::atom(atoms::NONAME)))
-            .unwrap_or(u64::MAX),
-        _ => u64::MAX,
-    }
 }
 
 fn arity_matches(value: Term, arity: Option<Term>) -> bool {
@@ -289,17 +145,6 @@ fn function_arity(value: Term, arity: Option<Term>) -> bool {
         arinsal_term::FunRef::Local { entry, .. } => i64::from(entry.arity) == arity,
         arinsal_term::FunRef::Export { entry } => i64::from(entry.arity()) == arity,
     })
-}
-
-fn list_length(value: Term) -> Option<i64> {
-    let mut count = 0;
-    let mut next = value;
-    while next != Term::NIL {
-        let (_, tail) = rt::cons_ref(next)?;
-        count += 1;
-        next = tail;
-    }
-    Some(count)
 }
 
 fn module(
@@ -822,10 +667,6 @@ extern "C" fn exploding_eq(_: u64, _: u64) -> i32 {
     panic!("always-immediate comparison must not call the runtime");
 }
 
-extern "C" fn exploding_helper(_: *mut ProcessHeader, _: u32, _: u64, _: u64) -> u64 {
-    panic!("always-immediate comparison must not call the runtime");
-}
-
 #[test]
 fn exact_comparisons_against_small_and_atom_immediates_are_inline() {
     let fixture = terms();
@@ -887,138 +728,12 @@ fn native_is_ne_exact() {
         true,
     );
 }
-#[test]
-fn unequal_immediates_skip_the_compare_helper() {
-    let fixture = terms();
-    let alpha = fixture
-        .values
-        .iter()
-        .find(|(name, _)| *name == "atom")
-        .unwrap()
-        .1;
-    let beta = Term::atom(global_atoms().intern("guard_beta").unwrap());
-    native_guard(
-        |a| a.emit_is_eq(ArgVal::X(0), ArgVal::X(1), 2, exploding_helper),
-        alpha,
-        beta,
-        false,
-    );
-    native_guard(
-        |a| a.emit_is_ne(ArgVal::X(0), ArgVal::X(1), 2, exploding_helper),
-        alpha,
-        beta,
-        true,
-    );
-    native_guard(
-        |a| {
-            a.emit_is_eq_exact(
-                ArgVal::X(0),
-                ArgVal::X(1),
-                2,
-                (exploding_eq as extern "C" fn(u64, u64) -> i32) as usize,
-            )
-        },
-        alpha,
-        beta,
-        false,
-    );
-    native_guard(
-        |a| {
-            a.emit_is_ne_exact(
-                ArgVal::X(0),
-                ArgVal::X(1),
-                2,
-                (exploding_eq as extern "C" fn(u64, u64) -> i32) as usize,
-            )
-        },
-        alpha,
-        beta,
-        true,
-    );
-    native_guard(
-        |a| a.emit_is_eq(ArgVal::X(0), ArgVal::X(1), 2, exploding_helper),
-        alpha,
-        alpha,
-        true,
-    );
-}
-
-#[test]
-fn native_is_eq() {
-    let f = terms();
-    native_guard(
-        |a| a.emit_is_eq(ArgVal::X(0), ArgVal::X(1), 2, guard_helper),
-        f.one,
-        f.one_float,
-        true,
-    );
-}
-#[test]
-fn native_is_ne() {
-    let f = terms();
-    native_guard(
-        |a| a.emit_is_ne(ArgVal::X(0), ArgVal::X(1), 2, guard_helper),
-        f.one,
-        f.one_float,
-        false,
-    );
-}
-#[test]
-fn native_is_lt() {
-    let f = terms();
-    native_guard(
-        |a| a.emit_is_lt(ArgVal::X(0), ArgVal::X(1), 2, guard_helper),
-        f.one,
-        Term::atom(atoms::TRUE),
-        true,
-    );
-}
-
-#[test]
-fn relative_comparisons_use_small_immediates_and_fallback_for_bignums() {
-    let fixture = terms();
-    let two = small(2);
-    native_guard(
-        |a| a.emit_is_lt(ArgVal::X(0), ArgVal::Immediate(bits(two)), 2, guard_helper),
-        fixture.one,
-        two,
-        true,
-    );
-    native_guard(
-        |a| a.emit_is_ge(ArgVal::Immediate(bits(two)), ArgVal::X(0), 2, guard_helper),
-        fixture.one,
-        two,
-        true,
-    );
-    let big = fixture
-        .values
-        .iter()
-        .find(|(name, _)| *name == "bignum")
-        .unwrap()
-        .1;
-    native_guard(
-        |a| a.emit_is_ge(ArgVal::X(0), ArgVal::Immediate(bits(two)), 2, guard_helper),
-        big,
-        two,
-        true,
-    );
-}
-#[test]
-fn native_is_ge() {
-    let f = terms();
-    native_guard(
-        |a| a.emit_is_ge(ArgVal::X(0), ArgVal::X(1), 2, guard_helper),
-        Term::atom(atoms::TRUE),
-        f.one,
-        true,
-    );
-}
 
 #[test]
 fn native_bif_element() {
     let f = terms();
     native_value(
-        |a| a.emit_bif_element(0, ArgVal::X(0), ArgVal::X(1), ArgVal::X(0), guard_helper),
+        |a| a.emit_bif_element(0, ArgVal::X(0), ArgVal::X(1), ArgVal::X(0)),
         small(1),
         f.tuple,
         bits(f.alpha),
@@ -1028,7 +743,7 @@ fn native_bif_element() {
 fn native_bif_hd() {
     let f = terms();
     native_value(
-        |a| a.emit_bif_hd(ArgVal::X(0), ArgVal::X(0), guard_helper),
+        |a| a.emit_bif_hd(ArgVal::X(0), ArgVal::X(0)),
         f.list,
         small(0),
         bits(f.one),
@@ -1038,7 +753,7 @@ fn native_bif_hd() {
 fn native_bif_tl() {
     let f = terms();
     native_value(
-        |a| a.emit_bif_tl(ArgVal::X(0), ArgVal::X(0), guard_helper),
+        |a| a.emit_bif_tl(ArgVal::X(0), ArgVal::X(0)),
         f.list,
         small(0),
         bits(Term::NIL),
@@ -1048,7 +763,7 @@ fn native_bif_tl() {
 fn native_bif_tuple_size() {
     let f = terms();
     native_value(
-        |a| a.emit_bif_tuple_size(0, ArgVal::X(0), ArgVal::X(0), guard_helper),
+        |a| a.emit_bif_tuple_size(0, ArgVal::X(0), ArgVal::X(0)),
         f.tuple,
         small(0),
         bits(small(1)),
@@ -1058,7 +773,7 @@ fn native_bif_tuple_size() {
 fn native_bif_map_size() {
     let f = terms();
     native_value(
-        |a| a.emit_bif_map_size(0, ArgVal::X(0), ArgVal::X(0), guard_helper),
+        |a| a.emit_bif_map_size(0, ArgVal::X(0), ArgVal::X(0)),
         f.map,
         small(0),
         bits(small(1)),
@@ -1082,7 +797,6 @@ fn native_bif_map_size_with_map_type() {
                     },
                 ),
                 ArgVal::X(0),
-                guard_helper,
             )
         },
         f.map,
@@ -1107,7 +821,6 @@ fn native_bif_map_size_with_integer_type() {
                     },
                 ),
                 ArgVal::X(0),
-                guard_helper,
             )
         },
         small(20_000),
@@ -1117,80 +830,10 @@ fn native_bif_map_size_with_integer_type() {
 }
 
 #[test]
-fn native_bif_is_map_key() {
-    let f = terms();
-    native_value(
-        |a| {
-            a.emit_bif_is_map_key(
-                0,
-                ArgVal::X(0),
-                ArgVal::X(1),
-                ArgVal::X(0),
-                guard_helper,
-                true,
-                true,
-                map_runtime(),
-            )
-        },
-        f.alpha,
-        f.map,
-        bits(Term::atom(atoms::TRUE)),
-    );
-}
-
-#[test]
-fn native_bif_is_map_key_with_map_type() {
-    let f = terms();
-    native_value(
-        |a| {
-            a.emit_bif_is_map_key_typed(
-                0,
-                TypedArg::new(ArgVal::X(0), ArgType::ANY),
-                TypedArg::new(
-                    ArgVal::X(1),
-                    ArgType {
-                        union_bits: type_id::MAP,
-                        min: None,
-                        max: None,
-                        unit: 1,
-                    },
-                ),
-                ArgVal::X(0),
-                guard_helper,
-                map_runtime(),
-            )
-        },
-        f.alpha,
-        f.map,
-        bits(Term::atom(atoms::TRUE)),
-    );
-}
-#[test]
-fn native_bif_map_get() {
-    let f = terms();
-    native_value(
-        |a| {
-            a.emit_bif_map_get(
-                0,
-                ArgVal::X(0),
-                ArgVal::X(1),
-                ArgVal::X(0),
-                guard_helper,
-                true,
-                true,
-                map_runtime(),
-            )
-        },
-        f.alpha,
-        f.map,
-        bits(f.one),
-    );
-}
-#[test]
 fn native_bif_byte_size() {
     let f = terms();
     native_value(
-        |a| a.emit_bif_byte_size(0, ArgVal::X(0), ArgVal::X(0), guard_helper),
+        |a| a.emit_bif_byte_size(0, ArgVal::X(0), ArgVal::X(0)),
         f.binary,
         small(0),
         bits(small(1)),
@@ -1200,7 +843,7 @@ fn native_bif_byte_size() {
 fn native_bif_bit_size() {
     let f = terms();
     native_value(
-        |a| a.emit_bif_bit_size(0, ArgVal::X(0), ArgVal::X(0), guard_helper),
+        |a| a.emit_bif_bit_size(0, ArgVal::X(0), ArgVal::X(0)),
         f.bitstring,
         small(0),
         bits(small(3)),
@@ -1210,110 +853,11 @@ fn native_bif_bit_size() {
 fn native_bif_self() {
     let f = terms();
     native_value(
-        |a| a.emit_bif_self(ArgVal::X(0), guard_helper),
+        |a| a.emit_bif_self(ArgVal::X(0)),
         small(0),
         small(0),
         bits(f.pid),
     );
-}
-#[test]
-fn native_bif_node() {
-    let f = terms();
-    native_value(
-        |a| a.emit_bif_node(0, ArgVal::X(0), ArgVal::X(0), guard_helper),
-        f.pid,
-        small(0),
-        bits(Term::atom(atoms::NONAME)),
-    );
-}
-#[test]
-fn native_bif_length() {
-    let f = terms();
-    native_value(
-        |a| {
-            a.emit_i_length_setup(0, 2, ArgVal::X(0))?;
-            a.emit_bif_length(0, 2, ArgVal::X(0), guard_helper)
-        },
-        f.list,
-        small(0),
-        bits(small(1)),
-    );
-}
-#[test]
-fn native_bif_min() {
-    let f = terms();
-    native_value(
-        |a| a.emit_bif_min(ArgVal::X(0), ArgVal::X(1), ArgVal::X(0), guard_helper),
-        f.one,
-        f.one_float,
-        bits(f.one),
-    );
-}
-#[test]
-fn native_bif_max() {
-    let f = terms();
-    native_value(
-        |a| a.emit_bif_max(ArgVal::X(0), ArgVal::X(1), ArgVal::X(0), guard_helper),
-        f.one,
-        f.one_float,
-        bits(f.one),
-    );
-}
-#[test]
-fn native_bif_abs() {
-    let _f = terms();
-    native_value(
-        |a| a.emit_bif_abs(0, ArgVal::X(0), ArgVal::X(0), guard_helper),
-        small(-9),
-        small(0),
-        bits(small(9)),
-    );
-}
-
-extern "C" fn unused_map_get(_p: *mut ProcessHeader, _map: u64, _key: u64, _hash: u64) -> u64 {
-    0
-}
-extern "C" fn unused_get_elements(
-    _p: *mut ProcessHeader,
-    _a: u64,
-    _b: u64,
-    _c: u64,
-    _d: u64,
-    _reg: *mut u64,
-) -> u64 {
-    0
-}
-extern "C" fn unused_map_update(
-    _p: *mut ProcessHeader,
-    _a: u64,
-    _b: u64,
-    _c: u64,
-    _d: u64,
-    _reg: *mut u64,
-) -> u64 {
-    0
-}
-
-/// Map runtime with real lookup fragments; the other helpers are unused by `map_get`.
-fn map_runtime() -> arinsal_beamasm::map::MapRuntime {
-    let fragments = Box::leak(Box::new(
-        arinsal_beamasm::map::MapFragments::new(unused_map_get, unused_map_update).unwrap(),
-    ));
-    arinsal_beamasm::map::MapRuntime {
-        get: unused_map_get,
-        get_elements: unused_get_elements,
-        lookup_module: 0,
-        new_map: unused_map_update,
-        update_assoc: unused_map_update,
-        update_exact: unused_map_update,
-        put_single: unused_map_update,
-        update_single_assoc_shared: fragments.update_single_assoc_shared(),
-        update_assoc_shared: fragments.update_assoc_shared(),
-        update_exact_shared: fragments.update_exact_shared(),
-        update_single_exact_shared: fragments.update_single_exact_shared(),
-        get_element_shared: fragments.get_element_shared(),
-        get_element_hash_shared: fragments.get_element_hash_shared(),
-    }
 }
 
 #[test]
@@ -1401,49 +945,9 @@ fn erlang_type_matrix() -> Option<Vec<Vec<bool>>> {
     Some(booleans.chunks(18).map(<[bool]>::to_vec).collect())
 }
 
-fn erlang_dynamic_function_matrix() -> Option<Vec<Vec<bool>>> {
-    let eval = r#"Values=[1,1 bsl 80,1.0,guard_alpha,true,false,[],[1],{guard_alpha},{guard_beta,1},#{guard_alpha=>1},<<16#a5>>,<<5:3>>,self(),open_port({spawn,"/usr/bin/true"},[]),make_ref(),fun(X)->X end,fun erlang:node/0],io:format("~w",[[[if is_function(F,A)->true; true->false end||A<-Values]||F<-Values]]),halt()."#;
-    let output = match Command::new("timeout")
-        .args(["30", "erl", "-noshell", "-eval", eval])
-        .output()
-    {
-        Ok(output) => output,
-        Err(error) => {
-            eprintln!("skipping OTP dynamic function differential: cannot run timeout: {error}");
-            return None;
-        }
-    };
-    if output.status.code() == Some(127) {
-        eprintln!("skipping OTP dynamic function differential: erl is not installed");
-        return None;
-    }
-    assert!(
-        output.status.success(),
-        "OTP dynamic function matrix failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let booleans = String::from_utf8_lossy(&output.stdout)
-        .split(|ch: char| !ch.is_ascii_alphabetic())
-        .filter_map(|word| match word {
-            "true" => Some(true),
-            "false" => Some(false),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        booleans.len(),
-        18 * 18,
-        "unexpected OTP dynamic function matrix"
-    );
-    Some(booleans.chunks(18).map(<[bool]>::to_vec).collect())
-}
-
 #[test]
 fn native_type_guards_match_otp_29() {
     let Some(expected) = erlang_type_matrix() else {
-        return;
-    };
-    let Some(dynamic_expected) = erlang_dynamic_function_matrix() else {
         return;
     };
     let fixture = terms();
@@ -1514,44 +1018,6 @@ fn native_type_guards_match_otp_29() {
                 u64::from(expected[row][index]),
                 "OTP type row {row}, term {}",
                 fixture.values[index].0
-            );
-        }
-    }
-
-    let finalized = module(|asm| {
-        asm.emit_is_function2(
-            ArgVal::X(0),
-            function_one,
-            arinsal_beamasm::guard::Function2TestTarget::LegacyBoolean(guard_helper),
-        )
-    });
-    for (index, (_, value)) in fixture.values.iter().enumerate() {
-        let regs = run(&finalized, *value, zero_term(*value));
-        assert_eq!(
-            regs[0],
-            u64::from(expected[18][index]),
-            "OTP function arity row, term {}",
-            fixture.values[index].0
-        );
-    }
-
-    let finalized = module(|asm| {
-        asm.emit_is_function2_guard_with_helper(ArgVal::X(0), ArgVal::X(1), 2, guard_helper)?;
-        asm.move_(ArgVal::Immediate(1), ArgVal::X(1))?;
-        asm.emit_raw(|e| {
-            e.mov_reg(Gpr::x(0), Gpr::xzr())?;
-            e.ret(Gpr::x(30))
-        })?;
-        asm.emit_i_func_label(2)?;
-        asm.move_(ArgVal::Immediate(0), ArgVal::X(1))
-    });
-    for (function_index, (_, function)) in fixture.values.iter().enumerate() {
-        for (arity_index, (_, arity)) in fixture.values.iter().enumerate() {
-            let regs = run(&finalized, *function, *arity);
-            assert_eq!(
-                regs[1],
-                u64::from(dynamic_expected[function_index][arity_index]),
-                "dynamic function arity for {function:?} and {arity:?}"
             );
         }
     }

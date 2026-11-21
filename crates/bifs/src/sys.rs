@@ -1,14 +1,11 @@
 //! Operating-system and stable runtime information BIFs.
 
 use std::ffi::OsString;
-use std::time::Instant;
 
 use arinsal_term::{Term, TermBuilder, global_atoms};
 
 use crate::pure::Heap;
 use crate::{BifError, Ctx};
-
-static PERF_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
 pub(super) fn lookup<V: crate::BifTableVisitor>(
     module: &str,
@@ -20,7 +17,6 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("erts_internal", "no_aux_work_threads", 0) => v.entry::<bodies::no_aux_work_threads>(),
         ("os", "getenv", 1) => v.entry::<bodies::getenv>(),
         ("os", "getpid", 0) => v.entry::<bodies::getpid>(),
-        ("os", "perf_counter", 0) => v.entry::<bodies::perf_counter>(),
         _ => return None,
     };
     if module == "os" || arinsal_spec::bif_lookup(module, name, arity).is_some() {
@@ -83,18 +79,6 @@ fn getpid_result(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     // SAFETY: getpid has no preconditions and does not retain pointers.
     string(ctx, &unsafe { libc::getpid() }.to_string())
 }
-/// The performance counter in nanoseconds (`erts_sys_perf_counter`); native
-/// `os:perf_counter/0` calls it directly.
-// Port of erts/emulator/sys/unix/erl_unix_sys.h:286-296 (erts_sys_perf_counter), OTP-29.1.1.
-pub extern "C" fn sys_perf_counter() -> u64 {
-    let nanos = PERF_START.get_or_init(Instant::now).elapsed().as_nanos();
-    u64::try_from(nanos).unwrap_or(u64::MAX)
-}
-
-fn perf_counter_result(ctx: &mut Ctx<'_>, _args: &[Term]) -> Result<Term, BifError> {
-    integer(ctx, sys_perf_counter())
-}
-
 macro_rules! word_adapters {
     ($($word:ident => $body:ident),+ $(,)?) => {
         $(#[inline(always)]
@@ -104,8 +88,8 @@ macro_rules! word_adapters {
     };
 }
 word_adapters!(no_aux_work_threads => no_aux_work_threads_result, getenv => getenv_result,
-    getpid => getpid_result, perf_counter => perf_counter_result);
-crate::word_bif_bodies_in!(bodies; no_aux_work_threads, getenv, getpid, perf_counter);
+    getpid => getpid_result);
+crate::word_bif_bodies_in!(bodies; no_aux_work_threads, getenv, getpid);
 
 /// Build the `os_type` and `os_version` global literals.
 // Port of erts/emulator/beam/erl_bif_info.c (os_info_init), OTP-29.1.1. Guarded by a `Once`

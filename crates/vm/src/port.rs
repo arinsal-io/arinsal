@@ -1,4 +1,5 @@
 //! Local OS ports backed by child processes.
+// Port of erts/emulator/beam/erl_bif_port.c and erts/emulator/sys/unix/sys_drivers.c, OTP-29.1.1.
 use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_etf::OwnedTerm;
@@ -8,8 +9,8 @@ use arinsal_term::{
     global_atoms, to_owned,
 };
 use parking_lot::Mutex;
-use std::ffi::{OsStr, OsString};
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::ffi::{CStr, OsStr, OsString};
+use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -414,13 +415,17 @@ impl PortTable {
         let started = self.interval.load(Ordering::Acquire);
         handle.started_interval.store(started, Ordering::Release);
         let pix = arinsal_term::ptab::port_table_layout().data2pix(id) as usize;
-        self.slots[pix].store(handle, self.progress.get());
+        self.slots[pix].store(handle);
         self.count.fetch_add(1, Ordering::Relaxed);
     }
 
     // Port of erts/emulator/beam/erl_ptab.c:675 (erts_ptab_delete_element), OTP-29.1.1.
     /// Clear one port while the caller holds `list` write-locked across id release.
-    fn remove_locked(&self, id: u64) -> Option<Arc<PortHandle>> {
+    fn remove_locked(
+        &self,
+        id: u64,
+        scheduler: &arinsal_sched::Scheduler<Process>,
+    ) -> Option<Arc<PortHandle>> {
         let slot = self.slot(id)?;
         let progress = self.progress.get()?;
         // The caller holds the table lock, so the slot cannot change between the check and the swap.
@@ -428,7 +433,7 @@ impl PortTable {
             .with(progress, false, |handle| handle.id == id)
             .unwrap_or(false)
         {
-            let removed = slot.take(progress)?;
+            let removed = slot.take(scheduler)?;
             raw::retire_data(removed.data.swap(0), &removed.scheduler);
             self.count.fetch_sub(1, Ordering::Relaxed);
             let started_interval = removed.started_interval.load(Ordering::Acquire);
@@ -630,7 +635,8 @@ fn reserve_port_id(runtime: &crate::process::Runtime) -> Result<PortIdReservatio
 
 fn remove_port(runtime: &crate::process::Runtime, id: u64) -> Option<Arc<PortHandle>> {
     let ports = runtime.ports.lock();
-    let handle = runtime.ports.remove_locked(id)?;
+    let scheduler = runtime.scheduler_if_started()?;
+    let handle = runtime.ports.remove_locked(id, scheduler)?;
     runtime.port_ids.release(id);
     drop(ports);
     release_port_name(runtime, &handle);
@@ -2736,40 +2742,70 @@ fn signal_badsig(handle: &PortHandle, id: u64) {
     signal_port_exit(handle, id, Term::atom(arinsal_term::atoms::BADSIG));
 }
 
-/// Mutual exclusion between descriptor creation and `Command::spawn`.
-///
-/// `pipe`/`dup`/`socket`/`accept` then `FD_CLOEXEC` is not atomic. A port child
-/// spawned in that window inherits the descriptor. `erl_child_setup` never has
-/// this window: it closes every fd above 3 at start and sets CLOEXEC before any
-/// child exists (erl_child_setup.c:466-470, OTP-29.1.1).
-pub(crate) fn cloexec_publish<R>(body: impl FnOnce() -> R) -> R {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    body()
+/// `SET_CLOEXEC(fd)`.
+// Port of erts/emulator/sys/unix/erl_child_setup.c (`SET_CLOEXEC`), OTP-29.1.1.
+pub(crate) fn set_cloexec(fd: RawFd) -> std::io::Result<()> {
+    raw::set_cloexec(fd)
+}
+
+/// `pipe()` with no close-on-exec, as `spawn_start` creates `ifd`/`ofd`.
+// Port of erts/emulator/sys/unix/sys_drivers.c (`spawn_start`), OTP-29.1.1.
+pub(crate) fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    raw::pipe()
+}
+
+/// `pipe()` then `SET_CLOEXEC` on both ends.
+// Port of erts/emulator/sys/unix/erl_child_setup.c (`pipe` + `SET_CLOEXEC`), OTP-29.1.1.
+pub(crate) fn pipe_cloexec() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    raw::pipe_cloexec()
+}
+
+/// `socket()` then `SET_CLOEXEC`.
+// Port of erts/emulator/drivers/common/inet_drv.c (`sock_open`) and
+// erts/emulator/sys/unix/erl_child_setup.c (`SET_CLOEXEC`), OTP-29.1.1.
+pub(crate) fn socket_cloexec(domain: i32, kind: i32, protocol: i32) -> std::io::Result<OwnedFd> {
+    raw::socket_cloexec(domain, kind, protocol)
+}
+
+/// `accept()` then `SET_CLOEXEC`.
+// Port of erts/emulator/drivers/common/inet_drv.c (`sock_accept`) and
+// erts/emulator/sys/unix/erl_child_setup.c (`SET_CLOEXEC`), OTP-29.1.1.
+pub(crate) fn accept_cloexec(fd: impl rustix::fd::AsFd) -> std::io::Result<OwnedFd> {
+    raw::accept_cloexec(fd)
+}
+
+/// `socketpair()` with no close-on-exec, as `forker_start` creates the UDS.
+// Port of erts/emulator/sys/unix/sys_drivers.c (`forker_start`), OTP-29.1.1.
+pub(crate) fn socketpair(
+    domain: i32,
+    kind: i32,
+    protocol: i32,
+) -> std::io::Result<(OwnedFd, OwnedFd)> {
+    raw::socketpair(domain, kind, protocol)
+}
+
+/// `fork` + child `dup2` onto fd 3 + `setsid` + `execv`, as `forker_start`.
+// Port of erts/emulator/sys/unix/sys_drivers.c (`forker_start`), OTP-29.1.1.
+pub(crate) fn forker_fork_exec(
+    executable: &CStr,
+    helper_fd: RawFd,
+    max_files: &CStr,
+) -> std::io::Result<()> {
+    raw::forker_fork_exec(executable, helper_fd, max_files)
+}
+
+/// `isatty(0) && isatty(1)` of forker_start.
+pub(crate) fn stdio_is_tty() -> bool {
+    raw::stdio_is_tty()
+}
+
+/// Write stdin's termios to the forker UDS, as forker_start does.
+pub(crate) fn write_tty_mode(fd: RawFd) -> std::io::Result<()> {
+    raw::write_tty_mode(fd)
 }
 
 pub(crate) fn duplicate_fd(fd: RawFd) -> std::io::Result<OwnedFd> {
-    cloexec_publish(|| {
-        unsafe extern "C" {
-            fn dup(fd: i32) -> i32;
-        }
-        // SAFETY: dup returns a fresh descriptor; setting CLOEXEC before the lock is
-        // released prevents a concurrently spawned port child from inheriting it.
-        let copy = unsafe {
-            let copy = dup(fd);
-            if copy >= 0 && libc::fcntl(copy, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
-                let error = std::io::Error::last_os_error();
-                libc::close(copy);
-                return Err(error);
-            }
-            copy
-        };
-        if copy < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: copy is a fresh descriptor owned by this OwnedFd.
-        Ok(unsafe { OwnedFd::from_raw_fd(copy) })
-    })
+    raw::duplicate_fd_cloexec(fd)
 }
 
 impl arinsal_sched::RunPort for PortHandle {
@@ -2952,7 +2988,7 @@ fn suspend_on_busy(
         return false;
     };
     // Suspended before it is queued on the port, so a resume racing with this cannot be lost.
-    if process.self_pid == Some(pid) {
+    if process.self_pid() == Some(pid) {
         crate::suspend::suspend_self(process);
     }
     if !drv.save_suspend_process(packed_pid(pid)) {
@@ -2997,14 +3033,14 @@ fn lookup_port(process: &Process, term: Term) -> Result<Arc<PortHandle>, VmError
     {
         return runtime
             .ports
-            .get_word(term.tagged_word(), process.on_managed)
+            .get_word(term.tagged_word(), process.on_normal_scheduler())
             .ok_or_else(badarg);
     }
     let id = port_id(process, term).ok_or_else(badarg)?;
     process
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.ports.get_from(id, process.on_managed))
+        .and_then(|runtime| runtime.ports.get_from(id, process.on_normal_scheduler()))
         .ok_or_else(badarg)
 }
 
@@ -3045,6 +3081,8 @@ fn port_data_word(term: Term) -> Option<u64> {
 // Port of erts/emulator/beam/erl_port.h (ErtsPortDataHeap), OTP-29.1.1.
 #[repr(C)]
 struct PortDataBlock {
+    /// `ErtsPortDataHeap.later_op`: the cleanup node lives in the block being freed.
+    later_op: arinsal_sched::ErtsThrPrgrLaterOp,
     /// The number of trailing words holding the copied term, as `ErtsPortDataHeap::hsize`.
     hsize: usize,
     term: Term,
@@ -3100,7 +3138,7 @@ pub(crate) fn port_close_light(
     if crate::trace::active() {
         return None;
     }
-    let caller = process.self_pid?;
+    let caller = process.self_pid()?;
     light_result(port_close(process, None, caller, *port))
 }
 
@@ -3118,9 +3156,11 @@ impl crate::natives::ThinProcessBif for PortGetData {
             && let Some(runtime) = process.runtime.as_ref()
             && let Some(term) = runtime
                 .ports
-                .with_word(args[0].tagged_word(), process.on_managed, |handle| {
-                    handle.data.load_immediate()
-                })
+                .with_word(
+                    args[0].tagged_word(),
+                    process.on_normal_scheduler(),
+                    |handle| handle.data.load_immediate(),
+                )
                 .flatten()
         {
             return Ok(term);
@@ -3180,7 +3220,7 @@ pub(crate) fn port_set_data_light(
 fn port_get_data(process: &mut Process, port: Term) -> Result<Term, VmError> {
     let id = port_id(process, port).ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let managed = process.on_managed;
+    let managed = process.on_normal_scheduler();
     let heap = &mut process.heap;
     runtime
         .ports
@@ -3751,7 +3791,10 @@ pub(crate) fn erts_deliver_port_exit(
     {
         return false;
     }
-    let Some(handle) = runtime.ports.remove_locked(id) else {
+    let Some(scheduler) = runtime.scheduler_if_started() else {
+        return false;
+    };
+    let Some(handle) = runtime.ports.remove_locked(id, scheduler) else {
         return false;
     };
     runtime.port_ids.release(id);
@@ -3795,7 +3838,7 @@ fn close(process: &Process, term: Term) -> Result<Term, VmError> {
 }
 
 fn close_inner(process: &Process, term: Term, trace_receive: bool) -> Result<Term, VmError> {
-    let sender = process.self_pid.ok_or_else(badarg)?;
+    let sender = process.self_pid().ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     let id = port_id(process, term).ok_or_else(badarg)?;
     if trace_receive && let Some(caller) = sender.to_term() {
@@ -3863,12 +3906,12 @@ pub(crate) fn exit_port(process: &mut Process, port: Term, reason: Term) -> Resu
         && let Some(drv) = handle.drv_port()
     {
         let reason = to_owned(reason).map_err(|_| badarg())?;
-        let pid = process.self_pid.ok_or_else(badarg)?;
+        let pid = process.self_pid().ok_or_else(badarg)?;
         // An exit signal to a port that is gone is dropped (bif.c:1794).
         let _ = drv_sig::exit(process, None, pid, &handle, &drv, false, pid, reason, false);
         return Ok(());
     }
-    let caller = process.self_pid.ok_or_else(badarg)?;
+    let caller = process.self_pid().ok_or_else(badarg)?;
     erts_deliver_port_exit(runtime, id, caller, reason, None, false);
     Ok(())
 }
@@ -3934,7 +3977,7 @@ fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Res
         );
     }
     if notify.is_none()
-        && let Some(from) = process.self_pid
+        && let Some(from) = process.self_pid()
         && let Some(target) = pid.to_term()
     {
         let mut heap = VecHeap::new();
@@ -3945,7 +3988,7 @@ fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Res
         }
     }
     let scheduler = runtime.scheduler()?;
-    if let Some(from) = notify.or(process.self_pid) {
+    if let Some(from) = notify.or(process.self_pid()) {
         // Port of erts/emulator/beam/io.c:2324-2351 and 3304-3332 (set_port_connected,
         // deliver_result), OTP-29.1.1. `port_connect/2` traces the result but only
         // `! {connect, ...}` queues it.
@@ -4197,7 +4240,7 @@ fn register_monitor(
         && !process.runtime.as_ref().is_some_and(|runtime| {
             runtime
                 .ports
-                .with_from(id, process.on_managed, |_| ())
+                .with_from(id, process.on_normal_scheduler(), |_| ())
                 .is_some()
         })
     {
@@ -4227,17 +4270,17 @@ pub(crate) fn demonitor_port(
         return;
     };
     // The common case runs on the borrowed handle; a port that is busy takes a counted one.
-    let free = runtime
-        .ports
-        .with_from(port_id, process.on_managed, |handle| {
-            match handle.driver.as_ref() {
-                Some(drv) => drv_sig::demonitor_now(handle, drv, &origin),
-                None => {
-                    let _ = handle.lt_monitors.lock().remove_target_of(&origin);
-                    true
-                }
+    let free = runtime.ports.with_from(
+        port_id,
+        process.on_normal_scheduler(),
+        |handle| match handle.driver.as_ref() {
+            Some(drv) => drv_sig::demonitor_now(handle, drv, &origin),
+            None => {
+                let _ = handle.lt_monitors.lock().remove_target_of(&origin);
+                true
             }
-        });
+        },
+    );
     // `erts_port_lookup` failed: `ERTS_PORT_OP_DROPPED`, origin already released.
     if free != Some(false) {
         return;
@@ -4298,7 +4341,7 @@ fn output_command(
         // the bad value before the badsig exit signal.
         crate::utils::send_error_to_logger_nogl(
             runtime,
-            tracer.and_then(|process| process.self_pid),
+            tracer.and_then(|process| process.self_pid()),
             &format!("Bad value on output port '{}'\n", handle.port_name()),
         );
         signal_badsig(handle, id);
@@ -4383,14 +4426,14 @@ pub(crate) fn send_from_process(
     loop {
         match send_message_inner(process, port, message, nosuspend, ctx.as_deref_mut())? {
             (PortSend::Busy, Some((handle, drv))) if !nosuspend => {
-                let pid = process.self_pid.ok_or_else(badarg)?;
+                let pid = process.self_pid().ok_or_else(badarg)?;
                 if suspend_on_busy(process, &handle, &drv, pid) {
                     return Ok(PortSend::Busy);
                 }
             }
             // ERTS_PORT_OP_BUSY_SCHEDULED: sent; only a suspending send waits on the port.
             (PortSend::SentSuspended, Some((handle, drv))) if !nosuspend => {
-                let pid = process.self_pid.ok_or_else(badarg)?;
+                let pid = process.self_pid().ok_or_else(badarg)?;
                 if suspend_on_busy(process, &handle, &drv, pid) {
                     return Ok(PortSend::SentSuspended);
                 }
@@ -4444,7 +4487,7 @@ fn send_message_inner(
     {
         // Port of erts/emulator/beam/io.c:3975 (erts_port_command): `close` and `connect`
         // are port signals checked against the connected process when they execute.
-        let sender = process.self_pid.unwrap_or(from);
+        let sender = process.self_pid().unwrap_or(from);
         if from_connected {
             trace_port_receive_term(process, from, id, parts[1]);
         }
@@ -4508,7 +4551,7 @@ fn send_message_inner(
             nosuspend,
             force: false,
         };
-        let sender = process.self_pid.unwrap_or(from);
+        let sender = process.self_pid().unwrap_or(from);
         return Ok(
             match drv_sig::output(
                 process, ctx, sender, &handle, &drv_port, from, command[1], flags, false,
@@ -4530,7 +4573,7 @@ fn send_message_inner(
                 if !nosuspend {
                     // erts_suspend(c_p, ERTS_PROC_LOCK_MAIN, prt): the sender, not the
                     // connected process the message names.
-                    let pid = process.self_pid.ok_or_else(badarg)?;
+                    let pid = process.self_pid().ok_or_else(badarg)?;
                     crate::suspend::suspend_self(process);
                     state.suspended.push(pid);
                     let busy_port = state.busy_port;

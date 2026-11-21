@@ -299,7 +299,6 @@ pub(crate) fn initialize_spawned(
         std::ptr::addr_of_mut!((*process).slow).write(slow);
         std::ptr::addr_of_mut!((*process).entry_started).write(false);
         std::ptr::addr_of_mut!((*process).gc_live).write(x_registers);
-        std::ptr::addr_of_mut!((*process).max_heap_peak).write(0);
         std::ptr::addr_of_mut!((*process).virtual_reds).write(0);
         std::ptr::addr_of_mut!((*process).reductions_used).write(0);
         std::ptr::addr_of_mut!((*process).gc_deferred).write(false);
@@ -307,13 +306,9 @@ pub(crate) fn initialize_spawned(
         std::ptr::addr_of_mut!((*process).stats).write(stats);
         std::ptr::addr_of_mut!((*process).final_exit_reason).write(None);
         std::ptr::addr_of_mut!((*process).runtime).write(None);
-        std::ptr::addr_of_mut!((*process).self_pid).write(None);
-        std::ptr::addr_of_mut!((*process).on_managed).write(false);
         std::ptr::addr_of_mut!((*process).native).write(None);
         std::ptr::addr_of_mut!((*process).scheduler_data)
             .write(arinsal_sched::ProcSchedData::default());
-        std::ptr::addr_of_mut!((*process).run_key).write(0);
-        std::ptr::addr_of_mut!((*process).exec_key).write(0);
         std::ptr::addr_of_mut!((*process).signal_probe).write(None);
         std::ptr::addr_of_mut!((*process).native_retry).write(None);
         std::ptr::addr_of_mut!((*process).native_apply).write(false);

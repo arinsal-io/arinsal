@@ -108,13 +108,16 @@ fn fields(term: &OwnedTerm) -> Vec<i64> {
     values.iter().map(integer).collect()
 }
 
-fn call_both(reference: &RefErl, beam: &[u8], function: &str) -> (Vec<i64>, Vec<i64>) {
+/// Both nodes load the probe once, before the first call: a reload purges the previous
+/// version, and the literal area collector's work for that purge (and its collections)
+/// would land asynchronously in the next measured window of the VM-wide counter. Real `erl`
+/// shows the same noise when it reloads before every call (`bif` 2515 words vs 0).
+fn call_both(reference: &RefErl, function: &str) -> (Vec<i64>, Vec<i64>) {
     let expected = match reference.call(MODULE, function, &[]) {
         CallResult::Ok(term) => fields(&term),
         other => panic!("reference {function} failed: {other:?}"),
     };
     let mut vm = crate::common::node();
-    crate::common::load_fresh(&mut vm, beam);
     let outcome = vm
         .eval_scheduled(MODULE, function, &[], 1)
         .unwrap_or_else(|error| panic!("Arinsal {function} failed: {error:?}"));
@@ -158,15 +161,16 @@ fn garbage_collection_statistics_match_otp() {
         .compile_named(MODULE, SOURCE, &[])
         .expect("compile GC stats probe");
     reference.load(MODULE, &beam).expect("load GC stats probe");
+    crate::common::load_fresh(&mut crate::common::node(), &beam);
 
-    let (expected, actual) = call_both(&reference, &beam, "shape");
+    let (expected, actual) = call_both(&reference, "shape");
     similar_asserts::assert_eq!(expected.len(), 4);
     similar_asserts::assert_eq!(actual[0], 0, "statistics third element");
     similar_asserts::assert_eq!(actual[1], expected[1], "fullsweep_after");
     similar_asserts::assert_eq!(actual[2], expected[2], "min_heap_size");
     similar_asserts::assert_eq!(actual[3], expected[3], "min_bin_vheap_size");
 
-    let (expected, actual) = call_both(&reference, &beam, "explicit");
+    let (expected, actual) = call_both(&reference, "explicit");
     similar_asserts::assert_eq!(expected.len(), 5);
     // 30 major collections. Other schedulers may add a couple.
     assert_count("explicit", 0, actual[0], expected[0], true);
@@ -179,7 +183,7 @@ fn garbage_collection_statistics_match_otp() {
     similar_asserts::assert_eq!(actual[3], 0, "statistics third element");
     assert_count("explicit", 4, actual[4], expected[4], true);
 
-    let (expected, actual) = call_both(&reference, &beam, "minors");
+    let (expected, actual) = call_both(&reference, "minors");
     similar_asserts::assert_eq!(expected.len(), 4);
     assert_count("minors", 0, actual[0], expected[0], true);
     assert!(
@@ -191,7 +195,7 @@ fn garbage_collection_statistics_match_otp() {
     assert_count("minors", 3, actual[3], expected[3], true);
 
     for function in ["take", "wide"] {
-        let (expected, actual) = call_both(&reference, &beam, function);
+        let (expected, actual) = call_both(&reference, function);
         similar_asserts::assert_eq!(expected.len(), 5, "{function}");
         similar_asserts::assert_eq!(actual[2], 0, "{function} statistics third element");
         let exact = function == "wide";
@@ -201,13 +205,13 @@ fn garbage_collection_statistics_match_otp() {
         assert_count(function, 4, actual[4], expected[4], exact);
     }
 
-    let (expected, actual) = call_both(&reference, &beam, "bif");
+    let (expected, actual) = call_both(&reference, "bif");
     similar_asserts::assert_eq!(actual[2], 0, "bif statistics third element");
     assert_count("bif", 0, actual[0], expected[0], true);
     assert_count("bif", 1, actual[1], expected[1], true);
     assert_count("bif", 4, actual[4], expected[4], true);
 
-    let (expected, actual) = call_both(&reference, &beam, "alloc");
+    let (expected, actual) = call_both(&reference, "alloc");
     similar_asserts::assert_eq!(actual[2], 0, "alloc statistics third element");
     assert_count("alloc", 0, actual[0], expected[0], true);
     assert_count("alloc", 1, actual[1], expected[1], false);

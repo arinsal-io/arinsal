@@ -24,6 +24,8 @@ pub(crate) mod raw;
 /// instance is read from the block's carrier on free, as erts does.
 struct ProcessBlock<T: Task> {
     refc: AtomicUsize,
+    /// `common.u.release`: the table's later-op node, used after `erts_ptab_delete_element`.
+    later_op: crate::thr_progress::ErtsThrPrgrLaterOp,
     process: Process<T>,
 }
 
@@ -85,6 +87,7 @@ impl<T: Task> ProcRef<T> {
         let result = unsafe {
             let raw = block.as_ptr();
             (&raw mut (*raw).refc).write(AtomicUsize::new(1));
+            (&raw mut (*raw).later_op).write(crate::thr_progress::ErtsThrPrgrLaterOp::new());
             (&raw mut (*raw).process).write(build(&context));
             init(&mut (*raw).process, &context)
         };
@@ -157,15 +160,14 @@ impl<T: Task> ProcRef<T> {
         }
     }
 
-    /// A later operation that releases the reference held at `raw`
-    /// (erts `release_process` scheduled by erts_ptab_delete_element).
-    pub(crate) fn release_later(raw: *mut ()) -> crate::thr_progress::LaterOp {
-        // erts_ptab_delete_element passes `ptab->r.o.element_size`, sizeof(Process).
-        crate::thr_progress::LaterOp::Cleanup {
-            release: release_raw_address::<T>,
-            data: raw as usize,
-            size: std::mem::size_of::<ProcessBlock<T>>(),
-        }
+    /// Schedule `release_process` of the table's reference at `raw` after thread progress.
+    ///
+    /// Port of erts/emulator/beam/erl_ptab.c (`erts_ptab_delete_element`:
+    /// `erts_schedule_thr_prgr_later_cleanup_op(release_element, ptab_el, &ptab_el->u.release,
+    /// element_size)`), OTP-29.1.1.
+    /// `ptab->r.o.element_size` (`sizeof(Process)`).
+    pub(crate) const fn element_size() -> usize {
+        std::mem::size_of::<ProcessBlock<T>>()
     }
 }
 
@@ -214,12 +216,6 @@ fn release_raw<T: Task>(raw: *mut ()) {
     // SAFETY: `raw` was produced by `ProcRef::<T>::erase` and is released once, by the
     // `ErasedProcRef` that owns it.
     drop(unsafe { ProcRef::<T>::from_raw(raw) });
-}
-
-fn release_raw_address<T: Task>(data: usize) {
-    // SAFETY: `data` is the address a table slot gave up in `ProcRef::release_later`, and the
-    // later operation runs once.
-    drop(unsafe { ProcRef::<T>::from_raw(data as *mut ()) });
 }
 
 /// A [`ProcRef`] whose process type is not named, as `SpawnedProcess` carries it.
@@ -345,11 +341,15 @@ impl<M: SignalMessage> SignalProbe<M> {
         )
     }
 
-    /// Configures the parallel sender buffers of the process's off-heap message queue.
-    // Port of erts/emulator/beam/erl_proc_sig_queue.c:10600-10694
-    // (erts_proc_sig_queue_try_enqueue_to_buffer setup), OTP-29.1.1.
-    pub fn set_parallel_signal_buffers(&self, enabled: bool) {
-        self.input().set_buffers_enabled(enabled);
+    /// Flush and remove the parallel sender buffers of the process's message queue; the
+    /// buffer array is released after thread progress.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:10597
+    // (erts_proc_sig_queue_flush_and_deinstall_buffers: erts_schedule_thr_prgr_later_cleanup_op
+    // of the buffer array), OTP-29.1.1.
+    pub fn flush_and_deinstall_buffers<S: Task>(&self, scheduler: &crate::Scheduler<S>) {
+        if let Some(args) = self.input().flush_and_deinstall_buffers() {
+            scheduler.schedule_later_op_args(args);
+        }
     }
 
     fn field<U>(&self, field: NonNull<U>) -> &U {
@@ -362,6 +362,11 @@ impl<M: SignalMessage> SignalProbe<M> {
     /// The process's outer signal queue.
     pub(crate) fn input(&self) -> &Incoming<Event<M>> {
         self.field(self.input)
+    }
+
+    /// The shared process struct this probe points into (`c_p` without the task cell).
+    pub(crate) fn shared(&self) -> &crate::ProcShared<M> {
+        self.field(self.shared)
     }
 
     /// The thread progress domain of the runtime the process lives in.
@@ -461,9 +466,13 @@ impl<T: Task> TaskCell<T> {
 
     /// Build the task after slot allocation and write it into its final storage once.
     #[inline(always)]
-    pub(crate) fn init_with<E>(&mut self, init: impl FnOnce() -> Result<T, E>) -> Result<(), E> {
+    pub(crate) fn init_with<E>(
+        &mut self,
+        pid: crate::Pid,
+        init: impl FnOnce() -> Result<T, E>,
+    ) -> Result<(), E> {
         assert!(!self.initialized, "a task is written once");
-        self.task.write(init()?).init_in_place();
+        self.task.write(init()?).init_in_place(pid);
         self.initialized = true;
         Ok(())
     }

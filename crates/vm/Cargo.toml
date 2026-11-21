@@ -60,6 +60,12 @@ nix = { version = "0.29.0", features = ["fs", "net", "process"] }
 arc-swap = "1.9.2"
 parking_lot = "0.12.5"
 
+[[bin]]
+name = "erl_child_setup"
+path = "src/bin/erl_child_setup.rs"
+test = false
+bench = false
+
 [dev-dependencies]
 arinsal-beamjit = { path = "../beamjit" }
 stats_alloc = "0.1.10"

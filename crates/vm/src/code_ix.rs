@@ -10,13 +10,16 @@
 //! runs with `ERTS_SAVE_CALLS_CODE_IX`, whose address of every export is the save_calls
 //! dispatch fragment.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 
 mod raw;
 use raw::{RawSlot, RetireOp};
+pub(crate) use raw::{later_data, magic_from_later_data, magic_payload as raw_magic_payload};
 
+use crate::Process;
 use crate::load::CodeTables;
+use arinsal_sched::{ErtsThrPrgrLaterOp, RunCtx, Scheduler};
 use arinsal_term::FunEntry;
 
 pub(crate) use arinsal_term::{ERTS_NUM_CODE_IX, ERTS_SAVE_CALLS_CODE_IX};
@@ -42,6 +45,54 @@ struct Permission {
     /// Ticket of a staging area that ended (`erts_end_staging_code_ix`) and waits for its code
     /// barrier before the commit; `work` holds its tables until the stager commits them.
     ended: Option<u64>,
+}
+
+/// Port of erts/emulator/beam/code_ix.h (`ErtsCodeBarrier`), OTP-29.1.1.
+pub(crate) struct ErtsCodeBarrier {
+    pub(crate) pending_schedulers: AtomicI32,
+    pub(crate) later_op: ErtsThrPrgrLaterOp,
+    pub(crate) size: usize,
+    pub(crate) later_function: Option<fn(*mut ())>,
+    pub(crate) later_data: *mut (),
+}
+
+impl ErtsCodeBarrier {
+    pub(crate) const fn new() -> Self {
+        Self {
+            pending_schedulers: AtomicI32::new(0),
+            later_op: ErtsThrPrgrLaterOp::new(),
+            size: 0,
+            later_function: None,
+            later_data: std::ptr::null_mut(),
+        }
+    }
+}
+
+/// Port of erts/emulator/beam/code_ix.c:558 (`erts_schedule_code_barrier`) on the
+/// `CODE_IX_ISSUE_INSTRUCTION_BARRIERS` path, OTP-29.1.1.
+pub(crate) fn erts_schedule_code_barrier(
+    scheduler: &Scheduler<Process>,
+    barrier: &ErtsCodeBarrier,
+    later_function: fn(*mut ()),
+    later_data: *mut (),
+) {
+    raw::erts_schedule_code_barrier_cleanup_on_scheduler(
+        scheduler,
+        barrier,
+        later_function,
+        later_data,
+        0,
+    );
+}
+
+/// [`erts_schedule_code_barrier`] from a running process (`esdp` of `RunCtx`).
+pub(crate) fn erts_schedule_code_barrier_from_ctx(
+    ctx: &mut RunCtx<'_, Process>,
+    barrier: &ErtsCodeBarrier,
+    later_function: fn(*mut ()),
+    later_data: *mut (),
+) {
+    raw::erts_schedule_code_barrier_cleanup_from_ctx(ctx, barrier, later_function, later_data, 0);
 }
 
 /// `erts_atomic32_t the_active_code_index` (code_ix.c): the code index every scheduler runs
@@ -82,6 +133,12 @@ pub(crate) struct CodeIndexes {
     native_fns: RwLock<Arc<Vec<Option<crate::natives::nif::NativeFn>>>>,
     /// `erts_coverage_mode`: applies to modules loaded after it is set.
     coverage_mode: Mutex<arinsal_loader::CoverageMode>,
+    /// `committer_state.barrier` of beam_bif_load.c: the later-op node of a staged commit.
+    pub(crate) barrier: ErtsCodeBarrier,
+    /// Ticket of a staging area waiting for `commit_code_ix` after its code barrier.
+    pub(crate) commit_ticket: AtomicU64,
+    /// Pid of the stager `commit_code_ix` resumes (`updater_process` analogue).
+    pub(crate) commit_pid: AtomicU64,
 }
 
 impl CodeIndexes {
@@ -101,6 +158,9 @@ impl CodeIndexes {
             released: Condvar::new(),
             native_fns: RwLock::default(),
             coverage_mode: Mutex::new(arinsal_loader::CoverageMode::None),
+            barrier: ErtsCodeBarrier::new(),
+            commit_ticket: AtomicU64::new(0),
+            commit_pid: AtomicU64::new(0),
         }
     }
 
@@ -396,7 +456,7 @@ impl CodeIndexes {
 
     /// Commits the ended staging area `ticket` and lets threads stage again.
     // Port of erts/emulator/beam/beam_bif_load.c:301-320 (commit_code_ix), OTP-29.1.1.
-    fn commit_ended(&self, ticket: u64) {
+    pub(crate) fn commit_ended(&self, ticket: u64) {
         let mut permission = self.lock_permission();
         // A thread changing code in place also changes the ended tables: wait for it.
         while permission.owner.is_some() {
@@ -713,14 +773,19 @@ pub(crate) struct Staging {
 /// permission until its commit. Dropping it commits (`commit_code_ix`), which also happens
 /// when its stager exits while suspended, as erts commits without resuming an exiting stager.
 pub(crate) struct EndedStaging {
-    code: Arc<CodeIndexes>,
-    ticket: u64,
+    pub(crate) code: Arc<CodeIndexes>,
+    pub(crate) ticket: u64,
 }
 
 impl EndedStaging {
     /// Makes the staged code active: the code barrier of the stager passed.
     pub(crate) fn commit(self) {
         drop(self);
+    }
+
+    /// Drop without committing; the later op of `commit_code_ix` calls [`CodeIndexes::commit_ended`].
+    pub(crate) fn disarm(self) -> u64 {
+        raw::disarm_ended_staging(self)
     }
 }
 

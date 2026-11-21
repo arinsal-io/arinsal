@@ -9,7 +9,6 @@ use crate::{
 
 const E: Gpr = Gpr::x(20);
 const C_P: Gpr = Gpr::x(21);
-const FCALLS: Gpr = Gpr::w(22);
 const HTOP: Gpr = Gpr::x(23);
 const XREGS: [Gpr; 6] = [
     Gpr::x(25),
@@ -33,11 +32,6 @@ const TAG_BOXED: u64 = 2;
 const RESERVED_WORDS: u32 = arinsal_term::S_RESERVED as u32;
 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:137-149 and erl_vm.h:120, OTP-29.1.1.
 const MAX_LIVE_X_REGS: u32 = 1027;
-const MAX_REGISTER_X: usize = 6;
-
-/// GC callback used by emitted heap checks. It receives the raw allocation
-/// need and the live X register count; the reserve belongs to the heap check.
-pub type GcHook = unsafe extern "C" fn(*mut ProcessHeader, *mut u64, usize, usize, i32) -> i32;
 
 impl BeamModuleAssembler {
     /// Builds a cons cell in the young heap and writes its tagged list pointer.
@@ -595,7 +589,7 @@ impl BeamModuleAssembler {
     /// and tags its value, boxing it as a one-digit bignum when it is not a small.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3126-3164 (emit_i_perf_counter),
     // OTP-29.1.1.
-    pub fn emit_i_perf_counter(&mut self, clock: usize, hook: GcHook) -> Result<(), ModuleError> {
+    pub fn emit_i_perf_counter(&mut self, clock: usize) -> Result<(), ModuleError> {
         if clock == 0 {
             return Err(ModuleError::InvalidOperand("perf counter clock is missing"));
         }
@@ -616,7 +610,7 @@ impl BeamModuleAssembler {
         // X register live.
         self.code.emit(|e| e.mov_reg(XREGS[0], Gpr::x(0)))?;
         // ERTS_MAX_UINT64_HEAP_SIZE: a header and one digit.
-        self.emit_heap_check(0, 2, 0, hook)?;
+        self.emit_heap_check(0, 2, 0)?;
         self.code.emit(|e| {
             // make_pos_bignum_header(1)
             e.mov_const(SCRATCH[0], (1 << 6) | 0x08)?;
@@ -633,15 +627,10 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
-    /// Checks available heap space and calls the GC hook on the slow path.
+    /// Checks available heap space and calls `garbage_collect` on the slow path.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:90-122 and beam_asm_global.cpp:102-140, OTP-29.1.1
-    pub fn emit_test_heap(
-        &mut self,
-        words: u32,
-        live: u32,
-        hook: GcHook,
-    ) -> Result<(), ModuleError> {
-        self.emit_heap_check(0, words, live, hook)
+    pub fn emit_test_heap(&mut self, words: u32, live: u32) -> Result<(), ModuleError> {
+        self.emit_heap_check(0, words, live)
     }
 
     /// Checks heap space, allocates heap words inline, and reserves stack words.
@@ -651,9 +640,8 @@ impl BeamModuleAssembler {
         stack_words: u32,
         heap_words: u32,
         live: u32,
-        hook: GcHook,
     ) -> Result<(), ModuleError> {
-        self.emit_heap_check(stack_words, heap_words, live, hook)?;
+        self.emit_heap_check(stack_words, heap_words, live)?;
         if stack_words != 0 {
             let bytes = stack_words
                 .checked_mul(8)
@@ -670,9 +658,8 @@ impl BeamModuleAssembler {
         stack_words: u32,
         heap_words: u32,
         live: u32,
-        hook: GcHook,
     ) -> Result<(), ModuleError> {
-        self.emit_allocate_heap(stack_words, heap_words, live, hook)?;
+        self.emit_allocate_heap(stack_words, heap_words, live)?;
         self.code.emit(|e| e.mov_const(SCRATCH[0], NIL))?;
         for index in 0..stack_words {
             let offset = index
@@ -689,7 +676,6 @@ impl BeamModuleAssembler {
         stack_words: u32,
         heap_words: u32,
         live: u32,
-        hook: GcHook,
     ) -> Result<(), ModuleError> {
         if live >= MAX_LIVE_X_REGS {
             return Err(ModuleError::InvalidOperand(
@@ -706,61 +692,24 @@ impl BeamModuleAssembler {
             .checked_mul(8)
             .ok_or(ModuleError::InvalidOperand("heap check size overflow"))?;
         let done = self.code.new_label();
-        self.emit_pointer_offset(SCRATCH[0], HTOP, u64::from(bytes), false)?;
+        // ARG3 = HTOP + bytes needed; ARG4 = live (instr_common.cpp:150-157, emit_gc_test).
+        self.emit_pointer_offset(Gpr::x(2), HTOP, u64::from(bytes), false)?;
         self.code
-            .emit(|e| e.cmp_reg(SCRATCH[0], E, arinsal_a64::enc::Shift::Lsl, 0))?;
+            .emit(|e| e.cmp_reg(Gpr::x(2), E, arinsal_a64::enc::Shift::Lsl, 0))?;
         self.code.b_cond(Cond::Ls, done)?;
         self.code
             .emit(|e| e.mov_const(Gpr::x(3), u64::from(live)))?;
-        self.gc_fragment_call(hook as usize)?;
+        self.gc_fragment_call()?;
         self.code.bind(done)?;
         Ok(())
-    }
-
-    /// Emits the shared garbage-collection fragment called by every heap and stack check.
-    ///
-    /// ARG3 (x8) is `HTOP` plus the reserve and the bytes needed, ARG4 (x3) the live X count.
-    /// The reserve is removed again: the collector adds it itself.
-    // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:99-129 (emit_garbage_collect),
-    // OTP-29.1.1.
-    pub(super) fn emit_garbage_collect_fragment(&mut self, hook: usize) -> Result<(), ModuleError> {
-        let error = self.code.new_label();
-        let update = crate::Update::HEAP_ALLOC.union(crate::Update::X_REGS);
-        self.code
-            .emit(|e| e.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16))?;
-        self.code.emit(|e| {
-            e.sub_reg(Gpr::x(2), SCRATCH[0], HTOP, arinsal_a64::enc::Shift::Lsl, 0)?;
-            e.lsr_imm(Gpr::x(2), Gpr::x(2), 3)?;
-            e.sub_imm(Gpr::x(2), Gpr::x(2), RESERVED_WORDS as u16, false)
-        })?;
-        crate::emit_enter_runtime(&mut self.code, MAX_REGISTER_X, update)?;
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(0), C_P)?;
-            crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(1))?;
-            e.mov_reg(Gpr::w(4), FCALLS)
-        })?;
-        self.fragment_call(hook)?;
-        crate::emit_leave_runtime(&mut self.code, MAX_REGISTER_X, update)?;
-        self.code.emit(|e| {
-            e.sub_reg(FCALLS, FCALLS, Gpr::w(0), arinsal_a64::enc::Shift::Lsl, 0)?;
-            e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)?;
-            e.ldr_uoff(Gpr::x(9), C_P, 40)
-        })?;
-        self.code.cbnz(Gpr::x(9), error)?;
-        self.code.emit(|e| e.ret(Gpr::x(30)))?;
-        self.code.bind(error)?;
-        self.code
-            .emit(|e| e.sub_imm(Gpr::x(30), Gpr::x(30), 4, false))?;
-        self.branch_error_from_lr()
     }
 
     pub(super) fn emit_stack_check(
         &mut self,
         stack_words: u32,
         live: u32,
-        hook: GcHook,
     ) -> Result<(), ModuleError> {
-        self.emit_heap_check(stack_words, 0, live, hook)
+        self.emit_heap_check(stack_words, 0, live)
     }
 
     fn destination_reg(&self, dst: ArgVal) -> Result<Gpr, ModuleError> {

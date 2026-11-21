@@ -691,18 +691,17 @@ pub(crate) unsafe fn retain_cloned_binary_owner<H: HeapAlloc + ?Sized>(
     flags: u64,
     overhead_words: u64,
     owner: Option<arinsal_alloc::raw::OwnedBinaryRef>,
-) -> Result<(), TermError> {
+) {
     // SAFETY: external owner pointer was incremented by clone_binary_owner.
     unsafe {
         if flags == EXTERNAL_OWNER {
             let binary = Arc::from_raw(ptr as *const ExternalBinary);
             *bin_ref.add(1) = external_val_word(&binary);
-            heap.link_external_binary(bin_ref, binary)
+            heap.link_external_binary(bin_ref, binary);
         } else {
             *bin_ref.add(1) = ptr;
             let writable = flags & BINARY_FLAG_WRITABLE != 0;
-            heap.link_bin_ref(bin_ref, writable, overhead_words, owner)?;
-            Ok(())
+            heap.link_bin_ref(bin_ref, writable, overhead_words, owner);
         }
     }
 }
@@ -1149,9 +1148,6 @@ impl<H: ?Sized + HeapAlloc> TermBuilder<'_, H> {
         if visible_bits > isize::MAX as usize || prefix.len() > capacity {
             return Err(TermError::BadArg);
         }
-        if !self.heap.supports_writable_binary() {
-            return Err(TermError::Unsupported("writable binary heap owner"));
-        }
         let binary =
             WritableBinary::from_prefix(prefix, prefix.len(), capacity, visible_bits.div_ceil(8))?;
         self.install_writable_binary(binary, visible_bits, visible_bits, true)
@@ -1159,9 +1155,6 @@ impl<H: ?Sized + HeapAlloc> TermBuilder<'_, H> {
 
     /// Box a byte range owned by an opaque native resource without copying it.
     pub fn external_binary(&mut self, owner: Arc<ExternalBinary>) -> Result<Term, TermError> {
-        if !self.heap.supports_external_binary() {
-            return Err(TermError::Unsupported("external binary heap owner"));
-        }
         let adjustment = owner.data & 3;
         let len = owner.len();
         let end = len
@@ -1181,7 +1174,7 @@ impl<H: ?Sized + HeapAlloc> TermBuilder<'_, H> {
             *sub.add(3) = end as u64;
             *sub.add(4) = Term::from_ptr(p, 2).0;
         }
-        self.heap.link_external_binary(p, owner)?;
+        self.heap.link_external_binary(p, owner);
         // SAFETY: the BinRef occupies the first three words of this allocation.
         Ok(Term::from_ptr(unsafe { p.add(3) }, 2))
     }
@@ -1317,12 +1310,8 @@ impl<H: ?Sized + HeapAlloc> TermBuilder<'_, H> {
             .checked_add(suffix.len())
             .ok_or(TermError::SystemLimit)?;
         let bit_len = count.checked_mul(8).ok_or(TermError::SystemLimit)?;
-        if bit_len > isize::MAX as usize || !self.heap.supports_writable_binary() {
-            return Err(if bit_len > isize::MAX as usize {
-                TermError::SystemLimit
-            } else {
-                TermError::Unsupported("writable binary heap owner")
-            });
+        if bit_len > isize::MAX as usize {
+            return Err(TermError::SystemLimit);
         }
         let binary = WritableBinary::from_parts(prefix, suffix, capacity, count)?;
         self.install_writable_binary(binary, bit_len, bit_len, false)
@@ -1341,9 +1330,6 @@ impl<H: ?Sized + HeapAlloc> TermBuilder<'_, H> {
             || visible_bits > isize::MAX as usize
         {
             return Err(TermError::BadArg);
-        }
-        if !self.heap.supports_writable_binary() {
-            return Err(TermError::Unsupported("writable binary heap owner"));
         }
         let visible_bytes = visible_bits / 8;
         let binary = WritableBinary::from_prefix(prefix, visible_bytes, capacity, visible_bytes)?;
@@ -1372,9 +1358,6 @@ impl<H: ?Sized + HeapAlloc> TermBuilder<'_, H> {
                 .is_none_or(|end| end > source.len().saturating_mul(8))
         {
             return Err(TermError::BadArg);
-        }
-        if !self.heap.supports_writable_binary() {
-            return Err(TermError::Unsupported("writable binary heap owner"));
         }
         let visible_bytes = visible_bits.div_ceil(8);
         let mut binary = WritableBinary::from_prefix(&[], visible_bytes, capacity, visible_bytes)?;
@@ -1412,9 +1395,6 @@ impl<H: ?Sized + HeapAlloc> TermBuilder<'_, H> {
         }
         if apparent_size_bits < bit_len || apparent_size_bits > isize::MAX as usize {
             return Err(TermError::BadArg);
-        }
-        if !self.heap.supports_writable_binary() {
-            return Err(TermError::Unsupported("writable binary heap owner"));
         }
         let count = bit_len.div_ceil(8);
         if apparent_size_bits.div_ceil(8) > capacity.max(count) {
@@ -1463,7 +1443,7 @@ impl<H: ?Sized + HeapAlloc> TermBuilder<'_, H> {
             true,
             (apparent_size_bits.div_ceil(8) / 8) as u64,
             Some(binary_owner),
-        )?;
+        );
         // SAFETY: p was allocated for the SUB_BITS directly after the BinRef.
         Ok((Term::from_ptr(unsafe { p.add(3) }, 2), data_address))
     }

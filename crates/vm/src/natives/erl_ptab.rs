@@ -470,9 +470,7 @@ fn build_ptab_result(
         magic_ref.as_deref().copied().unwrap_or(Term::NIL),
     ];
     let live = if magic_ref.is_some() { 2 } else { 1 };
-    process
-        .ensure_objv(conses.saturating_mul(2), &mut objv[..live])
-        .map_err(|_| BifError::SystemLimit)?;
+    process.ensure_objv(conses.saturating_mul(2), &mut objv[..live]);
     *accumulator = objv[0];
     if let Some(magic_ref) = magic_ref {
         *magic_ref = objv[1];

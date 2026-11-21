@@ -203,9 +203,8 @@ impl ReceiveFragments {
             .map_err(fail)?;
             emit_leave_runtime(&mut code, 0, Update::NONE).map_err(fail)?;
             code.emit(|e| {
-                e.and_imm(TMP1, XREG2, !1)?;
-                e.str_uoff(TMP1, C_P, PROCESS_I)?;
-                e.mov_reg(ARG3, TMP1)?;
+                e.str_uoff(XREG2, C_P, PROCESS_I)?;
+                e.mov_reg(ARG3, XREG2)?;
                 e.mov_const(TMP2, 0)?;
                 e.strb_uoff(TMP2, C_P, PROCESS_ARITY)?;
                 e.mov_const(SUPER_TMP, context_switch as u64)?;
@@ -236,14 +235,12 @@ impl ReceiveFragments {
         self.memory.ptr_at(self.loop_rec_offset) as usize
     }
 
-    /// Entry of the unlocked wait: x0 holds the resume address, bit 0 set when the wait is its
-    /// own resume target.
+    /// Entry of the unlocked wait: x0 holds the resume address.
     pub fn wait_unlocked_shared(&self) -> usize {
         self.memory.ptr_at(self.wait_unlocked_offset) as usize
     }
 
-    /// Entry of the locked wait: x0 holds the resume address, bit 0 set when the wait is its
-    /// own resume target.
+    /// Entry of the locked wait: x0 holds the resume address.
     pub fn wait_locked_shared(&self) -> usize {
         self.memory.ptr_at(self.wait_locked_offset) as usize
     }
