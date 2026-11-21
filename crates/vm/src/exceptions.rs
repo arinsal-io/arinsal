@@ -576,28 +576,18 @@ fn save_raw(
     class: Class,
     top: Option<&stacktrace::TopFrame>,
 ) -> Result<Term, VmError> {
-    // Port of erts/emulator/beam/beam_common.c:885 (`save_stacktrace`), OTP-29.1.1.
-    let depth = crate::erl_init::erts_backtrace_depth();
     let error_pc = std::mem::take(&mut p.native_error_pc);
     // `handle_error` passes its `pc` directly to `save_stacktrace`; frame identity is
     // resolved later by `build_stacktrace` through the active ranges table.
     let native_pc = (error_pc != 0).then_some(error_pc);
-    Ok(stacktrace::save_stacktrace(
+    if stacktrace::class_from_freason(p.heap.abi.exc.freason) != Some(class) {
+        p.heap.abi.exc.freason = stacktrace::class_to_freason(Some(class));
+    }
+    Ok(stacktrace::save_from_top(
         p,
-        stacktrace::StackTraceSave {
-            class,
-            depth,
-            // A freason of another class is the PRIMARY_EXCEPTION an earlier caught exception
-            // kept (handle_error); erts raisers set `c_p->freason` before raising.
-            freason: if stacktrace::class_from_freason(p.heap.abi.exc.freason) == Some(class) {
-                p.heap.abi.exc.freason
-            } else {
-                stacktrace::class_to_freason(Some(class))
-            },
-            native_pc,
-            top: top.map(stacktrace::SaveTop::Live),
-        },
+        native_pc.unwrap_or(0),
         registers,
+        top,
     ))
 }
 
@@ -614,15 +604,7 @@ pub(super) fn materialize(p: &mut Process, trace: Term) -> Result<Term, VmError>
     }
     // The saved trace stays behind the term: the same one can be rebuilt by a later raise.
     // A plain raw bignum is built from one temporary frame array and one heap block.
-    let direct = stacktrace::build_direct(p, trace);
-    if let Some(result) = direct {
-        return result;
-    }
-    let saved = stacktrace::with_saved(trace, |raw| stacktrace::build_saved(p, raw));
-    match saved {
-        Some(result) => result,
-        None => Ok(trace),
-    }
+    stacktrace::build_stacktrace(p, trace)
 }
 
 fn strip_top_location(p: &mut Process, trace: Term) -> Result<Term, VmError> {

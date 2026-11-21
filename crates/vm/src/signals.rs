@@ -520,13 +520,11 @@ fn dirty_process_handle_signals(
 /// Process BIFs resolved before the process-independent BIF table.
 ///
 /// [`call`] admits every `erlang` function name in this table at any arity.
-/// `erts_internal:spawn_system_process/3` is `spawn/3` for system processes.
 pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erlang", "monitor", 2),
     ("erlang", "monitor", 3),
     ("erlang", "demonitor", 1),
     ("erlang", "demonitor", 2),
-    ("erts_internal", "spawn_system_process", 3),
     ("erts_internal", "dirty_process_handle_signals", 1),
 ];
 
@@ -541,7 +539,6 @@ pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
 
 #[derive(Clone, Copy)]
 enum SignalBif {
-    SpawnSystemProcess3,
     DirtyProcessHandleSignals1,
 }
 
@@ -698,7 +695,6 @@ fn finish_demonitor_origin(
     }
 }
 
-resolved_signal_handler!(spawn_system_process3, SpawnSystemProcess3);
 resolved_signal_handler!(dirty_process_handle_signals1, DirtyProcessHandleSignals1);
 
 pub(crate) fn handler(
@@ -707,7 +703,6 @@ pub(crate) fn handler(
     arity: u8,
 ) -> Option<crate::natives::ResolvedNative> {
     Some(match (module, function, arity) {
-        ("erts_internal", "spawn_system_process", 3) => spawn_system_process3,
         ("erts_internal", "dirty_process_handle_signals", 1) => dirty_process_handle_signals1,
         _ => return None,
     })
@@ -891,21 +886,6 @@ fn call_resolved(
     args: &[Term],
 ) -> Result<Term, VmError> {
     match (entry, args) {
-        (SignalBif::SpawnSystemProcess3, [module, function, args]) => {
-            // Port of erts/emulator/beam/erl_init.c (erts_internal_spawn_system_process_3:
-            // erl_spawn_system_process with default options), OTP-29.1.1.
-            let mut so = crate::natives::erl_process::ErlSpawnOpts::new(process.runtime);
-            so.system_proc = true;
-            crate::natives::erl_process::erl_create_process(
-                process,
-                std::ptr::null_mut(),
-                *module,
-                *function,
-                *args,
-                &mut so,
-            )
-            .map_err(crate::natives::erl_process::CreateError::into_bif_error)
-        }
         (SignalBif::DirtyProcessHandleSignals1, [arg]) => {
             dirty_process_handle_signals(vm, process, ctx, *arg)
         }

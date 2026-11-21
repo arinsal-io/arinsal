@@ -118,14 +118,27 @@ pub(super) fn process_main(
     reg: &mut SchedulerRegisters,
 ) -> Result<RunState, VmError> {
     let mut slice = slice_begin(process, ctx, reg);
-    let mut exit = None;
-    loop {
-        match slice_step(process, ctx, reg, &mut slice, exit.take()) {
-            SliceStep::Enter(entry) => {
-                exit = Some(crate::native_bridge::native_enter(process, reg, &entry));
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut exit = None;
+        loop {
+            match slice_step(process, ctx, reg, &mut slice, exit.take()) {
+                SliceStep::Enter(entry) => {
+                    exit = Some(crate::native_bridge::native_enter(process, reg, &entry));
+                }
+                SliceStep::End(result) => break result,
             }
-            SliceStep::End(result) => break result,
         }
+    }
+    // On x86 only the generated process_main jumps to `c_p->i`; this slice runs on dirty
+    // schedulers, and erts_dirty_process_main (beam_common.c) never executes Erlang code.
+    #[cfg(target_arch = "x86_64")]
+    match slice_step(process, ctx, reg, &mut slice, None) {
+        SliceStep::Enter(entry) => Err(VmError::Unsupported(format!(
+            "dirty scheduler asked to execute Erlang code at {:#x}",
+            entry.code_address
+        ))),
+        SliceStep::End(result) => result,
     }
 }
 

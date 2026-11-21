@@ -205,6 +205,10 @@ impl ArgRegs {
         self.copy_out(&saved, arity);
     }
 
+    /// Offset of the `REDS_IN` slot (`def_arg_reg[5]`) in the file, for generated code.
+    pub const REDS_IN_OFFSET: usize =
+        std::mem::offset_of!(Self, inline) + 5 * std::mem::size_of::<Term>();
+
     /// `REDS_IN` (`c_p->def_arg_reg[5]`): FCALLS at the start of the running slice. The slot
     /// is free while the X file is attached, since `copy_in_registers` moved the saved
     /// registers out; `copy_out_registers` overwrites it when the arity reaches six.
@@ -1656,7 +1660,9 @@ pub(crate) const TAIL_FUN_CALL: u8 = 2;
 
 /// The resumable part of an interrupted BIF call.
 pub(crate) struct BifTrapPending {
+    #[cfg(target_arch = "aarch64")]
     pub(crate) caller_module: usize,
+    #[cfg(target_arch = "aarch64")]
     pub(crate) caller_ip: usize,
     /// Set by a light BIF call that trapped: the scheduler still has to context-switch
     /// (erts `context_switch_simplified`) and bind the trap to its native call site.
@@ -1674,6 +1680,7 @@ pub(crate) struct BifTrapPending {
     pub(crate) arity: usize,
     /// The trapped BIF's module and function: an `apply` that trapped is redone as
     /// `apply(Module, Function, Args)` built from the trap state.
+    #[cfg(target_arch = "aarch64")]
     pub(crate) callee: (arinsal_term::Atom, arinsal_term::Atom),
 }
 
@@ -1700,6 +1707,7 @@ impl Process {
     /// has no such position (its native code never keeps one), so every site is the same one
     /// and the trapped import alone names the call.
     #[inline]
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn trap_site(&self) -> (usize, usize) {
         (0, 0)
     }

@@ -378,10 +378,19 @@ pub extern "C" fn beam_jit_wait_timeout(
                 // `c_p->def_arg_reg[0] = next`: the timeout label a timed-out schedule-in
                 // continues at.
                 process.receive_timeout_next = next;
-                // erts_set_proc_timer_term(c_p, timeout_value) while the process runs; a
-                // timer already set for this receive stays as it is.
-                arinsal_sched::erts_proc_sched_data(process, |_, esdp| {
-                    arinsal_sched::erts_set_proc_timer_term(esdp, pos);
+                // erts_set_proc_timer_term(c_p, timeout_value) while the process runs: the
+                // timer is `c_p->common.timer`, the wheel is `esdp->timer_wheel`. A timer
+                // already set for this receive stays as it is.
+                arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
+                    let pid = process
+                        .self_pid()
+                        .expect("native wait_timeout runs on a live process");
+                    arinsal_sched::erts_set_proc_timer_term(
+                        receive_probe(process).receive_timer(),
+                        pid,
+                        esdp,
+                        pos,
+                    );
                 })
                 .expect(
                     "native code runs inside an executor slice, which publishes its scheduler data",

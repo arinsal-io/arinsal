@@ -1888,13 +1888,29 @@ fn remote_relations(
             return;
         };
         let exiting = |target: &Process| target.dirty_exiting() || target.has_exit_cont();
-        // An exit signal the drain handled makes the target exiting (ERTS_PROC_IS_EXITING):
+        // A handled exit signal makes the target exiting (ERTS_PROC_IS_EXITING):
         // it has no relations to report, and its exit is not the caller's failure.
-        if !exiting(target)
-            && let Err(error) = target.drain(target_ctx)
-            && !Process::erts_proc_is_exiting(target_ctx)
-        {
-            signal_error = Some(error);
+        if !exiting(target) {
+            let handled = target.fetch_signals(target_ctx).and_then(|()| {
+                loop {
+                    let mut reds = crate::process::CONTEXT_REDS;
+                    let done = target.handle_incoming(
+                        target_ctx,
+                        &mut reds,
+                        crate::process::CONTEXT_REDS,
+                        true,
+                    )?;
+                    Process::erts_bif_chk_exited(target, target_ctx)?;
+                    if done || exiting(target) || Process::erts_proc_is_exiting(target_ctx) {
+                        break Ok(());
+                    }
+                }
+            });
+            if let Err(error) = handled
+                && !Process::erts_proc_is_exiting(target_ctx)
+            {
+                signal_error = Some(error);
+            }
         }
         if signal_error.is_none() && !exiting(target) && !Process::erts_proc_is_exiting(target_ctx)
         {
@@ -1915,14 +1931,23 @@ fn remote_relations(
 /// Fetch and handle the current process's incoming signals before reading its link tree.
 ///
 /// Port of erts/emulator/beam/erl_bif_info.c:4650-4668 (`link_list` and `monitor_list`),
-/// OTP-29.1.1: the debug introspection path drains pending signals even for the caller itself.
+/// OTP-29.1.1: the debug introspection path handles pending signals even for the caller itself.
 fn current_relations(
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
 ) -> Result<Option<Relations>, VmError> {
     let exiting = |target: &Process| target.dirty_exiting() || target.has_exit_cont();
     if !exiting(process) {
-        process.drain(ctx)?;
+        process.fetch_signals(ctx)?;
+        loop {
+            let mut reds = crate::process::CONTEXT_REDS;
+            let done =
+                process.handle_incoming(ctx, &mut reds, crate::process::CONTEXT_REDS, true)?;
+            Process::erts_bif_chk_exited(process, ctx)?;
+            if done || exiting(process) || Process::erts_proc_is_exiting(ctx) {
+                break;
+            }
+        }
     }
     Ok((!exiting(process)).then(|| Relations::of(process)))
 }

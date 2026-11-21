@@ -41,23 +41,6 @@ impl Process {
         }
     }
 
-    /// Handle every signal queued for this process: fetch once, then handle the middle queue
-    /// in `CONTEXT_REDS` rounds until it is empty.
-    // Port of erts/emulator/beam/erl_bif_info.c:4643-4652 (process_info on a process that
-    // handles its signals until done), OTP-29.1.1.
-    pub(crate) fn drain(&mut self, ctx: &mut RunCtx<'_, crate::Process>) -> Result<(), VmError> {
-        let mut local_only = false;
-        loop {
-            let mut reds = CONTEXT_REDS;
-            let done = self.handle_incoming(ctx, &mut reds, CONTEXT_REDS, local_only)?;
-            Self::erts_bif_chk_exited(self, ctx)?;
-            if done {
-                return Ok(());
-            }
-            local_only = true;
-        }
-    }
-
     /// Insert a flush signal and set `FS_FLUSHING_SIGS`.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:3520-3560
     // (`erts_proc_sig_init_flush_signals`), OTP-29.1.1.

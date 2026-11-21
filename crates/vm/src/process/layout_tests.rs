@@ -161,9 +161,6 @@ fn check_process_code_sees_the_function_of_a_return_trace_frame() {
 /// are left alone (the latter answers true).
 #[test]
 fn check_process_code_clears_ftrace_that_names_the_module() {
-    fn packed(module: usize, ip: usize) -> u64 {
-        (1 << 63) | ((module as u64) << 32) | ip as u64
-    }
     fn install(process: &mut Process, pc: u64, current: u64, trace: &[u64]) {
         let mut digits = vec![
             arinsal_beamasm::exc::EXC_ERROR,
@@ -185,32 +182,24 @@ fn check_process_code_clears_ftrace_that_names_the_module() {
 
     let mut process = Process::new();
     arinsal_sched::Task::init_in_place(&mut process, arinsal_sched::Pid::from_data(0));
-    install(&mut process, packed(7, 4), 0, &[]);
-    assert!(!process.references_code(7, |_| false));
+    install(&mut process, 0x4500, 0, &[]);
+    assert!(!process.references_code(7, |address| address == 0x4500));
     assert_eq!(process.heap.abi.exc.freason, 0);
     assert_eq!(process.heap.abi.exc.fvalue, 0);
     assert_eq!(process.heap.abi.exc.ftrace, 0);
 
-    install(&mut process, 0, packed(7, 9), &[]);
-    assert!(!process.references_code(7, |_| false));
+    install(&mut process, 0, 0x4600, &[]);
+    assert!(!process.references_code(7, |address| address == 0x4600));
     assert_eq!(process.heap.abi.exc.ftrace, 0);
 
-    install(&mut process, 0, 0, &[packed(7, 3)]);
-    assert!(!process.references_code(7, |_| false));
+    install(&mut process, 0, 0, &[0x4700]);
+    assert!(!process.references_code(7, |address| address == 0x4700));
     assert_eq!(process.heap.abi.exc.ftrace, 0);
 
-    install(&mut process, 0x4500, 0, &[]);
-    assert!(!process.references_code(7, |address| address == 0x4500));
-    assert_eq!(process.heap.abi.exc.ftrace, 0);
-
-    install(&mut process, 0, 0, &[0x4500]);
-    assert!(!process.references_code(7, |address| address == 0x4500));
-    assert_eq!(process.heap.abi.exc.ftrace, 0);
-
-    // Another module, and a BIF MFA in `current` (atom pair, not a code pointer).
-    install(&mut process, packed(9, 1), (20 << 32) | 30, &[packed(9, 2)]);
+    // A BIF `ErtsCodeMFA*` in `current` lives in the export table, not the purged module.
+    install(&mut process, 0x4500, 0x100, &[0x4501]);
     let other = process.heap.abi.exc.ftrace;
-    assert!(!process.references_code(7, |_| true));
+    assert!(!process.references_code(7, |address| address == 0x9999));
     assert_eq!(process.heap.abi.exc.ftrace, other);
     assert_eq!(
         process.heap.abi.exc.freason,
@@ -219,7 +208,7 @@ fn check_process_code_clears_ftrace_that_names_the_module() {
 
     // The process itself is in the module (`rp->i`): erts returns before looking at ftrace.
     process.set_native_pc(Some(0x7000));
-    install(&mut process, packed(7, 4), 0, &[]);
+    install(&mut process, 0x4500, 0, &[]);
     let live = process.heap.abi.exc.ftrace;
     assert!(process.references_code(7, |address| address == 0x7000));
     assert_eq!(process.heap.abi.exc.ftrace, live);

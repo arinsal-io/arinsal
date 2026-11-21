@@ -1,8 +1,11 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::{EncodeOptions, OwnedTerm, decode, encode};
+#[cfg(target_arch = "aarch64")]
 use arinsal_term::{Term, TermBuilder};
+#[cfg(target_arch = "aarch64")]
 use arinsal_vm::Process;
 use similar_asserts::assert_eq;
+#[cfg(target_arch = "aarch64")]
 use std::process::Command;
 use std::sync::Mutex;
 

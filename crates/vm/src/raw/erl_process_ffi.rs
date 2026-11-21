@@ -27,6 +27,19 @@ pub extern "C" fn erts_schedule(
     arinsal_sched::erts_schedule_c_abi::<crate::proc_create::Process>(p.cast(), calls).cast()
 }
 
+/// `int arinsal_slice_step(Process *c_p, int resume)`: the Rust slice of the running `c_p`
+/// (`arinsal_sched::erts_slice_step_c_abi`); nonzero when process_main jumps to `c_p->i`,
+/// zero when the slice ended and process_main schedules `c_p` out.
+// Deviation (Step D of the generated_process_main plan, see crates/beamasm/src/x86/
+// process_main.rs): erts process_main has no such call.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(no_mangle)]
+pub extern "C" fn arinsal_slice_step(c_p: *mut ProcessHeader, resume: i32) -> i32 {
+    i32::from(arinsal_sched::erts_slice_step_c_abi::<
+        crate::proc_create::Process,
+    >(c_p.cast(), resume != 0))
+}
+
 /// `void erts_do_exit_process(Process *p, Eterm reason)`: terminate `c_p` with `reason`. On
 /// return the process is FREE in `p->state`, or its exit yielded with `p->u.terminate` set;
 /// process_main goes to `do_schedule` either way.

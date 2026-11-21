@@ -665,6 +665,16 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "exit_signal", 2) => bif!(crate::natives::bif::exit_signal_2),
         ("erlang", "exit_signal", 3) => bif!(crate::natives::bif::exit_signal_3),
         ("erlang", "spawn", 3) => bif!(crate::natives::bif::spawn_3),
+        // beam_bif_load.c
+        ("erlang", "loaded", 0) => bif!(crate::natives::beam_bif_load::loaded_0),
+        ("erlang", "pre_loaded", 0) => bif!(crate::natives::beam_bif_load::pre_loaded_0),
+        ("erlang", "module_loaded", 1) => bif!(crate::natives::beam_bif_load::module_loaded_1),
+        ("erlang", "check_old_code", 1) => bif!(crate::natives::beam_bif_load::check_old_code_1),
+        ("erlang", "function_exported", 3) => bif!(crate::natives::bif::function_exported_3),
+        // erl_init.c
+        ("erts_internal", "spawn_system_process", 3) => {
+            bif!(crate::natives::erl_init::erts_internal_spawn_system_process_3)
+        }
         ("erlang", "spawn_link", 3) => bif!(crate::natives::bif::spawn_link_3),
         ("erlang", "spawn_opt", 4) => bif!(crate::natives::bif::spawn_opt_4),
         ("erts_internal", "spawn_request", 4) => {

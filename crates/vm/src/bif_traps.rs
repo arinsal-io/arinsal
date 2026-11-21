@@ -126,7 +126,9 @@ fn clear_export_trap(process: &mut Process) {
 pub(crate) struct ContinuationTarget {
     pub(crate) continuation: &'static str,
     pub(crate) trap_export_id: usize,
+    #[cfg(target_arch = "aarch64")]
     pub(crate) module: &'static str,
+    #[cfg(target_arch = "aarch64")]
     pub(crate) function: &'static str,
     pub(crate) arity: usize,
     pub(crate) module_atom: arinsal_term::Atom,
@@ -180,7 +182,9 @@ pub(crate) fn continuation_target(continuation: &'static str) -> &'static Contin
         let target: &'static ContinuationTarget = Box::leak(Box::new(ContinuationTarget {
             continuation,
             trap_export_id: all.len(),
+            #[cfg(target_arch = "aarch64")]
             module,
+            #[cfg(target_arch = "aarch64")]
             function,
             arity,
             module_atom: global_atoms()
@@ -225,7 +229,7 @@ pub(crate) fn take_export_trap(process: &mut Process) -> Option<crate::ExportTra
 pub(crate) fn install_export_trap(
     process: &mut Process,
     import: usize,
-    callee: (arinsal_term::Atom, arinsal_term::Atom),
+    _callee: (arinsal_term::Atom, arinsal_term::Atom),
     trap: &crate::ExportTrap,
     schedule_out: bool,
 ) {
@@ -241,7 +245,9 @@ pub(crate) fn install_export_trap(
         process.set_gc_enabled(false);
     }
     process.slice_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
+        #[cfg(target_arch = "aarch64")]
         caller_module: process.trap_site().0,
+        #[cfg(target_arch = "aarch64")]
         caller_ip: process.trap_site().1,
         schedule_out,
         import,
@@ -249,7 +255,8 @@ pub(crate) fn install_export_trap(
         target: trap.target,
         gc_was_enabled,
         arity,
-        callee,
+        #[cfg(target_arch = "aarch64")]
+        callee: _callee,
         args: {
             let mut saved = [Term::NIL; 4];
             saved[..arity].copy_from_slice(&trap.args);

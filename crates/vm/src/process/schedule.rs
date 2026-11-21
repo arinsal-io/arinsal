@@ -307,6 +307,58 @@ impl Task for Process {
         })
     }
 
+    // Port of erts/emulator/beam/jit/x86/process_main.cpp (emit_process_main: the slice
+    // between erts_schedule and `jmp c_p->i`, and from context_switch / do_schedule back to
+    // schedule_next), OTP-29.1.1.
+    #[cfg(target_arch = "x86_64")]
+    fn run_step(c_p: &mut CP<'_>, esdp: &ErtsSchedulerData, resume: bool) -> bool {
+        use super::executor_run::{SliceStep, slice_begin, slice_step};
+        esdp.with_ctx(c_p, |process, ctx| {
+            let data = arinsal_sched::erts_sched_registers(esdp);
+            let (slice, step) = if resume {
+                let mut slice = data
+                    .slice
+                    .take()
+                    .expect("schedule_next continues the slice it left");
+                let step = data.registers.with(|reg| {
+                    let exit = arinsal_beamasm::take_native_exit(reg);
+                    slice_step(process, ctx, reg, &mut slice, Some(exit))
+                });
+                (slice, step)
+            } else {
+                // process_main has run copy_in_registers and set REDS_IN (def_arg_reg[5]).
+                if !process.run_task_begin(ctx) {
+                    return false;
+                }
+                data.registers.with(|reg| {
+                    let mut slice = slice_begin(process, ctx, reg);
+                    let step = slice_step(process, ctx, reg, &mut slice, None);
+                    (slice, step)
+                })
+            };
+            match step {
+                SliceStep::Enter(_) => {
+                    data.slice.set(Some(slice));
+                    true
+                }
+                SliceStep::End(result) => {
+                    let result = process.run_executor_end(ctx, result);
+                    process.run_task_end(ctx, result);
+                    false
+                }
+            }
+        })
+    }
+
+    // Port of erts/emulator/beam/erl_process.c (sched_thread_func: `process_main(esdp)`) and
+    // jit/x86/process_main.cpp (emit_process_main), OTP-29.1.1.
+    #[cfg(target_arch = "x86_64")]
+    fn process_main(esdp: &ErtsSchedulerData) -> ! {
+        arinsal_sched::erts_sched_registers(esdp)
+            .registers
+            .process_main()
+    }
+
     // Port of erts/emulator/beam/erl_process.c:9660-9700 (erts_schedule, schedule-out of the
     // process that ran: `actual_reds = calls - esdp->virtual_reds`, `p->reds += actual_reds`,
     // then trace_schedule_out), OTP-29.1.1.
@@ -533,11 +585,21 @@ impl Process {
 
     #[inline(always)]
     fn run_task(&mut self, ctx: &mut RunCtx<'_, crate::Process>) {
+        if !self.run_task_begin(ctx) {
+            return;
+        }
+        let result = self.run_executor(ctx);
+        self.run_task_end(ctx, result)
+    }
+
+    /// The part of [`Self::run_task`] before the process_main loop: `false` when the slice
+    /// ended without running Erlang code.
+    fn run_task_begin(&mut self, ctx: &mut RunCtx<'_, crate::Process>) -> bool {
         if self.runtime.is_none() {
             // A process with no node runtime (the in-process test harness) has no code to
             // run; it ends at once.
             ctx.erts_proc_exit_free(self);
-            return;
+            return false;
         }
         // Profiling allocates no side record unless runnable-proc profiling is actually on.
         // Port of erts/emulator/beam/erl_process.c:6978-6992 (schedule_process_sys_task and
@@ -553,7 +615,7 @@ impl Process {
             // Exited by a dirty signal handler while queued for a dirty scheduler: the exit
             // ran there, only the process structure remains to be released.
             ctx.erts_proc_exit_free(self);
-            return;
+            return false;
         }
         if self.has_exit_cont() {
             // Port of erts/emulator/beam/erl_process.c:14819 (erts_continue_exit_process
@@ -561,9 +623,18 @@ impl Process {
             // (continue_exit: `erts_continue_exit_process(c_p); goto do_schedule`),
             // OTP-29.1.1: an exiting process resumes at its exit continuation.
             self.erts_continue_exit_process(&mut Vm {}, ctx);
-            return self.exit_outcome(ctx);
+            self.exit_outcome(ctx);
+            return false;
         }
-        let result = self.run_executor(ctx);
+        true
+    }
+
+    /// The part of [`Self::run_task`] after the process_main loop ended the slice.
+    fn run_task_end(
+        &mut self,
+        ctx: &mut RunCtx<'_, crate::Process>,
+        result: Result<RunState, VmError>,
+    ) {
         if self.has_exit_cont()
             || ctx.proc_state().load(Ordering::Acquire) & arinsal_sched::psflg::FREE != 0
         {
@@ -618,7 +689,16 @@ impl Process {
     fn run_executor(&mut self, ctx: &mut RunCtx<'_, crate::Process>) -> Result<RunState, VmError> {
         let esdp = ctx.esdp();
         let data = arinsal_sched::erts_sched_registers(esdp);
-        let mut result = data.registers.with(|reg| process_main(self, ctx, reg));
+        let result = data.registers.with(|reg| process_main(self, ctx, reg));
+        self.run_executor_end(ctx, result)
+    }
+
+    /// The part of [`Self::run_executor`] after the process_main loop ended the slice.
+    fn run_executor_end(
+        &mut self,
+        ctx: &mut RunCtx<'_, crate::Process>,
+        mut result: Result<RunState, VmError>,
+    ) -> Result<RunState, VmError> {
         // BIF_TRAP context-switches to beam_bif_export_trap. The continuation is an export
         // call, so the caller's CP stays on the stack and the backtrace PC is that trap.
         if matches!(result, Ok(RunState::Yield))

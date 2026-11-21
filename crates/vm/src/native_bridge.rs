@@ -1024,7 +1024,8 @@ pub(crate) fn native_prepare(
 
 /// Enter native code at the prepared `c_p->i`; returns when the native code leaves to the
 /// scheduler loop.
-// Port of erts/emulator/beam/jit/x86/process_main.cpp:300 (`jmp c_p->i`), OTP-29.1.1.
+// Port of erts/emulator/beam/jit/arm/process_main.cpp (`br c_p->i`), OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub(crate) fn native_enter(
     process: &mut Process,

@@ -1056,7 +1056,11 @@ fn process_info_aux(
         },
         arinsal_term::atoms::CURRENT_FUNCTION => process_info_item_current_function(vm, process)?,
         arinsal_term::atoms::CURRENT_LOCATION => process_info_item_current_location(vm, process)?,
-        arinsal_term::atoms::CURRENT_STACKTRACE => current_stacktrace(process, reserve)?,
+        arinsal_term::atoms::CURRENT_STACKTRACE => {
+            // Port of erl_bif_info.c:2400 (`include_i = (p != rp || REQUEST_FOR_OTHER)`).
+            let include_i = matches!(src, InfoSource::Other(_));
+            current_stacktrace(process, reserve, include_i)?
+        }
         arinsal_term::atoms::GARBAGE_COLLECTION => {
             process_info_item_garbage_collection(src, process, *reserve)?
         }
@@ -2263,11 +2267,15 @@ fn backtrace_with(process: &Process) -> Vec<u8> {
     text
 }
 
-fn current_stacktrace(process: &mut Process, reserve: &mut usize) -> Result<Term, VmError> {
+fn current_stacktrace(
+    process: &mut Process,
+    reserve: &mut usize,
+    include_i: bool,
+) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_bif_info.c:2397-2404 (current_stacktrace), OTP-29.1.1:
     // erts reads the runtime-wide limit, shared by every scheduler.
     let depth = crate::erl_init::erts_backtrace_depth();
-    crate::stacktrace::build_for_process_info(process, depth, reserve)
+    crate::stacktrace::build_for_process_info(process, depth, include_i, reserve)
 }
 
 pub(crate) fn live(process: &Process, pid: Pid) -> Result<bool, VmError> {

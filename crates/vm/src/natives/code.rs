@@ -645,57 +645,6 @@ fn module_name(term: Term) -> Option<String> {
         .map(|name| name.to_string())
 }
 
-/// `erlang:module_loaded/1` called directly from native code.
-// Port of erts/emulator/beam/beam_bif_load.c:2548 (module_loaded_1), OTP-29.1.1: the module
-// table of the active code index.
-pub(crate) fn module_loaded_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [module] = args else {
-        return None;
-    };
-    let name = global_atoms().text(module.as_atom()?)?;
-    let loaded = process
-        .runtime
-        .as_ref()?
-        .with_active_code(|_, tables| tables.loaded.contains_key(name));
-    Some(Ok(Term::atom(if loaded {
-        atoms::TRUE
-    } else {
-        atoms::FALSE
-    })))
-}
-
-/// `erlang:function_exported/3` called directly from native code.
-// Port of erts/emulator/beam/bif.c:4402 (function_exported_3), OTP-29.1.1.
-pub(crate) fn function_exported_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [module, function, arity] = args else {
-        return None;
-    };
-    let module = module.as_atom()?;
-    let function = function.as_atom()?;
-    let arity = arity.as_small()? as u32;
-    let code = process.runtime.as_ref()?.code_indexes();
-    let code_ix = code.active();
-    let exported = code.with_active_tables(|tables| {
-        tables
-            .exports
-            .function_exported((module, function, arity), code_ix)
-            || (module == atoms::ERLANG
-                && ((function == atoms::APPLY && matches!(arity, 2 | 3))
-                    || (function == atoms::YIELD && arity == 0)))
-    });
-    Some(Ok(Term::atom(if exported {
-        atoms::TRUE
-    } else {
-        atoms::FALSE
-    })))
-}
-
 fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     let Some(name) = args.first().and_then(|arg| module_name(*arg)) else {
         return Err(badarg());
@@ -1436,11 +1385,6 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erts_internal", "beamfile_module_md5", 1),
     ("erts_internal", "prepare_loading", 2),
     ("erlang", "finish_loading", 1),
-    ("erlang", "module_loaded", 1),
-    ("erlang", "loaded", 0),
-    ("erlang", "pre_loaded", 0),
-    ("erlang", "function_exported", 3),
-    ("erlang", "check_old_code", 1),
     ("erlang", "delete_module", 1),
     ("erts_internal", "purge_module", 2),
     ("erts_internal", "check_process_code", 1),
@@ -1640,92 +1584,6 @@ fn call_values(
         ("erts_internal", "beamfile_module_md5", 1) => Some(beamfile_module_md5(process, args[0])),
         ("erts_internal", "prepare_loading", 2) => Some(prepare(vm, process, args)),
         ("erlang", "finish_loading", 1) => Some(finish_loading_1(vm, process, ctx, args)),
-        ("erlang", "module_loaded", 1) => Some((|| {
-            let name = module_name(args[0]).ok_or_else(badarg)?;
-            Ok(Term::atom(
-                if code_tables(erts_active_code_ix())
-                    .loaded
-                    .contains_key(&name)
-                {
-                    atoms::TRUE
-                } else {
-                    atoms::FALSE
-                },
-            ))
-        })()),
-        ("erlang", "loaded", 0) => Some({
-            // Port of erts/emulator/beam/beam_bif_load.c:762 (loaded_0), OTP-29.1.1:
-            // walk `module_code(i)` for i in 0..module_code_size and CONS each module
-            // with curr or old code, so the Erlang list is reverse creation order.
-            let tables = code_tables(erts_active_code_ix());
-            let mut modules = Vec::new();
-            for i in 0..tables.loaded.code_size() {
-                let Some(entry) = tables.loaded.module_code(i) else {
-                    continue;
-                };
-                if entry.curr.is_some() || entry.old.is_some() {
-                    modules.push(Term::atom(entry.module));
-                }
-            }
-            modules.reverse();
-            make_list(process, modules)
-        }),
-        ("erlang", "pre_loaded", 0) => Some(make_list(
-            process,
-            [
-                "persistent_term",
-                "counters",
-                "atomics",
-                "erts_dirty_process_signal_handler",
-                "erts_trace_cleaner",
-                "erts_literal_area_collector",
-                "erl_tracer",
-                "erts_internal",
-                "erlang",
-                "erl_prim_loader",
-                "prim_zip",
-                "prim_net",
-                "prim_socket",
-                "socket_registry",
-                "zlib",
-                "prim_file",
-                "prim_inet",
-                "prim_eval",
-                "prim_buffer",
-                "init",
-                "erl_init",
-                "erts_code_purger",
-            ]
-            .into_iter()
-            .map(crate::atom_cache::put),
-        )),
-        ("erlang", "function_exported", 3) => Some((|| {
-            let name = module_name(args[0]).ok_or_else(badarg)?;
-            let function = module_name(args[1]).ok_or_else(badarg)?;
-            let arity = args[2].as_small().ok_or_else(badarg)? as u32;
-            let result = code_tables(erts_active_code_ix())
-                .loaded
-                .get(&name)
-                .is_some_and(|id| {
-                    code_tables(erts_active_code_ix()).modules[*id]
-                        .exports
-                        .iter()
-                        .any(|export| {
-                            export.function == function && u32::from(export.arity) == arity
-                        })
-                });
-            Ok(Term::atom(if result { atoms::TRUE } else { atoms::FALSE }))
-        })()),
-        ("erlang", "check_old_code", 1) => Some((|| {
-            let name = module_name(args[0]).ok_or_else(badarg)?;
-            Ok(Term::atom(
-                if code_tables(erts_active_code_ix()).loaded.has_old(&name) {
-                    atoms::TRUE
-                } else {
-                    atoms::FALSE
-                },
-            ))
-        })()),
         ("erlang", "delete_module", 1) => Some((|| {
             let name = module_name(args[0]).ok_or_else(badarg)?;
             // The thread-progress callback commits the ended staging area and releases this

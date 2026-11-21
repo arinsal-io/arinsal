@@ -64,6 +64,12 @@ use self::spawn_eval::*;
 // Port of erts/emulator/beam/erl_process.h (`erts_atomic32_t state` in `struct process`),
 // OTP-29.1.1.
 pub const PROCESS_STATE_OFFSET: usize = arinsal_sched::process_state_offset::<crate::Process>();
+/// Offset of `c_p->def_arg_reg[5]` from `c_p`: the slot process_main keeps `REDS_IN` in
+/// ([`crate::proc_create::ArgRegs::reds_in`]).
+// Port of erts/emulator/beam/erl_process.h (`Eterm def_arg_reg[6]` in `struct process`),
+// OTP-29.1.1.
+pub const PROCESS_DEF_ARG_REG5_OFFSET: usize =
+    std::mem::offset_of!(crate::Process, x) + crate::proc_create::ArgRegs::REDS_IN_OFFSET;
 /// Offset of `c_p->flags` ([`arinsal_term::pflags`]) from `c_p`.
 // Port of erts/emulator/beam/erl_process.h (`Uint32 flags` in `struct process`), OTP-29.1.1.
 pub const PROCESS_FLAGS_OFFSET: usize =

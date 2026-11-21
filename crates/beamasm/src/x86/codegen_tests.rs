@@ -531,12 +531,10 @@ impl Process {
             // SAFETY: boxed arguments point into `self.stack`, which outlives the call.
             self.regs.x_reg_array[i] = unsafe { Term::from_raw_bits(*arg) };
         }
-        // SAFETY: `entry` is a function entry of a module generated for the x86-64 BeamAsm
-        // register contract, alive in executable memory for the duration of the call; the
-        // process heap and stack point into `self.stack`.
-        let exit = unsafe {
-            super::rt::enter_native_raw(&mut self.header, &mut self.regs, entry as *const _)
-        };
+        // `entry` is a function entry of a module generated for the x86-64 BeamAsm register
+        // contract, alive in executable memory for the duration of the call; the process
+        // heap and stack point into `self.stack`.
+        let exit = super::test_sched::enter(&mut self.header, &mut self.regs, entry);
         assert_eq!(exit, ExitReason::Returned);
         self.regs.x_reg_array[0].tagged_word()
     }

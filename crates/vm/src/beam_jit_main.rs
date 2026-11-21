@@ -130,6 +130,8 @@ pub(crate) fn beamasm_emit_call_nif(
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) use x86::bga;
+#[cfg(target_arch = "x86_64")]
+pub(crate) use x86::process_main_ptr;
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
@@ -156,6 +158,7 @@ mod x86 {
                 state: crate::PROCESS_STATE_OFFSET as u32,
                 sig_qs_save: crate::PROCESS_SIGQ_SAVE_OFFSET as u32,
                 message_term: crate::ERTS_MESSAGE_TERM_OFFSET as u32,
+                def_arg_reg5: crate::PROCESS_DEF_ARG_REG5_OFFSET as u32,
             })
             // erts_exit(ERTS_ABORT_EXIT, ...) when the global code cannot be generated.
             .unwrap_or_else(|error| panic!("beamasm_init: {error}"))
@@ -176,6 +179,20 @@ mod x86 {
             // `beam_exit = (ErtsCodePtr)bga->get_process_exit()` (beam_jit_main.cpp:395).
             exit: get(GlobalLabels::ProcessExit),
         });
-        arinsal_beamasm::set_process_main_labels(get(GlobalLabels::DispatchNif));
+        arinsal_beamasm::set_process_main_labels(
+            jit.bga
+                .native_exit_ptr()
+                .expect("process_main emits the native exit fragment"),
+        );
+    }
+
+    /// `bga->get_process_main()`: the generated scheduler loop `void
+    /// process_main(ErtsSchedulerData *esdp)` (called with `&esdp->registers`).
+    // Port of erts/emulator/beam/jit/beam_jit_main.cpp:413-418 (process_main), OTP-29.1.1.
+    pub(crate) fn process_main_ptr() -> usize {
+        bga()
+            .bga
+            .get_ptr(GlobalLabels::ProcessMain)
+            .expect("beamasm_init emits process_main")
     }
 }

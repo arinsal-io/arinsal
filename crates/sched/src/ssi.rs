@@ -276,15 +276,19 @@ fn sched_set_suspended_sleeptype(ssi: &ErtsSchedulerSleepInfo) -> u32 {
     }
 }
 
-/// `suspend_scheduler_sleep` of a dirty scheduler (`normal_sched == 0`): sleep on
-/// `ssi->event` without a timeout until a wake clears the suspended wait flags.
+/// `suspend_scheduler_sleep`: sleep on `ssi->event` until a wake clears the suspended wait
+/// flags. A dirty scheduler (`normal_sched == 0`) passes no deadline and waits without a
+/// timeout; a normal one waits until its next timer at most.
 // Port of erts/emulator/beam/erl_process.c:7742 (suspend_scheduler_sleep), OTP-29.1.1.
-pub(crate) fn suspend_scheduler_sleep_dirty(ssi: &ErtsSchedulerSleepInfo) {
+pub(crate) fn suspend_scheduler_sleep(ssi: &ErtsSchedulerSleepInfo, timeout_time: Option<Instant>) {
     let flgs = sched_spin_suspended(ssi, ERTS_SCHED_SUSPEND_SLEEP_SPINCOUNT);
     if flgs == ERTS_SSI_FLGS_SUSPENDED_WAIT {
         let flgs = sched_set_suspended_sleeptype(ssi);
         if flgs == ERTS_SSI_FLGS_SUSPENDED_WAIT | ERTS_SSI_FLG_TSE_SLEEPING {
-            ssi.event.wait();
+            match timeout_time {
+                None => ssi.event.wait(),
+                Some(deadline) => tse_twait_until(ssi, deadline),
+            }
         }
     }
 }

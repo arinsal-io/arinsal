@@ -5,6 +5,7 @@
 //! returns `None` for calls it does not implement. Adding a family means adding
 //! its module below and one line to [`FAMILIES`].
 
+pub(crate) mod beam_bif_load;
 pub(crate) mod beam_debug;
 pub(crate) mod bif;
 pub(crate) mod bif_phash2;
@@ -26,6 +27,7 @@ pub(crate) mod erl_bif_unique;
 pub(crate) mod erl_db;
 pub(crate) mod erl_debugger;
 pub(crate) mod erl_hl_timer;
+pub(crate) mod erl_init;
 pub(crate) mod erl_iolist;
 pub(crate) mod erl_iolist_generic;
 pub(crate) mod erl_map;
@@ -318,13 +320,6 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     }
     if module == "erts_internal" && function == "suspend_process" && arity == 2 {
         return Some(proc::suspend_process_light);
-    }
-    if module == "erlang" {
-        match (function, arity) {
-            ("module_loaded", 1) => return Some(code::module_loaded_light),
-            ("function_exported", 3) => return Some(code::function_exported_light),
-            _ => {}
-        }
     }
     None
 }

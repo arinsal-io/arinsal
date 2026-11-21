@@ -34,6 +34,7 @@ fn fragments() -> &'static ReceiveFragments {
                     sig_qs_save: std::mem::offset_of!(TestProcess, save) as u32,
                     message_term: 8,
                     state: 0,
+                    def_arg_reg5: 0,
                 },
             )
             .unwrap();

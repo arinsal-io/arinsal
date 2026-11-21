@@ -48,8 +48,10 @@ fn static_nifs() -> &'static std::sync::Mutex<std::collections::HashMap<usize, S
     NIFS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+#[cfg(target_arch = "aarch64")]
 static NEXT_STATIC_NIF: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn register_static_nif(
     module: String,
     function: String,
@@ -236,6 +238,7 @@ pub(crate) fn static_nif_dirty_class(
 /// Port of erts/emulator/beam/erl_nif.c:3437-3477 (static_schedule_dirty_nif and
 /// static_schedule_dirty_io_nif), OTP-29.1.1. A process outside a scheduler (`Vm::eval`) has no
 /// dirty scheduler to move to and runs the NIF in place.
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn moves_to_dirty(
     process: &crate::Process,
     module: &str,
@@ -310,6 +313,7 @@ pub(crate) extern "C" fn arinsal_beamasm_export_trampoline(
 /// `error_handler:undefined_function/3` (the process's error handler module), with X0..X2 set
 /// to the stub's module, function and argument list; zero when there is no such function.
 // Port of erts/emulator/beam/beam_common.c:1294-1345 (call_error_handler), OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 pub(crate) extern "C" fn arinsal_beamasm_call_error_handler(
     header: *mut ProcessHeader,
     ep: u64,
@@ -338,6 +342,7 @@ pub(crate) extern "C" fn arinsal_beamasm_call_error_handler(
 /// returns the address the call continues with.
 // Port of erts/emulator/beam/jit/arm/instr_call.cpp:123-148 (emit_dispatch_save_calls_export),
 // OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 pub(crate) extern "C" fn arinsal_beamasm_save_calls_export(
     header: *mut ProcessHeader,
     _identity: u64,
@@ -438,6 +443,7 @@ pub(crate) fn vbump_reds(process: &mut crate::Process, reds: i32) {
 /// Prepares the live X registers and handler arguments for a native line-breakpoint call.
 // Port of erts/emulator/beam/beam_bp.c:1821-1865
 // (erts_line_breakpoint_hit__prepare_call), OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 pub extern "C" fn arinsal_beamasm_line_breakpoint_prepare(
     header: *mut ProcessHeader,
     pc: u64,
@@ -488,6 +494,7 @@ pub extern "C" fn arinsal_beamasm_line_breakpoint_prepare(
 /// Restores the live X register prefix from the stack below a returning breakpoint handler.
 // Port of erts/emulator/beam/beam_bp.c:1868-1882
 // (erts_line_breakpoint_hit__cleanup), OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 pub extern "C" fn arinsal_beamasm_line_breakpoint_cleanup(
     header: *mut ProcessHeader,
     reg: *mut u64,
@@ -1146,11 +1153,11 @@ pub(crate) fn bif_error(process: &mut crate::Process, trap: crate::exceptions::T
         (
             Some(
                 TopFrame::Bif {
-                    info: BifErrorInfo::Cause(cause) | BifErrorInfo::Map(cause),
+                    info: BifErrorInfo::Cause(cause),
                     ..
                 }
                 | TopFrame::BifRegisters {
-                    info: BifErrorInfo::Cause(cause) | BifErrorInfo::Map(cause),
+                    info: BifErrorInfo::Cause(cause),
                     ..
                 },
             ),
@@ -1268,6 +1275,7 @@ pub(crate) fn set_native_error_info(
 /// Raises `{badfun,Fun}` or `{badarity,{Fun,Args}}` for a native fun call.
 // Port of erts/emulator/beam/beam_common.c:750-770 (expand_error_value) and
 // erts/emulator/beam/jit/arm/instr_fun.cpp:84-100, OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 fn set_call_fun_error(
     process: &mut crate::Process,
     registers: &mut arinsal_beamasm::SchedulerRegisters,
@@ -1391,100 +1399,6 @@ pub(crate) fn unpack_error_arglist(process: &mut crate::Process) -> (Term, Term)
     (reason, args)
 }
 
-/// Supplies erts' `bif_mfa` input to `save_stacktrace`, with arguments in the live X registers.
-// Port of erts/emulator/beam/beam_common.c:899-925 (`save_stacktrace`), OTP-29.1.1.
-pub(crate) fn native_bif_top(
-    process: &mut crate::Process,
-    bif_info: u64,
-    registers: &[Term],
-) -> Option<crate::stacktrace::TopFrame> {
-    use crate::stacktrace::TopFrame;
-    let freason = process.heap.abi.exc.freason;
-    // Port of beam_common.c:1010-1026 (`save_stacktrace`, non_bif_stacktrace), OTP-29.1.1:
-    // with a NULL `bif_mfa`, a function_clause takes `s->current = c_p->current` (set by
-    // `i_func_info_shared`) and `make_arglist(c_p, reg, current->arity)`. It is not a BIF
-    // frame: `build_stacktrace` looks its location up from the function's code
-    // (`erts_codemfa_to_code(s->current)`), which `function_clause_code` supplies.
-    if bif_info == 0 && is_function_clause(freason) {
-        let (module, function, arity) =
-            crate::raw::beam_common_ffi::code_mfa(process.heap.abi.current as usize as u64)?;
-        let arity = u8::try_from(arity).ok()?;
-        let args = crate::stacktrace::make_arglist(process, registers, usize::from(arity));
-        return Some(TopFrame::CurrentArgsNoLocation {
-            module,
-            function,
-            arity,
-            args,
-        });
-    }
-    if bif_info == 0 {
-        let info = crate::native_hooks::from_raw(process.heap.abi.exc.fvalue);
-        return (freason & arinsal_beamasm::exc::EXF_HAS_EXT_INFO != 0
-            && info.classify() == arinsal_term::TermKind::Map)
-            .then_some(TopFrame::CurrentArgsInfoTerm(None, info));
-    }
-    let (module, function, arity) = crate::raw::beam_common_ffi::code_mfa(bif_info)?;
-    if module == arinsal_term::atoms::ERLANG {
-        if (function == arinsal_term::atoms::ERROR
-            || function == arinsal_term::atoms::EXIT
-            || function == arinsal_term::atoms::THROW)
-            && arity == 1
-        {
-            return None;
-        }
-        if function == arinsal_term::atoms::ERROR && arity >= 2 {
-            let args = registers.get(1).copied();
-            return match registers
-                .get(2)
-                .filter(|_| arity > 2)
-                .and_then(|options| crate::exceptions::error_info_term(*options))
-            {
-                Some(info) => Some(TopFrame::CurrentArgsInfoTerm(args, info)),
-                None => args.map(TopFrame::CurrentArgs),
-            };
-        }
-    }
-    let info = native_bif_error_info(freason, process.heap.abi.exc.fvalue);
-    Some(TopFrame::BifRegisters {
-        module,
-        function,
-        arity: arity as usize,
-        info,
-    })
-}
-
-/// `GET_EXC_INDEX(freason) == GET_EXC_INDEX(EXC_FUNCTION_CLAUSE)`.
-// Port of erts/emulator/beam/error.h (GET_EXC_INDEX), OTP-29.1.1.
-fn is_function_clause(freason: u64) -> bool {
-    freason & arinsal_beamasm::exc::EXC_INDEXBITS
-        == arinsal_term::exc::EXC_FUNCTION_CLAUSE & arinsal_beamasm::exc::EXC_INDEXBITS
-}
-
-/// `erts_codemfa_to_code(c_p->current)` for a function_clause exception: the code right after
-/// the function's `ErtsCodeMfa`, whose line entry `build_stacktrace` reports; `None` for any
-/// other exception, whose saved `pc` is the raising address.
-// Port of erts/emulator/beam/code_ix.h (erts_codemfa_to_code) and beam_common.c:1229-1233
-// (`build_stacktrace`), OTP-29.1.1.
-pub(crate) fn function_clause_code(process: &crate::Process) -> Option<usize> {
-    (is_function_clause(process.heap.abi.exc.freason) && !process.heap.abi.current.is_null()).then(
-        || process.heap.abi.current as usize + core::mem::size_of::<arinsal_term::ErtsCodeMfa>(),
-    )
-}
-
-fn native_bif_error_info(freason: u64, fvalue: u64) -> crate::stacktrace::BifErrorInfo {
-    if freason & arinsal_beamasm::exc::EXF_HAS_EXT_INFO == 0 {
-        return crate::stacktrace::BifErrorInfo::Plain;
-    }
-    let value = crate::native_hooks::from_raw(fvalue);
-    if value.classify() == arinsal_term::TermKind::Map {
-        // Port of erts/emulator/beam/beam_common.c:1015-1018 (`save_stacktrace`): an extended
-        // info map in fvalue is already complete and is attached directly to the BIF frame.
-        crate::stacktrace::BifErrorInfo::Map(value)
-    } else {
-        crate::stacktrace::BifErrorInfo::Cause(value)
-    }
-}
-
 /// The error term for `freason`'s exit code. Does not update `c_p->fvalue` or
 /// `c_p->freason`.
 // Port of erts/emulator/beam/beam_common.c:742-777 (expand_error_value) and :382 (error_atom),
@@ -1544,6 +1458,7 @@ pub(crate) fn halloc_tuple2(process: &mut crate::Process, a: Term, b: Term) -> T
 /// Resolves a fun call that missed the local-dispatch fast path.
 // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1307-1365
 // (beam_jit_handle_unloaded_fun) and instr_fun.cpp:77-140, OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 pub extern "C" fn arinsal_beamasm_fun_resolver(
     header: *mut ProcessHeader,
     fun_raw: u64,
@@ -1667,6 +1582,7 @@ fn apply_bif_error_adjustment(
 #[derive(Clone, Copy)]
 pub(crate) struct ApplyTarget {
     pub export: *const arinsal_term::ExportEntry,
+    #[cfg(target_arch = "aarch64")]
     pub target: usize,
 }
 
@@ -1702,12 +1618,14 @@ fn lookup_apply_export(
         .and_then(|runtime| runtime.export_entry(mfa, code_ix))
         .map(|export| ApplyTarget {
             export: std::ptr::from_ref(export),
+            #[cfg(target_arch = "aarch64")]
             target: export.address(code_ix),
         })
         .or_else(|| {
             let export = crate::export::export_entry_or_stub(mfa);
             Some(ApplyTarget {
                 export: std::ptr::from_ref(&**export),
+                #[cfg(target_arch = "aarch64")]
                 target: export.address(code_ix),
             })
         })

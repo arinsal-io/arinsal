@@ -26,6 +26,8 @@ pub struct ProcessOffsets {
     /// `offsetof(ErtsSignal, common.tag)` is the same word (`ERL_MESSAGE_REF_FIELDS__` and
     /// `ERTS_SIGNAL_COMMON_FIELDS__` share their first three words).
     pub message_term: u32,
+    /// `offsetof(Process, def_arg_reg[5])`: `REDS_IN`, FCALLS at the start of the slice.
+    pub def_arg_reg5: u32,
 }
 
 impl ProcessOffsets {
@@ -36,5 +38,6 @@ impl ProcessOffsets {
         state: 624,
         sig_qs_save: 328,
         message_term: 16,
+        def_arg_reg5: 184,
     };
 }

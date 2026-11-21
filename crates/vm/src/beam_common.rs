@@ -482,8 +482,11 @@ pub extern "C" fn handle_error(
     process.heap.abi.i = pc as *const core::ffi::c_void;
     // Port of erts/emulator/beam/beam_common.c:470-495 (handle_error: an EXF_ARGLIST Value
     // is `{Reason, Args[, ErrorInfo]}`), OTP-29.1.1.
+    let mut args = Term::atom(arinsal_term::atoms::TRUE);
     let mut value = if process.heap.abi.exc.freason & arinsal_beamasm::exc::EXF_ARGLIST != 0 {
-        crate::native_helpers::unpack_error_arglist(process).0
+        let (reason, unpacked) = crate::native_helpers::unpack_error_arglist(process);
+        args = unpacked;
+        reason
     } else {
         crate::native_hooks::from_raw(process.heap.abi.exc.fvalue)
     };
@@ -491,22 +494,14 @@ pub extern "C" fn handle_error(
     // EXF_SAVETRACE is set), OTP-29.1.1.
     let freason = process.heap.abi.exc.freason;
     if freason & arinsal_beamasm::exc::EXF_SAVETRACE != 0 {
-        // `save_stacktrace(c_p, pc, reg, bif_mfa, Args)`: erlang:error/2,3 take Args (x1) and
-        // their error_info from the argument registers in `native_bif_top`.
-        let top = crate::native_helpers::native_bif_top(process, bif_info, registers);
-        // A function_clause ignores the raising pc (beam_common.c:1023, `s->pc = NULL`); its
-        // location is that of `erts_codemfa_to_code(s->current)` (beam_common.c:1231).
-        let native_pc =
-            crate::native_helpers::function_clause_code(process).or((pc != 0).then_some(pc));
-        let input = crate::stacktrace::StackTraceSave {
-            class: crate::native_helpers::get_exc_class(freason),
-            depth: crate::erl_init::erts_backtrace_depth(),
-            freason,
-            native_pc,
-            top: top.as_ref().map(crate::stacktrace::SaveTop::Live),
-        };
-        let trace = crate::stacktrace::save_stacktrace(process, input, registers);
-        process.heap.abi.exc.ftrace = crate::native_hooks::raw(trace);
+        // `save_stacktrace(c_p, pc, reg, bif_mfa, Args)`.
+        crate::stacktrace::save_stacktrace(
+            process,
+            pc,
+            registers,
+            bif_info as *const arinsal_term::ErtsCodeMfa,
+            args,
+        );
     }
     // Port of erts/emulator/beam/beam_common.c:509-515 (handle_error: throws that are not
     // caught are turned into 'nocatch' errors), OTP-29.1.1.

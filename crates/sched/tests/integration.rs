@@ -826,7 +826,12 @@ fn wait_timer_keeps_its_position_across_reentry() {
                     };
                 }
                 {
-                    arinsal_sched::erts_set_proc_timer_term(ctx.esdp(), pos);
+                    arinsal_sched::erts_set_proc_timer_term(
+                        ctx.receive_timer(),
+                        ctx.pid(),
+                        ctx.esdp(),
+                        pos,
+                    );
                     let _ = ctx.clear_active_unless_queued();
                 }
             })

@@ -6,8 +6,11 @@ use std::process::Command;
 
 const CHILD: &str = "ARINSAL_NATIVE_REGRESS_CHILD";
 const CHILD_MODULE: &str = "ARINSAL_NATIVE_REGRESS_MODULE";
+#[cfg(target_arch = "aarch64")]
 const MODULE: &str = "native_regress_test";
+#[cfg(target_arch = "aarch64")]
 const GC_MODULE: &str = "native_regress_gc";
+#[cfg(target_arch = "aarch64")]
 const FRAMES_MODULE: &str = "native_regress_frames";
 // Value-producing comparison BIFs (`bif_is_eq_exact`, `bif_is_ne_exact`, `bif_is_lt`,
 // `bif_is_ge`): immediate, small-typed and generic operand paths.
@@ -70,6 +73,7 @@ zero_float(Size) ->
     <<Value:Size/float>> = <<>>,
     Value.
 "#;
+#[cfg(target_arch = "aarch64")]
 const LIST_FIELDS_SOURCE: &str = r#"-module(native_list_fields).
 -export([run/0]).
 
@@ -80,8 +84,10 @@ len([], N) -> N.
 
 run() -> {head([first|last]), tail([first|last]), tail([first, second]), len([1, 2, 3], 0)}.
 "#;
+#[cfg(target_arch = "aarch64")]
 const BIF_FRAMES_MODULE: &str = "native_bif_frames";
 
+#[cfg(target_arch = "aarch64")]
 const BIF_FRAMES_SOURCE: &str = r#"-module(native_bif_frames).
 -export([run/0]).
 
@@ -100,6 +106,7 @@ run() ->
 
 // A failing BIF is the top frame and the calling function the next one, including BIFs
 // the scheduler runs for native code (spawn/3) and BIF calls in tail position.
+#[cfg(target_arch = "aarch64")]
 const FRAMES_SOURCE: &str = r#"-module(native_regress_frames).
 -export([run/0]).
 
@@ -117,6 +124,7 @@ run() ->
 
 // Match contexts, extracted binaries and tails must survive a collection at every allocation,
 // including one inside a call made while the context is saved in a Y register.
+#[cfg(target_arch = "aarch64")]
 const GC_SOURCE: &str = r#"-module(native_regress_gc).
 -export([run/0]).
 
@@ -153,6 +161,7 @@ run() ->
 
 // Each case is evaluated separately so one mismatch names its case. Stack frames are cut to
 // {M,F,Arity-or-Args} because line information of the caller differs between runs.
+#[cfg(target_arch = "aarch64")]
 const SOURCE: &str = r#"-module(native_regress_test).
 -export([run/0, yget/2, ykey/2]).
 

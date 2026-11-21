@@ -71,6 +71,7 @@ fn light_kind(module: &str, function: &str, arity: u32) -> bool {
 impl DispatchTarget {
     /// The stable `Export *` passed to erts' `save_calls`.
     // Port of erts/emulator/beam/export.h (`Export` allocation), OTP-29.1.1.
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn export_entry_address(&self) -> usize {
         Arc::as_ptr(self.slot) as usize
     }
@@ -359,6 +360,7 @@ pub(crate) fn make_export(mfa: Mfa) -> &'static Arc<arinsal_term::ExportEntry> {
 /// Export descriptor returned by the native line-breakpoint prepare helper.
 // Port of erts/emulator/beam/beam_bp.c:1828-1830
 // (erts_line_breakpoint_hit__prepare_call), OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn line_breakpoint_export(code_ix: usize) -> Option<&'static arinsal_term::ExportEntry> {
     let atoms = arinsal_term::global_atoms();
     let mfa = (
@@ -509,6 +511,7 @@ fn publish_module(
 /// with `identity`: the export's address in its node's active code index.
 // Port of erts/emulator/beam/jit/arm/instr_call.cpp:141-147 (emit_dispatch_save_calls_export:
 // "Keep going with the actual code index"), OTP-29.1.1.
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn save_calls_continuation(export: Option<ExportDispatch>) -> usize {
     export.map_or_else(crate::beam_jit_main::beam_export_trampoline, |target| {
         let active = crate::code_ix::global().active();

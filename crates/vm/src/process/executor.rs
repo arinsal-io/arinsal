@@ -106,6 +106,10 @@ pub struct SchedulerData {
     /// `esdp->no` as the allocator numbers it: the allocator index of this scheduler's thread,
     /// read once on its first process turn and handed to the heap of each process it runs.
     pub(super) alloc_ix: std::cell::Cell<Option<usize>>,
+    /// The locals of the generated x86 `process_main` the Rust slice keeps between two
+    /// native entries of one slice (`Task::run_step`).
+    #[cfg(target_arch = "x86_64")]
+    pub(super) slice: std::cell::Cell<Option<super::executor_run::Slice>>,
 }
 
 impl Default for SchedulerData {
@@ -123,6 +127,8 @@ impl Default for SchedulerData {
             registers_addr: std::cell::Cell::new(0),
             current_nif: std::cell::Cell::new(None),
             alloc_ix: std::cell::Cell::new(None),
+            #[cfg(target_arch = "x86_64")]
+            slice: std::cell::Cell::new(None),
         }
     }
 }

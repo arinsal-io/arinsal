@@ -57,6 +57,10 @@ pub const EXC_ERROR: u64 = EXC_PRIMARY | EXTAG_ERROR | EXF_LOG;
 pub const EXC_EXIT: u64 = EXC_PRIMARY | EXTAG_EXIT;
 /// Generic nonlocal return, thrown term in `fvalue`.
 pub const EXC_THROWN: u64 = EXC_PRIMARY | EXTAG_THROWN | EXF_THROWN;
+/// Error with a given arglist term (`error/2`).
+pub const EXC_ERROR_2: u64 = EXC_ERROR | EXF_ARGLIST;
+/// Error with a given arglist term and extended error info (`error/3`).
+pub const EXC_ERROR_3: u64 = EXC_ERROR | EXF_ARGLIST | EXF_HAS_EXT_INFO;
 
 const fn coded(index: u64) -> u64 {
     (index << EXC_OFFSET) | EXC_ERROR

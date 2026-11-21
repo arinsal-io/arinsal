@@ -35,6 +35,19 @@ pub(crate) fn printable_return_address(p: *const ProcessHeader, e: *const u64) -
     0
 }
 
+/// `void copy_in_registers(Process *c_p, Eterm *reg)`: process_main's schedule-in load of
+/// the saved argument registers into the scheduler's register array (`schedule_next`).
+// Port of erts/emulator/beam/beam_common.c:336 (copy_in_registers), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn copy_in_registers(c_p: *mut ProcessHeader, reg: *mut u64) {
+    let process = crate::native_hooks::process_from_header(c_p)
+        .expect("copy_in_registers: c_p is the process erts_schedule returned");
+    let registers =
+        crate::native_hooks::registers_at(arinsal_beamasm::SchedulerRegisters::from_reg(reg))
+            .expect("copy_in_registers: reg is esdp->registers->x_reg_array");
+    crate::beam_common::copy_in_registers(process, registers);
+}
+
 /// `void copy_out_registers(Process *c_p, Eterm *reg)`: process_main's schedule-out save of
 /// the `c_p->arity` live registers (`context_switch_simplified`).
 // Port of erts/emulator/beam/beam_common.c:306-334 (copy_out_registers), OTP-29.1.1.

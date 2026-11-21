@@ -1,22 +1,16 @@
-//! Audited native runtime transition core on x86-64: the C-to-Erlang entry bridge, its exit
-//! fragment and the trace return addresses.
+//! Audited native runtime transition core on x86-64: the native exit fragment's fixed
+//! address and the trace return addresses.
 //!
-//! Port of the process entry and exit of erts/emulator/beam/jit/x86/process_main.cpp
-//! (emit_process_main: `schedule_next` hands a process to native code with
-//! `emit_leave_runtime<eStack | eHeap>` and a jump to `c_p->i`; `context_switch*` /
-//! `do_schedule` come back with `emit_enter_runtime<eStack | eHeap>`), OTP-29.1.1. erts runs
-//! the scheduler loop on the runtime stack below `process_main`; here the Rust scheduler calls
-//! the bridge once per slice, so the bridge is the native side of that loop.
+//! The scheduler loop is erts' generated `process_main` (`x86::process_main`): it allocates
+//! the register file on the scheduler thread's C stack, so every `emit_enter_runtime`
+//! switches to the runtime stack with `lea rsp, [registers + runtime_stack]`, as erts.
 //!
-//! erts selects `NATIVE_ERLANG_STACK` on x86-64: `E` is `rsp`. Native code therefore leaves
-//! the runtime (scheduler thread) stack on entry and returns to it before every runtime call;
-//! the runtime stack position lives in `SchedulerRegisters::runtime_stack`, which the bridge
-//! sets to its own frame.
+//! Deviation (Step D of the generated_process_main plan): the exit fragment
+//! `arinsal_enter_native_return` is a CP erts does not have. The Rust slice running inside
+//! `erts_schedule` enters functions with it as their return address and reads the exit kind
+//! `process_main` leaves in `tmp_mem[3]` ([`take_native_exit`]).
 
-use crate::{
-    ACTIVE_CODE_IX_DISP, ENTRY_RETURN_DISP, ExitReason, ProcessHeader, RUNTIME_STACK_DISP,
-    SchedulerRegisters, X_REG_ARRAY_OFFSET, tmp_mem_disp,
-};
+use crate::{ExitReason, ProcessHeader, RUNTIME_STACK_DISP, SchedulerRegisters, tmp_mem_disp};
 use core::ffi::c_void;
 
 /// Code address of an erts runtime symbol for BeamAsm `runtime_call`.
@@ -28,55 +22,12 @@ pub fn addr(f: *const ()) -> usize {
     f as usize
 }
 
-/// Per-call exit fragment result passed between the assembly bridge and Rust.
-#[repr(C)]
-#[derive(Default)]
-struct NativeExit {
-    kind: u64,
-    target: usize,
-    resume: usize,
-}
-
-/// Enters generated code by raw address through the process-wide pinned-register trampoline.
-///
-/// Native code returns to the exit fragment `arinsal_enter_native_return` (or jumps there
-/// with `E` in `rsp`). A non-zero `tmp_mem[3]` marker is the exit kind: 2 hands the call at
-/// `ARG2` (resume address `ARG3`) to the scheduler, any other non-zero value yields; zero is
-/// a plain return.
-///
-/// # Safety
-/// `code_ptr` must point into a live executable mapping at a function entry that follows the
-/// x86-64 BeamAsm register contract (`register` in `beam_asm`) and leaves through the exit
-/// fragment with `E` in `rsp`.
-// Inlined so the scheduler's slice calls the trampoline directly, as on arm64.
-#[inline(always)]
-pub unsafe fn enter_native_raw(
-    header: &mut ProcessHeader,
-    regs: &mut SchedulerRegisters,
-    code_ptr: *const c_void,
-) -> ExitReason {
-    let mut exit = NativeExit::default();
-    // SAFETY: The assembly bridge saves the System V callee-saved registers, loads the
-    // documented ProcessHeader/SchedulerRegisters layout, switches to the Erlang stack, jumps to
-    // code_ptr and comes back to this frame on the runtime stack through its exit fragment.
-    unsafe { arinsal_enter_native(header, regs, code_ptr, &mut exit) };
-    match exit.kind {
-        2 => ExitReason::CallUnported {
-            target_pc: exit.target,
-            resume_pc: exit.resume,
-        },
-        0 => ExitReason::Returned,
-        _ => ExitReason::Yield,
-    }
-}
-
 // The pointer exposes the fixed C-layout prefix; trailing BIF bookkeeping is Rust-only.
 #[allow(improper_ctypes)]
 unsafe extern "C" {
+    /// The native exit fragment (see the module documentation); forwards to the fragment
+    /// `process_main` emits.
     pub fn arinsal_enter_native_return();
-    /// The Rust scheduler loop's `schedule_next`: where `context_switch`,
-    /// `context_switch_simplified` and `do_schedule` leave native code (see the bridge).
-    pub fn arinsal_schedule_next();
     /// erts `beam_return_trace`: the return address of a return_trace frame.
     pub fn arinsal_return_trace();
     /// erts `beam_exception_trace`: the return address of an exception_trace frame.
@@ -85,25 +36,37 @@ unsafe extern "C" {
     pub fn arinsal_return_to_trace();
     /// erts `beam_call_trace_return`: the return address of a call time/memory frame.
     pub fn arinsal_call_trace_return();
-    fn arinsal_enter_native(
-        header: *mut ProcessHeader,
-        regs: *mut SchedulerRegisters,
-        code: *const c_void,
-        exit: *mut NativeExit,
-    );
+    /// `Process *erts_schedule(ErtsSchedulerData *esdp, Process *p, int calls)` (VM), the
+    /// call at `schedule_next` of `process_main`.
+    pub fn erts_schedule(
+        esdp: *mut c_void,
+        p: *mut ProcessHeader,
+        calls: i32,
+    ) -> *mut ProcessHeader;
 }
 
-/// `labels[dispatch_nif]` of process_main: the global fragment a schedule-in jumps to when
-/// `c_p->i` points at an `ErtsNativeFunc` trampoline holding `op_call_nif_WWW`. The entry
-/// bridge below is this port's process_main, so it reads the label from here.
-// Port of erts/emulator/beam/jit/x86/process_main.cpp:303-311 (`labels[dispatch_nif]`),
-// OTP-29.1.1.
-static PROCESS_MAIN_DISPATCH_NIF: core::sync::atomic::AtomicUsize =
+/// The exit of the native code `process_main` jumped to last, left in the register file at
+/// `schedule_next`; consumed.
+pub fn take_native_exit(regs: &mut SchedulerRegisters) -> ExitReason {
+    match core::mem::take(&mut regs.tmp_mem[3]) {
+        1 => ExitReason::Returned,
+        3 => ExitReason::CallUnported {
+            target_pc: regs.tmp_mem[0] as usize,
+            resume_pc: regs.tmp_mem[1] as usize,
+        },
+        _ => ExitReason::Yield,
+    }
+}
+
+/// The native exit fragment `process_main` emitted, which `arinsal_enter_native_return`
+/// jumps to.
+static PROCESS_MAIN_NATIVE_EXIT: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-/// Publishes the global fragments process_main dispatches to on schedule-in.
-pub fn set_process_main_labels(dispatch_nif: usize) {
-    PROCESS_MAIN_DISPATCH_NIF.store(dispatch_nif, core::sync::atomic::Ordering::Release);
+/// Publishes the native exit fragment of the emitted `process_main`
+/// (`BeamGlobalAssembler::native_exit_ptr`).
+pub fn set_process_main_labels(native_exit: usize) {
+    PROCESS_MAIN_NATIVE_EXIT.store(native_exit, core::sync::atomic::Ordering::Release);
 }
 
 // Port of erts/emulator/beam/jit/x86/instr_bif.cpp:1136 (get_on_load_address), OTP-29.1.1.
@@ -843,6 +806,13 @@ unsafe extern "C" {
     /// `void copy_out_registers(Process *c_p, Eterm *reg)` (beam_common.h): saves the
     /// `c_p->arity` live X registers into the process before it is scheduled out.
     pub fn copy_out_registers(c_p: *mut crate::ProcessHeader, reg: *mut u64);
+    /// `void copy_in_registers(Process *c_p, Eterm *reg)` (beam_common.h): loads the saved
+    /// argument registers into the scheduler's array after `erts_schedule`.
+    pub fn copy_in_registers(c_p: *mut crate::ProcessHeader, reg: *mut u64);
+    /// `int arinsal_slice_step(Process *c_p, int resume)`: the Rust slice of `c_p`; nonzero
+    /// when `process_main` jumps to `c_p->i`. Deviation (Step D, see `x86::process_main`):
+    /// erts has no such call.
+    pub fn arinsal_slice_step(c_p: *mut crate::ProcessHeader, resume: i32) -> i32;
 }
 
 /// Displacements (from `registers`) the bridge shares with native fragments and the VM, as on
@@ -850,8 +820,10 @@ unsafe extern "C" {
 const TMP_MEM0: i32 = tmp_mem_disp(0);
 const TMP_MEM1: i32 = tmp_mem_disp(1);
 /// `tmp_mem[3]`: the exit kind marker a fragment leaves before jumping to the exit fragment.
+#[cfg(test)]
 const EXIT_MARKER: i32 = tmp_mem_disp(3);
 /// `tmp_mem[4]`: the exit fragment address, for runtime error fragments.
+#[cfg(test)]
 const EXIT_FRAGMENT: i32 = tmp_mem_disp(4);
 /// `tmp_mem[5]`: the Rust trace return hook.
 const TRACE_HOOK: i32 = tmp_mem_disp(5);
@@ -903,7 +875,7 @@ core::arch::global_asm!(
     "mov [r13 + {htop}], r15",
     "mov [r13 + {stop}], rsp",
     "mov [r13 + {fcalls}], r14d",
-    "mov rsp, [rbx + {runtime_stack}]",
+    "lea rsp, [rbx + {runtime_stack}]",
     "mov rdi, r13",
     // `reg`: the hook roots and reloads the X registers through it.
     "mov rdx, rbx",
@@ -927,110 +899,14 @@ core::arch::global_asm!(
 );
 
 core::arch::global_asm!(
-    concat!(".global ", asm_sym!("arinsal_enter_native")),
-    concat!(asm_sym!("arinsal_enter_native"), ":"),
-    // Port of erts/emulator/beam/jit/x86/process_main.cpp:53-110 and 270-293
-    // (emit_process_main), OTP-29.1.1. Arguments (System V): rdi = c_p, rsi = registers,
-    // rdx = code, rcx = exit record. Preserve the System V callee-saved registers; together
-    // with the exit record pointer and the return address the frame is 64 bytes, so the
-    // runtime stack stays 16-byte aligned for runtime calls.
-    "push rbp",
-    "push rbx",
-    "push r12",
-    "push r13",
-    "push r14",
-    "push r15",
-    "push rcx",
-    // `registers` points at x_reg_array (process_main.cpp:72-77); c_p is r13.
-    "lea rbx, [rsi + {x_reg_array}]",
-    "mov r13, rdi",
-    // The runtime stack every emit_enter_runtime switches back to is this frame.
-    "mov [rbx + {runtime_stack}], rsp",
-    // Setup reduction counting and the active code index (process_main.cpp:252-286): the
-    // runtime already resolved the process's code index (save_calls or the active one).
-    "mov r14d, [r13 + {fcalls}]",
-    "mov r12, [rbx + {active_code_ix}]",
-    // Runtime error fragments find the exit fragment here after a runtime call.
-    concat!("lea rax, [rip + ", asm_sym!("arinsal_enter_native_return"), "]"),
-    "mov [rbx + {exit_fragment}], rax",
-    // emit_leave_runtime<eStack | eHeap>: switch to the Erlang stack.
-    "mov r15, [r13 + {htop}]",
-    "mov rsp, [r13 + {stop}]",
-    // Port of erts/emulator/beam/jit/x86/process_main.cpp:303-311, OTP-29.1.1: a process
-    // returning from a dirty or scheduled NIF has `c_p->i` (rdx, which the runtime stored in
-    // `c_p->i`) on an `ErtsNativeFunc` trampoline holding `op_call_nif_WWW`, which native
-    // code never starts with; it continues in `dispatch_nif`.
-    "cmp qword ptr [rdx], {op_call_nif}",
-    "jne 4f",
-    "mov rdx, [rip + {dispatch_nif}]",
-    "4:",
-    // A call entered from the scheduler returns to its caller's continuation: it is the
-    // callee's CP, which on x86-64 is the word on top of the Erlang stack (`entry_return`).
-    "mov rax, [rbx + {entry_return}]",
-    "test rax, rax",
-    "jz 2f",
-    "mov qword ptr [rbx + {entry_return}], 0",
-    "push rax",
-    // Port of erts/emulator/beam/jit/x86/process_main.cpp:288-293, OTP-29.1.1: a scheduler
-    // re-entry can target a BIF continuation, whose result is in RET.
-    "mov rax, [rbx]",
-    "jmp rdx",
-    "2:",
-    "mov rax, [rbx]",
-    // The call pushes the exit fragment as the callee's CP, which must be 4-byte aligned
-    // (`aligned_call`, jit/x86/beam_asm.hpp:420-440): pad so the 2-byte `call rdx` ends on a
-    // 4-byte boundary. A call (not a jump) also keeps the return stack buffer balanced.
-    ".p2align 2",
-    ".byte 0x66, 0x90",
-    "call rdx",
-    // This label must directly follow the `call rdx` above: its return address is the exit
-    // fragment. Arrives by a `ret` or a jump, with `E` in rsp either way.
+    // The native exit fragment's fixed address (a CP the VM recognises and native code
+    // returns to): forwards to the fragment `process_main` emits (`x86::process_main`).
+    // Deviation: erts has no such CP; see the module documentation.
     concat!(".global ", asm_sym!("arinsal_enter_native_return")),
+    ".p2align 2",
     concat!(asm_sym!("arinsal_enter_native_return"), ":"),
-    // The marker distinguishes a scheduler handoff without adding work to each BEAM return;
-    // consume it so a later plain return is not taken for a handoff.
-    "mov rcx, [rbx + {exit_marker}]",
-    "mov qword ptr [rbx + {exit_marker}], 0",
-    "mov rax, rcx",
-    // emit_enter_runtime<eStack | eHeap | eReductions>: publish the cursors, back to the
-    // runtime stack.
-    "mov [r13 + {htop}], r15",
-    "mov [r13 + {stop}], rsp",
-    "mov [r13 + {fcalls}], r14d",
-    "3:",
-    "mov rsp, [rbx + {runtime_stack}]",
-    "pop rcx",
-    "mov [rcx], rax",
-    "mov [rcx + 8], rsi",
-    "mov [rcx + 16], rdx",
-    "pop r15",
-    "pop r14",
-    "pop r13",
-    "pop r12",
-    "pop rbx",
-    "pop rbp",
-    "ret",
-    // `schedule_next` of erts' process_main (process_main.cpp:195-293), reached by a jump from
-    // the schedule-out half of the `process_main` fragment (beam_asm_global
-    // `emit_process_main`) on the runtime stack, with HTOP, E and FCALLS published to `c_p`
-    // and the live X registers copied out: back to the Rust scheduler loop, which runs
-    // `erts_schedule` and re-enters through this bridge. Kind 1: the process was scheduled
-    // out.
-    concat!(".global ", asm_sym!("arinsal_schedule_next")),
-    concat!(asm_sym!("arinsal_schedule_next"), ":"),
-    "mov eax, 1",
-    "jmp 3b",
-    htop = const HTOP,
-    stop = const STOP,
-    fcalls = const FCALLS,
-    x_reg_array = const X_REG_ARRAY_OFFSET,
-    runtime_stack = const RUNTIME_STACK_DISP,
-    active_code_ix = const ACTIVE_CODE_IX_DISP,
-    entry_return = const ENTRY_RETURN_DISP,
-    exit_fragment = const EXIT_FRAGMENT,
-    exit_marker = const EXIT_MARKER,
-    op_call_nif = const arinsal_term::OP_CALL_NIF_WWW,
-    dispatch_nif = sym PROCESS_MAIN_DISPATCH_NIF,
+    "jmp qword ptr [rip + {native_exit}]",
+    native_exit = sym PROCESS_MAIN_NATIVE_EXIT,
 );
 
 // Port of erts/emulator/beam/jit/x86/instr_map.cpp runtime call prototypes, OTP-29.1.1.
@@ -1451,8 +1327,20 @@ mod tests {
         unreachable!("byte-test fixture")
     }
     #[unsafe(no_mangle)]
-    extern "C" fn copy_out_registers(_: *mut crate::ProcessHeader, _: *mut u64) {
-        unreachable!("byte-test fixture")
+    extern "C" fn copy_out_registers(_: *mut crate::ProcessHeader, _: *mut u64) {}
+    #[unsafe(no_mangle)]
+    extern "C" fn copy_in_registers(_: *mut crate::ProcessHeader, _: *mut u64) {}
+    #[unsafe(no_mangle)]
+    extern "C" fn arinsal_slice_step(p: *mut crate::ProcessHeader, resume: i32) -> i32 {
+        crate::x86::test_sched::arinsal_slice_step(p, resume != 0)
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn erts_schedule(
+        _: *mut c_void,
+        p: *mut crate::ProcessHeader,
+        _: i32,
+    ) -> *mut crate::ProcessHeader {
+        crate::x86::test_sched::erts_schedule(p)
     }
 
     #[unsafe(no_mangle)]
@@ -1717,14 +1605,10 @@ mod tests {
         unreachable!("byte-test fixture")
     }
 
-    // Native functions following the x86-64 BeamAsm register contract, entered through the
-    // bridge. `preserve` is a host-side caller that checks the bridge keeps every System V
-    // callee-saved register.
+    // Native functions following the x86-64 BeamAsm register contract, entered from the
+    // generated `process_main`.
     core::arch::global_asm!(
         concat!(asm_sym!("arinsal_x86_test_return"), ":"),
-        // Clobber registers the host expects preserved; the bridge must restore them.
-        "mov rbp, 0x1111",
-        "mov r12, 0x2222",
         // RET holds XREG0 on entry.
         "mov [rbx + 8], rax",
         "add r15, 16",
@@ -1738,7 +1622,7 @@ mod tests {
         concat!(asm_sym!("arinsal_x86_test_runtime_call"), ":"),
         // emit_enter_runtime<eStack>, runtime_call, emit_leave_runtime<eStack>.
         "mov [r13 + {stop}], rsp",
-        "mov rsp, [rbx + {runtime_stack}]",
+        "lea rsp, [rbx + {runtime_stack}]",
         "mov rdi, r13",
         "call {hook}",
         "mov rsp, [r13 + {stop}]",
@@ -1755,44 +1639,6 @@ mod tests {
         concat!("lea rax, [rip + ", asm_sym!("arinsal_exception_trace"), "]"),
         "push rax",
         "ret",
-        concat!(asm_sym!("arinsal_x86_test_preserve"), ":"),
-        "push rbx",
-        "push rbp",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-        "sub rsp, 8",
-        "mov rbx, 0x0b0b",
-        "mov rbp, 0x5005",
-        "mov r12, 0x1212",
-        "mov r13, 0x1313",
-        "mov r14, 0x1414",
-        "mov r15, 0x1515",
-        concat!("call ", asm_sym!("arinsal_enter_native")),
-        "xor eax, eax",
-        "cmp rbx, 0x0b0b",
-        "jne 4f",
-        "cmp rbp, 0x5005",
-        "jne 4f",
-        "cmp r12, 0x1212",
-        "jne 4f",
-        "cmp r13, 0x1313",
-        "jne 4f",
-        "cmp r14, 0x1414",
-        "jne 4f",
-        "cmp r15, 0x1515",
-        "jne 4f",
-        "mov eax, 1",
-        "4:",
-        "add rsp, 8",
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop rbp",
-        "pop rbx",
-        "ret",
         exit_marker = const EXIT_MARKER,
         exit_fragment = const EXIT_FRAGMENT,
         stop = const STOP,
@@ -1806,23 +1652,22 @@ mod tests {
         fn arinsal_x86_test_runtime_call();
         fn arinsal_x86_test_yield_jump();
         fn arinsal_x86_test_exception_trace();
-        fn arinsal_x86_test_preserve(
-            header: *mut ProcessHeader,
-            regs: *mut SchedulerRegisters,
-            code: *const c_void,
-            exit: *mut NativeExit,
-        ) -> u64;
     }
 
     /// A runtime function called from native code on the runtime stack. Heap allocation and
-    /// formatting exercise the 16-byte stack alignment the C ABI requires.
+    /// formatting exercise the 16-byte stack alignment the C ABI requires; the stack it runs
+    /// on is the scheduler thread's, just below the register file.
     extern "C" fn runtime_hook(c_p: *mut ProcessHeader) -> u64 {
         let words: Vec<u64> = (0..64).collect();
         let text = format!("{:?}", &words[..4]);
-        // SAFETY: the test bridge passes the live header it was entered with.
+        let probe = 0u8;
+        let sp = &raw const probe as usize;
+        // SAFETY: the test passes the live header it was entered with.
         let fcalls = unsafe { (*c_p).fcalls };
+        RUNTIME_SP.store(sp, core::sync::atomic::Ordering::Relaxed);
         fcalls as u64 + text.len() as u64
     }
+    static RUNTIME_SP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
     /// The Rust trace return hook: records its kind and continues at the exit fragment. Like
     /// the VM's `arinsal_beamasm_native_trace_return`, it gets `reg` (`x_reg_array`), not the
@@ -1857,8 +1702,7 @@ mod tests {
         }
 
         fn enter(&mut self, code: unsafe extern "C" fn()) -> ExitReason {
-            // SAFETY: the test functions above follow the bridge contract.
-            unsafe { enter_native_raw(&mut self.header, &mut self.regs, code as *const c_void) }
+            crate::x86::test_sched::enter(&mut self.header, &mut self.regs, code as usize)
         }
 
         fn stop_offset(&self) -> isize {
@@ -1880,7 +1724,7 @@ mod tests {
             fixture.regs.x_reg_array[1].tagged_word(),
             arinsal_term::Term::NIL.tagged_word()
         );
-        // The bridge's CP was pushed just below `stop`, 4-byte aligned.
+        // schedule_next pushed the exit fragment just below `stop`, 4-byte aligned.
         let cp = fixture.stack[31];
         assert_eq!(cp, arinsal_enter_native_return as *const () as u64);
         assert_eq!(cp & 3, 0);
@@ -1921,6 +1765,13 @@ mod tests {
         );
         assert_eq!(fixture.regs.x_reg_array[2].tagged_word(), 100 + 12);
         assert_eq!(fixture.stop_offset(), 32);
+        // The runtime function ran below the register file on the scheduler thread's C
+        // stack, never on the heap or the Erlang stack.
+        let sp = RUNTIME_SP.load(core::sync::atomic::Ordering::Relaxed);
+        let stack = fixture.stack.as_ptr_range();
+        assert!(!(stack.start as usize..stack.end as usize).contains(&sp));
+        let mirror = std::ptr::from_ref(&*fixture.regs) as usize;
+        assert!(!(mirror..mirror + core::mem::size_of::<SchedulerRegisters>()).contains(&sp));
     }
 
     #[test]
@@ -1930,7 +1781,7 @@ mod tests {
             fixture.enter(arinsal_x86_test_yield_jump),
             ExitReason::Yield
         );
-        // A jump leaves the bridge's CP on the Erlang stack: `stop` is below it.
+        // A jump leaves schedule_next's CP on the Erlang stack: `stop` is below it.
         assert_eq!(fixture.stop_offset(), 31);
     }
 
@@ -1944,24 +1795,7 @@ mod tests {
         );
         assert_eq!(fixture.regs.tmp_mem[7], 11);
         // The trace frame's address was popped; the hook's jump to the exit fragment leaves
-        // the bridge's own CP below `stop`.
+        // schedule_next's CP below `stop`.
         assert_eq!(fixture.stop_offset(), 31);
-    }
-
-    #[test]
-    fn bridge_preserves_callee_saved_registers() {
-        let mut fixture = Fixture::new();
-        let mut exit = NativeExit::default();
-        // SAFETY: the test native function follows the bridge contract.
-        let preserved = unsafe {
-            arinsal_x86_test_preserve(
-                &mut fixture.header,
-                &mut *fixture.regs,
-                arinsal_x86_test_return as *const c_void,
-                &mut exit,
-            )
-        };
-        assert_eq!(preserved, 1);
-        assert_eq!(exit.kind, 0);
     }
 }

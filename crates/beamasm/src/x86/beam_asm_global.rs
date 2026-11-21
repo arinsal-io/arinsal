@@ -456,6 +456,9 @@ pub struct BeamGlobalAssembler {
     ptrs: Vec<Option<usize>>,
     /// The `offsetof` values of the VM's `Process` the fragments compile in.
     pub(crate) offsets: ProcessOffsets,
+    /// The native exit fragment `emit_process_main` binds (Arinsal's exit protocol, see
+    /// `x86::process_main`).
+    pub(crate) native_exit: Option<Label>,
 }
 
 /// `ErtsCodeMFA` a global fragment raises with (`static ErtsCodeMFA mfa` in its emitter).
@@ -500,6 +503,7 @@ impl BeamGlobalAssembler {
             labels,
             ptrs: Vec::new(),
             offsets,
+            native_exit: None,
         }
     }
 
@@ -1180,19 +1184,17 @@ mod tests {
         }
     }
 
-    /// The text of erts' `process_main` with Arinsal's schedule-out half: erts' loop entry and
-    /// `schedule_next` (the Rust scheduler's) are left out, `reds_used` is not computed, and
-    /// `schedule_next` publishes FCALLS and jumps to the bridge. `fill` is the byte the
-    /// displacements to code elsewhere are written with.
-    fn arinsal_process_main(dump: &str, fill: u8) -> Vec<String> {
+    /// The schedule-out half of erts' `process_main` text, from `do_schedule_local` to the
+    /// `copy_out_registers` call and the FCALLS store that follows in this port
+    /// (`schedule_out`; erts computes `reds_used` there instead, see `x86::process_main`).
+    /// `fill` is the byte the displacements to code elsewhere are written with.
+    fn schedule_out_text(dump: &str, fill: u8) -> Vec<String> {
         let main = fragment_lines(dump, "process_main");
         let from = |text: &str| main.iter().position(|l| *l == text).unwrap();
         let at = |i: usize| crate::x86::jdump::erts_to_arinsal(main[i]);
         // L215 (context_switch_local) up to `short jmp L217` after `Process exiting`.
         let local = from("movzx edi, byte ptr [rdx-8]") - 1;
         let exiting = from("mov qword ptr [r13+464], 0");
-        // The `copy_out_registers` call of `not_exiting` (L219).
-        let copy_out = from("mov r14d, edx") + 1;
         let do_schedule_local = main[exiting + 1].strip_prefix("short jmp ").unwrap();
         let fill_disp = if fill == 0 { "rip+0" } else { "rip-1" };
         let mut text = vec![
@@ -1203,8 +1205,6 @@ mod tests {
             let line = at(i);
             text.push(match line.as_str() {
                 "lea rdi, qword ptr [global::process_exit]" => format!("lea rdi, [{fill_disp}]"),
-                // asmjit binds the forward `short jz` target L219 here; GNU `as` takes it as
-                // written.
                 _ => line,
             });
         }
@@ -1212,42 +1212,73 @@ mod tests {
             .iter()
             .find_map(|l| l.strip_prefix("short jz "))
             .unwrap();
+        // reds_used and copy_out_registers run at slice_ended (`slice_ended_text`).
         text.push(format!("{not_exiting}:"));
-        text.extend((copy_out..copy_out + 2).map(at));
-        text.push(format!(
-            ".byte 0x40, 0xe8, {fill:#04x}, {fill:#04x}, {fill:#04x}, {fill:#04x}"
-        ));
         text.push("Lsched:".into());
         text.push(crate::x86::jdump::erts_to_arinsal(
             "mov dword ptr [r13+120], r14d",
         ));
-        text.push(format!(
-            ".byte 0x40, 0xe9, {fill:#04x}, {fill:#04x}, {fill:#04x}, {fill:#04x}"
-        ));
-        for entry in ["context_switch", "context_switch_simplified", "do_schedule"] {
-            text.push(".p2align 0".into());
-            // Without the loop between them, the jumps back to the local labels are in rel8
-            // reach, where asmjit (and GNU `as`) take the short form.
-            text.extend(
-                fragment_lines(dump, entry)
-                    .into_iter()
-                    .map(|l| crate::x86::jdump::erts_to_arinsal(l).replace("{disp32} ", "")),
-            );
-        }
         text
     }
 
-    // The schedule-out half of process_main against erts' text (see `arinsal_process_main`),
-    // the three entry points bound where erts binds them.
+    /// erts' reds_used + `copy_out_registers` tail of `not_exiting` (L219), which the port
+    /// runs at `slice_ended`; the call's displacement is `fill`.
+    fn slice_ended_text(dump: &str, fill: u8) -> Vec<String> {
+        let main = fragment_lines(dump, "process_main");
+        // The second load of def_arg_reg[5]; the first is do_schedule_local's.
+        let from = main
+            .iter()
+            .rposition(|l| *l == "mov rdx, qword ptr [r13+184]")
+            .unwrap();
+        let call = from + 5;
+        assert!(main[call].starts_with("call "), "{}", main[call]);
+        let mut text: Vec<String> = main[from..call]
+            .iter()
+            .map(|l| crate::x86::jdump::erts_to_arinsal(l))
+            .collect();
+        text.push(format!(
+            ".byte 0x40, 0xe8, {fill:#04x}, {fill:#04x}, {fill:#04x}, {fill:#04x}"
+        ));
+        text.push(crate::x86::jdump::erts_to_arinsal(main[call + 1]));
+        text
+    }
+
+    /// Finds `zeros` in `code` where the bytes `zeros` and `ones` agree on (the others are
+    /// displacements to code elsewhere).
+    fn find_masked(code: &[u8], zeros: &[u8], ones: &[u8]) -> Option<usize> {
+        (0..=code.len().checked_sub(zeros.len())?).find(|&at| {
+            code[at..at + zeros.len()]
+                .iter()
+                .zip(zeros.iter().zip(ones))
+                .all(|(o, (z, f))| z != f || o == z)
+        })
+    }
+
+    // process_main against erts' text: the prologue (with Arinsal's register file size, see
+    // Step E in `x86::process_main`) and the schedule-out half; the three entry points bound
+    // where erts binds them.
     #[test]
     fn process_main_matches_erts_dump() {
         let Some(dump) = crate::x86::jdump::erts_dump("beam_asm_global") else {
             eprintln!("skipping: `erl +JDdump true` unavailable");
             return;
         };
-        let (Some(zeros), Some(ones)) = (
-            crate::x86::jdump::gnu_as(&arinsal_process_main(&dump, 0)),
-            crate::x86::jdump::gnu_as(&arinsal_process_main(&dump, 0xff)),
+        let main = fragment_lines(&dump, "process_main");
+        let size = core::mem::size_of::<crate::SchedulerRegisters>() + 64;
+        let prologue = main[..4]
+            .iter()
+            .map(|l| {
+                crate::x86::jdump::erts_to_arinsal(l)
+                    .replace("16592", &size.to_string())
+                    .replace("rsp+64", &format!("rsp+{}", crate::X_REG_ARRAY_OFFSET))
+            })
+            .collect::<Vec<_>>();
+        let (Some(prologue), Some(zeros), Some(ones), Some(tail_zeros), Some(tail_ones)) = (
+            crate::x86::jdump::gnu_as(&prologue),
+            crate::x86::jdump::gnu_as(&schedule_out_text(&dump, 0)),
+            crate::x86::jdump::gnu_as(&schedule_out_text(&dump, 0xff)),
+            crate::x86::jdump::gnu_as(&slice_ended_text(&dump, 0)),
+            crate::x86::jdump::gnu_as(&slice_ended_text(&dump, 0xff)),
         ) else {
             eprintln!("skipping byte comparison: GNU binutils unavailable");
             return;
@@ -1259,16 +1290,20 @@ mod tests {
             .into_iter()
             .find(|(label, _)| *label == GlobalLabels::ProcessMain)
             .unwrap();
-        let ours = &code[range.start..range.start + zeros.len()];
+        let ours = &code[range.clone()];
+        assert_eq!(&ours[..prologue.len()], &prologue[..]);
         assert!(
-            ours.iter()
-                .zip(zeros.iter().zip(&ones))
-                .all(|(o, (z, f))| z != f || o == z),
-            "{:02x?}\nvs\n{:02x?}",
-            ours,
-            zeros
+            find_masked(ours, &zeros, &ones).is_some(),
+            "{:02x?}\nnot in\n{:02x?}",
+            zeros,
+            ours
         );
-        assert!(code[range.start + zeros.len()..range.end].len() < 8);
+        assert!(
+            find_masked(ours, &tail_zeros, &tail_ones).is_some(),
+            "{:02x?}\nnot in\n{:02x?}",
+            tail_zeros,
+            ours
+        );
         let main = ga.asm.a.label_location(ga.label(GlobalLabels::ProcessMain));
         for (entry, name) in [
             (GlobalLabels::ContextSwitch, "context_switch"),

@@ -163,6 +163,7 @@ impl TraceFrameKind {
     }
 
     /// The kind passed in x1 by its return stub.
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn from_index(index: u64) -> Option<Self> {
         Some(match index {
             0 => Self::ReturnTrace,
@@ -2862,9 +2863,9 @@ fn caller_info(
 
 // Port of erts/emulator/beam/erl_db_util.c:5375-5421 (matchCurrentStacktrace), OTP-29.1.1.
 fn current_stacktraces(process: &mut Process) -> Result<Vec<(VecHeap, Term)>, VmError> {
-    // Reserve one slot beyond OTP's MAX_BACKTRACE_SIZE for the current frame, which is
-    // removed before the caller prefixes are built below.
-    let trace = crate::stacktrace::build(process, 65)?;
+    // Port of erts/emulator/beam/erl_db_util.c:2955-2978 (matchCurrentStacktrace):
+    // `erts_save_stacktrace` only, no `rp->i` current frame.
+    let trace = crate::stacktrace::build(process, 64)?;
     let owned = to_owned(trace)
         .map_err(|error| VmError::Unsupported(format!("match stacktrace copy: {error:?}")))?;
     let OwnedTerm::List { elems, .. } = &owned else {
@@ -2872,10 +2873,7 @@ fn current_stacktraces(process: &mut Process) -> Result<Vec<(VecHeap, Term)>, Vm
             "match stacktrace is not a list".into(),
         ));
     };
-    // Port of erts/emulator/beam/erl_db_util.c:5375-5421 (matchCurrentStacktrace),
-    // OTP-29.1.1: the match-spec operation reports the tracee's saved callers, excluding the
-    // current interpreter/JIT position used as the top frame by the general stacktrace builder.
-    let callers = elems.get(1..).unwrap_or_default();
+    let callers = elems.as_slice();
     // Port of erts/emulator/beam/error.h:206 (MAX_BACKTRACE_SIZE), OTP-29.1.1. Capture once
     // at the runtime maximum, then apply each match-spec's requested depth to the saved callers.
     let backtrace_depth = crate::erl_init::erts_backtrace_depth();

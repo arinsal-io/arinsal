@@ -2619,3 +2619,41 @@ pub(crate) extern "C" fn insert_element_3(c_p: *mut ProcessHeader, reg: *mut u64
     };
     crate::native_hooks::raw(process.heap.insert_element(source, ix as usize, value))
 }
+
+/// `erlang:function_exported/3`: the export of the active code index, plus `apply/2,3` and
+/// `yield/0`, which have none.
+// Port of erts/emulator/beam/bif.c (function_exported_3), OTP-29.1.1.
+pub(crate) extern "C" fn function_exported_3(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let [module, function, arity] = bif_args::<3>(reg);
+    let result = (|| -> Result<Term, VmError> {
+        let module = module.as_atom().ok_or_else(badarg)?;
+        let function = function.as_atom().ok_or_else(badarg)?;
+        let arity = arity.as_small().ok_or_else(badarg)?;
+        let Ok(arity) = u32::try_from(arity) else {
+            return Ok(Term::atom(atoms::FALSE));
+        };
+        let code = process.runtime.as_ref().ok_or_else(badarg)?.code_indexes();
+        let code_ix = code.active();
+        let exported = code.with_active_tables(|tables| {
+            tables
+                .exports
+                .function_exported((module, function, arity), code_ix)
+                || (module == atoms::ERLANG
+                    && ((function == atoms::APPLY && matches!(arity, 2 | 3))
+                        || (function == atoms::YIELD && arity == 0)))
+        });
+        Ok(Term::atom(if exported {
+            atoms::TRUE
+        } else {
+            atoms::FALSE
+        }))
+    })();
+    bif_ret(c_p, i, result)
+}

@@ -422,6 +422,7 @@ impl BeamModuleAssembler {
                 state: 0,
                 sig_qs_save: 0,
                 message_term: 0,
+                def_arg_reg5: 0,
             },
             catches: Vec::new(),
             functions: Vec::new(),

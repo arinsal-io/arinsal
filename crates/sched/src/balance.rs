@@ -48,6 +48,9 @@ pub(crate) const IMMIGRATE_QMASK: u32 = QMASK << IMMIGRATE_SHFT;
 pub(crate) const EVACUATE_QMASK: u32 = QMASK << EVACUATE_SHFT;
 pub(crate) const FLG_OUT_OF_WORK: u32 = 1 << FLG_BASE2;
 pub(crate) const FLG_HALFTIME_OUT_OF_WORK: u32 = 1 << (FLG_BASE2 + 1);
+/// The scheduler of the run queue is offline or stopped by blocked multi-scheduling
+/// (`ERTS_RUNQ_FLG_SUSPENDED`).
+pub(crate) const FLG_SUSPENDED: u32 = 1 << (FLG_BASE2 + 2);
 pub(crate) const FLG_INACTIVE: u32 = 1 << (FLG_BASE2 + 4);
 /// The scheduler of the run queue has not declared itself out of work (`ERTS_RUNQ_FLG_NONEMPTY`).
 pub(crate) const FLG_NONEMPTY: u32 = 1 << (FLG_BASE2 + 5);

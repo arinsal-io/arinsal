@@ -1,12 +1,17 @@
 //! Every spawned process enters native code at its first function (erl_create_process sets I to
 //! the export's native address); the interpreter is entered only where no native code exists.
 
+#[cfg(target_arch = "aarch64")]
 use arinsal_difftest::{CallResult, RefErl};
+#[cfg(target_arch = "aarch64")]
 use std::process::Command;
 
+#[cfg(target_arch = "aarch64")]
 const CHILD: &str = "ARINSAL_JIT_SPAWN_CHILD";
+#[cfg(target_arch = "aarch64")]
 const MODULE: &str = "jit_spawn_test";
 
+#[cfg(target_arch = "aarch64")]
 const SOURCE: &str = r#"-module(jit_spawn_test).
 -export([run/0, three/2, loop/1, hib/1, hib2/1]).
 
@@ -41,6 +46,7 @@ run() ->
     wait(10, []).
 "#;
 
+#[cfg(target_arch = "aarch64")]
 fn child() -> bool {
     let Some(beam_path) = std::env::var_os(CHILD) else {
         return false;
