@@ -2650,11 +2650,7 @@ fn nif_port_command_hook(from: Option<Term>, port: Term, data: Term) -> bool {
 ///
 /// `erl_tracer` stays out of the table because its entry points are conditional.
 /// `nif_error` of any other arity still falls through to [`call`].
-pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
-    ("erlang", "load_nif", 2),
-    ("erlang", "nif_error", 1),
-    ("erlang", "nif_error", 2),
-];
+pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[("erlang", "load_nif", 2)];
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
@@ -2667,7 +2663,6 @@ type Handler =
 pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler> {
     match (module, function, arity) {
         ("erlang", "load_nif", 2) => Some(call_load_nif),
-        ("erlang", "nif_error", 1 | 2) => Some(call_nif_error),
         _ => None,
     }
 }
@@ -2699,19 +2694,6 @@ fn load_nif_bif_error(process: &mut Process) -> Result<Term, VmError> {
     )
 }
 
-fn call_nif_error(
-    _vm: &mut Vm,
-    _process: &mut Process,
-    _ctx: &mut RunCtx<'_, crate::Process>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    let reason = args
-        .first()
-        .copied()
-        .unwrap_or_else(|| Term::atom(arinsal_term::atoms::BADARG));
-    Err(VmError::Trap(crate::exceptions::Trap::error(reason)))
-}
-
 /// Dispatches `load_nif`, dynamic NIF entry, and `erl_tracer` on the scheduler.
 pub(crate) fn call(
     vm: &mut Vm,
@@ -2737,13 +2719,6 @@ fn call_values(
     install_hub(process, ctx);
     if let Some(handle) = handler(module, function, args.len() as u8) {
         return Some(handle(vm, process, ctx, args));
-    }
-    if module == "erlang" && function == "nif_error" {
-        let reason = args
-            .first()
-            .copied()
-            .unwrap_or_else(|| Term::atom(arinsal_term::atoms::BADARG));
-        return Some(Err(VmError::Trap(crate::exceptions::Trap::error(reason))));
     }
     if module == "erl_tracer"
         && code_tables(erts_active_code_ix())

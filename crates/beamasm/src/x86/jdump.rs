@@ -347,7 +347,10 @@ fn asmjit_compact_qword_cmp(line: &str) -> Option<String> {
 /// `TMP_MEM1..5` follow it; Arinsal's start at -128).
 pub(crate) fn erts_to_arinsal(line: &str) -> String {
     use crate::x86::beam_asm::{get_runtime_stack_ref, tmp_mem_q_disp};
-    let mut line = asmjit_size_optimized(line.trim_start_matches("rex ")).replace(".db ", ".byte ");
+    let mut line = asmjit_size_optimized(line.trim_start_matches("rex "))
+        .replace(".db ", ".byte ")
+        // asmjit's explicit no-base marker has no GNU `as` spelling.
+        .replace("[abs ", "[");
     // A short jump to a local label: GNU `as` picks rel8 itself for a label in reach.
     if line.starts_with("short j") && !line.contains("global::") {
         line = line.trim_start_matches("short ").to_string();

@@ -1011,7 +1011,9 @@ pub(crate) fn native_prepare(
         .ok_or_else(|| VmError::Unsupported("live X register count".into()))?;
     process.ensure_entry(0, objv);
     registers.entry_return = 0;
-    process.clear_native_resume();
+    // process_main's schedule-in is `jmp c_p->i`: `c_p->current` stays what the process left
+    // (ERTS_BIF_PREP_TRAP's trap export, read by beam_bif_export_trap).
+    // Port of erts/emulator/beam/jit/x86/process_main.cpp (process_main), OTP-29.1.1.
     process.heap.abi.i = code_address as *const std::ffi::c_void;
     process.heap.abi.arity = arity;
     registers.tmp_mem[3] = 0;
@@ -1141,7 +1143,7 @@ fn native_prepare_entry(
             process.heap.abi.exc.freason
         );
     }
-    process.clear_native_resume();
+    // `jmp c_p->i` leaves `c_p->current` as the process left it (see native_prepare).
     process.heap.abi.i = code_ptr;
     process.heap.abi.arity = arity;
     registers.tmp_mem[3] = 0;

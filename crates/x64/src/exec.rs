@@ -856,15 +856,62 @@ fn mach_vm_protect(task: u32, address: u64, size: u64, set_maximum: i32, protect
 mod tests {
     use super::{CodeMemory, ExecError};
 
+    /// Enters the bytes the caller just wrote at offset 0 as `F`.
+    #[cfg(target_arch = "x86_64")]
+    fn enter<F: Copy>(memory: &CodeMemory) -> F {
+        // SAFETY: each caller writes valid SysV machine code for `F` at offset 0 before calling.
+        unsafe { memory.entry(0) }
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn writes_through_rw_alias_and_executes_through_rx_alias() {
         let mut memory = CodeMemory::new(16).unwrap();
         similar_asserts::assert_eq!(memory.as_ptr() == memory.as_rw_ptr(), false);
         memory.write(0, &[0xb8, 42, 0, 0, 0, 0xc3]).unwrap();
-        // SAFETY: bytes encode `mov eax, 42; ret`, matching this function signature and ABI.
-        let function: extern "C" fn() -> u32 = unsafe { memory.entry(0) };
+        let function: extern "C" fn() -> u32 = enter(&memory);
         similar_asserts::assert_eq!(function(), 42);
+    }
+
+    /// x86_64 counterpart of `arinsal_a64` `test_exec_add_execute_patch_sub`: write, execute,
+    /// patch through the RW alias, execute again. Dual mapping keeps RX executable (asmjit
+    /// `VirtMem::alloc_dual_mapping`); x86 caches are coherent so no icache flush is needed.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn write_execute_patch_execute() {
+        let mut memory = CodeMemory::new(16).unwrap();
+        memory.write(0, &[0xb8, 42, 0, 0, 0, 0xc3]).unwrap();
+        let function: extern "C" fn() -> u32 = enter(&memory);
+        similar_asserts::assert_eq!(function(), 42);
+        memory.write(0, &[0xb8, 7, 0, 0, 0, 0xc3]).unwrap();
+        similar_asserts::assert_eq!(function(), 7);
+    }
+
+    /// x86_64 counterpart of `arinsal_a64` `test_multithreaded_execution`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn multithreaded_execution() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let mut memory = CodeMemory::new(16).unwrap();
+        // `mov eax, edi; add eax, esi; ret` — SysV: first two args in edi/esi, return in eax.
+        memory.write(0, &[0x89, 0xf8, 0x01, 0xf0, 0xc3]).unwrap();
+        let function: extern "C" fn(u32, u32) -> u32 = enter(&memory);
+        let memory = Arc::new(memory);
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let _keep = Arc::clone(&memory);
+                thread::spawn(move || {
+                    for j in 0..1000_u32 {
+                        similar_asserts::assert_eq!(function(i, j), i + j);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("thread panicked");
+        }
     }
 
     #[test]

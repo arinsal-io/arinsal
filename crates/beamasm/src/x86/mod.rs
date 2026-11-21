@@ -25,6 +25,8 @@ pub mod instr_trace;
 mod jdump;
 pub mod process_main;
 #[allow(unsafe_code)]
+mod raw;
+#[allow(unsafe_code)]
 pub mod rt;
 #[cfg(test)]
 #[allow(unsafe_code)]

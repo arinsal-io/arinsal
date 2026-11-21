@@ -582,7 +582,7 @@ fn coverage_mode(mode: arinsal_loader::CoverageMode) -> arinsal_beamjit::Coverag
 
 /// `beamasm_is_line_breakpoint_trampoline`: the code at `offset` is a disabled or enabled
 /// line-breakpoint trampoline.
-// Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:343-380
+// Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:343-398
 // (is_line_breakpoint_trampoline), OTP-29.1.1.
 fn is_line_breakpoint_trampoline(memory: &CodeMemory, offset: usize) -> bool {
     use arinsal_beamasm::beam_asm_global::GlobalLabels;
@@ -596,11 +596,29 @@ fn is_line_breakpoint_trampoline(memory: &CodeMemory, offset: usize) -> bool {
         return false;
     }
     let call_offset = i32::from_le_bytes([code[4], code[5], code[6], code[7]]) as isize;
-    let target = (memory.as_ptr() as usize + offset + 8).wrapping_add_signed(call_offset);
-    crate::beam_jit_main::bga()
+    let code_start = memory.as_ptr() as usize;
+    let target = (code_start + offset + 8).wrapping_add_signed(call_offset);
+    let Some(expected_target) = crate::beam_jit_main::bga()
         .bga
         .get_ptr(GlobalLabels::ILineBreakpointTrampolineShared)
-        == Some(target)
+    else {
+        return false;
+    };
+    if target == expected_target {
+        return true;
+    }
+
+    // The module dispatch table contains an indirect JMP thunk to the shared trampoline.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:377-398.
+    let Some(thunk_offset) = target.checked_sub(code_start) else {
+        return false;
+    };
+    let mut thunk = [0u8; 6];
+    if memory.read(thunk_offset, &mut thunk).is_err() || thunk[..2] != [0x40, 0xE9] {
+        return false;
+    }
+    let jump_offset = i32::from_le_bytes([thunk[2], thunk[3], thunk[4], thunk[5]]) as isize;
+    target.wrapping_add_signed(6 + jump_offset) == expected_target
 }
 
 /// Loads `beam` with the x86 module assembler: `load_code` with `stp->ba`, then

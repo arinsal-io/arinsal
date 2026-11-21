@@ -47,7 +47,8 @@ fn badarg_cause(arity: usize, cause: arinsal_term::Atom) -> VmError {
 }
 
 /// `BIF_RET` / `BIF_ERROR` / `BIF_TRAP*` of a body below. `BIF_ERROR` only sets the process'
-/// `freason` / `fvalue`; `BIF_TRAP*` and yields complete through the export in `c_p->current`.
+/// `freason` / `fvalue`; `BIF_TRAP*` (and `ERTS_BIF_YIELD*`, which names its export) is
+/// [`erts_bif_prep_trap`] of the trap export the body named.
 // Port of erts/emulator/beam/bif.h (BIF_RET, BIF_ERROR, BIF_TRAP*), OTP-29.1.1.
 #[inline(always)]
 pub(crate) fn bif_ret(c_p: *mut ProcessHeader, i: u64, result: Result<Term, VmError>) -> u64 {
@@ -55,8 +56,53 @@ pub(crate) fn bif_ret(c_p: *mut ProcessHeader, i: u64, result: Result<Term, VmEr
         Ok(value) => crate::native_hooks::raw(value),
         Err(VmError::Freason(freason)) => bif_error(c_p, freason),
         Err(VmError::Trap(trap)) => crate::native_helpers::bif_error_trap(c_p, trap),
+        #[cfg(target_arch = "x86_64")]
+        Err(VmError::TrapExport(trap)) => bif_trap(c_p, trap),
         Err(error) => crate::native_helpers::bif_return_current(c_p, i, error),
     }
+}
+
+/// `BIF_TRAPn(Trap, p, A0..)` of a `bif_table[].f` body: [`erts_bif_prep_trap`], then
+/// THE_NON_VALUE. The call fragment sees `freason == TRAP` and context-switches to `c_p->i`.
+// Port of erts/emulator/beam/bif.h:392-434 (BIF_TRAP0..4), OTP-29.1.1.
+// arm's Rust process_main still completes a trap through `bif_traps::install_export_trap`.
+#[cfg(target_arch = "x86_64")]
+#[cold]
+#[inline(never)]
+pub(crate) fn bif_trap(c_p: *mut ProcessHeader, trap: crate::ExportTrap) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    erts_bif_prep_trap(process, &trap);
+    arinsal_term::THE_NON_VALUE
+}
+
+/// `ERTS_BIF_PREP_TRAPn(Ret, Trap, Proc, A0..)` under BEAMASM: the arguments go to `reg[0..n]`,
+/// `c_p->i = beam_bif_export_trap`, `c_p->arity = n`, `c_p->freason = TRAP` and
+/// `c_p->current = &Trap->info.mfa`. `beam_bif_export_trap` calls that export on schedule-in;
+/// nothing here looks at the BIF that trapped.
+// Port of erts/emulator/beam/bif.h:316-388 (ERTS_BIF_PREP_TRAP, ERTS_BIF_PREP_TRAP0..4) and
+// jit/x86/beam_asm_global.cpp:143-154 (emit_bif_export_trap), OTP-29.1.1.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn erts_bif_prep_trap(process: &mut Process, trap: &crate::ExportTrap) {
+    let arity = trap.args.len();
+    debug_assert!(arity <= 4, "BIF_TRAP passes at most four arguments");
+    // `erts_set_gc_state(c_p, 0)` of a body whose trap state holds heap terms (bif.c
+    // erts_dsend_export_trap_context); erl_gc.c erts_gc_after_bif_call_lhf: the first trap
+    // with F_DISABLE_GC saves live_hf_end.
+    if trap.gc_disabled {
+        process.set_gc_enabled(false);
+    }
+    if !process.heap.gc_enabled() {
+        process.heap.save_live_frags_mark();
+    }
+    process.x.ensure_x(arity);
+    process.x[..arity].copy_from_slice(&trap.args);
+    process.gc_live = arity;
+    process.heap.abi.i = crate::beam_jit_main::beam_bif_export_trap() as *const _;
+    process.heap.abi.arity = arity as u8;
+    process.heap.abi.exc.freason = arinsal_term::exc::TRAP;
+    process.heap.abi.current = std::ptr::from_ref(&trap.entry.info.mfa).cast();
 }
 
 /// `BIF_ERROR(c_p, freason)`: only `freason` (a cause is already in `fvalue`); `handle_error`
@@ -1975,6 +2021,28 @@ pub(crate) extern "C" fn error_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64
 /// `erlang:error/2`: retain the explicit arguments in the BIF error value.
 // Port of erts/emulator/beam/bif.c (error_2), OTP-29.1.1.
 pub(crate) extern "C" fn error_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [reason, arguments] = bif_args::<2>(reg);
+    error_with_value(
+        c_p,
+        process,
+        &[reason, arguments],
+        arinsal_term::exc::EXC_ERROR | arinsal_term::exc::EXF_ARGLIST,
+    )
+}
+
+/// `erlang:nif_error/1`: `error/1` for NIF stubs.
+// Port of erts/emulator/beam/bif.c:1512-1516 (nif_error_1), OTP-29.1.1.
+pub(crate) extern "C" fn nif_error_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    primary_exception(c_p, reg, arinsal_term::exc::EXC_ERROR)
+}
+
+/// `erlang:nif_error/2`: `error/2` for NIF stubs.
+// Port of erts/emulator/beam/bif.c:1525-1531 (nif_error_2: EXC_ERROR_2), OTP-29.1.1.
+pub(crate) extern "C" fn nif_error_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };

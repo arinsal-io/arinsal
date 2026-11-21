@@ -93,9 +93,9 @@ pub struct DispatchRuntimeHelpers {
     pub compare: CompareHelpers,
     /// Native line-breakpoint helpers.
     pub line_breakpoint: LineBreakpointHelpers,
-    /// `apply/3` resolver of the run-process stub (`arinsal_beamasm_apply3_resolver`). Zero builds
+    /// `apply()` of the run-process stub (`beam_common.c apply`, `op_i_apply_only`). Zero builds
     /// no stub.
-    pub apply3_resolver: usize,
+    pub apply: usize,
     /// `call_error_handler` of the export trampoline: `(c_p, Export.info) -> Export*` of
     /// `error_handler:undefined_function/3` with X0..X2 set up, or zero. Zero builds none.
     pub call_error_handler: usize,
@@ -207,7 +207,7 @@ impl DispatchFragments {
             save_calls_fun: save_calls_fun_helper,
             compare,
             line_breakpoint: LineBreakpointHelpers::default(),
-            apply3_resolver: 0,
+            apply: 0,
             call_error_handler: 0,
             beam_jit_call_nif: 0,
             erts_call_nif_early: 0,
@@ -233,7 +233,7 @@ impl DispatchFragments {
             save_calls_fun: save_calls_fun_helper,
             compare,
             line_breakpoint: line_breakpoint_helpers,
-            apply3_resolver,
+            apply,
             call_error_handler,
             beam_jit_call_nif,
             erts_call_nif_early,
@@ -321,8 +321,8 @@ impl DispatchFragments {
         // start stub applies X0..X2 and branches to the resolved code, as a tail call.
         code.bind(run_process)
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
-        if apply3_resolver != 0 {
-            emit_run_process_fragment(&mut code, apply3_resolver, raise_exception)
+        if apply != 0 {
+            emit_run_process_fragment(&mut code, apply, raise_exception)
                 .map_err(|_| ExecError::InvalidSize("run-process fragment"))?;
         }
         code.bind(save_calls_export)
@@ -418,7 +418,7 @@ impl DispatchFragments {
             breakpoint_offset: labels[&breakpoint],
             line_breakpoint_offset: labels[&line_breakpoint],
             line_breakpoint_cleanup_offset: labels[&line_breakpoint_cleanup],
-            run_process_offsets: (apply3_resolver != 0)
+            run_process_offsets: (apply != 0)
                 .then(|| (labels[&run_process], labels[&save_calls_export])),
             save_calls_export_offset: labels[&save_calls_export],
             apply_fun_offset: labels[&apply_fun],
@@ -1942,6 +1942,7 @@ fn emit_line_breakpoint_shared(
         encoder.ldr_uoff(Gpr::x(1), Gpr::x(19), pc_slot)?;
         encoder.ldr_uoff(Gpr::x(2), Gpr::x(19), live_slot)?;
         crate::arm::beam_asm::load_x_reg_array(encoder, Gpr::x(3))?;
+        encoder.mov_reg(Gpr::x(4), Gpr::x(20))?;
         encoder.mov_const(Gpr::x(17), helpers.prepare_call as u64)?;
         encoder.blr(Gpr::x(17))
     })?;
@@ -1954,8 +1955,8 @@ fn emit_line_breakpoint_shared(
     code.bind(cleanup)?;
     emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
-        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
-        crate::arm::beam_asm::load_x_reg_array(encoder, Gpr::x(1))?;
+        crate::arm::beam_asm::load_x_reg_array(encoder, Gpr::x(0))?;
+        encoder.mov_reg(Gpr::x(1), Gpr::x(20))?;
         encoder.mov_const(Gpr::x(17), helpers.cleanup as u64)?;
         encoder.blr(Gpr::x(17))
     })?;
@@ -1995,51 +1996,53 @@ fn emit_restore_and_exit_frame(code: &mut CodeBuffer, frame_bytes: u16) -> Resul
     Ok(())
 }
 
-/// Leaves native execution so the scheduler can interpret a call named by `sentinel`.
-///
-/// Expects the call continuation in `x30` (set by the caller before the branch); any
-/// argument the scheduler needs (the arity, the fun) is already published in `c_p`.
-/// The beam_run_process stub: `apply/3` on X0..X2 through the runtime resolver, then a tail branch
-/// to the resolved code (erts `emit_variable_apply` + `emit_i_apply_only`, instr_call.cpp:205-261).
-/// The process starts with no Erlang frame: the continuation in x30 is the exit bridge, so it is
-/// kept, not popped. The resolver returns the target, or the interpreter fragment.
-// Port of erts/emulator/beam/jit/arm/instr_call.cpp:205-261 (emit_variable_apply, emit_i_apply_only),
-// erts/emulator/beam/beam_emu.c:693-694 (beam_run_process), OTP-29.1.1.
+/// The beam_run_process stub: `apply/3` on X0..X2 through `apply()`, then a tail branch
+/// to `Export.dispatch.addresses[active_code_ix]` (`emit_variable_apply(true)` +
+/// `emit_i_apply_only`, without leaving an Erlang frame: this stub is entered with the
+/// exit continuation in x30).
+// Port of erts/emulator/beam/jit/arm/instr_call.cpp:205-261 (emit_variable_apply,
+// emit_i_apply_only), erts/emulator/beam/beam_emu.c:693-694 (beam_run_process), OTP-29.1.1.
 fn emit_run_process_fragment(
     code: &mut CodeBuffer,
-    resolver: usize,
+    apply: usize,
     raise_exception: arinsal_a64::buf::Label,
 ) -> Result<(), BufferError> {
-    // All cached X registers: the resolved target's arguments may be any of them.
-    emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
+    let entry = code.new_label();
+    let dispatch = code.new_label();
+    code.bind(entry)?;
+    // Preserve LR across `apply()`: there is no Erlang frame to restore it from.
+    code.emit(|encoder| {
+        encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16)?;
+        encoder.mov_reg(Gpr::x(29), Gpr::sp())
+    })?;
+    let update = Update::HEAP_ALLOC
+        .union(Update::REDUCTIONS)
+        .union(Update::X_REGS);
+    emit_enter_runtime(code, 3, update)?;
     code.emit(|encoder| {
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
-        // The resolver may run Erlang code (traps, error handlers); the caller's x30 is kept in the
-        // header, as the module-level apply does (bif.rs emit_bif_runtime_call).
-        encoder.str_uoff(Gpr::x(30), Gpr::x(21), 72)?;
-        // No return address and no stack offset: not a tail apply in module code.
-        encoder.mov_const(Gpr::x(1), 0)?;
-        encoder.mov_const(Gpr::x(2), 0)?;
-        crate::arm::beam_asm::load_x_reg_array(encoder, Gpr::x(3))?;
-        encoder.mov_const(Gpr::x(17), resolver as u64)?;
+        crate::arm::beam_asm::load_x_reg_array(encoder, Gpr::x(1))
+    })?;
+    code.adr(Gpr::x(2), entry)?;
+    code.emit(|encoder| {
+        encoder.mov_const(Gpr::x(3), 0)?;
+        encoder.mov_const(Gpr::x(17), apply as u64)?;
         encoder.blr(Gpr::x(17))
     })?;
-    emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
-    code.emit(|encoder| encoder.ldr_uoff(Gpr::x(30), Gpr::x(21), 72))?;
+    emit_leave_runtime(code, 6, update)?;
+    code.emit(|encoder| encoder.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16))?;
     // A failed apply raised (current = erlang:apply/3), with the caller's continuation as the
     // exception pc and the host frame the raise fragment pops, as the export trampoline does.
-    let resolved = code.new_label();
-    code.cbnz(Gpr::x(1), resolved)?;
+    code.cbnz(Gpr::x(0), dispatch)?;
     code.emit(|encoder| {
         encoder.str_pre(Gpr::x(30), Gpr::x(20), -8)?;
         encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -32)?;
         encoder.mov_reg(Gpr::x(29), Gpr::sp())
     })?;
     code.b(raise_exception)?;
-    code.bind(resolved)?;
+    code.bind(dispatch)?;
     code.emit(|encoder| {
-        // x0 is the Export* (ARG1) of a dispatchable target, x1 the address.
-        encoder.mov_reg(Gpr::x(14), Gpr::x(1))?;
+        encoder.ldr_regoff(Gpr::x(14), Gpr::x(0), Gpr::x(24), 3)?;
         encoder.br(Gpr::x(14))
     })?;
     Ok(())

@@ -187,8 +187,6 @@ pub trait ModuleEnv {
     fn compare_shared(&self) -> CompareShared {
         CompareShared::default()
     }
-    /// Map lookup slow path. It returns zero when the key is absent.
-    fn map_lookup_helper(&self) -> MapLookupHelper;
     /// Dispatches an OTP BIF function body using the current X registers.
     fn bif_mfa_helper(&self) -> BifMfaHelper;
     /// Return a dispatch slot that calls the BIF itself (never its module's stub body) through
@@ -243,11 +241,9 @@ pub trait ModuleEnv {
     fn add_stacktrace_helper(&self) -> arinsal_beamasm::catch::AddStacktraceHook {
         unused_add_stacktrace
     }
-    /// Runtime entry points for `apply`, `apply/2` and `apply/3`.
+    /// Runtime entry points for `apply/2`. `apply` / `fixed_apply` are the erts C symbols.
     fn apply_runtime(&self) -> arinsal_beamasm::misc::ApplyRuntime {
         arinsal_beamasm::misc::ApplyRuntime {
-            resolver: unused_apply_resolver,
-            apply3_resolver: unused_apply3_resolver,
             apply_fun_shared: 0,
             fun_resolver: unused_fun_resolver,
         }
@@ -359,25 +355,6 @@ extern "C" fn unused_big_to_float(_term: u64, _resp: *mut f64) -> i32 {
     0
 }
 
-extern "C" fn unused_apply_resolver(
-    _process: *mut ProcessHeader,
-    _arity: u32,
-    _return_ip: u64,
-    _stack_offset: u32,
-    _: *mut u64,
-) -> arinsal_beamasm::misc::ApplyResolution {
-    arinsal_beamasm::misc::ApplyResolution::default()
-}
-
-extern "C" fn unused_apply3_resolver(
-    _process: *mut ProcessHeader,
-    _return_ip: u64,
-    _stack_offset: u32,
-    _: *mut u64,
-) -> arinsal_beamasm::misc::ApplyResolution {
-    arinsal_beamasm::misc::ApplyResolution::default()
-}
-
 extern "C" fn unused_fun_resolver(
     _process: *mut ProcessHeader,
     _fun: u64,
@@ -386,10 +363,6 @@ extern "C" fn unused_fun_resolver(
 ) -> usize {
     0
 }
-
-/// Runtime lookup for map element instructions.
-pub type MapLookupHelper =
-    unsafe extern "C" fn(*mut ProcessHeader, *mut u64, u64, u64, u64, u64) -> u64;
 
 /// Runtime dispatcher for BIF entry functions.
 pub type BifMfaHelper = unsafe extern "C" fn(*mut ProcessHeader, *mut u64, u64, u64, u64) -> u64;

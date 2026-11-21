@@ -6,6 +6,7 @@
 //! its module below and one line to [`FAMILIES`].
 
 pub(crate) mod beam_bif_load;
+pub(crate) mod beam_bp;
 pub(crate) mod beam_debug;
 pub(crate) mod bif;
 pub(crate) mod bif_phash2;
@@ -469,7 +470,7 @@ fn classify_by_name(
     if let Some(entry) = resolve(module, function, arity) {
         return (ImportClass::Native, pack_native(entry));
     }
-    if is_dynamic(module, function, arity) {
+    if is_dynamic(module) {
         return (ImportClass::Dynamic, 0);
     }
     if has_bif {
@@ -483,11 +484,8 @@ fn classify_by_name(
 
 /// Natives whose result depends on VM state, or miss-path side effects that
 /// must still run (`prim_tty` owner, conditional `erl_tracer`).
-fn is_dynamic(module: &str, function: &str, arity: u8) -> bool {
+fn is_dynamic(module: &str) -> bool {
     module == "erl_tracer"
-        || (module == "erlang"
-            && function == "nif_error"
-            && !nif::recognizes(module, function, arity))
 }
 
 fn proc_claims(module: &str, function: &str, arity: u8) -> bool {

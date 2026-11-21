@@ -3,41 +3,9 @@
 use crate::Process;
 use arinsal_arith::ArithError;
 use arinsal_beamasm::{ProcessHeader, SchedulerRegisters};
-#[cfg(target_arch = "aarch64")]
-use arinsal_maps::MapError;
 use arinsal_term::{Term, cmp, cmp_exact};
 use num_traits::ToPrimitive;
 use std::cmp::Ordering;
-
-/// Runtime lookup for native map element instructions.
-///
-/// # Safety
-/// The pointers must be the active process header and scheduler registers.
-#[cfg(target_arch = "aarch64")]
-pub extern "C" fn arinsal_beamasm_map_lookup(
-    header: *mut ProcessHeader,
-    _reg: *mut u64,
-    map: u64,
-    key: u64,
-    _hash: u64,
-    _hashed: u64,
-) -> u64 {
-    let Some(process) = enter_runtime(header) else {
-        return 0;
-    };
-    match arinsal_maps::get(from_raw(map), from_raw(key)) {
-        Ok(Some(value)) => raw(value),
-        Ok(None) => 0,
-        Err(MapError::Badmap(_)) => {
-            set_error(process, "badmap");
-            0
-        }
-        Err(_) => {
-            set_error(process, "badarg");
-            0
-        }
-    }
-}
 
 /// Reject an unsupported dynamic BIF entry as an Erlang `undef` exception.
 ///

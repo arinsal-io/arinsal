@@ -200,29 +200,10 @@ impl ModuleEnv for CorpusEnv {
     }
 
     fn apply_runtime(&self) -> arinsal_beamasm::misc::ApplyRuntime {
-        extern "C" fn apply(
-            _: *mut ProcessHeader,
-            _: u32,
-            _: u64,
-            _: u32,
-            _: *mut u64,
-        ) -> arinsal_beamasm::misc::ApplyResolution {
-            arinsal_beamasm::misc::ApplyResolution::default()
-        }
-        extern "C" fn apply3(
-            _: *mut ProcessHeader,
-            _: u64,
-            _: u32,
-            _: *mut u64,
-        ) -> arinsal_beamasm::misc::ApplyResolution {
-            arinsal_beamasm::misc::ApplyResolution::default()
-        }
         extern "C" fn fun(_: *mut ProcessHeader, _: u64, _: u32, _: *mut u64) -> usize {
             0
         }
         arinsal_beamasm::misc::ApplyRuntime {
-            resolver: apply,
-            apply3_resolver: apply3,
             apply_fun_shared: 1,
             fun_resolver: fun,
         }
@@ -244,9 +225,6 @@ impl ModuleEnv for CorpusEnv {
             eq: (eq as extern "C" fn(u64, u64) -> i32) as usize,
             ..Default::default()
         }
-    }
-    fn map_lookup_helper(&self) -> arinsal_beamjit::MapLookupHelper {
-        map_lookup
     }
     fn bif_mfa_helper(&self) -> arinsal_beamjit::BifMfaHelper {
         bif_mfa
@@ -273,16 +251,6 @@ impl ModuleEnv for CorpusEnv {
 
 /// `erts_garbage_collect_nobump` of the corpus: the modules are compiled, never run.
 extern "C" fn gc(_: *mut ProcessHeader, _: usize, _: *mut u64, _: i32, _: i32) -> i32 {
-    0
-}
-extern "C" fn map_lookup(
-    _: *mut ProcessHeader,
-    _: *mut u64,
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-) -> u64 {
     0
 }
 extern "C" fn bif_mfa(_: *mut ProcessHeader, _: *mut u64, _: u64, _: u64, _: u64) -> u64 {

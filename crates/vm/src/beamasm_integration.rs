@@ -360,12 +360,10 @@ pub(crate) fn make_export(mfa: Mfa) -> &'static Arc<arinsal_term::ExportEntry> {
 /// Export descriptor returned by the native line-breakpoint prepare helper.
 // Port of erts/emulator/beam/beam_bp.c:1828-1830
 // (erts_line_breakpoint_hit__prepare_call), OTP-29.1.1.
-#[cfg(target_arch = "aarch64")]
 pub(crate) fn line_breakpoint_export(code_ix: usize) -> Option<&'static arinsal_term::ExportEntry> {
-    let atoms = arinsal_term::global_atoms();
     let mfa = (
-        atoms.intern("erts_internal").ok()?,
-        atoms.intern("breakpoint").ok()?,
+        arinsal_term::atoms::ERTS_INTERNAL,
+        arinsal_term::atoms::BREAKPOINT,
         4,
     );
     crate::export::find_export_entry(crate::code_ix::global(), mfa, code_ix)

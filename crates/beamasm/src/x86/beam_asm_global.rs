@@ -533,6 +533,7 @@ impl BeamGlobalAssembler {
             G::ProcessMain => Self::emit_process_main,
             G::ILoopRecShared => Self::emit_i_loop_rec_shared,
             G::ApplyFunShared => Self::emit_apply_fun_shared,
+            G::ILineBreakpointTrampolineShared => Self::emit_i_line_breakpoint_trampoline_shared,
             G::BifElementShared => Self::emit_bif_element_shared,
             G::CheckFloatError => Self::emit_check_float_error,
             G::FconvShared => Self::emit_fconv_shared,
@@ -569,6 +570,7 @@ impl BeamGlobalAssembler {
             G::BsSizeCheckShared => Self::emit_bs_size_check_shared,
             G::BsGetTailShared => Self::emit_bs_get_tail_shared,
             G::BsGetUtf8Shared => Self::emit_bs_get_utf8_shared,
+            G::BsGetUtf8ShortShared => Self::emit_bs_get_utf8_short_shared,
             G::BsCreateBinErrorShared => Self::emit_bs_create_bin_error_shared,
             G::BsInitBitsShared => Self::emit_bs_init_bits_shared,
             G::GetSint64Shared => Self::emit_get_sint64_shared,
@@ -943,13 +945,38 @@ mod tests {
     /// The instruction lines of fragment `name` in the erts dump.
     fn fragment_lines<'a>(dump: &'a str, name: &str) -> Vec<&'a str> {
         let head = format!("global::{name}:");
-        dump.lines()
+        let mut lines: Vec<_> = dump
+            .lines()
             .skip_while(|line| line.trim() != head)
             .skip(1)
             .map(str::trim)
             .take_while(|line| *line != "align 8" && !line.starts_with("global::"))
             .filter(|line| !line.starts_with('#'))
-            .collect()
+            .collect();
+
+        // `aligned_call(OperandType)` emits a sizing call, rewinds the AsmJit cursor, then
+        // emits padding and the final call. JDdump logs the sizing call even though the
+        // rewind overwrites it in the code buffer; compare the final bytes, not that log entry.
+        let mut index = 0;
+        while index < lines.len() {
+            if lines[index].starts_with("call ") {
+                let mut next = index + 1;
+                while next < lines.len()
+                    && (lines[next].starts_with(".byte ") || lines[next].starts_with(".db "))
+                {
+                    next += 1;
+                }
+                if next < lines.len()
+                    && lines[next].starts_with("call ")
+                    && lines[next] == lines[index]
+                {
+                    lines.remove(index);
+                    continue;
+                }
+            }
+            index += 1;
+        }
+        lines
     }
 
     /// Rewrites erts' static addresses to Arinsal's: the MFA or `the_active_code_index` an
@@ -1050,6 +1077,12 @@ mod tests {
                 G::IBsrBodyShared => vec![mfa_address(&crate::x86::instr_arith::BSR_MFA)],
                 G::ILengthBodyShared => vec![mfa_address(&crate::x86::instr_bif::LENGTH_MFA)],
                 G::ILoadNifShared => vec![mfa_address(&crate::x86::instr_bif::LOAD_NIF_MFA)],
+                G::ILineBreakpointTrampolineShared => {
+                    vec![crate::x86::raw::line_breakpoint_prepare() as u64]
+                }
+                G::ILineBreakpointCleanup => {
+                    vec![crate::x86::raw::line_breakpoint_cleanup() as u64]
+                }
                 _ => Vec::new(),
             }
         };
@@ -1059,7 +1092,29 @@ mod tests {
         }
         let ga = BeamGlobalAssembler::new(ProcessOffsets::ERTS_X86_64).unwrap();
         let code = ga.asm.a.bytes(Section::Code);
-        let ranges = ga.ranges();
+        let mut ranges = ga.ranges();
+        let line_bp_index = ranges
+            .iter()
+            .position(|(label, _)| *label == GlobalLabels::ILineBreakpointTrampolineShared)
+            .unwrap();
+        let (line_bp, line_bp_range) = ranges.remove(line_bp_index);
+        let cleanup_offset = ga
+            .asm
+            .a
+            .label_location(ga.label(GlobalLabels::ILineBreakpointCleanup))
+            .unwrap()
+            .offset;
+        ranges.insert(
+            line_bp_index,
+            (line_bp, line_bp_range.start..cleanup_offset),
+        );
+        ranges.insert(
+            line_bp_index + 1,
+            (
+                GlobalLabels::ILineBreakpointCleanup,
+                cleanup_offset..line_bp_range.end,
+            ),
+        );
         let unbound: Vec<&str> = GLOBAL_LABELS
             .iter()
             .filter(|label| ga.asm.a.label_location(ga.label(**label)).is_none())

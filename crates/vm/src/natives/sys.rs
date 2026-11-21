@@ -361,14 +361,9 @@ pub(crate) fn reply_literal_area_copy(
 /// The `nodes/2` visible-map fast path stays outside the table: that arm returns
 /// `None` for selectors it does not handle.
 pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
-    ("persistent_term", "put", 2),
-    ("persistent_term", "put_new", 2),
     ("persistent_term", "get", 0),
     ("persistent_term", "get", 1),
     ("persistent_term", "get", 2),
-    ("persistent_term", "erase", 1),
-    ("persistent_term", "info", 0),
-    ("erts_internal", "erase_persistent_terms", 0),
     ("erlang", "nodes", 0),
     ("erlang", "statistics", 1),
     // `term_to_string/1` is `term_to_string(T, undefined)` in erts_internal.erl.
@@ -386,14 +381,9 @@ type Handler =
 
 pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler> {
     match (module, function, arity) {
-        ("persistent_term", "put", 2) => Some(persistent_term_put_2),
-        ("persistent_term", "put_new", 2) => Some(persistent_term_put_new_2),
         ("persistent_term", "get", 0) => Some(persistent_term_get_0),
         ("persistent_term", "get", 1) => Some(call_persistent_term_get_1),
         ("persistent_term", "get", 2) => Some(call_persistent_term_get_2),
-        ("persistent_term", "erase", 1) => Some(persistent_term_erase_1),
-        ("persistent_term", "info", 0) => Some(persistent_term_info_0),
-        ("erts_internal", "erase_persistent_terms", 0) => Some(erase_persistent_terms_0),
         ("erlang", "nodes", 0) => Some(call_nodes0),
         ("erlang", "statistics", 1) => Some(call_statistics),
         ("erts_internal", "garbage_collect", 1) => Some(call_garbage_collect),
@@ -834,8 +824,17 @@ fn persistent_system_limit() -> VmError {
 
 /// `persistent_term:put/2`.
 // Port of erts/emulator/beam/erl_bif_persistent.c (persistent_term_put_2), OTP-29.1.1.
-pub(crate) fn persistent_term_put_2(
-    _vm: &mut Vm,
+pub(crate) extern "C" fn persistent_term_put_2(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    crate::natives::bif::bif_sched::<2>(c_p, reg, i, |_vm, process, ctx, args| {
+        persistent_term_put_2_body(process, ctx, &args)
+    })
+}
+
+fn persistent_term_put_2_body(
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
@@ -859,8 +858,17 @@ pub(crate) fn persistent_term_put_2(
 
 /// `persistent_term:put_new/2`.
 // Port of erts/emulator/beam/erl_bif_persistent.c (persistent_term_put_new_2), OTP-29.1.1.
-pub(crate) fn persistent_term_put_new_2(
-    _vm: &mut Vm,
+pub(crate) extern "C" fn persistent_term_put_new_2(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    crate::natives::bif::bif_sched::<2>(c_p, reg, i, |_vm, process, ctx, args| {
+        persistent_term_put_new_2_body(process, ctx, &args)
+    })
+}
+
+fn persistent_term_put_new_2_body(
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
@@ -947,8 +955,17 @@ fn call_persistent_term_get_2(
 
 /// `persistent_term:erase/1`.
 // Port of erts/emulator/beam/erl_bif_persistent.c (persistent_term_erase_1), OTP-29.1.1.
-pub(crate) fn persistent_term_erase_1(
-    _vm: &mut Vm,
+pub(crate) extern "C" fn persistent_term_erase_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    crate::natives::bif::bif_sched::<1>(c_p, reg, i, |_vm, process, ctx, args| {
+        persistent_term_erase_1_body(process, ctx, &args)
+    })
+}
+
+fn persistent_term_erase_1_body(
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
@@ -971,12 +988,15 @@ pub(crate) fn persistent_term_erase_1(
 
 /// `persistent_term:info/0`.
 // Port of erts/emulator/beam/erl_bif_persistent.c (persistent_term_info_0), OTP-29.1.1.
-pub(crate) fn persistent_term_info_0(
-    _vm: &mut Vm,
-    process: &mut Process,
-    _ctx: &mut RunCtx<'_, crate::Process>,
-    _args: &[Term],
-) -> Result<Term, VmError> {
+pub(crate) extern "C" fn persistent_term_info_0(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    crate::natives::bif::bif_process::<0>(c_p, reg, i, |process, _| persistent_term_info(process))
+}
+
+fn persistent_term_info(process: &mut Process) -> Result<Term, VmError> {
     let (count, memory) = process.persistent_terms.info();
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     (|| {
@@ -999,8 +1019,17 @@ pub(crate) fn persistent_term_info_0(
 
 /// `erts_internal:erase_persistent_terms/0`.
 // Port of erts/emulator/beam/erl_bif_persistent.c (erts_internal_erase_persistent_terms_0), OTP-29.1.1.
-pub(crate) fn erase_persistent_terms_0(
-    _vm: &mut Vm,
+pub(crate) extern "C" fn erase_persistent_terms_0(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    crate::natives::bif::bif_sched::<0>(c_p, reg, i, |_vm, process, ctx, args| {
+        erase_persistent_terms_0_body(process, ctx, &args)
+    })
+}
+
+fn erase_persistent_terms_0_body(
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],

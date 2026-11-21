@@ -36,6 +36,19 @@ unsafe extern "C" {
     pub fn get_map_element(map: u64, key: u64) -> u64;
     /// `Eterm get_map_element_hash(Eterm map, Eterm key, erts_ihash_t hx)` (beam_common.h).
     pub fn get_map_element_hash(map: u64, key: u64, hash: u64) -> u64;
+    /// `const Export *apply(Process *p, Eterm *reg, ErtsCodePtr I, Uint flags)`
+    /// (beam_common.h); the export address, or null after setting the process exception.
+    pub fn apply(c_p: *mut ProcessHeader, reg: *mut u64, i: usize, flags: u64) -> usize;
+    /// `const Export *fixed_apply(Process *p, Eterm *reg, Uint arity, ErtsCodePtr I,
+    /// Uint flags)` (beam_common.h); the export address, or null after setting the process
+    /// exception.
+    pub fn fixed_apply(
+        c_p: *mut ProcessHeader,
+        reg: *mut u64,
+        arity: u64,
+        i: usize,
+        flags: u64,
+    ) -> usize;
 }
 
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (emit_i_length_common:
@@ -358,6 +371,27 @@ mod test_stubs {
     #[unsafe(no_mangle)]
     extern "C" fn get_map_element_hash(_: u64, _: u64, _: u64) -> u64 {
         unreachable!("byte-test fixture")
+    }
+
+    /// Fixture for BeamAsm apply tests: `c_p->id` holds the Export* the emitter dispatches.
+    #[unsafe(no_mangle)]
+    extern "C" fn apply(c_p: *mut ProcessHeader, _: *mut u64, _: usize, _: u64) -> usize {
+        super::process_header_mut(c_p, |header| header.self_pid as usize)
+    }
+
+    /// Fixture for BeamAsm fixed-apply tests: records arity in `fvalue` and returns the Export*.
+    #[unsafe(no_mangle)]
+    extern "C" fn fixed_apply(
+        c_p: *mut ProcessHeader,
+        _: *mut u64,
+        arity: u64,
+        _: usize,
+        _: u64,
+    ) -> usize {
+        super::process_header_mut(c_p, |header| {
+            header.exc.fvalue = arity;
+            header.self_pid as usize
+        })
     }
 
     #[unsafe(no_mangle)]

@@ -8,9 +8,7 @@ use arinsal_beam::BeamFile;
 use arinsal_beamasm::{
     dispatch::CompareHelpers, dispatch::DispatchFragments, guard::CompareShared,
 };
-use arinsal_beamjit::{
-    BifMfaHelper, MapLookupHelper, ModuleEnv, compile_parsed_module_with_options,
-};
+use arinsal_beamjit::{BifMfaHelper, ModuleEnv, compile_parsed_module_with_options};
 use arinsal_term::{Term, TermBuilder, VecHeap, from_owned, global_atoms};
 use num_bigint::BigInt;
 use std::collections::HashMap;
@@ -34,6 +32,8 @@ pub(crate) fn beamasm_init() {
         // arm runs the Rust process_main shaped like beam_emu.c until its migration, so
         // `beam_exit` is that loop's `error_action_code` instruction (beam_emu.c `beam_exit_`).
         exit: crate::process::beam_exit_address(),
+        // The Rust process_main's trap-export dispatch, as `beam_exit` above.
+        bif_export_trap: crate::bif_traps::arm_loop_bif_export_trap(),
     });
     arinsal_beamasm::set_process_main_labels(fragments.dispatch_nif());
 }
@@ -70,13 +70,14 @@ fn fragments() -> Option<&'static DispatchFragments> {
                     },
                     line_breakpoint: arinsal_beamasm::dispatch::LineBreakpointHelpers {
                         garbage_collect: yield_fragments()?.garbage_collect(),
-                        prepare_call: crate::native_helpers::arinsal_beamasm_line_breakpoint_prepare
-                            as *const () as usize,
-                        cleanup: crate::native_helpers::arinsal_beamasm_line_breakpoint_cleanup
-                            as *const () as usize,
+                        prepare_call:
+                            crate::raw::line_breakpoint::arinsal_beamasm_line_breakpoint_prepare
+                                as *const () as usize,
+                        cleanup:
+                            crate::raw::line_breakpoint::arinsal_beamasm_line_breakpoint_cleanup
+                                as *const () as usize,
                     },
-                    apply3_resolver: crate::native_helpers::arinsal_beamasm_apply3_resolver
-                        as *const () as usize,
+                    apply: crate::raw::beam_common_ffi::apply as *const () as usize,
                     call_error_handler: crate::native_helpers::arinsal_beamasm_call_error_handler
                         as *const () as usize,
                     beam_jit_call_nif: crate::beam_jit_common::beam_jit_call_nif as *const ()
@@ -1088,9 +1089,6 @@ impl ModuleEnv for VmModuleEnv<'_> {
         shared.eq = crate::utils::eq as *const () as usize;
         shared
     }
-    fn map_lookup_helper(&self) -> MapLookupHelper {
-        crate::arinsal_beamasm_map_lookup
-    }
     fn bif_mfa_helper(&self) -> BifMfaHelper {
         crate::arinsal_beamasm_bif_mfa
     }
@@ -1168,8 +1166,6 @@ impl ModuleEnv for VmModuleEnv<'_> {
     fn apply_runtime(&self) -> arinsal_beamasm::misc::ApplyRuntime {
         let fragments = fragments();
         arinsal_beamasm::misc::ApplyRuntime {
-            resolver: crate::native_helpers::arinsal_beamasm_apply_resolver,
-            apply3_resolver: crate::native_helpers::arinsal_beamasm_apply3_resolver,
             apply_fun_shared: fragments.map_or(0, DispatchFragments::apply_fun_shared),
             fun_resolver: crate::native_helpers::arinsal_beamasm_fun_resolver,
         }

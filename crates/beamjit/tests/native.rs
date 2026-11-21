@@ -9,18 +9,8 @@ use arinsal_beamasm::{
 };
 use arinsal_beamjit::{ModuleEnv, compile_module_with_env};
 use similar_asserts::assert_eq;
-use std::{
-    fs,
-    process::Command,
-    sync::{
-        OnceLock,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Instant,
-};
+use std::{fs, process::Command, sync::OnceLock, time::Instant};
 
-static MAP_LOOKUP_RESULT: AtomicU64 = AtomicU64::new(0);
-static MAP_LOOKUP_KEY: AtomicU64 = AtomicU64::new(0);
 static YIELD_FRAGMENTS: OnceLock<YieldFragments> = OnceLock::new();
 static RAISE_FRAGMENTS: OnceLock<RaiseFragments> = OnceLock::new();
 
@@ -160,10 +150,6 @@ impl ModuleEnv for TestEnv {
         0x0F00
     }
 
-    fn map_lookup_helper(&self) -> arinsal_beamjit::MapLookupHelper {
-        map_lookup_helper
-    }
-
     fn bif_mfa_helper(&self) -> arinsal_beamjit::BifMfaHelper {
         bif_mfa_helper
     }
@@ -197,18 +183,6 @@ extern "C" fn fun_resolver(
     _reg: *mut u64,
 ) -> usize {
     0
-}
-
-extern "C" fn map_lookup_helper(
-    _process: *mut ProcessHeader,
-    _registers: *mut u64,
-    _map: u64,
-    key: u64,
-    _hash: u64,
-    _hashed: u64,
-) -> u64 {
-    MAP_LOOKUP_KEY.store(key, Ordering::SeqCst);
-    MAP_LOOKUP_RESULT.load(Ordering::SeqCst)
 }
 
 extern "C" fn bif_mfa_helper(
@@ -543,8 +517,6 @@ fn otp_logger_reply_return_returns_the_reply_map() {
     });
     let header = &mut process.header;
     let reply = tagged_small(77);
-    MAP_LOOKUP_RESULT.store(atom("true"), Ordering::SeqCst);
-    MAP_LOOKUP_KEY.store(0, Ordering::SeqCst);
     let mut registers = SchedulerRegisters::default();
     registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(reply);
     registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(state);
@@ -557,14 +529,10 @@ fn otp_logger_reply_return_returns_the_reply_map() {
         header.i
     );
     let result = registers.x_reg_array[0];
-    // Port of erts/emulator/beam/jit/arm/instr_map.cpp:362-390, OTP-29.1.1: a flatmap
-    // lookup of an immediate key stays inline and never reaches the runtime hook.
-    assert_eq!(MAP_LOOKUP_KEY.load(Ordering::SeqCst), 0);
     assert_eq!(read_heap_word(result.tagged_word(), 0), 3 << 6);
     assert_eq!(read_heap_word(result.tagged_word(), 1), atom("reply"));
     assert_eq!(read_heap_word(result.tagged_word(), 2), reply);
     assert_eq!(read_heap_word(result.tagged_word(), 3), state);
-    MAP_LOOKUP_RESULT.store(0, Ordering::SeqCst);
 }
 
 fn caller_module(target: usize, label: u32) -> arinsal_beamasm::module::FinalizedModule {

@@ -19,6 +19,11 @@ fn code_memory_spans_share_allocator_block() {
 /// 3. Write a second block after the first is executing.
 /// 4. Patch the first (change `add` to `sub` `0xcb010000`), flush icache.
 /// 5. Call again and check the new result.
+///
+/// Executes AArch64 instructions; the x86_64 counterpart is
+/// `arinsal_x64::exec::tests::writes_through_rw_alias_and_executes_through_rx_alias`
+/// (and the patch/multithreaded tests next to it).
+#[cfg(target_arch = "aarch64")]
 #[test]
 fn test_exec_add_execute_patch_sub() {
     let mut mem = CodeMemory::new(4096).expect("allocate CodeMemory");
@@ -157,6 +162,7 @@ fn test_out_of_bounds_write() {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 #[test]
 fn test_write_helpers() {
     let mut mem = CodeMemory::new(4096).expect("allocate CodeMemory");
@@ -186,6 +192,7 @@ fn test_write_helpers() {
     assert_eq!(f(50, 25), 25);
 }
 
+#[cfg(target_arch = "aarch64")]
 #[test]
 fn test_multithreaded_execution() {
     use std::sync::Arc;

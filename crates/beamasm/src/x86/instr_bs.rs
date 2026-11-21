@@ -2,8 +2,9 @@
 //! instructions (`i_bs_start_match3`, `i_bs_match`, `i_bs_match_test_heap`, `bs_get_*`,
 //! `i_bs_get_*`, `i_bs_skip_*`, `bs_set_position`, ...), `bs_init_writable`, and the global
 //! fragments `bs_size_check_shared`, `bs_get_tail_shared`, `bs_get_utf8_shared`,
-//! `bs_create_bin_error_shared`, `get_sint64_shared`, `construct_utf8_shared` and
-//! `store_unaligned`. Every `emit_*` is one erts `BeamModuleAssembler::emit_*` or
+//! `bs_get_utf8_short_shared`, `bs_create_bin_error_shared`, `get_sint64_shared`,
+//! `construct_utf8_shared` and `store_unaligned`. Every `emit_*` is one erts
+//! `BeamModuleAssembler::emit_*` or
 //! `BeamGlobalAssembler::emit_*`; segment planning is the arch-neutral port of
 //! jit/beam_jit_bs.cpp in `common::bs`.
 
@@ -2504,6 +2505,113 @@ impl BeamGlobalAssembler {
         a.emit(|e| e.ret())
     }
 
+    /// Reads up to five bytes from an unaligned or short UTF-8 match context.
+    // Port of erts/emulator/beam/jit/x86/instr_bs.cpp:615-751
+    // (emit_bs_get_utf8_short_shared), OTP-29.1.1.
+    pub(crate) fn emit_bs_get_utf8_short_shared(&mut self) -> Result<(), AsmError> {
+        let ctx = ARG1;
+        let bin_position = ARG2;
+        let bin_base = ARG3;
+        let start_offset = SUB_BITS_START;
+        let utf8_shared = self.label(GlobalLabels::BsGetUtf8Shared);
+        let (at_least_one, two, three_or_more, four, five, read_done, no_masking, ascii) = {
+            let a = &mut self.asm;
+            (
+                a.new_label(),
+                a.new_label(),
+                a.new_label(),
+                a.new_label(),
+                a.new_label(),
+                a.new_label(),
+                a.new_label(),
+                a.new_label(),
+            )
+        };
+        let a = &mut self.asm;
+
+        // Include the next byte when the first bit starts mid-byte.
+        a.emit(|e| e.shr_ri(RET, 3))?;
+        a.emit(|e| e.test_rr(RET, RET))?;
+        a.short_jcc(CondCode::NE, at_least_one)?;
+        a.emit(|e| e.ret())?;
+
+        a.bind(at_least_one)?;
+        a.emit(|e| e.mov_rr(ARG5, RET))?;
+        a.emit(|e| e.test_ri(bin_position, 7))?;
+        a.emit(|e| e.setcc_r(CondCode::NE, ARG4.r8()))?;
+        a.emit(|e| e.movzx_rr(ARG4D, ARG4.r8()))?;
+        a.emit(|e| e.add_rr(RET, ARG4))?;
+        a.emit(|e| e.push_r(bin_position))?;
+        a.emit(|e| e.shr_ri(bin_position, 3))?;
+
+        a.emit(|e| e.cmp_ri(RET, 2))?;
+        a.short_jcc(CondCode::E, two)?;
+        a.short_jcc(CondCode::A, three_or_more)?;
+        a.emit(|e| e.mov_rm(RETB, Mem::base_index(bin_base, bin_position, 0, 0, 1)))?;
+        a.emit(|e| e.movzx_rr(RETD, RETB))?;
+        a.short_jmp(read_done)?;
+
+        a.bind(two)?;
+        a.emit(|e| e.mov_rm(RET.r16(), Mem::base_index(bin_base, bin_position, 0, 0, 2)))?;
+        a.emit(|e| e.movzx_rr(RETD, RET.r16()))?;
+        a.short_jmp(read_done)?;
+
+        a.bind(three_or_more)?;
+        a.emit(|e| e.cmp_ri(RET, 4))?;
+        a.short_jcc(CondCode::E, four)?;
+        a.short_jcc(CondCode::A, five)?;
+        a.emit(|e| e.mov_rm(RETB, Mem::base_index(bin_base, bin_position, 0, 2, 1)))?;
+        a.emit(|e| e.movzx_rr(RETD, RETB))?;
+        a.emit(|e| e.shl_ri(RETD, 16))?;
+        a.emit(|e| e.mov_rm(RET.r16(), Mem::base_index(bin_base, bin_position, 0, 0, 2)))?;
+        a.short_jmp(read_done)?;
+
+        a.bind(four)?;
+        a.emit(|e| e.mov_rm(RETD, Mem::base_index(bin_base, bin_position, 0, 0, 4)))?;
+        a.short_jmp(read_done)?;
+
+        a.bind(five)?;
+        a.emit(|e| e.mov_rm(RETD, Mem::base_index(bin_base, bin_position, 0, 0, 4)))?;
+        a.emit(|e| e.mov_rm(ARG4.r8(), Mem::base_index(bin_base, bin_position, 0, 4, 1)))?;
+        a.emit(|e| e.movzx_rr(ARG4D, ARG4.r8()))?;
+        a.emit(|e| e.shl_ri(ARG4, 32))?;
+        a.emit(|e| e.or_rr(RET, ARG4))?;
+
+        a.bind(read_done)?;
+        a.emit(|e| e.pop_r(bin_position))?;
+        a.emit(|e| e.bswap(RET))?;
+        if ctx == enc::RCX {
+            a.emit(|e| e.push_r(enc::RCX))?;
+        }
+        a.emit(|e| e.mov_rr(enc::RCX.r32(), bin_position.r32()))?;
+        a.emit(|e| e.and_ri(enc::RCX.r8(), 7))?;
+        a.emit(|e| e.shl_rr(RET, enc::RCX))?;
+
+        a.emit(|e| e.mov_ri(enc::RCX.r8(), 64))?;
+        a.emit(|e| e.cmp_ri(ARG5, 3))?;
+        a.short_jcc(CondCode::A, no_masking)?;
+        a.emit(|e| e.shl_ri(ARG5D, 3))?;
+        a.emit(|e| e.sub_rr(enc::RCX.r8(), ARG5.r8()))?;
+        a.emit(|e| e.mov_ri(ARG5, -1))?;
+        a.emit(|e| e.shl_rr(ARG5, enc::RCX))?;
+        a.emit(|e| e.and_rr(RET, ARG5))?;
+
+        a.bind(no_masking)?;
+        if ctx == enc::RCX {
+            a.emit(|e| e.pop_r(enc::RCX))?;
+        }
+        a.emit(|e| e.bt_ri(RET, 63))?;
+        a.short_jcc(CondCode::AE, ascii)?;
+        a.emit(|e| e.shr_ri(RET, 32))?;
+        a.jmp(utf8_shared)?;
+
+        a.bind(ascii)?;
+        a.emit(|e| e.add_mi(qword_ptr(ctx, start_offset), 8))?;
+        a.emit(|e| e.shr_ri(RET, 56 - TAG_IMMED1_SIZE))?;
+        a.emit(|e| e.or_ri(RET, TAG_IMMED1_SMALL))?;
+        a.emit(|e| e.ret())
+    }
+
     /// Decodes a multi-byte UTF-8 code point with PEXT/SHRX: ARG1 the match state, ARG2 the
     /// bit position, RETd four big-endian bytes. On success the code point is a small in RET,
     /// the position is advanced and ZF is clear; on failure ZF is set.
@@ -4607,6 +4715,7 @@ zero_large() -> <<0:1024>>.
             G::BsSizeCheckShared,
             G::BsGetTailShared,
             G::BsGetUtf8Shared,
+            G::BsGetUtf8ShortShared,
             G::BsCreateBinErrorShared,
             G::GetSint64Shared,
             G::ConstructUtf8Shared,
@@ -4619,6 +4728,6 @@ zero_large() -> <<0:1024>>.
                 .unwrap();
         let m = BeamModuleAssembler::with_global(4, &ga, 0x1000);
         assert!(m.ga_get(G::BsGetTailShared).is_ok());
-        assert!(m.ga_get(G::BsGetUtf8ShortShared).is_err());
+        assert!(m.ga_get(G::BsGetUtf8ShortShared).is_ok());
     }
 }

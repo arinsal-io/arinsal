@@ -3,20 +3,11 @@
 use arinsal_a64::enc::Gpr;
 
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
+use crate::rt::{addr, apply, fixed_apply};
+use crate::{Update, emit_enter_runtime, emit_leave_runtime};
 
-/// What [`ApplyHook`] resolved, returned in AAPCS64 `x0` and `x1`.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[repr(C)]
-pub struct ApplyResolution {
-    /// The Export* passed in ARG1 to its dispatch address, or zero for a direct entry.
-    pub export: u64,
-    /// The address to call, or zero when the resolver set an exception.
-    pub target: u64,
-}
-
-/// Resolves `apply Arity` to an export, a native entry or the interpreter fragment.
-pub type ApplyHook =
-    extern "C" fn(*mut crate::ProcessHeader, u32, u64, u32, *mut u64) -> ApplyResolution;
+const C_P: Gpr = Gpr::x(21);
+const ACTIVE_CODE_IX: Gpr = Gpr::x(24);
 
 impl BeamModuleAssembler {
     /// `send`: `call_light_bif_shared` with `BIF_TRAP_EXPORT(BIF_send_2)` and `send_2`.
@@ -55,22 +46,10 @@ pub enum ApplyKind {
     Apply2,
 }
 
-/// Resolves `apply/3` (module, function and argument list in X0..X2), with the arguments
-/// moved into the X registers, to the export's address with the Export* for ARG1, or to the
-/// `apply/3` interpreter fragment.
-///
-/// The return address (non-zero for a tail apply) and stack offset are those of [`ApplyHook`],
-/// for `apply_bif_error_adjustment`.
-pub type Apply3Hook =
-    extern "C" fn(*mut crate::ProcessHeader, u64, u32, *mut u64) -> ApplyResolution;
-
-/// Runtime entry points used by the apply instructions.
+/// Runtime entry points used by `apply/2`. `apply` / `fixed_apply` are the erts C
+/// symbols the emitters `runtime_call`, as x86 does.
 #[derive(Clone, Copy, Debug)]
 pub struct ApplyRuntime {
-    /// Resolves a fixed-arity apply; returns a native target or the fixed-apply fragment.
-    pub resolver: ApplyHook,
-    /// Resolves `apply/3`; returns the export to call, or zero after setting the exception.
-    pub apply3_resolver: Apply3Hook,
     /// Shared fragment unpacking the `apply/2` argument list (`apply_fun_shared`).
     pub apply_fun_shared: usize,
     /// Resolves the fun of an `apply/2` that misses the local fun fast path.
@@ -100,9 +79,8 @@ pub fn emit_apply_tail(
 }
 
 // Port of erts/emulator/beam/jit/arm/instr_call.cpp:205-320, OTP-29.1.1.
-// A fixed apply and `apply/3` resolve their target in the runtime; one that is not natively
-// compiled (or an invalid apply, which raises) goes to the interpreter through a shared
-// fragment.
+// `apply` / `fixed_apply` return the Export* (ARG1); a null pointer raises with apply3_mfa,
+// otherwise `emit_setup_dispatchable_call` loads `addresses[active_code_ix]`.
 fn emit_apply_common(
     asm: &mut BeamModuleAssembler,
     kind: ApplyKind,
@@ -118,84 +96,79 @@ fn emit_apply_common(
     } else {
         asm.record_return_site(continuation)?;
     }
-    let live = match kind {
+    let update = Update::HEAP_ALLOC
+        .union(Update::REDUCTIONS)
+        .union(Update::X_REGS);
+    let enter_live = match kind {
         // Port of emit_fixed_apply's `emit_enter_runtime(Arity.get() + 2)`,
-        // erts/emulator/beam/jit/arm/instr_call.cpp:270-274, OTP-29.1.1. A failing
-        // `fixed_apply` also writes X0..X2 (module, function, argument list), which the
-        // raise reads from the register cache, so at least three are reloaded.
-        ApplyKind::Fixed(arity) => (arity as usize + 2).max(3),
-        _ => 6,
-    };
-    let update = crate::Update::HEAP_ALLOC
-        .union(crate::Update::REDUCTIONS)
-        .union(crate::Update::X_REGS);
-    match kind {
+        // erts/emulator/beam/jit/arm/instr_call.cpp:270-274, OTP-29.1.1.
         ApplyKind::Fixed(arity) => {
             if arity > 255 {
                 return Err(ModuleError::InvalidOperand("apply arity exceeds 255"));
             }
-            let entry = asm.code.new_label();
-            asm.code.bind(entry)?;
-            asm.code
-                .emit(|e| e.mov_const(Gpr::x(9), u64::from(arity)))?;
+            arity as usize + 2
+        }
+        // Port of emit_variable_apply's `emit_enter_runtime(..., 3)`,
+        // erts/emulator/beam/jit/arm/instr_call.cpp:217-218, OTP-29.1.1.
+        _ => 3,
+    };
+    let dispatch = asm.code.new_label();
+    let entry = asm.code.new_label();
+    asm.code.bind(entry)?;
+    if let ApplyKind::Fixed(arity) = kind {
+        // ARG3 = arity before enter_runtime (instr_call.cpp:270).
+        asm.code
+            .emit(|e| e.mov_const(Gpr::x(2), u64::from(arity)))?;
+    }
+    emit_enter_runtime(&mut asm.code, enter_live, update)?;
+    asm.code.emit(|e| {
+        e.mov_reg(Gpr::x(0), C_P)?;
+        crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(1))
+    })?;
+    match kind {
+        ApplyKind::Fixed(_) => {
             if tail {
-                asm.code.adr(Gpr::x(10), entry)?;
+                asm.code.adr(Gpr::x(3), entry)?;
             } else {
-                asm.code.emit(|e| e.mov_const(Gpr::x(10), 0))?;
+                asm.code.emit(|e| e.mov_const(Gpr::x(3), 0))?;
             }
-            asm.code.emit(|e| e.mov_const(Gpr::x(11), 0))?;
-            asm.emit_runtime_hook(
-                runtime.resolver as usize,
-                // The last argument is `reg` (`load_x_reg_array`): the resolver moves the arguments there.
-                &[Gpr::x(9), Gpr::x(10), Gpr::x(11), Gpr::x(19)],
-                live,
-                update,
-            )?;
+            asm.code.emit(|e| e.mov_const(Gpr::x(4), 0))?;
+            asm.fragment_call(addr(fixed_apply as *const ()))?;
         }
         // Port of erts/emulator/beam/jit/arm/instr_call.cpp:205-244 (emit_variable_apply),
         // OTP-29.1.1: any number of X registers is live after the call.
         _ => {
-            let entry = asm.code.new_label();
-            asm.code.bind(entry)?;
             if tail {
-                asm.code.adr(Gpr::x(9), entry)?;
+                asm.code.adr(Gpr::x(2), entry)?;
             } else {
-                asm.code.emit(|e| e.mov_const(Gpr::x(9), 0))?;
+                asm.code.emit(|e| e.mov_const(Gpr::x(2), 0))?;
             }
-            asm.code.emit(|e| e.mov_const(Gpr::x(10), 0))?;
-            asm.emit_runtime_hook(
-                runtime.apply3_resolver as usize,
-                &[Gpr::x(9), Gpr::x(10), Gpr::x(19)],
-                live,
-                update,
-            )?;
+            asm.code.emit(|e| e.mov_const(Gpr::x(3), 0))?;
+            asm.fragment_call(addr(apply as *const ()))?;
         }
     }
-    {
-        // Port of erts/emulator/beam/jit/arm/instr_call.cpp:263-299 (emit_fixed_apply) and
-        // beam_asm.hpp:388-403 (emit_setup_dispatchable_call), OTP-29.1.1: the resolver
-        // leaves the Export* in ARG1 (x0; zero for a direct native entry or a fragment)
-        // and the address to call in x1. Zero there is the exception it set.
-        let resolved = asm.code.new_label();
-        asm.code.cbnz(Gpr::x(1), resolved)?;
-        // Port of erts/emulator/beam/jit/arm/instr_call.cpp:220-230,92-96
-        // (emit_raise_exception(entry, &apply3_mfa)), OTP-29.1.1: X0..X2 hold the operands.
-        static APPLY3_MFA: std::sync::OnceLock<crate::bif::ErtsCodeMfa> =
-            std::sync::OnceLock::new();
-        let mfa = APPLY3_MFA.get_or_init(|| crate::bif::ErtsCodeMfa {
-            module: arinsal_term::Term::atom(arinsal_term::atoms::ERLANG).word(),
-            function: arinsal_term::Term::atom(arinsal_term::atoms::APPLY).word(),
-            arity: 3,
-        });
-        asm.branch_error_with_mfa(std::ptr::from_ref(mfa) as usize)?;
-        asm.code.bind(resolved)?;
-        asm.code.emit(|e| e.mov_reg(Gpr::x(17), Gpr::x(1)))?;
-    }
+    // Port of emit_leave_runtime without a live count: reload all six cached X registers
+    // (instr_call.cpp:236-237, 289-292).
+    emit_leave_runtime(&mut asm.code, 6, update)?;
+    asm.code.cbnz(Gpr::x(0), dispatch)?;
+    // Port of erts/emulator/beam/jit/arm/instr_call.cpp:239-240,294-295
+    // (emit_raise_exception(entry, &apply3_mfa)), OTP-29.1.1: X0..X2 hold the operands.
+    static APPLY3_MFA: std::sync::OnceLock<crate::bif::ErtsCodeMfa> = std::sync::OnceLock::new();
+    let mfa = APPLY3_MFA.get_or_init(|| crate::bif::ErtsCodeMfa {
+        module: arinsal_term::Term::atom(arinsal_term::atoms::ERLANG).word(),
+        function: arinsal_term::Term::atom(arinsal_term::atoms::APPLY).word(),
+        arity: 3,
+    });
+    asm.branch_error_with_mfa(std::ptr::from_ref(mfa) as usize)?;
+    asm.code.bind(dispatch)?;
+    // Port of beam_asm.hpp:388-403 (emit_setup_dispatchable_call): ARG1 is the Export*.
+    asm.code
+        .emit(|e| e.ldr_regoff(Gpr::x(14), Gpr::x(0), ACTIVE_CODE_IX, 3))?;
     if tail {
         asm.emit_leave_frame()?;
-        asm.code.emit(|e| e.br(Gpr::x(17)))?;
+        asm.code.emit(|e| e.br(Gpr::x(14)))?;
     } else {
-        asm.code.emit(|e| e.blr(Gpr::x(17)))?;
+        asm.code.emit(|e| e.blr(Gpr::x(14)))?;
         asm.code.bind(continuation)?;
     }
     Ok(())

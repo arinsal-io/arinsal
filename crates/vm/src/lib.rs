@@ -78,7 +78,7 @@ pub use bif_table::has_function as bif_table_has_function;
 pub use calls::call_bif;
 pub use native_bridge::install_crash_dump;
 #[cfg(target_arch = "aarch64")]
-pub use native_hooks::{arinsal_beamasm_bif_mfa, arinsal_beamasm_map_lookup};
+pub use native_hooks::arinsal_beamasm_bif_mfa;
 pub use natives::implemented_natives;
 #[doc(hidden)]
 pub use natives::tty::registered_callers as tty_registered_callers;

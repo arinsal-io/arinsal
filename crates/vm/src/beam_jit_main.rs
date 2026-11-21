@@ -16,6 +16,7 @@ static BEAM_SAVE_CALLS_FUN: AtomicUsize = AtomicUsize::new(0);
 static BEAM_UNLOADED_FUN: AtomicUsize = AtomicUsize::new(0);
 static BEAM_I_LINE_BREAKPOINT_CLEANUP: AtomicUsize = AtomicUsize::new(0);
 static BEAM_EXIT: AtomicUsize = AtomicUsize::new(0);
+static BEAM_BIF_EXPORT_TRAP: AtomicUsize = AtomicUsize::new(0);
 
 /// The code pointers `beamasm_init` of a backend publishes (beam_jit_main.cpp:373-397).
 pub(crate) struct BeamCodePtrs {
@@ -33,6 +34,8 @@ pub(crate) struct BeamCodePtrs {
     pub(crate) i_line_breakpoint_cleanup: usize,
     /// `beam_exit`.
     pub(crate) exit: usize,
+    /// `beam_bif_export_trap`.
+    pub(crate) bif_export_trap: usize,
 }
 
 /// Stores the code pointers of the backend's global code.
@@ -48,6 +51,12 @@ pub(crate) fn publish(ptrs: &BeamCodePtrs) {
     // `c_p->i == beam_exit` identifies an exiting process: never the null `i`.
     assert_ne!(ptrs.exit, 0, "beamasm_init: beam_exit");
     BEAM_EXIT.store(ptrs.exit, Ordering::Relaxed);
+    // `ERTS_BIF_PREP_TRAP` points `c_p->i` here: never the null `i`.
+    assert_ne!(
+        ptrs.bif_export_trap, 0,
+        "beamasm_init: beam_bif_export_trap"
+    );
+    BEAM_BIF_EXPORT_TRAP.store(ptrs.bif_export_trap, Ordering::Relaxed);
     crate::fun_dispatch::init(ptrs.unloaded_fun, ptrs.save_calls_fun);
 }
 
@@ -75,6 +84,13 @@ pub(crate) fn beam_i_line_breakpoint_cleanup() -> usize {
 /// terminates through `handle_error` with its catches killed.
 pub(crate) fn beam_exit() -> usize {
     BEAM_EXIT.load(Ordering::Relaxed)
+}
+
+/// `beam_bif_export_trap`: where `ERTS_BIF_PREP_TRAP` leaves a trapping process; on
+/// schedule-in it calls the trap export named by `c_p->current`.
+// Port of erts/emulator/beam/jit/beam_jit_main.cpp:60,393 (beam_bif_export_trap), OTP-29.1.1.
+pub(crate) fn beam_bif_export_trap() -> usize {
+    BEAM_BIF_EXPORT_TRAP.load(Ordering::Relaxed)
 }
 
 /// `beamasm_init()`: the global code of the backend, generated once per OS process.
@@ -178,6 +194,9 @@ mod x86 {
             i_line_breakpoint_cleanup: get(GlobalLabels::ILineBreakpointCleanup),
             // `beam_exit = (ErtsCodePtr)bga->get_process_exit()` (beam_jit_main.cpp:395).
             exit: get(GlobalLabels::ProcessExit),
+            // `beam_bif_export_trap = (ErtsCodePtr)bga->get_bif_export_trap()`
+            // (beam_jit_main.cpp:393).
+            bif_export_trap: get(GlobalLabels::BifExportTrap),
         });
         arinsal_beamasm::set_process_main_labels(
             jit.bga

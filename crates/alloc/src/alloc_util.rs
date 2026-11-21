@@ -4641,7 +4641,19 @@ mod tests {
     }
 
     fn tree_work_per_pair(strategy: Strategy, pairs: usize) -> (f64, f64, f64) {
-        let mut allocator = AllocUtil::new(strategy, AllocUtilOptions::default());
+        // One large MBC so the counts are `rbt_search`/`rbt_insert`/`rbt_delete` on the
+        // free-block tree (`erl_ao_firstfit_alloc.c`), not the OS mmap layout of several
+        // carriers in the address-ordered carrier tree.
+        let mut allocator = AllocUtil::new(
+            strategy,
+            AllocUtilOptions {
+                sbct: 1 << 20,
+                smbcs: 8 << 20,
+                mmbcs: 8 << 20,
+                lmbcs: 8 << 20,
+                ..Default::default()
+            },
+        );
         let mut state = 0x2545_f491_4f6c_dd1d_u64;
         let mut next = move || {
             state ^= state << 13;

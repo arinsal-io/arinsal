@@ -457,6 +457,8 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "setelement", 3) => bif!(crate::natives::bif::setelement_3),
         ("erlang", "tuple_size", 1) => bif!(crate::natives::bif::tuple_size_1),
         ("erlang", "error", 1) => bif!(crate::natives::bif::error_1),
+        ("erlang", "nif_error", 1) => bif!(crate::natives::bif::nif_error_1),
+        ("erlang", "nif_error", 2) => bif!(crate::natives::bif::nif_error_2),
         ("erlang", "exit", 1) => bif!(crate::natives::bif::exit_1),
         ("erlang", "throw", 1) => bif!(crate::natives::bif::throw_1),
         ("erlang", "raise", 3) => bif!(crate::natives::bif::raise_3),
@@ -643,6 +645,14 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "node", 1) => bif!(crate::dist::node_1),
         ("persistent_term", "get", 1) => bif!(crate::natives::sys::persistent_term_get_1),
         ("persistent_term", "get", 2) => bif!(crate::natives::sys::persistent_term_get_2),
+        // erl_bif_persistent.c
+        ("persistent_term", "put", 2) => bif!(crate::natives::sys::persistent_term_put_2),
+        ("persistent_term", "put_new", 2) => bif!(crate::natives::sys::persistent_term_put_new_2),
+        ("persistent_term", "erase", 1) => bif!(crate::natives::sys::persistent_term_erase_1),
+        ("persistent_term", "info", 0) => bif!(crate::natives::sys::persistent_term_info_0),
+        ("erts_internal", "erase_persistent_terms", 0) => {
+            bif!(crate::natives::sys::erase_persistent_terms_0)
+        }
         // bif.c
         ("erlang", "monitor", 2) => bif!(crate::natives::bif::monitor_2),
         ("erlang", "monitor", 3) => bif!(crate::natives::bif::monitor_3),

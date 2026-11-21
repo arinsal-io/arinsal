@@ -86,11 +86,19 @@ fn trap_state_term(
 /// `beam_bif_export_trap`. `BIF_TRAP` points `c_p->i` here; it is not a BEAM function, so a
 /// backtrace names it "unknown function".
 // Port of erts/emulator/beam/bif.h:316-326 (ERTS_BIF_PREP_TRAP under BEAMASM) and
-// jit/arm/beam_asm_global.cpp:145 (emit_bif_export_trap), OTP-29.1.1.
+// jit/beam_jit_main.cpp:393 (beam_bif_export_trap), OTP-29.1.1.
 pub(crate) fn bif_export_trap_pc() -> usize {
+    crate::beam_jit_main::beam_bif_export_trap()
+}
+
+/// The arm Rust process_main's `beam_bif_export_trap`: the address it recognises in `c_p->i`
+/// until arm's process_main is emitted, as its `beam_exit` is.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn arm_loop_bif_export_trap() -> usize {
     bif_export_trap as *const () as usize
 }
 
+#[cfg(target_arch = "aarch64")]
 fn bif_export_trap() {}
 
 /// A trapped BIF is scheduled out at `beam_bif_export_trap` with the caller's return
@@ -112,7 +120,7 @@ pub(crate) fn note_export_trap(process: &mut Process) {
         }
     }
     // `push_native_continuation` republishes the header and clears `i`.
-    process.heap.abi.i = bif_export_trap as *const u8 as *const _;
+    process.heap.abi.i = bif_export_trap_pc() as *const _;
 }
 
 fn clear_export_trap(process: &mut Process) {
@@ -240,6 +248,8 @@ pub(crate) fn install_export_trap(
     process.x.ensure_x(arity);
     process.x[..arity].copy_from_slice(&trap.args);
     process.gc_live = arity;
+    // ERTS_BIF_PREP_TRAP: `c_p->current = &Trap->info.mfa`, which `beam_bif_export_trap` calls.
+    process.heap.abi.current = std::ptr::from_ref(&trap.entry.info.mfa).cast();
     let gc_was_enabled = process.heap.gc_enabled();
     if trap.gc_disabled {
         process.set_gc_enabled(false);
@@ -284,7 +294,7 @@ pub(crate) fn arm_export_trap(process: &mut Process) {
     {
         process.heap.abi.arity = arity as u8;
     }
-    process.heap.abi.i = bif_export_trap as *const u8 as *const _;
+    process.heap.abi.i = bif_export_trap_pc() as *const _;
 }
 
 /// `ERTS_VBUMP_ALL_REDS`: the rest of the slice is given up without being the process's own

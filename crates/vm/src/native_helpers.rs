@@ -440,82 +440,6 @@ pub(crate) fn vbump_reds(process: &mut crate::Process, reds: i32) {
     }
 }
 
-/// Prepares the live X registers and handler arguments for a native line-breakpoint call.
-// Port of erts/emulator/beam/beam_bp.c:1821-1865
-// (erts_line_breakpoint_hit__prepare_call), OTP-29.1.1.
-#[cfg(target_arch = "aarch64")]
-pub extern "C" fn arinsal_beamasm_line_breakpoint_prepare(
-    header: *mut ProcessHeader,
-    pc: u64,
-    live: u64,
-    reg: *mut u64,
-) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
-        return 0;
-    };
-    let Ok(live) = usize::try_from(live) else {
-        return 0;
-    };
-    if live > registers.x_reg_array.len() {
-        return 0;
-    }
-    let Some(function) = crate::native_function_at(pc as usize) else {
-        return 0;
-    };
-    let Some((_, line)) = function.line_at(pc as usize) else {
-        return 0;
-    };
-    if (function.module, function.function, function.arity) == ("erts_internal", "breakpoint", 4) {
-        return 0;
-    }
-    let Some(export) =
-        crate::beamasm_integration::line_breakpoint_export(registers.active_code_ix as usize)
-    else {
-        return 0;
-    };
-
-    for index in 0..live {
-        if !process.heap.stack_set(index, registers.x_reg_array[index]) {
-            crate::native_hooks::set_error(process, "system_limit");
-            return 0;
-        }
-    }
-    let args = [
-        Term::atom(function.module_atom),
-        Term::atom(function.function_atom),
-        Term::small(i64::from(function.arity)).expect("arity is a small integer"),
-        Term::small(i64::from(line)).expect("debug line is a small integer"),
-    ];
-    registers.x_reg_array[..4].copy_from_slice(&args);
-    process.heap.abi.arity = 4;
-    export as *const arinsal_term::ExportEntry as usize as u64
-}
-
-/// Restores the live X register prefix from the stack below a returning breakpoint handler.
-// Port of erts/emulator/beam/beam_bp.c:1868-1882
-// (erts_line_breakpoint_hit__cleanup), OTP-29.1.1.
-#[cfg(target_arch = "aarch64")]
-pub extern "C" fn arinsal_beamasm_line_breakpoint_cleanup(
-    header: *mut ProcessHeader,
-    reg: *mut u64,
-) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
-        return 0;
-    };
-    let mut live = 0usize;
-    while let Some(value) = process.heap.stack_get(live) {
-        if crate::native_bridge::is_native_continuation(value.tagged_word() as usize) {
-            break;
-        }
-        let Some(destination) = registers.x_reg_array.get_mut(live) else {
-            break;
-        };
-        *destination = value;
-        live += 1;
-    }
-    live as u64
-}
-
 /// The function `call_light_bif_shared` branches to for this export.
 ///
 /// Port of erts/emulator/beam/erl_bif_table.c (`bif_table[].f`), OTP-29.1.1: each BIF
@@ -1582,8 +1506,6 @@ fn apply_bif_error_adjustment(
 #[derive(Clone, Copy)]
 pub(crate) struct ApplyTarget {
     pub export: *const arinsal_term::ExportEntry,
-    #[cfg(target_arch = "aarch64")]
-    pub target: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -1618,15 +1540,11 @@ fn lookup_apply_export(
         .and_then(|runtime| runtime.export_entry(mfa, code_ix))
         .map(|export| ApplyTarget {
             export: std::ptr::from_ref(export),
-            #[cfg(target_arch = "aarch64")]
-            target: export.address(code_ix),
         })
         .or_else(|| {
             let export = crate::export::export_entry_or_stub(mfa);
             Some(ApplyTarget {
                 export: std::ptr::from_ref(&**export),
-                #[cfg(target_arch = "aarch64")]
-                target: export.address(code_ix),
             })
         })
 }
@@ -1791,61 +1709,6 @@ pub(crate) fn resolve_apply(
         return Err(ApplyFailure::Adjustment);
     }
     Ok(target)
-}
-
-#[cfg(target_arch = "aarch64")]
-fn arm_apply_resolution(
-    resolution: Result<ApplyTarget, ApplyFailure>,
-) -> arinsal_beamasm::misc::ApplyResolution {
-    match resolution {
-        Ok(target) => arinsal_beamasm::misc::ApplyResolution {
-            export: target.export as u64,
-            target: target.target as u64,
-        },
-        // The emitter raises with `apply3_mfa` in ARG4 (instr_call.cpp emit_i_apply).
-        Err(ApplyFailure::Raise | ApplyFailure::Adjustment) => {
-            arinsal_beamasm::misc::ApplyResolution::default()
-        }
-    }
-}
-
-/// ARM's fixed-apply entry maps the shared erts export resolution to its branch pair.
-// Port of erts/emulator/beam/beam_common.c:1529-1566 (`fixed_apply`), OTP-29.1.1.
-#[cfg(target_arch = "aarch64")]
-pub extern "C" fn arinsal_beamasm_apply_resolver(
-    header: *mut ProcessHeader,
-    arity: u32,
-    return_ip: u64,
-    stack_offset: u32,
-    reg: *mut u64,
-) -> arinsal_beamasm::misc::ApplyResolution {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
-        return arinsal_beamasm::misc::ApplyResolution::default();
-    };
-    let resolution = resolve_fixed_apply(
-        process,
-        registers,
-        arity as usize,
-        return_ip,
-        u64::from(stack_offset),
-    );
-    arm_apply_resolution(resolution)
-}
-
-/// ARM's variable-apply entry maps the shared erts export resolution to its branch pair.
-// Port of erts/emulator/beam/beam_common.c:1434-1527 (`apply`), OTP-29.1.1.
-#[cfg(target_arch = "aarch64")]
-pub extern "C" fn arinsal_beamasm_apply3_resolver(
-    header: *mut ProcessHeader,
-    return_ip: u64,
-    stack_offset: u32,
-    reg: *mut u64,
-) -> arinsal_beamasm::misc::ApplyResolution {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime_reg(header, reg) else {
-        return arinsal_beamasm::misc::ApplyResolution::default();
-    };
-    let resolution = resolve_apply(process, registers, return_ip, u64::from(stack_offset));
-    arm_apply_resolution(resolution)
 }
 
 /// Starts `bs_create_bin` append and publishes its writable buffer to native stores.

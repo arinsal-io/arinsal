@@ -8,13 +8,16 @@ use std::collections::HashMap;
 
 use arinsal_term::Atom;
 use arinsal_x64::buf::{Label, Section};
-use arinsal_x64::enc::{Gp, Mem, MemBase};
+use arinsal_x64::enc::{CondCode, Gp, Mem, MemBase};
 
 use super::beam_asm::register::{
-    ARG1, ARG2, ARG3, ARG4, ARG5, ARG6, E, REGISTERS, RET, TMP1, TMP2,
+    ARG1, ARG2, ARG3, ARG4, ARG5, ARG6, C_P, E, HTOP, REGISTERS, RET, TMP1, TMP2,
 };
-use super::beam_asm::{AsmError, BeamAssembler, Distance, Update, get_arg_ref};
+use super::beam_asm::{
+    AsmError, BeamAssembler, Distance, Update, get_arg_ref, get_y_ref, tmp_mem_q,
+};
 use super::beam_asm_global::{BeamGlobalAssembler, GLOBAL_LABELS, GlobalLabels};
+use super::raw;
 pub use super::rt::{addr, beam_catches_cons, beam_catches_cons_nil, i_emit_nyi};
 use crate::common::args::{ArgVal, REG_MASK};
 use crate::common::beam_asm_h::{
@@ -111,6 +114,102 @@ impl super::beam_asm_global::BeamGlobalAssembler {
 
         a.bind(bp_only)?;
         a.aligned_call_label(generic_bp_local)?;
+        a.emit(|e| e.ret())
+    }
+
+    /// Prepares a line-breakpoint call, lets its cleanup fragment restore live X registers,
+    /// and returns to the interrupted native code.
+    // Port of erts/emulator/beam/jit/x86/beam_asm_module.cpp:233-328
+    // (emit_i_line_breakpoint_trampoline_shared), OTP-29.1.1.
+    pub(crate) fn emit_i_line_breakpoint_trampoline_shared(&mut self) -> Result<(), AsmError> {
+        let (exit_trampoline, dealloc_and_exit_trampoline, after_gc_check, dispatch_call) = {
+            let a = &mut self.asm;
+            (a.new_label(), a.new_label(), a.new_label(), a.new_label())
+        };
+        let saved_live = tmp_mem_q(0);
+        let saved_pc = tmp_mem_q(1);
+        let saved_stack_needed = tmp_mem_q(2);
+        let cleanup = self.label(GlobalLabels::ILineBreakpointCleanup);
+        let garbage_collect = self.label(GlobalLabels::GarbageCollect);
+        let a = &mut self.asm;
+
+        a.emit_enter_frame()?;
+        a.emit(|e| e.mov_mr(saved_live, TMP1))?;
+        a.emit(|e| e.mov_rm(TMP2, get_y_ref(0, 8)))?;
+        a.emit(|e| e.sub_ri(TMP2, 8))?;
+        a.emit(|e| e.mov_mr(saved_pc, TMP2))?;
+
+        // x86-64 BeamAsm uses the native stack, so the reserved CP-space term is zero.
+        a.emit(|e| e.mov_rr(ARG4, TMP1))?;
+        a.emit(|e| {
+            e.lea(
+                RET,
+                arinsal_x64::enc::Mem {
+                    base: None,
+                    index: Some(TMP1),
+                    shift: 3,
+                    disp: 0,
+                    size: 8,
+                },
+            )
+        })?;
+        a.emit(|e| e.mov_mr(saved_stack_needed, RET))?;
+        a.emit(|e| {
+            e.lea(
+                ARG3,
+                arinsal_x64::enc::qword_ptr(RET, (arinsal_term::S_RESERVED * 8) as i32),
+            )
+        })?;
+        a.emit(|e| e.lea(ARG3, arinsal_x64::enc::Mem::base_index(HTOP, ARG3, 0, 0, 8)))?;
+        a.emit(|e| e.cmp_rr(ARG3, E))?;
+        a.short_jcc(CondCode::BE, after_gc_check)?;
+
+        a.fragment_call(garbage_collect)?;
+        a.emit(|e| e.mov_rm(RET, saved_stack_needed))?;
+        a.bind(after_gc_check)?;
+        a.emit(|e| e.sub_rr(E, RET))?;
+
+        a.emit(|e| e.mov_rr(ARG1, C_P))?;
+        a.emit(|e| e.mov_rm(ARG2, saved_pc))?;
+        a.emit(|e| e.mov_rm(ARG3, saved_live))?;
+        a.load_x_reg_array(ARG4)?;
+        a.emit(|e| e.lea(ARG5, get_y_ref(0, 8)))?;
+        a.emit_enter_runtime(Update::NONE)?;
+        a.runtime_call(raw::line_breakpoint_prepare())?;
+        a.emit_leave_runtime(Update::NONE)?;
+
+        a.emit(|e| e.test_rr(RET, RET))?;
+        a.jcc(CondCode::NE, dispatch_call)?;
+        a.emit(|e| e.mov_rm(RET, saved_stack_needed))?;
+        a.jmp(dealloc_and_exit_trampoline)?;
+
+        a.bind(dispatch_call)?;
+        let target = a.emit_setup_dispatchable_call_active(RET)?;
+        a.erlang_call_m(target)?;
+
+        a.bind(cleanup)?;
+        a.load_x_reg_array(ARG1)?;
+        a.emit(|e| e.lea(ARG2, get_y_ref(0, 8)))?;
+        a.emit_enter_runtime(Update::NONE)?;
+        a.runtime_call(raw::line_breakpoint_cleanup())?;
+        a.emit_leave_runtime(Update::NONE)?;
+
+        a.emit(|e| {
+            e.lea(
+                RET,
+                arinsal_x64::enc::Mem {
+                    base: None,
+                    index: Some(RET),
+                    shift: 3,
+                    disp: 0,
+                    size: 8,
+                },
+            )
+        })?;
+        a.bind(dealloc_and_exit_trampoline)?;
+        a.emit(|e| e.add_rr(E, RET))?;
+        a.bind(exit_trampoline)?;
+        a.emit_leave_frame()?;
         a.emit(|e| e.ret())
     }
 

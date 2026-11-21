@@ -14,40 +14,27 @@ extern "C" fn light_bif_hook(_: *mut ProcessHeader, identity: u64) -> u64 {
     identity
 }
 
-extern "C" fn apply_hook(
-    process: *mut ProcessHeader,
-    arity: u32,
-    _: u64,
-    _: u32,
-    _: *mut u64,
-) -> arinsal_beamasm::misc::ApplyResolution {
-    arinsal_beamasm::rt::process_header_mut(process, |header| header.exc.fvalue = u64::from(arity));
-    arinsal_beamasm::misc::ApplyResolution {
-        export: 0,
-        target: arinsal_beamasm::rt::process_header_mut(process, |header| header.self_pid),
-    }
-}
-
-extern "C" fn apply3_hook(
-    _: *mut ProcessHeader,
-    _: u64,
-    _: u32,
-    _: *mut u64,
-) -> arinsal_beamasm::misc::ApplyResolution {
-    arinsal_beamasm::misc::ApplyResolution::default()
-}
-
 extern "C" fn fun_hook(_: *mut ProcessHeader, _: u64, _: u32, _: *mut u64) -> usize {
     0
 }
 
 fn runtime() -> ApplyRuntime {
     ApplyRuntime {
-        resolver: apply_hook,
-        apply3_resolver: apply3_hook,
         apply_fun_shared: 0,
         fun_resolver: fun_hook,
     }
+}
+
+/// Export whose `addresses[*]` is `target`, returned by the test `fixed_apply` stub via `c_p->id`.
+fn apply_export(target: usize) -> u64 {
+    let export = Box::leak(Box::new(arinsal_beamasm::bif::ExportEntry::with_addresses(
+        arinsal_term::atoms::ERLANG,
+        arinsal_term::atoms::APPLY,
+        1,
+        target,
+        target,
+    )));
+    std::ptr::from_ref(export) as u64
 }
 
 fn target(asm: &mut BeamModuleAssembler) {
@@ -132,7 +119,7 @@ fn native_apply() {
     target(&mut asm);
     let module = asm.finalize().unwrap();
     let header = ProcessHeader {
-        self_pid: module.entries[&2] as usize as u64,
+        self_pid: apply_export(module.entries[&2] as usize),
         ..ProcessHeader::default()
     };
     let (header, regs, outcome) = execute(&module, header, [0x44, 1, 0]);
@@ -155,7 +142,7 @@ fn native_apply_last() {
     target(&mut asm);
     let module = asm.finalize().unwrap();
     let header = ProcessHeader {
-        self_pid: module.entries[&2] as usize as u64,
+        self_pid: apply_export(module.entries[&2] as usize),
         ..ProcessHeader::default()
     };
     let (_, regs, outcome) = execute(&module, header, [0x55, 1, 0]);
@@ -210,7 +197,6 @@ fn apply_fun_module(fragments: &DispatchFragments) -> FinalizedModule {
     let runtime = ApplyRuntime {
         apply_fun_shared: fragments.apply_fun_shared(),
         fun_resolver: apply_fun_hook,
-        ..runtime()
     };
     let mut asm = BeamModuleAssembler::new();
     asm.set_exception_resolver(capture_bif_mfa as *const () as usize);
