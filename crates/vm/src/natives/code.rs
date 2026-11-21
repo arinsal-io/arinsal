@@ -1100,8 +1100,10 @@ pub(crate) fn apply_on_load_patterns(vm: &mut Vm, process: &Process, name: &str)
     vm.refresh_trace_pattern(process, name, "_", None);
 }
 
-fn check_process_code(process: &mut Process, name: &str) -> bool {
-    let Some(&old) = code_tables(erts_active_code_ix()).old.get(name) else {
+/// Port of erts/emulator/beam/beam_bif_load.c:593-613 (`erts_check_process_code`):
+/// `Module.old` of `erts_get_module(module, erts_active_code_ix())` at check time.
+pub(crate) fn check_process_code(process: &mut Process, name: &str) -> bool {
+    let Some(old) = code_tables(erts_active_code_ix()).loaded.old(name) else {
         return false;
     };
     let native =
@@ -1224,11 +1226,10 @@ fn delete(
     }
     let staging = crate::code_ix::global().start_staging();
     let outcome = staging.with(|tables| {
-        if tables.old.contains_key(name) {
+        if tables.loaded.has_old(name) {
             return Outcome::NotPurged;
         }
-        if let Some(current) = tables.loaded.remove(name) {
-            tables.old.insert(name.to_owned(), current);
+        if tables.loaded.make_current_old(name).is_some() {
             crate::load::retract_module_records(name);
             tables.deleted.insert(name.to_owned());
             tables.module_files.remove(name);
@@ -1313,11 +1314,11 @@ fn purge(
         "prepare" | "prepare_on_load" => {
             let old = crate::code_ix::global().update_active(|tables| {
                 if phase == "prepare_on_load"
-                    && let Some(id) = tables.pending_on_load.remove(name)
+                    && let Some(id) = tables.loaded.take_on_load(name)
                 {
-                    tables.old.insert(name.to_owned(), id);
+                    tables.loaded.set_old(name, id);
                 }
-                tables.old.get(name).copied()
+                tables.loaded.old(name)
             });
             if let Some(id) = old {
                 let code = code_tables(erts_active_code_ix()).code_meta[id]
@@ -1361,7 +1362,7 @@ fn purge(
                         freed.extend(tables.release(id));
                     }
                 }
-                let removed = tables.old.remove(name);
+                let removed = tables.loaded.take_old(name);
                 if let Some(id) = removed {
                     // Port of erts/emulator/beam/beam_bif_load.c:2254-2258, OTP-29.1.1: the
                     // purged instance's NIF library is unloaded even while its slot lingers.
@@ -1403,10 +1404,7 @@ fn finish_on_load(name: &str, keep: bool) -> Result<Term, VmError> {
 /// erlang:finish_after_on_load/2 for a caller outside any process (`Vm::eval_scheduled`'s
 /// `code_server` role); `badarg` when `name` has no pending on_load code.
 pub(crate) fn finish_after_on_load(name: &str, keep: bool) -> Result<(), VmError> {
-    if !code_tables(erts_active_code_ix())
-        .pending_on_load
-        .contains_key(name)
-    {
+    if !code_tables(erts_active_code_ix()).loaded.has_on_load(name) {
         return Err(badarg());
     }
     let module = arinsal_term::global_atoms().get(name);
@@ -1417,10 +1415,10 @@ pub(crate) fn finish_after_on_load(name: &str, keep: bool) -> Result<(), VmError
             if let Some(module) = module {
                 crate::export::finish_after_on_load(tables, module, true, ix);
             }
-            if let Some(id) = tables.pending_on_load.remove(name)
+            if let Some(id) = tables.loaded.take_on_load(name)
                 && let Some(previous) = tables.make_current(name, id)
             {
-                tables.old.insert(name.to_owned(), previous);
+                tables.loaded.set_old(name, previous);
             }
         });
         drop(staging);
@@ -1665,10 +1663,7 @@ fn call_values(
                 let Some(entry) = tables.loaded.module_code(i) else {
                     continue;
                 };
-                let has_old = global_atoms()
-                    .text(entry.module)
-                    .is_some_and(|name| tables.old.contains_key(name));
-                if entry.curr.is_some() || has_old {
+                if entry.curr.is_some() || entry.old.is_some() {
                     modules.push(Term::atom(entry.module));
                 }
             }
@@ -1724,7 +1719,7 @@ fn call_values(
         ("erlang", "check_old_code", 1) => Some((|| {
             let name = module_name(args[0]).ok_or_else(badarg)?;
             Ok(Term::atom(
-                if code_tables(erts_active_code_ix()).old.contains_key(&name) {
+                if code_tables(erts_active_code_ix()).loaded.has_old(&name) {
                     atoms::TRUE
                 } else {
                     atoms::FALSE
@@ -1821,9 +1816,8 @@ fn call_values(
                 return Some(Err(badarg()));
             };
             let id = match code_tables(erts_active_code_ix())
-                .pending_on_load
-                .get(&name)
-                .copied()
+                .loaded
+                .on_load(&name)
                 .or_else(|| {
                     code_tables(erts_active_code_ix())
                         .loaded
@@ -2237,8 +2231,8 @@ mod tests {
         );
         assert_eq!(
             code_tables(erts_active_code_ix())
-                .old
-                .contains_key("arinsal_hot_versions"),
+                .loaded
+                .has_old("arinsal_hot_versions"),
             reference.call(
                 "erlang",
                 "check_old_code",

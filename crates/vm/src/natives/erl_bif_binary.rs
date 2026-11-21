@@ -9,7 +9,7 @@
 use std::ops::Deref;
 
 use crate::bif_traps::TrapContext;
-use crate::natives::bif::{badarg, bif_ret};
+use crate::natives::bif::{badarg, bif_badarg, bif_ret, bif_system_limit};
 use crate::natives::erl_bif_lists::bif_trap;
 use crate::natives::erl_iolist::charge;
 use arinsal_beamasm::ProcessHeader;
@@ -2216,7 +2216,7 @@ pub(crate) extern "C" fn binary_copy_trap(c_p: *mut ProcessHeader, reg: *mut u64
 /// `binary_part/2,3` and `binary:part/2,3`.
 // Port of erts/emulator/beam/erl_bif_binary.c (erts_binary_part, binary_part_2, binary_part_3),
 // OTP-29.1.1.
-fn binary_part(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize) -> u64 {
+fn binary_part(c_p: *mut ProcessHeader, reg: *mut u64, arity: usize) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
@@ -2233,24 +2233,24 @@ fn binary_part(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize) -> 
             });
         match pair {
             Some((position, length)) => (bin, position, length),
-            None => return bif_ret(c_p, i, Err(badarg())),
+            None => return bif_badarg(c_p),
         }
     } else {
         let [bin, position, length] = crate::bif_table::bif_args::<3>(reg);
         match (position.as_small(), length.as_small()) {
             (Some(position), Some(length)) => (bin, position, length),
-            _ => return bif_ret(c_p, i, Err(badarg())),
+            _ => return bif_badarg(c_p),
         }
     };
     if length < 0 {
         length = match length.checked_neg() {
             Some(length) if length <= position => length,
-            _ => return bif_ret(c_p, i, Err(badarg())),
+            _ => return bif_badarg(c_p),
         };
         position -= length;
     }
     if position < 0 || length < 0 || position.checked_add(length).is_none() {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     }
     let (Some(start), Some(length)) = (
         usize::try_from(position)
@@ -2258,23 +2258,23 @@ fn binary_part(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize) -> 
             .and_then(|n| n.checked_mul(8)),
         usize::try_from(length).ok().and_then(|n| n.checked_mul(8)),
     ) else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     let result = TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
         .sub_binary_bif(bin, start, length);
     match result {
         Ok(value) => crate::native_hooks::raw(value),
-        Err(arinsal_term::TermError::BadArg) => bif_ret(c_p, i, Err(badarg())),
-        Err(_) => bif_ret(c_p, i, Err(find_error(BifError::SystemLimit))),
+        Err(arinsal_term::TermError::BadArg) => bif_badarg(c_p),
+        Err(_) => bif_system_limit(c_p),
     }
 }
 
 /// `binary_part/2` and `binary:part/2`.
-pub(crate) extern "C" fn binary_part_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
-    binary_part(c_p, reg, i, 2)
+pub(crate) extern "C" fn binary_part_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    binary_part(c_p, reg, 2)
 }
 
 /// `binary_part/3` and `binary:part/3`.
-pub(crate) extern "C" fn binary_part_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
-    binary_part(c_p, reg, i, 3)
+pub(crate) extern "C" fn binary_part_3(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    binary_part(c_p, reg, 3)
 }

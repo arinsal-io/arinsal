@@ -984,10 +984,7 @@ mod tests {
     use similar_asserts::assert_eq;
 
     fn test_progress() -> Arc<crate::thr_progress::ThrProgress> {
-        Arc::new(crate::thr_progress::ThrProgress::new(
-            Arc::from([]),
-            Arc::from([]),
-        ))
+        Arc::new(crate::thr_progress::ThrProgress::new(0))
     }
 
     /// A task type for the run queues the balance tests create.
@@ -1004,7 +1001,7 @@ mod tests {
             _calls: &mut u32,
         ) {
             {
-                let _ = crate::erts_wait_clear_active(c_p.state());
+                let _ = c_p.clear_active_unless_queued();
             }
         }
     }

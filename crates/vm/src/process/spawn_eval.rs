@@ -402,7 +402,6 @@ impl Runtime {
             persistent_term_later_op: arinsal_sched::ErtsThrPrgrLaterOp::new(),
             persistent_term_resume_pid: AtomicU64::new(0),
             persistent_term_resume_owner: AtomicU64::new(0),
-            multi_scheduling: Mutex::new(MultiScheduling::default()),
         }))
     }
 

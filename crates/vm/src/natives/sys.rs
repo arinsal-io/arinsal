@@ -8,7 +8,7 @@ use arinsal_beamasm::ProcessHeader;
 use arinsal_pterm::RetiredArea;
 use arinsal_sched::RunCtx;
 use arinsal_term::{
-    FragmentIndex, SharedCopyCache, Term, TermBuilder, TermKind, copy_term,
+    FragmentIndex, HeapReservation, SharedCopyCache, Term, TermBuilder, TermKind, copy_term,
     copy_term_preserving_sharing_with_cache, global_atoms,
 };
 use std::collections::HashSet;
@@ -685,7 +685,7 @@ fn bif_return_trap(process: &mut Process, args: &[Term]) -> Result<Term, VmError
         return Err(badarg());
     };
     if *tag == crate::atom_cache::put("multi_scheduling") {
-        let state = multi_scheduling_state(process, crate::process::MultiScheduling::state);
+        let state = multi_scheduling_state(process);
         if state == "enabled" {
             Err(VmError::Unsupported(
                 "bif_return_trap: unexpected multi scheduling block state".into(),
@@ -722,6 +722,22 @@ pub(crate) extern "C" fn bif_handle_signals_return_2(
 
 /// The continuation of `ERTS_BIF_HANDLE_SIGNALS_FROM_RETURN`.
 pub(crate) const BIF_HANDLE_SIGNALS_RETURN: &str = "erlang:bif_handle_signals_return/2";
+
+/// `ERTS_BIF_HANDLE_SIGNALS_FROM_RETURN`: `BIF_TRAP2` to `bif_handle_signals_return/2`.
+// Port of erts/emulator/beam/bif.h:527-528, OTP-29.1.1.
+#[cold]
+#[inline(never)]
+pub(crate) fn handle_signals_from_return(
+    process: &mut crate::Process,
+    from: Term,
+    value: Term,
+) -> VmError {
+    VmError::TrapExport(crate::ExportTrap::new(
+        process,
+        BIF_HANDLE_SIGNALS_RETURN,
+        vec![from, value],
+    ))
+}
 
 /// A persistent-term BIF that updates the table: `put/2`, `put_new/2`, `erase/1`,
 /// `erts_internal:erase_persistent_terms/0`.
@@ -1527,24 +1543,13 @@ pub(crate) fn system_info_process_item(
             let value = gc_defaults(process.runtime).max_heap();
             Some(max_heap_map(process, value))
         }
-        Some("multi_scheduling") => Some(Ok(crate::atom_cache::put(multi_scheduling_state(
-            process,
-            |state| state.state(),
-        )))),
+        Some("multi_scheduling") => {
+            Some(Ok(crate::atom_cache::put(multi_scheduling_state(process))))
+        }
         // Port of erts/emulator/beam/erl_bif_info.c:3390 (multi_scheduling_blockers), OTP-29.1.1.
         Some(name @ ("multi_scheduling_blockers" | "normal_multi_scheduling_blockers")) => {
             let normal = name.starts_with("normal");
-            let single = with_flags(process, |flags| flags.schedulers_total == 1);
-            let blockers = if single {
-                Vec::new()
-            } else {
-                multi_scheduling_state(process, |state| state.blockers(normal))
-            };
-            let terms = blockers
-                .into_iter()
-                .filter_map(arinsal_sched::Pid::to_term)
-                .collect::<Vec<_>>();
-            Some(cons_list(process, &terms))
+            Some(multi_scheduling_blockers(process, normal))
         }
         // Port of erts/emulator/beam/erl_bif_info.c:3251 and
         // erts/emulator/beam/erl_cpu_topology.c:662-692, OTP-29.1.1.
@@ -4465,17 +4470,41 @@ pub(crate) fn gc_defaults(runtime: Option<&crate::process::Runtime>) -> &GcDefau
 }
 
 pub(crate) fn multi_scheduling_blocked(process: &Process) -> bool {
-    multi_scheduling_state(process, crate::process::MultiScheduling::any_blocked)
+    multi_scheduling_state(process) != "enabled"
 }
 
-fn multi_scheduling_state<T>(
-    process: &Process,
-    body: impl FnOnce(&crate::process::MultiScheduling) -> T,
-) -> T {
+fn multi_scheduling_state(process: &Process) -> &'static str {
     match process.runtime.as_ref() {
-        Some(runtime) => body(&runtime.multi_scheduling.lock().unwrap()),
-        None => body(&crate::process::MultiScheduling::default()),
+        Some(runtime) => runtime
+            .scheduler()
+            .map_or("enabled", |scheduler| scheduler.multi_scheduling_state()),
+        None => "enabled",
     }
+}
+
+fn multi_scheduling_blockers(process: &mut Process, normal: bool) -> Result<Term, VmError> {
+    let scheduler = process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.scheduler().ok().cloned());
+    let Some(scheduler) = scheduler else {
+        return Ok(Term::NIL);
+    };
+    scheduler.with_multi_scheduling_blockers(normal, |max_entries, pids| {
+        if max_entries == 0 {
+            return Ok(Term::NIL);
+        }
+        let mut reservation =
+            HeapReservation::new(&mut process.heap, 2 * max_entries).map_err(|_| badarg())?;
+        let mut list = Term::NIL;
+        for pid in pids {
+            let pid = pid.to_term().ok_or_else(badarg)?;
+            list = TermBuilder::new(&mut reservation)
+                .cons(pid, list)
+                .map_err(|_| badarg())?;
+        }
+        Ok(list)
+    })
 }
 
 pub(crate) fn normalize_spawn_heap_minimum(
@@ -4628,34 +4657,116 @@ fn parse_scheduler_pair(value: &str, cpus: usize) -> Option<(usize, usize)> {
 }
 
 fn multi_scheduling(process: &mut Process, value: Term) -> Result<Term, VmError> {
-    // Port of erts/emulator/beam/erl_process.c:8484 (erts_block_multi_scheduling), OTP-29.1.1.
-    let action = match atom_name(value) {
-        Some("block") => crate::process::MsbChange::Block { normal: false },
-        Some("unblock") => crate::process::MsbChange::Unblock { normal: false },
-        Some("block_normal") => crate::process::MsbChange::Block { normal: true },
-        Some("unblock_normal") => crate::process::MsbChange::Unblock { normal: true },
+    // Port of erts/emulator/beam/bif.c:4976-5010 (system_flag_2) and
+    // erl_process.c:8484-8665 (erts_block_multi_scheduling), OTP-29.1.1.
+    let (on, normal) = match atom_name(value) {
+        Some("block") => (true, false),
+        Some("unblock") => (false, false),
+        Some("block_normal") => (true, true),
+        Some("unblock_normal") => (false, true),
         _ => return Err(badarg()),
     };
-    let pid = process.self_pid().ok_or_else(badarg)?;
-    // An unscheduled evaluation has no runtime and no other scheduler to block.
     let Some(runtime) = process.runtime else {
-        let mut state = crate::process::MultiScheduling::default();
-        state.change(pid, action);
-        return Ok(crate::atom_cache::put(state.state()));
+        return Ok(crate::atom_cache::put("enabled"));
     };
-    let mut state = runtime.multi_scheduling.lock().unwrap();
-    if state.change(pid, action) {
-        // erts F_HAVE_BLCKD_MSCHED / F_HAVE_BLCKD_NMSCHED: released when this process exits.
-        process.cold_mut().have_blocked_multi_scheduling = true;
+    let scheduler = runtime
+        .scheduler()
+        .map_err(|_| VmError::Unsupported("system_flag(multi_scheduling): no scheduler".into()))?;
+    let pid = process.self_pid().ok_or_else(badarg)?;
+    if on {
+        // erts suspends the caller before taking `schdlr_sspnd.mtx` to avoid a resume/suspend race.
+        crate::suspend::suspend_self(process);
+        if normal {
+            process.cold_mut().have_blocked_normal_multi_scheduling = true;
+        } else {
+            process.cold_mut().have_blocked_multi_scheduling = true;
+        }
     }
-    if let Ok(scheduler) = runtime.scheduler() {
-        // Port of erts/emulator/beam/erl_process.c:8559-8561 (erts_block_multi_scheduling,
-        // OTP-29.1.1): every run queue but the first is suspended, so the blocking scheduler is
-        // scheduler 1 whichever scheduler the caller ran on. The caller's own scheduler may be
-        // offline (`schedulers_online` 1), where nothing would ever run the blocked node.
-        scheduler.set_scheduling_blocked(state.any_blocked(), Some(0));
+    let result = scheduler.block_multi_scheduling(pid, on, normal, false);
+    match result {
+        arinsal_sched::SchedulerSuspendResult::DoneMschedBlocked => {
+            if on {
+                crate::suspend::resume_self(process);
+            } else if !scheduler.multi_scheduling_block_type_ongoing(normal) {
+                clear_multi_scheduling_flag(process, normal);
+            }
+            Ok(crate::atom_cache::put("blocked"))
+        }
+        arinsal_sched::SchedulerSuspendResult::DoneNmschedBlocked => {
+            if on {
+                crate::suspend::resume_self(process);
+            } else if !scheduler.multi_scheduling_block_type_ongoing(normal) {
+                clear_multi_scheduling_flag(process, normal);
+            }
+            Ok(crate::atom_cache::put("blocked_normal"))
+        }
+        arinsal_sched::SchedulerSuspendResult::YieldDoneMschedBlocked => {
+            crate::bif_traps::vbump_all_reds(process);
+            Err(VmError::TrapExport(crate::ExportTrap::new(
+                process,
+                BIF_RETURN_TRAP,
+                vec![
+                    crate::atom_cache::put("blocked"),
+                    crate::atom_cache::put("multi_scheduling"),
+                ],
+            )))
+        }
+        arinsal_sched::SchedulerSuspendResult::YieldDoneNmschedBlocked => {
+            crate::bif_traps::vbump_all_reds(process);
+            Err(VmError::TrapExport(crate::ExportTrap::new(
+                process,
+                BIF_RETURN_TRAP,
+                vec![
+                    crate::atom_cache::put("blocked_normal"),
+                    crate::atom_cache::put("multi_scheduling"),
+                ],
+            )))
+        }
+        arinsal_sched::SchedulerSuspendResult::Done => {
+            if on {
+                crate::suspend::resume_self(process);
+            } else {
+                clear_multi_scheduling_flag(process, normal);
+            }
+            Ok(crate::atom_cache::put("enabled"))
+        }
+        arinsal_sched::SchedulerSuspendResult::YieldRestart => {
+            crate::bif_traps::vbump_all_reds(process);
+            Err(VmError::TrapExport(crate::ExportTrap::new(
+                process,
+                "erlang:system_flag/2",
+                vec![crate::atom_cache::put("multi_scheduling"), value],
+            )))
+        }
+        arinsal_sched::SchedulerSuspendResult::YieldDone => {
+            crate::bif_traps::vbump_all_reds(process);
+            Err(VmError::TrapExport(crate::ExportTrap::new(
+                process,
+                BIF_RETURN_TRAP,
+                vec![
+                    crate::atom_cache::put("enabled"),
+                    crate::atom_cache::put("multi_scheduling"),
+                ],
+            )))
+        }
+        arinsal_sched::SchedulerSuspendResult::Invalid => {
+            if on {
+                crate::suspend::resume_self(process);
+                clear_multi_scheduling_flag(process, normal);
+            }
+            Err(badarg())
+        }
     }
-    Ok(crate::atom_cache::put(state.state()))
+}
+
+fn clear_multi_scheduling_flag(process: &mut Process, normal: bool) {
+    if let Some(cold) = process.cold.as_mut() {
+        if normal {
+            cold.have_blocked_normal_multi_scheduling = false;
+        } else {
+            cold.have_blocked_multi_scheduling = false;
+        }
+    }
 }
 
 /// Release every multi-scheduling block `process` still holds.
@@ -4666,18 +4777,21 @@ pub(crate) fn release_multi_scheduling_blocks(process: &mut Process, pid: arinsa
     let Some(cold) = process.cold.as_mut() else {
         return;
     };
-    if !std::mem::take(&mut cold.have_blocked_multi_scheduling) {
+    let full = std::mem::take(&mut cold.have_blocked_multi_scheduling);
+    let normal = std::mem::take(&mut cold.have_blocked_normal_multi_scheduling);
+    if !full && !normal {
         return;
     }
     let Some(runtime) = process.runtime.as_ref() else {
         return;
     };
-    let mut state = runtime.multi_scheduling.lock().unwrap();
-    state.release(pid);
-    if !state.any_blocked()
-        && let Ok(scheduler) = runtime.scheduler()
-    {
-        scheduler.set_scheduling_blocked(false, None);
+    if let Ok(scheduler) = runtime.scheduler() {
+        if full {
+            let _ = scheduler.block_multi_scheduling(pid, false, false, true);
+        }
+        if normal {
+            let _ = scheduler.block_multi_scheduling(pid, false, true, true);
+        }
     }
 }
 
@@ -4732,7 +4846,7 @@ fn schedulers_online(process: &Process, value: Term, dirty: bool) -> Result<Term
             .and_then(|runtime| runtime.scheduler().ok())
         {
             scheduler.set_dirty_cpu_online(flags.dirty_cpu_online);
-            if !dirty && multi_scheduling_state(process, |state| state.any_blocked()) {
+            if !dirty && multi_scheduling_blocked(process) {
                 // Port of erts/emulator/beam/erl_process.c:8316-8321
                 // (`erts_set_schedulers_online`), OTP-29.1.1: scheduler 1 stays online and is
                 // the blocking scheduler.
@@ -5305,7 +5419,7 @@ fn scheduler_stats(
 // Port of erts/emulator/beam/erl_process.c:8130-8152 (erts_schedulers_state), OTP-29.1.1.
 pub(crate) fn normal_schedulers_active(process: &Process) -> usize {
     let online = with_flags(process, |flags| flags.schedulers_online);
-    if multi_scheduling_state(process, |state| state.any_blocked()) {
+    if multi_scheduling_blocked(process) {
         1
     } else {
         online
@@ -5324,9 +5438,9 @@ fn all_schedulers_state(process: &mut Process) -> Result<Term, VmError> {
     let dirty_online = dirty_cpu_schedulers_online(process);
     // Port of erts/emulator/beam/erl_process.c:8130-8152 (`erts_schedulers_state`), OTP-29.1.1.
     // These are scheduler suspend counts, not workers currently executing tasks.
-    let (any_blocked, blocked) = multi_scheduling_state(process, |state| {
-        (state.any_blocked(), state.state() == "blocked")
-    });
+    let multi_scheduling = multi_scheduling_state(process);
+    let any_blocked = multi_scheduling != "enabled";
+    let blocked = multi_scheduling == "blocked";
     let active = if any_blocked { 1 } else { online };
     let dirty_cpu_active = if blocked { 0 } else { dirty_online };
     let dirty_io_active = if blocked { 0 } else { dirty_io };

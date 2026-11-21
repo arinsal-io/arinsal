@@ -61,7 +61,7 @@ pub(crate) extern "C" fn maps_values_1(c_p: *mut ProcessHeader, reg: *mut u64, i
 
 /// `map_size/1`.
 // Port of erts/emulator/beam/erl_map.c (map_size_1), OTP-29.1.1.
-pub(crate) extern "C" fn map_size_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn map_size_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
@@ -70,22 +70,13 @@ pub(crate) extern "C" fn map_size_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u
     match arinsal_maps::size(map) {
         // A map's size is far below the small integer limit.
         Ok(size) => Term::small(size as i64).map_or(0, crate::native_hooks::raw),
-        Err(_) => bif_error_tagged(
-            c_p,
-            reg,
-            i,
-            process,
-            "erlang:map_size/1",
-            1,
-            Term::atom(atoms::BADMAP),
-            map,
-        ),
+        Err(_) => bif_error_fvalue(c_p, arinsal_term::exc::EXC_BADMAP, map),
     }
 }
 
 /// `map_get/2`.
 // Port of erts/emulator/beam/erl_map.c (map_get_2), OTP-29.1.1.
-pub(crate) extern "C" fn map_get_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn map_get_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
@@ -95,32 +86,14 @@ pub(crate) extern "C" fn map_get_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u6
         if let Ok(Some(value)) = arinsal_maps::get(map, key) {
             return crate::native_hooks::raw(value);
         }
-        return bif_error_tagged(
-            c_p,
-            reg,
-            i,
-            process,
-            "erlang:map_get/2",
-            2,
-            Term::atom(atoms::BADKEY),
-            key,
-        );
+        return bif_error_fvalue(c_p, arinsal_term::exc::EXC_BADKEY, key);
     }
-    bif_error_tagged(
-        c_p,
-        reg,
-        i,
-        process,
-        "erlang:map_get/2",
-        2,
-        Term::atom(atoms::BADMAP),
-        map,
-    )
+    bif_error_fvalue(c_p, arinsal_term::exc::EXC_BADMAP, map)
 }
 
 /// `is_map_key/2`.
 // Port of erts/emulator/beam/erl_map.c (is_map_key_2), OTP-29.1.1.
-pub(crate) extern "C" fn is_map_key_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn is_map_key_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
@@ -134,16 +107,7 @@ pub(crate) extern "C" fn is_map_key_2(c_p: *mut ProcessHeader, reg: *mut u64, i:
             atoms::FALSE
         }));
     }
-    bif_error_tagged(
-        c_p,
-        reg,
-        i,
-        process,
-        "erlang:is_map_key/2",
-        2,
-        Term::atom(atoms::BADMAP),
-        map,
-    )
+    bif_error_fvalue(c_p, arinsal_term::exc::EXC_BADMAP, map)
 }
 
 /// `const long reds = iterations_per_red * ERTS_BIF_REDS_LEFT(p)`.
@@ -879,33 +843,23 @@ const ERTS_HASHMAP_MERGE_CONTEXT_SIZE: usize = 56;
 /// The trap state of `hashmap_merge`: the `HashmapMergeContext` of its magic binary.
 type MergeState = TrapContext<Option<HashmapMergeContext>>;
 
-/// `BIF_P->fvalue = value; BIF_ERROR(BIF_P, BADMAP)` (`tag` is `badmap`) or `BADKEY`: the
-/// `{Tag, Value}` reason `expand_error_value` builds, raised with the BIF's frame.
-// Port of erts/emulator/beam/beam_common.c (expand_error_value), OTP-29.1.1.
+/// `BIF_P->fvalue = value; BIF_ERROR(BIF_P, BADMAP | BADKEY)`: the BIF allocates nothing.
+/// `handle_error` builds `{badmap, Value}` / `{badkey, Value}` (`expand_error_value`) after
+/// `raise_exception_shared` has synced HTOP: a guard BIF (`map_get/2`, `map_size/1`,
+/// `is_map_key/2`) runs under `emit_enter_runtime<Update::eReductions>`, where `c_p->htop`
+/// is stale and a young-heap `HAlloc` would be overwritten.
+// Port of erts/emulator/beam/erl_map.c (map_get_2, map_size_1, is_map_key_2, maps_get_2, ...:
+// `BIF_P->fvalue = ...; BIF_ERROR(BIF_P, BADMAP/BADKEY)`), bif.h (BIF_ERROR) and
+// beam_common.c (expand_error_value), OTP-29.1.1.
 #[cold]
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
-fn bif_error_tagged(
-    c_p: *mut ProcessHeader,
-    reg: *mut u64,
-    i: u64,
-    process: &mut crate::Process,
-    export: &'static str,
-    arity: usize,
-    tag: Term,
-    value: Term,
-) -> u64 {
-    let mut heap = ProcessHeapHandle(&mut process.heap);
-    let reason = match TermBuilder::new(&mut heap).tuple2(tag, value) {
-        Ok(reason) => reason,
-        Err(_) => return system_limit(c_p, i),
+fn bif_error_fvalue(c_p: *mut ProcessHeader, freason: u64, value: Term) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
     };
-    let _ = (reg, process, export, arity);
-    bif_ret(
-        c_p,
-        i,
-        Err(VmError::Trap(crate::exceptions::Trap::error(reason))),
-    )
+    process.heap.abi.exc.freason = freason;
+    process.heap.abi.exc.fvalue = value.word();
+    arinsal_term::THE_NON_VALUE
 }
 
 /// `BIF_ERROR(p, SYSTEM_LIMIT)` of a failed `HAlloc`, which erts cannot hit (the heap grows).
@@ -935,16 +889,7 @@ pub(crate) extern "C" fn maps_merge_2(c_p: *mut ProcessHeader, reg: *mut u64, i:
         if map_a.is_flatmap() || map_a.is_hashmap() {
             return crate::native_hooks::raw(map_a);
         }
-        return bif_error_tagged(
-            c_p,
-            reg,
-            i,
-            process,
-            "maps:merge/2",
-            2,
-            Term::atom(atoms::BADMAP),
-            map_a,
-        );
+        return bif_error_fvalue(c_p, arinsal_term::exc::EXC_BADMAP, map_a);
     }
     if map_a.is_flatmap() {
         if map_b.is_flatmap() {
@@ -958,16 +903,7 @@ pub(crate) extern "C" fn maps_merge_2(c_p: *mut ProcessHeader, reg: *mut u64, i:
             // Will always become a tree.
             return map_merge_mixed(c_p, reg, i, process, map_a, map_b, false);
         }
-        return bif_error_tagged(
-            c_p,
-            reg,
-            i,
-            process,
-            "maps:merge/2",
-            2,
-            Term::atom(atoms::BADMAP),
-            map_b,
-        );
+        return bif_error_fvalue(c_p, arinsal_term::exc::EXC_BADMAP, map_b);
     }
     if map_a.is_hashmap() {
         if map_b.is_hashmap() {
@@ -977,27 +913,9 @@ pub(crate) extern "C" fn maps_merge_2(c_p: *mut ProcessHeader, reg: *mut u64, i:
         if map_b.is_flatmap() {
             return map_merge_mixed(c_p, reg, i, process, map_b, map_a, true);
         }
-        return bif_error_tagged(
-            c_p,
-            reg,
-            i,
-            process,
-            "maps:merge/2",
-            2,
-            Term::atom(atoms::BADMAP),
-            map_b,
-        );
+        return bif_error_fvalue(c_p, arinsal_term::exc::EXC_BADMAP, map_b);
     }
-    bif_error_tagged(
-        c_p,
-        reg,
-        i,
-        process,
-        "maps:merge/2",
-        2,
-        Term::atom(atoms::BADMAP),
-        map_a,
-    )
+    bif_error_fvalue(c_p, arinsal_term::exc::EXC_BADMAP, map_a)
 }
 
 /// Convert the flatmap to a HAMT, then `hashmap_merge`.
@@ -1133,16 +1051,7 @@ pub(crate) extern "C" fn maps_find_2(c_p: *mut ProcessHeader, reg: *mut u64, i: 
     process.heap.note_bif_entry();
     let [key, map] = crate::bif_table::bif_args::<2>(reg);
     if !(map.is_flatmap() || map.is_hashmap()) {
-        return bif_error_tagged(
-            c_p,
-            reg,
-            i,
-            process,
-            "maps:find/2",
-            2,
-            Term::atom(atoms::BADMAP),
-            map,
-        );
+        return bif_error_fvalue(c_p, arinsal_term::exc::EXC_BADMAP, map);
     }
     match arinsal_maps::get(map, key) {
         Ok(Some(value)) => {
@@ -1153,22 +1062,13 @@ pub(crate) extern "C" fn maps_find_2(c_p: *mut ProcessHeader, reg: *mut u64, i: 
             }
         }
         Ok(None) => crate::native_hooks::raw(Term::atom(atoms::ERROR)),
-        Err(_) => bif_error_tagged(
-            c_p,
-            reg,
-            i,
-            process,
-            "maps:find/2",
-            2,
-            Term::atom(atoms::BADMAP),
-            map,
-        ),
+        Err(_) => bif_error_fvalue(c_p, arinsal_term::exc::EXC_BADMAP, map),
     }
 }
 
 /// `maps:get/2`.
 // Port of erts/emulator/beam/erl_map.c (maps_get_2), OTP-29.1.1.
-pub(crate) extern "C" fn maps_get_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn maps_get_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
@@ -1178,32 +1078,14 @@ pub(crate) extern "C" fn maps_get_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u
         if let Ok(Some(value)) = arinsal_maps::get(map, key) {
             return crate::native_hooks::raw(value);
         }
-        return bif_error_tagged(
-            c_p,
-            reg,
-            i,
-            process,
-            "maps:get/2",
-            2,
-            Term::atom(atoms::BADKEY),
-            key,
-        );
+        return bif_error_fvalue(c_p, arinsal_term::exc::EXC_BADKEY, key);
     }
-    bif_error_tagged(
-        c_p,
-        reg,
-        i,
-        process,
-        "maps:get/2",
-        2,
-        Term::atom(atoms::BADMAP),
-        map,
-    )
+    bif_error_fvalue(c_p, arinsal_term::exc::EXC_BADMAP, map)
 }
 
 /// `maps:is_key/2`.
 // Port of erts/emulator/beam/erl_map.c (maps_is_key_2), OTP-29.1.1.
-pub(crate) extern "C" fn maps_is_key_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn maps_is_key_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
@@ -1217,16 +1099,7 @@ pub(crate) extern "C" fn maps_is_key_2(c_p: *mut ProcessHeader, reg: *mut u64, i
             atoms::FALSE
         }));
     }
-    bif_error_tagged(
-        c_p,
-        reg,
-        i,
-        process,
-        "maps:is_key/2",
-        2,
-        Term::atom(atoms::BADMAP),
-        map,
-    )
+    bif_error_fvalue(c_p, arinsal_term::exc::EXC_BADMAP, map)
 }
 
 /// The failure of a map operation as `BIF_ERROR` with the BIF's frame: `{badmap, Map}` or
@@ -1246,26 +1119,8 @@ fn map_failure(
 ) -> u64 {
     use arinsal_maps::MapError;
     match error {
-        MapError::Badmap(map) => bif_error_tagged(
-            c_p,
-            reg,
-            i,
-            process,
-            export,
-            arity,
-            Term::atom(atoms::BADMAP),
-            map,
-        ),
-        MapError::Badkey(key) => bif_error_tagged(
-            c_p,
-            reg,
-            i,
-            process,
-            export,
-            arity,
-            Term::atom(atoms::BADKEY),
-            key,
-        ),
+        MapError::Badmap(map) => bif_error_fvalue(c_p, arinsal_term::exc::EXC_BADMAP, map),
+        MapError::Badkey(key) => bif_error_fvalue(c_p, arinsal_term::exc::EXC_BADKEY, key),
         MapError::Allocation => system_limit(c_p, i),
         _ => ycf_error(c_p, reg, i, process, export, arity, BifError::BADARG),
     }
@@ -1348,17 +1203,6 @@ pub(crate) extern "C" fn maps_take_2(c_p: *mut ProcessHeader, reg: *mut u64, i: 
     }
 }
 
-/// `BIF_P->fvalue = value; BIF_ERROR(BIF_P, BADMAP)`.
-// Port of erts/emulator/beam/bif.h (BIF_ERROR) and erl_map.c (BADMAP sites), OTP-29.1.1.
-fn bif_badmap(c_p: *mut ProcessHeader, value: Term) -> u64 {
-    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
-        return 0;
-    };
-    process.heap.abi.exc.freason = arinsal_term::exc::EXC_BADMAP;
-    process.heap.abi.exc.fvalue = value.word();
-    arinsal_term::THE_NON_VALUE
-}
-
 /// `erts_debug:map_info/1`.
 // Port of erts/emulator/beam/erl_map.c (erts_debug_map_info_1, hashmap_info), OTP-29.1.1.
 pub(crate) extern "C" fn erts_debug_map_info_1(
@@ -1379,7 +1223,7 @@ pub(crate) extern "C" fn erts_debug_map_info_1(
     } else if node.is_flatmap() {
         bif_badarg(c_p)
     } else {
-        bif_badmap(c_p, node)
+        bif_error_fvalue(c_p, arinsal_term::exc::EXC_BADMAP, node)
     }
 }
 
@@ -1518,7 +1362,7 @@ pub(crate) extern "C" fn erts_internal_map_to_tuple_keys_1(
     } else if value.is_hashmap() {
         bif_badarg(c_p)
     } else {
-        bif_badmap(c_p, value)
+        bif_error_fvalue(c_p, arinsal_term::exc::EXC_BADMAP, value)
     }
 }
 
@@ -1601,7 +1445,7 @@ pub(crate) extern "C" fn erts_internal_map_hashmap_children_1(
     process.heap.note_bif_entry();
     let [value] = crate::bif_table::bif_args::<1>(reg);
     if value.classify() != TermKind::Map {
-        return bif_badmap(c_p, value);
+        return bif_error_fvalue(c_p, arinsal_term::exc::EXC_BADMAP, value);
     }
     let Some(children) = hashmap_node_children(value) else {
         return bif_badarg(c_p);

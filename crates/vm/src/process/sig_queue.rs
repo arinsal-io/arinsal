@@ -252,6 +252,27 @@ impl Process {
         }
     }
 
+    /// `erts_proc_notify_new_message(c_p, ERTS_PROC_LOCK_MAIN)` on the running process after a
+    /// signal became a message: ERTS_PSFLG_ACTIVE is set (erts_schedule_process of a running
+    /// process enqueues nothing), so a process scheduled for its signals alone
+    /// (ERTS_PSFLG_RUNNING_SYS) goes on to run the receive that takes the message.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.h:2080 (erts_proc_notify_new_message),
+    // OTP-29.1.1.
+    fn erts_proc_notify_new_message(ctx: &RunCtx<'_, crate::Process>) {
+        let state = ctx.proc_state();
+        if state.load(Ordering::Relaxed) & arinsal_sched::psflg::ACTIVE == 0 {
+            state.fetch_or(arinsal_sched::psflg::ACTIVE, Ordering::AcqRel);
+        }
+    }
+
+    /// The notify at the end of convert_to_down_message (erl_proc_sig_queue.c:5058), when the
+    /// monitor signal was converted (a message appended after `queued` entries).
+    fn notify_converted(&self, ctx: &RunCtx<'_, crate::Process>, queued: usize) {
+        if self.inbox.len() > queued {
+            Self::erts_proc_notify_new_message(ctx);
+        }
+    }
+
     /// Move the outer signal queue into this process. Without unhandled signals in the
     /// middle queue, and when the batch holds only ordinary messages and receive tracing is
     /// off, the messages go straight to the message queue; otherwise the batch is appended to
@@ -267,6 +288,37 @@ impl Process {
             && crate::trace::flags(self, ctx.pid()) & crate::trace::RECEIVE != 0;
         // The fetch sets `ERTS_PSFLG_SIG_Q` itself when it leaves signals to handle.
         ctx.fetch_signals(&mut self.sig_cont_mut(), recv_traced);
+        self.fetched(ctx, cont, start, recv_traced)
+    }
+
+    /// The receive helper's fetch into an empty middle queue: `true` when nothing was queued,
+    /// with the msgq lock kept for the wait (erts_proc_sig_receive_helper returns "with message
+    /// queue locked"); otherwise as [`Self::fetch_signals`].
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:7767-7795 (erts_proc_sig_receive_helper),
+    // OTP-29.1.1.
+    pub(crate) fn fetch_signals_receive(
+        &mut self,
+        ctx: &mut RunCtx<'_, crate::Process>,
+    ) -> Result<bool, VmError> {
+        let recv_traced = crate::trace::active()
+            && crate::trace::flags(self, ctx.pid()) & crate::trace::RECEIVE != 0;
+        if ctx.fetch_signals_receive(&mut self.sig_cont_mut(), recv_traced) {
+            return Ok(true);
+        }
+        self.fetched(ctx, false, 0, recv_traced)?;
+        Ok(false)
+    }
+
+    /// The fetched batch in the middle queue past `start`: without unhandled signals before
+    /// it (`cont`), receive tracing or non-message signals it joins the message queue.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:1332 (erts_proc_sig_fetch__), OTP-29.1.1.
+    fn fetched(
+        &mut self,
+        ctx: &mut RunCtx<'_, crate::Process>,
+        cont: bool,
+        start: usize,
+        recv_traced: bool,
+    ) -> Result<(), VmError> {
         if cont
             || self.sig_cont().len() == start
             || recv_traced
@@ -287,7 +339,9 @@ impl Process {
                     self.inbox.push_message_node(node);
                     self.uncount_message_words(before);
                 }
-                _ => self.move_message(ctx, node)?,
+                _ => {
+                    self.move_message(ctx, node)?;
+                }
             }
         }
         crate::natives::erts_debug::after_message_queue_change(self);
@@ -340,7 +394,6 @@ impl Process {
         // The end of the message queue before this call: erts moves the handled part of the
         // middle queue there only when it stops, so `stretch_limit` looks at what precedes.
         let msgq_end = self.inbox.entries.last_field();
-        let queued = self.inbox.len();
         let mut cnt = 0_i32;
         let mut yield_ = false;
         let mut handled = false;
@@ -421,7 +474,11 @@ impl Process {
             if !node.is_lazy() && !matches!(node.payload, Payload::Signal(_)) {
                 // ERTS_SIG_Q_OP_ALTACT_MSG: a priority message enters the priority queue.
                 match self.move_message(ctx, node) {
-                    Ok(()) => {
+                    Ok(delivered) => {
+                        if delivered {
+                            // erl_proc_sig_queue.c:6219 (handle_altact_msg).
+                            Self::erts_proc_notify_new_message(ctx);
+                        }
                         cnt += 1;
                         continue;
                     }
@@ -536,17 +593,10 @@ impl Process {
         if state & (arinsal_sched::psflg::SIG_Q | arinsal_sched::psflg::SIG_IN_Q) == 0 {
             ctx.clear_maybe_self_sigs();
         }
-        // A signal converted into a message (an exit or monitor down for a process trapping
-        // them, a reply) makes the process active, so a process scheduled for its signals
-        // alone (ERTS_PSFLG_RUNNING_SYS) goes on to run the receive that takes it.
-        // Port of erts/emulator/beam/erl_proc_sig_queue.c:4790, 5058, 5115, 5257, 5910, 6219,
-        // 6957, 7153 (`erts_proc_notify_new_message(c_p, ERTS_PROC_LOCK_MAIN)` after each
-        // conversion: ERTS_PSFLG_ACTIVE set on the running process, no enqueue), OTP-29.1.1.
-        if self.inbox.len() > queued {
-            let state = ctx.proc_state();
-            if state.load(Ordering::Relaxed) & arinsal_sched::psflg::ACTIVE == 0 {
-                state.fetch_or(arinsal_sched::psflg::ACTIVE, Ordering::AcqRel);
-            }
+        // Port of erl_proc_sig_queue.c:7151-7153: a hibernated process with messages is
+        // made active.
+        if !self.inbox.is_empty() && self.hibernated() {
+            Self::erts_proc_notify_new_message(ctx);
         }
         let done = result?;
         crate::natives::erts_debug::after_message_queue_change(self);
@@ -756,6 +806,8 @@ impl Process {
                             // A process exit without a token converts to a message with NIL.
                             self.inbox.push_back_nil(tuple);
                         }
+                        // erl_proc_sig_queue.c:4790 (handle_exit_signal).
+                        Self::erts_proc_notify_new_message(ctx);
                         self.trace_converted_signal(ctx, tuple, sender);
                         if was_linked {
                             self.trace_getting_unlinked(ctx, sender);
@@ -825,6 +877,8 @@ impl Process {
                         } else {
                             self.inbox.push_back(tuple);
                         }
+                        // erl_proc_sig_queue.c:4790 (handle_exit_signal).
+                        Self::erts_proc_notify_new_message(ctx);
                         break 'exit Ok(1);
                     }
                     if reason != Term::atom(arinsal_term::atoms::NORMAL) {
@@ -849,6 +903,7 @@ impl Process {
                     reference,
                     Term::atom(arinsal_term::atoms::NOPROC),
                 )?;
+                self.notify_converted(ctx, queued);
                 self.trace_new_message(ctx, queued, from);
                 // convert_to_down_message (erl_proc_sig_queue.c:4838-5056).
                 8
@@ -868,6 +923,7 @@ impl Process {
                 let reason = reason.into_receiver(self)?;
                 let queued = self.inbox.len();
                 self.deliver_monitor_down(from, reference, reason)?;
+                self.notify_converted(ctx, queued);
                 self.trace_new_message(ctx, queued, from);
                 8
             }
@@ -875,6 +931,7 @@ impl Process {
                 let reason = Term::from_immed_word(reason).expect("an immediate reason");
                 let queued = self.inbox.len();
                 self.deliver_monitor_down(from, reference, reason)?;
+                self.notify_converted(ctx, queued);
                 self.trace_new_message(ctx, queued, from);
                 8
             }
@@ -883,6 +940,7 @@ impl Process {
                 // still drops it when its monitor is gone (erl_proc_sig_queue.c:6355).
                 let queued = self.inbox.len();
                 self.deliver_monitor_down_message(reference, *message)?;
+                self.notify_converted(ctx, queued);
                 self.trace_new_message(ctx, queued, from);
                 8
             }
@@ -1119,6 +1177,8 @@ impl Process {
         if convert_to_message {
             let message = crate::dist::spawn_reply_message(self, tag, data)?;
             self.inbox.push_back(message);
+            // erl_proc_sig_queue.c:5910 (handle_dist_spawn_reply).
+            Self::erts_proc_notify_new_message(ctx);
         }
         Ok(cnt)
     }
@@ -1273,6 +1333,8 @@ impl Process {
             } else {
                 self.inbox.push_back_nil(tuple);
             }
+            // erl_proc_sig_queue.c:4790 (handle_exit_signal).
+            Self::erts_proc_notify_new_message(ctx);
             self.trace_converted_signal(ctx, tuple, sender);
             if was_linked {
                 self.trace_getting_unlinked_external(ctx, from);

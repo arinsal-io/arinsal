@@ -185,8 +185,7 @@ impl ObufBlock {
         let arrays = IovArrays { iov, vlen };
         assert!(arrays.end() <= data_off && data_off <= size);
         // erts_bin_drv_alloc never fails (it aborts on out of memory).
-        let mut block = arinsal_alloc::typed::BinaryBlock::new(size, 0, size)
-            .expect("dist output buffer allocation");
+        let mut block = arinsal_alloc::typed::BinaryBlock::drv_alloc(size);
         block.bytes_mut_unique().expect("a fresh Binary is unique")[iov..arrays.end()].fill(0);
         Self {
             block: Some(block),

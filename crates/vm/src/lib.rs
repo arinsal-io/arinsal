@@ -37,6 +37,7 @@ mod exceptions;
 mod export;
 mod interp;
 mod load;
+mod module;
 mod native_bridge;
 mod proc_create;
 // ---- vm_funs ----

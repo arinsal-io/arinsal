@@ -9,6 +9,8 @@ use crate::ptab_slot::{Progress, ProgressSlot};
 use crate::sig_queue::{OwnedSignal, SignalQueue};
 use crate::thr_progress::{self, raw};
 
+mod msgq_lock;
+
 const SIGNAL_BUFFER_COUNT: usize = 64;
 const BUFFER_CONTENTION_INSTALL_LIMIT: usize = 50;
 const BUFFER_FLUSH_ROUNDS: usize = 8192;
@@ -850,9 +852,75 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
             return None;
         }
         let mut queue = self.lock_msgq();
+        self.take_all_locked(&mut queue, into, keep_in_cont)
+    }
+
+    /// The final fetch of `erts_proc_sig_receive_helper`: take the msgq lock, splice the
+    /// in-queue onto `into` as [`Self::take_all`], and when nothing was queued keep the lock
+    /// held (`ERTS_PROC_LOCKS_MSG_RECEIVE`) for the wait instruction the receive continues at,
+    /// which clears `ERTS_PSFLG_ACTIVE` under it and releases it
+    /// ([`Self::release_receive_lock`]). Returns whether the lock stays held.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:7767-7795 (erts_proc_sig_receive_helper:
+    // erts_proc_sig_queue_lock, erts_proc_sig_fetch, "return with message queue locked"),
+    // OTP-29.1.1.
+    pub(crate) fn take_all_or_keep_locked(
+        &self,
+        into: &mut SignalQueue<T>,
+        keep_in_cont: bool,
+    ) -> (Option<raw::LaterOpArgs>, bool) {
+        debug_assert!(
+            into.is_empty(),
+            "the receive helper fetches with an empty middle queue"
+        );
+        let mut queue = self.lock_msgq();
+        let later_op = self.take_all_locked(&mut queue, into, keep_in_cont);
+        if into.is_empty() {
+            msgq_lock::keep_locked(queue);
+            return (later_op, true);
+        }
+        (later_op, false)
+    }
+
+    /// `beam_jit_take_receive_lock`: take `ERTS_PROC_LOCKS_MSG_RECEIVE` for a wait not reached
+    /// from the receive helper (`wait_unlocked`, `wait_timeout_unlocked`).
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1188-1190 (beam_jit_take_receive_lock),
+    // OTP-29.1.1.
+    pub(crate) fn take_receive_lock(&self) {
+        msgq_lock::keep_locked(self.lock_msgq());
+    }
+
+    /// Release the msgq lock the receive took (`erts_proc_unlock(c_p,
+    /// ERTS_PROC_LOCKS_MSG_RECEIVE)` in beam_jit_wait_locked, beam_jit_wait_timeout and
+    /// beam_jit_timeout_locked).
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1192-1256, OTP-29.1.1.
+    pub(crate) fn release_receive_lock(&self) {
+        msgq_lock::release_kept(&self.msgq);
+    }
+
+    /// A wait outside a receive (erts_hibernate): under the msgq lock, clear
+    /// `ERTS_PSFLG_ACTIVE` when no signal is queued. Returns whether it was cleared; when not,
+    /// queued signals keep the process active and its next fetch takes them.
+    // Port of erts/emulator/beam/beam_common.c:1584-1596 (erts_hibernate: `if
+    // (!erts_proc_sig_fetch(c_p)) erts_atomic32_read_band_relb(&c_p->state,
+    // ~ERTS_PSFLG_ACTIVE)` under ERTS_PROC_LOCK_MSGQ), OTP-29.1.1.
+    pub(crate) fn clear_active_unless_queued(&self) -> bool {
+        let queue = self.lock_msgq();
+        if !queue.is_empty() || self.buffered.load(Ordering::SeqCst) != 0 {
+            return false;
+        }
+        self.state.fetch_and(!psflg::ACTIVE, Ordering::Release);
+        true
+    }
+
+    fn take_all_locked(
+        &self,
+        queue: &mut parking_lot::MutexGuard<'_, SignalQueue<T>>,
+        into: &mut SignalQueue<T>,
+        keep_in_cont: bool,
+    ) -> Option<raw::LaterOpArgs> {
         let buffers = self.buffers.is_occupied();
         let later_op = buffers
-            .then(|| self.flush_buffers_locked(&mut queue, true))
+            .then(|| self.flush_buffers_locked(queue, true))
             .flatten();
         let set = if !queue.is_empty()
             && (keep_in_cont || !into.is_empty() || queue.non_messages() != 0)
@@ -861,9 +929,9 @@ impl<T: InSignal + Send + 'static> Incoming<T> {
         } else {
             0
         };
-        into.append(&mut queue);
+        into.append(queue);
         if buffers {
-            self.dequeued(&queue);
+            self.dequeued(queue);
             if set != 0 {
                 self.state.fetch_or(set, Ordering::SeqCst);
             }
@@ -952,10 +1020,7 @@ mod tests {
     }
 
     fn test_progress() -> Progress {
-        Progress(Arc::new(thr_progress::ThrProgress::new(
-            Arc::from([]),
-            Arc::from([]),
-        )))
+        Progress(Arc::new(thr_progress::ThrProgress::new(0)))
     }
 
     impl InSignal for i32 {

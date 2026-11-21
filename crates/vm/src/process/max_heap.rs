@@ -39,16 +39,25 @@ impl Process {
 /// GC tracer, and returns whether the process is killed (`MAX_HEAP_SIZE_KILL`). As in erts,
 /// every collection over the limit reports: a killed process collects no more.
 // Port of erts/emulator/beam/erl_gc.c:3741-3822 (reached_max_heap_size), OTP-29.1.1.
-pub(super) fn reached_max_heap_size(process: &mut Process, limit: MaxHeap, used: u64) -> bool {
+pub(super) fn reached_max_heap_size(
+    process: &mut Process,
+    limit: MaxHeap,
+    check: arinsal_term::MaxHeapCollectionCheck,
+) -> bool {
     // `ERTS_IS_P_TRACED_FL(p, F_TRACE_GC)`.
     let traced = process
         .self_pid()
         .filter(|&pid| crate::trace::flags(process, pid) & crate::trace::GC != 0);
     if traced.is_some() || limit.log {
-        // `msg = erts_process_gc_info(p, ...)`, shared by the report and the trace event.
-        let msg = crate::natives::proc::process_gc_info(process).unwrap_or(Term::NIL);
+        // The first erts_process_gc_info pass sizes the exact term; the second builds it in
+        // ERTS_ALC_T_TMP using the proposed capacities from this collection check.
+        let (_gc_info_heap, msg) = crate::natives::proc::process_gc_info(
+            process,
+            check.extra_heap_size,
+            check.extra_old_heap_size,
+        );
         if limit.log {
-            report_max_heap(process, limit, used, msg);
+            report_max_heap(process, limit, check.total_heap_size as u64, msg);
         }
         if let Some(pid) = traced {
             // `trace_gc(p, am_gc_max_heap_size, 0, msg)` (erl_trace.c:1439): `msg` is a value,
@@ -57,82 +66,6 @@ pub(super) fn reached_max_heap_size(process: &mut Process, limit: MaxHeap, used:
         }
     }
     limit.kill
-}
-
-/// Off-heap binary words reachable from `objv` (the X register roots the caller holds), the
-/// mailbox and the dictionary.
-pub(super) fn off_heap_binary_words(process: &Process, objv: &[Term]) -> usize {
-    let mut seen = HashSet::new();
-    let mut bytes = HashMap::<usize, usize>::new();
-    let mut stack = Vec::new();
-    for term in objv.iter().copied().chain(process.inbox.iter().copied()) {
-        stack.push(term);
-    }
-    if let Some(dictionary) = &process.dictionary {
-        for (key, value) in dictionary.entries() {
-            stack.push(key);
-            stack.push(value);
-        }
-    }
-    for index in 0..process.heap.stack_words() {
-        if let Some(term) = process.heap.stack_get(index) {
-            stack.push(term);
-        }
-    }
-    while let Some(term) = stack.pop() {
-        if !term.is_pointer() {
-            continue;
-        }
-        // SAFETY: The term is a live pointer on this process heap. The bit
-        // pattern is an identity for the DAG walk, not a dereference.
-        let bits = unsafe { term.raw_bits() };
-        if !seen.insert(bits) {
-            continue;
-        }
-        // SAFETY: The owning heap stays live for this walk; no collection runs.
-        if let Some(binary) = unsafe { term.binary_ref() } {
-            if binary.bytes().len() > 64 {
-                bytes
-                    .entry(binary.bytes().as_ptr() as usize)
-                    .or_insert(binary.bytes().len());
-            }
-            continue;
-        }
-        // SAFETY: The cons cell borrows this live heap; no collection runs.
-        if let Some((head, tail)) = unsafe { term.cons_ref() } {
-            stack.push(head);
-            stack.push(tail);
-            continue;
-        }
-        // SAFETY: The tuple borrows this live heap; no collection runs.
-        if let Some(tuple) = unsafe { term.tuple_ref() } {
-            for index in 0..tuple.len() {
-                if let Some(element) = tuple.get(index) {
-                    stack.push(element);
-                }
-            }
-            continue;
-        }
-        // SAFETY: The map borrows this live heap; no collection runs.
-        if let Some(map) = unsafe { term.flatmap_ref() } {
-            for (key, value) in map.iter() {
-                stack.push(key);
-                stack.push(value);
-            }
-            continue;
-        }
-        // SAFETY: The fun borrows this live heap; no collection runs.
-        if let Some(fun) = unsafe { term.fun_ref() } {
-            for index in 0..fun.num_free() {
-                if let Some(value) = fun.free(index) {
-                    stack.push(value);
-                }
-            }
-        }
-    }
-    bytes
-        .values()
-        .fold(0, |sum, len| sum.saturating_add(len.div_ceil(8)))
 }
 
 // g_proc_sched. Port of erl_gc.c:3756 (error_logger report in `reached_max_heap_size`),
@@ -165,34 +98,28 @@ fn report_max_heap(process: &mut Process, limit: MaxHeap, used: u64, gc_info: Te
             arinsal_term::atoms::FALSE
         })
     };
-    // `erts_build_stacktrace(&hfact, p, 0, erts_backtrace_depth, 1)`.
+    // `erts_factory_tmp_init` holds both the stacktrace and logger arguments in ERTS_ALC_T_TMP.
     let depth = crate::erl_init::erts_backtrace_depth();
-    let stacktrace = crate::stacktrace::build(process, depth).unwrap_or(Term::NIL);
-    let built = (|| -> Result<Term, VmError> {
-        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut builder = TermBuilder::new(&mut heap);
-        let mut args = vec![pid];
-        if let Some(node_name) = node_name {
-            args.push(Term::atom(
-                arinsal_term::global_atoms()
-                    .intern(&node_name)
-                    .map_err(|error| VmError::Unsupported(format!("node atom: {error:?}")))?,
-            ));
-        }
-        args.extend([
-            Term::small(limit.size as i64).unwrap_or(Term::NIL),
-            Term::small(used as i64).unwrap_or(Term::NIL),
-            bool_atom(limit.kill),
-            Term::atom(arinsal_term::atoms::TRUE),
-            Term::small(process.inbox.len() as i64).unwrap_or(Term::NIL),
-            gc_info,
-            stacktrace,
-        ]);
-        builder
-            .list_from_iter(args)
-            .map_err(|error| VmError::Unsupported(format!("logger args: {error:?}")))
-    })();
-    if let Ok(args) = built {
-        crate::utils::send_error_term_to_logger(runtime, self_pid, group_leader, &format, args);
+    let (mut heap, stacktrace) = crate::stacktrace::build_tmp(process, depth)
+        .expect("erts_build_stacktrace in temporary factory");
+    let mut args = vec![pid];
+    if let Some(node_name) = node_name {
+        let node = arinsal_term::global_atoms()
+            .intern(&node_name)
+            .expect("erts_this_node system name atom");
+        args.push(Term::atom(node));
     }
+    args.extend([
+        Term::small(limit.size as i64).expect("max_heap_size fits a small integer"),
+        Term::small(used as i64).expect("total heap size fits a small integer"),
+        bool_atom(limit.kill),
+        Term::atom(arinsal_term::atoms::TRUE),
+        Term::small(process.inbox.len() as i64).expect("message queue length fits a small integer"),
+        gc_info,
+        stacktrace,
+    ]);
+    let args = TermBuilder::new(&mut heap)
+        .list_from_iter(args)
+        .expect("erts_produce_heap logger arguments");
+    crate::utils::send_error_term_to_logger(runtime, self_pid, group_leader, &format, args);
 }

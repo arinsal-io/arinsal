@@ -4992,7 +4992,7 @@ fn rbuf_stage(inner: &mut Inner, extra: usize) -> bool {
         let Some(needed) = end.checked_add(extra) else {
             return false;
         };
-        return needed <= bin.len() || bin.realloc(needed).is_ok();
+        return needed <= bin.len() || bin.realloc_fnf(needed);
     }
     // tcp_recv starts with alloc_buffer(desc->inet.bufsz), then tcp_expand_buffer keeps
     // the used prefix and grows that allocation when packet_parser knows the frame size.
@@ -5001,7 +5001,7 @@ fn rbuf_stage(inner: &mut Inner, extra: usize) -> bool {
     } else {
         total
     };
-    let Ok(mut bin) = arinsal_term::RefcBinary::new_uninit(initial) else {
+    let Some(mut bin) = arinsal_term::RefcBinary::drv_alloc_fnf(initial) else {
         return false;
     };
     let Some(buf) = bin.bytes_mut_unique() else {

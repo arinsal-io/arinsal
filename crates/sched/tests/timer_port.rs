@@ -24,7 +24,7 @@ impl Task for Sink {
                 }
             }
             {
-                let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
+                let _ = ctx.clear_active_unless_queued();
             }
         })
     }
@@ -318,7 +318,7 @@ impl Task for Victim {
                 };
             }
             {
-                let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
+                let _ = ctx.clear_active_unless_queued();
             }
         })
     }

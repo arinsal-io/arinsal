@@ -1905,16 +1905,21 @@ impl ProcessHeap {
         &self,
         min_free: usize,
         message_words: usize,
-    ) -> (usize, Option<usize>) {
+    ) -> (MaxHeapCollectionCheck, Option<MaxHeapCollectionCheck>) {
         let source_words = self.young_gen_usage() + message_words;
         let young_free = self.stop_index().saturating_sub(self.htop_index());
         if self.collection_is_major() {
-            return (self.major_max_heap_size(source_words), None);
+            return (self.major_max_heap_check(source_words), None);
         }
 
         let mature_words = self.mature_words();
-        let old_heap_capacity = if self.old_words.is_empty() && mature_words != 0 {
+        let extra_old_heap_size = if self.old_words.is_empty() && mature_words != 0 {
             next_heap_size(source_words, 1, 0)
+        } else {
+            0
+        };
+        let old_heap_capacity = if self.old_words.is_empty() {
+            extra_old_heap_size
         } else {
             self.old_words.len()
         };
@@ -1924,14 +1929,18 @@ impl ProcessHeap {
             0,
             self.min_heap_size as usize,
         );
-        let minor_size = source_words + young_free + old_heap_capacity + young_capacity;
+        let minor = MaxHeapCollectionCheck {
+            total_heap_size: source_words + young_free + old_heap_capacity + young_capacity,
+            extra_heap_size: young_capacity,
+            extra_old_heap_size,
+        };
         let major_size = self
             .minor_falls_back_to_major()
-            .then(|| self.major_max_heap_size(source_words));
-        (minor_size, major_size)
+            .then(|| self.major_max_heap_check(source_words));
+        (minor, major_size)
     }
 
-    fn major_max_heap_size(&self, source_words: usize) -> usize {
+    fn major_max_heap_check(&self, source_words: usize) -> MaxHeapCollectionCheck {
         let size_before = source_words + self.old_htop;
         let capacity = next_heap_size(
             self.stack_words() + size_before + S_RESERVED,
@@ -1944,10 +1953,14 @@ impl ProcessHeap {
             } else {
                 capacity
             };
-        size_before
-            + self.old_words.len().saturating_sub(self.old_htop)
-            + self.stop_index().saturating_sub(self.htop_index())
-            + capacity
+        MaxHeapCollectionCheck {
+            total_heap_size: size_before
+                + self.old_words.len().saturating_sub(self.old_htop)
+                + self.stop_index().saturating_sub(self.htop_index())
+                + capacity,
+            extra_heap_size: capacity,
+            extra_old_heap_size: 0,
+        }
     }
 
     /// Full sweep that leaves the young heap exactly as large as the live data,
@@ -2684,6 +2697,18 @@ pub struct GcInfoWords {
     pub old_heap_size: usize,
     /// Used young-heap words.
     pub heap_size: usize,
+}
+
+/// Heap size and proposed block sizes at one max-heap-size check.
+// Port of the arguments at erl_gc.c:1454-1455 and :1903-1904 (`reached_max_heap_size`), OTP-29.1.1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaxHeapCollectionCheck {
+    /// Current and proposed heap capacity counted by `has_reached_max_heap_size`.
+    pub total_heap_size: usize,
+    /// Proposed young heap capacity added to `heap_block_size` in GC info.
+    pub extra_heap_size: usize,
+    /// Proposed old heap capacity added to `old_heap_block_size` in GC info.
+    pub extra_old_heap_size: usize,
 }
 
 /// Address index over a heap's fragments for repeated ownership queries.

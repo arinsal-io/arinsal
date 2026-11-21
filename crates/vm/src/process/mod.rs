@@ -16,7 +16,6 @@ use arinsal_term::{
     Atom, ProcessHeap, SharedCopyCache, Term, TermBuilder, VecHeap, copy_struct_litopt, copy_term,
     copy_term_preserving_sharing_with_cache, global_atoms, size_object,
 };
-use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 

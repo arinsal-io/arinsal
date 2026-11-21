@@ -2,6 +2,18 @@
 
 use super::*;
 
+const OTP_OPT_DEBUG: i32 = 1001;
+const OTP_OPT_IOW: i32 = 1002;
+const OTP_OPT_CTRL_PROC: i32 = 1003;
+const OTP_OPT_RCVBUF: i32 = 1004;
+const OTP_OPT_RCVCTRLBUF: i32 = 1006;
+const OTP_OPT_SNDCTRLBUF: i32 = 1007;
+const OTP_OPT_FD: i32 = 1008;
+const OTP_OPT_META: i32 = 1009;
+const OTP_OPT_USE_REGISTRY: i32 = 1010;
+const OTP_OPT_SELECT_READ: i32 = 1011;
+const OTP_OPT_DOMAIN: i32 = 1999;
+
 /// How the value of a native option is encoded. The names are `esock_setopt_bool_opt`
 /// and friends.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -245,73 +257,82 @@ pub(super) fn option(args: &[O], set: bool) -> Result<O, BifError> {
 }
 
 fn setopt_otp(h: &Sock, opt: i32, value: &O) -> Result<O, BifError> {
-    let mut st = h.state.lock().unwrap();
-    let flag_option = |st: &State, open_state: u32, opt: i32| -> Option<O> {
-        let _ = st;
-        if !state_bits::is_open(open_state) {
-            return Some(error("closed"));
-        }
-        match decode_bool(value) {
-            Some(flag) => {
-                h.otp_options.lock().unwrap().insert(opt, bool_atom(flag));
-                None
-            }
-            None => Some(invalid_value()),
-        }
-    };
+    let mut st = h.lock_both();
     match opt {
         OTP_OPT_DEBUG | OTP_OPT_IOW => {
-            let state = st.write_state;
-            Ok(flag_option(&st, state, opt).unwrap_or_else(|| atom("ok")))
+            if !state_bits::is_open(st.write_state()) {
+                return Ok(error("closed"));
+            }
+            Ok(match decode_bool(value) {
+                Some(flag) => {
+                    if opt == OTP_OPT_DEBUG {
+                        st.set_dbg(flag);
+                    } else {
+                        st.set_iow(flag);
+                    }
+                    atom("ok")
+                }
+                None => invalid_value(),
+            })
         }
         OTP_OPT_SELECT_READ => {
-            let state = st.read_state;
-            Ok(flag_option(&st, state, opt).unwrap_or_else(|| atom("ok")))
+            if !state_bits::is_open(st.read_state()) {
+                return Ok(error("closed"));
+            }
+            Ok(match decode_bool(value) {
+                Some(flag) => {
+                    st.set_select_read(flag);
+                    atom("ok")
+                }
+                None => invalid_value(),
+            })
         }
         OTP_OPT_CTRL_PROC => Ok(setopt_otp_ctrl_proc(h, &mut st, value)),
-        OTP_OPT_RCVBUF => Ok(setopt_otp_rcvbuf(h, &st, value)),
+        OTP_OPT_RCVBUF => Ok(setopt_otp_rcvbuf(&mut st, value)),
         OTP_OPT_RCVCTRLBUF | OTP_OPT_SNDCTRLBUF => {
             let (state, default) = if opt == OTP_OPT_RCVCTRLBUF {
-                (st.read_state, RECV_CTRL_BUFFER_SIZE_DEFAULT)
+                (st.read_state(), RECV_CTRL_BUFFER_SIZE_DEFAULT as i64)
             } else {
-                (st.write_state, SEND_CTRL_BUFFER_SIZE_DEFAULT)
+                (st.write_state(), SEND_CTRL_BUFFER_SIZE_DEFAULT as i64)
             };
             if !state_bits::is_open(state) {
                 return Ok(error("closed"));
             }
             Ok(match decode_bufsz(value, default) {
                 Some(size) => {
-                    h.otp_options.lock().unwrap().insert(opt, O::Int(size));
+                    if opt == OTP_OPT_RCVCTRLBUF {
+                        st.set_r_ctrl_sz(size as usize);
+                    } else {
+                        st.set_w_ctrl_sz(size as usize);
+                    }
                     atom("ok")
                 }
                 None => invalid_value(),
             })
         }
         OTP_OPT_META => {
-            if !state_bits::is_open(st.write_state) {
+            if !state_bits::is_open(st.write_state()) {
                 return Ok(error("closed"));
             }
             let Some(me) = self_pid() else {
                 return Err(BifError::BADARG);
             };
-            if h.owner.lock().unwrap().as_ref() != Some(&me) {
+            if st.ctrl_pid().as_ref() != Some(&me) {
                 return Ok(error_invalid("not_owner"));
             }
-            h.otp_options.lock().unwrap().insert(opt, value.clone());
+            st.set_meta(Some(value));
             Ok(atom("ok"))
         }
         OTP_OPT_USE_REGISTRY => {
-            if !state_bits::is_open(st.write_state) {
+            if !state_bits::is_open(st.write_state()) {
                 return Ok(error("closed"));
             }
             if decode_bool(value) != Some(true) {
                 return Ok(invalid_value());
             }
-            if !use_reg(h) {
-                h.otp_options
-                    .lock()
-                    .unwrap()
-                    .insert(OTP_OPT_USE_REGISTRY, atom("true"));
+            if !st.use_reg() {
+                st.set_use_reg(true);
+                drop(st);
                 send_reg_msg("add", h);
             }
             Ok(atom("ok"))
@@ -323,13 +344,13 @@ fn setopt_otp(h: &Sock, opt: i32, value: &O) -> Result<O, BifError> {
 /// `esock_setopt_otp_ctrl_proc`: the owner hands the socket to a new controlling
 /// process and the controlling process monitor moves with it.
 fn setopt_otp_ctrl_proc(h: &Sock, st: &mut State, value: &O) -> O {
-    if !state_bits::is_open(st.write_state) {
+    if !state_bits::is_open(st.write_state()) {
         return error("closed");
     }
     let Some(me) = self_pid() else {
         return error("closed");
     };
-    if h.owner.lock().unwrap().as_ref() != Some(&me) {
+    if st.ctrl_pid().as_ref() != Some(&me) {
         return error_invalid("not_owner");
     }
     let O::Pid { node, .. } = value else {
@@ -338,27 +359,26 @@ fn setopt_otp_ctrl_proc(h: &Sock, st: &mut State, value: &O) -> O {
     if node != "nonode@nohost" {
         return invalid_value();
     }
-    demonitor_process(h, &me, st.ctrl_mon.take());
-    *h.owner.lock().unwrap() = Some(value.clone());
+    demonitor_process(h, &me, st.take_ctrl_mon());
+    st.set_ctrl_pid(Some(value));
     match monitor_process(h, value) {
-        Some(monitor) => st.ctrl_mon = Some(monitor),
+        Some(monitor) => st.set_ctrl_mon(Some(monitor)),
         None => {
-            *h.owner.lock().unwrap() = None;
-            let mut guard = h.socket.lock().unwrap();
-            lifecycle::down_ctrl(h, &mut guard, st);
-            st.read_state |= state_bits::CLOSING;
-            st.write_state |= state_bits::CLOSING;
+            st.set_ctrl_pid(None);
+            lifecycle::down_ctrl(h, st);
+            st.or_read_state(state_bits::CLOSING);
+            st.or_write_state(state_bits::CLOSING);
         }
     }
     atom("ok")
 }
 
 /// `esock_setopt_otp_rcvbuf`: `default | pos_integer() | {N, default | pos_integer()}`.
-fn setopt_otp_rcvbuf(h: &Handle, st: &State, value: &O) -> O {
-    if !state_bits::is_open(st.read_state) {
+fn setopt_otp_rcvbuf(st: &mut State, value: &O) -> O {
+    if !state_bits::is_open(st.read_state()) {
         return error("closed");
     }
-    let (num, size) = match decode_bufsz(value, RECV_BUFFER_SIZE_DEFAULT) {
+    let (num, size) = match decode_bufsz(value, RECV_BUFFER_SIZE_DEFAULT as i64) {
         Some(size) => (0, size),
         None => {
             let O::Tuple(parts) = value else {
@@ -369,60 +389,39 @@ fn setopt_otp_rcvbuf(h: &Handle, st: &State, value: &O) -> O {
             };
             let (Some(num), Some(size)) = (
                 u32::try_from(*num).ok().filter(|num| *num > 0),
-                decode_bufsz(size, RECV_BUFFER_SIZE_DEFAULT),
+                decode_bufsz(size, RECV_BUFFER_SIZE_DEFAULT as i64),
             ) else {
                 return invalid_value();
             };
             (num, size)
         }
     };
-    let stored = if num == 0 {
-        O::Int(size)
-    } else {
-        pair(O::Int(num.into()), O::Int(size))
-    };
-    h.otp_options.lock().unwrap().insert(OTP_OPT_RCVBUF, stored);
+    st.set_r_num(num);
+    st.set_r_buf_sz(size as usize);
     atom("ok")
 }
 
 fn getopt_otp(h: &Handle, opt: i32) -> Result<O, BifError> {
-    let st = h.state.lock().unwrap();
-    let options = h.otp_options.lock().unwrap();
-    let flag = |opt: i32| options.get(&opt).cloned().unwrap_or_else(|| atom("false"));
-    let open_read = state_bits::is_open(st.read_state);
-    let open_write = state_bits::is_open(st.write_state);
+    let st = h.lock_both();
+    let open_read = state_bits::is_open(st.read_state());
+    let open_write = state_bits::is_open(st.write_state());
+    let rcvbuf = if st.r_num() == 0 {
+        O::Int(st.r_buf_sz() as i64)
+    } else {
+        pair(O::Int(st.r_num().into()), O::Int(st.r_buf_sz() as i64))
+    };
     let value = match opt {
-        OTP_OPT_DEBUG | OTP_OPT_IOW | OTP_OPT_SELECT_READ if open_read => flag(opt),
-        OTP_OPT_CTRL_PROC if open_read => h
-            .owner
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or_else(|| atom("undefined")),
-        OTP_OPT_RCVBUF if open_read => options
-            .get(&opt)
-            .cloned()
-            .unwrap_or(O::Int(RECV_BUFFER_SIZE_DEFAULT)),
-        OTP_OPT_RCVCTRLBUF if open_read => options
-            .get(&opt)
-            .cloned()
-            .unwrap_or(O::Int(RECV_CTRL_BUFFER_SIZE_DEFAULT)),
-        OTP_OPT_SNDCTRLBUF if open_write => options
-            .get(&opt)
-            .cloned()
-            .unwrap_or(O::Int(SEND_CTRL_BUFFER_SIZE_DEFAULT)),
-        OTP_OPT_FD if open_read => {
-            drop(options);
-            let guard = h.socket.lock().unwrap();
-            let fd = guard.as_ref().map_or(-1, AsRawFd::as_raw_fd);
-            return Ok(ok(O::Int(fd.into())));
-        }
-        OTP_OPT_META if open_write => options
-            .get(&opt)
-            .cloned()
-            .unwrap_or_else(|| atom("undefined")),
-        OTP_OPT_USE_REGISTRY => options.get(&opt).cloned().unwrap_or_else(|| atom("false")),
-        OTP_OPT_DOMAIN if open_read => atom(h.domain),
+        OTP_OPT_DEBUG if open_read => bool_atom(st.dbg()),
+        OTP_OPT_IOW if open_read => bool_atom(st.iow()),
+        OTP_OPT_SELECT_READ if open_read => bool_atom(st.select_read()),
+        OTP_OPT_CTRL_PROC if open_read => st.ctrl_pid().unwrap_or_else(|| atom("undefined")),
+        OTP_OPT_RCVBUF if open_read => rcvbuf,
+        OTP_OPT_RCVCTRLBUF if open_read => O::Int(st.r_ctrl_sz() as i64),
+        OTP_OPT_SNDCTRLBUF if open_write => O::Int(st.w_ctrl_sz() as i64),
+        OTP_OPT_FD if open_read => return Ok(ok(O::Int(st.sock().unwrap_or(-1).into()))),
+        OTP_OPT_META if open_write => st.meta().unwrap_or_else(|| atom("undefined")),
+        OTP_OPT_USE_REGISTRY => bool_atom(st.use_reg()),
+        OTP_OPT_DOMAIN if open_read => atom(h.domain_name()),
         OTP_OPT_DEBUG | OTP_OPT_IOW | OTP_OPT_SELECT_READ | OTP_OPT_CTRL_PROC | OTP_OPT_RCVBUF
         | OTP_OPT_RCVCTRLBUF | OTP_OPT_SNDCTRLBUF | OTP_OPT_FD | OTP_OPT_META | OTP_OPT_DOMAIN => {
             return Ok(error("closed"));
@@ -461,15 +460,10 @@ fn getsockopt_bytes(fd: i32, level: i32, opt: i32, size: usize) -> Result<Vec<u8
 }
 
 fn setopt(h: &Sock, level: i32, opt: i32, value: &O, native: bool) -> Result<O, BifError> {
-    let guard = h.socket.lock().unwrap();
-    let st = h.state.lock().unwrap();
-    let Some(s) = guard.as_ref() else {
+    let st = h.lock_write();
+    let Some(fd) = st.open_sock(st.write_state()) else {
         return Ok(error("closed"));
     };
-    if !state_bits::is_open(st.write_state) {
-        return Ok(error("closed"));
-    }
-    let fd = s.as_raw_fd();
     if native {
         let bytes = match value {
             O::Binary(bytes) => bytes.clone(),
@@ -533,15 +527,10 @@ fn encode_linger(onoff: i32, linger: i32) -> Vec<u8> {
 
 /// `args` is the rest of the getopt arguments: nothing, or the kind and its value.
 fn getopt(h: &Handle, level: i32, opt: i32, args: &[O]) -> Result<O, BifError> {
-    let guard = h.socket.lock().unwrap();
-    let st = h.state.lock().unwrap();
-    let Some(s) = guard.as_ref() else {
+    let st = h.lock_read();
+    let Some(fd) = st.open_sock(st.read_state()) else {
         return Ok(error("closed"));
     };
-    if !state_bits::is_open(st.read_state) {
-        return Ok(error("closed"));
-    }
-    let fd = s.as_raw_fd();
     if args.len() == 2 && name(&args[0]) == Some("native") {
         let size = match &args[1] {
             O::Int(n) if *n > 0 && *n <= 65536 => *n as usize,
@@ -617,31 +606,22 @@ fn state_atoms(state: u32) -> O {
 
 pub(super) fn info(value: &O) -> Result<O, BifError> {
     let h = handle(value)?;
-    let st = h.state.lock().unwrap();
-    let owner = h
-        .owner
-        .lock()
-        .unwrap()
-        .clone()
-        .unwrap_or_else(|| atom("undefined"));
-    let requests = |current: &Option<Requestor>, queue: &VecDeque<Requestor>| {
-        O::Int((queue.len() + usize::from(current.is_some())) as i64)
-    };
+    let st = h.lock_both();
+    let owner = st.ctrl_pid().unwrap_or_else(|| atom("undefined"));
+    let requests =
+        |kind: Kind| O::Int((st.queue_len(kind) + usize::from(st.current(kind).is_some())) as i64);
     Ok(map(&[
-        ("domain", atom(h.domain)),
-        ("type", atom(h.kind)),
+        ("domain", atom(h.domain_name())),
+        ("type", atom(h.type_name())),
         ("protocol", O::Int(h.protocol.into())),
         ("owner", owner),
-        ("counters", h.counters.lock().unwrap().term()),
-        ("ctype", h.ctype.clone()),
-        ("rstates", state_atoms(st.read_state)),
-        ("wstates", state_atoms(st.write_state)),
-        ("num_readers", requests(&st.current_reader, &st.readers_q)),
-        ("num_writers", requests(&st.current_writer, &st.writers_q)),
-        (
-            "num_acceptors",
-            requests(&st.current_acceptor, &st.acceptors_q),
-        ),
+        ("counters", st.counters_term()),
+        ("ctype", h.ctype()),
+        ("rstates", state_atoms(st.read_state())),
+        ("wstates", state_atoms(st.write_state())),
+        ("num_readers", requests(Kind::Reader)),
+        ("num_writers", requests(Kind::Writer)),
+        ("num_acceptors", requests(Kind::Acceptor)),
     ]))
 }
 

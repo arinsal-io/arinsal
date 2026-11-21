@@ -43,14 +43,11 @@ pub use atom::{
     IndexInfo, atoms, global_atoms, set_atom_table_limit,
 };
 pub use bits::{
-    BinaryOwner, ExternalBinary, PreparedWritableAppend, PrivateAppendUpdate, RefcBinary,
-    SUB_BITS_MUTABLE, SUB_BITS_VOLATILE, WritableBinary, binary_memory_bytes,
-    binary_offset_adjustment, binary_owner, erts_bs_private_append_checked,
-    erts_bs_private_append_checked_with_heap, erts_bs_private_append_checked_with_update,
-    erts_bs_private_append_fast, erts_bs_private_append_fast_with_update, external_binary_magic,
-    is_match_context, is_writable_binary, match_position, set_match_position, sub_bits_flags,
-    writable_bytes_mut, writable_capacity, writable_extend_private, writable_finalize,
-    writable_gc_visit, writable_resize_private,
+    BinaryOwner, ExternalBinary, PreparedWritableAppend, RefcBinary, SUB_BITS_MUTABLE,
+    SUB_BITS_VOLATILE, WritableBinary, binary_memory_bytes, binary_offset_adjustment, binary_owner,
+    external_binary_magic, is_match_context, is_writable_binary, match_position,
+    set_match_position, sub_bits_flags, writable_bytes_mut, writable_capacity,
+    writable_extend_private, writable_finalize, writable_gc_visit, writable_resize_private,
 };
 pub use copy::{
     SharedCopyCache, copy_ets_element, copy_flat_tuple, copy_shallow, copy_shared, copy_struct,
@@ -66,8 +63,8 @@ pub use fun::{
     set_export_stub_hook, set_fun_dispatch_fragments, set_fun_entry_stub_hook,
 };
 pub use gc::{
-    FragmentAlloc, FragmentIndex, GcMessageQueue, GcRootSet, GcStats, erts_next_heap_size,
-    normalize_heap_minimum, set_gc_clock_for_long_gc, spawned_heap_words,
+    FragmentAlloc, FragmentIndex, GcMessageQueue, GcRootSet, GcStats, MaxHeapCollectionCheck,
+    erts_next_heap_size, normalize_heap_minimum, set_gc_clock_for_long_gc, spawned_heap_words,
 };
 pub use global_literals::{
     GlobalLiteralBuild, global_dflags_record, global_empty_tuple, global_erl_file_suffix,
@@ -94,7 +91,8 @@ pub use heap::{
     ConsListBuilder, FrameLayout, HAllocReservation, HeapAlloc, HeapBinaryWriter, HeapBlockBuilder,
     HeapFactory, HeapFactoryMark, HeapReservation, HeapReservationState, HeapTermSlot, LiteralArea,
     MfaLocation, NativeAbi, ProcessHeap, S_REDZONE, S_RESERVED, StackWord, TemporaryHeap,
-    TermBuilder, Tuple3Chain, TupleBuilder, VecHeap, flat_key_cmp, pflags,
+    TemporaryHeapFactory, TemporaryTermBuffer, TermBuilder, Tuple3Chain, TupleBuilder, VecHeap,
+    flat_key_cmp, pflags,
 };
 pub use identity::Identity;
 pub use internal_hash::{immediate_internal_hash, internal_hash, internal_salted_hash};

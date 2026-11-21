@@ -441,7 +441,11 @@ impl CodeIndexes {
             crate::natives::code::erts_purge_state().wait_for_stage_permission();
         };
         if !nested {
-            let copy = CodeTables::clone(&self.active_tables());
+            let mut copy = CodeTables::clone(&self.active_tables());
+            // Port of erts/emulator/beam/module.c:270-308 (`copy_module` /
+            // `module_start_staging`), OTP-29.1.1: each code index has its own `Module`
+            // objects; `curr` / `old` / `on_load` are copied from active onto them.
+            copy.loaded = copy.loaded.unique();
             copy.stage_fun_entries(self.active(), self.staging());
             crate::export::export_start_staging(&copy, self.active(), self.staging());
             self.lock_permission().work = Some(copy);
@@ -1177,19 +1181,19 @@ mod tests {
         let before = code.active_tables();
         let (active, staging_ix) = (code.active(), code.staging());
         code.update_active(|tables| {
-            tables.old.insert("purged_mod".into(), 4);
+            tables.loaded.set_old("purged_mod", 4);
         });
         assert_eq!((code.active(), code.staging()), (active, staging_ix));
         let after = code.active_tables();
-        assert_eq!(after.old.get("purged_mod"), Some(&4));
+        assert_eq!(after.loaded.old("purged_mod"), Some(4));
         assert_ne!(after.generation, before.generation);
         // Inside a staging area the update lands in the staging tables.
         let staging = code.start_staging();
         code.update_active(|tables| {
-            tables.old.insert("staged_purge".into(), 5);
+            tables.loaded.set_old("staged_purge", 5);
         });
-        assert!(!code.active_tables().old.contains_key("staged_purge"));
+        assert!(!code.active_tables().loaded.has_old("staged_purge"));
         drop(staging);
-        assert_eq!(code.active_tables().old.get("staged_purge"), Some(&5));
+        assert_eq!(code.active_tables().loaded.old("staged_purge"), Some(5));
     }
 }

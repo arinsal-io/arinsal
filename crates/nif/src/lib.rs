@@ -24,8 +24,8 @@ pub use res_monitor::{
     DownFn, MonitorsOf, ResourceMonitor, ResourceMonitorCount, ResourceMonitors,
 };
 pub use resources::{
-    LibraryRefs, enif_keep_resource, enif_release_resource, resource_down, resource_stop,
-    resource_stop_data, resource_type_name,
+    LibraryRefs, enif_keep_resource, enif_release_resource, resource_down,
+    resource_magic_orig_size, resource_stop, resource_stop_data, resource_type_name,
 };
 
 // C ABI entry points implemented by shim.c and resolved by dynamically loaded NIFs.

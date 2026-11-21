@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::code_ix::{code_tables, erts_active_code_ix};
+use crate::module::ModuleIndex;
 use arinsal_term::{Atom, FunEntry, global_atoms};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 
@@ -11,6 +12,14 @@ pub(crate) struct SharedTable<T: Clone>(Arc<T>);
 impl<T: Clone> SharedTable<T> {
     fn new(value: T) -> Self {
         Self(Arc::new(value))
+    }
+
+    /// A distinct `T` with the same contents. `module_start_staging`'s `copy_module` copies
+    /// `curr` / `old` / `on_load` onto new `Module` objects of the staging index; sharing the
+    /// `IndexTable` with the active index would let a staging `curr`/`old` write land in
+    /// `erts_get_module(..., erts_active_code_ix())` before commit.
+    pub(crate) fn unique(&self) -> Self {
+        Self(Arc::new((*self.0).clone()))
     }
 }
 
@@ -25,126 +34,6 @@ impl<T: Clone> std::ops::Deref for SharedTable<T> {
 impl<T: Clone> std::ops::DerefMut for SharedTable<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         Arc::make_mut(&mut self.0)
-    }
-}
-
-/// A module name usable as a [`ModuleIndex`] key: an atom, or text that is resolved to one.
-pub(crate) trait ModuleKey {
-    fn atom(&self) -> Option<Atom>;
-}
-
-impl ModuleKey for Atom {
-    fn atom(&self) -> Option<Atom> {
-        Some(*self)
-    }
-}
-
-impl ModuleKey for str {
-    fn atom(&self) -> Option<Atom> {
-        global_atoms().get(self)
-    }
-}
-
-impl ModuleKey for String {
-    fn atom(&self) -> Option<Atom> {
-        self.as_str().atom()
-    }
-}
-
-impl<K: ModuleKey + ?Sized> ModuleKey for &K {
-    fn atom(&self) -> Option<Atom> {
-        (**self).atom()
-    }
-}
-
-/// `MODULE_LIMIT` (module.c): IndexTable cap for `module_code`.
-const MODULE_LIMIT: usize = 64 * 1024;
-
-/// One `IndexSlot` of `module_tables[ix]`: the module atom and its current instance.
-/// Old code stays in [`CodeTables::old`] until purge, as `Module.old`.
-// Port of erts/emulator/beam/module.h (`Module`), OTP-29.1.1.
-#[derive(Clone, Copy)]
-pub(crate) struct ModuleTableEntry {
-    /// `Module.module` (atom).
-    pub(crate) module: Atom,
-    /// Current code instance (`Module.curr`); `None` when `curr.code_length == 0`.
-    pub(crate) curr: Option<usize>,
-}
-
-/// `module_tables[ix]`: hash lookup by module atom plus a sequential index assigned at first
-/// `erts_put_module`. `erlang:loaded/0` walks `module_code(i)` for `i` in `0..entries`.
-/// Entries are never reused except when abort drops an uncommitted staging copy
-/// (`index_erase_latest_from`).
-// Port of erts/emulator/beam/module.c:47 (`module_tables`), `erts_put_module` /
-// `module_code` / `module_code_size`, and erts/emulator/beam/index.c (`IndexTable`),
-// OTP-29.1.1.
-#[derive(Clone, Default)]
-pub(crate) struct ModuleIndex {
-    /// Hash: module atom → table index (`index_get` / `erts_get_module`).
-    by_atom: HashMap<Atom, usize, std::hash::BuildHasherDefault<crate::process::IdHasher>>,
-    /// `seg_table` / `module_code(i)`: creation order. Index 0 is the first `erts_put_module`.
-    slots: Vec<ModuleTableEntry>,
-}
-
-impl ModuleIndex {
-    /// Current-code instance id (`erts_get_module` then `modp->curr`).
-    pub(crate) fn get<K: ModuleKey + ?Sized>(&self, key: &K) -> Option<&usize> {
-        let atom = key.atom()?;
-        let &ix = self.by_atom.get(&atom)?;
-        self.slots.get(ix)?.curr.as_ref()
-    }
-
-    /// Whether the module has current code (`module_loaded` / `curr.code_hdr != NULL`).
-    pub(crate) fn contains_key<K: ModuleKey + ?Sized>(&self, key: &K) -> bool {
-        self.get(key).is_some()
-    }
-
-    /// Port of module.c `put_module` / `erts_put_module` and index.c `index_put_entry`.
-    /// First insert of a name gets `entries`; a later put returns the same index.
-    pub(crate) fn put_module(&mut self, name: &str) -> Option<usize> {
-        let atom = global_atoms().intern(name).ok()?;
-        if let Some(&ix) = self.by_atom.get(&atom) {
-            return Some(ix);
-        }
-        let ix = self.slots.len();
-        if ix >= MODULE_LIMIT {
-            // Port of index.c:89 (`erts_exit(ERTS_DUMP_EXIT, "no more index entries in %s")`).
-            panic!("no more index entries in module_code (max={MODULE_LIMIT})");
-        }
-        self.slots.push(ModuleTableEntry {
-            module: atom,
-            curr: None,
-        });
-        self.by_atom.insert(atom, ix);
-        Some(ix)
-    }
-
-    /// Makes `id` the current instance (`make_current` / `modp->curr`). Puts the module first.
-    pub(crate) fn insert(&mut self, name: &str, id: usize) -> Option<usize> {
-        let ix = self.put_module(name)?;
-        self.slots[ix].curr.replace(id)
-    }
-
-    /// Clears current code without dropping the table slot (delete_module: curr → old).
-    pub(crate) fn remove<K: ModuleKey + ?Sized>(&mut self, key: &K) -> Option<usize> {
-        let atom = key.atom()?;
-        let &ix = self.by_atom.get(&atom)?;
-        self.slots.get_mut(ix)?.curr.take()
-    }
-
-    /// Port of module.c `module_code_size` (`module_tables[ix].entries`).
-    pub(crate) fn code_size(&self) -> usize {
-        self.slots.len()
-    }
-
-    /// Port of module.c `module_code(i, code_ix)`.
-    pub(crate) fn module_code(&self, i: usize) -> Option<&ModuleTableEntry> {
-        self.slots.get(i)
-    }
-
-    /// Current-code instance ids (`modp->curr` for every slot with code).
-    pub(crate) fn values(&self) -> impl Iterator<Item = &usize> {
-        self.slots.iter().filter_map(|entry| entry.curr.as_ref())
     }
 }
 
@@ -207,9 +96,8 @@ pub(crate) struct CodeTables {
     /// The published version of these tables; see [`crate::code_ix::next_generation`].
     pub(crate) generation: u64,
     pub(crate) modules: SharedTable<Vec<Arc<Module>>>,
+    /// `module_tables[ix]`: one `Module` with `curr` / `old` / `on_load`.
     pub(crate) loaded: SharedTable<ModuleIndex>,
-    pub(crate) old: SharedTable<HashMap<String, usize>>,
-    pub(crate) pending_on_load: SharedTable<HashMap<String, usize>>,
     pub(crate) deleted: SharedTable<std::collections::HashSet<String>>,
     pub(crate) code_meta: SharedTable<Vec<Option<Arc<CodeMeta>>>>,
     pub(crate) loaded_nifs: SharedTable<std::collections::HashSet<String>>,
@@ -648,7 +536,8 @@ impl CodeTables {
         const ARC: usize = 2 * size_of::<usize>();
         let export_key = size_of::<(Atom, Atom, u32)>();
         let exports = &self.exports;
-        let module_table = self.modules.capacity() * size_of::<Arc<Module>>()
+        let module_table = self.loaded.table_bytes()
+            + self.modules.capacity() * size_of::<Arc<Module>>()
             + self.modules.len() * (ARC + size_of::<Module>());
         let export_table = exports.order.capacity() * export_key
             + exports.seen.capacity() * (export_key + 1)
@@ -681,9 +570,7 @@ impl CodeTables {
         Self {
             generation: crate::code_ix::next_generation(),
             modules: SharedTable::new(Vec::new()),
-            loaded: SharedTable::new(ModuleIndex::default()),
-            old: SharedTable::new(HashMap::new()),
-            pending_on_load: SharedTable::new(HashMap::new()),
+            loaded: SharedTable::new(ModuleIndex::new()),
             deleted: SharedTable::new(std::collections::HashSet::new()),
             code_meta: SharedTable::new(Vec::new()),
             loaded_nifs: SharedTable::new(std::collections::HashSet::new()),
@@ -986,7 +873,7 @@ impl Vm {
         let staging = crate::code_ix::global().start_staging();
         let mut released = None;
         staging.with(|tables| {
-            if let Some(old_id) = tables.old.remove(&name) {
+            if let Some(old_id) = tables.loaded.take_old(&name) {
                 released = tables.release(old_id);
             }
             tables.intern_fun_entries(&mut module);
@@ -1017,7 +904,7 @@ impl Vm {
         staging.with(|tables| {
             let id = tables.alloc(module, Some(meta));
             if let Some(previous) = tables.make_current(&name, id) {
-                tables.old.insert(name.clone(), previous);
+                tables.loaded.set_old(&name, previous);
             }
         });
         drop(staging);
@@ -1043,9 +930,9 @@ impl Vm {
         if let Some(&id) = code_tables(erts_active_code_ix()).loaded.get(&beam.module) {
             return Ok(id);
         }
-        if let Some(&id) = code_tables(erts_active_code_ix())
-            .pending_on_load
-            .get(&beam.module)
+        if let Some(id) = code_tables(erts_active_code_ix())
+            .loaded
+            .on_load(&beam.module)
         {
             return Ok(id);
         }
@@ -1093,9 +980,9 @@ impl Vm {
             // a module with `-on_load` is not made current; its code waits in the module's
             // on_load slot until erlang:finish_after_on_load/2 keeps it.
             if on_load {
-                tables.pending_on_load.insert(name.clone(), id);
-            } else {
-                tables.make_current(&name, id);
+                tables.loaded.set_on_load(&name, id);
+            } else if let Some(previous) = tables.make_current(&name, id) {
+                tables.loaded.set_old(&name, previous);
             }
             if let Some((requested, path)) = file {
                 tables
@@ -1143,7 +1030,7 @@ impl Vm {
             }
             names
                 .iter()
-                .filter(|name| tables.loaded.contains_key(*name) && tables.old.contains_key(*name))
+                .filter(|name| tables.loaded.contains_key(*name) && tables.loaded.has_old(*name))
                 .cloned()
                 .collect()
         });
@@ -1167,9 +1054,9 @@ impl Vm {
                 let id = tables.alloc(module, Some(meta));
                 tables.known_modules.insert(name.clone());
                 if pending {
-                    tables.pending_on_load.insert(name.clone(), id);
+                    tables.loaded.set_on_load(&name, id);
                 } else if let Some(previous) = tables.make_current(&name, id) {
-                    tables.old.insert(name.clone(), previous);
+                    tables.loaded.set_old(&name, previous);
                 }
             });
             if pending {
@@ -1457,62 +1344,5 @@ mod purge_free_tests {
         assert!(code_tables(erts_active_code_ix()).code_meta[id].is_none());
         native.unpublish();
         drop(native);
-    }
-}
-
-#[cfg(test)]
-mod module_index_tests {
-    use super::ModuleIndex;
-    use arinsal_term::global_atoms;
-
-    fn name_at(index: &ModuleIndex, i: usize) -> String {
-        global_atoms()
-            .text(index.module_code(i).expect("slot").module)
-            .expect("atom text")
-            .to_owned()
-    }
-
-    #[test]
-    fn put_module_index_is_creation_order() {
-        let mut index = ModuleIndex::default();
-        similar_asserts::assert_eq!(index.put_module("mi_first"), Some(0));
-        similar_asserts::assert_eq!(index.put_module("mi_second"), Some(1));
-        similar_asserts::assert_eq!(index.put_module("mi_first"), Some(0));
-        similar_asserts::assert_eq!(index.insert("mi_first", 11), None);
-        similar_asserts::assert_eq!(index.insert("mi_second", 22), None);
-        similar_asserts::assert_eq!(index.insert("mi_third", 33), None);
-        similar_asserts::assert_eq!(index.code_size(), 3);
-        similar_asserts::assert_eq!(name_at(&index, 0), "mi_first");
-        similar_asserts::assert_eq!(name_at(&index, 1), "mi_second");
-        similar_asserts::assert_eq!(name_at(&index, 2), "mi_third");
-        similar_asserts::assert_eq!(index.get("mi_first").copied(), Some(11));
-        similar_asserts::assert_eq!(index.remove("mi_first"), Some(11));
-        assert!(index.get("mi_first").is_none());
-        assert!(!index.contains_key("mi_first"));
-        similar_asserts::assert_eq!(index.code_size(), 3);
-        similar_asserts::assert_eq!(index.insert("mi_first", 44), None);
-        similar_asserts::assert_eq!(index.get("mi_first").copied(), Some(44));
-        similar_asserts::assert_eq!(name_at(&index, 0), "mi_first");
-        similar_asserts::assert_eq!(index.module_code(0).unwrap().curr, Some(44));
-
-        // loaded_0 CONS-walk: reverse creation order of slots that have curr or old.
-        let old = ["mi_second"];
-        let mut loaded = Vec::new();
-        for i in 0..index.code_size() {
-            let entry = index.module_code(i).unwrap();
-            let name = global_atoms().text(entry.module).unwrap();
-            if entry.curr.is_some() || old.contains(&name) {
-                loaded.push(name.to_owned());
-            }
-        }
-        loaded.reverse();
-        similar_asserts::assert_eq!(
-            loaded,
-            vec![
-                "mi_third".to_string(),
-                "mi_second".to_string(),
-                "mi_first".to_string()
-            ]
-        );
     }
 }

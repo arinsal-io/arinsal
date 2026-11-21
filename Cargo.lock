@@ -283,6 +283,7 @@ dependencies = [
  "arinsal-sched",
  "arinsal-term",
  "cc",
+ "libc",
  "libloading",
  "num-traits",
 ]

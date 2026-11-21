@@ -71,7 +71,9 @@ fn vm_call(vm: &mut arinsal_vm::Vm, function: &str, args: &[OwnedTerm]) -> CallR
     }
 }
 
-fn trim_difftest_server_frame(result: CallResult) -> CallResult {
+/// Drops the harness frame under the evaluated call: `difftest_server` on the reference node,
+/// `arinsal_eval_carrier` on the VM (both call the function from their own frame).
+fn trim_harness_frame(result: CallResult) -> CallResult {
     let CallResult::Ok(mut result) = result else {
         return result;
     };
@@ -83,7 +85,7 @@ fn trim_difftest_server_frame(result: CallResult) -> CallResult {
             !matches!(frame,
                 OwnedTerm::Tuple(fields)
                     if matches!(fields.first(), Some(OwnedTerm::Atom(module))
-                        if module == "difftest_server")
+                        if module == "difftest_server" || module == "arinsal_eval_carrier")
             )
         });
     }
@@ -115,21 +117,22 @@ fn legacy_raise_frames_and_depth_match_otp() {
         let actual = vm_call(&mut vm, function, &[]);
         similar_asserts::assert_eq!(actual, expected, "{function}");
     }
-    // RefErl::call adds its RPC frame to traces; direct VM evaluation has no such frame.
-    let expected = trim_difftest_server_frame(reference.call(
+    // RefErl::call and the VM's eval carrier each add their own frame to the trace.
+    let expected = trim_harness_frame(reference.call(
         "raise_stacktrace_differential",
         "reraise_after_bif_trap",
         &[],
     ));
-    let actual = vm
-        .eval_scheduled(
+    let actual = trim_harness_frame(
+        vm.eval_scheduled(
             "raise_stacktrace_differential",
             "reraise_after_bif_trap",
             &[],
             1,
         )
         .map(|outcome| CallResult::Ok(outcome.term))
-        .unwrap_or_else(|error| CallResult::TransportError(error.to_string()));
+        .unwrap_or_else(|error| CallResult::TransportError(error.to_string())),
+    );
     similar_asserts::assert_eq!(actual, expected, "reraise_after_bif_trap");
     for depth in [0, 1, 2, 8] {
         let args = [OwnedTerm::Int(depth)];

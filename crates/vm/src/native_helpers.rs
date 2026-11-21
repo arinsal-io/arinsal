@@ -3,7 +3,7 @@
 //! Port of erts/emulator/beam/jit/x86/instr_bif.cpp:1136 (`get_on_load_address`).
 
 use arinsal_beamasm::ProcessHeader;
-use arinsal_term::{HeapAlloc, PreparedWritableAppend, Term, TermBuilder};
+use arinsal_term::{PreparedWritableAppend, Term, TermBuilder};
 
 use crate::beamasm_integration::ExportDispatch;
 
@@ -20,7 +20,7 @@ pub extern "C" fn get_on_load_address(header: *mut ProcessHeader, module_raw: u6
         .and_then(|module| arinsal_term::global_atoms().text(module))
         .and_then(|module| {
             runtime?.with_active_code(|_, tables| {
-                let id = tables.pending_on_load.get(module).copied()?;
+                let id = tables.loaded.on_load(module)?;
                 let meta = tables.code_meta.get(id)?.as_ref()?;
                 meta.beamasm.as_ref()?.on_load_address()
             })
@@ -1350,23 +1350,29 @@ pub(crate) fn unpack_error_arglist(process: &mut crate::Process) -> (Term, Term)
 /// Supplies erts' `bif_mfa` input to `save_stacktrace`, with arguments in the live X registers.
 // Port of erts/emulator/beam/beam_common.c:899-925 (`save_stacktrace`), OTP-29.1.1.
 pub(crate) fn native_bif_top(
-    process: &crate::Process,
+    process: &mut crate::Process,
     bif_info: u64,
     registers: &[Term],
 ) -> Option<crate::stacktrace::TopFrame> {
     use crate::stacktrace::TopFrame;
     let freason = process.heap.abi.exc.freason;
-    // Port of beam_common.c `save_stacktrace` (non_bif_stacktrace): with a NULL `bif_mfa`,
-    // only a function_clause reads its MFA and arguments from `c_p->current` and the
-    // argument registers (set by `i_func_info_shared`).
-    let bif_info = if bif_info == 0
-        && freason & arinsal_beamasm::exc::EXC_INDEXBITS
-            == arinsal_term::exc::EXC_FUNCTION_CLAUSE & arinsal_beamasm::exc::EXC_INDEXBITS
-    {
-        process.heap.abi.current as usize as u64
-    } else {
-        bif_info
-    };
+    // Port of beam_common.c:1010-1026 (`save_stacktrace`, non_bif_stacktrace), OTP-29.1.1:
+    // with a NULL `bif_mfa`, a function_clause takes `s->current = c_p->current` (set by
+    // `i_func_info_shared`) and `make_arglist(c_p, reg, current->arity)`. It is not a BIF
+    // frame: `build_stacktrace` looks its location up from the function's code
+    // (`erts_codemfa_to_code(s->current)`), which `function_clause_code` supplies.
+    if bif_info == 0 && is_function_clause(freason) {
+        let (module, function, arity) =
+            crate::raw::beam_common_ffi::code_mfa(process.heap.abi.current as usize as u64)?;
+        let arity = u8::try_from(arity).ok()?;
+        let args = crate::stacktrace::make_arglist(process, registers, usize::from(arity));
+        return Some(TopFrame::CurrentArgsNoLocation {
+            module,
+            function,
+            arity,
+            args,
+        });
+    }
     if bif_info == 0 {
         let info = crate::native_hooks::from_raw(process.heap.abi.exc.fvalue);
         return (freason & arinsal_beamasm::exc::EXF_HAS_EXT_INFO != 0
@@ -1401,6 +1407,24 @@ pub(crate) fn native_bif_top(
         arity: arity as usize,
         info,
     })
+}
+
+/// `GET_EXC_INDEX(freason) == GET_EXC_INDEX(EXC_FUNCTION_CLAUSE)`.
+// Port of erts/emulator/beam/error.h (GET_EXC_INDEX), OTP-29.1.1.
+fn is_function_clause(freason: u64) -> bool {
+    freason & arinsal_beamasm::exc::EXC_INDEXBITS
+        == arinsal_term::exc::EXC_FUNCTION_CLAUSE & arinsal_beamasm::exc::EXC_INDEXBITS
+}
+
+/// `erts_codemfa_to_code(c_p->current)` for a function_clause exception: the code right after
+/// the function's `ErtsCodeMfa`, whose line entry `build_stacktrace` reports; `None` for any
+/// other exception, whose saved `pc` is the raising address.
+// Port of erts/emulator/beam/code_ix.h (erts_codemfa_to_code) and beam_common.c:1229-1233
+// (`build_stacktrace`), OTP-29.1.1.
+pub(crate) fn function_clause_code(process: &crate::Process) -> Option<usize> {
+    (is_function_clause(process.heap.abi.exc.freason) && !process.heap.abi.current.is_null()).then(
+        || process.heap.abi.current as usize + core::mem::size_of::<arinsal_term::ErtsCodeMfa>(),
+    )
 }
 
 fn native_bif_error_info(freason: u64, fvalue: u64) -> crate::stacktrace::BifErrorInfo {
@@ -2025,34 +2049,4 @@ pub(crate) fn bs_append_checked(
             0
         }
     }
-}
-
-/// Runs erts' checked private append and charges its writable-binary overhead on the process.
-// Port of erts/emulator/beam/erl_bits.c:1928-2017 (`erts_bs_private_append_checked`), OTP-29.1.1.
-pub(crate) fn bs_private_append_checked(
-    process: &mut crate::Process,
-    ebs: &mut [u64; 2],
-    bin: u64,
-    extra_bits: u64,
-) -> u64 {
-    let update = arinsal_term::erts_bs_private_append_checked_with_heap(
-        ebs.as_mut_ptr(),
-        bin,
-        extra_bits,
-        &mut process.heap,
-    );
-    if update.result != 0 && update.result != u64::MAX {
-        process.heap.update_writable_binary_overhead_at(
-            crate::native_hooks::from_raw(bin),
-            update.bin_ref,
-            update.old_size_bits,
-            update.new_size_bits,
-        );
-        process.heap.abi.fcalls = process
-            .heap
-            .abi
-            .fcalls
-            .saturating_sub((update.copied_bits / (8 * 1024)).min(i32::MAX as usize) as i32);
-    }
-    update.result
 }

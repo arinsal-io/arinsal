@@ -287,11 +287,8 @@ pub(super) fn bif_error_with_atoms(
                 // Port of erts/emulator/beam/bif.c (error_2), OTP-29.1.1: the supplied
                 // argument term is kept verbatim in the exception's stack-frame data.
                 let frame_args = Some(args[1]);
-                match args.get(2).and_then(error_info_option) {
-                    Some(info) => Some(stacktrace::TopFrame::CurrentArgsWithInfo(
-                        frame_args,
-                        Box::new(info),
-                    )),
+                match args.get(2).and_then(|options| error_info_term(*options)) {
+                    Some(info) => Some(stacktrace::TopFrame::CurrentArgsInfoTerm(frame_args, info)),
                     None => frame_args.map(stacktrace::TopFrame::CurrentArgs),
                 }
             } else {
@@ -342,37 +339,7 @@ pub(super) fn bif_error_with_atoms(
     }
 }
 
-// Port of erts/emulator/beam/bif.c:1464-1499 (error_3 option validation), OTP-29.1.1.
-pub(crate) fn error_info_option(options: &Term) -> Option<OwnedTerm> {
-    let owned = to_owned(*options).ok()?;
-    let OwnedTerm::List { elems, tail } = &owned else {
-        return None;
-    };
-    if **tail != OwnedTerm::Nil {
-        return None;
-    }
-    if elems.is_empty() {
-        return None;
-    }
-    let mut error_info = None;
-    for option in elems {
-        let OwnedTerm::Tuple(fields) = option else {
-            return None;
-        };
-        if fields.len() != 2 || fields[0] != OwnedTerm::atom("error_info") {
-            return None;
-        }
-        let OwnedTerm::Map(_) = &fields[1] else {
-            return None;
-        };
-        error_info = Some(fields[1].clone());
-    }
-    error_info
-}
-
-/// `error_info_option` on the heap terms themselves: the last `{error_info, Map}` map of a
-/// proper, non-empty option list. The scheduler path copies it off-heap; the native resolver
-/// keeps the live term, as erts keeps it in `c_p->ftrace`.
+/// The last `{error_info, Map}` map of a proper, non-empty option list, kept as a heap term.
 // Port of erts/emulator/beam/bif.c (error_3 option validation), OTP-29.1.1.
 pub(crate) fn error_info_term(options: Term) -> Option<Term> {
     let mut info = None;

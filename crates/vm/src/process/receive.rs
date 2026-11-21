@@ -154,20 +154,6 @@ impl Process {
         }
     }
 
-    /// The fetch a clause-less receive's wait does before it sleeps; `true` when it made the
-    /// process exiting instead (erts' fetch cannot fail; a handler failure takes the same
-    /// erts_set_self_exiting path as in [`Self::receive_helper`]).
-    pub(crate) fn wait_fetch_signals(&mut self, ctx: &mut RunCtx<'_, crate::Process>) -> bool {
-        match self.fetch_signals(ctx) {
-            Ok(()) => false,
-            Err(error) => {
-                let reason = super::exit::exit_reason_from(self, &error);
-                self.erts_set_self_exiting(ctx, reason);
-                true
-            }
-        }
-    }
-
     fn receive_helper_signals(
         &mut self,
         ctx: &mut RunCtx<'_, crate::Process>,
@@ -180,16 +166,22 @@ impl Process {
             if self.sig_cont_empty() {
                 consumed_reds += 4;
                 left_reds -= 4;
-                self.fetch_signals(ctx)?;
+                // No signal was queued: the msgq lock stays held for the wait instruction
+                // the receive continues at (ERTS_PROC_LOCKS_MSG_RECEIVE).
+                if self.fetch_signals_receive(ctx)? {
+                    return Ok((consumed_reds, ReceiveHelper::Wait));
+                }
                 // Messages may have been moved directly to the message queue.
                 if self.inbox.peek().is_some() {
                     return Ok((consumed_reds, ReceiveHelper::Message));
                 }
-                if self.sig_cont_empty() {
-                    return Ok((consumed_reds, ReceiveHelper::Wait));
-                }
                 if left_reds <= 0 {
                     break;
+                }
+                // The fetched signals all went away while moved (messages to an inactive
+                // alias): fetch again, under the lock.
+                if self.sig_cont_empty() {
+                    continue;
                 }
             }
             // At least the preferred amount of reductions.
@@ -294,12 +286,13 @@ impl Process {
         Some(monitor.alias_priority())
     }
 
-    /// Move a message signal into the message queue.
+    /// Move a message signal into the message queue; `false` when it was dropped (an
+    /// inactive alias, an undecodable dist message).
     pub(super) fn move_message(
         &mut self,
         ctx: &mut RunCtx<'_, crate::Process>,
         mut node: MessageNode,
-    ) -> Result<(), VmError> {
+    ) -> Result<bool, VmError> {
         let from = node.from;
         if let Payload::Message(message) = &mut node.payload {
             let (alias, receive_traced, mut priority) =
@@ -308,7 +301,7 @@ impl Process {
                 let Some((alias_priority, prio_alias_deactivated)) =
                     self.alias_message_accepted(ctx, alias)?
                 else {
-                    return Ok(());
+                    return Ok(false);
                 };
                 // erl_proc_sig_queue.c:6021-6045: only a priority alias delivers a priority
                 // message.
@@ -329,7 +322,7 @@ impl Process {
                     if prio_alias_deactivated {
                         self.prio_item_deleted(crate::receive::PrioItemType::Alias);
                     }
-                    return Ok(());
+                    return Ok(false);
                 }
                 let before = self.message_words_before();
                 // ERTS_SIG_Q_OP_ALTACT_MSG with a priority: insert_prepared_prio_msg.
@@ -352,7 +345,7 @@ impl Process {
                     self.prio_item_deleted(crate::receive::PrioItemType::Alias);
                 }
             }
-            return Ok(());
+            return Ok(true);
         }
         let Event { from, payload } = node.into_value();
         match payload {
@@ -368,6 +361,6 @@ impl Process {
             }
             _ => unreachable!("move_message takes message signals"),
         }
-        Ok(())
+        Ok(true)
     }
 }

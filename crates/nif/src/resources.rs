@@ -6,6 +6,7 @@ use arinsal_term::{MagicBin, Term, TermBuilder};
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::hint::black_box;
+use std::mem::size_of;
 use std::ptr;
 use std::sync::atomic::AtomicPtr;
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
@@ -203,14 +204,17 @@ fn resource_data(bin: &arinsal_term::MagicRef) -> *mut u8 {
 
 /// `mb->orig_size` for a resource of `size` user bytes, with the monitors block that a type
 /// with a `down` callback adds after the user data.
-pub(crate) fn resource_magic_orig_size(size: usize, has_down: bool) -> usize {
+///
+/// Port of erts/emulator/beam/erl_nif.c (`enif_alloc_resource`) and erl_binary.h
+/// (`ERTS_MAGIC_BIN_UNALIGNED_ORIG_SIZE`), OTP-29.1.1.
+pub const fn resource_magic_orig_size(size: usize, has_down: bool) -> usize {
     // offsetof(ErtsMagicBinary, u.unaligned.data) - offsetof(Binary, orig_bytes).
     const MAGIC_DATA_OFFSET: usize = 24;
     // offsetof(ErtsResource, data): the `type` and `monitors` pointers.
     const RESOURCE_DATA_OFFSET: usize = 16;
-    // sizeof(ErtsResourceMonitors): erts_mtx_t (a 64-byte pthread mutex on the reference
-    // macOS arm64 host), `root`, `refc` and `user_data_sz`.
-    const MONITORS_SIZE: usize = 64 + 3 * 8;
+    // sizeof(ErtsResourceMonitors): erts_mtx_t (`ethr_mutex` = `pthread_mutex_t` on Unix
+    // release builds), then `root`, `refc` and `user_data_sz` (global.h).
+    const MONITORS_SIZE: usize = size_of::<libc::pthread_mutex_t>() + 3 * size_of::<usize>();
     // ERTS_ALLOC_ALIGN_BYTES
     const ALLOC_ALIGN: usize = 8;
     let base = MAGIC_DATA_OFFSET + RESOURCE_DATA_OFFSET;
@@ -618,6 +622,7 @@ pub(crate) fn call_down(bin: &MagicBin, pid: Term, monitor: &[u8; 32]) -> bool {
 #[cfg(test)]
 mod orig_size_tests {
     use super::resource_magic_orig_size;
+    use std::mem::size_of;
 
     #[test]
     fn orig_size_follows_enif_alloc_resource() {
@@ -625,7 +630,8 @@ mod orig_size_tests {
         assert_eq!(resource_magic_orig_size(4, false), 44);
         assert_eq!(resource_magic_orig_size(0, false), 40);
         // The monitors block follows the user data rounded up to 8 bytes.
-        assert_eq!(resource_magic_orig_size(4, true), 40 + 8 + 88);
-        assert_eq!(resource_magic_orig_size(16, true), 40 + 16 + 88);
+        const MONITORS: usize = size_of::<libc::pthread_mutex_t>() + 3 * size_of::<usize>();
+        assert_eq!(resource_magic_orig_size(4, true), 40 + 8 + MONITORS);
+        assert_eq!(resource_magic_orig_size(16, true), 40 + 16 + MONITORS);
     }
 }

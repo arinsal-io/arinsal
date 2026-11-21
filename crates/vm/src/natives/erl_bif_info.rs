@@ -80,7 +80,11 @@ pub(crate) extern "C" fn is_process_alive_1(c_p: *mut ProcessHeader, reg: *mut u
             return bif_ret(
                 c_p,
                 i,
-                Err(handle_signals_from_return(process, arg, Term::atom(result))),
+                Err(crate::natives::sys::handle_signals_from_return(
+                    process,
+                    arg,
+                    Term::atom(result),
+                )),
             );
         }
         return crate::native_hooks::raw(Term::atom(result));
@@ -105,18 +109,6 @@ fn alive_trap(process: &mut crate::Process, pid: Term) -> VmError {
     ))
 }
 
-/// `ERTS_BIF_HANDLE_SIGNALS_FROM_RETURN`: `BIF_TRAP2` to `bif_handle_signals_return/2`.
-// Port of erts/emulator/beam/bif.h:527-528, OTP-29.1.1.
-#[cold]
-#[inline(never)]
-fn handle_signals_from_return(process: &mut crate::Process, from: Term, value: Term) -> VmError {
-    VmError::TrapExport(crate::ExportTrap::new(
-        process,
-        crate::natives::sys::BIF_HANDLE_SIGNALS_RETURN,
-        vec![from, value],
-    ))
-}
-
 /// `process_info/2`.
 // Port of erts/emulator/beam/erl_bif_info.c (process_info_2 → process_info_bif), OTP-29.1.1.
 pub(crate) extern "C" fn process_info_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
@@ -125,16 +117,11 @@ pub(crate) extern "C" fn process_info_2(c_p: *mut ProcessHeader, reg: *mut u64, 
     };
     process.heap.note_bif_entry();
     let [pid, item] = crate::bif_table::bif_args::<2>(reg);
-    match with_sched(process, reg, |vm, process, ctx| {
+    let result = with_sched(process, reg, |vm, process, ctx| {
         crate::natives::proc::process_info_call(Some(&*vm), process, ctx, pid, Some(item))
-    }) {
-        Ok(inner) => bif_ret(c_p, i, inner),
-        // `process_info_bif` sends to another process through `erts_proc_sig_send_*` and
-        // `ERTS_BIF_PREP_TRAP1(erts_await_result)`: that half needs the running slice's
-        // `RunCtx`. The same table body runs from the executor when this native slice
-        // has no `esdp->current_process`.
-        Err(_) => crate::native_helpers::yield_executor_bif(c_p, reg, i),
-    }
+    })
+    .flatten();
+    bif_ret(c_p, i, result)
 }
 
 /// `system_info/1`.

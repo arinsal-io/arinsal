@@ -1603,9 +1603,10 @@ pub(crate) struct ProcessCold {
     /// erts `F_DIRTY_MAJOR_GC` / `F_DIRTY_MINOR_GC`: a potentially long collection the
     /// process started itself waits for a dirty CPU scheduler.
     pub(crate) dirty_gc: Option<DirtyGc>,
-    /// erts `F_HAVE_BLCKD_MSCHED | F_HAVE_BLCKD_NMSCHED`: this process holds a
-    /// multi-scheduling block of its runtime.
+    /// erts `F_HAVE_BLCKD_MSCHED`: this process holds a full multi-scheduling block.
     pub(crate) have_blocked_multi_scheduling: bool,
+    /// erts `F_HAVE_BLCKD_NMSCHED`: this process holds a normal-scheduler block.
+    pub(crate) have_blocked_normal_multi_scheduling: bool,
     pub(crate) flags: ProcFlags,
     pub(crate) monitor_nodes: usize,
     pub(crate) group_leader: Option<arinsal_sched::Pid>,
@@ -2107,34 +2108,6 @@ impl Process {
         &mut self,
     ) -> Option<arinsal_sched::OwnedSignal<arinsal_sched::Event<crate::process::Message>>> {
         self.sig_cont_mut().pop_front_signal()
-    }
-    /// Moves the ordinary messages of the outer queue to the middle queue through the signal
-    /// probe, leaving the probe in place. `None` without a probe.
-    #[inline(always)]
-    pub(crate) fn probe_fetch_messages(&mut self) -> Option<usize> {
-        let probe = self.signal_probe.as_ref()?;
-        let scheduler = self.runtime?.scheduler_if_started()?;
-        let fetched = probe.fetch_messages_if(
-            scheduler,
-            |message| !message.is_altact_msg(),
-            |queue| self.sig_cont.append(queue),
-        );
-        let busy = !self.sig_cont.is_empty();
-        self.set_slow(Self::SLOW_SIG_CONT, busy);
-        Some(fetched)
-    }
-    /// [`Self::probe_fetch_messages`] with the message queue as the target: the outer queue is
-    /// spliced onto its end, no node is touched.
-    #[inline(always)]
-    pub(crate) fn probe_fetch_messages_into_inbox(&mut self) -> Option<usize> {
-        let probe = self.signal_probe.as_ref()?;
-        let scheduler = self.runtime?.scheduler_if_started()?;
-        let inbox = &mut self.inbox;
-        Some(probe.fetch_messages_if(
-            scheduler,
-            |message| !message.is_altact_msg(),
-            |queue| inbox.fetch_target().append(queue),
-        ))
     }
     /// Moves the whole outer queue to the middle queue through the signal probe.
     #[inline(always)]

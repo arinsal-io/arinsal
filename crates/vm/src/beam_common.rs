@@ -494,11 +494,15 @@ pub extern "C" fn handle_error(
         // `save_stacktrace(c_p, pc, reg, bif_mfa, Args)`: erlang:error/2,3 take Args (x1) and
         // their error_info from the argument registers in `native_bif_top`.
         let top = crate::native_helpers::native_bif_top(process, bif_info, registers);
+        // A function_clause ignores the raising pc (beam_common.c:1023, `s->pc = NULL`); its
+        // location is that of `erts_codemfa_to_code(s->current)` (beam_common.c:1231).
+        let native_pc =
+            crate::native_helpers::function_clause_code(process).or((pc != 0).then_some(pc));
         let input = crate::stacktrace::StackTraceSave {
             class: crate::native_helpers::get_exc_class(freason),
             depth: crate::erl_init::erts_backtrace_depth(),
             freason,
-            native_pc: (pc != 0).then_some(pc),
+            native_pc,
             top: top.as_ref().map(crate::stacktrace::SaveTop::Live),
         };
         let trace = crate::stacktrace::save_stacktrace(process, input, registers);

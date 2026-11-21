@@ -13,12 +13,10 @@
 //! ops: erts `enqueue_later_op` asserts `esdp && !dirty`; those callers use
 //! `erts_schedule_misc_aux_work` onto a normal scheduler.
 
+use crate::ssi::{self, ErtsSchedulerSleepInfo};
 use std::cell::{Cell, RefCell};
-use std::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
-};
+use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::thread::Thread;
 
 pub(crate) mod raw;
 pub use raw::ErtsThrPrgrLaterOp;
@@ -181,6 +179,31 @@ impl ThreadEvent {
         }
         *signaled = false;
     }
+
+    /// `erts_tse_twait` for `timeout`: `true` when the event was set (and is consumed),
+    /// `false` on timeout.
+    pub(crate) fn twait(&self, timeout: std::time::Duration) -> bool {
+        let signaled = self
+            .signaled
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (mut signaled, _) = self
+            .event
+            .wait_timeout_while(signaled, timeout, |signaled| !*signaled)
+            .unwrap_or_else(|error| error.into_inner());
+        std::mem::replace(&mut *signaled, false)
+    }
+
+    /// Consumes a pending set without waiting.
+    pub(crate) fn try_take(&self) -> bool {
+        std::mem::replace(
+            &mut *self
+                .signaled
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            false,
+        )
+    }
 }
 
 /// Shared thread progress state (erts `ErtsThrPrgrInternalData` and `erts_thr_prgr__`).
@@ -198,12 +221,10 @@ pub(crate) struct ThrProgress {
     unmanaged_wakeup: [UnmanagedWakeupData; WAKEUP_DATA_SIZE],
     unmanaged_callbacks: Box<[UnmanagedWakeupCallbackSlot]>,
     unmanaged_next: AtomicUsize,
-    /// Worker sleep state shared with the scheduler: waking a managed thread ends its
-    /// spin and unparks it (the managed `wakeup` callback, erl_process.c ssi_wake).
-    parked: Arc<[AtomicBool]>,
-    sleepers: Arc<[OnceLock<Thread>]>,
-    /// TID 0's managed aux thread is in the same thread-progress set but has no run queue.
-    aux_event: OnceLock<Arc<ThreadEvent>>,
+    /// `intrnl->managed.callbacks[id].arg`: the sleep info of each managed thread (the
+    /// schedulers, then the aux thread), which the managed callbacks wake and wait on
+    /// (erl_process.c thr_prgr_wakeup, thr_prgr_prep_wait, thr_prgr_wait, thr_prgr_fin_wait).
+    callbacks: Box<[Arc<ErtsSchedulerSleepInfo>]>,
     /// `intrnl->umrefc`: unmanaged threads delaying progress, counted in one of two slots.
     umrefc: [AtomicUsize; 2],
     /// `intrnl->misc.data.umrefc_ix.current`: the slot new delays count in.
@@ -217,20 +238,17 @@ pub(crate) struct ThrProgress {
 /// threads for the whole process, created once by [`init`].
 static INTRNL: OnceLock<Arc<ThrProgress>> = OnceLock::new();
 
-/// Creates the thread progress of the OS process, managed by the threads that `parked` and
-/// `sleepers` describe, and gives the allocator's delayed-dealloc queues and pools access to it.
+/// Creates the thread progress of the OS process, managed by the threads whose sleep infos
+/// `callbacks` holds, and gives the allocator's delayed-dealloc queues and pools access to it.
 ///
 /// Port of erts/emulator/beam/erl_thr_progress.c (erts_thr_progress_init), OTP-29.1.1, which
 /// `erl_start` runs once: erts has one runtime per OS process, so a second runtime in the same
 /// process is refused here instead of getting a thread progress of its own.
 pub(crate) fn init(
-    parked: Arc<[AtomicBool]>,
-    sleepers: Arc<[OnceLock<Thread>]>,
+    callbacks: Box<[Arc<ErtsSchedulerSleepInfo>]>,
     unmanaged: usize,
 ) -> Arc<ThrProgress> {
-    let progress = Arc::new(ThrProgress::new_with_managed_extra(
-        parked, sleepers, 1, unmanaged,
-    ));
+    let progress = Arc::new(ThrProgress::new_with_callbacks(callbacks, unmanaged));
     assert!(
         INTRNL.set(Arc::clone(&progress)).is_ok(),
         "thread progress is initialized once per OS process (erts_thr_progress_init): \
@@ -407,17 +425,17 @@ impl ThrProgress {
     /// runtime gets the one of the process through [`init`]; unit tests of the algorithm build
     /// their own.
     #[cfg(test)]
-    pub(crate) fn new(parked: Arc<[AtomicBool]>, sleepers: Arc<[OnceLock<Thread>]>) -> Self {
-        Self::new_with_managed_extra(parked, sleepers, 0, 0)
+    pub(crate) fn new(managed: usize) -> Self {
+        Self::new_with_callbacks(
+            (0..managed)
+                .map(|_| Arc::new(ErtsSchedulerSleepInfo::new(0)))
+                .collect(),
+            0,
+        )
     }
 
-    fn new_with_managed_extra(
-        parked: Arc<[AtomicBool]>,
-        sleepers: Arc<[OnceLock<Thread>]>,
-        managed_extra: usize,
-        unmanaged: usize,
-    ) -> Self {
-        let managed = parked.len() + managed_extra;
+    fn new_with_callbacks(callbacks: Box<[Arc<ErtsSchedulerSleepInfo>]>, unmanaged: usize) -> Self {
+        let managed = callbacks.len();
         let wakeup = std::array::from_fn(|_| WakeupData {
             len: AtomicU32::new(0),
             id: (0..managed).map(|_| AtomicUsize::new(0)).collect(),
@@ -440,9 +458,7 @@ impl ThrProgress {
             unmanaged_wakeup,
             unmanaged_callbacks: (0..unmanaged).map(|_| Mutex::new(None)).collect(),
             unmanaged_next: AtomicUsize::new(0),
-            parked,
-            sleepers,
-            aux_event: OnceLock::new(),
+            callbacks,
             umrefc: [AtomicUsize::new(0), AtomicUsize::new(0)],
             umrefc_current: AtomicUsize::new(0),
             umrefc_waiting: std::sync::atomic::AtomicI32::new(-1),
@@ -454,39 +470,10 @@ impl ThrProgress {
     }
 
     /// The managed `wakeup` callback (erts wakeup_managed).
+    // Port of erts/emulator/beam/erl_process.c:3121 (thr_prgr_wakeup: erts_sched_poke),
+    // OTP-29.1.1.
     fn wakeup_managed(&self, id: usize) {
-        let thread = if id < self.parked.len() {
-            self.parked[id].store(false, Ordering::SeqCst);
-            self.sleepers[id].get()
-        } else {
-            if let Some(event) = self.aux_event.get() {
-                event.signal();
-            }
-            None
-        };
-        if let Some(thread) = thread {
-            thread.unpark();
-            crate::interrupt_if_poll_sleeper(thread);
-        }
-    }
-
-    /// The managed `wait` callback of a thread that saw `LFLG_BLOCK`: waits on the primitive
-    /// [`Self::wakeup_managed`] signals until thr_progress_unblock has cleared the flag.
-    // Port of erts/emulator/beam/erl_process.c:3127-3157 (thr_prgr_prep_wait, thr_prgr_wait:
-    // erts_tse_reset of the thread's SSI event, then erts_tse_wait unless the wakeup already
-    // came), OTP-29.1.1. A scheduler's park token is the event `unpark` sets. The aux thread's
-    // event is reset and `lflgs` read again: thr_progress_unblock clears the flag before it
-    // signals, so the signal after the reset is never lost.
-    fn wait_managed(&self, id: usize) {
-        match self.aux_event.get() {
-            Some(event) if id >= self.parked.len() => {
-                event.reset();
-                if self.lflgs.load(Ordering::SeqCst) & LFLG_BLOCK != 0 {
-                    event.wait();
-                }
-            }
-            _ => std::thread::park(),
-        }
+        ssi::erts_sched_poke(&self.callbacks[id], crate::sched_poll_interrupt);
     }
 
     // Port of erl_thr_progress.c:276 (wakeup_unmanaged), OTP-29.1.1.
@@ -498,10 +485,6 @@ impl ThrProgress {
         if let Some(callback) = callback {
             callback();
         }
-    }
-
-    pub(crate) fn register_aux_event(&self, event: Arc<ThreadEvent>) {
-        self.aux_event.set(event).expect("aux event registers once");
     }
 
     fn notify_event(&self) {
@@ -602,20 +585,20 @@ impl ThrProgress {
     }
 }
 
-// Port of erl_thr_progress.c:1308 (block_thread), OTP-29.1.1: the managed `prepare_wait`
-// and `wait` callbacks are the thread's own (`cbp = &intrnl->managed.callbacks[tpd->id]`), the
-// ones its `wakeup` callback ends: the aux thread waits on its SSI event, which
-// thr_progress_unblock signals.
+// Port of erl_thr_progress.c:1308 (block_thread), OTP-29.1.1: the managed `prepare_wait`,
+// `wait` and `finalize_wait` callbacks are the thread's own
+// (`cbp = &intrnl->managed.callbacks[tpd->id]`), on its scheduler sleep info.
 fn block_thread(tpd: &mut ThrPrgrData) -> u32 {
     let progress = Arc::clone(&tpd.progress);
-    let id = tpd.id;
+    let cbp = Arc::clone(&progress.callbacks[tpd.id]);
     let mut lflgs;
     loop {
         progress.block_count_dec();
         loop {
+            ssi::thr_prgr_prep_wait(&cbp);
             lflgs = progress.lflgs.load(Ordering::Acquire);
             if lflgs & LFLG_BLOCK != 0 {
-                progress.wait_managed(id);
+                ssi::thr_prgr_wait(&cbp);
             } else {
                 break;
             }
@@ -626,6 +609,7 @@ fn block_thread(tpd: &mut ThrPrgrData) -> u32 {
     }
     // Port of erl_thr_progress.c:1327 (`erts_code_ix_finalize_wait` in `block_thread`).
     erts_code_ix_finalize_wait();
+    ssi::thr_prgr_fin_wait(&cbp);
     lflgs
 }
 
@@ -1442,12 +1426,10 @@ pub fn thread_progress_wait<R>(wait: impl FnOnce() -> R) -> R {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     fn progress(managed: usize) -> Arc<ThrProgress> {
-        Arc::new(ThrProgress::new(
-            (0..managed).map(|_| AtomicBool::new(false)).collect(),
-            (0..managed).map(|_| OnceLock::new()).collect(),
-        ))
+        Arc::new(ThrProgress::new(managed))
     }
 
     #[test]
@@ -1510,7 +1492,6 @@ mod tests {
         let progress = progress(1);
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                progress.sleepers[0].set(std::thread::current()).unwrap();
                 let managed = register_managed_thread(&progress, 0);
                 let mut awdp = AuxWorkLater::new();
                 let mut op = FlagOp {
@@ -1543,7 +1524,6 @@ mod tests {
         let progress = progress(1);
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                progress.sleepers[0].set(std::thread::current()).unwrap();
                 let managed = register_managed_thread(&progress, 0);
                 let mut awdp = AuxWorkLater::new();
                 let mut nodes = vec![ErtsThrPrgrLaterOp::new(); 403];
@@ -1605,7 +1585,6 @@ mod tests {
         let ran = Arc::new(AtomicBool::new(false));
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                progress.sleepers[0].set(std::thread::current()).unwrap();
                 let managed = register_managed_thread(&progress, 0);
                 let mut awdp = AuxWorkLater::new();
                 assert!(matches!(unmanaged_delay(&progress), DelayHandle::Managed));
@@ -1638,7 +1617,6 @@ mod tests {
         let progress = progress(1);
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                progress.sleepers[0].set(std::thread::current()).unwrap();
                 let managed = register_managed_thread(&progress, 0);
                 let mut awdp = AuxWorkLater::new();
                 let mut nodes = [ErtsThrPrgrLaterOp::new(), ErtsThrPrgrLaterOp::new()];
@@ -1663,12 +1641,8 @@ mod tests {
 
     #[test]
     fn unmanaged_registration_uses_erts_wakeup_bitmap() {
-        let parked: Arc<[AtomicBool]> = vec![AtomicBool::new(false)].into();
-        let sleepers: Arc<[OnceLock<Thread>]> = vec![OnceLock::new()].into();
-        let progress = Arc::new(ThrProgress::new_with_managed_extra(
-            Arc::clone(&parked),
-            Arc::clone(&sleepers),
-            0,
+        let progress = Arc::new(ThrProgress::new_with_callbacks(
+            vec![Arc::new(ErtsSchedulerSleepInfo::new(0))].into(),
             1,
         ));
         let woke = Arc::new(AtomicBool::new(false));
@@ -1681,7 +1655,6 @@ mod tests {
         });
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                progress.sleepers[0].set(std::thread::current()).unwrap();
                 let managed = register_managed_thread(&progress, 0);
                 for _ in 0..8 {
                     scheduler_progress(&managed, &mut ());
@@ -1704,7 +1677,6 @@ mod tests {
                 let stop = Arc::clone(&stop);
                 let passes = Arc::clone(&passes);
                 scope.spawn(move || {
-                    progress.sleepers[id].set(std::thread::current()).unwrap();
                     let managed = register_managed_thread(&progress, id);
                     while !stop.load(Ordering::SeqCst) {
                         scheduler_progress(&managed, &mut ());
@@ -1729,20 +1701,11 @@ mod tests {
     /// `wakeup` callback signals, so thr_progress_unblock wakes it.
     #[test]
     fn blocked_aux_thread_wakes_on_unblock() {
-        let progress = Arc::new(ThrProgress::new_with_managed_extra(
-            Arc::from([]),
-            Arc::from([]),
-            1,
-            0,
-        ));
-        let event = Arc::new(ThreadEvent::new());
-        progress.register_aux_event(Arc::clone(&event));
+        let progress = Arc::new(ThrProgress::new(1));
         let stop = AtomicBool::new(false);
         let passes = AtomicU64::new(0);
-        let aux = OnceLock::new();
         let woke = std::thread::scope(|scope| {
             scope.spawn(|| {
-                aux.set(std::thread::current()).unwrap();
                 let managed = register_managed_thread(&progress, 0);
                 while !stop.load(Ordering::SeqCst) {
                     scheduler_progress(&managed, &mut ());
@@ -1773,8 +1736,7 @@ mod tests {
             if !woke {
                 // Release the lost waiter so the scope can join and the test report.
                 progress.lflgs.fetch_and(!LFLG_BLOCK, Ordering::SeqCst);
-                event.signal();
-                aux.get().unwrap().unpark();
+                progress.callbacks[0].event.signal();
             }
             woke
         });

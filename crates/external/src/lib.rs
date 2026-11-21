@@ -1447,8 +1447,7 @@ pub fn erts_term_to_binary_int<H: HeapAlloc>(
                     context.state = TtbState::EncodeStaged(output);
                 } else {
                     // erts_bin_nrml_alloc(size): the result binary the pass fills in place.
-                    let binary =
-                        tri!(RefcBinary::new_uninit(size).map_err(|_| EncodeError::SystemLimit));
+                    let binary = RefcBinary::new_uninit(size);
                     context.state = TtbState::Encode(Some(binary));
                 }
             }
@@ -1918,7 +1917,7 @@ impl TtbContext {
         budget: usize,
     ) -> Result<(RefcEncoded, usize), EncodeError> {
         let size = self.output_size().ok_or(EncodeError::SystemLimit)?;
-        let mut binary = RefcBinary::new_uninit(size).map_err(|_| EncodeError::SystemLimit)?;
+        let mut binary = RefcBinary::new_uninit(size);
         let (done, work) = self.step_into(
             binary.bytes_mut_unique().ok_or(EncodeError::SystemLimit)?,
             budget,

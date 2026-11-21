@@ -77,7 +77,9 @@ pub(super) fn hibernate_fetch_collect(
     }
     hibernate_collect(process);
     process.fetch_signals(ctx)?;
-    Ok(process.inbox.is_empty())
+    // erts_hibernate: `if (!erts_proc_sig_fetch(c_p))` clear ERTS_PSFLG_ACTIVE, under the msgq
+    // lock senders enqueue under.
+    Ok(process.inbox.is_empty() && ctx.clear_active_unless_queued())
 }
 
 /// `hibernate/3` with no waiting messages: shrink the heap to the `apply(M, F, A)`
@@ -279,77 +281,19 @@ impl Process {
         stats
     }
 
-    /// A message copied onto the heap when it was sent is counted by `call_memory` when it is
-    /// received, not when it arrives.
-    // Port of erts/emulator/beam/erl_message.c:659 (erts_adjust_memory_break(pp, -sz)),
-    // OTP-29.1.1.
-    /// Allocated words before a message is queued, only when call_memory tracing needs it:
-    /// summing the heap fragments for every message made draining a long queue quadratic.
-    /// Fetch messages from the outer signal queue without the scheduler context.
-    ///
-    /// Native `loop_rec` calls this when its inner queue is exhausted, like erts'
-    /// `i_loop_rec` calling the receive helper. Messages at the head of the outer queue
-    /// move to the inner queue; the first non-message signal (or a message that needs
-    /// tracing or priority handling) stops the fetch and is left for the scheduler.
-    // Port of erts/emulator/beam/erl_proc_sig_queue.c:7730-7790 (erts_proc_sig_receive_helper)
-    // and the message case of erts_proc_sig_handle_incoming, OTP-29.1.1.
-    pub(crate) fn fetch_messages_in_place(&mut self) -> usize {
-        // Only the `erts_proc_sig_fetch` case that splices messages straight onto the message
-        // queue runs here: no unhandled signal in the middle queue, no receive tracing, and
-        // an outer queue of ordinary messages only.
-        if !self.sig_cont_empty() || crate::trace::active() {
-            return 0;
-        }
-        // Port of erts/emulator/beam/erl_proc_sig_queue.c:1332 (erts_proc_sig_fetch__): the outer
-        // queue, messages only, is spliced onto the message queue as a whole.
-        let traced_words =
-            crate::proc_create::raw::erts_psd_get::<Vec<crate::trace_bp::ProcBpTrace>>(
-                &self.psd,
-                crate::proc_create::raw::ERTS_PSD_CALL_MEMORY_BP,
-            )
-            .is_some_and(|entries| !entries.is_empty());
-        if !traced_words {
-            let Some(fetched) = self.probe_fetch_messages_into_inbox() else {
-                return 0;
-            };
-            if fetched != 0 {
-                self.inbox.spliced();
-                crate::natives::erts_debug::after_message_queue_change(self);
-            }
-            return fetched;
-        }
-        let Some(fetched) = self.probe_fetch_messages() else {
-            return 0;
-        };
-        while let Some(node) = self.pop_sig_cont_signal() {
-            debug_assert!(
-                matches!(node.payload, Payload::Message(_)),
-                "fetch_messages_if takes messages only"
-            );
-            let before = self.message_words_before();
-            self.inbox.push_message_node(node);
-            self.uncount_message_words(before);
-        }
-        if fetched != 0 {
-            crate::natives::erts_debug::after_message_queue_change(self);
-        }
-        fetched
-    }
-
     /// Fetch the outer signal queue before an on-heap collection: messages a sender
     /// installed on this heap while the process was not running are queued there and must
     /// be roots. Like `erts_proc_sig_fetch`, an outer queue of ordinary messages joins the
-    /// message queue when the middle queue is empty; otherwise the whole queue is appended
-    /// to the middle queue, whose on-heap messages are roots too.
+    /// middle queue without handling aliases, priority messages, or other incoming signals.
     // Port of erts/emulator/beam/erl_gc.c:987-990 (`erts_garbage_collect` fetches when
-    // `FS_ON_HEAP_MSGQ`) and erl_proc_sig_queue.c:1332 (erts_proc_sig_fetch__), OTP-29.1.1.
+    // `FS_ON_HEAP_MSGQ`) and erl_proc_sig_queue.h:1997 / .c:1332 (`erts_proc_sig_fetch` is
+    // only the outer-to-middle/private-queue splice), OTP-29.1.1.
     pub(super) fn fetch_outer_queue_for_gc(&mut self) {
         if self.message_queue_data() != MessageQueueData::OnHeap {
             return;
         }
-        if self.fetch_messages_in_place() != 0 {
-            return;
-        }
+        // GC has no ErtsSchedulerData and erts_proc_sig_fetch needs only the process and
+        // MSGQ lock. In particular, altact handling belongs to handle_incoming after GC.
         self.probe_fetch_all();
     }
 

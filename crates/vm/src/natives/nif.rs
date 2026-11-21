@@ -1951,23 +1951,25 @@ pub(crate) fn erts_load_nif(
         .ok_or_else(|| VmError::Unsupported("load_nif without a call site".into()))?;
     let caller_instance = [
         code_tables(erts_active_code_ix())
-            .pending_on_load
-            .get(function.module),
+            .loaded
+            .on_load(function.module),
         code_tables(erts_active_code_ix())
             .loaded
-            .get(function.module),
-        code_tables(erts_active_code_ix()).old.get(function.module),
+            .get(function.module)
+            .copied(),
+        code_tables(erts_active_code_ix())
+            .loaded
+            .old(function.module),
     ]
     .into_iter()
     .flatten()
-    .copied()
     .find(|&id| {
         crate::load::native_code_range(&code_tables(erts_active_code_ix()).code_meta, id)
             .is_some_and(|(start, end)| (start..end).contains(&pc))
     });
     let caller = function.module.to_owned();
     if caller_instance.is_some()
-        && caller_instance == code_tables(erts_active_code_ix()).old.get(&caller).copied()
+        && caller_instance == code_tables(erts_active_code_ix()).loaded.old(&caller)
     {
         return error_reason(
             process,
@@ -1976,28 +1978,29 @@ pub(crate) fn erts_load_nif(
         );
     }
     let caller_id = code_tables(erts_active_code_ix())
-        .pending_on_load
-        .get(&caller)
-        .or_else(|| code_tables(erts_active_code_ix()).loaded.get(&caller))
-        .copied()
+        .loaded
+        .on_load(&caller)
+        .or_else(|| {
+            code_tables(erts_active_code_ix())
+                .loaded
+                .get(&caller)
+                .copied()
+        })
         .or(caller_instance)
         .ok_or_else(|| VmError::Unsupported("load_nif caller".into()))?;
     // Port of erts/emulator/beam/erl_nif.c:4758-4772 (erts_load_nif), OTP-29.1.1: `prev_mi` is
     // the old code, or for a pending on_load instance the current code when there is one.
-    let prev_id = if code_tables(erts_active_code_ix())
-        .pending_on_load
-        .get(&caller)
-        == Some(&caller_id)
-    {
-        code_tables(erts_active_code_ix())
-            .loaded
-            .get(&caller)
-            .or_else(|| code_tables(erts_active_code_ix()).old.get(&caller))
-    } else {
-        code_tables(erts_active_code_ix()).old.get(&caller)
-    }
-    .copied()
-    .filter(|&id| id != caller_id);
+    let prev_id =
+        if code_tables(erts_active_code_ix()).loaded.on_load(&caller) == Some(caller_id) {
+            code_tables(erts_active_code_ix())
+                .loaded
+                .get(&caller)
+                .copied()
+                .or_else(|| code_tables(erts_active_code_ix()).loaded.old(&caller))
+        } else {
+            code_tables(erts_active_code_ix()).loaded.old(&caller)
+        }
+        .filter(|&id| id != caller_id);
     if caller == "erlang" {
         return error_reason(
             process,

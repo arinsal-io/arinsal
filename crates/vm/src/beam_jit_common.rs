@@ -301,42 +301,51 @@ fn remove_message_leave_reds(process: &mut crate::Process, fcalls: i32) -> i32 {
 
 /// The process waits for a message: no live X registers (`c_p->arity = 0`), and
 /// `ERTS_PSFLG_ACTIVE` cleared in `p->state` unless its receive timer already fired, so
-/// schedule_out_process leaves it out of the run queues. The generated code then jumps to
-/// do_schedule; the process resumes at `cp`.
+/// schedule_out_process leaves it out of the run queues. The caller holds
+/// `ERTS_PROC_LOCKS_MSG_RECEIVE` (the receive helper's final fetch or
+/// beam_jit_take_receive_lock kept it), which every sender holds while it enqueues, and this
+/// releases it. The generated code then jumps to do_schedule; the process resumes at `cp`.
 // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1192-1201 (beam_jit_wait_locked) and
 // emu/msg_instrs.tab:110 (wait clears F_DELAY_GC), OTP-29.1.1.
 #[unsafe(no_mangle)]
 pub extern "C" fn beam_jit_wait_locked(header: *mut ProcessHeader, _cp: usize) {
-    let Some(process) = crate::native_hooks::enter_runtime(header) else {
-        return;
-    };
+    let process = crate::native_hooks::enter_runtime(header)
+        .expect("the wait instruction runs on its own process");
     process.set_delay_gc(false);
     process.gc_live = 0;
     process.set_native_resume_arity(0);
-    if process.receive_timer_timed_out() {
-        return;
+    let probe = receive_probe(process);
+    if !process.receive_timer_timed_out() {
+        arinsal_sched::erts_wait_clear_active(probe.proc_state());
     }
-    let Some(probe) = process.signal_probe() else {
-        return;
-    };
-    // erts clears ERTS_PSFLG_ACTIVE holding the msgq lock, which every sender takes before it
-    // reads the state to decide on scheduling: a message enqueued after the receive's last
-    // fetch finds the process inactive and schedules it. The lock-free outer queue gives the
-    // same order on the state word: the clear fails while `ERTS_PSFLG_MSG_SIG_IN_Q` says
-    // messages arrived since that fetch. They are fetched (erts_proc_sig_fetch) and the
-    // process stays active, so the receive resumed at `cp` looks at them.
-    if !arinsal_sched::erts_wait_clear_active(probe.proc_state()) {
-        let _exiting = arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
-            arinsal_sched::RunCtx::with_current(esdp, |ctx| process.wait_fetch_signals(ctx))
-        })
-        .flatten()
-        .expect("native code runs inside an executor slice, which publishes its scheduler data");
-    }
+    probe.release_receive_lock();
 }
 
-/// Takes the receive lock; the private queue needs no lock here.
+/// The process's signal queue handle, which the receive helper installs before any wait.
+fn receive_probe(process: &crate::Process) -> &arinsal_sched::SignalProbe<crate::process::Message> {
+    process
+        .signal_probe()
+        .expect("a receive installs its signal probe before it waits")
+}
+
+/// Takes the receive lock (`ERTS_PROC_LOCKS_MSG_RECEIVE`), for a wait not reached from the
+/// receive helper.
+// Port of erts/emulator/beam/jit/beam_jit_common.cpp:1188-1190 (beam_jit_take_receive_lock),
+// OTP-29.1.1.
 #[unsafe(no_mangle)]
-pub extern "C" fn beam_jit_take_receive_lock(_header: *mut ProcessHeader) {}
+pub extern "C" fn beam_jit_take_receive_lock(header: *mut ProcessHeader) {
+    let process = crate::native_hooks::enter_runtime(header)
+        .expect("the wait instruction runs on its own process");
+    if process.signal_probe().is_none() {
+        let probe = arinsal_sched::erts_proc_sched_data(process, |_, esdp| {
+            arinsal_sched::RunCtx::with_current(esdp, |ctx| ctx.signal_probe())
+        })
+        .flatten()
+        .flatten();
+        process.set_signal_probe(probe);
+    }
+    receive_probe(process).take_receive_lock();
+}
 
 /// `beam_jit_wait_locked` after taking the receive lock.
 // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1203-1206, OTP-29.1.1.
@@ -356,11 +365,14 @@ pub extern "C" fn beam_jit_wait_timeout(
     // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1208-1222
     // (beam_jit_wait_timeout), OTP-29.1.1: timeout setup updates process wait state but does
     // not access the process heap or stack cursors.
-    let Some(process) = crate::native_hooks::enter_runtime(header) else {
-        return 2;
-    };
+    let process = crate::native_hooks::enter_runtime(header)
+        .expect("the wait instruction runs on its own process");
     match process.wait_timeout(crate::native_hooks::from_raw(timeout)) {
-        Ok(Some(0)) => 0,
+        Ok(Some(0)) => {
+            // RET_next: the receive times out now, without waiting.
+            receive_probe(process).release_receive_lock();
+            0
+        }
         Ok(remaining) => {
             if let Some(pos) = remaining {
                 // `c_p->def_arg_reg[0] = next`: the timeout label a timed-out schedule-in
@@ -378,6 +390,7 @@ pub extern "C" fn beam_jit_wait_timeout(
             1
         }
         Err(_) => {
+            receive_probe(process).release_receive_lock();
             crate::native_hooks::set_error(process, "timeout_value");
             // RET_badarg (RET_next=0, RET_wait=1, RET_badarg=2), as in instr_msg.cpp.
             2
@@ -418,6 +431,9 @@ pub extern "C" fn beam_jit_timeout(header: *mut ProcessHeader) {
 // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1253-1256, OTP-29.1.1.
 #[unsafe(no_mangle)]
 pub extern "C" fn beam_jit_timeout_locked(header: *mut ProcessHeader) {
+    let process = crate::native_hooks::process_from_header(header)
+        .expect("the timeout instruction runs on its own process");
+    receive_probe(process).release_receive_lock();
     beam_jit_timeout(header);
 }
 

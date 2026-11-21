@@ -22,6 +22,7 @@ enum NativeTopRoots {
     BifRegisters { start: usize, len: usize },
     CurrentArgs(usize),
     CurrentArgsNoLocation(usize),
+    CurrentArgsInfoTerms { args: Option<usize>, info: usize },
 }
 
 #[inline]
@@ -170,6 +171,10 @@ pub(crate) fn gc_after_native_parts(
             roots.push(value);
             roots.len() - 1
         });
+        // `save_stacktrace` keeps these terms in the process-owned ftrace tuple; a BIF epilogue
+        // collection rewrites the live top-frame copies along with its X-register roots.
+        // Port of erts/emulator/beam/beam_common.c:880-1051 (save_stacktrace) and erl_gc.c
+        // (garbage_collect), OTP-29.1.1.
         let top = trap.top.as_ref().and_then(|top| match top {
             crate::stacktrace::TopFrame::Bif { args, .. } => args
                 .root_terms(&mut roots)
@@ -191,8 +196,17 @@ pub(crate) fn gc_after_native_parts(
                 Some(NativeTopRoots::CurrentArgs(roots.len() - 1))
             }
             crate::stacktrace::TopFrame::CurrentArgsWithInfo(None, _) => None,
-            // Resolver-local; it never reaches a trap that survives a collection.
-            crate::stacktrace::TopFrame::CurrentArgsInfoTerm(..) => None,
+            crate::stacktrace::TopFrame::CurrentArgsInfoTerm(args, info) => {
+                let args = args.map(|args| {
+                    roots.push(args);
+                    roots.len() - 1
+                });
+                roots.push(*info);
+                Some(NativeTopRoots::CurrentArgsInfoTerms {
+                    args,
+                    info: roots.len() - 1,
+                })
+            }
         });
         Some(NativeErrorRoots::Trap { reason, trace, top })
     } else {
@@ -222,6 +236,9 @@ pub(crate) fn gc_after_native_parts(
                     NativeTopRoots::CurrentArgsNoLocation(_) => {
                         unreachable!("BIF argument storage remains stable across GC")
                     }
+                    NativeTopRoots::CurrentArgsInfoTerms { .. } => {
+                        unreachable!("BIF argument storage remains stable across GC")
+                    }
                 },
                 Some(crate::stacktrace::TopFrame::BifRegisters { .. }) => {
                     if let NativeTopRoots::BifRegisters { start, len } = top_roots {
@@ -242,6 +259,17 @@ pub(crate) fn gc_after_native_parts(
                     if let NativeTopRoots::CurrentArgs(index) = top_roots =>
                 {
                     *args = roots[index]
+                }
+                Some(crate::stacktrace::TopFrame::CurrentArgsInfoTerm(args, info))
+                    if let NativeTopRoots::CurrentArgsInfoTerms {
+                        args: args_root,
+                        info: info_root,
+                    } = top_roots =>
+                {
+                    if let (Some(args), Some(args_root)) = (args, args_root) {
+                        *args = roots[args_root];
+                    }
+                    *info = roots[info_root];
                 }
                 _ => unreachable!("trapped top-frame metadata remains stable across GC"),
             }

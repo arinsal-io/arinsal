@@ -8,6 +8,12 @@
 
 use std::alloc::{Layout, handle_alloc_error};
 use std::ptr::NonNull;
+use std::sync::Arc;
+
+use crate::bits::{ExternalBinary, RefcBinary, WritableBinary};
+use crate::{HeapAlloc, MagicBin, Node};
+use arinsal_alloc::raw::OwnedBinaryRef;
+use arinsal_alloc::typed::{AllocBlock, ErtsAlcType};
 
 /// erts `ErlOffHeap` of a heap fragment: the head of the off-heap list of the objects in
 /// `mem` and their virtual binary heap overhead.
@@ -101,6 +107,40 @@ impl HeapFrag {
         frag
     }
 
+    /// `erts_reserve_heap__` allocation for an `ErtsHeapFactory` in `FACTORY_TMP` mode.
+    // Port of erts/emulator/beam/erl_message.c:1376-1440, OTP-29.1.1.
+    pub(crate) fn new_tmp_buffer(size: usize, used: usize) -> Self {
+        debug_assert!(used <= size);
+        let words = HEAP_FRAG_MEM_OFFSET
+            .checked_div(std::mem::size_of::<u64>())
+            .and_then(|header| header.checked_add(size))
+            .expect("temporary heap fragment allocation size fits");
+        let mut block = AllocBlock::new(ErtsAlcType::TMP, words)
+            .expect("erts_alloc ERTS_ALC_T_TMP heap fragment");
+        let pointer = block.as_mut_ptr().cast::<ErlHeapFragment>();
+        let frag = Self(NonNull::new(pointer).expect("temporary heap fragment is allocated"));
+        frag.store(NEXT, 0);
+        frag.store(OFF_HEAP_FIRST, 0);
+        frag.store(OFF_HEAP_OVERHEAD, 0);
+        frag.store(ALLOC_SIZE, size as u64);
+        frag.store(USED_SIZE, used as u64);
+        let transferred = block.into_raw();
+        assert_eq!(transferred.as_ptr().cast::<ErlHeapFragment>(), pointer);
+        frag
+    }
+
+    /// `ERTS_HEAP_FREE(factory->alloc_type, bp, ERTS_HEAP_FRAG_SIZE(bp->alloc_size))` for TMP.
+    // Port of erts/emulator/beam/erl_message.c:1618-1627 (`erts_factory_undo`), OTP-29.1.1.
+    pub(crate) fn free_tmp_buffer(self) {
+        let words = (HEAP_FRAG_MEM_OFFSET / std::mem::size_of::<u64>())
+            .checked_add(self.alloc_size())
+            .expect("temporary heap fragment allocation size fits");
+        let pointer = self.0.cast::<u8>();
+        // SAFETY: this fragment was transferred from one `AllocBlock::new(TMP, words)`,
+        // remains on the unique FACTORY_TMP fragment chain, and is removed before freeing.
+        drop(unsafe { AllocBlock::from_raw(pointer, ErtsAlcType::TMP, words) });
+    }
+
     /// The header word at byte offset `field`; the handle names a live fragment.
     #[inline(always)]
     fn load(self, field: usize) -> u64 {
@@ -179,6 +219,207 @@ impl HeapFrag {
     #[inline]
     pub(crate) fn has_off_heap(self) -> bool {
         self.load(OFF_HEAP_FIRST) != 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn off_heap_first(self) -> usize {
+        self.load(OFF_HEAP_FIRST) as usize
+    }
+
+    #[inline(always)]
+    fn set_off_heap_first(self, first: usize) {
+        self.store(OFF_HEAP_FIRST, first as u64);
+    }
+
+    #[inline(always)]
+    fn off_heap_overhead(self) -> u64 {
+        self.load(OFF_HEAP_OVERHEAD)
+    }
+
+    #[inline(always)]
+    fn set_off_heap_overhead(self, overhead: u64) {
+        self.store(OFF_HEAP_OVERHEAD, overhead);
+    }
+}
+
+/// `ErtsHeapFactory` with `mode == FACTORY_TMP`: its head is the linked TMP `ErlHeapFragment` list.
+// Port of erts/emulator/beam/erl_message.c:1346-1357, 1371-1440, 1543-1627, OTP-29.1.1.
+pub struct TemporaryHeapFactory {
+    heap_frags: *mut ErlHeapFragment,
+    hp: *mut u64,
+    hp_end: *mut u64,
+}
+
+impl Default for TemporaryHeapFactory {
+    fn default() -> Self {
+        Self {
+            heap_frags: std::ptr::null_mut(),
+            hp: std::ptr::null_mut(),
+            hp_end: std::ptr::null_mut(),
+        }
+    }
+}
+
+impl TemporaryHeapFactory {
+    /// `erts_factory_tmp_init(factory, NULL, 0, ERTS_ALC_T_TMP)`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn produce(&mut self, need: usize, extra: usize) -> *mut u64 {
+        let need_end = self.hp.wrapping_add(need);
+        if !self.hp.is_null() && (need_end as usize) <= self.hp_end as usize {
+            let hp = self.hp;
+            self.hp = need_end;
+            return hp;
+        }
+
+        if let Some(fragment) = HeapFrag::from_ptr(self.heap_frags) {
+            let mem = fragment.mem();
+            assert!((self.hp as usize) >= (mem as usize));
+            assert!((self.hp as usize) <= (self.hp_end as usize));
+            assert_eq!(self.hp_end, mem.wrapping_add(fragment.alloc_size()));
+            let used = (self.hp as usize - mem as usize) / std::mem::size_of::<u64>();
+            fragment.set_used_size(used);
+            if used == 0 {
+                self.heap_frags = fragment.next();
+                fragment.set_next(std::ptr::null_mut());
+                assert!(!fragment.has_off_heap());
+                fragment.free_tmp_buffer();
+            }
+        }
+
+        let size = need
+            .checked_add(extra)
+            .expect("erts temporary heap fragment size");
+        let fragment = HeapFrag::new_tmp_buffer(size, size);
+        fragment.set_next(self.heap_frags);
+        self.heap_frags = fragment.as_ptr();
+        self.hp = fragment.mem().wrapping_add(need);
+        self.hp_end = fragment.mem().wrapping_add(size);
+        fragment.mem()
+    }
+
+    fn produce_fragment_only(&mut self, need: usize, extra: usize) -> *mut u64 {
+        if let Some(fragment) = HeapFrag::from_ptr(self.heap_frags) {
+            let mem = fragment.mem();
+            assert!((self.hp as usize) >= (mem as usize));
+            assert!((self.hp as usize) <= (self.hp_end as usize));
+            assert_eq!(self.hp_end, mem.wrapping_add(fragment.alloc_size()));
+            let used = (self.hp as usize - mem as usize) / std::mem::size_of::<u64>();
+            fragment.set_used_size(used);
+        }
+        let size = need
+            .checked_add(extra)
+            .expect("erts temporary heap fragment size");
+        let fragment = HeapFrag::new_tmp_buffer(size, size);
+        fragment.set_next(self.heap_frags);
+        self.heap_frags = fragment.as_ptr();
+        self.hp = fragment.mem().wrapping_add(need);
+        self.hp_end = fragment.mem().wrapping_add(size);
+        fragment.mem()
+    }
+
+    fn current(&self) -> Option<HeapFrag> {
+        HeapFrag::from_ptr(self.heap_frags)
+    }
+}
+
+impl Drop for TemporaryHeapFactory {
+    fn drop(&mut self) {
+        // `erts_factory_undo` cleans each fragment's off-heap chain before ERTS_ALC_T_TMP free.
+        while let Some(fragment) = HeapFrag::from_ptr(self.heap_frags) {
+            self.heap_frags = fragment.next();
+            crate::gc::release_off_heap_chain(fragment.off_heap_first());
+            fragment.set_off_heap_first(0);
+            fragment.free_tmp_buffer();
+        }
+    }
+}
+
+impl HeapAlloc for TemporaryHeapFactory {
+    fn alloc(&mut self, words: usize) -> Option<*mut u64> {
+        Some(self.produce(words, 200))
+    }
+
+    fn alloc_halloc_with_extra(&mut self, words: usize, extra: usize) -> Option<*mut u64> {
+        Some(self.produce(words, extra))
+    }
+
+    fn alloc_with_extra(&mut self, words: usize, extra: usize) -> Option<*mut u64> {
+        Some(self.produce(words, extra))
+    }
+
+    fn alloc_fragment_only(&mut self, words: usize) -> Option<*mut u64> {
+        Some(self.produce_fragment_only(words, 512))
+    }
+
+    fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
+        drop(binary);
+    }
+
+    fn link_bin_ref(
+        &mut self,
+        bin_ref: *mut u64,
+        _writable: bool,
+        overhead_words: u64,
+        owner: Option<OwnedBinaryRef>,
+    ) {
+        let fragment = self
+            .current()
+            .expect("temporary BinRef follows its allocation");
+        let next = fragment.off_heap_first();
+        crate::heap::store(bin_ref.wrapping_add(2), next as u64);
+        fragment.set_off_heap_first(bin_ref as usize);
+        if let Some(owner) = owner {
+            owner.transfer_to_bin_ref(bin_ref);
+        }
+        fragment.set_off_heap_overhead(fragment.off_heap_overhead().saturating_add(overhead_words));
+    }
+
+    fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) {
+        drop(binary);
+    }
+
+    fn supports_writable_binary(&self) -> bool {
+        true
+    }
+
+    fn link_external_binary(&mut self, bin_ref: *mut u64, binary: Arc<ExternalBinary>) {
+        let fragment = self
+            .current()
+            .expect("temporary binary follows its allocation");
+        let mut first = fragment.off_heap_first();
+        crate::heap::link_external_bin_ref(&mut first, bin_ref, binary);
+        fragment.set_off_heap_first(first);
+    }
+
+    fn supports_external_binary(&self) -> bool {
+        true
+    }
+
+    fn link_node(&mut self, thing: *mut u64, node: Node) {
+        let fragment = self
+            .current()
+            .expect("temporary node follows its allocation");
+        let mut first = fragment.off_heap_first();
+        crate::heap::link_node_thing(&mut first, thing, node);
+        fragment.set_off_heap_first(first);
+    }
+
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: MagicBin) {
+        let fragment = self
+            .current()
+            .expect("temporary magic ref follows its allocation");
+        let mut first = fragment.off_heap_first();
+        let mut overhead = fragment.off_heap_overhead();
+        crate::heap::link_magic_thing(&mut first, &mut overhead, thing, owner);
+        fragment.set_off_heap_first(first);
+        fragment.set_off_heap_overhead(overhead);
+    }
+
+    fn supports_magic(&self) -> bool {
+        true
     }
 }
 

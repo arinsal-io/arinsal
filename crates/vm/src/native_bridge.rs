@@ -807,11 +807,8 @@ fn found_catch(
     reg[1] = reason;
     reg[2] = trace;
     reg[3] = exception_class_atom(class);
-    // handle_error has already set `c_p->freason = PRIMARY_EXCEPTION(..)` and `c_p->fvalue =
-    // NIL`, and keeps freason (beam_common.c:521-565). Arinsal still clears it
-    // (FREASON-TEST-1): bs_construct.rs:716, bs_fast.rs:964, module.rs:2403 and dispatch.rs:1829
-    // test a nonzero `freason` after their runtime calls.
-    process.heap.abi.exc.freason = 0;
+    // `handle_error` leaves PRIMARY_EXCEPTION in `c_p->freason` across `found_catch`; the catch
+    // code consumes it after the non-value marker in x0 (beam_common.c:517-525, :650-678).
     process.heap.abi.exc.ftrace = 0;
 }
 

@@ -314,3 +314,78 @@ fn aux_work_process_exit_cancels_owned_timer_memory() {
     let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
     assert_eq!(expected, CallResult::Ok(canonical));
 }
+
+#[test]
+fn no_aux_work_threads_is_schedulers_plus_one_without_mdai() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping no_aux default differential");
+        return;
+    };
+    let source = r#"-module(no_aux_default).
+        -export([run/0]).
+        run() ->
+            erts_internal:no_aux_work_threads() =:= erlang:system_info(schedulers) + 1."#;
+    let beam = reference
+        .compile_named("no_aux_default", source, &[])
+        .unwrap();
+    reference.load("no_aux_default", &beam).unwrap();
+    let expected = reference.call("no_aux_default", "run", &[]);
+    let mut vm = crate::common::node();
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm.eval_scheduled("no_aux_default", "run", &[], 1).unwrap();
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
+}
+
+#[test]
+fn no_aux_work_threads_counts_dirty_alloc_instances() {
+    let flags: &[&str] = &["+S", "2", "+SDcpu", "1", "+Mdai", "2"];
+    let Some(want) = no_aux_probe("erl", flags) else {
+        eprintln!("erl unavailable; skipping no_aux +Mdai differential");
+        return;
+    };
+    let Some(got) = no_aux_probe("arinsal", flags) else {
+        eprintln!("arinsal CLI not built; skipping no_aux +Mdai differential");
+        return;
+    };
+    similar_asserts::assert_eq!(got, want, "+S 2 +SDcpu 1 +Mdai 2");
+}
+
+fn no_aux_probe(runtime: &str, flags: &[&str]) -> Option<String> {
+    use std::path::Path;
+    use std::process::Command;
+    let mut command = if runtime == "erl" {
+        arinsal_difftest::reference::erl()?
+    } else {
+        let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/arinsal");
+        if !bin.is_file() {
+            return None;
+        }
+        let mut command = Command::new("timeout");
+        command.arg("30").arg(bin);
+        command
+    };
+    let output = command
+        .arg("-noshell")
+        .args(flags)
+        .args([
+            "-eval",
+            "io:format(\"~p\", [erts_internal:no_aux_work_threads()]), halt().",
+        ])
+        .env("ERL_AFLAGS", "")
+        .env("ERL_FLAGS", "")
+        .env("ERL_ZFLAGS", "")
+        .env("ERL_OTP29_FLAGS", "")
+        .env("ERL_CRASH_DUMP", "/dev/null")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        eprintln!(
+            "{runtime} {flags:?} exited {:?}: {}{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}

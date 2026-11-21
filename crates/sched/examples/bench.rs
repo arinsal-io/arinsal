@@ -91,7 +91,7 @@ impl Task for Dummy {
                 }
             }
             {
-                let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
+                let _ = ctx.clear_active_unless_queued();
             }
         })
     }

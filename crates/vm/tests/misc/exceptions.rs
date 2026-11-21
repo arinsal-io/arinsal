@@ -7,18 +7,11 @@ use arinsal_vm::{Vm, VmError};
 fn direct_bif_raise_preserves_class_and_reason() {
     let mut vm = crate::common::node();
     let value = Term::atom(global_atoms().intern("direct_reason").unwrap());
-    for (function, class, expected) in [
-        ("error", "Error", OwnedTerm::Atom("direct_reason".into())),
-        ("exit", "Exit", OwnedTerm::Atom("direct_reason".into())),
-        (
-            "throw",
-            "Error",
-            OwnedTerm::Tuple(vec![
-                OwnedTerm::Atom("nocatch".into()),
-                OwnedTerm::Atom("direct_reason".into()),
-            ]),
-        ),
-    ] {
+    // The eval carrier applies the BIF inside `try ... catch Class:Reason:Stack`, so a throw is
+    // caught as a throw: handle_error makes it `{nocatch, Reason}` only when `c_p->catches`
+    // is 0 (beam_common.c:509-515).
+    for (function, class) in [("error", "Error"), ("exit", "Exit"), ("throw", "Throw")] {
+        let expected = OwnedTerm::Atom("direct_reason".into());
         let Err(VmError::Raised(raised)) = vm.eval_exported("erlang", function, &[value]) else {
             panic!("{function}/1 did not raise a structured exception");
         };
@@ -100,6 +93,65 @@ fn four_hundred_exception_snippets_match_otp() {
                 "{function}({n}): expected {expected:?}, actual {actual:?}"
             );
         }
+    }
+}
+
+/// Guard BIFs that fail in a body (`i_bif*_body_shared`) report only `freason`/`fvalue`:
+/// `c_p->current` is not set on that path (erts names the BIF with `ubif2mfa`). Each call runs
+/// in a fresh carrier process with the module already loaded, where `current` is unset.
+#[test]
+fn guard_bif_body_errors_match_otp() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping guard BIF error differential test");
+        return;
+    };
+    let source = r#"
+-module(vm_exc_guard_body).
+-export([run/2]).
+run(N, A) -> try trigger(N, A) catch C:R:S -> {C,R,S} end.
+trigger(1, _) -> erlang:map_get(k, #{});
+trigger(2, _) -> erlang:map_get(k, [not_a_map]);
+trigger(3, M) -> erlang:map_get(k, M);
+trigger(4, _) -> erlang:map_size([not_a_map]);
+trigger(5, A) -> erlang:map_size(A);
+trigger(6, _) -> erlang:is_map_key(k, [not_a_map]);
+trigger(7, A) -> erlang:binary_part(A, {5, 5});
+trigger(8, A) -> erlang:binary_part(A, 5, 5);
+trigger(9, A) -> erlang:binary_part(A, {0, -1});
+trigger(10, A) -> maps:get(k, A);
+trigger(11, A) -> binary:part(A, 9, 1).
+"#;
+    let beam = reference
+        .compile_named("vm_exc_guard_body", source, &[])
+        .unwrap();
+    reference.load("vm_exc_guard_body", &beam).unwrap();
+    let mut vm = crate::common::node();
+    vm.load_bytes(&beam).unwrap();
+    let map = OwnedTerm::Map(vec![(OwnedTerm::Atom("a".into()), OwnedTerm::Int(1))]);
+    let binary = OwnedTerm::Binary(vec![1, 2]);
+    let cases = [
+        (1, OwnedTerm::Nil),
+        (2, OwnedTerm::Nil),
+        (3, map.clone()),
+        (3, OwnedTerm::Int(1)),
+        (4, OwnedTerm::Nil),
+        (5, OwnedTerm::Int(1)),
+        (6, OwnedTerm::Nil),
+        (7, binary.clone()),
+        (8, binary.clone()),
+        (9, binary.clone()),
+        (10, map),
+        (11, binary),
+    ];
+    for (n, arg) in cases {
+        let args = [OwnedTerm::Int(n), arg];
+        let expected = trim_result(reference.call("vm_exc_guard_body", "run", &args));
+        let actual = trim_result(vm_call(&mut vm, "run", &args, "vm_exc_guard_body"));
+        assert!(
+            compare(&expected, &actual, CompareMode::Exact).is_ok(),
+            "run({args:?}): expected {expected:?}, actual {actual:?}"
+        );
+        assert!(matches!(actual, CallResult::Ok(_)));
     }
 }
 

@@ -476,11 +476,8 @@ fn full_loop(
                         if at_beam_exit(process) {
                             break error_action_code(process, &mut *reg);
                         }
-                        let result = process.drain(ctx).and_then(|()| {
-                            // Only a BIF run for a native exit keeps a redzone.
-                            process.heap.clear_native_redzone();
-                            (Vm {}).enter_native_position(process)
-                        });
+                        process.heap.clear_native_redzone();
+                        let result = (Vm {}).enter_native_position(process);
                         // erts schedules out only when FCALLS runs out; entering the native code
                         // of the process's position continues the slice.
                         if matches!(&result, Ok(RunState::Yield))
@@ -847,7 +844,7 @@ pub(super) fn schedule_in_running_sys(
 /// no dirty work, all its reductions otherwise.
 // Port of erts/emulator/beam/erl_process.c:10319-10350 (erts_schedule:
 // erts_proc_sig_handle_incoming with `sig_reds`, then `reds -= sig_reds`), OTP-29.1.1.
-fn schedule_in_signals(
+pub(crate) fn schedule_in_signals(
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     state: u32,

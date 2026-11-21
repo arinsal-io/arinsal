@@ -332,9 +332,16 @@ pub(super) fn schedule_suspend_hibernate(
         };
     }
     if process.hibernate_sched() {
-        process.drain(ctx)?;
+        // Port of beam_common.c:1586-1596 (`erts_hibernate`): fetch only; do not drain the
+        // middle queue. `erts_proc_sig_fetch` returns `mq_len`.
+        process.fetch_signals(ctx)?;
         if process.inbox.is_empty() {
-            return Ok(Some(RunState::Wait));
+            // Signals queued since the drain keep the process active for the next one.
+            return Ok(Some(if ctx.clear_active_unless_queued() {
+                RunState::Wait
+            } else {
+                RunState::Yield
+            }));
         }
         // elixir_loop1: unlike hibernate/3, hibernate/0 keeps its stack.
         let resume_in_place = process

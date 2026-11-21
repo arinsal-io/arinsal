@@ -1399,6 +1399,8 @@ pub fn allocate_iolist_binary<H: HeapAlloc + ?Sized>(
     if byte_len == 0 {
         return crate::TermBuilder::new(heap).binary(&[]);
     }
+    // Size check that stays here, as iolist overflow / `IS_BINARY_SIZE_OK`: the bit length
+    // must fit a word. `erts_bin_nrml_alloc` itself does not return system_limit.
     let bit_len = byte_len
         .checked_mul(8)
         .filter(|bits| *bits <= isize::MAX as usize)

@@ -441,6 +441,13 @@ impl<'a, T: Task> CP<'a, T> {
     pub fn state(&self) -> &'a AtomicU32 {
         self.shared().input.state()
     }
+
+    /// A wait outside a receive: clear `ERTS_PSFLG_ACTIVE` under the msgq lock unless signals
+    /// are queued (erts_hibernate). Returns whether it was cleared.
+    // Port of erts/emulator/beam/beam_common.c:1584-1596 (erts_hibernate), OTP-29.1.1.
+    pub fn clear_active_unless_queued(&self) -> bool {
+        self.shared().input.clear_active_unless_queued()
+    }
 }
 
 /// The task of a process, written in place into the process struct after the struct is

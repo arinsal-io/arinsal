@@ -18,6 +18,7 @@ arinsal-maps.workspace = true
 arinsal-alloc = { path = "../alloc" }
 arinsal-etf.workspace = true
 libloading = "0.8.9"
+libc = "0.2.175"
 num-traits.workspace = true
 
 [build-dependencies]

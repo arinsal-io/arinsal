@@ -2,16 +2,37 @@
 // Port of erts/emulator/beam/erl_bits.c, erl_bits.h, and jit/beam_jit_common.cpp,
 // OTP-29.1.1.
 
+use arinsal_alloc::raw::BinaryView;
+use arinsal_alloc::typed::BinaryBlock;
 use arinsal_beamasm::{ProcessHeader, SchedulerRegisters};
 use arinsal_bits::{SegFlags, SegSize, SegType, Segment, SegmentValue};
-use arinsal_term::{Term, TermBuilder};
+use arinsal_term::{HeapAlloc, Term, TermBuilder};
 
 const ERTS_ON_HEAP_BITS_LIMIT: usize = 64 * 8;
 const ERTS_HEAP_BITS_TAG: u64 = 0x20;
 const ERTS_SUB_BITS_HEADER: u64 = (4 << 6) | 0x24;
+const ERTS_HEADER_BIN_REF: u64 = (2 << 6) | 0x28;
 const ERTS_BOXED_TAG: u64 = 2;
+const ERTS_SUB_BITS_FLAG_MUTABLE: u64 = 1 << 0;
 const ERTS_SUB_BITS_FLAG_VOLATILE: u64 = 1 << 1;
+const ERTS_SUB_BITS_FLAGS_WRITABLE: u64 = ERTS_SUB_BITS_FLAG_MUTABLE | ERTS_SUB_BITS_FLAG_VOLATILE;
 const ERTS_BINARY_FLAG_WRITABLE: u64 = 1 << 2;
+const ERTS_BINARY_FLAG_ACTIVE_WRITER: u64 = 1 << 3;
+const ERTS_BINARY_HEADER_WORDS: usize = 4;
+
+/// `NBYTES` in erts/emulator/beam/erl_bits.h:27, OTP-29.1.1.
+fn nbytes(bits: u64) -> u64 {
+    bits.wrapping_add(7) >> 3
+}
+
+/// `GROW_PROC_BIN_SIZE` in erts/emulator/beam/erl_bits.c:72, OTP-29.1.1.
+fn grow_proc_bin_size(size: usize) -> usize {
+    if size > (1 << 24) {
+        (1.2 * size as f64) as usize
+    } else {
+        size.wrapping_mul(2)
+    }
+}
 
 /// Uses the two-word `ErlBitsState` supplied by BeamAsm.
 fn with_state<R>(state: *mut u64, body: impl FnOnce(&mut [u64; 2]) -> R) -> Option<R> {
@@ -403,7 +424,10 @@ pub extern "C" fn erts_bs_append_checked(
     result
 }
 
-/// Runs checked private append through the same VM implementation used by the arm emitter.
+/// Private append of `extra_bits` into the unique writable `bin`.
+///
+/// Cannot fail on this 64-bit BeamAsm path: the size was validated by the caller,
+/// `HeapFragOnlyAlloc` and `erts_bin_realloc` never return failure to the caller.
 // Port of erts/emulator/beam/erl_bits.c:1928-2017 (`erts_bs_private_append_checked`), OTP-29.1.1.
 #[unsafe(no_mangle)]
 pub extern "C" fn erts_bs_private_append_checked(
@@ -412,13 +436,77 @@ pub extern "C" fn erts_bs_private_append_checked(
     bin: u64,
     extra_bits: u64,
 ) -> u64 {
-    let Some(process) = crate::native_hooks::enter_runtime(c_p) else {
-        return 0;
-    };
-    with_state(ebs, |state| {
-        crate::native_helpers::bs_private_append_checked(process, state, bin, extra_bits)
-    })
-    .unwrap_or(0)
+    let process =
+        crate::native_hooks::enter_runtime(c_p).expect("erts_bs_private_append_checked: Process *");
+    // SAFETY: BeamAsm `am_private_append` passes the live scheduler `ErlBitsState`, a
+    // `HEADER_SUB_BITS` whose `orig` is a `HEADER_BIN_REF`, and that BinRef's `Binary`.
+    // `sb->start == 0` and overflow are erts ASSERTs on BEAMASM; realloc and
+    // `HeapFragOnlyAlloc` cannot fail back to this caller.
+    unsafe {
+        let sb = (bin - ERTS_BOXED_TAG) as *mut u64;
+        debug_assert_eq!(sb.read(), ERTS_SUB_BITS_HEADER);
+        let orig = sb.add(4).read();
+        let br = (orig - ERTS_BOXED_TAG) as *mut u64;
+        debug_assert_eq!(br.read(), ERTS_HEADER_BIN_REF);
+        debug_assert_eq!(sb.add(2).read(), 0);
+        let old_position = sb.add(3).read();
+        ebs.add(1).write(old_position);
+        debug_assert!(u64::MAX - extra_bits >= old_position);
+        let new_position = old_position.wrapping_add(extra_bits);
+        let used_size = nbytes(new_position) as usize;
+        let mut header = br.add(1).read() as *mut u64;
+        let orig_size = header.add(3).read() as usize;
+        let view =
+            BinaryView::from_header(header, ERTS_BINARY_HEADER_WORDS + orig_size.div_ceil(8));
+        process.heap.update_writable_binary_overhead_at(
+            crate::native_hooks::from_raw(bin),
+            br as usize,
+            old_position as usize,
+            new_position as usize,
+        );
+        let (result, current_bin) = if view.has_flags(ERTS_BINARY_FLAG_WRITABLE) {
+            debug_assert_eq!(sb.add(1).read() & 3, ERTS_SUB_BITS_FLAGS_WRITABLE);
+            debug_assert_eq!(header.add(2).read(), 1);
+            if orig_size < used_size {
+                let new_size = grow_proc_bin_size(used_size);
+                let mut allocation = BinaryBlock::borrow_from_view(view)
+                    .expect("live writable Binary has allocator metadata");
+                allocation.realloc(new_size);
+                header = allocation.header_ptr().cast_mut();
+                br.add(1).write(header as u64);
+                charge_binary_reductions(process, old_position as usize);
+            }
+            sb.add(3).write(new_position);
+            let capacity = header.add(3).read() as usize;
+            let view =
+                BinaryView::from_header(header, ERTS_BINARY_HEADER_WORDS + capacity.div_ceil(8));
+            view.set_flags(ERTS_BINARY_FLAG_ACTIVE_WRITER);
+            view.set_apparent_size(used_size);
+            (bin, view.bytes_ptr() as u64)
+        } else {
+            let new_size = grow_proc_bin_size(used_size);
+            let copy = orig_size.min(new_size);
+            let prefix = view.bytes(copy).expect("orig_bytes of the traced Binary");
+            let (term, data_address) = TermBuilder::new(&mut process.heap)
+                .writable_binary_copy_in_fragment_with_address(
+                    prefix,
+                    new_position as usize,
+                    new_size,
+                )
+                .expect("HeapFragOnlyAlloc never fails");
+            charge_binary_reductions(process, old_position as usize);
+            (term.tagged_word(), data_address as u64)
+        };
+        debug_assert!({
+            let flags = (current_bin as *const u8)
+                .wrapping_sub(4 * core::mem::size_of::<u64>())
+                .cast::<u64>()
+                .read();
+            flags & ERTS_BINARY_FLAG_WRITABLE != 0
+        });
+        ebs.write(current_bin);
+        result
+    }
 }
 
 /// `erts_build_sub_bitstring` copies small ranges and otherwise allocates a `SUB_BITS` pointing

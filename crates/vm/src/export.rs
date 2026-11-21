@@ -174,8 +174,11 @@ pub(crate) fn finish_loading(
                 ep.set_bif_traced(false);
             }
         } else if tables.loaded.get(module.name.as_str()).is_some() {
-            // Port of erts/emulator/beam/beam_bif_load.c:2459-2480 (beam_make_current_old).
+            // Port of erts/emulator/beam/beam_bif_load.c:2459-2480 (beam_make_current_old):
+            // exports of the current instance go to the error handler, then `modp->old =
+            // modp->curr` and `curr` is emptied so the new instance can occupy `curr`.
             delete_code(tables, module.name_atom, ix);
+            tables.loaded.make_current_old(module.name.as_str());
         }
         for (mfa, export) in exports.iter().chain(imports) {
             tables.exports.put_export(*mfa, export);

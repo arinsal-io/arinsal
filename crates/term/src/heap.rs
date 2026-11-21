@@ -3098,6 +3098,12 @@ impl ProcessHeap {
         self.owners.vheap.old
     }
 
+    /// Old virtual binary heap usage plus off-heap overhead used by `max_heap_size`.
+    // Port of erts/emulator/beam/erl_gc.c:3730 (`has_reached_max_heap_size`), OTP-29.1.1.
+    pub fn max_heap_off_heap_words(&self) -> u64 {
+        self.owners.vheap.old + self.owners.overhead
+    }
+
     /// Current young virtual binary heap block size, in machine words.
     pub fn bin_vheap_block_size(&self) -> u64 {
         self.bin_vheap_size
@@ -3760,6 +3766,11 @@ impl TemporaryHeap {
         self.used
     }
 
+    /// Words remaining in this fixed temporary block.
+    pub fn remaining_words(&self) -> usize {
+        self.capacity - self.used
+    }
+
     /// Copy a tuple into this block, copying its key first and other elements in reverse order.
     ///
     /// Port of `db_copy_from_comp` in `erts/emulator/beam/erl_db_util.c`, OTP-29.1.1.
@@ -3865,6 +3876,70 @@ impl HeapAlloc for TemporaryHeap {
         true
     }
 }
+
+/// Exact-size `ERTS_ALC_T_TMP` term storage with no heap-fragment header.
+// Port of the raw TMP buffer in erts/emulator/beam/erl_gc.c:3790-3792 (`reached_max_heap_size`),
+// OTP-29.1.1.
+pub struct TemporaryTermBuffer {
+    block: AllocBlock,
+    capacity: usize,
+    used: usize,
+}
+
+impl TemporaryTermBuffer {
+    /// Allocate exactly `words` term words from `ERTS_ALC_T_TMP`.
+    pub fn new(words: usize) -> Result<Self, arinsal_alloc::alloc_util::AllocError> {
+        let mut block = AllocBlock::new(ErtsAlcType::TMP, words)?;
+        #[cfg(any(feature = "validate-terms", debug_assertions, test))]
+        crate::validate::note_stable_range(block.as_mut_ptr() as usize, words * 8);
+        Ok(Self {
+            block,
+            capacity: words,
+            used: 0,
+        })
+    }
+}
+
+impl Drop for TemporaryTermBuffer {
+    fn drop(&mut self) {
+        #[cfg(any(feature = "validate-terms", debug_assertions, test))]
+        crate::validate::forget_stable_range(self.block.as_mut_ptr() as usize);
+    }
+}
+
+impl HeapAlloc for TemporaryTermBuffer {
+    fn alloc(&mut self, words: usize) -> Option<*mut u64> {
+        let end = self.used.checked_add(words)?;
+        if end > self.capacity {
+            return None;
+        }
+        let ptr = self.block.as_mut_ptr().wrapping_add(self.used);
+        self.used = end;
+        Some(ptr)
+    }
+
+    fn alloc_halloc_with_extra(&mut self, words: usize, extra: usize) -> Option<*mut u64> {
+        let required = self.used.checked_add(words)?.checked_add(extra)?;
+        if required > self.capacity {
+            return None;
+        }
+        self.alloc(words)
+    }
+
+    fn alloc_with_extra(&mut self, words: usize, extra: usize) -> Option<*mut u64> {
+        self.alloc_halloc_with_extra(words, extra)
+    }
+
+    fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
+        drop(binary);
+    }
+
+    fn link_node(&mut self, _thing: *mut u64, _node: Node) {
+        unreachable!("process_gc_info does not allocate node terms");
+    }
+}
+
+pub use crate::raw::heap_frag::TemporaryHeapFactory;
 
 /// Immutable module literals. Address-range checks avoid consuming a pointer tag bit.
 pub struct LiteralArea {
@@ -4977,7 +5052,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
                     .ok_or(TermError::SystemLimit)
             });
         }
-        let mut binary = RefcBinary::new_uninit(size)?;
+        let mut binary = RefcBinary::new_uninit(size);
         let written = fill(binary.bytes_mut_unique().ok_or(TermError::BadArg)?)?;
         if written > size {
             return Err(TermError::BadArg);
@@ -5011,7 +5086,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         if bit_len.div_ceil(8) != size {
             return Err(TermError::BadArg);
         }
-        let binary = RefcBinary::new_uninit(size)?;
+        let binary = RefcBinary::new_uninit(size);
         self.install_refc_binary(binary, bit_len)
     }
     /// Build a bitstring with high bits significant in its final byte.
@@ -5025,7 +5100,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         }
         // Port of erts/emulator/beam/external.c (`dec_term`, BINARY_EXT / BIT_BINARY_EXT),
         // OTP-29.1.1: allocate the final refc binary and copy the payload once.
-        let mut binary = RefcBinary::new_uninit(count)?;
+        let mut binary = RefcBinary::new_uninit(count);
         let data = binary.bytes_mut_unique().ok_or(TermError::BadArg)?;
         data.copy_from_slice(&bytes[..count]);
         if !bit_len.is_multiple_of(8)
@@ -5049,7 +5124,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
             })?;
             return Ok((term, address));
         }
-        let binary = RefcBinary::new_uninit(count)?;
+        let binary = RefcBinary::new_uninit(count);
         address = binary.as_ptr() as usize;
         let term = self.install_refc_binary(binary, bit_len)?;
         Ok((term, address))
@@ -6636,7 +6711,7 @@ impl Term {
 }
 #[cfg(test)]
 mod heap_block_tests {
-    use super::{HeapAlloc, ProcessHeap, TermBuilder, VecHeap};
+    use super::{HeapAlloc, ProcessHeap, TemporaryHeapFactory, Term, TermBuilder, VecHeap};
 
     #[test]
     fn positive_bignum_block_leaves_digits_for_incremental_fill() {
@@ -6651,6 +6726,21 @@ mod heap_block_tests {
             term.with_bignum_digits_mut(|digits| digits.to_vec()),
             Some(vec![11, 22, 33])
         );
+    }
+
+    #[test]
+    fn temporary_factory_grows_and_keeps_prior_terms_stable() {
+        let mut heap = TemporaryHeapFactory::new();
+        let first = TermBuilder::new(&mut heap)
+            .tuple(&[Term::small(17).unwrap()])
+            .unwrap();
+        let values = (0..400).map(|value| Term::small(value).unwrap());
+        let list = TermBuilder::new(&mut heap).list_from_iter(values).unwrap();
+
+        // SAFETY: Both terms are allocated by `heap`, which remains alive through these reads.
+        let tuple_value = unsafe { first.tuple_ref().unwrap().get(0).unwrap() };
+        similar_asserts::assert_eq!(tuple_value, Term::small(17).unwrap());
+        similar_asserts::assert_eq!(crate::term_sequence(list).unwrap().len(), 400);
     }
 
     #[test]

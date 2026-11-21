@@ -929,10 +929,9 @@ pub(crate) enum RemoteOp {
     Collect { request_id: Message, major: bool },
     /// Check whether the target still has a direct reference to old module code.
     CheckProcessCode {
-        /// Old code of the checked module; `None` when it has none (the result is `false`).
-        module: Option<usize>,
-        /// Native function ranges of the old module version, when BeamAsm compiled it.
-        native: Option<std::sync::Arc<crate::beamasm_integration::CompiledVersion>>,
+        /// Module atom text; `erts_check_process_code` looks up `Module.old` of
+        /// `erts_get_module(module, erts_active_code_ix())` when the task runs.
+        module: String,
         async_request: Option<Message>,
         kill: bool,
     },

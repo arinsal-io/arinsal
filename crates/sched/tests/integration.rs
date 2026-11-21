@@ -26,7 +26,7 @@ impl Task for Collector {
                 this.output.lock().unwrap().push(entry);
             }
             {
-                let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
+                let _ = ctx.clear_active_unless_queued();
             }
         })
     }
@@ -117,7 +117,7 @@ impl Task for CountTask {
                 this.0.fetch_add(1, Ordering::Relaxed);
             }
             {
-                let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
+                let _ = ctx.clear_active_unless_queued();
             }
         })
     }
@@ -322,7 +322,7 @@ fn hot_mailbox_repeated_waits_do_not_lose_wakes() {
                     this.0.fetch_add(1, Ordering::Relaxed);
                 }
                 {
-                    let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
+                    let _ = ctx.clear_active_unless_queued();
                 }
             })
         }
@@ -389,7 +389,7 @@ fn worker_blocks_preserve_sender_message_signal_order() {
                         output.lock().unwrap().push((event.from, sequence));
                     }
                     {
-                        let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
+                        let _ = ctx.clear_active_unless_queued();
                     }
                 }
             })
@@ -446,7 +446,7 @@ fn ping_pong_gives_external_work_a_turn() {
                         }
                     }
                     {
-                        let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
+                        let _ = ctx.clear_active_unless_queued();
                     }
                 }
                 Work::Observe(count, observed) => {
@@ -752,7 +752,7 @@ impl Task for Idle {
         esdp.with_ctx(c_p, |_, ctx| {
             while ctx.receive().is_some() {}
             {
-                let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
+                let _ = ctx.clear_active_unless_queued();
             }
         })
     }
@@ -827,7 +827,7 @@ fn wait_timer_keeps_its_position_across_reentry() {
                 }
                 {
                     arinsal_sched::erts_set_proc_timer_term(ctx.esdp(), pos);
-                    let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
+                    let _ = ctx.clear_active_unless_queued();
                 }
             })
         }

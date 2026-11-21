@@ -3,8 +3,12 @@
 use crate::alloc_util::AllocError;
 use crate::instances::{InstanceAllocation, ThreadSpecificAllocators};
 use crate::raw::WordView;
+use std::io::Write;
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
+
+/// `BIN_FLAG_DRV` (`erl_binary.h`).
+const BIN_FLAG_DRV: u64 = 1 << 1;
 
 /// An ERTS allocation type name from `erl_alloc.types`.
 ///
@@ -119,6 +123,19 @@ impl ErtsAlcType {
     /// Name generated from `erl_alloc.types`.
     pub const fn name(self) -> &'static str {
         ALC_TYPES[self.0 as usize].0
+    }
+
+    /// Allocator advertisement string (`ERTS_ALC_A2AD`).
+    pub const fn allocator_name(self) -> &'static str {
+        ALLOCATOR_NAMES[self.allocator()]
+    }
+
+    /// Human-readable type string (`ERTS_ALC_N2TD` / `type_no_str`).
+    pub fn description(self) -> &'static str {
+        crate::types::ALLOCATION_TYPES
+            .iter()
+            .find(|ty| ty.name == self.name())
+            .map_or_else(|| self.name(), |ty| ty.description)
     }
 
     /// Index of this type among the fixed-size types (`ERTS_ALC_FIX_TYPE_IX`), `None` for a type
@@ -707,19 +724,57 @@ impl MessageRefBlock {
     }
 }
 
+/// `IS_BINARY_SIZE_OK`: a binary's size in bits must fit in a word.
+// Port of erts/emulator/beam/erl_binary.h:234 (`IS_BINARY_SIZE_OK`), OTP-29.1.1.
+pub const fn is_binary_size_ok(byte_size: usize) -> bool {
+    byte_size <= usize::MAX / 8
+}
+
+fn binary_alc_type(flags: u64) -> ErtsAlcType {
+    if flags & BIN_FLAG_DRV != 0 {
+        ErtsAlcType::DRV_BINARY
+    } else {
+        ErtsAlcType::BINARY
+    }
+}
+
+fn chicken_pad(flags: u64) -> usize {
+    if flags & BIN_FLAG_DRV == 0 {
+        return 0;
+    }
+    // Port of erts/emulator/beam/erl_binary.h:246 (`CHICKEN_PAD`), OTP-29.1.1.
+    if cfg!(debug_assertions) {
+        0
+    } else {
+        std::mem::size_of::<*const ()>().saturating_sub(1)
+    }
+}
+
 impl BinaryBlock {
     const PREFIX_WORDS: usize = 1;
     const HEADER_WORDS: usize = 4;
 
-    /// Allocate one binary header and byte payload from the `BINARY` allocator.
-    // Port of erts/emulator/beam/erl_binary.h:287 (`erts_bin_nrml_alloc_fnf`), OTP-29.1.1.
-    pub fn new(size: usize, flags: u64, apparent_size: usize) -> Result<Self, AllocError> {
-        let payload_words = size.div_ceil(std::mem::size_of::<u64>());
-        let words = Self::PREFIX_WORDS
+    fn words_for(size: usize, flags: u64) -> Result<usize, AllocError> {
+        if !is_binary_size_ok(size) {
+            return Err(AllocError::OutOfBounds);
+        }
+        let payload_bytes = size
+            .checked_add(chicken_pad(flags))
+            .ok_or(AllocError::OutOfBounds)?;
+        let payload_words = payload_bytes.div_ceil(std::mem::size_of::<u64>());
+        Self::PREFIX_WORDS
             .checked_add(Self::HEADER_WORDS)
             .and_then(|header| header.checked_add(payload_words))
-            .ok_or(AllocError::OutOfBounds)?;
-        let mut allocation = AllocBlock::new(ErtsAlcType::BINARY, words)?;
+            .ok_or(AllocError::OutOfBounds)
+    }
+
+    /// Allocate one binary header and byte payload (`erts_bin_nrml_alloc_fnf` /
+    /// `erts_bin_drv_alloc_fnf` when `BIN_FLAG_DRV` is set).
+    // Port of erts/emulator/beam/erl_binary.h:252 and :287 (`erts_bin_drv_alloc_fnf`,
+    // `erts_bin_nrml_alloc_fnf`), OTP-29.1.1.
+    pub fn new_fnf(size: usize, flags: u64, apparent_size: usize) -> Result<Self, AllocError> {
+        let words = Self::words_for(size, flags)?;
+        let mut allocation = AllocBlock::new(binary_alc_type(flags), words)?;
         let handle = allocation.handle.ok_or(AllocError::InvalidAllocation)?;
         let memory = &mut allocation.memory;
         memory.write_word(0, handle.instance() as u64);
@@ -737,6 +792,25 @@ impl BinaryBlock {
             allocators,
             owned: true,
         })
+    }
+
+    /// Allocate one binary header and byte payload (`erts_bin_nrml_alloc` /
+    /// `erts_bin_drv_alloc`). Out of memory ends the node.
+    // Port of erts/emulator/beam/erl_binary.h:274 and :309 (`erts_bin_drv_alloc`,
+    // `erts_bin_nrml_alloc`), OTP-29.1.1.
+    pub fn new(size: usize, flags: u64, apparent_size: usize) -> Self {
+        Self::new_fnf(size, flags, apparent_size)
+            .unwrap_or_else(|_| erts_alloc_enomem(binary_alc_type(flags), size))
+    }
+
+    /// `erts_bin_drv_alloc_fnf`.
+    pub fn drv_alloc_fnf(size: usize) -> Result<Self, AllocError> {
+        Self::new_fnf(size, BIN_FLAG_DRV, size)
+    }
+
+    /// `erts_bin_drv_alloc`. Out of memory ends the node.
+    pub fn drv_alloc(size: usize) -> Self {
+        Self::new(size, BIN_FLAG_DRV, size)
     }
 
     /// Create one owning handle for a live binary view.
@@ -919,16 +993,13 @@ impl BinaryBlock {
         self.memory.as_ptr().wrapping_add(Self::PREFIX_WORDS)
     }
 
-    /// Resize the single allocation while this is its unique owner.
+    /// Resize the single allocation while this is its unique owner (`erts_bin_realloc_fnf`).
     // Port of erts/emulator/beam/erl_binary.h:321 (`erts_bin_realloc_fnf`), OTP-29.1.1.
-    pub fn realloc(&mut self, size: usize) -> Result<(), AllocError> {
+    pub fn realloc_fnf(&mut self, size: usize) -> Result<(), AllocError> {
         if self.reference_count() != 1 {
             return Err(AllocError::Corrupt);
         }
-        let words = Self::PREFIX_WORDS
-            .checked_add(Self::HEADER_WORDS)
-            .and_then(|header| header.checked_add(size.div_ceil(std::mem::size_of::<u64>())))
-            .ok_or(AllocError::OutOfBounds)?;
+        let words = Self::words_for(size, self.flags())?;
         let bytes = words
             .checked_mul(std::mem::size_of::<u64>())
             .ok_or(AllocError::OutOfBounds)?;
@@ -943,6 +1014,18 @@ impl BinaryBlock {
         self.memory
             .atomic_store(Self::PREFIX_WORDS + 3, size as u64, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Resize the single allocation while this is its unique owner (`erts_bin_realloc`).
+    // Port of erts/emulator/beam/erl_binary.h:350 (`erts_bin_realloc`), OTP-29.1.1.
+    pub fn realloc(&mut self, size: usize) {
+        match self.realloc_fnf(size) {
+            Ok(()) => {}
+            Err(AllocError::Corrupt) => {
+                panic!("erts_bin_realloc: binary is not uniquely owned")
+            }
+            Err(_) => erts_realloc_enomem(binary_alc_type(self.flags()), size),
+        }
     }
 }
 
@@ -1363,6 +1446,51 @@ const ALLOCATOR_NAMES: [&str; 10] = [
     "driver_alloc",
 ];
 
+/// `ERTS_ALC_O_ALLOC` / `ERTS_ALC_O_REALLOC`.
+#[derive(Clone, Copy)]
+enum AlcOp {
+    Alloc,
+    Realloc,
+}
+
+/// Slogan of `erts_alc_fatal_error(ERTS_ALC_E_NOMEM, ...)`.
+// Port of erts/emulator/beam/erl_alloc.c:2074 (`ERTS_ALC_E_NOMEM`), OTP-29.1.1.
+pub fn nomem_slogan(allocation_type: ErtsAlcType, size: usize, realloc: bool) -> String {
+    let op = if realloc { "reallocate" } else { "allocate" };
+    format!(
+        "{}: Cannot {op} {size} bytes of memory (of type \"{}\").",
+        allocation_type.allocator_name(),
+        allocation_type.description()
+    )
+}
+
+fn erts_alc_fatal_error(op: AlcOp, allocation_type: ErtsAlcType, size: usize) -> ! {
+    // Port of erts/emulator/beam/erl_alloc.c:2033 (`erts_alc_fatal_error`) and
+    // erl_init.c:2708 (`erts_exit_vv` with `ERTS_DUMP_EXIT`), OTP-29.1.1.
+    // erts_exit(ERTS_DUMP_EXIT, slogan) prints the slogan (`erl_error`), then
+    // erl_crash_dump.c:509/697: "\nCrash dump is being written to: %s..." / "done\n".
+    let slogan = nomem_slogan(allocation_type, size, matches!(op, AlcOp::Realloc));
+    let mut stderr = std::io::stderr().lock();
+    let _ = write!(
+        stderr,
+        "{slogan}\n\nCrash dump is being written to: erl_crash.dump...done\n"
+    );
+    let _ = stderr.flush();
+    std::process::exit(1)
+}
+
+/// `erts_alloc_enomem`: print the allocator OOM slogan and `erts_exit(ERTS_DUMP_EXIT)`.
+// Port of erts/emulator/beam/erl_alloc.c:2099 (`erts_alloc_enomem`), OTP-29.1.1.
+pub fn erts_alloc_enomem(allocation_type: ErtsAlcType, size: usize) -> ! {
+    erts_alc_fatal_error(AlcOp::Alloc, allocation_type, size)
+}
+
+/// `erts_realloc_enomem`: print the allocator OOM slogan and `erts_exit(ERTS_DUMP_EXIT)`.
+// Port of erts/emulator/beam/erl_alloc.c:2111 (`erts_realloc_enomem`), OTP-29.1.1.
+pub fn erts_realloc_enomem(allocation_type: ErtsAlcType, size: usize) -> ! {
+    erts_alc_fatal_error(AlcOp::Realloc, allocation_type, size)
+}
+
 /// The configured scheduler and dirty allocator instance counts.
 #[derive(Clone, Copy)]
 struct InstanceConfig {
@@ -1396,6 +1524,15 @@ pub(crate) fn configured() -> Option<(usize, usize)> {
     CONFIG
         .get()
         .map(|config| (config.schedulers, config.dirty_instances))
+}
+
+/// `erts_no_dirty_alloc_instances` after `erts_alloc_init` (`+Mdai`, default 0).
+// Port of erts/emulator/beam/erl_alloc.c (`erts_no_dirty_alloc_instances`), OTP-29.1.1.
+pub fn dirty_alloc_instances() -> usize {
+    CONFIG
+        .get()
+        .map(|config| config.dirty_instances)
+        .unwrap_or(0)
 }
 
 /// Number of instances of the allocator `name`, `None` for an unknown or absent allocator.
@@ -1942,7 +2079,10 @@ pub fn ets_allocation_bytes() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{AllocBlock, ErtsAlcType, FixAllocArc, FixAllocRefCount};
+    use super::{
+        AllocBlock, BinaryBlock, ErtsAlcType, FixAllocArc, FixAllocRefCount, is_binary_size_ok,
+        nomem_slogan,
+    };
     use std::sync::atomic::Ordering;
 
     struct MonitorPayload {
@@ -2118,5 +2258,37 @@ mod tests {
             .join()
             .unwrap();
         crate::typed::drain_shared_deallocations();
+    }
+
+    #[test]
+    fn binary_nomem_slogan_matches_erts() {
+        similar_asserts::assert_eq!(
+            nomem_slogan(ErtsAlcType::BINARY, 32, false),
+            "binary_alloc: Cannot allocate 32 bytes of memory (of type \"binary\")."
+        );
+        similar_asserts::assert_eq!(
+            nomem_slogan(ErtsAlcType::DRV_BINARY, 8, true),
+            "binary_alloc: Cannot reallocate 8 bytes of memory (of type \"drv_binary\")."
+        );
+    }
+
+    #[test]
+    fn binary_fnf_rejects_a_size_whose_bit_length_does_not_fit_a_word() {
+        assert!(is_binary_size_ok(usize::MAX / 8));
+        assert!(!is_binary_size_ok(usize::MAX / 8 + 1));
+        assert!(BinaryBlock::new_fnf(usize::MAX / 8 + 1, 0, 0).is_err());
+        assert!(BinaryBlock::drv_alloc_fnf(usize::MAX / 8 + 1).is_err());
+    }
+
+    #[test]
+    fn binary_block_alloc_and_realloc_succeed_for_a_live_size() {
+        let mut block = BinaryBlock::new(16, 0, 16);
+        assert_eq!(block.size(), 16);
+        block.realloc(64);
+        assert_eq!(block.size(), 64);
+        assert!(block.realloc_fnf(usize::MAX / 8 + 1).is_err());
+        let drv = BinaryBlock::drv_alloc(8);
+        assert_eq!(drv.size(), 8);
+        assert_eq!(drv.flags() & 2, 2);
     }
 }

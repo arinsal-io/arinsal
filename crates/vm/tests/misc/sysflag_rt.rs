@@ -10,7 +10,8 @@ const SOURCE: &str = r#"
          bind_default/0, bind_orderings/0, bind_defined_orderings/0,
          topology_round_trip/0, topology_legacy_form/0, topology_root_levels/0,
          blocked_scheduler_run_queue/0,
-         microstate_after_disable/0, blocker_exit/0, change_flags/0,
+         microstate_after_disable/0, blocker_exit/0, multi_blockers/0,
+         block_normal_dirty/0, change_flags/0,
          runtime_defaults/0]).
 
 %% erts_continue_exit_process releases the blocks an exiting process holds.
@@ -50,6 +51,46 @@ blocker_exit() ->
     {A, B, {C1, C2, C3, C4, C5}, {D1, D2, D3, D4, D5, D6},
      erlang:system_info(multi_scheduling),
      erlang:system_info(normal_multi_scheduling_blockers)}.
+
+multi_blockers() ->
+    Parent = self(),
+    A = spawn(fun() ->
+                  R = erlang:system_flag(multi_scheduling, block),
+                  Parent ! {blocked, a, R},
+                  receive unblock ->
+                      Parent ! {unblocked, a,
+                                erlang:system_flag(multi_scheduling, unblock)}
+                  end
+              end),
+    RA = receive {blocked, a, R1} -> R1 end,
+    B = spawn(fun() ->
+                  R = erlang:system_flag(multi_scheduling, block),
+                  Parent ! {blocked, b, R},
+                  receive unblock ->
+                      Parent ! {unblocked, b,
+                                erlang:system_flag(multi_scheduling, unblock)}
+                  end
+              end),
+    RB = receive {blocked, b, R2} -> R2 end,
+    BeforeOrder = erlang:system_info(multi_scheduling_blockers) =:= [B, A],
+    A ! unblock,
+    UA = receive {unblocked, a, R3} -> R3 end,
+    Middle = {erlang:system_info(multi_scheduling),
+              erlang:system_info(multi_scheduling_blockers) =:= [B]},
+    B ! unblock,
+    UB = receive {unblocked, b, R4} -> R4 end,
+    {RA, RB, BeforeOrder, UA, Middle, UB,
+     erlang:system_info(multi_scheduling),
+     erlang:system_info(multi_scheduling_blockers) =:= []}.
+
+block_normal_dirty() ->
+    Previous = erlang:system_flag(multi_scheduling, block_normal),
+    Parent = self(),
+    P = spawn(fun() -> Parent ! {dirty_done, erts_debug:dirty_cpu(wait, 20)} end),
+    Completed = receive {dirty_done, _} -> true after 5000 -> false end,
+    State = erlang:system_info(multi_scheduling),
+    Enabled = erlang:system_flag(multi_scheduling, unblock_normal),
+    {Previous, State, is_pid(P), Completed, Enabled}.
 
 %% Leaves every flag changed; a later runtime must not see these values.
 change_flags() ->
@@ -316,6 +357,16 @@ fn sysflag_rt_blocked_scheduler_keeps_the_caller_runnable() {
 #[test]
 fn sysflag_rt_exiting_blocker_releases_multi_scheduling() {
     compare("blocker_exit");
+}
+
+#[test]
+fn sysflag_rt_multiple_blockers_preserve_order_and_release_independently() {
+    compare("multi_blockers");
+}
+
+#[test]
+fn sysflag_rt_block_normal_keeps_dirty_cpu_work_running() {
+    compare("block_normal_dirty");
 }
 
 /// Several runtimes share this OS process; erts keeps these flags per emulator.

@@ -3038,6 +3038,11 @@ fn port_id(process: &Process, term: Term) -> Option<u64> {
     process.runtime.as_ref()?.reg.whereis_port(name)
 }
 
+/// `prt->common.id` when `sig_lookup_port` found the port; `None` when it did not.
+pub(crate) fn resolved_port_term(process: &Process, term: Term) -> Option<Term> {
+    port_id(process, term).and_then(Term::port)
+}
+
 pub(crate) fn is_live(process: &Process, id: u64) -> bool {
     process
         .runtime
@@ -3263,14 +3268,6 @@ fn driver_control(
     drv_sig::control(process, ctx, caller, drv_port, opcode, bytes)
 }
 
-/// Next local port id for `open_port`, or `system_limit` when the port table is full.
-// Port of erts/emulator/beam/erl_ptab.c (erts_ptab_new_element), OTP-29.1.1.
-fn notsup() -> VmError {
-    VmError::Trap(crate::exceptions::Trap::error(Term::atom(
-        arinsal_term::atoms::NOTSUP,
-    )))
-}
-
 /// `ERTS_PORT_OP_BUSY` without `nosuspend`, after `erts_suspend(BIF_P, ERTS_PROC_LOCK_MAIN,
 /// prt)`: `ERTS_BIF_YIELD3(BIF_TRAP_EXPORT(BIF_erts_internal_port_command_3), ...)`. The
 /// suspended process redoes the command through its own export once the port is not busy.
@@ -3295,36 +3292,67 @@ fn port_command(
     args: &[Term],
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_bif_port.c:168 (erts_internal_port_command_3), OTP-29.1.1.
-    let id = port_id(process, port).ok_or_else(badarg)?;
-    let handle = process
-        .runtime
-        .as_ref()
-        .and_then(|runtime| runtime.ports.get(id))
-        .ok_or_else(badarg)?;
     let mut nosuspend = false;
     let mut force = false;
     if args.len() == 3 {
-        let options = list(args[2]).ok_or_else(badarg)?;
+        // `BIF_RET(am_badopt)` before lookup: no HANDLE_SIGNALS tail.
+        let Some(options) = list(args[2]) else {
+            return Ok(Term::atom(arinsal_term::atoms::BADOPT));
+        };
         for option in options {
             if option == Term::atom(arinsal_term::atoms::NOSUSPEND) {
                 nosuspend = true;
             } else if option == Term::atom(arinsal_term::atoms::FORCE) {
                 force = true;
-                // tcp_inet sets ERL_DRV_FLAG_SOFT_BUSY (inet_drv.c driver flags).
-                // spawn/fd drivers do not, so `force` is `notsup` there.
-                let soft_busy = handle
-                    .driver
-                    .as_ref()
-                    .is_some_and(|d| d.driver().flags() & ERL_DRV_FLAG_SOFT_BUSY != 0);
-                if !soft_busy {
-                    return Err(notsup());
-                }
             } else {
-                return Err(badarg());
+                return Ok(Term::atom(arinsal_term::atoms::BADOPT));
             }
         }
     }
-    if let Some(drv_port) = handle.drv_port() {
+    let prt = resolved_port_term(process, port);
+    let Some(id) = port_id(process, port) else {
+        return crate::natives::erl_bif_port::after_port_return(
+            process,
+            ctx,
+            port,
+            prt,
+            Term::atom(arinsal_term::atoms::BADARG),
+            crate::natives::erl_bif_port::PortExiting::Error,
+        );
+    };
+    let Some(handle) = process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.ports.get(id))
+    else {
+        return crate::natives::erl_bif_port::after_port_return(
+            process,
+            ctx,
+            port,
+            prt,
+            Term::atom(arinsal_term::atoms::BADARG),
+            crate::natives::erl_bif_port::PortExiting::Error,
+        );
+    };
+    if force {
+        // tcp_inet sets ERL_DRV_FLAG_SOFT_BUSY (inet_drv.c driver flags).
+        // spawn/fd drivers do not, so `force` is `notsup` there.
+        let soft_busy = handle
+            .driver
+            .as_ref()
+            .is_some_and(|d| d.driver().flags() & ERL_DRV_FLAG_SOFT_BUSY != 0);
+        if !soft_busy {
+            return crate::natives::erl_bif_port::after_port_return(
+                process,
+                ctx,
+                port,
+                prt,
+                Term::atom(arinsal_term::atoms::NOTSUP),
+                crate::natives::erl_bif_port::PortExiting::Error,
+            );
+        }
+    }
+    let retval = if let Some(drv_port) = handle.drv_port() {
         // Port of erts/emulator/beam/erl_bif_port.c:168 (erts_internal_port_command_3).
         let flags = drv_sig::OutputFlags {
             bang: false,
@@ -3344,12 +3372,12 @@ fn port_command(
                 flags,
                 true,
             ) {
-                drv_sig::PortOp::Done => return Ok(Term::atom(arinsal_term::atoms::TRUE)),
+                drv_sig::PortOp::Done => break Ok(Term::atom(arinsal_term::atoms::TRUE)),
                 drv_sig::PortOp::Dropped | drv_sig::PortOp::Badarg => {
-                    return Ok(Term::atom(arinsal_term::atoms::BADARG));
+                    break Ok(Term::atom(arinsal_term::atoms::BADARG));
                 }
                 drv_sig::PortOp::Busy if nosuspend => {
-                    return Ok(Term::atom(arinsal_term::atoms::FALSE));
+                    break Ok(Term::atom(arinsal_term::atoms::FALSE));
                 }
                 drv_sig::PortOp::Busy => {
                     if suspend_on_busy(process, &handle, &drv_port, pid) {
@@ -3358,34 +3386,49 @@ fn port_command(
                 }
                 drv_sig::PortOp::BusyScheduled(reference)
                 | drv_sig::PortOp::Scheduled(reference) => {
-                    return match reference {
+                    break match reference {
                         Some(reference) => drv_sig::reference_term(process, reference),
                         None => Ok(Term::atom(arinsal_term::atoms::TRUE)),
                     };
                 }
             }
         }
-    }
-    // Every other port is a driver port; ram_file_drv is the one port without a driver
-    // record.
-    let framed = iodata(data).ok_or_else(badarg)?;
-    let bytes_out = framed.len();
-    let Some(ram_file) = handle.ram_file_data() else {
-        return Err(badarg());
+    } else {
+        // Every other port is a driver port; ram_file_drv is the one port without a driver
+        // record.
+        Ok(
+            if let (Some(framed), Some(ram_file)) = (iodata(data), handle.ram_file_data()) {
+                let bytes_out = framed.len();
+                let closed = {
+                    let state = handle.state.lock();
+                    state.closed || state.broken
+                };
+                if closed {
+                    Term::atom(arinsal_term::atoms::BADARG)
+                } else {
+                    trace_command_received_data(process, ctx.pid(), id, data, &framed);
+                    match crate::ram_file_drv::command(&ram_file, &handle, &framed) {
+                        Ok(()) => {
+                            handle.add_bytes_out(bytes_out);
+                            Term::atom(arinsal_term::atoms::TRUE)
+                        }
+                        Err(()) => Term::atom(arinsal_term::atoms::BADARG),
+                    }
+                }
+            } else {
+                Term::atom(arinsal_term::atoms::BADARG)
+            },
+        )
     };
-    let state = handle.state.lock();
-    if state.closed || state.broken {
-        return Err(badarg());
-    }
-    drop(state);
-    trace_command_received_data(process, ctx.pid(), id, data, &framed);
-    let result = crate::ram_file_drv::command(&ram_file, &handle, &framed);
-    if result.is_ok() {
-        handle.add_bytes_out(bytes_out);
-    }
-    result
-        .map(|()| Term::atom(arinsal_term::atoms::TRUE))
-        .map_err(|()| badarg())
+    let retval = retval?;
+    crate::natives::erl_bif_port::after_port_return(
+        process,
+        ctx,
+        port,
+        prt,
+        retval,
+        crate::natives::erl_bif_port::PortExiting::Error,
+    )
 }
 
 // Port of erts/emulator/beam/io.c:1508 (trace_port_receive command), OTP-29.1.1.

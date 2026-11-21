@@ -9,7 +9,6 @@
 //! data, through `with_sched`, as the trace calls of `erl_create_process` take the tracer through
 //! the scheduler. `suspend_process/2` stays on the executor (`erts_suspend` + `ERTS_BIF_YIELD`).
 
-use crate::code_ix::{code_tables, erts_active_code_ix};
 use crate::natives::bif::{badarg, bif_ret, with_sched};
 use crate::proc_create::AliasMode;
 use crate::process::{MaxHeap, Message, Runtime};
@@ -770,13 +769,8 @@ pub(crate) extern "C" fn erts_internal_no_aux_work_threads_0(
         return 0;
     };
     process.heap.note_bif_entry();
-    // erts counts its normal schedulers, the standard aux thread, and the extra aux threads
-    // created for dirty allocator instances (erl_process.c:6223; erl_init.c:1216).
-    let n = u64::from(arinsal_sched::unique::normal_scheduler_count())
-        + 1
-        + arinsal_args::active_allocator_options()
-            .dirty_instances
-            .unwrap_or(0) as u64;
+    // Port of erts/emulator/beam/erl_process.c:9234-9236: `BIF_RET(make_small(erts_no_aux_work_threads))`.
+    let n = u64::from(arinsal_sched::erts_no_aux_work_threads());
     bif_ret(c_p, i, crate::natives::sys::non_neg(process, n))
 }
 
@@ -889,17 +883,9 @@ fn request_system_task(
         }
         "check_process_code" => {
             let module = crate::signals::atom_name(arg0).ok_or_else(badarg)?;
-            let old = code_tables(erts_active_code_ix()).old.get(&module).copied();
             (
                 crate::signals::RemoteOp::CheckProcessCode {
-                    module: old,
-                    native: old.and_then(|old| {
-                        crate::load::native_code_version(
-                            &code_tables(erts_active_code_ix()).code_meta,
-                            old,
-                        )
-                        .cloned()
-                    }),
+                    module,
                     async_request: Some(Message::copy_from(req_id)?),
                     kill: false,
                 },

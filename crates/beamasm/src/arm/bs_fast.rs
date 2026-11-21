@@ -259,7 +259,8 @@ fn emit_private(
         crate::raw::erts_bs_private_append_checked as *const () as usize,
     )?;
     crate::emit_leave_runtime(&mut asm.code, live as usize, update)?;
-    asm.code.cbz(Gpr::x(0), slow)?;
+    // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1881, OTP-29.1.1:
+    // "There is no way the call can fail on a 64-bit architecture."
     asm.code
         .emit(|e| e.str_uoff(Gpr::x(0), SCHEDULER_REGS, TMP_MEM0))?;
     let ebs_off = crate::arm::beam_asm::ERL_BITS_STATE_REF;

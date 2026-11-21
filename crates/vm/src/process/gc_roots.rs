@@ -147,11 +147,11 @@ impl Process {
                 .as_ref()
                 .expect("limited heap has cold data")
                 .max_heap;
-            let binary_words = (if limit.include_shared_binaries {
-                off_heap_binary_words(self, objv)
+            let off_heap_words = if limit.include_shared_binaries {
+                self.heap.max_heap_off_heap_words()
             } else {
                 0
-            }) as u64;
+            };
             let message_words = if on_heap_msgq {
                 arinsal_term::GcMessageQueue::attached_words(&self.inbox)
             } else {
@@ -163,14 +163,16 @@ impl Process {
             let exceeded = [Some(checks.0), checks.1]
                 .into_iter()
                 .flatten()
-                .find(|&size| (size as u64).saturating_add(binary_words) > limit.size);
+                .find(|check| {
+                    (check.total_heap_size as u64).saturating_add(off_heap_words) > limit.size
+                });
             // Port of erts/emulator/beam/erl_gc.c:1454-1457 / 1903-1906 (minor_collection /
             // major_collection: `has_reached_max_heap_size` + `reached_max_heap_size` return
             // -2) and 870-886 (garbage_collect: `reds == -2`), OTP-29.1.1: a process configured
             // to be killed is made exiting and its collection delayed; it leaves through
             // `do_schedule` and terminates at `beam_exit`.
-            if let Some(size) = exceeded
-                && reached_max_heap_size(self, limit, (size as u64).saturating_add(binary_words))
+            if let Some(check) = exceeded
+                && reached_max_heap_size(self, limit, check)
             {
                 self.erts_set_self_exiting_c_p(Term::atom(arinsal_term::atoms::KILLED));
                 self.delay_heap_collection(min_free);

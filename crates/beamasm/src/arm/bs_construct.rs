@@ -284,23 +284,26 @@ fn emit_bs_create_bin_generic(
         .first()
         .filter(|s| s.kind == BsSegmentKind::PrivateAppend)
     {
-        let source = asm.source_reg(segment.src)?;
+        // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1865-1880 (`am_private_append`),
+        // OTP-29.1.1: `load_erl_bits_state(ARG1); mov(ARG2, c_p); mov_arg(ARG3, seg.src);
+        // mov(ARG4, sizeReg)`. The source goes straight into ARG3: a Y or memory X source loads
+        // through the module scratch register (x9), which a staged argument copy would overwrite.
         let ebs = crate::arm::beam_asm::ERL_BITS_STATE_REF;
         asm.code.emit(|e| {
-            e.add_imm(Gpr::x(8), SCHEDULER_REGS, ebs as u16, false)?;
-            e.mov_reg(Gpr::x(9), C_P)?;
-            e.mov_reg(Gpr::x(10), source)?;
-            e.mov_reg(Gpr::x(11), BITS)
+            e.add_imm(Gpr::x(0), SCHEDULER_REGS, ebs as u16, false)?;
+            e.mov_reg(Gpr::x(1), C_P)?;
+            e.mov_reg(Gpr::x(3), BITS)
         })?;
+        asm.mov_arg_to_reg(Gpr::x(2), segment.src)?;
         emit_runtime_call(
             asm,
             crate::raw::erts_bs_private_append_checked as *const () as usize,
             live as usize,
             crate::Update::NONE,
-            &[Gpr::x(8), Gpr::x(9), Gpr::x(10), Gpr::x(11)],
+            &[Gpr::x(0), Gpr::x(1), Gpr::x(2), Gpr::x(3)],
         )?;
-        asm.code
-            .emit(|e| e.str_uoff(Gpr::x(0), SCHEDULER_REGS, SAVED_RESULT))?;
+        // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1881, OTP-29.1.1:
+        // "There is no way the call can fail on a 64-bit architecture."
         let bits_state = crate::arm::beam_asm::ERL_BITS_STATE_REF;
         asm.code.emit(|e| {
             e.ldr_uoff(Gpr::x(8), SCHEDULER_REGS, bits_state + 8)?;
@@ -334,7 +337,14 @@ fn emit_bs_create_bin_generic(
             ],
         )?;
     }
-    asm.code.cbz(Gpr::x(0), route_failure)?;
+    // erts tests ARG1 only for `am_append` (above) and never for `am_private_append`.
+    // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1881 and :1979 (`a.str(ARG1, TMP_MEM1q)`).
+    if segments
+        .first()
+        .is_none_or(|segment| segment.kind != BsSegmentKind::PrivateAppend)
+    {
+        asm.code.cbz(Gpr::x(0), route_failure)?;
+    }
     asm.code
         .emit(|e| e.str_uoff(Gpr::x(0), SCHEDULER_REGS, SAVED_RESULT))?;
 

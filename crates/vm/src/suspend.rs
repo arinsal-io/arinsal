@@ -425,18 +425,19 @@ pub(crate) fn suspend_self_true(process: &mut Process) -> bool {
 }
 
 /// Undoes one [`suspend_self`] of the calling process (erl_process.c:9402, erts_resume).
-pub(crate) fn resume_self(process: &mut Process) {
+pub(crate) fn resume_self(process: &mut Process) -> bool {
     let Some(cold) = process.cold.as_mut() else {
-        return;
+        return false;
     };
     if cold.suspend_count == 0 {
-        return;
+        return false;
     }
     cold.suspend_count -= 1;
-    if let (0, Some(runtime), Some(pid)) = (cold.suspend_count, process.runtime, process.self_pid())
-    {
+    let resumed = cold.suspend_count == 0;
+    if let (true, Some(runtime), Some(pid)) = (resumed, process.runtime, process.self_pid()) {
         mirror_bit(runtime, pid, false);
     }
+    resumed
 }
 
 impl Runtime {

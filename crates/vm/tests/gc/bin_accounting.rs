@@ -59,8 +59,8 @@ fn binary_memory_lifetime_matches_erts() {
     let mut vm = crate::common::node();
     crate::common::load_fresh(&mut vm, &beam);
 
-    assert_eq!(expected, call(&mut vm, "run"));
-    assert_eq!(expected_error, call(&mut vm, "badarg"));
+    similar_asserts::assert_eq!(expected, call(&mut vm, "run"));
+    similar_asserts::assert_eq!(expected_error, call(&mut vm, "badarg"));
 }
 
 #[test]
@@ -77,19 +77,22 @@ value() -> {literal, <<16#5a:1600000>>}.
     let beam = reference
         .compile_named("bin_accounting_literal", source, &[])
         .unwrap();
+    // compile:forms on the RefErl server can leave compiler binaries in binary_alloc.
+    // Measure only the load, after GC, matching erts_memory around code:load_binary.
+    let _ = reference.eval("erlang:garbage_collect()");
     let reference_before = reference.eval("erlang:memory(binary)").unwrap();
     reference.load("bin_accounting_literal", &beam).unwrap();
     let reference_after = reference.eval("erlang:memory(binary)").unwrap();
 
-    let local_before = arinsal_term::binary_memory_bytes();
     let mut vm = crate::common::node();
+    let local_before = arinsal_term::binary_memory_bytes();
     crate::common::load_fresh(&mut vm, &beam);
     let expected_value = reference.call("bin_accounting_literal", "value", &[]);
     let actual_value = vm
         .eval_scheduled("bin_accounting_literal", "value", &[], 1)
         .unwrap();
     let canonical_value = decode(&encode(&actual_value.term, EncodeOptions::default())).unwrap();
-    assert_eq!(expected_value, CallResult::Ok(canonical_value));
+    similar_asserts::assert_eq!(expected_value, CallResult::Ok(canonical_value));
     let local_after = arinsal_term::binary_memory_bytes();
     let increased = |before: &arinsal_etf::OwnedTerm, after: &arinsal_etf::OwnedTerm| {
         let (arinsal_etf::OwnedTerm::Int(before), arinsal_etf::OwnedTerm::Int(after)) =
@@ -99,7 +102,7 @@ value() -> {literal, <<16#5a:1600000>>}.
         };
         after > before
     };
-    assert_eq!(
+    similar_asserts::assert_eq!(
         increased(&reference_before, &reference_after),
         local_after > local_before
     );
@@ -147,5 +150,5 @@ fn binary_freed_on_another_scheduler_is_gone_after_wait_deallocations() {
     let expected = reference.call("bin_accounting_cross", "run", &[]);
     let actual = crate::common::peer_eval(&[], &[&beam], "bin_accounting_cross:run()");
     let canonical = decode(&encode(&actual, EncodeOptions::default())).unwrap();
-    assert_eq!(expected, CallResult::Ok(canonical));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(canonical));
 }

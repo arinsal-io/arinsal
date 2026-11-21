@@ -15,6 +15,7 @@ mod port_life;
 mod port_link_trees_differential;
 mod port_monitor_differential;
 mod port_opts;
+mod port_sig_flush_differential;
 mod port_tasks;
 mod port_trace_differential;
 mod ports_compat;

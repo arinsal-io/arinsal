@@ -233,12 +233,15 @@ impl Vm {
         let name = atom_name(Term::atom(entry.module))
             .ok_or_else(|| VmError::Unsupported("lambda module atom".into()))?;
         let found = [
-            code_tables(erts_active_code_ix()).loaded.get(&name),
-            code_tables(erts_active_code_ix()).old.get(&name),
+            code_tables(erts_active_code_ix())
+                .loaded
+                .get(&name)
+                .copied(),
+            code_tables(erts_active_code_ix()).loaded.old(&name),
         ]
         .into_iter()
         .flatten()
-        .find_map(|&id| {
+        .find_map(|id| {
             code_tables(erts_active_code_ix()).modules[id]
                 .funs
                 .iter()
@@ -304,8 +307,8 @@ impl Vm {
         if !crate::trace_bp::any_pattern()
             && !crate::trace::saves_calls(p)
             && !code_tables(erts_active_code_ix())
-                .pending_on_load
-                .contains_key(module)
+                .loaded
+                .has_on_load(module)
             && let Some(&module_id) = code_tables(erts_active_code_ix()).loaded.get(&module_atom)
             && let Some(target) = code_tables(erts_active_code_ix()).modules[module_id]
                 .export_slot_atom(function_atom, arity as u32)

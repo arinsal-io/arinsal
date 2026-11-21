@@ -4,7 +4,8 @@ use crate::{Process, VmError};
 use arinsal_bifs::{Class, ProcessHeapHandle};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{
-    Atom, HeapAlloc, ProcessHeap, Term, TermBuilder, TermKind, from_owned, global_atoms, to_owned,
+    Atom, HeapAlloc, ProcessHeap, TemporaryHeapFactory, Term, TermBuilder, TermKind, from_owned,
+    global_atoms, to_owned,
 };
 use arinsal_term::{ExternalBinary, MagicBin, Node, WritableBinary};
 use std::sync::{Arc, OnceLock};
@@ -358,7 +359,7 @@ impl BifArgs {
         }
     }
 
-    fn to_term(&self, heap: &mut TraceHeap) -> Result<Term, VmError> {
+    fn to_term(&self, heap: &mut impl HeapAlloc) -> Result<Term, VmError> {
         match self {
             Self::Inline { values, len } => TermBuilder::new(heap)
                 .list_from_slice(&values[..usize::from(*len)])
@@ -386,7 +387,7 @@ pub(super) enum StoredTopFrame {
         args: Term,
     },
     CurrentArgsInfoTerm(Option<Term>, Term),
-    CurrentArgsWithInfo(Option<OwnedTerm>, Box<OwnedTerm>),
+    CurrentArgsWithInfo(Option<Term>, Box<OwnedTerm>),
 }
 
 /// Where the exception was raised: erts' `s->pc` (save_stacktrace's `pc`).
@@ -460,14 +461,9 @@ pub(super) fn capture(
             TopFrame::CurrentArgsInfoTerm(args, info) => {
                 Ok(StoredTopFrame::CurrentArgsInfoTerm(*args, *info))
             }
-            TopFrame::CurrentArgsWithInfo(args, info) => Ok(StoredTopFrame::CurrentArgsWithInfo(
-                args.map(|args| {
-                    to_owned(args)
-                        .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))
-                })
-                .transpose()?,
-                info.clone(),
-            )),
+            TopFrame::CurrentArgsWithInfo(args, info) => {
+                Ok(StoredTopFrame::CurrentArgsWithInfo(*args, info.clone()))
+            }
         })
         .transpose()?;
     if captured_top.is_some() {
@@ -765,6 +761,18 @@ impl SaveTop<'_> {
             }) => Some((*module, *function)),
             _ => None,
         }
+    }
+}
+
+/// The first `arity` argument registers as a list on the process heap (HAlloc: young heap,
+/// else a heap fragment; never fails).
+// Port of erts/emulator/beam/beam_common.c (make_arglist), OTP-29.1.1.
+pub(crate) fn make_arglist(p: &mut Process, registers: &[Term], arity: usize) -> Term {
+    let values = &registers[..arity];
+    let mut heap = TraceHeap::new(&mut p.heap);
+    match TermBuilder::new(&mut heap).list_from_slice(values) {
+        Ok(list) => list,
+        Err(error) => unreachable!("make_arglist allocates with HAlloc semantics: {error:?}"),
     }
 }
 
@@ -1161,10 +1169,8 @@ pub(super) enum TopFrame {
         args: Term,
     },
     CurrentArgsWithInfo(Option<Term>, Box<OwnedTerm>),
-    /// `erlang:error/2,3` read straight from the argument registers: the supplied argument
-    /// term and validated `error_info` map stay heap terms, as in erts' `c_p->ftrace`. Only
-    /// the native exception resolver builds it; nothing collects before `save_stacktrace`
-    /// copies the two words.
+    /// `erlang:error/2,3` arguments and the validated `error_info` map stay heap terms, as in
+    /// erts' `c_p->ftrace`; a pending BIF epilogue collection roots both terms.
     CurrentArgsInfoTerm(Option<Term>, Term),
 }
 
@@ -1233,7 +1239,7 @@ fn trace_atoms() -> &'static TraceAtoms {
 /// The `error_info` map of a failing BIF frame.
 // Port of erts/emulator/beam/beam_common.c:932-998 (save_stacktrace), OTP-29.1.1.
 fn bif_error_info(
-    heap: &mut TraceHeap,
+    heap: &mut impl HeapAlloc,
     module: Atom,
     info: BifErrorInfo,
 ) -> Result<Option<Term>, VmError> {
@@ -1268,7 +1274,7 @@ fn bif_error_info(
 }
 
 fn build_frame(
-    heap: &mut TraceHeap,
+    heap: &mut impl HeapAlloc,
     module: Atom,
     function: Atom,
     arity_or_args: Term,
@@ -1332,6 +1338,45 @@ pub(super) fn build(p: &mut Process, depth: usize) -> Result<Term, VmError> {
     build_with_reserve(p, depth, None)
 }
 
+/// Build `erts_build_stacktrace` terms in the caller's temporary factory.
+// Port of erts/emulator/beam/beam_common.c:1205 (`build_stacktrace`), OTP-29.1.1.
+pub(super) fn build_tmp(
+    p: &mut Process,
+    depth: usize,
+) -> Result<(TemporaryHeapFactory, Term), VmError> {
+    let mut raw = capture_current(p, depth)?;
+    let mut heap = TemporaryHeapFactory::new();
+    let trace = build_saved_with_reserve_target(p, &mut raw, None, Some(&mut heap))?;
+    Ok((heap, trace))
+}
+
+fn stacktrace_block_words(raw: &RawTrace) -> usize {
+    let top = raw.top.as_ref();
+    let bif_args = match top {
+        Some(StoredTopFrame::Bif { args, .. }) => match args {
+            BifArgs::Inline { len, .. } => usize::from(*len),
+            BifArgs::Owned(args) => match args.as_ref() {
+                OwnedTerm::List { elems, .. } => elems.len(),
+                _ => 0,
+            },
+            BifArgs::TermList(args) => {
+                arinsal_term::term_sequence(*args).map_or(0, |terms| terms.len())
+            }
+        },
+        _ => 0,
+    };
+    let frame_budget = (1
+        + raw.continuations.len()
+        + usize::from(matches!(top, Some(StoredTopFrame::Bif { .. }))))
+    .min(raw.depth.max(1));
+    let bif_extra = if matches!(top, Some(StoredTopFrame::Bif { .. })) {
+        48 + 2 * bif_args
+    } else {
+        0
+    };
+    frame_budget * 17 + bif_extra
+}
+
 /// Build the live `process_info` stacktrace using `erts_build_stacktrace`'s per-frame heap
 /// reservations and the caller's remaining result reserve.
 pub(super) fn build_for_process_info(
@@ -1347,6 +1392,15 @@ fn build_with_reserve(
     depth: usize,
     reserve: Option<&mut usize>,
 ) -> Result<Term, VmError> {
+    let mut raw = capture_current(p, depth)?;
+    if let Some(reserve) = reserve {
+        build_saved_with_reserve(p, &mut raw, Some(reserve))
+    } else {
+        build_saved(p, &mut raw)
+    }
+}
+
+fn capture_current(p: &Process, depth: usize) -> Result<RawTrace, VmError> {
     // A process inside a native BIF call raises at that call's pc, as in `exceptions.rs`.
     let trapped = p.heap.abi.i as usize == crate::bif_traps::bif_export_trap_pc();
     let native_pc = p.native_call_pc;
@@ -1375,11 +1429,7 @@ fn build_with_reserve(
         &p.heap,
         depth,
     )?;
-    if let Some(reserve) = reserve {
-        build_saved_with_reserve(p, &mut raw, Some(reserve))
-    } else {
-        build_saved(p, &mut raw)
-    }
+    Ok(raw)
 }
 
 /// Port of erts/emulator/beam/beam_common.c:1205 (build_stacktrace), OTP-29.1.1.
@@ -1707,13 +1757,22 @@ fn cons_prepared(
 }
 
 pub(super) fn build_saved(p: &mut Process, raw: &mut RawTrace) -> Result<Term, VmError> {
-    build_saved_with_reserve(p, raw, None)
+    build_saved_with_reserve_target(p, raw, None, None)
 }
 
 fn build_saved_with_reserve(
     p: &mut Process,
     raw: &mut RawTrace,
     reserve: Option<&mut usize>,
+) -> Result<Term, VmError> {
+    build_saved_with_reserve_target(p, raw, reserve, None)
+}
+
+fn build_saved_with_reserve_target(
+    p: &mut Process,
+    raw: &mut RawTrace,
+    reserve: Option<&mut usize>,
+    temporary_heap: Option<&mut TemporaryHeapFactory>,
 ) -> Result<Term, VmError> {
     let top = raw
         .top
@@ -1746,14 +1805,7 @@ fn build_saved_with_reserve(
                 Ok(TopFrame::CurrentArgsInfoTerm(*args, *info))
             }
             StoredTopFrame::CurrentArgsWithInfo(args, info) => {
-                let args = args
-                    .as_ref()
-                    .map(|args| {
-                        from_owned(args, &mut ProcessHeapHandle(&mut p.heap))
-                            .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))
-                    })
-                    .transpose()?;
-                Ok(TopFrame::CurrentArgsWithInfo(args, info.clone()))
+                Ok(TopFrame::CurrentArgsWithInfo(*args, info.clone()))
             }
         })
         .transpose()?;
@@ -1769,6 +1821,7 @@ fn build_saved_with_reserve(
                     native_top,
                     ranges: Some(ranges),
                     reserve,
+                    temporary_heap,
                 },
             )
         })
@@ -1781,6 +1834,7 @@ fn build_saved_with_reserve(
                 native_top,
                 ranges: None,
                 reserve,
+                temporary_heap,
             },
         )
     }
@@ -1791,6 +1845,7 @@ struct SavedBuildContext<'a> {
     native_top: Option<usize>,
     ranges: Option<&'a [crate::native_bridge::ModuleRange]>,
     reserve: Option<&'a mut usize>,
+    temporary_heap: Option<&'a mut TemporaryHeapFactory>,
 }
 
 fn build_saved_active(
@@ -1803,39 +1858,31 @@ fn build_saved_active(
         native_top,
         ranges,
         reserve,
+        temporary_heap,
     } = context;
     raw.frames.clear();
-    // Upper bound per frame: 4-tuple, 3-element info list, file/line/error_info tuples
-    // and the one-pair error_info map; plus the result list and BIF argument list.
-    let bif_args = match top {
-        Some(TopFrame::Bif { args, .. }) => match args {
-            BifArgs::Inline { len, .. } => usize::from(*len),
-            BifArgs::Owned(_) => 0,
-            BifArgs::TermList(args) => {
-                arinsal_term::term_sequence(*args).map_or(0, |terms| terms.len())
-            }
-        },
-        _ => 0,
-    };
     // Port of beam_common.c:1258-1277: `fi.needed + 2` per frame, one HAlloc.
     // A located frame is 17 words (file tuple, line tuple, two conses, MFA tuple, list cell).
     let frame_budget =
         (1 + raw.continuations.len() + usize::from(matches!(top, Some(TopFrame::Bif { .. }))))
             .min(raw.depth.max(1));
-    let bif_extra = if matches!(top, Some(TopFrame::Bif { .. })) {
-        48 + 2 * bif_args
-    } else {
-        0
-    };
-    let block_words = frame_budget * 17 + bif_extra;
+    let block_words = stacktrace_block_words(raw);
     let native_frame = native_top.and_then(|pc| {
         ranges.and_then(|ranges| crate::native_bridge::stack_frame_in(Some(ranges), pc))
     });
     let no_location = raw.no_location;
-    let mut heap = if reserve.is_some() {
-        TraceHeap::new(&mut p.heap)
-    } else {
-        TraceHeap::with_block(&mut p.heap, block_words)
+    let mut process_trace_heap = temporary_heap.is_none().then(|| {
+        if reserve.is_some() {
+            TraceHeap::new(&mut p.heap)
+        } else {
+            TraceHeap::with_block(&mut p.heap, block_words)
+        }
+    });
+    let mut heap: &mut dyn HeapAlloc = match temporary_heap {
+        Some(heap) => heap,
+        None => process_trace_heap
+            .as_mut()
+            .expect("process stacktrace heap"),
     };
     let current_frame = if raw.no_current {
         None
@@ -1989,7 +2036,8 @@ fn build_saved_active(
                 Item::Built(_) => 0,
             })
             .sum::<usize>();
-        drop(heap);
+        let _ = heap;
+        drop(process_trace_heap);
         let mut heap = ProcessHeapHandle(&mut p.heap);
         for item in items.iter().rev() {
             let Item::Plain(frame) = item else {

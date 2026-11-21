@@ -4,7 +4,10 @@ use crate::code_ix::{code_tables, erts_active_code_ix};
 use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_sched::{Pid, Priority, RunCtx, Signal};
-use arinsal_term::{Atom, HeapReservation, Term, TermBuilder, TermError, TermKind, global_atoms};
+use arinsal_term::{
+    Atom, HeapReservation, TemporaryTermBuffer, Term, TermBuilder, TermError, TermKind,
+    global_atoms,
+};
 
 fn atom_name(term: Term) -> Option<String> {
     Some(global_atoms().text(term.as_atom()?)?.to_string())
@@ -660,7 +663,6 @@ fn process_info(
     src: InfoSource<'_>,
     process: &mut Process,
     pid: Pid,
-    _drain: Option<&mut RunCtx<'_, crate::Process>>,
     args: &ProcessInfoArgs,
     status: Term,
     charge: bool,
@@ -1590,9 +1592,55 @@ pub(crate) fn monitor_heap_sizes(process: &Process) -> [(&'static str, usize); 6
     ]
 }
 
-/// `erts_process_gc_info` for the max_heap_size report of `reached_max_heap_size`.
-pub(crate) fn process_gc_info(process: &mut Process) -> Result<Term, VmError> {
-    process_info_item_garbage_collection_info(process, 0)
+/// `erts_process_gc_info` for `reached_max_heap_size`; its term lives in an ERTS_ALC_T_TMP
+/// allocation until both the GC trace event and logger message have copied it.
+// Port of erts/emulator/beam/erl_gc.c:3650-3728 (`erts_process_gc_info`), OTP-29.1.1.
+pub(crate) fn process_gc_info(
+    process: &Process,
+    extra_heap_size: usize,
+    extra_old_heap_size: usize,
+) -> (TemporaryTermBuffer, Term) {
+    let sized = process.heap.gc_info_words();
+    let old_heap_block_size = sized.old_heap_block_size + extra_old_heap_size;
+    let heap_block_size = sized.heap_block_size + extra_heap_size;
+    let words = gc_info_entries(
+        process,
+        old_heap_block_size,
+        heap_block_size,
+        sized.mbuf_size,
+        sized.recent_size,
+        sized.old_heap_size,
+        sized.heap_size,
+    )
+    .iter()
+    .map(|(_, value)| 5 + uint_words(*value))
+    .sum();
+    let mut heap = TemporaryTermBuffer::new(words).expect("erts_alloc ERTS_ALC_T_TMP");
+    let entries = gc_info_entries(
+        process,
+        old_heap_block_size,
+        heap_block_size,
+        sized.mbuf_size,
+        sized.recent_size,
+        sized.old_heap_size,
+        sized.heap_size,
+    );
+    let message = {
+        let mut builder = TermBuilder::new(&mut heap);
+        let mut rows = [Term::NIL; 11];
+        for (row, (name, value)) in rows.iter_mut().zip(entries) {
+            let value = builder
+                .int_from_u64(value as u64)
+                .expect("erts_process_gc_info integer allocation");
+            *row = builder
+                .tuple(&[gc_info_atom(name), value])
+                .expect("erts_process_gc_info tuple allocation");
+        }
+        builder
+            .list_from_slice(&rows)
+            .expect("erts_process_gc_info list allocation")
+    };
+    (heap, message)
 }
 
 #[inline(never)]
@@ -1934,7 +1982,6 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erlang", "list_to_ref", 1),
     ("erlang", "fun_to_list", 1), // mix_loop6
     ("erts_internal", "process_flag", 3),
-    ("erlang", "process_info", 2),
     ("erlang", "hibernate", 3),
     // `i_hibernate` is an OTP instruction, not an Erlang wrapper interception.
     ("erlang", "hibernate", 0),
@@ -2280,7 +2327,6 @@ pub(crate) fn process_info_call(
             InfoSource::Caller,
             process,
             pid,
-            None,
             &args,
             Term::atom(arinsal_term::atoms::RUNNING),
             true,
@@ -2301,7 +2347,6 @@ pub(crate) fn process_info_call(
                 InfoSource::Other(target),
                 process,
                 pid,
-                None,
                 &args,
                 Term::atom(arinsal_term::atoms::RUNNING),
                 true,
@@ -2313,11 +2358,9 @@ pub(crate) fn process_info_call(
                 // Port of erl_bif_info.c:1439-1443: a result about another process is returned
                 // through `ERTS_BIF_HANDLE_SIGNALS_FROM_RETURN` when we have incoming signals.
                 if ctx.has_incoming_signals() {
-                    return Err(VmError::TrapExport(crate::ExportTrap::new(
-                        process,
-                        crate::natives::sys::BIF_HANDLE_SIGNALS_RETURN,
-                        vec![target, term],
-                    )));
+                    return Err(crate::natives::sys::handle_signals_from_return(
+                        process, target, term,
+                    ));
                 }
                 return Ok(term);
             }
@@ -2353,35 +2396,6 @@ pub(crate) fn process_info_call(
             Term::atom(arinsal_term::atoms::SYSTEM_LIMIT),
         ))),
     }
-}
-
-/// Resolve `process_info/1` without the generic string family. `/2` is `bif_table` `process_info_2`.
-// Port of erts/emulator/beam/erl_bif_info.c:1560 (`process_info_1`), OTP-29.1.1.
-pub(crate) fn process_info_handler(
-    module: &str,
-    function: &str,
-    arity: u8,
-) -> Option<super::ResolvedNative> {
-    (module == "erlang" && function == "process_info" && arity == 2)
-        .then_some(process_info_resolved)
-}
-
-fn process_info_resolved(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
-    args: super::NativeArgs<'_>,
-) -> Option<Result<Term, VmError>> {
-    args.with_values(process, |process, values| match values {
-        [target, item] => Some(process_info_call(
-            Some(&*vm),
-            process,
-            ctx,
-            *target,
-            Some(*item),
-        )),
-        _ => None,
-    })
 }
 
 pub(crate) fn collect_heap(
@@ -2510,16 +2524,7 @@ pub(crate) fn fulfill_request(
                 arinsal_term::atoms::RUNNING
             });
             let pid = ctx.pid();
-            let info = process_info(
-                None,
-                InfoSource::Caller,
-                process,
-                pid,
-                None,
-                &args,
-                status,
-                false,
-            )?;
+            let info = process_info(None, InfoSource::Caller, process, pid, &args, status, false)?;
             make_tuple(process, &[reference, info])
         }
         crate::signals::RemoteOp::GroupLeader { leader } => {
@@ -2546,17 +2551,13 @@ pub(crate) fn fulfill_request(
         )),
         crate::signals::RemoteOp::CheckProcessCode {
             module,
-            native,
             async_request,
             kill,
         } => {
-            // Port of erts/emulator/beam/beam_bif_load.c (erts_check_process_code), OTP-29.1.1:
-            // a module without old code is never referenced.
-            let references = module.is_some_and(|module| {
-                process.references_code(module, |address| {
-                    crate::load::native_code_contains(native.as_deref(), address)
-                })
-            });
+            // Port of erts/emulator/beam/beam_bif_load.c:593-613 and erl_process.c:10866
+            // (`erts_check_process_code` of `st->arg[0]`), OTP-29.1.1: the module atom is
+            // looked up on the active code index when the task runs, not when it is queued.
+            let references = crate::natives::code::check_process_code(process, &module);
             if kill && references {
                 let reason = Message::copy_from(Term::atom(arinsal_term::atoms::KILL))?;
                 ctx.signal(ctx.pid(), Signal::Exit(Box::new(reason)))
@@ -2864,9 +2865,6 @@ fn call_values(
                     Some(res) => Ok(res),
                     None => Ok(Term::atom(arinsal_term::atoms::BADTYPE)),
                 }
-            }
-            ("process_info", [pid, item]) => {
-                process_info_call(Some(&*vm), process, ctx, *pid, Some(*item))
             }
             ("hibernate", [module, function, args]) => {
                 hibernate(process, vm.x_regs()?, *module, *function, *args)
@@ -5315,7 +5313,6 @@ pub(crate) fn process_dump(
         InfoSource::Caller,
         process,
         pid,
-        None,
         &args,
         Term::atom(arinsal_term::atoms::RUNNING),
         false,

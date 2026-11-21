@@ -196,14 +196,6 @@ impl MessageQueue {
         QueuedMessage::node(term, None, false)
     }
 
-    /// The queue the outer queue is spliced onto by `erts_proc_sig_fetch__`.
-    pub(crate) fn fetch_target(&mut self) -> &mut arinsal_sched::MessageQueueList<Event<Message>> {
-        &mut self.entries
-    }
-
-    /// After a splice onto the end.
-    pub(crate) fn spliced(&mut self) {}
-
     /// Link an ordinary message node at the end of the queue.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_handle_incoming: a
     // message signal is moved onto the message queue as it is), OTP-29.1.1.
@@ -264,10 +256,6 @@ impl MessageQueue {
                         .map_or(0, arinsal_term::message::MessageHeap::message_data_size)
             })
             .fold(0, usize::saturating_add)
-    }
-
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &Term> {
-        self.entries.iter().map(|entry| &queued(entry).term)
     }
 
     /// Remove a message, transferring any off-heap fragment into the process heap.

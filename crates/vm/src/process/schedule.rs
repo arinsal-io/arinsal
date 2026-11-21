@@ -2,28 +2,39 @@ use super::executor_run::process_main;
 use super::*;
 
 /// A suspended process that would run on is parked instead. Its queued signals are handled
-/// first: a suspended process only handles signals (erts schedules it for them as system
-/// tasks), and one parked with unhandled signals in its middle queue would never run again.
-/// Returns `Yield` when the drain resumed the process, so it keeps running.
+/// with the RUNNING_SYS reds budget (erts schedules it for them as system tasks).
+/// Returns `Yield` when a resume raced with this suspension, so it keeps running.
 // Port of erts/emulator/beam/erl_process.c:9742 (ERTS_PSFLG_SUSPENDED processes are scheduled for
-// ERTS_PSFLG_ACTIVE_SYS signal handling only), OTP-29.1.1.
+// ERTS_PSFLG_ACTIVE_SYS signal handling only) and :10319-10350 (erts_proc_sig_handle_incoming
+// with a reds budget), OTP-29.1.1.
 pub(super) fn park_suspended(
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
 ) -> Result<RunState, VmError> {
+    use arinsal_sched::psflg;
+    use std::sync::atomic::Ordering;
     let pid = ctx.pid();
     process.cold_mut().sys_task_point = true;
-    let drained = process.drain(ctx);
-    let executed = drained.and_then(|()| crate::signals::execute_sys_tasks(process, ctx));
+    let state = ctx.proc_state().load(Ordering::Acquire);
+    let handled = if state & (psflg::SIG_Q | psflg::NMSG_SIG_IN_Q) != 0 {
+        super::executor_run::schedule_in_signals(process, ctx, state)
+    } else {
+        Ok(())
+    };
+    let executed = handled.and_then(|()| crate::signals::execute_sys_tasks(process, ctx));
     process.cold_mut().sys_task_point = false;
     executed?;
-    // The resumer's wake-up signal may have been consumed by the drain above: re-check so a
-    // resume racing with this suspension is not lost.
+    // The resumer's wake-up signal may have been consumed by the RUNNING_SYS handling above:
+    // re-check so a resume racing with this suspension is not lost.
     if process
         .runtime
         .as_ref()
         .is_none_or(|runtime| runtime.suspend_total_of(pid) == 0)
     {
+        return Ok(RunState::Yield);
+    }
+    // Signals queued since the drain keep the process active: the next slice drains them.
+    if !ctx.clear_active_unless_queued() {
         return Ok(RunState::Yield);
     }
     process.slice_mut().suspend_parked = true;
@@ -33,6 +44,10 @@ pub(super) fn park_suspended(
 impl Task for Process {
     type Message = Message;
     type SchedulerData = SchedulerData;
+
+    fn resume_internal_suspend(&mut self) -> bool {
+        crate::suspend::resume_self(self)
+    }
     // Port of erts/emulator/beam/erl_process.c (schedule: process scheduling statistics), OTP-29.1.1.
 
     fn scheduler_data(&self) -> Option<&arinsal_sched::ProcSchedData<Self>> {
@@ -576,24 +591,8 @@ impl Process {
     // OTP-29.1.1.
     fn exit_outcome(&self, ctx: &RunCtx<'_, crate::Process>) {
         if self.exit_waits() {
-            self.wait_locked(ctx);
+            let _ = ctx.clear_active_unless_queued();
         }
-    }
-
-    /// A slice that ends waiting outside a receive (hibernate, suspend, an exit pending on
-    /// spawn monitors, a debugger wait) clears `ERTS_PSFLG_ACTIVE` in `p->state` for
-    /// schedule_out_process, as the receive's own wait does in beam_jit_wait_locked. Receive
-    /// timers are set in the slice (beam_jit_wait_timeout) and cancelled where the receive
-    /// ends (remove_message / timeout / exit), never here.
-    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1192-1196 (beam_jit_wait_locked:
-    // `erts_atomic32_read_band_relb(&c_p->state, ~ERTS_PSFLG_ACTIVE)`), OTP-29.1.1.
-    //
-    // A message that reached the outer queue since the process last looked
-    // (`ERTS_PSFLG_MSG_SIG_IN_Q`) keeps it active: erts clears the bit under the msgq lock, which
-    // a sender takes before it reads the state, so the sender sees the process inactive and
-    // schedules it; the lock-free queue has the same order in the one state word.
-    fn wait_locked(&self, ctx: &RunCtx<'_, crate::Process>) {
-        let _ = arinsal_sched::erts_wait_clear_active(ctx.proc_state());
     }
 
     /// The slice ends with dirty work: `ERTS_PSFLG_DIRTY_CPU_PROC` / `ERTS_PSFLG_DIRTY_IO_PROC`
@@ -644,7 +643,11 @@ impl Process {
             .and_then(|cold| cold.debug_wait_completion.as_ref())
             .is_some_and(|completed| !completed.load(Ordering::Acquire))
         {
-            Ok(RunState::Wait)
+            Ok(if ctx.clear_active_unless_queued() {
+                RunState::Wait
+            } else {
+                RunState::Yield
+            })
         } else {
             result
         }
@@ -686,9 +689,10 @@ impl Process {
             }
             Ok(RunState::Yield) => {}
             Ok(RunState::Wait) => {
+                // The wait site cleared ERTS_PSFLG_ACTIVE under the msgq lock
+                // (beam_jit_wait_locked, erts_hibernate).
                 let _ =
                     self.take_work(|work| std::mem::take(&mut work.suspend_parked).then_some(()));
-                self.wait_locked(ctx);
             }
             Ok(RunState::Done(term)) => {
                 if trace_boot_enabled() {

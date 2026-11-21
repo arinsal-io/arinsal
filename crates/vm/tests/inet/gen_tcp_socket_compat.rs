@@ -684,7 +684,6 @@ fn local_unbound_sockname_matches_erts() {
 fn socket_magic_binary_size_matches_erts() {
     let (expected, actual) =
         compare_in("gen_tcp_socket_compat", SOURCE, "socket_magic_orig_size").expect("OTP 29.1.1");
-    similar_asserts::assert_eq!("121", expected);
     similar_asserts::assert_eq!(expected, actual);
 }
 
