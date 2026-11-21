@@ -5,10 +5,19 @@
 use crate::{ExitReason, NativeEntry, ProcessHeader, SchedulerRegisters};
 use core::ffi::c_void;
 
+/// Code address of an erts runtime symbol for BeamAsm `runtime_call`.
+///
+/// `f` is an `extern "C"` function item coerced to `*const ()` at the call site. This does
+/// not call the function; generated code calls the C symbol.
+#[inline(always)]
+pub fn addr(f: *const ()) -> usize {
+    f as usize
+}
+
 // Port of erts/emulator/beam/jit/beam_jit_common.cpp:679-704, OTP-29.1.1.
 unsafe extern "C" {
     /// `beam_jit_load_nif(Process *, ErtsCodePtr, Eterm *)`.
-    pub safe fn beam_jit_load_nif(
+    pub fn beam_jit_load_nif(
         c_p: *mut ProcessHeader,
         instruction: usize,
         registers: *mut u64,
@@ -21,12 +30,12 @@ unsafe extern "C" {
 // names and C signatures, the same symbols the x86 backend links (x86/rt.rs).
 unsafe extern "C" {
     /// `Eterm erl_is_function(Process *p, Eterm term, Eterm arity)` (erl_bif_op.h).
-    pub safe fn erl_is_function(c_p: *mut ProcessHeader, term: u64, arity: u64) -> u64;
+    pub fn erl_is_function(c_p: *mut ProcessHeader, term: u64, arity: u64) -> u64;
     /// `Eterm get_map_element(Eterm map, Eterm key)` (beam_common.h): the value, or
     /// THE_NON_VALUE.
-    pub safe fn get_map_element(map: u64, key: u64) -> u64;
+    pub fn get_map_element(map: u64, key: u64) -> u64;
     /// `Eterm get_map_element_hash(Eterm map, Eterm key, erts_ihash_t hx)` (beam_common.h).
-    pub safe fn get_map_element_hash(map: u64, key: u64, hash: u64) -> u64;
+    pub fn get_map_element_hash(map: u64, key: u64, hash: u64) -> u64;
 }
 
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (emit_i_length_common:
@@ -34,14 +43,14 @@ unsafe extern "C" {
 unsafe extern "C" {
     /// `Eterm erts_trapping_length_1(Process *p, Eterm *args)` (erl_bif_guard.c): the length,
     /// or THE_NON_VALUE with `freason` TRAP (state updated in `args`) or an error.
-    pub safe fn erts_trapping_length_1(c_p: *mut ProcessHeader, args: *mut u64) -> u64;
+    pub fn erts_trapping_length_1(c_p: *mut ProcessHeader, args: *mut u64) -> u64;
 }
 
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (emit_i_bif_body_shared:
 // `runtime_call<ErtsCodeMFA *(*)(void *), ubif2mfa>`), OTP-29.1.1.
 unsafe extern "C" {
     /// `ErtsCodeMFA *ubif2mfa(void *uf)` (beam_common.c): the MFA of a `bif.tab` ubif.
-    pub safe fn ubif2mfa(function: *const c_void) -> *const arinsal_term::ErtsCodeMfa;
+    pub fn ubif2mfa(function: *const c_void) -> *const arinsal_term::ErtsCodeMfa;
 }
 
 // Port of erts/emulator/beam/jit/arm/instr_arith.cpp (`runtime_call<..., erts_mixed_plus>` and
@@ -50,15 +59,15 @@ unsafe extern "C" {
 // exception in `c_p->freason`; the VM defines them in erl_arith.rs, the symbols x86 links.
 unsafe extern "C" {
     /// `Eterm erts_mixed_plus(Process *p, Eterm arg1, Eterm arg2)`.
-    pub safe fn erts_mixed_plus(c_p: *mut ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    pub fn erts_mixed_plus(c_p: *mut ProcessHeader, arg1: u64, arg2: u64) -> u64;
     /// `Eterm erts_mixed_minus(Process *p, Eterm arg1, Eterm arg2)`.
-    pub safe fn erts_mixed_minus(c_p: *mut ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    pub fn erts_mixed_minus(c_p: *mut ProcessHeader, arg1: u64, arg2: u64) -> u64;
     /// `Eterm erts_mixed_times(Process *p, Eterm arg1, Eterm arg2)`.
-    pub safe fn erts_mixed_times(c_p: *mut ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    pub fn erts_mixed_times(c_p: *mut ProcessHeader, arg1: u64, arg2: u64) -> u64;
     /// `Eterm erts_mixed_div(Process *p, Eterm arg1, Eterm arg2)`.
-    pub safe fn erts_mixed_div(c_p: *mut ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    pub fn erts_mixed_div(c_p: *mut ProcessHeader, arg1: u64, arg2: u64) -> u64;
     /// `Eterm erts_mul_add(Process *p, Eterm arg1, Eterm arg2, Eterm arg3, Eterm *pp)`.
-    pub safe fn erts_mul_add(
+    pub fn erts_mul_add(
         c_p: *mut ProcessHeader,
         arg1: u64,
         arg2: u64,
@@ -66,7 +75,7 @@ unsafe extern "C" {
         pp: *mut u64,
     ) -> u64;
     /// `int erts_int_div_rem(Process *p, Eterm arg1, Eterm arg2, Eterm *q, Eterm *r)`.
-    pub safe fn erts_int_div_rem(
+    pub fn erts_int_div_rem(
         c_p: *mut ProcessHeader,
         arg1: u64,
         arg2: u64,
@@ -74,27 +83,22 @@ unsafe extern "C" {
         r: *mut u64,
     ) -> i32;
     /// `Eterm erts_unary_minus(Process *p, Eterm arg1)`.
-    pub safe fn erts_unary_minus(c_p: *mut ProcessHeader, arg1: u64) -> u64;
+    pub fn erts_unary_minus(c_p: *mut ProcessHeader, arg1: u64) -> u64;
     /// `Eterm erts_band(Process *p, Eterm arg1, Eterm arg2)`.
-    pub safe fn erts_band(c_p: *mut ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    pub fn erts_band(c_p: *mut ProcessHeader, arg1: u64, arg2: u64) -> u64;
     /// `Eterm erts_bor(Process *p, Eterm arg1, Eterm arg2)`.
-    pub safe fn erts_bor(c_p: *mut ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    pub fn erts_bor(c_p: *mut ProcessHeader, arg1: u64, arg2: u64) -> u64;
     /// `Eterm erts_bxor(Process *p, Eterm arg1, Eterm arg2)`.
-    pub safe fn erts_bxor(c_p: *mut ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    pub fn erts_bxor(c_p: *mut ProcessHeader, arg1: u64, arg2: u64) -> u64;
     /// `Eterm erts_bsl(Process *p, Eterm arg1, Eterm arg2)`.
-    pub safe fn erts_bsl(c_p: *mut ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    pub fn erts_bsl(c_p: *mut ProcessHeader, arg1: u64, arg2: u64) -> u64;
     /// `Eterm erts_bsr(Process *p, Eterm arg1, Eterm arg2)`.
-    pub safe fn erts_bsr(c_p: *mut ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    pub fn erts_bsr(c_p: *mut ProcessHeader, arg1: u64, arg2: u64) -> u64;
     /// `Eterm erts_bnot(Process *p, Eterm arg)`.
-    pub safe fn erts_bnot(c_p: *mut ProcessHeader, arg: u64) -> u64;
+    pub fn erts_bnot(c_p: *mut ProcessHeader, arg: u64) -> u64;
     /// `Eterm beam_jit_int128_to_big(Process *p, Uint sign, Uint low, Uint high)`
     /// (beam_jit_common.cpp).
-    pub safe fn beam_jit_int128_to_big(
-        c_p: *mut ProcessHeader,
-        sign: u64,
-        low: u64,
-        high: u64,
-    ) -> u64;
+    pub fn beam_jit_int128_to_big(c_p: *mut ProcessHeader, sign: u64, low: u64, high: u64) -> u64;
 }
 
 // Port of erts/emulator/beam/jit/arm/instr_bs.cpp runtime_call targets and their
@@ -102,33 +106,29 @@ unsafe extern "C" {
 // with the original runtime names and argument order.
 unsafe extern "C" {
     /// `ErlSubBits *erts_bs_start_match_3(Process *, Eterm)`.
-    pub safe fn erts_bs_start_match_3(c_p: *mut ProcessHeader, value: u64) -> *mut u64;
+    pub fn erts_bs_start_match_3(c_p: *mut ProcessHeader, value: u64) -> *mut u64;
     /// `Eterm erts_bs_get_integer_2(Process *, Uint, unsigned, ErlSubBits *)`.
-    pub safe fn erts_bs_get_integer_2(
+    pub fn erts_bs_get_integer_2(
         c_p: *mut ProcessHeader,
         num_bits: u64,
         flags: u32,
         sub_bits: *mut u64,
     ) -> u64;
     /// `Eterm erts_bs_get_binary_2(Process *, Uint, ErlSubBits *)`.
-    pub safe fn erts_bs_get_binary_2(
-        c_p: *mut ProcessHeader,
-        num_bits: u64,
-        sub_bits: *mut u64,
-    ) -> u64;
+    pub fn erts_bs_get_binary_2(c_p: *mut ProcessHeader, num_bits: u64, sub_bits: *mut u64) -> u64;
     /// `Eterm erts_bs_get_float_2(Process *, Uint, unsigned, ErlSubBits *)`.
-    pub safe fn erts_bs_get_float_2(
+    pub fn erts_bs_get_float_2(
         c_p: *mut ProcessHeader,
         num_bits: u64,
         flags: u32,
         sub_bits: *mut u64,
     ) -> u64;
     /// `Eterm erts_bs_get_utf8(ErlSubBits *)`.
-    pub safe fn erts_bs_get_utf8(sub_bits: *mut u64) -> u64;
+    pub fn erts_bs_get_utf8(sub_bits: *mut u64) -> u64;
     /// `Eterm erts_bs_get_utf16(ErlSubBits *, Uint)`.
-    pub safe fn erts_bs_get_utf16(sub_bits: *mut u64, flags: u64) -> u64;
+    pub fn erts_bs_get_utf16(sub_bits: *mut u64, flags: u64) -> u64;
     /// `Eterm erts_build_sub_bitstring(Eterm **, Eterm, const BinRef *, const byte *, Uint, Uint)`.
-    pub safe fn erts_build_sub_bitstring(
+    pub fn erts_build_sub_bitstring(
         hp: *mut *mut u64,
         br_flags: u64,
         br: *const u64,
@@ -137,7 +137,7 @@ unsafe extern "C" {
         size: u64,
     ) -> u64;
     /// `int erts_cmp_bits(const byte *, Uint, const byte *, Uint, Uint)`.
-    pub safe fn erts_cmp_bits(
+    pub fn erts_cmp_bits(
         a: *const u8,
         a_offset: u64,
         b: *const u8,
@@ -145,7 +145,7 @@ unsafe extern "C" {
         size: u64,
     ) -> i32;
     /// `Eterm beam_jit_bs_get_integer(Process *, Eterm *, Eterm, Uint, Uint, Uint)`.
-    pub safe fn beam_jit_bs_get_integer(
+    pub fn beam_jit_bs_get_integer(
         c_p: *mut ProcessHeader,
         reg: *mut u64,
         context: u64,
@@ -154,7 +154,7 @@ unsafe extern "C" {
         live: u64,
     ) -> u64;
     /// `Eterm beam_jit_bs_init_bits(Process *, Eterm *, ErlBitsState *, Uint, Uint, unsigned)`.
-    pub safe fn beam_jit_bs_init_bits(
+    pub fn beam_jit_bs_init_bits(
         c_p: *mut ProcessHeader,
         reg: *mut u64,
         ebs: *mut u64,
@@ -163,16 +163,16 @@ unsafe extern "C" {
         live: u32,
     ) -> u64;
     /// `void beam_jit_bs_construct_fail_info(Process *, Uint, Eterm, Eterm)`.
-    pub safe fn beam_jit_bs_construct_fail_info(
+    pub fn beam_jit_bs_construct_fail_info(
         c_p: *mut ProcessHeader,
         packed_error_info: u64,
         arg3: u64,
         arg1: u64,
     );
     /// `Sint beam_jit_bs_bit_size(Eterm)`; `-1` means the term is not a bitstring.
-    pub safe fn beam_jit_bs_bit_size(term: u64) -> i64;
+    pub fn beam_jit_bs_bit_size(term: u64) -> i64;
     /// `Eterm erts_bs_append_checked(Process *, Eterm *, Uint, Uint, Uint, Uint)`.
-    pub safe fn erts_bs_append_checked(
+    pub fn erts_bs_append_checked(
         c_p: *mut ProcessHeader,
         reg: *mut u64,
         live: u64,
@@ -181,36 +181,36 @@ unsafe extern "C" {
         unit: u64,
     ) -> u64;
     /// `Eterm erts_bs_private_append_checked(ErlBitsState *, Process *, Eterm, Uint)`.
-    pub safe fn erts_bs_private_append_checked(
+    pub fn erts_bs_private_append_checked(
         ebs: *mut u64,
         c_p: *mut ProcessHeader,
         bin: u64,
         extra_bits: u64,
     ) -> u64;
     /// `Eterm erts_bs_init_writable(Process *, Eterm)`.
-    pub safe fn erts_bs_init_writable(c_p: *mut ProcessHeader, size: u64) -> u64;
+    pub fn erts_bs_init_writable(c_p: *mut ProcessHeader, size: u64) -> u64;
     /// `int erts_bs_put_integer_be(ErlBitsState *, Eterm, Uint)`.
-    pub safe fn erts_bs_put_integer_be(ebs: *mut u64, value: u64, num_bits: u64) -> i32;
+    pub fn erts_bs_put_integer_be(ebs: *mut u64, value: u64, num_bits: u64) -> i32;
     /// `int erts_bs_put_integer_le(ErlBitsState *, Eterm, Uint)`.
-    pub safe fn erts_bs_put_integer_le(ebs: *mut u64, value: u64, num_bits: u64) -> i32;
+    pub fn erts_bs_put_integer_le(ebs: *mut u64, value: u64, num_bits: u64) -> i32;
     /// `int erts_bs_put_binary(ErlBitsState *, Process *, Eterm, Uint)`.
-    pub safe fn erts_bs_put_binary(
+    pub fn erts_bs_put_binary(
         ebs: *mut u64,
         c_p: *mut ProcessHeader,
         value: u64,
         num_bits: u64,
     ) -> i32;
     /// `int erts_bs_put_binary_all(ErlBitsState *, Process *, Eterm, Uint)`.
-    pub safe fn erts_bs_put_binary_all(
+    pub fn erts_bs_put_binary_all(
         ebs: *mut u64,
         c_p: *mut ProcessHeader,
         value: u64,
         unit: u64,
     ) -> i32;
     /// `void beam_jit_bs_put_binary_all(ErlBitsState *, Process *, Eterm)`.
-    pub safe fn beam_jit_bs_put_binary_all(ebs: *mut u64, c_p: *mut ProcessHeader, value: u64);
+    pub fn beam_jit_bs_put_binary_all(ebs: *mut u64, c_p: *mut ProcessHeader, value: u64);
     /// `Eterm erts_bs_put_float(ErlBitsState *, Process *, Eterm, Uint, int)`.
-    pub safe fn erts_bs_put_float(
+    pub fn erts_bs_put_float(
         ebs: *mut u64,
         c_p: *mut ProcessHeader,
         value: u64,
@@ -218,9 +218,9 @@ unsafe extern "C" {
         flags: i32,
     ) -> u64;
     /// `int erts_bs_put_utf16(ErlBitsState *, Eterm, Uint)`.
-    pub safe fn erts_bs_put_utf16(ebs: *mut u64, value: u64, flags: u64) -> i32;
+    pub fn erts_bs_put_utf16(ebs: *mut u64, value: u64, flags: u64) -> i32;
     /// `void erts_bs_put_string(ErlBitsState *, byte *, Uint)`.
-    pub safe fn erts_bs_put_string(ebs: *mut u64, source: *const u8, num_bytes: u64);
+    pub fn erts_bs_put_string(ebs: *mut u64, source: *const u8, num_bytes: u64);
 }
 
 // Port of erts/emulator/beam/jit/arm/instr_map.cpp runtime call prototypes, OTP-29.1.1: the map
@@ -228,7 +228,7 @@ unsafe extern "C" {
 // erl_map.c, beam_jit_common.cpp); the VM defines the symbols x86 links.
 unsafe extern "C" {
     /// `Eterm erts_gc_new_map(Process *, Eterm *, Uint, Uint, const Eterm *)`.
-    pub safe fn erts_gc_new_map(
+    pub fn erts_gc_new_map(
         c_p: *mut ProcessHeader,
         reg: *mut u64,
         live: u64,
@@ -236,7 +236,7 @@ unsafe extern "C" {
         data: *const u64,
     ) -> u64;
     /// `Eterm erts_gc_update_map_assoc(Process *, Eterm *, Uint, Uint, const Eterm *)`.
-    pub safe fn erts_gc_update_map_assoc(
+    pub fn erts_gc_update_map_assoc(
         c_p: *mut ProcessHeader,
         reg: *mut u64,
         live: u64,
@@ -244,7 +244,7 @@ unsafe extern "C" {
         data: *const u64,
     ) -> u64;
     /// `Eterm erts_gc_update_map_exact(Process *, Eterm *, Uint, Uint, const Eterm *)`.
-    pub safe fn erts_gc_update_map_exact(
+    pub fn erts_gc_update_map_exact(
         c_p: *mut ProcessHeader,
         reg: *mut u64,
         live: u64,
@@ -252,7 +252,7 @@ unsafe extern "C" {
         data: *const u64,
     ) -> u64;
     /// `Uint beam_jit_get_map_elements(Eterm, Eterm *, Eterm *, Uint, Eterm *)`.
-    pub safe fn beam_jit_get_map_elements(
+    pub fn beam_jit_get_map_elements(
         map: u64,
         reg: *mut u64,
         stack: *mut u64,
@@ -260,9 +260,9 @@ unsafe extern "C" {
         fs: *mut u64,
     ) -> u64;
     /// `Eterm erts_maps_put(Process *, Eterm, Eterm, Eterm)`.
-    pub safe fn erts_maps_put(c_p: *mut ProcessHeader, key: u64, value: u64, map: u64) -> u64;
+    pub fn erts_maps_put(c_p: *mut ProcessHeader, key: u64, value: u64, map: u64) -> u64;
     /// `int erts_maps_update(Process *, Eterm, Eterm, Eterm, Eterm *)`.
-    pub safe fn erts_maps_update(
+    pub fn erts_maps_update(
         c_p: *mut ProcessHeader,
         key: u64,
         value: u64,
@@ -276,7 +276,7 @@ unsafe extern "C" {
 // links. Each returns THE_NON_VALUE (or false) on failure with the exception in `c_p->freason`.
 unsafe extern "C" {
     /// `bool erl_get_record_elements(Process *, Eterm *, Eterm, Uint, const Eterm *)`.
-    pub safe fn erl_get_record_elements(
+    pub fn erl_get_record_elements(
         c_p: *mut ProcessHeader,
         reg: *mut u64,
         source: u64,
@@ -284,7 +284,7 @@ unsafe extern "C" {
         elements: *const u64,
     ) -> bool;
     /// `Eterm erl_create_local_native_record(Process *, Eterm *, Eterm, Uint, Uint, const Eterm *)`.
-    pub safe fn erl_create_local_native_record(
+    pub fn erl_create_local_native_record(
         c_p: *mut ProcessHeader,
         reg: *mut u64,
         definition: u64,
@@ -293,7 +293,7 @@ unsafe extern "C" {
         elements: *const u64,
     ) -> u64;
     /// `Eterm erl_create_native_record(Process *, Eterm *, Eterm, Uint, Uint, const Eterm *)`.
-    pub safe fn erl_create_native_record(
+    pub fn erl_create_native_record(
         c_p: *mut ProcessHeader,
         reg: *mut u64,
         definition_id: u64,
@@ -302,7 +302,7 @@ unsafe extern "C" {
         elements: *const u64,
     ) -> u64;
     /// `Eterm erl_update_native_record(Process *, Eterm *, Eterm, Uint, Uint, const Eterm *)`.
-    pub safe fn erl_update_native_record(
+    pub fn erl_update_native_record(
         c_p: *mut ProcessHeader,
         reg: *mut u64,
         source: u64,
@@ -311,14 +311,14 @@ unsafe extern "C" {
         elements: *const u64,
     ) -> u64;
     /// `Eterm erl_get_local_record_field(Process *, Eterm, Eterm, Eterm)`.
-    pub safe fn erl_get_local_record_field(
+    pub fn erl_get_local_record_field(
         c_p: *mut ProcessHeader,
         source: u64,
         definition_id: u64,
         name: u64,
     ) -> u64;
     /// `Eterm erl_get_record_field(Process *, Eterm, Eterm, Eterm)`.
-    pub safe fn erl_get_record_field(
+    pub fn erl_get_record_field(
         c_p: *mut ProcessHeader,
         source: u64,
         definition_id: u64,

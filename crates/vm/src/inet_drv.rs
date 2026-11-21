@@ -22,6 +22,8 @@ use arinsal_term::{HeapAlloc, Term, TermBuilder, global_atoms};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::ops::Range;
+#[cfg(target_os = "linux")]
+use std::os::fd::IntoRawFd;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -932,9 +934,14 @@ fn open_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     if data[2] != 0 && data[2] != 1 {
         return err_bytes("eprotonosupport");
     }
-    let fd = match crate::port::socket_cloexec(domain, libc::SOCK_STREAM, 0) {
+    let fd = match open_inet_socket(
+        domain,
+        libc::SOCK_STREAM,
+        0,
+        inner.netns.as_ref().map(|ns| ns.as_slice()),
+    ) {
         Ok(fd) => fd,
-        Err(error) => return err_bytes(errno_name(error.raw_os_error().unwrap_or(libc::EIO))),
+        Err(error) => return err_bytes(errno_name(error)),
     };
     set_nonblock(fd.as_raw_fd());
     set_nosigpipe(fd.as_raw_fd());
@@ -1563,10 +1570,17 @@ fn apply_opt(
                 return false;
             }
             if code == OPT_MSGQ_HIGH {
+                if inner.msgq_low > val {
+                    inner.msgq_low = val;
+                }
                 inner.msgq_high = val;
             } else {
+                if inner.msgq_high < val {
+                    inner.msgq_high = val;
+                }
                 inner.msgq_low = val;
             }
+            apply_msgq_limits(inner);
         }
         OPT_SEND_TIMEOUT => inner.send_timeout = val,
         OPT_SEND_TIMEOUT_CLOSE => inner.send_timeout_close = val != 0,
@@ -1623,8 +1637,23 @@ fn apply_opt(
                 return false;
             }
         }
-        // HAVE_SETNS is absent on macOS, so netns falls through to EINVAL.
-        OPT_NETNS => return false,
+        OPT_NETNS => {
+            // Port of inet_drv.c:7151 (INET_LOPT_NETNS, `HAVE_SETNS`), OTP-29.1.1.
+            // Linux OTP 29.1.1 defines HAVE_SETNS; Darwin does not, so the option is EINVAL.
+            #[cfg(target_os = "linux")]
+            {
+                if val < 0 || *i + val as usize > data.len() {
+                    return false;
+                }
+                inner.netns = Some(Box::new(data[*i..*i + val as usize].to_vec()));
+                *i += val as usize;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (val, data, i);
+                return false;
+            }
+        }
         #[cfg(have_so_bindtodevice)]
         OPT_BIND_TO_DEVICE => {
             // Port of inet_drv.c:7848 (SO_BINDTODEVICE), OTP-29.1.1.
@@ -1900,7 +1929,25 @@ fn push_opt(inner: &Inner, code: u8, data: &[u8], i: &mut usize, out: &mut Vec<u
                 out.extend_from_slice(&name);
             }
         }
-        OPT_NETNS => return false,
+        OPT_NETNS => {
+            // Port of inet_drv.c:9278 (INET_LOPT_NETNS): omit when `desc->netns` is NULL.
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(ns) = inner.netns.as_deref() {
+                    let bytes = ns.split(|b| *b == 0).next().unwrap_or(ns.as_slice());
+                    if out.len() + 5 + bytes.len() > MAX_OPT_BUFFER {
+                        return false;
+                    }
+                    out.push(code);
+                    put_i32(out, bytes.len() as i32);
+                    out.extend_from_slice(bytes);
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return false;
+            }
+        }
         _ => return false,
     }
     true
@@ -3288,6 +3335,9 @@ struct Inner {
     recvttl: bool,
     show_econnreset: bool,
     debug: bool,
+    /// `desc->netns` (`HAVE_SETNS`): path stored by `INET_LOPT_NETNS`.
+    #[allow(clippy::box_collection)]
+    netns: Option<Box<Vec<u8>>>,
     high: i32,
     low: i32,
     msgq_high: i32,
@@ -3419,10 +3469,11 @@ impl Default for Inner {
             recvttl: false,
             show_econnreset: false,
             debug: false,
+            netns: None,
             high: 8 * 1024,
             low: 4 * 1024,
             msgq_high: 8 * 1024,
-            msgq_low: 8 * 1024,
+            msgq_low: 4 * 1024,
             send_timeout: -1,
             send_timeout_close: false,
             linger_on: false,
@@ -3487,115 +3538,255 @@ fn apply_saved(inner: &mut Inner) {
 }
 
 fn sock_bool(inner: &Inner, level: i32, name: i32, on: bool) {
-    sock_int(inner, level, name, i32::from(on));
+    let _ = inet_setopt_int(
+        inner.fd.as_ref().map(AsRawFd::as_raw_fd),
+        level,
+        name,
+        i32::from(on),
+        false,
+    );
 }
 
 fn sock_int(inner: &Inner, level: i32, name: i32, val: i32) {
-    let Some(fd) = inner.fd.as_ref() else {
-        return;
-    };
-    // SAFETY: fd is a socket this driver owns. A failed setsockopt leaves the saved value.
-    unsafe {
-        libc::setsockopt(
-            fd.as_raw_fd(),
-            level,
-            name,
-            (&val as *const i32).cast(),
-            std::mem::size_of::<i32>() as libc::socklen_t,
-        );
-    }
+    let _ = inet_setopt_int(
+        inner.fd.as_ref().map(AsRawFd::as_raw_fd),
+        level,
+        name,
+        val,
+        false,
+    );
 }
 
 fn sock_linger(inner: &Inner) {
-    let Some(fd) = inner.fd.as_ref() else {
-        return;
-    };
     let lin = libc::linger {
         l_onoff: i32::from(inner.linger_on),
         l_linger: inner.linger_secs,
     };
-    // SAFETY: fd is a socket this driver owns.
-    unsafe {
-        libc::setsockopt(
-            fd.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_LINGER,
-            (&lin as *const libc::linger).cast(),
-            std::mem::size_of::<libc::linger>() as libc::socklen_t,
-        );
-    }
+    let _ = inet_setopt(
+        inner.fd.as_ref().map(AsRawFd::as_raw_fd),
+        libc::SOL_SOCKET,
+        libc::SO_LINGER,
+        (&lin as *const libc::linger).cast(),
+        std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        false,
+    );
 }
 
 fn sock_get_int(inner: &Inner, level: i32, name: i32) -> Option<i32> {
-    let fd = inner.fd.as_ref()?;
+    sock_getopt_int(inner.fd.as_ref()?.as_raw_fd(), level, name)
+}
+
+pub(crate) fn sock_getopt_int(fd: RawFd, level: i32, name: i32) -> Option<i32> {
     let mut val = 0i32;
     let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
-    // SAFETY: fd is a socket this driver owns.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd.as_raw_fd(),
-            level,
-            name,
-            (&mut val as *mut i32).cast(),
-            &mut len,
-        )
-    };
+    let rc =
+        crate::inet_drv_raw::sock_getopt(fd, level, name, (&mut val as *mut i32).cast(), &mut len);
     (rc == 0).then_some(val)
 }
 
 fn sock_set(inner: &Inner, level: i32, name: i32, val: i32, propagate: bool) -> bool {
-    let Some(fd) = inner.fd.as_ref() else {
-        return !propagate;
-    };
-    // SAFETY: fd is a socket this driver owns.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd.as_raw_fd(),
-            level,
-            name,
-            (&val as *const i32).cast(),
-            std::mem::size_of::<i32>() as libc::socklen_t,
-        )
-    };
-    rc == 0 || !propagate
+    inet_setopt_int(
+        inner.fd.as_ref().map(AsRawFd::as_raw_fd),
+        level,
+        name,
+        val,
+        propagate,
+    )
 }
 
 fn sock_set_raw(inner: &Inner, level: i32, name: i32, bytes: &[u8]) -> bool {
-    let Some(fd) = inner.fd.as_ref() else {
-        return false;
-    };
-    // SAFETY: fd is a socket this driver owns; bytes is the option payload.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd.as_raw_fd(),
-            level,
-            name,
-            bytes.as_ptr().cast(),
-            bytes.len() as libc::socklen_t,
-        )
-    };
-    rc == 0
+    // RAW options use the default `propagate = 0`; bind-to-device sets it to 1 at the call site.
+    inet_setopt(
+        inner.fd.as_ref().map(AsRawFd::as_raw_fd),
+        level,
+        name,
+        bytes.as_ptr(),
+        bytes.len() as libc::socklen_t,
+        false,
+    )
 }
 
 fn sock_get_raw(inner: &Inner, level: i32, name: i32, size: usize) -> Option<Vec<u8>> {
-    let fd = inner.fd.as_ref()?;
+    let fd = inner.fd.as_ref()?.as_raw_fd();
     let mut buf = vec![0u8; size];
     let mut len = size as libc::socklen_t;
-    // SAFETY: fd is a socket this driver owns; buf is writable for `len` bytes.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd.as_raw_fd(),
-            level,
-            name,
-            buf.as_mut_ptr().cast(),
-            &mut len,
-        )
-    };
+    let rc = crate::inet_drv_raw::sock_getopt(fd, level, name, buf.as_mut_ptr(), &mut len);
     if rc != 0 {
         return None;
     }
     buf.truncate(len as usize);
     Some(buf)
+}
+
+/// Port of inet_drv.c:6831 (`inet_setopt`), OTP-29.1.1.
+pub(crate) fn inet_setopt(
+    fd: Option<RawFd>,
+    proto: i32,
+    ty: i32,
+    arg: *const u8,
+    arg_sz: libc::socklen_t,
+    propagate: bool,
+) -> bool {
+    let Some(fd) = fd else {
+        return !propagate;
+    };
+    #[cfg(target_os = "linux")]
+    {
+        setopt_prio_tos_trick(fd, proto, ty, arg, arg_sz, propagate)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        crate::inet_drv_raw::sock_setopt(fd, proto, ty, arg, arg_sz) == 0 || !propagate
+    }
+}
+
+pub(crate) fn inet_setopt_int(
+    fd: Option<RawFd>,
+    proto: i32,
+    ty: i32,
+    val: i32,
+    propagate: bool,
+) -> bool {
+    inet_setopt(
+        fd,
+        proto,
+        ty,
+        (&val as *const i32).cast(),
+        std::mem::size_of::<i32>() as libc::socklen_t,
+        propagate,
+    )
+}
+
+/// Port of inet_drv.c:6773 (`setopt_prio_tos_trick`), OTP-29.1.1.
+#[cfg(target_os = "linux")]
+fn setopt_prio_tos_trick(
+    fd: RawFd,
+    proto: i32,
+    ty: i32,
+    arg: *const u8,
+    arg_sz: libc::socklen_t,
+    propagate: bool,
+) -> bool {
+    let mut prio = 0i32;
+    let mut prio_sz = std::mem::size_of::<i32>() as libc::socklen_t;
+    let res_prio = crate::inet_drv_raw::sock_getopt(
+        fd,
+        libc::SOL_SOCKET,
+        libc::SO_PRIORITY,
+        (&mut prio as *mut i32).cast(),
+        &mut prio_sz,
+    );
+    let mut tos = 0i32;
+    let mut tos_sz = std::mem::size_of::<i32>() as libc::socklen_t;
+    let res_tos = crate::inet_drv_raw::sock_getopt(
+        fd,
+        libc::IPPROTO_IP,
+        libc::IP_TOS,
+        (&mut tos as *mut i32).cast(),
+        &mut tos_sz,
+    );
+    let mut res = crate::inet_drv_raw::sock_setopt(fd, proto, ty, arg, arg_sz);
+    if res == 0 && ty != libc::SO_PRIORITY {
+        if ty != libc::IP_TOS && res_tos == 0 {
+            let restored = crate::inet_drv_raw::sock_setopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_TOS,
+                (&tos as *const i32).cast(),
+                tos_sz,
+            );
+            if propagate {
+                res = restored;
+            }
+        }
+        if res == 0 && res_prio == 0 {
+            let restored = crate::inet_drv_raw::sock_setopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PRIORITY,
+                (&prio as *const i32).cast(),
+                prio_sz,
+            );
+            if propagate {
+                if restored != 0 && last_errno() == libc::EPERM {
+                    res = 0;
+                } else {
+                    res = restored;
+                }
+            }
+        }
+    }
+    res == 0 || !propagate
+}
+
+fn apply_msgq_limits(inner: &Inner) {
+    // Port of inet_drv.c:7081 (`erl_drv_busy_msgq_limits`), OTP-29.1.1.
+    let Some(port) = inner.port.as_ref().and_then(|port| port.upgrade()) else {
+        return;
+    };
+    port.set_msgq_limits(inner.msgq_low as usize, inner.msgq_high as usize);
+}
+
+/// Port of inet_drv.c:5118 (`inet_ctl_open`, including `HAVE_SETNS`), OTP-29.1.1.
+pub(crate) fn open_inet_socket(
+    domain: i32,
+    ty: i32,
+    proto: i32,
+    netns: Option<&[u8]>,
+) -> Result<OwnedFd, i32> {
+    let proto = if domain == libc::AF_UNIX { 0 } else { proto };
+    #[cfg(target_os = "linux")]
+    if let Some(path) = netns {
+        return open_socket_in_netns(domain, ty, proto, path);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = netns;
+    crate::port::socket_cloexec(domain, ty, proto)
+        .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))
+}
+
+#[cfg(target_os = "linux")]
+fn open_socket_in_netns(domain: i32, ty: i32, proto: i32, path: &[u8]) -> Result<OwnedFd, i32> {
+    // Port of inet_drv.c:5133-5199 (`inet_ctl_open` `HAVE_SETNS`), OTP-29.1.1.
+    let current_ns = crate::inet_drv_raw::open_rdonly(b"/proc/self/ns/net")?;
+    let new_ns = match crate::inet_drv_raw::open_rdonly(path) {
+        Ok(fd) => fd,
+        Err(save_errno) => {
+            crate::inet_drv_raw::close_eintr(current_ns);
+            return Err(save_errno);
+        }
+    };
+    if crate::inet_drv_raw::setns(new_ns, libc::CLONE_NEWNET) != 0 {
+        let save_errno = last_errno();
+        crate::inet_drv_raw::close_eintr(new_ns);
+        crate::inet_drv_raw::close_eintr(current_ns);
+        return Err(save_errno);
+    }
+    crate::inet_drv_raw::close_eintr(new_ns);
+
+    let opened = crate::port::socket_cloexec(domain, ty, proto);
+    if crate::inet_drv_raw::setns(current_ns, libc::CLONE_NEWNET) != 0 {
+        let save_errno = if opened.is_ok() {
+            last_errno()
+        } else {
+            opened
+                .as_ref()
+                .err()
+                .and_then(|error| error.raw_os_error())
+                .unwrap_or(libc::EIO)
+        };
+        if let Ok(fd) = opened {
+            crate::inet_drv_raw::close_eintr(fd.into_raw_fd());
+        }
+        crate::inet_drv_raw::close_eintr(current_ns);
+        return Err(save_errno);
+    }
+    crate::inet_drv_raw::close_eintr(current_ns);
+    opened.map_err(io_errno)
+}
+
+fn io_errno(error: std::io::Error) -> i32 {
+    error.raw_os_error().unwrap_or(libc::EIO)
 }
 
 fn sock_get_bool(inner: &Inner, level: i32, name: i32, fallback: bool) -> bool {
@@ -5112,10 +5303,18 @@ const SO_BINDTODEVICE: i32 = libc::SO_BINDTODEVICE;
 
 #[cfg(have_so_bindtodevice)]
 fn set_bind_device(inner: &Inner, name: &[u8]) -> bool {
+    // Port of inet_drv.c:7848: `propagate = 1` and `arg_sz = sizeof(ifname)`.
     let mut buf = [0u8; 16];
     let n = name.len().min(buf.len() - 1);
     buf[..n].copy_from_slice(&name[..n]);
-    sock_set_raw(inner, libc::SOL_SOCKET, SO_BINDTODEVICE, &buf)
+    inet_setopt(
+        inner.fd.as_ref().map(AsRawFd::as_raw_fd),
+        libc::SOL_SOCKET,
+        SO_BINDTODEVICE,
+        buf.as_ptr(),
+        buf.len() as libc::socklen_t,
+        true,
+    )
 }
 
 #[cfg(have_so_bindtodevice)]
@@ -5465,11 +5664,8 @@ fn poll_connect(inner: &mut Inner) -> Option<Out> {
             &mut len,
         )
     };
-    if rc == 0 && (err == 0 || err == libc::EINPROGRESS || err == libc::EAGAIN) {
-        if err != 0 {
-            // Writable interest fired early. Keep FD_CONNECT selected.
-            return None;
-        }
+    // Port of inet_drv.c:14275: any `SO_ERROR` or a failed getsockopt is connect failure.
+    if rc >= 0 && err == 0 {
         let waiter = inner.connect.take().unwrap();
         drop_pending(inner, waiter.caller, waiter.aref);
         inner.phase = Phase::Connected;
@@ -5478,7 +5674,7 @@ fn poll_connect(inner: &mut Inner) -> Option<Out> {
             aref: waiter.aref,
         });
     }
-    let reason = errno_name(if rc == 0 { err } else { last_errno() });
+    let reason = errno_name(err);
     let waiter = inner.connect.take().unwrap();
     drop_pending(inner, waiter.caller, waiter.aref);
     inner.phase = Phase::Open;

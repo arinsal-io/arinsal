@@ -54,6 +54,7 @@ pub use process::{
     PROCESS_STATE_OFFSET, ScheduledResult,
 };
 mod inet_drv;
+mod inet_drv_raw;
 // g_inet_udp
 mod inet_udp;
 pub(crate) mod node_tables;
@@ -176,6 +177,13 @@ pub enum VmError {
     },
     /// Exception awaiting BEAM handler dispatch.
     Trap(exceptions::Trap),
+    /// `BIF_ERROR(p, freason)` of a BIF body's helper: the erts `freason` the body stores in
+    /// `p->freason` before it returns THE_NON_VALUE (erl_db.c's local `freason__`). A reason
+    /// that needs `p->fvalue` (an `EXF_HAS_EXT_INFO` cause, `BADMAP`, ...) wrote it on the
+    /// process at the failing site.
+    /// Port of erts/emulator/beam/bif.h (BIF_ERROR) and erl_db.c (DB_GET_TABLE: `freason__`,
+    /// db_bif_fail), OTP-29.1.1.
+    Freason(u64),
     /// Uncaught Erlang exception with a symbolic stack trace.
     Raised(Box<exceptions::Raised>),
     /// Invalid or missing module.
@@ -226,6 +234,7 @@ impl std::fmt::Display for VmError {
                 write!(f, "** exception error: {reason}\n  in function {frame}")
             }
             Self::Trap(_) => write!(f, "unhandled BEAM exception"),
+            Self::Freason(freason) => write!(f, "BIF error (freason {freason:#x})"),
             Self::Raised(raised) => raised.fmt(f),
             Self::Load(s) => write!(f, "{s}"),
             Self::TrapExport(trap) => write!(

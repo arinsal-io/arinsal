@@ -161,19 +161,19 @@ pub(crate) extern "C" fn term_to_binary_trap_1(
         arinsal_bifs::tuple_element(state, 2),
         arinsal_bifs::tuple_element(state, 3),
     ) else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     let Some(bif_ix) = bix.as_small().and_then(|n| usize::try_from(n).ok()) else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     if bif_ix >= TTB_BIFS.len() {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     }
     let context = mref
         .with_magic_payload_mut::<TtbHolder, _>(|holder| holder.0.take())
         .flatten();
     let Some(mut context) = context else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     erts_term_to_binary_int(
         c_p,
@@ -475,7 +475,7 @@ pub(crate) extern "C" fn binary_to_term_trap_1(
         .with_magic_payload_mut::<B2tHolder, _>(|holder| holder.0.take())
         .flatten();
     let Some(mut ctx) = context else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     b2t_init_reds(process, &mut ctx);
     let exit = b2t_run(process, &mut ctx);

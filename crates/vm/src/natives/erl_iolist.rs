@@ -178,7 +178,7 @@ pub(crate) extern "C" fn iolist_size_continue_1(
             state.iolist.set_reds_left(process);
             iolist_size_dispatch(c_p, reg, i, process, state, Some(mref))
         }
-        None => bif_ret(c_p, i, Err(crate::natives::bif::badarg())),
+        None => crate::natives::bif::bif_badarg(c_p),
     }
 }
 
@@ -355,7 +355,7 @@ fn list_to_bitstring_bif(
         return if view.bit_len() % 8 == 0 {
             crate::native_hooks::raw(arg)
         } else {
-            bif_ret(c_p, i, Err(crate::natives::bif::badarg()))
+            crate::natives::bif::bif_badarg(c_p)
         };
     }
     let mut reds_left = i64::from(process.heap.abi.fcalls);
@@ -380,7 +380,7 @@ fn list_to_bitstring_bif(
         };
     }
     let Ok(cons) = Cons::try_from(arg) else {
-        return bif_ret(c_p, i, Err(crate::natives::bif::badarg()));
+        return crate::natives::bif::bif_badarg(c_p);
     };
     // Check for the `[bitstring()]` case.
     let (head, tail) = cons.pair();
@@ -421,7 +421,7 @@ pub(crate) extern "C" fn list_to_bitstring_continue_1(
             state.copy.iolist.set_reds_left(process);
             list_to_bitstring_dispatch(c_p, reg, i, process, state, Some(mref))
         }
-        None => bif_ret(c_p, i, Err(crate::natives::bif::badarg())),
+        None => crate::natives::bif::bif_badarg(c_p),
     }
 }
 
@@ -531,7 +531,7 @@ pub(crate) extern "C" fn iolist_to_iovec_1(c_p: *mut ProcessHeader, reg: *mut u6
     };
     process.heap.note_bif_entry();
     let [arg] = crate::bif_table::bif_args::<1>(reg);
-    let badarg = || bif_ret(c_p, i, Err(crate::natives::bif::badarg()));
+    let badarg = || crate::natives::bif::bif_badarg(c_p);
     // `[]`, `Bin` and `[Bin]` need no traversal.
     let single = if arg == Term::NIL {
         return crate::native_hooks::raw(Term::NIL);
@@ -593,7 +593,7 @@ pub(crate) extern "C" fn iolist_to_iovec_continue_1(
             state.copy.iolist.set_reds_left(process);
             iolist_to_iovec_dispatch(c_p, reg, i, process, state, Some(mref))
         }
-        None => bif_ret(c_p, i, Err(crate::natives::bif::badarg())),
+        None => crate::natives::bif::bif_badarg(c_p),
     }
 }
 

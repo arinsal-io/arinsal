@@ -27,32 +27,19 @@ fn finish(c_p: *mut ProcessHeader, i: u64, result: Result<arinsal_term::Term, Vm
 #[inline(never)]
 fn finish_error(c_p: *mut ProcessHeader, i: u64, error: VmError) -> u64 {
     match error {
-        VmError::Trap(_) => db_bif_fail(c_p, error),
+        VmError::Freason(freason) => db_bif_fail(c_p, freason),
         error => crate::native_helpers::bif_return_current(c_p, i, error),
     }
 }
 
-/// `db_bif_fail`: `p->freason = freason; return THE_NON_VALUE`.
-/// `freason == TRAP` is a continuation (`ERTS_BIF_PREP_TRAP`); those arrive as `Yield` /
-/// `TrapExport` and go through `bif_return_current`, not here.
+/// `db_bif_fail`: `p->freason = freason; return THE_NON_VALUE`. A cause the failure names is
+/// already in `p->fvalue`. `freason == TRAP` is a continuation (`ERTS_BIF_PREP_TRAP`); those
+/// arrive as `Yield` / `TrapExport` and go through `bif_return_current`, not here.
 // Port of erts/emulator/beam/erl_db.c (`db_bif_fail`) and bif.h (`BIF_ERROR`), OTP-29.1.1.
-fn db_bif_fail(c_p: *mut ProcessHeader, error: VmError) -> u64 {
-    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
-        return arinsal_term::THE_NON_VALUE;
-    };
-    let (freason, fvalue) = match error {
-        VmError::Trap(trap) if trap.reason == Term::atom(atoms::SYSTEM_LIMIT) => {
-            (arinsal_term::exc::EXC_SYSTEM_LIMIT, trap.reason)
-        }
-        VmError::Trap(trap) if trap.reason != Term::atom(atoms::BADARG) => (
-            arinsal_term::exc::EXC_BADARG | arinsal_term::exc::EXF_HAS_EXT_INFO,
-            trap.reason,
-        ),
-        VmError::Trap(trap) => (arinsal_term::exc::EXC_BADARG, trap.reason),
-        _ => (arinsal_term::exc::EXC_BADARG, Term::atom(atoms::BADARG)),
-    };
-    process.heap.abi.exc.freason = freason;
-    process.heap.abi.exc.fvalue = crate::native_hooks::raw(fvalue);
+fn db_bif_fail(c_p: *mut ProcessHeader, freason: u64) -> u64 {
+    if let Some(process) = crate::native_hooks::process_from_header(c_p) {
+        process.heap.abi.exc.freason = freason;
+    }
     arinsal_term::THE_NON_VALUE
 }
 
@@ -162,13 +149,7 @@ fn trap_list(
             match TermBuilder::new(&mut heap).magic_ref(owner) {
                 Ok(mref) => mref,
                 Err(_) => {
-                    return crate::native_helpers::bif_return_current(
-                        c_p,
-                        i,
-                        VmError::Trap(crate::exceptions::Trap::error(Term::atom(
-                            atoms::SYSTEM_LIMIT,
-                        ))),
-                    );
+                    return crate::natives::bif::bif_system_limit(c_p);
                 }
             }
         }
@@ -452,11 +433,9 @@ pub(crate) fn new_free_state(
         arinsal_sched::unique::next_ref_words(),
     );
     let mut heap = ProcessHeapHandle(&mut process.heap);
-    TermBuilder::new(&mut heap).magic_ref(owner).map_err(|_| {
-        VmError::Trap(crate::exceptions::Trap::error(Term::atom(
-            atoms::SYSTEM_LIMIT,
-        )))
-    })
+    TermBuilder::new(&mut heap)
+        .magic_ref(owner)
+        .map_err(|_| VmError::Freason(arinsal_term::exc::EXC_SYSTEM_LIMIT))
 }
 
 const ERTS_FREE_STATE_SIZE: usize = 64;

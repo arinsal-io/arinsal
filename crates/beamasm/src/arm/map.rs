@@ -7,6 +7,7 @@ use arinsal_a64::{
     exec::{CodeMemory, ExecError},
 };
 
+use crate::rt::addr;
 use crate::{
     Update, emit_enter_runtime, emit_leave_runtime,
     module::{ArgVal, BeamModuleAssembler, ModuleError},
@@ -105,7 +106,7 @@ impl MapFragments {
         code.bind(new_map).map_err(fail)?;
         emit_vector_map_shared(
             &mut code,
-            crate::rt::erts_gc_new_map as *const () as usize,
+            addr(crate::rt::erts_gc_new_map as *const ()),
             vector_update,
             None,
         )
@@ -121,7 +122,7 @@ impl MapFragments {
         code.bind(update_assoc_label).map_err(fail)?;
         emit_vector_map_shared(
             &mut code,
-            crate::rt::erts_gc_update_map_assoc as *const () as usize,
+            addr(crate::rt::erts_gc_update_map_assoc as *const ()),
             vector_update,
             None,
         )
@@ -129,7 +130,7 @@ impl MapFragments {
         code.bind(update_exact_guard_label).map_err(fail)?;
         emit_vector_map_shared(
             &mut code,
-            crate::rt::erts_gc_update_map_exact as *const () as usize,
+            addr(crate::rt::erts_gc_update_map_exact as *const ()),
             vector_update,
             None,
         )
@@ -137,7 +138,7 @@ impl MapFragments {
         code.bind(update_exact_label).map_err(fail)?;
         emit_vector_map_shared(
             &mut code,
-            crate::rt::erts_gc_update_map_exact as *const () as usize,
+            addr(crate::rt::erts_gc_update_map_exact as *const ()),
             vector_update,
             Some(raise_exception),
         )
@@ -462,7 +463,7 @@ impl BeamModuleAssembler {
         if key_is_immediate {
             return self.emit_get_element_fragment_call(runtime.get_element_shared, fail, dst);
         }
-        self.emit_get_map_element_call(crate::rt::get_map_element as *const () as usize)?;
+        self.emit_get_map_element_call(addr(crate::rt::get_map_element as *const ()))?;
         self.code.cbz(Gpr::x(0), fail)?;
         self.store_map_result(dst, Gpr::x(0))
     }
@@ -505,7 +506,7 @@ impl BeamModuleAssembler {
             let reg = self.source_reg(value)?;
             self.code.emit(|e| e.mov_reg(arg, reg))?;
         }
-        self.emit_get_map_element_call(crate::rt::get_map_element_hash as *const () as usize)?;
+        self.emit_get_map_element_call(addr(crate::rt::get_map_element_hash as *const ()))?;
         self.code.cbz(Gpr::x(0), fail)?;
         self.store_map_result(dst, Gpr::x(0))
     }
@@ -544,7 +545,7 @@ impl BeamModuleAssembler {
             e.mov_reg(Gpr::x(0), map)?;
             e.mov_reg(Gpr::x(1), Gpr::x(17))
         })?;
-        self.emit_get_map_element_call(crate::rt::get_map_element as *const () as usize)
+        self.emit_get_map_element_call(addr(crate::rt::get_map_element as *const ()))
     }
 
     /// `emit_enter_runtime(); runtime_call<get_map_element[_hash]>(); emit_leave_runtime()`

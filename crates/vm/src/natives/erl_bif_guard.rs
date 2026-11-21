@@ -9,7 +9,6 @@
 
 use crate::natives::bif::{bif_badarg, bif_ret, bif_system_limit};
 use arinsal_beamasm::ProcessHeader;
-use arinsal_bifs::ProcessHeapHandle;
 use arinsal_term::raw::Cons;
 use arinsal_term::{Term, TermBuilder, TermKind, atoms};
 
@@ -189,9 +188,8 @@ pub(crate) extern "C" fn size_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64)
     let Some(size) = size else {
         return bif_badarg(c_p);
     };
-    match TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
-        .int_from_u64(size as u64)
-    {
+    let mut heap = FragmentOnlyHeap(&mut process.heap);
+    match TermBuilder::new(&mut heap).int_from_u64(size as u64) {
         Ok(result) => crate::native_hooks::raw(result),
         Err(_) => crate::natives::bif::bif_system_limit(c_p),
     }
@@ -217,22 +215,41 @@ pub(crate) extern "C" fn is_integer_3(c_p: *mut ProcessHeader, reg: *mut u64, _i
     }))
 }
 
-/// A one-argument number BIF of erl_bif_guard.c: the result on the process heap, or
+/// A one-argument number BIF of erl_bif_guard.c: the result on a heap fragment, or
 /// `BIF_ERROR(BIF_P, BADARG)`.
 #[inline(always)]
 fn number_bif(
     c_p: *mut ProcessHeader,
     reg: *mut u64,
-    body: fn(Term, &mut ProcessHeapHandle<'_>) -> arinsal_arith::ArithResult,
+    body: fn(Term, &mut dyn arinsal_term::HeapAlloc) -> arinsal_arith::ArithResult,
 ) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
     let [arg] = crate::bif_table::bif_args::<1>(reg);
-    match body(arg, &mut ProcessHeapHandle(&mut process.heap)) {
+    let mut heap = FragmentOnlyHeap(&mut process.heap);
+    match body(arg, &mut heap) {
         Ok(value) => crate::native_hooks::raw(value),
         Err(_) => crate::natives::bif::bif_badarg(c_p),
+    }
+}
+
+/// `HeapFragOnlyAlloc` for guard BIF results: native HTOP may not be synced at this entry.
+// Port of erts/emulator/beam/erl_vm.h:219-224 (HeapFragOnlyAlloc), OTP-29.1.1.
+struct FragmentOnlyHeap<'a>(&'a mut arinsal_term::ProcessHeap);
+
+impl arinsal_term::HeapAlloc for FragmentOnlyHeap<'_> {
+    fn alloc(&mut self, words: usize) -> Option<*mut u64> {
+        arinsal_term::HeapAlloc::alloc_fragment_only(self.0, words)
+    }
+
+    fn retain_binary(&mut self, binary: std::sync::Arc<arinsal_term::RefcBinary>) {
+        arinsal_term::HeapAlloc::retain_binary(self.0, binary)
+    }
+
+    fn link_node(&mut self, thing: *mut u64, node: arinsal_term::Node) {
+        arinsal_term::HeapAlloc::link_node(self.0, thing, node)
     }
 }
 
@@ -303,7 +320,7 @@ fn bitstring_size(
         None => {
             // `erts_make_integer` of a size above the small range.
             process.heap.note_bif_entry();
-            let mut heap = ProcessHeapHandle(&mut process.heap);
+            let mut heap = FragmentOnlyHeap(&mut process.heap);
             let term = arinsal_term::TermBuilder::new(&mut heap)
                 .int_from_u64(value as u64)
                 .expect("HAlloc");

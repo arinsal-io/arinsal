@@ -29,6 +29,7 @@ mod external_encode_trap;
 mod external_identity_differential;
 mod guard_arith;
 mod guard_compare_differential;
+mod guard_fragment_results;
 mod iolist_reductions;
 mod iolist_to_iovec_compat;
 mod light_bif_boundary_differential;

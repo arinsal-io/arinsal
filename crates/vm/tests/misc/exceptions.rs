@@ -155,6 +155,148 @@ trigger(11, A) -> binary:part(A, 9, 1).
     }
 }
 
+/// `bif_table` BIF bodies of every family fail with `BIF_ERROR`: only `freason`/`fvalue`
+/// (`c_p->current` is not looked up). Each call is the first one in a fresh carrier process
+/// with the module already loaded.
+#[test]
+fn bif_family_errors_in_fresh_process_match_otp() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping BIF family error differential test");
+        return;
+    };
+    let source = r#"
+-module(vm_exc_bif_families).
+-export([run/2]).
+run(N, A) -> try trigger(N, A) catch C:R:S -> {C,R,S} end.
+trigger(1, A) -> erlang:atom_to_list(A);
+trigger(2, A) -> erlang:list_to_atom(A);
+trigger(3, A) -> erlang:binary_to_list(A);
+trigger(4, A) -> erlang:list_to_binary(A);
+trigger(5, A) -> erlang:iolist_size(A);
+trigger(6, A) -> erlang:iolist_to_binary(A);
+trigger(7, A) -> binary:at(A, 9);
+trigger(8, A) -> binary:encode_unsigned(A);
+trigger(9, A) -> binary:decode_unsigned(A);
+trigger(10, A) -> binary:referenced_byte_size(A);
+trigger(11, A) -> unicode:characters_to_binary(A);
+trigger(12, A) -> erlang:atom_to_binary(A, utf8);
+trigger(13, A) -> erlang:binary_to_term(A);
+trigger(14, A) -> erlang:term_to_binary(a, A);
+trigger(15, A) -> erlang:phash2(a, A);
+trigger(16, A) -> os:getenv(A);
+trigger(17, A) -> erlang:whereis(A);
+trigger(18, A) -> erlang:register(A, b);
+trigger(19, A) -> erlang:process_info(A);
+trigger(20, A) -> erlang:system_info(A);
+trigger(21, A) -> ets:new(A, []);
+trigger(22, A) -> ets:insert(A, {a});
+trigger(23, A) -> ets:lookup(A, a);
+trigger(24, A) -> lists:reverse(A, []);
+trigger(25, A) -> lists:member(a, A);
+trigger(26, A) -> lists:keyfind(a, 1, A);
+trigger(27, A) -> maps:merge(A, #{});
+trigger(28, A) -> maps:from_list(A);
+trigger(29, A) -> math:log(A);
+trigger(30, A) -> erlang:element(5, A);
+trigger(31, A) -> erlang:tuple_size(A);
+trigger(32, A) -> erlang:hd(A);
+trigger(33, A) -> erlang:length(A);
+trigger(34, A) -> erlang:byte_size(A);
+trigger(35, A) -> erlang:integer_to_list(A);
+trigger(36, A) -> erlang:list_to_integer(A);
+trigger(37, A) -> erlang:monitor(A, b);
+trigger(38, A) -> erlang:send_after(A, b, m);
+trigger(39, A) -> erlang:make_tuple(A, a);
+trigger(40, A) -> erlang:setelement(5, A, b);
+trigger(41, A) -> erlang:crc32(A);
+trigger(42, A) -> erlang:unique_integer(A);
+trigger(43, A) -> erlang:port_info(A);
+trigger(44, A) -> erlang:open_port(A, []);
+trigger(45, A) -> re:run(A, "a").
+"#;
+    let beam = reference
+        .compile_named("vm_exc_bif_families", source, &[])
+        .unwrap();
+    reference.load("vm_exc_bif_families", &beam).unwrap();
+    let mut vm = crate::common::node();
+    vm.load_bytes(&beam).unwrap();
+    for n in 1..=45 {
+        let arg = match n {
+            1 | 3 | 12 | 13 | 19 | 29 | 30 | 34 | 35 | 39 | 40 => OwnedTerm::Int(-1),
+            21 | 37 | 42 | 44 => OwnedTerm::Int(1),
+            _ => OwnedTerm::Tuple(vec![OwnedTerm::Atom("bad".into())]),
+        };
+        let args = [OwnedTerm::Int(n), arg];
+        let expected = trim_result(reference.call("vm_exc_bif_families", "run", &args));
+        let actual = trim_result(vm_call(&mut vm, "run", &args, "vm_exc_bif_families"));
+        assert!(
+            compare(&expected, &actual, CompareMode::Exact).is_ok(),
+            "run({args:?}): expected {expected:?}, actual {actual:?}"
+        );
+        assert!(matches!(actual, CallResult::Ok(_)));
+    }
+}
+
+/// Failing BIFs whose helpers carry the erts `freason` (ETS, ...): the body stores it in
+/// `p->freason` and returns THE_NON_VALUE. Each call is the first one in a fresh carrier
+/// process with the module already loaded; the spawned cases fail in a process that has run
+/// nothing else.
+#[test]
+fn freason_family_errors_in_fresh_process_match_otp() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping freason family error differential test");
+        return;
+    };
+    let source = r#"
+-module(vm_exc_freason).
+-export([run/1]).
+run(N) -> try trigger(N) catch C:R:S -> {C,R,S} end.
+other(F) ->
+    {_, Ref} = spawn_monitor(fun() -> exit(try F() catch C:R:S -> {C,R,S} end) end),
+    receive {'DOWN', Ref, _, _, X} -> X end.
+trigger(1) -> ets:lookup(no_such_table, a);
+trigger(2) -> ets:insert(no_such_table, {a});
+trigger(3) -> ets:insert(ets:new(t, []), foo);
+trigger(4) -> ets:insert(ets:new(t, []), [{a}, foo]);
+trigger(5) -> ets:update_counter(ets:new(t, []), k, 1);
+trigger(6) -> ets:lookup_element(ets:new(t, []), k, 2);
+trigger(7) -> ets:info(ets:new(t, []), bogus);
+trigger(8) -> ets:select(ets:new(t, []), bad_ms);
+trigger(9) -> ets:delete(no_such_table);
+trigger(10) -> ets:setopts(ets:new(t, []), bogus);
+trigger(11) -> ets:new(t, [bogus]);
+trigger(12) -> ets:update_element(ets:new(t, []), k, {2, a});
+trigger(13) -> T = ets:new(t, [protected]), other(fun() -> ets:insert(T, {a}) end);
+trigger(14) -> T = ets:new(t, [private]), other(fun() -> ets:lookup(T, a) end);
+trigger(15) -> other(fun() -> ets:member(no_such_table, a) end);
+trigger(16) -> other(fun() -> ets:select_count(no_such_table, []) end);
+trigger(17) -> other(fun() -> ets:match_object(ets:new(t, []), {a}, 0) end);
+trigger(18) -> T = ets:new(t, []), ets:delete(T), ets:lookup(T, a);
+trigger(19) -> ets:first(no_such_table);
+trigger(20) -> ets:give_away(ets:new(t, []), self(), x);
+trigger(21) -> ets:update_counter(ets:new(t, []), k, 1, bad_default);
+trigger(22) -> ets:delete_object(no_such_table, {a});
+trigger(23) -> ets:slot(ets:new(t, []), -1);
+trigger(24) -> ets:match_spec_compile(bad).
+"#;
+    let beam = reference
+        .compile_named("vm_exc_freason", source, &[])
+        .unwrap();
+    reference.load("vm_exc_freason", &beam).unwrap();
+    let mut vm = crate::common::node();
+    vm.load_bytes(&beam).unwrap();
+    for n in 1..=24 {
+        let args = [OwnedTerm::Int(n)];
+        let expected = trim_result(reference.call("vm_exc_freason", "run", &args));
+        let actual = trim_result(vm_call(&mut vm, "run", &args, "vm_exc_freason"));
+        assert!(
+            compare(&expected, &actual, CompareMode::Exact).is_ok(),
+            "run({args:?}): expected {expected:?}, actual {actual:?}"
+        );
+        assert!(matches!(actual, CallResult::Ok(_)));
+    }
+}
+
 fn trim_result(result: CallResult) -> CallResult {
     match result {
         CallResult::Ok(term) => CallResult::Ok(trim_harness(&term)),

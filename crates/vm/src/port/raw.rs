@@ -104,13 +104,19 @@ pub(super) fn forker_fork_exec(
     max_files: &CStr,
 ) -> io::Result<()> {
     let argv0 = c"erl_child_setup";
+    // forker_start holds the CPU topology read lock around fork when called by a bound
+    // scheduler; the child restores the inherited affinity before replacing its image.
+    let binding = arinsal_sched::erts_sched_bind_atfork_prepare::<crate::Process>();
     // SAFETY: forker_start forks from the emulator; the child uses only async-signal-safe
-    // calls (dup2, setsid, execv, _exit) before the image is replaced.
+    // calls (scheduler unbind, dup2, setsid, execv, _exit) before the image is replaced.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        arinsal_sched::erts_sched_bind_atfork_parent(binding);
+        return Err(error);
     }
     if pid == 0 {
+        arinsal_sched::erts_sched_bind_atfork_child(&binding);
         // SAFETY: this is the forked child; only async-signal-safe calls until execv/_exit.
         unsafe {
             if helper_fd != 3 && libc::dup2(helper_fd, 3) < 0 {
@@ -123,6 +129,7 @@ pub(super) fn forker_fork_exec(
             libc::_exit(1);
         }
     }
+    arinsal_sched::erts_sched_bind_atfork_parent(binding);
     Ok(())
 }
 

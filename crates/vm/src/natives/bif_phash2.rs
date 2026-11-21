@@ -9,6 +9,7 @@
 use super::bif::{badarg, bif_ret};
 use super::erl_bif_lists::{bif_trap, create_trap_state};
 use crate::bif_traps::TrapContext;
+use crate::natives::bif::bif_badarg;
 use crate::{Process, VmError};
 use arinsal_beamasm::ProcessHeader;
 use arinsal_bifs::{BifCall, Ctx, Phash2Cont, Phash2Run, ProcessHeapHandle};
@@ -44,7 +45,7 @@ pub(crate) extern "C" fn phash2_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64
     let [term, range] = crate::bif_table::bif_args::<2>(reg);
     // The range is checked before the term is hashed, on a resumed call too.
     if arinsal_bifs::phash2_range_arg(range).is_err() {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     }
     let result = trapping_make_hash2(process, term, Some(range), "erlang:phash2/2");
     bif_ret(c_p, i, result)

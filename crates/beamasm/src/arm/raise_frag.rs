@@ -418,10 +418,9 @@ impl RaiseFragments {
 }
 
 const ARG4: Gpr = Gpr::x(3);
-// erts calls `i_bif*` with only `Update::eReductions` (instr_bif.cpp:47-64) because its guard
-// BIFs never allocate on the process heap. This port's BIFs may build terms on the heap, so the
-// call also publishes and reloads HTOP and E.
-const I_BIF_UPDATE: Update = Update::HEAP_ALLOC.union(Update::REDUCTIONS);
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:47-101: both shared i_bif fragments update
+// only FCALLS. Guard BIFs that allocate must use heap fragments, as their erts implementations do.
+const I_BIF_UPDATE: Update = Update::REDUCTIONS;
 
 /// ARG2 = argument vector, ARG4 (!) = BIF function pointer; the result is returned in ARG1
 /// (THE_NON_VALUE if the BIF call failed).

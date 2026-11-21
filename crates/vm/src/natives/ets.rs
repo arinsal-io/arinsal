@@ -97,25 +97,22 @@ fn boolean_term(value: bool) -> Term {
 fn needs_context() -> VmError {
     VmError::Unsupported("ETS BIF needs the scheduler context".into())
 }
+/// `BIF_ERROR(BIF_P, BADARG)`.
 fn badarg() -> VmError {
-    VmError::Trap(crate::exceptions::Trap::error(Term::atom(
-        arinsal_term::atoms::BADARG,
-    )))
+    VmError::Freason(arinsal_term::exc::EXC_BADARG)
 }
-/// `p->fvalue = EXI_*`. `db_bif_fail` assigns `p->freason = BADARG | EXF_HAS_EXT_INFO`.
-/// The cause atom on the `Trap` is the local `freason__` of `DB_GET_TABLE`, not an
-/// exception class: `db_bif_fail` turns it into `BADARG | EXF_HAS_EXT_INFO`.
+/// `p->fvalue = EXI_*` of `db_get_table_aux` / `handle_lacking_permission`; the local
+/// `freason__` is `BADARG | EXF_HAS_EXT_INFO`, which `db_bif_fail` stores in `p->freason`.
 // Port of erts/emulator/beam/erl_db.c (`db_get_table_aux`, `handle_lacking_permission`), OTP-29.1.1.
 fn badarg_cause(heap: &mut ProcessHeap, cause: &'static str) -> VmError {
     let cause = *ETS_ATOMS.get(cause).expect("ETS error cause atom");
     heap.abi.exc.fvalue = crate::native_hooks::raw(Term::atom(cause));
-    VmError::Trap(crate::exceptions::Trap::error(Term::atom(cause)))
+    VmError::Freason(arinsal_term::exc::EXC_BADARG | arinsal_term::exc::EXF_HAS_EXT_INFO)
 }
 
+/// `BIF_ERROR(BIF_P, SYSTEM_LIMIT)` (`DB_ERROR_SYSRES`).
 fn system_limit() -> VmError {
-    VmError::Trap(crate::exceptions::Trap::error(Term::atom(
-        arinsal_term::atoms::SYSTEM_LIMIT,
-    )))
+    VmError::Freason(arinsal_term::exc::EXC_SYSTEM_LIMIT)
 }
 fn binary_info_err(heap: &mut ProcessHeap, error: EtsError) -> VmError {
     match error {

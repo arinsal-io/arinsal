@@ -1,11 +1,13 @@
 // Port of erts/emulator/sys/unix/erl_child_setup.c (`main`, `start_new_child`,
 // `handle_sigchld`), OTP-29.1.1.
 
+#[path = "erl_child_setup/hash.rs"]
+mod hash;
 #[path = "erl_child_setup/raw.rs"]
 mod raw;
 
+use hash::Hash;
 use raw::{Fork, UDS_FD};
-use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char};
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -76,7 +78,7 @@ fn main() {
         None
     };
 
-    let mut children: HashMap<libc::pid_t, u64> = HashMap::new();
+    let mut children = Hash::new();
     let uds_fd = std::os::fd::AsRawFd::as_raw_fd(&raw::uds_fd());
 
     loop {
@@ -114,7 +116,7 @@ fn main() {
                     };
                     let errno = if os_pid < 0 { raw::last_errno() } else { 0 };
                     if port_id != THE_NON_VALUE {
-                        children.insert(os_pid, port_id);
+                        children.put(os_pid, port_id);
                     }
                     let mut go = [0u8; FRAME_LEN];
                     go[0..4].copy_from_slice(&GO.to_ne_bytes());
@@ -136,7 +138,7 @@ fn main() {
             }
             let pid = i32::from_ne_bytes(ibuff[0..4].try_into().unwrap());
             let status = i32::from_ne_bytes(ibuff[4..8].try_into().unwrap());
-            let Some(port_id) = children.remove(&pid) else {
+            let Some(port_id) = children.remove(pid) else {
                 continue;
             };
             let mut frame = [0u8; FRAME_LEN];

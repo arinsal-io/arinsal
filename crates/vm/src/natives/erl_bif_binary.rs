@@ -1531,7 +1531,7 @@ fn binary_find(
                 .and_then(|mref| builder.magic_ref(pat_bin).map(|pat| (mref, pat)))
         };
         let Ok((mref, pat_term)) = refs else {
-            return bif_ret(c_p, i, Err(find_error(BifError::SystemLimit)));
+            return bif_system_limit(c_p);
         };
         process.set_gc_enabled(false);
         process.heap.abi.fcalls = 0;
@@ -1582,7 +1582,7 @@ pub(crate) extern "C" fn binary_find_trap(c_p: *mut ProcessHeader, reg: *mut u64
     let [subject, mref, pattern] = crate::bif_table::bif_args::<3>(reg);
     let initial = get_reds(process);
     let Some(pat_bin) = pattern.magic_owner() else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     let stepped = mref.with_magic_payload_mut::<FindHolder, _>(|holder| {
         let search = &mut holder.0;
@@ -1604,7 +1604,7 @@ pub(crate) extern "C" fn binary_find_trap(c_p: *mut ProcessHeader, reg: *mut u64
             let trap = bif_trap(process, BINARY_FIND_TRAP, vec![subject, mref, pattern]);
             bif_ret(c_p, i, Err(trap))
         }
-        None => bif_ret(c_p, i, Err(badarg())),
+        None => bif_badarg(c_p),
     }
 }
 
@@ -1654,7 +1654,7 @@ pub(crate) extern "C" fn binary_last_1(c_p: *mut ProcessHeader, reg: *mut u64, i
 
 /// `binary:at/2`.
 // Port of erts/emulator/beam/erl_bif_binary.c (binary_at_2), OTP-29.1.1.
-pub(crate) extern "C" fn binary_at_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn binary_at_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let [bin, position] = crate::bif_table::bif_args::<2>(reg);
     let value = (|| {
         let view = BinRef::try_from(bin).ok()?;
@@ -1675,7 +1675,7 @@ pub(crate) extern "C" fn binary_at_2(c_p: *mut ProcessHeader, reg: *mut u64, i: 
     })();
     match value {
         Some(value) => crate::native_hooks::raw(value),
-        None => bif_ret(c_p, i, Err(badarg())),
+        None => bif_badarg(c_p),
     }
 }
 
@@ -1692,7 +1692,7 @@ fn term_to_uint(term: Term) -> Option<usize> {
 pub(crate) extern "C" fn binary_referenced_byte_size_1(
     c_p: *mut ProcessHeader,
     reg: *mut u64,
-    i: u64,
+    _i: u64,
 ) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
@@ -1700,14 +1700,14 @@ pub(crate) extern "C" fn binary_referenced_byte_size_1(
     process.heap.note_bif_entry();
     let [bin] = crate::bif_table::bif_args::<1>(reg);
     let Ok(view) = BinRef::try_from(bin) else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     let size = view.referenced_byte_size();
     let value =
         TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap)).int_from_u64(size as u64);
     match value {
         Ok(value) => crate::native_hooks::raw(value),
-        Err(_) => bif_ret(c_p, i, Err(find_error(BifError::SystemLimit))),
+        Err(_) => bif_system_limit(c_p),
     }
 }
 
@@ -1766,7 +1766,7 @@ fn continue_longest_common(
         .filter_map(|index| arinsal_bifs::tuple_element(binaries, index).ok())
         .collect();
     if items.len() != count || binary_index == 0 || binary_index >= count {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     }
     let save_reds = common_reds(process) as i64;
     let mut reds = save_reds;
@@ -1846,14 +1846,14 @@ fn longest_common(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, suffix: bool) 
     while let Some((head, tail)) = cons_cell(rest) {
         let size = match BinRef::try_from(head) {
             Ok(view) if view.bit_len().is_multiple_of(8) => view.bit_len(),
-            _ => return bif_ret(c_p, i, Err(badarg())),
+            _ => return bif_badarg(c_p),
         };
         smallest_size = smallest_size.min(size);
         binaries.push(head);
         rest = tail;
     }
     if rest != Term::NIL || binaries.is_empty() {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     }
     // Trivial cases are weeded out as they complicate the main loop.
     if smallest_size == 0 || binaries.len() == 1 {
@@ -1875,7 +1875,7 @@ fn longest_common_trap(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, suffix: b
     let (Some(index), Some(size), Some(position)) =
         (to_uint(index), to_uint(size), to_uint(position))
     else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     continue_longest_common(c_p, i, process, suffix, binaries, index, size, position)
 }
@@ -1928,7 +1928,7 @@ fn little_endian(order: Option<Term>) -> Option<bool> {
     }
 }
 
-fn encode_unsigned(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize) -> u64 {
+fn encode_unsigned(c_p: *mut ProcessHeader, reg: *mut u64, arity: usize) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
@@ -1939,10 +1939,10 @@ fn encode_unsigned(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize)
         .map(num_bigint::BigInt::from)
         .or_else(|| arinsal_term::raw::big_value(args[0]));
     let (Some(value), Some(little)) = (value, little_endian(args.get(1).copied())) else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     if value.sign() == num_bigint::Sign::Minus {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     }
     let mut bytes = value.to_bytes_be().1;
     if bytes.is_empty() {
@@ -1959,28 +1959,28 @@ fn encode_unsigned(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize)
 pub(crate) extern "C" fn binary_encode_unsigned_1(
     c_p: *mut ProcessHeader,
     reg: *mut u64,
-    i: u64,
+    _i: u64,
 ) -> u64 {
-    encode_unsigned(c_p, reg, i, 1)
+    encode_unsigned(c_p, reg, 1)
 }
 
 /// `binary:encode_unsigned/2`.
 pub(crate) extern "C" fn binary_encode_unsigned_2(
     c_p: *mut ProcessHeader,
     reg: *mut u64,
-    i: u64,
+    _i: u64,
 ) -> u64 {
-    encode_unsigned(c_p, reg, i, 2)
+    encode_unsigned(c_p, reg, 2)
 }
 
-fn decode_unsigned(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize) -> u64 {
+fn decode_unsigned(c_p: *mut ProcessHeader, reg: *mut u64, arity: usize) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     process.heap.note_bif_entry();
     let args = crate::bif_table::bif_arg_vec(reg, arity);
     let Some(little) = little_endian(args.get(1).copied()) else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     let value = with_binary_input(args[0], |bytes| {
         Ok(if little {
@@ -1990,11 +1990,11 @@ fn decode_unsigned(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize)
         })
     });
     let Ok(value) = value else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     match TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap)).int_from_bigint(&value) {
         Ok(term) => crate::native_hooks::raw(term),
-        Err(_) => bif_ret(c_p, i, Err(find_error(BifError::SystemLimit))),
+        Err(_) => bif_system_limit(c_p),
     }
 }
 
@@ -2002,18 +2002,18 @@ fn decode_unsigned(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize)
 pub(crate) extern "C" fn binary_decode_unsigned_1(
     c_p: *mut ProcessHeader,
     reg: *mut u64,
-    i: u64,
+    _i: u64,
 ) -> u64 {
-    decode_unsigned(c_p, reg, i, 1)
+    decode_unsigned(c_p, reg, 1)
 }
 
 /// `binary:decode_unsigned/2`.
 pub(crate) extern "C" fn binary_decode_unsigned_2(
     c_p: *mut ProcessHeader,
     reg: *mut u64,
-    i: u64,
+    _i: u64,
 ) -> u64 {
-    decode_unsigned(c_p, reg, i, 2)
+    decode_unsigned(c_p, reg, 2)
 }
 
 /// Bits copied per reduction: a cache line (`ERTS_CACHE_LINE_SIZE * 8`).
@@ -2108,11 +2108,11 @@ fn do_binary_copy(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize) 
         (bin, term_to_uint(count))
     };
     let (Ok(view), Some(count)) = (BinRef::try_from(bin), count) else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     let bits = view.bit_len();
     if !bits.is_multiple_of(8) {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     }
     let source_len = bits / 8;
     if count == 0 || source_len == 0 {
@@ -2120,7 +2120,7 @@ fn do_binary_copy(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize) 
         return crate::native_hooks::raw(empty);
     }
     if count >= usize::MAX / bits {
-        return bif_ret(c_p, i, Err(find_error(BifError::SystemLimit)));
+        return bif_system_limit(c_p);
     }
     let length = source_len * count;
     let target_bits = length * 8;
@@ -2138,7 +2138,7 @@ fn do_binary_copy(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize) 
                 charge(process, target_bits / BITSTRING_COPY_LOOP_FACTOR);
                 crate::native_hooks::raw(value)
             }
-            Err(_) => bif_ret(c_p, i, Err(find_error(BifError::SystemLimit))),
+            Err(_) => bif_system_limit(c_p),
         };
     }
     // `erts_new_bitstring`: an uninitialized off-heap binary (the target is above one slice, so
@@ -2147,11 +2147,11 @@ fn do_binary_copy(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, arity: usize) 
         &mut ProcessHeapHandle(&mut process.heap),
         length,
     ) else {
-        return bif_ret(c_p, i, Err(find_error(BifError::SystemLimit)));
+        return bif_system_limit(c_p);
     };
     let result = output.term();
     let Ok(copied) = copy_loop(bin, result, 0, max_copy_bits.min(target_bits)) else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     // `ERTS_BIF_YIELD3(binary_copy_trap_export, bin, result, copied_bits)`.
     crate::bif_traps::vbump_all_reds(process);
@@ -2184,7 +2184,7 @@ pub(crate) extern "C" fn binary_copy_trap(c_p: *mut ProcessHeader, reg: *mut u64
         copied_term.as_small().and_then(|n| usize::try_from(n).ok()),
         BinRef::try_from(result),
     ) else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     let target_size = target.bit_len();
     let max_copy_bits = copy_reds(process);
@@ -2196,7 +2196,7 @@ pub(crate) extern "C" fn binary_copy_trap(c_p: *mut ProcessHeader, reg: *mut u64
         trap_offset = initial_target_offset + max_copy_bits;
     }
     let Ok(copied) = copy_loop(bin, result, copied_bits, trap_offset) else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     if copied == target_size {
         charge(

@@ -998,6 +998,13 @@ pub(crate) fn bif_return(
     let result = match result {
         Ok(value) => Ok(value),
         Err(crate::VmError::Trap(trap)) => Err(trap),
+        Err(crate::VmError::Freason(freason)) => {
+            // `call_bif_shared` stores the BIF's MFA in `c_p->current`; `BIF_ERROR` only
+            // `freason`.
+            process.heap.abi.current = std::ptr::from_ref(export.mfa()).cast();
+            process.heap.abi.exc.freason = freason;
+            return arinsal_term::THE_NON_VALUE;
+        }
         Err(crate::VmError::TrapExport(trap)) => {
             return bif_trap_export(process, export, trap, identity as usize);
         }
@@ -1015,10 +1022,11 @@ pub(crate) fn bif_return(
     process_bif_result(process, export, result)
 }
 
-/// [`bif_return`] of a `bif_table[].f` body's failure: `BIF_ERROR`, `BIF_TRAP*` or an outcome
-/// the scheduler completes. The export is the one the call fragment named in `c_p->current`.
+/// [`bif_return`] of a `bif_table[].f` body's `BIF_TRAP*` or of an outcome the scheduler
+/// completes. The export is the one the call fragment named in `c_p->current`. `BIF_ERROR`
+/// does not come here: it is [`bif_error_trap`], which needs no export.
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-536 (call_light_bif_shared: the
-// THE_NON_VALUE arm, `c_p->current` = `&exp->info.mfa`), OTP-29.1.1.
+// THE_NON_VALUE arm with TRAP, `c_p->current` = `&exp->info.mfa`), OTP-29.1.1.
 #[cold]
 #[inline(never)]
 pub(crate) fn bif_return_current(header: *mut ProcessHeader, i: u64, error: crate::VmError) -> u64 {
@@ -1030,6 +1038,27 @@ pub(crate) fn bif_return_current(header: *mut ProcessHeader, i: u64, error: crat
         return 0;
     };
     bif_return(process, export, identity, i != 0, Err(error))
+}
+
+/// `BIF_ERROR` of a `bif_table[].f` body: writes `freason` / `fvalue` / `ftrace` and returns
+/// THE_NON_VALUE. The raise path names the BIF: the call fragment's export MFA
+/// (`raise_exception_shared`), `ubif2mfa` for a guard BIF, or `c_p->current` for
+/// `call_bif_shared`. Nothing here reads `c_p->current`, so a guard BIF in a fresh process
+/// (no `current` yet) raises as in erts. A continuation's error that names the original BIF is
+/// `ERTS_BIF_PREP_ERROR_TRAPPED*`: `c_p->current` is that BIF and its arguments go to X0...
+// Port of erts/emulator/beam/bif.h (BIF_ERROR, ERTS_BIF_PREP_ERROR_TRAPPED1/2/3), OTP-29.1.1.
+#[cold]
+#[inline(never)]
+pub(crate) fn bif_error_trap(header: *mut ProcessHeader, trap: crate::exceptions::Trap) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(header) else {
+        return 0;
+    };
+    let current = crate::raw::beam_common_ffi::code_mfa(process.heap.abi.current as usize as u64)
+        .map(|(module, function, arity)| (module, function, arity as usize));
+    if let Some(bif) = error_trapped_bif(&trap, current) {
+        process.heap.abi.current = std::ptr::from_ref(bif.mfa()).cast();
+    }
+    bif_error(process, trap)
 }
 
 /// An outcome of a BIF called from native code that the scheduler completes.
@@ -1054,35 +1083,50 @@ fn process_bif_error(
     export: ExportDispatch,
     trap: crate::exceptions::Trap,
 ) -> u64 {
-    let mut export = export;
-    // ERTS_BIF_PREP_ERROR_TRAPPED1/2/3(p, reason, bif, args...): a continuation's error names
-    // the original BIF: `c_p->current = &bif->info.mfa` and the arguments go back to X0...
-    if let Some(crate::stacktrace::TopFrame::Bif {
+    let export = error_trapped_bif(
+        &trap,
+        Some((
+            export.module_atom,
+            export.function_atom,
+            export.arity as usize,
+        )),
+    )
+    .unwrap_or(export);
+    process.heap.abi.current = std::ptr::from_ref(export.mfa()).cast();
+    bif_error(process, trap)
+}
+
+/// `ERTS_BIF_PREP_ERROR_TRAPPED1/2/3(p, reason, bif, args...)`: a continuation's error names
+/// the original BIF, whose arguments go back to X0... The export of that BIF when the error's
+/// frame names a BIF other than `current`.
+// Port of erts/emulator/beam/bif.h (ERTS_BIF_PREP_ERROR_TRAPPED1/2/3), OTP-29.1.1.
+fn error_trapped_bif(
+    trap: &crate::exceptions::Trap,
+    current: Option<(arinsal_term::Atom, arinsal_term::Atom, usize)>,
+) -> Option<ExportDispatch> {
+    let Some(crate::stacktrace::TopFrame::Bif {
         module,
         function,
         args,
         ..
     }) = &trap.top
-        && let Some(terms) = args.inline_terms()
-        && (*module, *function, terms.len())
-            != (
-                export.module_atom,
-                export.function_atom,
-                export.arity as usize,
-            )
-    {
-        let atoms = arinsal_term::global_atoms();
-        if let (Some(m), Some(f)) = (atoms.text(*module), atoms.text(*function))
-            && let Some(bif) = crate::beamasm_integration::bif_mfa_export(m, f, terms.len() as u32)
-        {
-            if let Ok(reg) = (crate::Vm {}).x_regs() {
-                reg[..terms.len()].copy_from_slice(terms);
-            }
-            export = bif;
-        }
+    else {
+        return None;
+    };
+    let terms = args.inline_terms()?;
+    if current == Some((*module, *function, terms.len())) {
+        return None;
     }
-    process.heap.abi.current = std::ptr::from_ref(export.mfa()).cast();
-    bif_error(process, trap)
+    let atoms = arinsal_term::global_atoms();
+    let bif = crate::beamasm_integration::bif_mfa_export(
+        atoms.text(*module)?,
+        atoms.text(*function)?,
+        terms.len() as u32,
+    )?;
+    if let Ok(reg) = (crate::Vm {}).x_regs() {
+        reg[..terms.len()].copy_from_slice(terms);
+    }
+    Some(bif)
 }
 
 /// `BIF_ERROR` from a native BIF body: writes only `freason`, `fvalue` and `ftrace` and

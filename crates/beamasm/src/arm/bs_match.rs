@@ -4,6 +4,7 @@
 
 use super::beam_asm::{NUM_REGISTER_BACKED_XREGS, is_register_backed};
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
+use crate::rt::addr;
 use arinsal_a64::enc::{Cond, Gpr};
 /// Words of a `SUB_BITS` object (erts/emulator/beam/erl_bits.h, ERL_SUB_BITS_SIZE).
 const ERL_SUB_BITS_SIZE: u32 = 5;
@@ -144,7 +145,7 @@ impl BeamModuleAssembler {
         })?;
         emit_bs_runtime_call(
             self,
-            crate::raw::erts_bs_get_integer_2 as *const () as usize,
+            addr(crate::raw::erts_bs_get_integer_2 as *const ()),
             0,
             crate::Update::NONE,
             &[Gpr::x(21), Gpr::x(10), Gpr::x(9), CTX],
@@ -196,7 +197,7 @@ impl BeamModuleAssembler {
         self.code.emit(|e| e.mov_reg(Gpr::x(8), src_reg))?;
         emit_bs_runtime_call(
             self,
-            crate::raw::erts_bs_start_match_3 as *const () as usize,
+            addr(crate::raw::erts_bs_start_match_3 as *const ()),
             live as usize,
             crate::Update::HEAP,
             &[Gpr::x(21), Gpr::x(8)],
@@ -409,7 +410,7 @@ impl BeamModuleAssembler {
         self.code.emit(|e| e.and_imm(CTX, context, !7))?;
         emit_bs_runtime_call(
             self,
-            crate::raw::erts_bs_get_integer_2 as *const () as usize,
+            addr(crate::raw::erts_bs_get_integer_2 as *const ()),
             0,
             crate::Update::HEAP,
             &[Gpr::x(21), FIELD_BITS, Gpr::xzr(), CTX],
@@ -456,7 +457,7 @@ impl BeamModuleAssembler {
             })?;
             emit_bs_runtime_call(
                 self,
-                crate::raw::erts_bs_get_integer_2 as *const () as usize,
+                addr(crate::raw::erts_bs_get_integer_2 as *const ()),
                 live as usize,
                 crate::Update::NONE,
                 &[Gpr::x(21), FIELD_BITS, Gpr::x(10), CTX],
@@ -475,7 +476,7 @@ impl BeamModuleAssembler {
             })?;
             emit_bs_runtime_call(
                 self,
-                crate::raw::beam_jit_bs_get_integer as *const () as usize,
+                addr(crate::raw::beam_jit_bs_get_integer as *const ()),
                 live as usize,
                 crate::Update::HEAP_ALLOC
                     .union(crate::Update::X_REGS)
@@ -515,7 +516,7 @@ impl BeamModuleAssembler {
         self.emit_bs_field_size(bits, unit, fail_label)?;
         emit_bs_runtime_call(
             self,
-            crate::raw::erts_bs_get_binary_2 as *const () as usize,
+            addr(crate::raw::erts_bs_get_binary_2 as *const ()),
             live as usize,
             crate::Update::HEAP,
             &[Gpr::x(21), FIELD_BITS, CTX],
@@ -558,7 +559,7 @@ impl BeamModuleAssembler {
         })?;
         emit_bs_runtime_call(
             self,
-            crate::raw::erts_bs_get_binary_2 as *const () as usize,
+            addr(crate::raw::erts_bs_get_binary_2 as *const ()),
             live as usize,
             crate::Update::HEAP,
             &[Gpr::x(21), FIELD_BITS, CTX],
@@ -603,7 +604,7 @@ impl BeamModuleAssembler {
         })?;
         emit_bs_runtime_call(
             self,
-            crate::raw::erts_cmp_bits as *const () as usize,
+            addr(crate::raw::erts_cmp_bits as *const ()),
             NUM_REGISTER_BACKED_XREGS as usize,
             crate::Update::NONE,
             &[pointer, Gpr::xzr(), Gpr::x(13), Gpr::x(14), Gpr::x(10)],
@@ -668,7 +669,7 @@ impl BeamModuleAssembler {
         })?;
         emit_bs_runtime_call(
             self,
-            crate::raw::erts_build_sub_bitstring as *const () as usize,
+            addr(crate::raw::erts_build_sub_bitstring as *const ()),
             live as usize,
             crate::Update::HEAP,
             &[
@@ -793,7 +794,7 @@ impl BeamModuleAssembler {
         self.code.emit(|e| e.and_imm(CTX, context, !7))?;
         emit_bs_runtime_call(
             self,
-            crate::raw::erts_bs_get_float_2 as *const () as usize,
+            addr(crate::raw::erts_bs_get_float_2 as *const ()),
             live as usize,
             crate::Update::HEAP,
             &[Gpr::x(21), FIELD_BITS, Gpr::x(10), CTX],
@@ -812,7 +813,7 @@ impl BeamModuleAssembler {
         self.code.emit(|e| e.and_imm(CTX, context, !7))?;
         emit_bs_runtime_call(
             self,
-            crate::raw::erts_bs_get_utf8 as *const () as usize,
+            addr(crate::raw::erts_bs_get_utf8 as *const ()),
             NUM_REGISTER_BACKED_XREGS as usize,
             crate::Update::NONE,
             &[CTX],
@@ -837,7 +838,7 @@ impl BeamModuleAssembler {
         self.code.emit(|e| e.and_imm(CTX, context, !7))?;
         emit_bs_runtime_call(
             self,
-            crate::raw::erts_bs_get_utf16 as *const () as usize,
+            addr(crate::raw::erts_bs_get_utf16 as *const ()),
             NUM_REGISTER_BACKED_XREGS as usize,
             crate::Update::NONE,
             &[CTX, flags],

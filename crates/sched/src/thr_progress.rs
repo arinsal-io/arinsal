@@ -14,7 +14,7 @@
 //! `erts_schedule_misc_aux_work` onto a normal scheduler.
 
 use crate::ssi::{self, ErtsSchedulerSleepInfo};
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -496,8 +496,7 @@ impl ThrProgress {
     fn block_count_dec(&self) -> bool {
         let block_count = self.block_count.fetch_sub(1, Ordering::SeqCst) - 1;
         if block_count == 0 {
-            let event = raw::blocker_event_load(&self.blocker_event);
-            if !event.is_null() {
+            if let Some(event) = raw::blocker_event_load(&self.blocker_event) {
                 raw::erts_tse_set(event);
             }
             return true;
@@ -963,7 +962,9 @@ fn thr_progress_unblock(progress: &ThrProgress, tpd: Option<&mut ThrPrgrData>) {
     progress.lflgs.fetch_and(!LFLG_BLOCK, Ordering::SeqCst);
     // Unmanaged threads waiting to take `LFLG_BLOCK` wait on this event.
     progress.notify_event();
-    raw::erts_tse_return(event);
+    if let Some(event) = event {
+        raw::erts_tse_return(event);
+    }
     if wakeup {
         loop {
             if progress.thr[id].0.load(Ordering::Relaxed) != VAL_WAITING {
@@ -1154,7 +1155,10 @@ pub(crate) fn scheduler_progress(managed: &ManagedThread, run_queue: &mut dyn Ru
 
 /// Drain ready scheduler-owned later operations from `handle_aux_work`.
 // Port of erts/emulator/beam/erl_process.c:2281 (handle_thr_prgr_later_op), OTP-29.1.1.
-pub(crate) fn handle_thr_prgr_later_op(awdp: *mut AuxWorkLater, current: u64) -> LaterOpHandle {
+pub(crate) fn handle_thr_prgr_later_op(
+    awdp: &UnsafeCell<AuxWorkLater>,
+    current: u64,
+) -> LaterOpHandle {
     raw::handle_thr_prgr_later_op(
         awdp,
         current,
@@ -1270,12 +1274,12 @@ fn haw_thr_prgr_later_cleanup_op_wakeup(
 }
 
 /// Port of erts/emulator/beam/erl_process.c:1703 (`haw_thr_prgr_current_reset`).
-pub(crate) fn haw_thr_prgr_current_reset(awdp: *mut AuxWorkLater) {
+pub(crate) fn haw_thr_prgr_current_reset(awdp: &UnsafeCell<AuxWorkLater>) {
     raw::aux_work_later_current_reset(awdp);
 }
 
 /// Port of erts/emulator/beam/erl_process.c:1708 (`haw_thr_prgr_current`).
-pub(crate) fn haw_thr_prgr_current(awdp: *mut AuxWorkLater, progress: &ThrProgress) -> u64 {
+pub(crate) fn haw_thr_prgr_current(awdp: &UnsafeCell<AuxWorkLater>, progress: &ThrProgress) -> u64 {
     raw::aux_work_later_current(awdp, progress.current.load(Ordering::Acquire))
 }
 
@@ -1285,25 +1289,27 @@ pub(crate) fn haw_thr_prgr_current_check_progress(cached: u64, progress: &ThrPro
 }
 
 /// Port of erts/emulator/beam/erl_process.c:2351 (`erts_schedule_thr_prgr_later_op`).
+#[cfg(test)]
 pub(crate) fn erts_schedule_thr_prgr_later_op(
     progress: &ThrProgress,
     awdp: &mut AuxWorkLater,
     aux_work: &AtomicU32,
     later_func: fn(*mut ()),
     later_data: *mut (),
-    lop: *mut ErtsThrPrgrLaterOp,
+    lop: &mut ErtsThrPrgrLaterOp,
 ) {
     enqueue_later_op(progress, awdp, aux_work, later_func, later_data, lop, None);
 }
 
 /// Port of erts/emulator/beam/erl_process.c:2361 (`erts_schedule_thr_prgr_later_cleanup_op`).
+#[cfg(test)]
 pub(crate) fn erts_schedule_thr_prgr_later_cleanup_op(
     progress: &ThrProgress,
     awdp: &mut AuxWorkLater,
     aux_work: &AtomicU32,
     later_func: fn(*mut ()),
     later_data: *mut (),
-    lop: *mut ErtsThrPrgrLaterOp,
+    lop: &mut ErtsThrPrgrLaterOp,
     size: usize,
 ) {
     enqueue_later_op(
@@ -1318,13 +1324,14 @@ pub(crate) fn erts_schedule_thr_prgr_later_cleanup_op(
 }
 
 // Port of erl_process.c:2324 (`enqueue_later_op`), OTP-29.1.1.
+#[cfg(test)]
 pub(crate) fn enqueue_later_op(
     progress: &ThrProgress,
     awdp: &mut AuxWorkLater,
     aux_work: &AtomicU32,
     later_func: fn(*mut ()),
     later_data: *mut (),
-    lop: *mut ErtsThrPrgrLaterOp,
+    lop: &mut ErtsThrPrgrLaterOp,
     cleanup_size: Option<usize>,
 ) {
     with_tpd(|tpd| {
@@ -1339,6 +1346,36 @@ pub(crate) fn enqueue_later_op(
         let later = current_to_later(tpd.confirmed);
         fence(Ordering::SeqCst);
         raw::enqueue(&mut awdp.later_op.list, later, later_func, later_data, lop);
+        // Port of erl_process.c:2344 (`set_aux_work_flags_wakeup_nob` in `enqueue_later_op`).
+        aux_work.fetch_or(1 << 5, Ordering::Release);
+        match cleanup_size {
+            Some(size) => haw_thr_prgr_later_cleanup_op_wakeup(tpd, awdp, later, size),
+            None => haw_thr_prgr_wakeup(tpd, awdp, later),
+        }
+    });
+}
+
+/// `enqueue_later_op` of a node already packed as `LaterOpArgs` (erts dirty/non-scheduler
+/// callers that first `erts_schedule_misc_aux_work`).
+pub(crate) fn enqueue_later_op_args(
+    progress: &ThrProgress,
+    awdp: &mut AuxWorkLater,
+    aux_work: &AtomicU32,
+    args: raw::LaterOpArgs,
+) {
+    with_tpd(|tpd| {
+        let Some(tpd) = tpd.filter(|tpd| std::ptr::eq(Arc::as_ptr(&tpd.progress), progress)) else {
+            debug_assert!(
+                false,
+                "enqueue_later_op requires a normal scheduler (erts ASSERT esdp && !dirty)"
+            );
+            return;
+        };
+        // erts_thr_progress_later: read confirmed, then a full barrier, then current_to_later.
+        let later = current_to_later(tpd.confirmed);
+        fence(Ordering::SeqCst);
+        let cleanup_size = args.size;
+        args.enqueue(&mut awdp.later_op.list, later);
         // Port of erl_process.c:2344 (`set_aux_work_flags_wakeup_nob` in `enqueue_later_op`).
         aux_work.fetch_or(1 << 5, Ordering::Release);
         match cleanup_size {
@@ -1462,7 +1499,7 @@ mod tests {
             &AUX_WORK_FLAGS,
             set_flag,
             std::ptr::from_mut(op).cast(),
-            op.later_op.as_list_node(),
+            &mut op.later_op,
         );
     }
 
@@ -1484,7 +1521,7 @@ mod tests {
     }
 
     fn drain(awdp: &mut AuxWorkLater, current: u64) {
-        handle_thr_prgr_later_op(std::ptr::from_mut(awdp), current);
+        handle_thr_prgr_later_op(UnsafeCell::from_mut(awdp), current);
     }
 
     #[test]

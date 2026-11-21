@@ -19,6 +19,15 @@ use crate::{
 };
 use core::ffi::c_void;
 
+/// Code address of an erts runtime symbol for BeamAsm `runtime_call`.
+///
+/// `f` is an `extern "C"` function item coerced to `*const ()` at the call site. This does
+/// not call the function; generated code calls the C symbol.
+#[inline(always)]
+pub fn addr(f: *const ()) -> usize {
+    f as usize
+}
+
 /// Per-call exit fragment result passed between the assembly bridge and Rust.
 #[repr(C)]
 #[derive(Default)]
@@ -101,19 +110,19 @@ pub fn set_process_main_labels(dispatch_nif: usize) {
 // The VM exports this static erts helper's C symbol to generated code.
 unsafe extern "C" {
     /// `ErtsCodePtr get_on_load_address(Process *, Eterm)`.
-    pub safe fn get_on_load_address(c_p: *mut crate::ProcessHeader, module: u64) -> usize;
+    pub fn get_on_load_address(c_p: *mut crate::ProcessHeader, module: u64) -> usize;
 }
 
 // Port of erts/emulator/beam/jit/x86/beam_asm_global.cpp:28-32 (`extern "C" { #include
 // "bif.h" #include "beam_common.h" }`) and erl_gc.h, OTP-29.1.1: the runtime functions the
 // fragments of this file call by address (`runtime_call`). They are defined with these erts
 // names and C signatures by the VM (docs/design/jit_runtime_symbols.md); fragments take their
-// address with `f as usize`. The declarations live in this raw module (`unsafe extern`);
-// `beam_asm_global` re-exports them.
+// address with `addr(f as *const ())`. The declarations live in this raw module (`unsafe
+// extern`); `beam_asm_global` re-exports them.
 unsafe extern "C" {
     /// `ErtsCodePtr handle_error(Process *c_p, ErtsCodePtr pc, Eterm *reg,
     /// const ErtsCodeMFA *bif_mfa)` (beam_common.h): the handler to continue at, or null.
-    pub safe fn handle_error(
+    pub fn handle_error(
         c_p: *mut crate::ProcessHeader,
         pc: usize,
         reg: *mut u64,
@@ -122,7 +131,7 @@ unsafe extern "C" {
     /// `const Export *call_error_handler(Process *p, const ErtsCodeMFA *mfa, Eterm *reg,
     /// Eterm func)` (beam_common.h): the `Export` address, or null. `Export` is read only by
     /// native code, so it crosses as an address.
-    pub safe fn call_error_handler(
+    pub fn call_error_handler(
         c_p: *mut crate::ProcessHeader,
         mfa: *const arinsal_term::ErtsCodeMfa,
         reg: *mut u64,
@@ -133,7 +142,7 @@ unsafe extern "C" {
     pub safe static the_active_code_index: u32;
     /// `int erts_garbage_collect_nobump(Process *p, Uint need, Eterm *objv, int nobj,
     /// int fcalls)` (erl_gc.h:171): reductions spent.
-    pub safe fn erts_garbage_collect_nobump(
+    pub fn erts_garbage_collect_nobump(
         c_p: *mut crate::ProcessHeader,
         need: usize,
         objv: *mut u64,
@@ -148,7 +157,7 @@ unsafe extern "C" {
     /// `Eterm erts_gc_after_bif_call_lhf(Process *p, ErlHeapFragment *live_hf_end,
     /// Eterm result, Eterm *regs, Uint arity)` (erl_gc.h): collects after a BIF whose result
     /// left a collection desired; `live_hf_end` is `c_p->mbuf` before the call.
-    pub safe fn erts_gc_after_bif_call_lhf(
+    pub fn erts_gc_after_bif_call_lhf(
         c_p: *mut crate::ProcessHeader,
         live_hf_end: usize,
         result: u64,
@@ -160,19 +169,19 @@ unsafe extern "C" {
 // Port of erts/emulator/beam/jit/x86/instr_arith.cpp runtime-call declarations, OTP-29.1.1.
 unsafe extern "C" {
     /// `Eterm erts_band(Process *p, Eterm arg1, Eterm arg2)`.
-    pub safe fn erts_band(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    pub fn erts_band(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
     /// `Eterm erts_bnot(Process *p, Eterm arg)`.
-    pub safe fn erts_bnot(c_p: *mut crate::ProcessHeader, arg: u64) -> u64;
+    pub fn erts_bnot(c_p: *mut crate::ProcessHeader, arg: u64) -> u64;
     /// `Eterm erts_bor(Process *p, Eterm arg1, Eterm arg2)`.
-    pub safe fn erts_bor(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    pub fn erts_bor(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
     /// `Eterm erts_bsl(Process *p, Eterm arg1, Eterm arg2)`.
-    pub safe fn erts_bsl(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    pub fn erts_bsl(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
     /// `Eterm erts_bsr(Process *p, Eterm arg1, Eterm arg2)`.
-    pub safe fn erts_bsr(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    pub fn erts_bsr(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
     /// `Eterm erts_bxor(Process *p, Eterm arg1, Eterm arg2)`.
-    pub safe fn erts_bxor(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    pub fn erts_bxor(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
     /// `int erts_int_div_rem(Process *p, Eterm arg1, Eterm arg2, Eterm *q, Eterm *r)`.
-    pub safe fn erts_int_div_rem(
+    pub fn erts_int_div_rem(
         c_p: *mut crate::ProcessHeader,
         arg1: u64,
         arg2: u64,
@@ -180,15 +189,15 @@ unsafe extern "C" {
         remainder: *mut u64,
     ) -> i32;
     /// `Eterm erts_mixed_div(Process *p, Eterm arg1, Eterm arg2)`.
-    pub safe fn erts_mixed_div(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    pub fn erts_mixed_div(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
     /// `Eterm erts_mixed_minus(Process *p, Eterm arg1, Eterm arg2)`.
-    pub safe fn erts_mixed_minus(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    pub fn erts_mixed_minus(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
     /// `Eterm erts_mixed_plus(Process *p, Eterm arg1, Eterm arg2)`.
-    pub safe fn erts_mixed_plus(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    pub fn erts_mixed_plus(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
     /// `Eterm erts_mixed_times(Process *p, Eterm arg1, Eterm arg2)`.
-    pub safe fn erts_mixed_times(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
+    pub fn erts_mixed_times(c_p: *mut crate::ProcessHeader, arg1: u64, arg2: u64) -> u64;
     /// `Eterm erts_mul_add(Process *p, Eterm arg1, Eterm arg2, Eterm arg3, Eterm *pp)`.
-    pub safe fn erts_mul_add(
+    pub fn erts_mul_add(
         c_p: *mut crate::ProcessHeader,
         arg1: u64,
         arg2: u64,
@@ -196,14 +205,14 @@ unsafe extern "C" {
         result: *mut u64,
     ) -> u64;
     /// `Eterm erts_unary_minus(Process *p, Eterm arg1)`.
-    pub safe fn erts_unary_minus(c_p: *mut crate::ProcessHeader, arg1: u64) -> u64;
+    pub fn erts_unary_minus(c_p: *mut crate::ProcessHeader, arg1: u64) -> u64;
 }
 
 // Port of erts/emulator/beam/jit/x86/instr_float.cpp (`extern "C" { #include "big.h" }`),
 // OTP-29.1.1: `big_to_double` writes the converted float to TMP_MEM1.
 unsafe extern "C" {
     /// `int big_to_double(Eterm x, double *resp)` (big.h).
-    pub safe fn big_to_double(x: u64, resp: *mut f64) -> i32;
+    pub fn big_to_double(x: u64, resp: *mut f64) -> i32;
 }
 
 // Port of erts/emulator/beam/jit/x86/instr_guard_bifs.cpp (`erl_utils.h`), OTP-29.1.1:
@@ -211,7 +220,7 @@ unsafe extern "C" {
 // with instr_map below.
 unsafe extern "C" {
     /// `int eq(Eterm a, Eterm b)` (erl_utils.h / utils.c).
-    pub safe fn eq(a: u64, b: u64) -> i32;
+    pub fn eq(a: u64, b: u64) -> i32;
 }
 
 // Port of erts/emulator/beam/erl_process_dict.h, erl_bif_op.h, erl_utils.h and
@@ -219,16 +228,16 @@ unsafe extern "C" {
 // perf-counter callback table consumed by instr_common.cpp, OTP-29.1.1.
 unsafe extern "C" {
     /// `Eterm erts_pd_hash_get(Process *p, Eterm id)` (erl_process_dict.h).
-    pub safe fn erts_pd_hash_get(c_p: *mut crate::ProcessHeader, id: u64) -> u64;
+    pub fn erts_pd_hash_get(c_p: *mut crate::ProcessHeader, id: u64) -> u64;
     /// `Eterm erts_pd_hash_get_with_hx(Process *p, erts_ihash_t hx, Eterm id)`
     /// (erl_process_dict.h); `erts_ihash_t` is a machine word.
-    pub safe fn erts_pd_hash_get_with_hx(c_p: *mut crate::ProcessHeader, hx: u64, id: u64) -> u64;
+    pub fn erts_pd_hash_get_with_hx(c_p: *mut crate::ProcessHeader, hx: u64, id: u64) -> u64;
     /// `Eterm erl_is_function(Process *p, Eterm term, Eterm arity)` (erl_bif_op.h).
-    pub safe fn erl_is_function(c_p: *mut crate::ProcessHeader, term: u64, arity: u64) -> u64;
+    pub fn erl_is_function(c_p: *mut crate::ProcessHeader, term: u64, arity: u64) -> u64;
     /// `Sint erts_cmp_compound(Eterm a, Eterm b, int exact, int eq_only)` (utils.h).
-    pub safe fn erts_cmp_compound(a: u64, b: u64, exact: i32, eq_only: i32) -> i64;
+    pub fn erts_cmp_compound(a: u64, b: u64, exact: i32, eq_only: i32) -> i64;
     /// `int erts_cmp_atoms(Eterm a, Eterm b)` (erl_utils.h).
-    pub safe fn erts_cmp_atoms(a: u64, b: u64) -> i32;
+    pub fn erts_cmp_atoms(a: u64, b: u64) -> i32;
 }
 
 /// The perf-counter function table in erts' `ErtsSysTimeData__`.
@@ -296,11 +305,11 @@ pub fn perf_counter_address() -> usize {
     unsafe {
         #[cfg(target_os = "windows")]
         {
-            erts_sys_time_data__.r.o.sys_hrtime as *const () as usize
+            addr(erts_sys_time_data__.r.o.sys_hrtime as *const ())
         }
         #[cfg(not(target_os = "windows"))]
         {
-            erts_sys_time_data__.r.o.perf_counter as *const () as usize
+            addr(erts_sys_time_data__.r.o.perf_counter as *const ())
         }
     }
 }
@@ -312,10 +321,16 @@ pub fn perf_counter_address() -> usize {
 // is called by the loader side of `patchCatches`. `beam_asm_module` re-exports both.
 unsafe extern "C" {
     /// `static void i_emit_nyi(char *msg)`: halts the emulator with `NYI: <msg>`.
-    pub safe fn i_emit_nyi(msg: *const core::ffi::c_char);
+    pub fn i_emit_nyi(msg: *const core::ffi::c_char);
     /// `unsigned beam_catches_cons(ErtsCodePtr cp, unsigned cdr, ErtsCodePtr **)`: a new
     /// catch index for the handler `cp`, chained to `cdr`.
-    pub safe fn beam_catches_cons(cp: usize, cdr: u32, cdrpp: *mut *mut usize) -> u32;
+    pub fn beam_catches_cons(cp: usize, cdr: u32, cdrpp: *mut *mut usize) -> u32;
+}
+
+/// `patchCatches` (`beam_jit_common.cpp:506-531`): `beam_catches_cons(cp, cdr, NULL)`.
+pub fn beam_catches_cons_nil(cp: usize, cdr: u32) -> u32 {
+    // SAFETY: erts `patchCatches` passes a null `cdrpp`; the VM owns the catch table.
+    unsafe { beam_catches_cons(cp, cdr, core::ptr::null_mut()) }
 }
 
 // Port of erts/emulator/beam/jit/x86/instr_common.cpp and instr_call.cpp (`extern "C" {
@@ -323,16 +338,16 @@ unsafe extern "C" {
 // call by address. `instr_common` and `instr_call` re-export them.
 unsafe extern "C" {
     /// `Eterm add_stacktrace(Process *c_p, Eterm Value, Eterm exc)` (beam_common.h).
-    pub safe fn add_stacktrace(c_p: *mut crate::ProcessHeader, value: u64, exc: u64) -> u64;
+    pub fn add_stacktrace(c_p: *mut crate::ProcessHeader, value: u64, exc: u64) -> u64;
     /// `void erts_sanitize_freason(Process *c_p, Eterm exc)` (beam_common.h).
-    pub safe fn erts_sanitize_freason(c_p: *mut crate::ProcessHeader, exc: u64);
+    pub fn erts_sanitize_freason(c_p: *mut crate::ProcessHeader, exc: u64);
     /// `void save_calls(Process *p, const Export *)` (beam_common.h). `Export` crosses as an
     /// address, as for `call_error_handler`.
-    pub safe fn save_calls(c_p: *mut crate::ProcessHeader, export: usize);
+    pub fn save_calls(c_p: *mut crate::ProcessHeader, export: usize);
     /// `const Export *fixed_apply(Process *p, Eterm *reg, Uint arity, ErtsCodePtr I,
     /// Uint flags)` (beam_common.h); the export address, or null after setting the process
     /// exception.
-    pub safe fn fixed_apply(
+    pub fn fixed_apply(
         c_p: *mut crate::ProcessHeader,
         reg: *mut u64,
         arity: u64,
@@ -341,33 +356,32 @@ unsafe extern "C" {
     ) -> usize;
     /// `const Export *apply(Process *p, Eterm *reg, ErtsCodePtr I, Uint flags)`
     /// (beam_common.h); the export address, or null after setting the process exception.
-    pub safe fn apply(c_p: *mut crate::ProcessHeader, reg: *mut u64, i: usize, flags: u64)
-    -> usize;
+    pub fn apply(c_p: *mut crate::ProcessHeader, reg: *mut u64, i: usize, flags: u64) -> usize;
 }
 
 // Port of erts/emulator/beam/jit/x86/instr_common.cpp runtime declarations, OTP-29.1.1.
 unsafe extern "C" {
     /// `int raw_raise(Eterm stacktrace, Eterm exc_class, Eterm value, Process *c_p)`
     /// (beam_common.h).
-    pub safe fn raw_raise(
+    pub fn raw_raise(
         stacktrace: u64,
         exc_class: u64,
         value: u64,
         c_p: *mut crate::ProcessHeader,
     ) -> i32;
     /// `Eterm build_stacktrace(Process *c_p, Eterm exc)` (global.h).
-    pub safe fn build_stacktrace(c_p: *mut crate::ProcessHeader, exc: u64) -> u64;
+    pub fn build_stacktrace(c_p: *mut crate::ProcessHeader, exc: u64) -> u64;
     /// `void erts_do_exit_process(Process *p, Eterm reason)` (erl_process.h).
-    pub safe fn erts_do_exit_process(c_p: *mut crate::ProcessHeader, reason: u64);
+    pub fn erts_do_exit_process(c_p: *mut crate::ProcessHeader, reason: u64);
     /// `void erts_continue_exit_process(Process *p)` (erl_process.h).
-    pub safe fn erts_continue_exit_process(c_p: *mut crate::ProcessHeader);
+    pub fn erts_continue_exit_process(c_p: *mut crate::ProcessHeader);
 }
 
 // Port of erts/emulator/beam/jit/x86/instr_records.cpp and instr_trace.cpp runtime-call
 // declarations, OTP-29.1.1. These helpers are part of the BeamAsm runtime ABI.
 unsafe extern "C" {
     /// `bool erl_get_record_elements(Process *, Eterm *, Eterm, Uint, const Eterm *)`.
-    pub safe fn erl_get_record_elements(
+    pub fn erl_get_record_elements(
         c_p: *mut crate::ProcessHeader,
         registers: *mut u64,
         source: u64,
@@ -375,7 +389,7 @@ unsafe extern "C" {
         elements: *const u64,
     ) -> bool;
     /// `Eterm erl_create_local_native_record(Process *, Eterm *, Eterm, Uint, Uint, const Eterm *)`.
-    pub safe fn erl_create_local_native_record(
+    pub fn erl_create_local_native_record(
         c_p: *mut crate::ProcessHeader,
         registers: *mut u64,
         definition: u64,
@@ -384,7 +398,7 @@ unsafe extern "C" {
         elements: *const u64,
     ) -> u64;
     /// `Eterm erl_create_native_record(Process *, Eterm *, Eterm, Uint, Uint, const Eterm *)`.
-    pub safe fn erl_create_native_record(
+    pub fn erl_create_native_record(
         c_p: *mut crate::ProcessHeader,
         registers: *mut u64,
         definition_id: u64,
@@ -393,7 +407,7 @@ unsafe extern "C" {
         elements: *const u64,
     ) -> u64;
     /// `Eterm erl_update_native_record(Process *, Eterm *, Eterm, Uint, Uint, const Eterm *)`.
-    pub safe fn erl_update_native_record(
+    pub fn erl_update_native_record(
         c_p: *mut crate::ProcessHeader,
         registers: *mut u64,
         source: u64,
@@ -402,28 +416,28 @@ unsafe extern "C" {
         elements: *const u64,
     ) -> u64;
     /// `Eterm erl_get_local_record_field(Process *, Eterm, Eterm, Eterm)`.
-    pub safe fn erl_get_local_record_field(
+    pub fn erl_get_local_record_field(
         c_p: *mut crate::ProcessHeader,
         source: u64,
         definition_id: u64,
         name: u64,
     ) -> u64;
     /// `Eterm erl_get_record_field(Process *, Eterm, Eterm, Eterm)`.
-    pub safe fn erl_get_record_field(
+    pub fn erl_get_record_field(
         c_p: *mut crate::ProcessHeader,
         source: u64,
         definition_id: u64,
         name: u64,
     ) -> u64;
     /// `void erts_call_trace_return(Process *, const ErtsCodeInfo *, Eterm, Eterm)`.
-    pub safe fn erts_call_trace_return(
+    pub fn erts_call_trace_return(
         c_p: *mut crate::ProcessHeader,
         previous_info: *const core::ffi::c_void,
         value: u64,
         tracer: u64,
     );
     /// `void erts_trace_return(Process *, ErtsCodeMFA *, Eterm, ErtsTracer, Eterm)`.
-    pub safe fn erts_trace_return(
+    pub fn erts_trace_return(
         c_p: *mut crate::ProcessHeader,
         mfa: *mut arinsal_term::ErtsCodeMfa,
         value: u64,
@@ -431,33 +445,52 @@ unsafe extern "C" {
         session_id: u64,
     );
     /// `void erts_hibernate(Process *, Eterm *, int)`.
-    pub safe fn erts_hibernate(c_p: *mut crate::ProcessHeader, registers: *mut u64, arg: i32);
+    pub fn erts_hibernate(c_p: *mut crate::ProcessHeader, registers: *mut u64, arg: i32);
     /// `void beam_jit_return_to_trace(Process *, Eterm, Eterm *)`.
-    pub safe fn beam_jit_return_to_trace(
+    pub fn beam_jit_return_to_trace(
         c_p: *mut crate::ProcessHeader,
         session_id: u64,
         continuation: *mut u64,
     );
 }
 
+/// The runtime wrapper around `erts_trace_return` used by the static helper in erts.
+///
+/// # Safety
+/// Generated code calls this with the live process and the return-trace frame; the same
+/// contract as erts `return_trace` in instr_trace.cpp.
+// Port of erts/emulator/beam/jit/x86/instr_trace.cpp:172-180 (return_trace), OTP-29.1.1.
+pub unsafe extern "C" fn return_trace(
+    c_p: *mut crate::ProcessHeader,
+    mfa: *mut arinsal_term::ErtsCodeMfa,
+    value: u64,
+    tracer: u64,
+    session_id: u64,
+) {
+    // `ERTS_UNREQ_PROC_MAIN_LOCK` / `ERTS_REQ_PROC_MAIN_LOCK` compile to no-ops in release
+    // builds without ERTS_ENABLE_LOCK_CHECK, which is the runtime this assembler emits for.
+    // SAFETY: generated code calls this with the live process and the return-trace frame.
+    unsafe { erts_trace_return(c_p, mfa, value, tracer, session_id) }
+}
+
 // Port of erts/emulator/beam/jit/x86/instr_bif.cpp runtime-call declarations, OTP-29.1.1.
 unsafe extern "C" {
     /// `Eterm erts_trapping_length_1(Process *, Eterm *)`.
-    pub safe fn erts_trapping_length_1(c_p: *mut crate::ProcessHeader, args: *mut u64) -> u64;
+    pub fn erts_trapping_length_1(c_p: *mut crate::ProcessHeader, args: *mut u64) -> u64;
     /// `ErtsCodeMFA *ubif2mfa(void *)`.
-    pub safe fn ubif2mfa(function: *const core::ffi::c_void) -> *const arinsal_term::ErtsCodeMfa;
+    pub fn ubif2mfa(function: *const core::ffi::c_void) -> *const arinsal_term::ErtsCodeMfa;
     /// `ErtsCodePtr erts_call_nif_early(Process *, const ErtsCodeInfo *)`.
-    pub safe fn erts_call_nif_early(
+    pub fn erts_call_nif_early(
         c_p: *mut crate::ProcessHeader,
         code_info: *const crate::common::beam_asm_h::ErtsCodeInfo,
     ) -> usize;
     /// `ErtsCodePtr erts_printable_return_address(const Process *, const Eterm *)`.
-    pub safe fn erts_printable_return_address(
+    pub fn erts_printable_return_address(
         c_p: *const crate::ProcessHeader,
         stack: *const u64,
     ) -> usize;
     /// `Eterm beam_jit_call_bif(Process *, Eterm *, ErtsCodePtr, ErtsBifFunc, Uint)`.
-    pub safe fn beam_jit_call_bif(
+    pub fn beam_jit_call_bif(
         c_p: *mut crate::ProcessHeader,
         registers: *mut u64,
         instruction: usize,
@@ -465,7 +498,7 @@ unsafe extern "C" {
         arity: usize,
     ) -> u64;
     /// `Eterm beam_jit_call_nif(Process *, ErtsCodePtr, Eterm *, BeamJitNifF *, erl_module_nif *)`.
-    pub safe fn beam_jit_call_nif(
+    pub fn beam_jit_call_nif(
         c_p: *mut crate::ProcessHeader,
         instruction: usize,
         registers: *mut u64,
@@ -473,7 +506,7 @@ unsafe extern "C" {
         module: usize,
     ) -> u64;
     /// `enum beam_jit_nif_load_ret beam_jit_load_nif(Process *, ErtsCodePtr, Eterm *)`.
-    pub safe fn beam_jit_load_nif(
+    pub fn beam_jit_load_nif(
         c_p: *mut crate::ProcessHeader,
         instruction: usize,
         registers: *mut u64,
@@ -489,7 +522,7 @@ unsafe extern "C" {
     /// `const Export *beam_jit_handle_unloaded_fun(Process *c_p, Eterm *reg, int arity,
     /// Eterm fun_thing, ErtsCodeIndex code_ix)`: the export to call, or null with
     /// `c_p->freason` set. `Export` crosses as an address.
-    pub safe fn beam_jit_handle_unloaded_fun(
+    pub fn beam_jit_handle_unloaded_fun(
         c_p: *mut crate::ProcessHeader,
         reg: *mut u64,
         arity: i32,
@@ -497,7 +530,7 @@ unsafe extern "C" {
         code_ix: u32,
     ) -> usize;
     /// `Eterm beam_jit_build_argument_list(Process *c_p, const Eterm *regs, int arity)`.
-    pub safe fn beam_jit_build_argument_list(
+    pub fn beam_jit_build_argument_list(
         c_p: *mut crate::ProcessHeader,
         regs: *const u64,
         arity: i32,
@@ -508,13 +541,13 @@ unsafe extern "C" {
 // runtime entries called by the x86 BIF, NIF and export-breakpoint fragments.
 unsafe extern "C" {
     /// `BeamInstr erts_generic_breakpoint(Process *, ErtsCodeInfo *, Eterm *)`.
-    pub safe fn erts_generic_breakpoint(
+    pub fn erts_generic_breakpoint(
         c_p: *mut crate::ProcessHeader,
         code_info: *mut crate::common::beam_asm_h::ErtsCodeInfo,
         reg: *mut u64,
     ) -> usize;
     /// `int erts_call_dirty_nif(ErtsSchedulerData *, Process *, ErtsCodePtr, const Eterm *)`.
-    pub safe fn erts_call_dirty_nif(
+    pub fn erts_call_dirty_nif(
         scheduler_data: *mut c_void,
         c_p: *mut crate::ProcessHeader,
         instruction: usize,
@@ -530,10 +563,10 @@ unsafe extern "C" {
 unsafe extern "C" {
     /// `void beam_jit_bs_field_size_argument_error(Process *c_p, Eterm size)`
     /// (beam_jit_common.hpp).
-    pub safe fn beam_jit_bs_field_size_argument_error(c_p: *mut crate::ProcessHeader, size: u64);
+    pub fn beam_jit_bs_field_size_argument_error(c_p: *mut crate::ProcessHeader, size: u64);
     /// `Eterm beam_jit_bs_get_integer(Process *c_p, Eterm *reg, Eterm context, Uint flags,
     /// Uint size, Uint Live)` (beam_jit_common.hpp).
-    pub safe fn beam_jit_bs_get_integer(
+    pub fn beam_jit_bs_get_integer(
         c_p: *mut crate::ProcessHeader,
         reg: *mut u64,
         context: u64,
@@ -543,7 +576,7 @@ unsafe extern "C" {
     ) -> u64;
     /// `void beam_jit_bs_construct_fail_info(Process *c_p, Uint packed_error_info,
     /// Eterm arg3, Eterm arg1)` (beam_jit_common.hpp).
-    pub safe fn beam_jit_bs_construct_fail_info(
+    pub fn beam_jit_bs_construct_fail_info(
         c_p: *mut crate::ProcessHeader,
         packed_error_info: u64,
         arg3: u64,
@@ -551,7 +584,7 @@ unsafe extern "C" {
     );
     /// `Eterm beam_jit_bs_init_bits(Process *c_p, Eterm *reg, struct erl_bits_state *EBS,
     /// Uint num_bits, Uint alloc, unsigned Live)` (beam_jit_common.hpp).
-    pub safe fn beam_jit_bs_init_bits(
+    pub fn beam_jit_bs_init_bits(
         c_p: *mut crate::ProcessHeader,
         reg: *mut u64,
         ebs: *mut u64,
@@ -560,10 +593,10 @@ unsafe extern "C" {
         live: u32,
     ) -> u64;
     /// `ErlSubBits *erts_bs_start_match_3(Process *p, Eterm Bin)` (erl_bits.h).
-    pub safe fn erts_bs_start_match_3(c_p: *mut crate::ProcessHeader, bin: u64) -> usize;
+    pub fn erts_bs_start_match_3(c_p: *mut crate::ProcessHeader, bin: u64) -> usize;
     /// `Eterm erts_bs_get_integer_2(Process *p, Uint num_bits, unsigned flags,
     /// ErlSubBits *sb)` (erl_bits.h).
-    pub safe fn erts_bs_get_integer_2(
+    pub fn erts_bs_get_integer_2(
         c_p: *mut crate::ProcessHeader,
         num_bits: u64,
         flags: u32,
@@ -571,27 +604,23 @@ unsafe extern "C" {
     ) -> u64;
     /// `Eterm erts_bs_get_float_2(Process *p, Uint num_bits, unsigned flags,
     /// ErlSubBits *sb)` (erl_bits.h).
-    pub safe fn erts_bs_get_float_2(
+    pub fn erts_bs_get_float_2(
         c_p: *mut crate::ProcessHeader,
         num_bits: u64,
         flags: u32,
         sb: usize,
     ) -> u64;
     /// `Eterm erts_bs_get_binary_2(Process *p, Uint num_bits, ErlSubBits *sb)` (erl_bits.h).
-    pub safe fn erts_bs_get_binary_2(
-        c_p: *mut crate::ProcessHeader,
-        num_bits: u64,
-        sb: usize,
-    ) -> u64;
+    pub fn erts_bs_get_binary_2(c_p: *mut crate::ProcessHeader, num_bits: u64, sb: usize) -> u64;
     /// `Eterm erts_bs_get_utf8(ErlSubBits *sb)` (erl_bits.h).
-    pub safe fn erts_bs_get_utf8(sb: usize) -> u64;
+    pub fn erts_bs_get_utf8(sb: usize) -> u64;
     /// `Eterm erts_bs_get_utf16(ErlSubBits *sb, Uint flags)` (erl_bits.h).
-    pub safe fn erts_bs_get_utf16(sb: usize, flags: u64) -> u64;
+    pub fn erts_bs_get_utf16(sb: usize, flags: u64) -> u64;
     /// `Eterm erts_bs_init_writable(Process *p, Eterm sz)` (erl_bits.h).
-    pub safe fn erts_bs_init_writable(c_p: *mut crate::ProcessHeader, sz: u64) -> u64;
+    pub fn erts_bs_init_writable(c_p: *mut crate::ProcessHeader, sz: u64) -> u64;
     /// `int erts_cmp_bits(const byte *a_ptr, Uint a_offs, const byte *b_ptr, Uint b_offs,
     /// Uint size)` (erl_bits.h).
-    pub safe fn erts_cmp_bits(
+    pub fn erts_cmp_bits(
         a_ptr: *const u8,
         a_offs: u64,
         b_ptr: *const u8,
@@ -600,7 +629,7 @@ unsafe extern "C" {
     ) -> i32;
     /// `Eterm erts_build_sub_bitstring(Eterm **hp, Eterm br_flags, const BinRef *br,
     /// const byte *base, Uint offset, Uint size)` (erl_bits.h).
-    pub safe fn erts_build_sub_bitstring(
+    pub fn erts_build_sub_bitstring(
         hp: *mut *mut u64,
         br_flags: u64,
         br: usize,
@@ -615,7 +644,7 @@ unsafe extern "C" {
 unsafe extern "C" {
     /// `Eterm erts_bs_append_checked(Process *p, Eterm *reg, Uint live, Uint size,
     /// Uint extra_words, Uint unit)` (erl_bits.h).
-    pub safe fn erts_bs_append_checked(
+    pub fn erts_bs_append_checked(
         c_p: *mut crate::ProcessHeader,
         reg: *mut u64,
         live: u64,
@@ -625,7 +654,7 @@ unsafe extern "C" {
     ) -> u64;
     /// `Eterm erts_bs_private_append_checked(ErlBitsState *EBS, Process *p, Eterm bin,
     /// Uint size)` (erl_bits.h).
-    pub safe fn erts_bs_private_append_checked(
+    pub fn erts_bs_private_append_checked(
         ebs: *mut u64,
         c_p: *mut crate::ProcessHeader,
         bin: u64,
@@ -633,7 +662,7 @@ unsafe extern "C" {
     ) -> u64;
     /// `int erts_bs_put_binary(ErlBitsState *EBS, Process *p, Eterm bin, Uint num_bits)`
     /// (erl_bits.h).
-    pub safe fn erts_bs_put_binary(
+    pub fn erts_bs_put_binary(
         ebs: *mut u64,
         c_p: *mut crate::ProcessHeader,
         bin: u64,
@@ -641,7 +670,7 @@ unsafe extern "C" {
     ) -> i32;
     /// `int erts_bs_put_binary_all(ErlBitsState *EBS, Process *p, Eterm bin, Uint unit)`
     /// (erl_bits.h).
-    pub safe fn erts_bs_put_binary_all(
+    pub fn erts_bs_put_binary_all(
         ebs: *mut u64,
         c_p: *mut crate::ProcessHeader,
         bin: u64,
@@ -649,10 +678,10 @@ unsafe extern "C" {
     ) -> i32;
     /// `void beam_jit_bs_put_binary_all(ErlBitsState *EBS, Process *p, Eterm bin)`
     /// (beam_jit_common.hpp).
-    pub safe fn beam_jit_bs_put_binary_all(ebs: *mut u64, c_p: *mut crate::ProcessHeader, bin: u64);
+    pub fn beam_jit_bs_put_binary_all(ebs: *mut u64, c_p: *mut crate::ProcessHeader, bin: u64);
     /// `Eterm erts_bs_put_float(ErlBitsState *EBS, Process *p, Eterm float, Uint num_bits,
     /// int flags)` (erl_bits.h).
-    pub safe fn erts_bs_put_float(
+    pub fn erts_bs_put_float(
         ebs: *mut u64,
         c_p: *mut crate::ProcessHeader,
         float: u64,
@@ -661,14 +690,14 @@ unsafe extern "C" {
     ) -> u64;
     /// `int erts_bs_put_integer_be(ErlBitsState *EBS, Eterm integer, Uint num_bits)`
     /// (erl_bits.h).
-    pub safe fn erts_bs_put_integer_be(ebs: *mut u64, integer: u64, num_bits: u64) -> i32;
+    pub fn erts_bs_put_integer_be(ebs: *mut u64, integer: u64, num_bits: u64) -> i32;
     /// `int erts_bs_put_integer_le(ErlBitsState *EBS, Eterm integer, Uint num_bits)`
     /// (erl_bits.h).
-    pub safe fn erts_bs_put_integer_le(ebs: *mut u64, integer: u64, num_bits: u64) -> i32;
+    pub fn erts_bs_put_integer_le(ebs: *mut u64, integer: u64, num_bits: u64) -> i32;
     /// `int erts_bs_put_utf16(ErlBitsState *EBS, Eterm integer, Uint flags)` (erl_bits.h).
-    pub safe fn erts_bs_put_utf16(ebs: *mut u64, integer: u64, flags: u64) -> i32;
+    pub fn erts_bs_put_utf16(ebs: *mut u64, integer: u64, flags: u64) -> i32;
     /// `void erts_bs_put_string(ErlBitsState *EBS, byte *iptr, Uint num_bytes)` (erl_bits.h).
-    pub safe fn erts_bs_put_string(ebs: *mut u64, string: *const u8, num_bytes: u64);
+    pub fn erts_bs_put_string(ebs: *mut u64, string: *const u8, num_bytes: u64);
 }
 
 // These link-only entry points let the code emitter tests run without linking the VM.
@@ -764,7 +793,7 @@ mod bs_create_bin_test_symbols {
 unsafe extern "C" {
     /// `int erts_proc_sig_receive_helper(Process *c_p, int fcalls, int neg_o_reds,
     /// ErtsMessage **msgpp, int *get_outp)` (erl_proc_sig_queue.h): reductions used.
-    pub safe fn erts_proc_sig_receive_helper(
+    pub fn erts_proc_sig_receive_helper(
         c_p: *mut crate::ProcessHeader,
         fcalls: i32,
         neg_o_reds: i32,
@@ -773,25 +802,21 @@ unsafe extern "C" {
     ) -> i32;
     /// `ErtsMessage *beam_jit_decode_dist(Process *c_p, ErtsMessage *msgp)`
     /// (beam_jit_common.hpp): the decoded message, or null when it was dropped.
-    pub safe fn beam_jit_decode_dist(c_p: *mut crate::ProcessHeader, msgp: usize) -> usize;
+    pub fn beam_jit_decode_dist(c_p: *mut crate::ProcessHeader, msgp: usize) -> usize;
     /// `Eterm erts_msgq_recv_marker_insert(Process *c_p)` (erl_proc_sig_queue.h).
-    pub safe fn erts_msgq_recv_marker_insert(c_p: *mut crate::ProcessHeader) -> u64;
+    pub fn erts_msgq_recv_marker_insert(c_p: *mut crate::ProcessHeader) -> u64;
     /// `void erts_msgq_recv_marker_bind(Process *c_p, Eterm insert_id, Eterm bind_id)`
     /// (erl_proc_sig_queue.h).
-    pub safe fn erts_msgq_recv_marker_bind(
-        c_p: *mut crate::ProcessHeader,
-        insert_id: u64,
-        bind_id: u64,
-    );
+    pub fn erts_msgq_recv_marker_bind(c_p: *mut crate::ProcessHeader, insert_id: u64, bind_id: u64);
     /// `void erts_msgq_recv_marker_clear(Process *c_p, Eterm id)` (erl_proc_sig_queue.h).
-    pub safe fn erts_msgq_recv_marker_clear(c_p: *mut crate::ProcessHeader, id: u64);
+    pub fn erts_msgq_recv_marker_clear(c_p: *mut crate::ProcessHeader, id: u64);
     /// `void erts_msgq_recv_marker_set_save(Process *c_p, Eterm id)` (erl_proc_sig_queue.h).
-    pub safe fn erts_msgq_recv_marker_set_save(c_p: *mut crate::ProcessHeader, id: u64);
+    pub fn erts_msgq_recv_marker_set_save(c_p: *mut crate::ProcessHeader, id: u64);
     /// `void erts_msgq_set_save_next(Process *c_p)` (erl_proc_sig_queue.h).
-    pub safe fn erts_msgq_set_save_next(c_p: *mut crate::ProcessHeader);
+    pub fn erts_msgq_set_save_next(c_p: *mut crate::ProcessHeader);
     /// `Sint32 beam_jit_remove_message(Process *c_p, Sint32 FCALLS, Eterm *HTOP, Eterm *E,
     /// Uint32 active_code_ix)` (beam_jit_common.hpp): the remaining reductions.
-    pub safe fn beam_jit_remove_message(
+    pub fn beam_jit_remove_message(
         c_p: *mut crate::ProcessHeader,
         fcalls: i32,
         htop: *mut u64,
@@ -799,25 +824,25 @@ unsafe extern "C" {
         active_code_ix: u32,
     ) -> i32;
     /// `void beam_jit_wait_unlocked(Process *c_p, ErtsCodePtr cp)` (beam_jit_common.hpp).
-    pub safe fn beam_jit_wait_unlocked(c_p: *mut crate::ProcessHeader, cp: usize);
+    pub fn beam_jit_wait_unlocked(c_p: *mut crate::ProcessHeader, cp: usize);
     /// `void beam_jit_wait_locked(Process *c_p, ErtsCodePtr cp)` (beam_jit_common.hpp).
-    pub safe fn beam_jit_wait_locked(c_p: *mut crate::ProcessHeader, cp: usize);
+    pub fn beam_jit_wait_locked(c_p: *mut crate::ProcessHeader, cp: usize);
     /// `void beam_jit_take_receive_lock(Process *c_p)` (beam_jit_common.hpp).
-    pub safe fn beam_jit_take_receive_lock(c_p: *mut crate::ProcessHeader);
+    pub fn beam_jit_take_receive_lock(c_p: *mut crate::ProcessHeader);
     /// `enum beam_jit_tmo_ret beam_jit_wait_timeout(Process *c_p, Eterm timeout_value,
     /// ErtsCodePtr next)` (beam_jit_common.hpp): `RET_next` 0, `RET_wait` 1, `RET_badarg` 2.
-    pub safe fn beam_jit_wait_timeout(
+    pub fn beam_jit_wait_timeout(
         c_p: *mut crate::ProcessHeader,
         timeout_value: u64,
         next: usize,
     ) -> u32;
     /// `void beam_jit_timeout(Process *c_p)` (beam_jit_common.hpp).
-    pub safe fn beam_jit_timeout(c_p: *mut crate::ProcessHeader);
+    pub fn beam_jit_timeout(c_p: *mut crate::ProcessHeader);
     /// `void beam_jit_timeout_locked(Process *c_p)` (beam_jit_common.hpp).
-    pub safe fn beam_jit_timeout_locked(c_p: *mut crate::ProcessHeader);
+    pub fn beam_jit_timeout_locked(c_p: *mut crate::ProcessHeader);
     /// `void copy_out_registers(Process *c_p, Eterm *reg)` (beam_common.h): saves the
     /// `c_p->arity` live X registers into the process before it is scheduled out.
-    pub safe fn copy_out_registers(c_p: *mut crate::ProcessHeader, reg: *mut u64);
+    pub fn copy_out_registers(c_p: *mut crate::ProcessHeader, reg: *mut u64);
 }
 
 /// Displacements (from `registers`) the bridge shares with native fragments and the VM, as on
@@ -1011,7 +1036,7 @@ core::arch::global_asm!(
 // Port of erts/emulator/beam/jit/x86/instr_map.cpp runtime call prototypes, OTP-29.1.1.
 unsafe extern "C" {
     /// `Eterm erts_gc_new_map(Process *, Eterm *, Uint, Uint, const Eterm *)`.
-    pub safe fn erts_gc_new_map(
+    pub fn erts_gc_new_map(
         c_p: *mut crate::ProcessHeader,
         reg: *mut u64,
         live: u64,
@@ -1019,7 +1044,7 @@ unsafe extern "C" {
         data: *const u64,
     ) -> u64;
     /// `Eterm erts_gc_update_map_assoc(Process *, Eterm *, Uint, Uint, const Eterm *)`.
-    pub safe fn erts_gc_update_map_assoc(
+    pub fn erts_gc_update_map_assoc(
         c_p: *mut crate::ProcessHeader,
         reg: *mut u64,
         live: u64,
@@ -1027,7 +1052,7 @@ unsafe extern "C" {
         data: *const u64,
     ) -> u64;
     /// `Eterm erts_gc_update_map_exact(Process *, Eterm *, Uint, Uint, const Eterm *)`.
-    pub safe fn erts_gc_update_map_exact(
+    pub fn erts_gc_update_map_exact(
         c_p: *mut crate::ProcessHeader,
         reg: *mut u64,
         live: u64,
@@ -1035,11 +1060,11 @@ unsafe extern "C" {
         data: *const u64,
     ) -> u64;
     /// `Eterm get_map_element(Eterm, Eterm)`.
-    pub safe fn get_map_element(map: u64, key: u64) -> u64;
+    pub fn get_map_element(map: u64, key: u64) -> u64;
     /// `Eterm get_map_element_hash(Eterm, Eterm, erts_ihash_t)`.
-    pub safe fn get_map_element_hash(map: u64, key: u64, hash: u64) -> u64;
+    pub fn get_map_element_hash(map: u64, key: u64, hash: u64) -> u64;
     /// `Uint beam_jit_get_map_elements(Eterm, Eterm *, Eterm *, Uint, Eterm *)`.
-    pub safe fn beam_jit_get_map_elements(
+    pub fn beam_jit_get_map_elements(
         map: u64,
         reg: *mut u64,
         stack: *mut u64,
@@ -1047,14 +1072,9 @@ unsafe extern "C" {
         fs: *mut u64,
     ) -> u64;
     /// `Eterm erts_maps_put(Process *, Eterm, Eterm, Eterm)`.
-    pub safe fn erts_maps_put(
-        c_p: *mut crate::ProcessHeader,
-        key: u64,
-        value: u64,
-        map: u64,
-    ) -> u64;
+    pub fn erts_maps_put(c_p: *mut crate::ProcessHeader, key: u64, value: u64, map: u64) -> u64;
     /// `int erts_maps_update(Process *, Eterm, Eterm, Eterm, Eterm *)`.
-    pub safe fn erts_maps_update(
+    pub fn erts_maps_update(
         c_p: *mut crate::ProcessHeader,
         key: u64,
         value: u64,
@@ -1811,7 +1831,7 @@ mod tests {
         let registers = SchedulerRegisters::from_reg(reg);
         // SAFETY: the trace fragment passes the `reg` of the live register file it runs with.
         unsafe { (*registers).tmp_mem[7] = kind + 10 };
-        arinsal_enter_native_return as *const () as usize
+        addr(arinsal_enter_native_return as *const ())
     }
 
     struct Fixture {

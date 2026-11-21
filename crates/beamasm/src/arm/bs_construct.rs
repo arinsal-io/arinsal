@@ -5,6 +5,7 @@
 use super::beam_asm::NUM_REGISTER_BACKED_XREGS;
 
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
+use crate::rt::addr;
 use arinsal_a64::enc::{Cond, Gpr, Shift};
 
 /// Construction segment kind, in the numbering shared with the runtime hook.
@@ -238,7 +239,7 @@ fn emit_bs_create_bin_generic(
         })?;
         emit_runtime_call(
             asm,
-            crate::raw::erts_bs_append_checked as *const () as usize,
+            addr(crate::raw::erts_bs_append_checked as *const ()),
             (live + 1) as usize,
             crate::Update::HEAP_ALLOC
                 .union(crate::Update::X_REGS)
@@ -297,7 +298,7 @@ fn emit_bs_create_bin_generic(
         asm.mov_arg_to_reg(Gpr::x(2), segment.src)?;
         emit_runtime_call(
             asm,
-            crate::raw::erts_bs_private_append_checked as *const () as usize,
+            addr(crate::raw::erts_bs_private_append_checked as *const ()),
             live as usize,
             crate::Update::NONE,
             &[Gpr::x(0), Gpr::x(1), Gpr::x(2), Gpr::x(3)],
@@ -322,7 +323,7 @@ fn emit_bs_create_bin_generic(
         })?;
         emit_runtime_call(
             asm,
-            crate::raw::beam_jit_bs_init_bits as *const () as usize,
+            addr(crate::raw::beam_jit_bs_init_bits as *const ()),
             live as usize,
             crate::Update::HEAP_ALLOC
                 .union(crate::Update::X_REGS)
@@ -536,7 +537,7 @@ fn emit_bs_fail_info(
     })?;
     emit_runtime_call(
         asm,
-        crate::raw::beam_jit_bs_construct_fail_info as *const () as usize,
+        addr(crate::raw::beam_jit_bs_construct_fail_info as *const ()),
         live,
         crate::Update::HEAP_ALLOC,
         &[C_P, Gpr::x(8), Gpr::x(10), Gpr::x(11)],
@@ -625,9 +626,9 @@ fn emit_segment_write(
                 bits
             };
             let target = if segment.flags & 2 != 0 {
-                crate::raw::erts_bs_put_integer_le as *const () as usize
+                addr(crate::raw::erts_bs_put_integer_le as *const ())
             } else {
-                crate::raw::erts_bs_put_integer_be as *const () as usize
+                addr(crate::raw::erts_bs_put_integer_be as *const ())
             };
             emit_runtime_call(
                 asm,
@@ -644,7 +645,7 @@ fn emit_segment_write(
                     .emit(|e| e.mov_const(flags, u64::from(segment.unit)))?;
                 emit_runtime_call(
                     asm,
-                    crate::raw::erts_bs_put_binary_all as *const () as usize,
+                    addr(crate::raw::erts_bs_put_binary_all as *const ()),
                     live,
                     crate::Update::REDUCTIONS,
                     &[Gpr::x(8), C_P, source, flags],
@@ -652,7 +653,7 @@ fn emit_segment_write(
             } else {
                 emit_runtime_call(
                     asm,
-                    crate::raw::erts_bs_put_binary as *const () as usize,
+                    addr(crate::raw::erts_bs_put_binary as *const ()),
                     live,
                     crate::Update::REDUCTIONS,
                     &[Gpr::x(8), C_P, source, bits],
@@ -665,7 +666,7 @@ fn emit_segment_write(
                 .emit(|e| e.mov_const(flags, u64::from(segment.flags)))?;
             emit_runtime_call(
                 asm,
-                crate::raw::erts_bs_put_float as *const () as usize,
+                addr(crate::raw::erts_bs_put_float as *const ()),
                 live,
                 crate::Update::NONE,
                 &[Gpr::x(8), C_P, source, bits, flags],
@@ -678,7 +679,7 @@ fn emit_segment_write(
                 .emit(|e| e.mov_const(flags, u64::from(segment.flags)))?;
             emit_runtime_call(
                 asm,
-                crate::raw::erts_bs_put_utf16 as *const () as usize,
+                addr(crate::raw::erts_bs_put_utf16 as *const ()),
                 live,
                 crate::Update::NONE,
                 &[Gpr::x(8), source, flags],
@@ -700,7 +701,7 @@ fn emit_segment_write(
             };
             emit_runtime_call(
                 asm,
-                crate::raw::erts_bs_put_string as *const () as usize,
+                addr(crate::raw::erts_bs_put_string as *const ()),
                 live,
                 crate::Update::NONE,
                 &[Gpr::x(8), source, byte_count],
@@ -1119,7 +1120,7 @@ impl BeamModuleAssembler {
         let src = self.source_reg(src)?;
         emit_runtime_call(
             self,
-            crate::raw::erts_bs_init_writable as *const () as usize,
+            addr(crate::raw::erts_bs_init_writable as *const ()),
             0,
             crate::Update::HEAP_ALLOC.union(crate::Update::REDUCTIONS),
             &[C_P, src],

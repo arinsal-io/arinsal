@@ -8,6 +8,7 @@
 //! process_info_2), OTP-29.1.1.
 //! Each BIF is `bif_table[].f` with `(c_p, reg, I)`.
 
+use crate::natives::bif::bif_badarg;
 use crate::natives::bif::{badarg, bif_ret, with_sched};
 use crate::{Process, VmError};
 use arinsal_beamasm::ProcessHeader;
@@ -46,7 +47,7 @@ pub(crate) extern "C" fn is_process_alive_1(c_p: *mut ProcessHeader, reg: *mut u
             .as_ref()
             .and_then(|runtime| runtime.scheduler_if_started())
         else {
-            return bif_ret(c_p, i, Err(badarg()));
+            return bif_badarg(c_p);
         };
         // erts_proc_lookup_raw, then `rp->state`: an exiting process or one with signals in
         // its queue traps to `is_process_alive_trap`, which orders the answer after them.
@@ -95,7 +96,7 @@ pub(crate) extern "C" fn is_process_alive_1(c_p: *mut ProcessHeader, reg: *mut u
     {
         return crate::native_hooks::raw(Term::atom(atoms::FALSE));
     }
-    bif_ret(c_p, i, Err(badarg()))
+    bif_badarg(c_p)
 }
 
 /// `BIF_TRAP1(is_process_alive_trap, BIF_P, BIF_ARG_1)`.

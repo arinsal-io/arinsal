@@ -5,6 +5,7 @@
 use crate::bs_construct::{BsSegment, BsSegmentKind};
 use crate::common::bs::{BscAction, BscSegment, beam_jit_bsc_combine_segments};
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
+use crate::rt::addr;
 use arinsal_a64::enc::{Cond, Gpr, Shift, Shifted};
 use arinsal_term::{Term, atoms};
 
@@ -256,7 +257,7 @@ fn emit_private(
     crate::emit_enter_runtime(&mut asm.code, live as usize, update)?;
     emit_direct_call(
         asm,
-        crate::raw::erts_bs_private_append_checked as *const () as usize,
+        addr(crate::raw::erts_bs_private_append_checked as *const ()),
     )?;
     crate::emit_leave_runtime(&mut asm.code, live as usize, update)?;
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1881, OTP-29.1.1:
@@ -350,10 +351,7 @@ fn emit_append(
         e.mov_const(Gpr::x(4), u64::from(alloc))?;
         e.mov_const(Gpr::x(5), plan.unit)
     })?;
-    emit_direct_call(
-        asm,
-        crate::raw::erts_bs_append_checked as *const () as usize,
-    )?;
+    emit_direct_call(asm, addr(crate::raw::erts_bs_append_checked as *const ()))?;
     crate::emit_leave_runtime(&mut asm.code, live as usize + 1, update)?;
     asm.code.cbz(Gpr::x(0), slow)?;
     asm.code.emit(|e| e.cmn_imm(Gpr::x(0), 1, false))?;

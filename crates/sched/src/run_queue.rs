@@ -41,7 +41,7 @@ impl<T: Task> std::ops::Deref for ProcQueues<T> {
 impl<T: Task> ProcQueues<T> {
     /// `no_empty_run_queues`: the global count of a normal run queue, `None` for a dirty one.
     pub(crate) fn new(
-        no_empty_run_queues: Option<std::sync::Arc<std::sync::atomic::AtomicI32>>,
+        no_empty_run_queues: Option<std::sync::Arc<crate::balance::NoEmptyRunQueues>>,
     ) -> Self {
         Self {
             lists: raw::RqMutex::new(raw::Lists::new()),

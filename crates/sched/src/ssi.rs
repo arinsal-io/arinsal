@@ -48,6 +48,16 @@ impl ErtsSchedulerSleepInfo {
     }
 }
 
+/// `ETHR_SPIN_BODY`: `pause` on x86, a compiler barrier on AArch64.
+// Port of erts/include/internal/ethread.h:419-439 (ETHR_SPIN_BODY), OTP-29.1.1.
+#[inline(always)]
+fn ethr_spin_body() {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    std::hint::spin_loop();
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
+
 /// `sched_prep_spin_wait`: publish SLEEPING|WAITING unless the scheduler is suspended.
 pub(crate) fn sched_prep_spin_wait(ssi: &ErtsSchedulerSleepInfo) -> u32 {
     let mut xflgs = 0;
@@ -68,6 +78,27 @@ pub(crate) fn sched_prep_spin_wait(ssi: &ErtsSchedulerSleepInfo) -> u32 {
     }
 }
 
+/// `sched_prep_cont_spin_wait`: re-publish SLEEPING after a wait that left WAITING set.
+pub(crate) fn sched_prep_cont_spin_wait(ssi: &ErtsSchedulerSleepInfo) -> u32 {
+    let mut nflgs = ERTS_SSI_FLG_SLEEPING | ERTS_SSI_FLG_WAITING;
+    let mut xflgs = ERTS_SSI_FLG_WAITING;
+    loop {
+        match ssi
+            .flags
+            .compare_exchange(xflgs, nflgs, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => return nflgs,
+            Err(oflgs) => {
+                if oflgs & ERTS_SSI_FLG_WAITING == 0 {
+                    return oflgs;
+                }
+                xflgs = oflgs;
+                nflgs |= oflgs & (ERTS_SSI_FLG_SUSPENDED | ERTS_SSI_FLG_MSB_EXEC);
+            }
+        }
+    }
+}
+
 /// `sched_spin_wait`: spin while SLEEPING|WAITING stays set, `spincount` rounds at most.
 pub(crate) fn sched_spin_wait(ssi: &ErtsSchedulerSleepInfo, spincount: u32) -> u32 {
     let mut until_yield = ERTS_SCHED_SPIN_UNTIL_YIELD;
@@ -79,8 +110,7 @@ pub(crate) fn sched_spin_wait(ssi: &ErtsSchedulerSleepInfo, spincount: u32) -> u
         {
             return flgs;
         }
-        // ERTS_SPIN_BODY
-        std::hint::spin_loop();
+        ethr_spin_body();
         until_yield -= 1;
         if until_yield == 0 {
             until_yield = ERTS_SCHED_SPIN_UNTIL_YIELD;
@@ -168,6 +198,119 @@ pub(crate) fn tse_twait_until(ssi: &ErtsSchedulerSleepInfo, deadline: Instant) {
             std::thread::yield_now();
             if ssi.event.try_take() {
                 return;
+            }
+        }
+    }
+}
+
+const ERTS_SSI_FLGS_SUSPENDED_WAIT: u32 =
+    ERTS_SSI_FLG_SLEEPING | ERTS_SSI_FLG_WAITING | ERTS_SSI_FLG_SUSPENDED;
+
+/// `ERTS_SCHED_SUSPEND_SLEEP_SPINCOUNT`.
+const ERTS_SCHED_SUSPEND_SLEEP_SPINCOUNT: u32 = 0;
+
+/// `sched_prep_spin_suspended`: publish SLEEPING|WAITING|SUSPENDED while SUSPENDED stays set;
+/// returns the flags seen when the scheduler is no longer suspended.
+// Port of erts/emulator/beam/erl_process.c:7366 (sched_prep_spin_suspended), OTP-29.1.1.
+pub(crate) fn sched_prep_spin_suspended(ssi: &ErtsSchedulerSleepInfo, xpct: u32) -> u32 {
+    let nflgs = ERTS_SSI_FLGS_SUSPENDED_WAIT;
+    let mut xflgs = xpct;
+    loop {
+        match ssi
+            .flags
+            .compare_exchange(xflgs, nflgs, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => return nflgs,
+            Err(oflgs) => {
+                if oflgs & ERTS_SSI_FLG_SUSPENDED == 0 {
+                    return oflgs;
+                }
+                xflgs = oflgs;
+            }
+        }
+    }
+}
+
+/// `sched_spin_suspended`.
+// Port of erts/emulator/beam/erl_process.c:7385 (sched_spin_suspended), OTP-29.1.1.
+fn sched_spin_suspended(ssi: &ErtsSchedulerSleepInfo, spincount: u32) -> u32 {
+    let mut until_yield = ERTS_SCHED_SPIN_UNTIL_YIELD;
+    let mut sc = spincount;
+    loop {
+        let flgs = ssi.flags.load(Ordering::Acquire);
+        if flgs & ERTS_SSI_FLGS_SUSPENDED_WAIT != ERTS_SSI_FLGS_SUSPENDED_WAIT {
+            return flgs;
+        }
+        ethr_spin_body();
+        until_yield -= 1;
+        if until_yield == 0 {
+            until_yield = ERTS_SCHED_SPIN_UNTIL_YIELD;
+            std::thread::yield_now();
+        }
+        sc = sc.saturating_sub(1);
+        if sc == 0 {
+            return flgs;
+        }
+    }
+}
+
+/// `sched_set_suspended_sleeptype` with `ERTS_SSI_FLG_TSE_SLEEPING`.
+// Port of erts/emulator/beam/erl_process.c:7409 (sched_set_suspended_sleeptype), OTP-29.1.1.
+fn sched_set_suspended_sleeptype(ssi: &ErtsSchedulerSleepInfo) -> u32 {
+    let nflgs = ERTS_SSI_FLGS_SUSPENDED_WAIT | ERTS_SSI_FLG_TSE_SLEEPING;
+    let mut xflgs = ERTS_SSI_FLGS_SUSPENDED_WAIT;
+    ssi.event.reset();
+    loop {
+        match ssi
+            .flags
+            .compare_exchange(xflgs, nflgs, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => return nflgs,
+            Err(oflgs) => {
+                if oflgs & ERTS_SSI_FLGS_SUSPENDED_WAIT != ERTS_SSI_FLGS_SUSPENDED_WAIT {
+                    return oflgs;
+                }
+                xflgs = oflgs;
+            }
+        }
+    }
+}
+
+/// `suspend_scheduler_sleep` of a dirty scheduler (`normal_sched == 0`): sleep on
+/// `ssi->event` without a timeout until a wake clears the suspended wait flags.
+// Port of erts/emulator/beam/erl_process.c:7742 (suspend_scheduler_sleep), OTP-29.1.1.
+pub(crate) fn suspend_scheduler_sleep_dirty(ssi: &ErtsSchedulerSleepInfo) {
+    let flgs = sched_spin_suspended(ssi, ERTS_SCHED_SUSPEND_SLEEP_SPINCOUNT);
+    if flgs == ERTS_SSI_FLGS_SUSPENDED_WAIT {
+        let flgs = sched_set_suspended_sleeptype(ssi);
+        if flgs == ERTS_SSI_FLGS_SUSPENDED_WAIT | ERTS_SSI_FLG_TSE_SLEEPING {
+            ssi.event.wait();
+        }
+    }
+}
+
+/// `sched_resume_wake__`: clear SUSPENDED (and the sleep flags) and wake the scheduler if it
+/// slept.
+// Port of erts/emulator/beam/erl_process.c:7330 (sched_resume_wake__), OTP-29.1.1.
+pub(crate) fn sched_resume_wake(ssi: &ErtsSchedulerSleepInfo) {
+    let mut xflgs = ERTS_SSI_FLG_SLEEPING
+        | ERTS_SSI_FLG_TSE_SLEEPING
+        | ERTS_SSI_FLG_WAITING
+        | ERTS_SSI_FLG_SUSPENDED;
+    loop {
+        match ssi
+            .flags
+            .compare_exchange(xflgs, 0, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(oflgs) => {
+                erts_sched_finish_poke(ssi, oflgs, || {});
+                return;
+            }
+            Err(oflgs) => {
+                if oflgs & (ERTS_SSI_FLG_MSB_EXEC | ERTS_SSI_FLG_SUSPENDED) == 0 {
+                    return;
+                }
+                xflgs = oflgs;
             }
         }
     }

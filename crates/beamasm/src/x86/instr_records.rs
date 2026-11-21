@@ -11,7 +11,7 @@ use super::beam_asm::register::{ARG1, ARG2, ARG3, ARG4, ARG5, ARG6, C_P, RET};
 use super::beam_asm::{AsmError, Distance, Update, emit_boxed_val};
 use super::beam_asm_module::{BeamModuleAssembler, arg_label};
 use super::rt::{
-    erl_create_local_native_record, erl_create_native_record, erl_get_local_record_field,
+    addr, erl_create_local_native_record, erl_create_native_record, erl_get_local_record_field,
     erl_get_record_elements, erl_get_record_field, erl_update_native_record,
 };
 
@@ -136,7 +136,7 @@ impl BeamModuleAssembler {
         self.embed_vararg_rodata(args, ARG5, 0)?;
         self.asm.emit_enter_runtime(Update::STACK)?;
         self.asm
-            .runtime_call(erl_get_record_elements as *const () as usize)?;
+            .runtime_call(addr(erl_get_record_elements as *const ()))?;
         self.asm.emit_leave_runtime(Update::STACK)?;
         self.asm.emit(|e| e.test_rr(RET.r8(), RET.r8()))?;
         self.asm.jcc(CondCode::E, fail)
@@ -163,7 +163,7 @@ impl BeamModuleAssembler {
         let spec = Update::HEAP_ALLOC.union(Update::REDUCTIONS);
         self.asm.emit_enter_runtime(spec)?;
         self.asm
-            .runtime_call(erl_create_local_native_record as *const () as usize)?;
+            .runtime_call(addr(erl_create_local_native_record as *const ()))?;
         self.asm.emit_leave_runtime(spec)?;
         self.asm.emit_test_the_non_value(RET)?;
         self.asm.short_jcc(CondCode::NE, next)?;
@@ -193,7 +193,7 @@ impl BeamModuleAssembler {
         let spec = Update::HEAP_ALLOC.union(Update::REDUCTIONS);
         self.asm.emit_enter_runtime(spec)?;
         self.asm
-            .runtime_call(erl_create_native_record as *const () as usize)?;
+            .runtime_call(addr(erl_create_native_record as *const ()))?;
         self.asm.emit_leave_runtime(spec)?;
         self.asm.emit_test_the_non_value(RET)?;
         self.asm.short_jcc(CondCode::NE, next)?;
@@ -223,7 +223,7 @@ impl BeamModuleAssembler {
         let spec = Update::HEAP_ALLOC.union(Update::REDUCTIONS);
         self.asm.emit_enter_runtime(spec)?;
         self.asm
-            .runtime_call(erl_update_native_record as *const () as usize)?;
+            .runtime_call(addr(erl_update_native_record as *const ()))?;
         self.asm.emit_leave_runtime(spec)?;
         self.asm.emit_test_the_non_value(RET)?;
         self.asm.short_jcc(CondCode::NE, next)?;
@@ -249,9 +249,9 @@ impl BeamModuleAssembler {
         self.mov_arg_to_reg(ARG4, name)?;
         self.asm.emit_enter_runtime(Update::HEAP_ALLOC)?;
         let function = if matches!(id, ArgVal::Immediate(_)) {
-            erl_get_local_record_field as *const () as usize
+            addr(erl_get_local_record_field as *const ())
         } else {
-            erl_get_record_field as *const () as usize
+            addr(erl_get_record_field as *const ())
         };
         self.asm.runtime_call(function)?;
         self.asm.emit_leave_runtime(Update::HEAP_ALLOC)?;

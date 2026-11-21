@@ -12,6 +12,7 @@ use super::beam_asm::{
 };
 use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
 use super::beam_asm_module::{BeamModuleAssembler, arg_label, arg_word};
+use super::rt::addr;
 pub use super::rt::{beam_jit_build_argument_list, beam_jit_handle_unloaded_fun};
 use crate::common::args::{ArgVal, MAX_REG, Relation, memory_relation};
 use crate::common::types::{BeamModuleAssemblerCommon, type_id};
@@ -60,7 +61,7 @@ impl BeamGlobalAssembler {
         a.load_x_reg_array(ARG2)?;
         a.emit(|e| e.shr_ri(ARG3, i64::from(FUN_HEADER_ARITY_OFFS)))?;
         a.emit(|e| e.mov_rr(ARG5, ACTIVE_CODE_IX))?;
-        a.runtime_call(beam_jit_handle_unloaded_fun as *const () as usize)?;
+        a.runtime_call(addr(beam_jit_handle_unloaded_fun as *const ()))?;
         a.emit_leave_runtime(update.union(Update::CODE_INDEX))?;
         a.emit(|e| e.test_rr(RET, RET))?;
         a.jcc(CondCode::E, error)?;
@@ -103,7 +104,7 @@ impl BeamGlobalAssembler {
         a.emit(|e| e.mov_rr(ARG1, C_P))?;
         a.load_x_reg_array(ARG2)?;
         a.emit(|e| e.shr_ri(ARG3, i64::from(FUN_HEADER_ARITY_OFFS)))?;
-        a.runtime_call(beam_jit_build_argument_list as *const () as usize)?;
+        a.runtime_call(addr(beam_jit_build_argument_list as *const ()))?;
         a.emit_leave_runtime(Update::HEAP_ALLOC)?;
         a.emit(|e| e.mov_rm(ARG1, tmp_mem_q(0)))?;
         a.emit(|e| e.mov_mr(get_x_ref(0, 8), ARG1))?;

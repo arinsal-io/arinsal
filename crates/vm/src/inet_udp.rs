@@ -66,6 +66,7 @@ const OPT_REUSEPORT_LB: u8 = 18;
 const OPT_EXCLUSIVEADDRUSE: u8 = 19;
 const OPT_MSGQ_HIGH: u8 = 36;
 const OPT_MSGQ_LOW: u8 = 37;
+const OPT_NETNS: u8 = 38;
 const OPT_MULTICAST_IF: u8 = 11;
 const OPT_MULTICAST_TTL: u8 = 12;
 const OPT_MULTICAST_LOOP: u8 = 13;
@@ -295,9 +296,14 @@ fn open_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     if domain == libc::AF_UNIX {
         protocol = 0;
     }
-    let fd = match crate::port::socket_cloexec(domain, libc::SOCK_DGRAM, protocol) {
+    let fd = match inet_drv::open_inet_socket(
+        domain,
+        libc::SOCK_DGRAM,
+        protocol,
+        inner.netns.as_ref().map(|ns| ns.as_slice()),
+    ) {
         Ok(fd) => fd,
-        Err(error) => return err_bytes(errno_name(error.raw_os_error().unwrap_or(libc::EIO))),
+        Err(error) => return err_bytes(errno_name(error)),
     };
     set_nonblock(fd.as_raw_fd());
     set_nosigpipe(fd.as_raw_fd());
@@ -532,19 +538,19 @@ fn setopts(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
 
 fn apply_opt(inner: &mut Inner, code: u8, val: i32, data: &[u8], i: &mut usize) -> bool {
     match code {
-        OPT_REUSEADDR => sock_bool(inner, libc::SOL_SOCKET, libc::SO_REUSEADDR, val != 0),
-        OPT_DONTROUTE => sock_bool(inner, libc::SOL_SOCKET, libc::SO_DONTROUTE, val != 0),
-        OPT_BROADCAST => sock_bool(inner, libc::SOL_SOCKET, libc::SO_BROADCAST, val != 0),
-        OPT_REUSEPORT => sock_bool(inner, libc::SOL_SOCKET, libc::SO_REUSEPORT, val != 0),
+        OPT_REUSEADDR => sock_bool(inner, libc::SOL_SOCKET, libc::SO_REUSEADDR, val != 0, false),
+        OPT_DONTROUTE => sock_bool(inner, libc::SOL_SOCKET, libc::SO_DONTROUTE, val != 0, false),
+        OPT_BROADCAST => sock_bool(inner, libc::SOL_SOCKET, libc::SO_BROADCAST, val != 0, false),
+        OPT_REUSEPORT => sock_bool(inner, libc::SOL_SOCKET, libc::SO_REUSEPORT, val != 0, false),
         // Port of inet_drv.c (inet_set_opts): load balancing is SO_REUSEPORT on Linux and
         // absent elsewhere; SO_PRIORITY and SO_EXCLUSIVEADDRUSE likewise.
         #[cfg(target_os = "linux")]
-        OPT_REUSEPORT_LB => sock_bool(inner, libc::SOL_SOCKET, libc::SO_REUSEPORT, val != 0),
+        OPT_REUSEPORT_LB => sock_bool(inner, libc::SOL_SOCKET, libc::SO_REUSEPORT, val != 0, false),
         #[cfg(not(target_os = "linux"))]
         OPT_REUSEPORT_LB => true,
         OPT_EXCLUSIVEADDRUSE => true,
         #[cfg(target_os = "linux")]
-        OPT_PRIORITY => sock_int(inner, libc::SOL_SOCKET, libc::SO_PRIORITY, val),
+        OPT_PRIORITY => sock_int(inner, libc::SOL_SOCKET, libc::SO_PRIORITY, val, true),
         #[cfg(not(target_os = "linux"))]
         OPT_PRIORITY => true,
         OPT_MSGQ_HIGH | OPT_MSGQ_LOW => {
@@ -553,13 +559,20 @@ fn apply_opt(inner: &mut Inner, code: u8, val: i32, data: &[u8], i: &mut usize) 
                 return false;
             }
             if code == OPT_MSGQ_HIGH {
+                if inner.msgq_low > val {
+                    inner.msgq_low = val;
+                }
                 inner.msgq_high = val;
             } else {
+                if inner.msgq_high < val {
+                    inner.msgq_high = val;
+                }
                 inner.msgq_low = val;
             }
+            apply_msgq_limits(inner);
             true
         }
-        OPT_SNDBUF => sock_int(inner, libc::SOL_SOCKET, libc::SO_SNDBUF, val),
+        OPT_SNDBUF => sock_int(inner, libc::SOL_SOCKET, libc::SO_SNDBUF, val, false),
         OPT_RCVBUF => {
             if !inner.buffer_set {
                 // Port of inet_drv.c:7328-7348 (UDP rcvbuf buffer cap), OTP-29.1.1.
@@ -569,32 +582,30 @@ fn apply_opt(inner: &mut Inner, code: u8, val: i32, data: &[u8], i: &mut usize) 
                     inner.buffer.max(val)
                 };
             }
-            sock_int(inner, libc::SOL_SOCKET, libc::SO_RCVBUF, val)
+            sock_int(inner, libc::SOL_SOCKET, libc::SO_RCVBUF, val, false)
         }
         OPT_TOS => {
             inner.tos = val;
-            sock_int(inner, libc::IPPROTO_IP, libc::IP_TOS, val)
+            sock_int(inner, libc::IPPROTO_IP, libc::IP_TOS, val, true)
         }
         // Port of inet_drv.c:7428-7438 (INET_OPT_TCLASS), OTP-29.1.1.
         OPT_TCLASS => {
             inner.tclass = val;
-            sock_int(inner, libc::IPPROTO_IPV6, libc::IPV6_TCLASS, val)
+            sock_int(inner, libc::IPPROTO_IPV6, libc::IPV6_TCLASS, val, true)
         }
         OPT_TTL => {
             inner.ttl = val;
-            sock_int(inner, libc::IPPROTO_IP, libc::IP_TTL, val)
+            sock_int(inner, libc::IPPROTO_IP, libc::IP_TTL, val, true)
         }
         OPT_MULTICAST_TTL => {
             // Port of inet_drv.c:7571. Always IP_MULTICAST_TTL; propagate stays 0.
             inner.multicast_ttl = val;
-            let _ = sock_int(inner, libc::IPPROTO_IP, libc::IP_MULTICAST_TTL, val);
-            true
+            sock_int(inner, libc::IPPROTO_IP, libc::IP_MULTICAST_TTL, val, false)
         }
         OPT_MULTICAST_LOOP => {
             // Port of inet_drv.c:7580. Always IP_MULTICAST_LOOP; propagate stays 0.
             inner.multicast_loop = val != 0;
-            let _ = sock_int(inner, libc::IPPROTO_IP, libc::IP_MULTICAST_LOOP, val);
-            true
+            sock_int(inner, libc::IPPROTO_IP, libc::IP_MULTICAST_LOOP, val, false)
         }
         OPT_MULTICAST_IF => set_multicast_if(inner, val),
         OPT_ADD_MEMBERSHIP | OPT_DROP_MEMBERSHIP => {
@@ -603,24 +614,20 @@ fn apply_opt(inner: &mut Inner, code: u8, val: i32, data: &[u8], i: &mut usize) 
         OPT_IPV6_V6ONLY => {
             inner.v6only = val != 0;
             if inner.domain == libc::AF_INET6 {
-                sock_bool(inner, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, val != 0)
+                sock_bool(inner, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, val != 0, true)
             } else {
                 // No fd yet: the option is remembered. With an fd, inet4 rejects it.
                 inner.fd.is_none()
             }
         }
         OPT_BUFFER => {
-            if val <= 0 {
-                return false;
-            }
-            inner.buffer = val;
+            // Port of inet_drv.c:6963 (bufsz floored at INET_BUFFER_MIN).
+            inner.buffer = val.max(1);
             inner.buffer_set = true;
             true
         }
         OPT_HEADER => {
-            if val < 0 {
-                return false;
-            }
+            // Port of inet_drv.c:6936 (`desc->hsz = ival`): any integer is stored.
             inner.header = val as usize;
             true
         }
@@ -655,20 +662,43 @@ fn apply_opt(inner: &mut Inner, code: u8, val: i32, data: &[u8], i: &mut usize) 
         }
         OPT_RECVTOS => {
             inner.recvtos = val != 0;
-            sock_bool(inner, libc::IPPROTO_IP, libc::IP_RECVTOS, val != 0)
+            sock_bool(inner, libc::IPPROTO_IP, libc::IP_RECVTOS, val != 0, true)
         }
         // Port of inet_drv.c:7466-7478 (INET_OPT_RECVTCLASS), OTP-29.1.1.
         OPT_RECVTCLASS => {
             inner.recvtclass = val != 0;
-            sock_bool(inner, libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS, val != 0)
+            sock_bool(
+                inner,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_RECVTCLASS,
+                val != 0,
+                true,
+            )
         }
         OPT_RECVTTL => {
             inner.recvttl = val != 0;
-            sock_bool(inner, libc::IPPROTO_IP, libc::IP_RECVTTL, val != 0)
+            sock_bool(inner, libc::IPPROTO_IP, libc::IP_RECVTTL, val != 0, true)
         }
         OPT_DEBUG => {
             inner.debug = val != 0;
             true
+        }
+        OPT_NETNS => {
+            // Port of inet_drv.c:7151 (INET_LOPT_NETNS, `HAVE_SETNS`), OTP-29.1.1.
+            #[cfg(target_os = "linux")]
+            {
+                if val < 0 || *i + val as usize > data.len() {
+                    return false;
+                }
+                inner.netns = Some(Box::new(data[*i..*i + val as usize].to_vec()));
+                *i += val as usize;
+                true
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (val, data, i);
+                false
+            }
         }
         _ => false,
     }
@@ -697,11 +727,13 @@ fn set_active(inner: &mut Inner, val: i32, data: &[u8], i: &mut usize) -> bool {
             inner.active = Active::Multi(sum as i16);
         }
     } else {
-        inner.active = match val {
-            0 => Active::Passive,
-            1 => Active::True,
-            2 => Active::Once,
-            _ => return false,
+        // Port of inet_drv.c:6968: any integer is stored; only 3 is `{active,N}`.
+        inner.active = if val == 0 {
+            Active::Passive
+        } else if val == 2 {
+            Active::Once
+        } else {
+            Active::True
         };
     }
     true
@@ -714,11 +746,15 @@ fn set_multicast_if(inner: &mut Inner, val: i32) -> bool {
     inner.multicast_if = val;
     let net = val.to_be();
     if inner.domain == libc::AF_INET {
-        let _ = sock_int(inner, libc::IPPROTO_IP, libc::IP_MULTICAST_IF, net);
-        true
+        sock_int(inner, libc::IPPROTO_IP, libc::IP_MULTICAST_IF, net, false)
     } else if inner.domain == libc::AF_INET6 {
-        let _ = sock_int(inner, libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_IF, net);
-        true
+        sock_int(
+            inner,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_MULTICAST_IF,
+            net,
+            false,
+        )
     } else {
         inner.fd.is_none()
     }
@@ -745,25 +781,45 @@ fn set_membership(
         *i += 4;
         let iface = be_addr(&data[*i..*i + 4]);
         *i += 4;
-        let req = libc::ip_mreq {
-            imr_multiaddr: libc::in_addr { s_addr: multi },
-            imr_interface: libc::in_addr { s_addr: iface },
-        };
-        let _ = ifindex;
         let name = if drop {
             libc::IP_DROP_MEMBERSHIP
         } else {
             libc::IP_ADD_MEMBERSHIP
         };
+        // Port of inet_drv.c:7696 (`HAVE_STRUCT_IP_MREQN`) / else `ip_mreq`.
         // propagate stays 0 (inet_drv.c:7923): a kernel refusal is still ok.
-        let _ = sock_bytes(
-            inner,
-            libc::IPPROTO_IP,
-            name,
-            (&req as *const libc::ip_mreq).cast(),
-            std::mem::size_of::<libc::ip_mreq>() as libc::socklen_t,
-        );
-        true
+        #[cfg(target_os = "linux")]
+        {
+            let req = libc::ip_mreqn {
+                imr_multiaddr: libc::in_addr { s_addr: multi },
+                imr_address: libc::in_addr { s_addr: iface },
+                imr_ifindex: ifindex,
+            };
+            sock_bytes(
+                inner,
+                libc::IPPROTO_IP,
+                name,
+                (&req as *const libc::ip_mreqn).cast(),
+                std::mem::size_of::<libc::ip_mreqn>() as libc::socklen_t,
+                false,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = ifindex;
+            let req = libc::ip_mreq {
+                imr_multiaddr: libc::in_addr { s_addr: multi },
+                imr_interface: libc::in_addr { s_addr: iface },
+            };
+            sock_bytes(
+                inner,
+                libc::IPPROTO_IP,
+                name,
+                (&req as *const libc::ip_mreq).cast(),
+                std::mem::size_of::<libc::ip_mreq>() as libc::socklen_t,
+                false,
+            )
+        }
     } else if domain_code == i32::from(AF_INET6_CODE) {
         if inner.domain != libc::AF_INET6 || *i + 16 > data.len() {
             return false;
@@ -780,14 +836,14 @@ fn set_membership(
         } else {
             IPV6_ADD_MEMBERSHIP
         };
-        let _ = sock_bytes(
+        sock_bytes(
             inner,
             libc::IPPROTO_IPV6,
             name,
             (&req as *const libc::ipv6_mreq).cast(),
             std::mem::size_of::<libc::ipv6_mreq>() as libc::socklen_t,
-        );
-        true
+            false,
+        )
     } else {
         false
     }
@@ -797,53 +853,55 @@ fn be_addr(bytes: &[u8]) -> u32 {
     u32::from_be_bytes(bytes.try_into().unwrap()).to_be()
 }
 
-fn sock_bool(inner: &Inner, level: i32, name: i32, on: bool) -> bool {
-    sock_int(inner, level, name, i32::from(on))
+fn sock_bool(inner: &Inner, level: i32, name: i32, on: bool, propagate: bool) -> bool {
+    sock_int(inner, level, name, i32::from(on), propagate)
 }
 
-fn sock_int(inner: &Inner, level: i32, name: i32, val: i32) -> bool {
-    let Some(fd) = inner.fd.as_ref() else {
-        return true;
-    };
-    // SAFETY: fd is a socket this driver owns.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd.as_raw_fd(),
-            level,
-            name,
-            (&val as *const i32).cast(),
-            std::mem::size_of::<i32>() as libc::socklen_t,
-        )
-    };
-    rc == 0
+fn sock_int(inner: &Inner, level: i32, name: i32, val: i32, propagate: bool) -> bool {
+    inet_drv::inet_setopt_int(
+        inner.fd.as_ref().map(AsRawFd::as_raw_fd),
+        level,
+        name,
+        val,
+        propagate,
+    )
 }
 
-fn sock_bytes(inner: &Inner, level: i32, name: i32, ptr: *const u8, len: libc::socklen_t) -> bool {
-    let Some(fd) = inner.fd.as_ref() else {
-        return true;
-    };
-    // SAFETY: ptr/len describe a setsockopt argument this driver built; fd is its socket.
-    let rc = unsafe { libc::setsockopt(fd.as_raw_fd(), level, name, ptr.cast(), len) };
-    rc == 0
+fn sock_bytes(
+    inner: &Inner,
+    level: i32,
+    name: i32,
+    ptr: *const u8,
+    len: libc::socklen_t,
+    propagate: bool,
+) -> bool {
+    inet_drv::inet_setopt(
+        inner.fd.as_ref().map(AsRawFd::as_raw_fd),
+        level,
+        name,
+        ptr,
+        len,
+        propagate,
+    )
 }
 
-fn sock_get_int(inner: &Inner, level: i32, name: i32, fallback: i32) -> i32 {
-    let Some(fd) = inner.fd.as_ref() else {
-        return fallback;
+fn sock_get_int(inner: &Inner, level: i32, name: i32) -> Option<i32> {
+    inet_drv::sock_getopt_int(inner.fd.as_ref()?.as_raw_fd(), level, name)
+}
+
+fn apply_msgq_limits(inner: &Inner) {
+    let Some(port) = inner.port.as_ref().and_then(|port| port.upgrade()) else {
+        return;
     };
-    let mut val = fallback;
-    let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
-    // SAFETY: fd is a socket this driver owns.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd.as_raw_fd(),
-            level,
-            name,
-            (&mut val as *mut i32).cast(),
-            &mut len,
-        )
-    };
-    if rc == 0 { val } else { fallback }
+    port.set_msgq_limits(inner.msgq_low as usize, inner.msgq_high as usize);
+}
+
+fn write_sock_int(inner: &Inner, code: u8, out: &mut Vec<u8>, level: i32, name: i32) {
+    // Port of inet_drv.c:9071: a failed getsockopt omits the option (`TRUNCATE_TO(0)`).
+    if let Some(value) = sock_get_int(inner, level, name) {
+        out.push(code);
+        put_i32(out, value);
+    }
 }
 
 fn getopts(inner: &Inner, data: &[u8]) -> Vec<u8> {
@@ -858,121 +916,116 @@ fn getopts(inner: &Inner, data: &[u8]) -> Vec<u8> {
 }
 
 fn push_opt(inner: &Inner, code: u8, out: &mut Vec<u8>) -> bool {
-    out.push(code);
+    let write_i32 = |out: &mut Vec<u8>, value: i32| {
+        out.push(code);
+        put_i32(out, value);
+    };
     match code {
-        OPT_REUSEADDR => put_i32(
-            out,
-            sock_get_int(inner, libc::SOL_SOCKET, libc::SO_REUSEADDR, 0),
-        ),
-        OPT_DONTROUTE => put_i32(
-            out,
-            sock_get_int(inner, libc::SOL_SOCKET, libc::SO_DONTROUTE, 0),
-        ),
-        OPT_BROADCAST => put_i32(
-            out,
-            sock_get_int(inner, libc::SOL_SOCKET, libc::SO_BROADCAST, 0),
-        ),
-        OPT_REUSEPORT => put_i32(
-            out,
-            sock_get_int(inner, libc::SOL_SOCKET, libc::SO_REUSEPORT, 0),
-        ),
+        OPT_REUSEADDR => write_sock_int(inner, code, out, libc::SOL_SOCKET, libc::SO_REUSEADDR),
+        OPT_DONTROUTE => write_sock_int(inner, code, out, libc::SOL_SOCKET, libc::SO_DONTROUTE),
+        OPT_BROADCAST => write_sock_int(inner, code, out, libc::SOL_SOCKET, libc::SO_BROADCAST),
+        OPT_REUSEPORT => write_sock_int(inner, code, out, libc::SOL_SOCKET, libc::SO_REUSEPORT),
         #[cfg(target_os = "linux")]
-        OPT_REUSEPORT_LB => put_i32(
-            out,
-            sock_get_int(inner, libc::SOL_SOCKET, libc::SO_REUSEPORT, 0),
-        ),
+        OPT_REUSEPORT_LB => write_sock_int(inner, code, out, libc::SOL_SOCKET, libc::SO_REUSEPORT),
         #[cfg(not(target_os = "linux"))]
-        OPT_REUSEPORT_LB => put_i32(out, 0),
-        OPT_EXCLUSIVEADDRUSE => put_i32(out, 0),
+        OPT_REUSEPORT_LB => write_i32(out, 0),
+        OPT_EXCLUSIVEADDRUSE => write_i32(out, 0),
         #[cfg(target_os = "linux")]
-        OPT_PRIORITY => put_i32(
-            out,
-            sock_get_int(inner, libc::SOL_SOCKET, libc::SO_PRIORITY, 0),
-        ),
+        OPT_PRIORITY => write_sock_int(inner, code, out, libc::SOL_SOCKET, libc::SO_PRIORITY),
         #[cfg(not(target_os = "linux"))]
-        OPT_PRIORITY => put_i32(out, 0),
-        OPT_MSGQ_HIGH => put_i32(out, inner.msgq_high),
-        OPT_MSGQ_LOW => put_i32(out, inner.msgq_low),
-        OPT_SNDBUF => put_i32(
-            out,
-            sock_get_int(inner, libc::SOL_SOCKET, libc::SO_SNDBUF, 0),
-        ),
-        OPT_RCVBUF => put_i32(
-            out,
-            sock_get_int(inner, libc::SOL_SOCKET, libc::SO_RCVBUF, 0),
-        ),
-        OPT_TOS => put_i32(
-            out,
-            sock_get_int(inner, libc::IPPROTO_IP, libc::IP_TOS, inner.tos),
-        ),
-        OPT_TCLASS => put_i32(
-            out,
-            sock_get_int(inner, libc::IPPROTO_IPV6, libc::IPV6_TCLASS, inner.tclass),
-        ),
-        OPT_TTL => put_i32(
-            out,
-            sock_get_int(inner, libc::IPPROTO_IP, libc::IP_TTL, inner.ttl),
-        ),
+        OPT_PRIORITY => write_i32(out, 0),
+        OPT_MSGQ_HIGH => write_i32(out, inner.msgq_high),
+        OPT_MSGQ_LOW => write_i32(out, inner.msgq_low),
+        OPT_SNDBUF => write_sock_int(inner, code, out, libc::SOL_SOCKET, libc::SO_SNDBUF),
+        OPT_RCVBUF => write_sock_int(inner, code, out, libc::SOL_SOCKET, libc::SO_RCVBUF),
+        OPT_TOS => write_sock_int(inner, code, out, libc::IPPROTO_IP, libc::IP_TOS),
+        OPT_TCLASS => write_sock_int(inner, code, out, libc::IPPROTO_IPV6, libc::IPV6_TCLASS),
+        OPT_TTL => write_sock_int(inner, code, out, libc::IPPROTO_IP, libc::IP_TTL),
         OPT_MULTICAST_TTL => {
-            let (level, name) = if inner.domain == libc::AF_INET6 {
-                (libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_HOPS)
-            } else {
-                (libc::IPPROTO_IP, libc::IP_MULTICAST_TTL)
-            };
-            put_i32(out, sock_get_int(inner, level, name, inner.multicast_ttl));
+            // Port of inet_drv.c:9487: always IPPROTO_IP / IP_MULTICAST_TTL.
+            write_sock_int(inner, code, out, libc::IPPROTO_IP, libc::IP_MULTICAST_TTL);
         }
         OPT_MULTICAST_LOOP => {
-            let (level, name) = if inner.domain == libc::AF_INET6 {
-                (libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_LOOP)
-            } else {
-                (libc::IPPROTO_IP, libc::IP_MULTICAST_LOOP)
-            };
-            put_i32(
-                out,
-                sock_get_int(inner, level, name, i32::from(inner.multicast_loop)),
-            );
+            // Port of inet_drv.c:9492: always IPPROTO_IP / IP_MULTICAST_LOOP.
+            write_sock_int(inner, code, out, libc::IPPROTO_IP, libc::IP_MULTICAST_LOOP);
         }
         OPT_MULTICAST_IF => {
-            // Decoder wants 4 address/index bytes, then the family code.
+            // Decoder wants 4 address/index bytes, then the family code
+            // (`prim_inet:dec_value(mif, ...)`).
             // Port of inet_drv.c:9497 (inet_fill_opts multicast-if), OTP-29.1.1.
-            let family = if inner.domain == libc::AF_INET6 {
-                i32::from(AF_INET6_CODE)
+            let (level, name, family) = if inner.domain == libc::AF_INET6 {
+                (
+                    libc::IPPROTO_IPV6,
+                    libc::IPV6_MULTICAST_IF,
+                    i32::from(AF_INET6_CODE),
+                )
+            } else if inner.domain == libc::AF_INET {
+                (
+                    libc::IPPROTO_IP,
+                    libc::IP_MULTICAST_IF,
+                    i32::from(AF_INET_CODE),
+                )
             } else {
-                i32::from(AF_INET_CODE)
+                return false;
             };
-            put_i32(out, inner.multicast_if);
+            let mif = sock_get_int(inner, level, name).unwrap_or(inner.multicast_if);
+            out.push(code);
+            put_i32(out, mif);
             put_i32(out, family);
         }
-        OPT_IPV6_V6ONLY => put_i32(
-            out,
-            sock_get_int(
-                inner,
-                libc::IPPROTO_IPV6,
-                libc::IPV6_V6ONLY,
-                i32::from(inner.v6only),
-            ),
-        ),
-        OPT_BUFFER => put_i32(out, inner.buffer),
-        OPT_HEADER => put_i32(out, inner.header as i32),
+        OPT_IPV6_V6ONLY => {
+            if let Some(value) = sock_get_int(inner, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY) {
+                write_i32(out, i32::from(value != 0));
+            }
+        }
+        OPT_BUFFER => write_i32(out, inner.buffer),
+        OPT_HEADER => write_i32(out, inner.header as i32),
         OPT_ACTIVE => match inner.active {
-            Active::Passive => put_i32(out, 0),
-            Active::True => put_i32(out, 1),
-            Active::Once => put_i32(out, 2),
+            Active::Passive => write_i32(out, 0),
+            Active::True => write_i32(out, 1),
+            Active::Once => write_i32(out, 2),
             Active::Multi(n) => {
-                put_i32(out, 3);
+                write_i32(out, 3);
                 out.extend_from_slice(&n.to_be_bytes());
             }
         },
-        OPT_PACKET => put_i32(out, inner.htype),
-        OPT_MODE => put_i32(out, i32::from(inner.binary)),
-        OPT_DELIVER => put_i32(out, inner.deliver),
-        OPT_EXIT => put_i32(out, i32::from(inner.exit_on_close)),
-        OPT_PACKET_SIZE => put_i32(out, inner.packet_size as i32),
-        OPT_READ_PACKETS => put_i32(out, inner.read_packets),
-        OPT_RECVTOS => put_i32(out, i32::from(inner.recvtos)),
-        OPT_RECVTCLASS => put_i32(out, i32::from(inner.recvtclass)),
-        OPT_RECVTTL => put_i32(out, i32::from(inner.recvttl)),
-        OPT_DEBUG => put_i32(out, i32::from(inner.debug)),
+        OPT_PACKET => write_i32(out, inner.htype),
+        OPT_MODE => write_i32(out, i32::from(inner.binary)),
+        OPT_DELIVER => write_i32(out, inner.deliver),
+        OPT_EXIT => write_i32(out, i32::from(inner.exit_on_close)),
+        OPT_PACKET_SIZE => write_i32(out, inner.packet_size as i32),
+        OPT_READ_PACKETS => write_i32(out, inner.read_packets),
+        OPT_RECVTOS => {
+            if let Some(value) = sock_get_int(inner, libc::IPPROTO_IP, libc::IP_RECVTOS) {
+                write_i32(out, i32::from(value != 0));
+            }
+        }
+        OPT_RECVTCLASS => {
+            if let Some(value) = sock_get_int(inner, libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS) {
+                write_i32(out, i32::from(value != 0));
+            }
+        }
+        OPT_RECVTTL => {
+            if let Some(value) = sock_get_int(inner, libc::IPPROTO_IP, libc::IP_RECVTTL) {
+                write_i32(out, i32::from(value != 0));
+            }
+        }
+        OPT_DEBUG => write_i32(out, i32::from(inner.debug)),
+        OPT_NETNS => {
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(ns) = inner.netns.as_deref() {
+                    let bytes = ns.split(|b| *b == 0).next().unwrap_or(ns.as_slice());
+                    out.push(code);
+                    put_i32(out, bytes.len() as i32);
+                    out.extend_from_slice(bytes);
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return false;
+            }
+        }
         _ => return false,
     }
     true
@@ -2001,6 +2054,9 @@ struct Inner {
     recvtclass: bool,
     recvttl: bool,
     debug: bool,
+    /// `desc->netns` (`HAVE_SETNS`).
+    #[allow(clippy::box_collection)]
+    netns: Option<Box<Vec<u8>>>,
     op_ref: u16,
     recv: Option<Recv>,
     recv_cnt: u32,
@@ -2050,6 +2106,7 @@ impl Default for Inner {
             recvtclass: false,
             recvttl: false,
             debug: false,
+            netns: None,
             op_ref: 0,
             recv: None,
             recv_cnt: 0,

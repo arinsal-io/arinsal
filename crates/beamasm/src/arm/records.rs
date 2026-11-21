@@ -4,6 +4,7 @@
 
 use arinsal_a64::enc::{Cond, Gpr};
 
+use crate::rt::addr;
 use crate::{
     Update, emit_enter_runtime, emit_leave_runtime,
     module::{ArgVal, BeamModuleAssembler, ModuleError},
@@ -141,9 +142,9 @@ impl BeamModuleAssembler {
             _ => false,
         };
         let target = if local {
-            crate::rt::erl_get_local_record_field as *const () as usize
+            addr(crate::rt::erl_get_local_record_field as *const ())
         } else {
-            crate::rt::erl_get_record_field as *const () as usize
+            addr(crate::rt::erl_get_record_field as *const ())
         };
         self.emit_record_call(target, 6, Update::HEAP_ALLOC, Update::HEAP_ALLOC)?;
         if fail != 0 {
@@ -165,7 +166,7 @@ impl BeamModuleAssembler {
         args: &[ArgVal],
     ) -> Result<(), ModuleError> {
         self.emit_create(
-            crate::rt::erl_create_local_native_record as *const () as usize,
+            addr(crate::rt::erl_create_local_native_record as *const ()),
             definition,
             dst,
             live,
@@ -183,7 +184,7 @@ impl BeamModuleAssembler {
         args: &[ArgVal],
     ) -> Result<(), ModuleError> {
         self.emit_create(
-            crate::rt::erl_create_native_record as *const () as usize,
+            addr(crate::rt::erl_create_native_record as *const ()),
             id,
             dst,
             live,
@@ -207,7 +208,7 @@ impl BeamModuleAssembler {
         })?;
         self.embed_vararg_rodata(args, ARG5)?;
         self.emit_record_call(
-            crate::rt::erl_get_record_elements as *const () as usize,
+            addr(crate::rt::erl_get_record_elements as *const ()),
             6,
             Update::STACK.union(Update::X_REGS),
             Update::X_REGS,
@@ -232,7 +233,7 @@ impl BeamModuleAssembler {
             .union(Update::X_REGS)
             .union(Update::REDUCTIONS);
         self.emit_record_call(
-            crate::rt::erl_update_native_record as *const () as usize,
+            addr(crate::rt::erl_update_native_record as *const ()),
             6,
             update,
             update,

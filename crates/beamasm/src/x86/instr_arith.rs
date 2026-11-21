@@ -14,6 +14,7 @@ use super::beam_asm::{
 };
 use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
 use super::beam_asm_module::{BeamModuleAssembler, arg_label};
+use super::rt::addr;
 pub use super::rt::{
     erts_band, erts_bnot, erts_bor, erts_bsl, erts_bsr, erts_bxor, erts_int_div_rem,
     erts_mixed_div, erts_mixed_minus, erts_mixed_plus, erts_mixed_times, erts_mul_add,
@@ -160,8 +161,7 @@ impl BeamGlobalAssembler {
         self.asm.emit(|e| e.mov_mr(tmp_mem_q(0), ARG2))?;
         self.asm.emit(|e| e.mov_mr(tmp_mem_q(1), ARG3))?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
-        self.asm
-            .runtime_call(erts_mixed_plus as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_mixed_plus as *const ()))?;
         self.asm.emit_leave_runtime(Update::REDUCTIONS)?;
         self.asm.emit_leave_frame()?;
         self.asm.emit_test_the_non_value(RET)?;
@@ -185,8 +185,7 @@ impl BeamGlobalAssembler {
         self.asm.emit_enter_frame()?;
         self.asm.emit_enter_runtime(Update::REDUCTIONS)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
-        self.asm
-            .runtime_call(erts_mixed_plus as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_mixed_plus as *const ()))?;
         self.asm.emit_leave_runtime(Update::REDUCTIONS)?;
         self.asm.emit_leave_frame()?;
         self.asm.emit_test_the_non_value(RET)?;
@@ -204,8 +203,7 @@ impl BeamGlobalAssembler {
         self.asm.emit(|e| e.mov_mr(tmp_mem_q(0), ARG2))?;
         self.asm.emit(|e| e.mov_mr(tmp_mem_q(1), ARG3))?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
-        self.asm
-            .runtime_call(erts_mixed_minus as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_mixed_minus as *const ()))?;
         self.asm.emit_leave_runtime(Update::REDUCTIONS)?;
         self.asm.emit_leave_frame()?;
         self.asm.emit_test_the_non_value(RET)?;
@@ -229,8 +227,7 @@ impl BeamGlobalAssembler {
         self.asm.emit_enter_frame()?;
         self.asm.emit_enter_runtime(Update::REDUCTIONS)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
-        self.asm
-            .runtime_call(erts_mixed_minus as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_mixed_minus as *const ()))?;
         self.asm.emit_leave_runtime(Update::REDUCTIONS)?;
         self.asm.emit_leave_frame()?;
         self.asm.emit_test_the_non_value(RET)?;
@@ -247,8 +244,7 @@ impl BeamGlobalAssembler {
         self.asm.emit_enter_runtime(Update::REDUCTIONS)?;
         self.asm.emit(|e| e.mov_mr(tmp_mem_q(0), ARG2))?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
-        self.asm
-            .runtime_call(erts_unary_minus as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_unary_minus as *const ()))?;
         self.asm.emit_leave_runtime(Update::REDUCTIONS)?;
         self.asm.emit_leave_frame()?;
         self.asm.emit_test_the_non_value(RET)?;
@@ -269,8 +265,7 @@ impl BeamGlobalAssembler {
         self.asm.emit_enter_frame()?;
         self.asm.emit_enter_runtime(Update::REDUCTIONS)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
-        self.asm
-            .runtime_call(erts_unary_minus as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_unary_minus as *const ()))?;
         self.asm.emit_leave_runtime(Update::REDUCTIONS)?;
         self.asm.emit_leave_frame()?;
         self.asm.emit_test_the_non_value(RET)?;
@@ -316,8 +311,7 @@ impl BeamGlobalAssembler {
         self.asm.emit(|e| e.lea(ARG4, tmp_mem_q(0)))?;
         self.asm.emit(|e| e.lea(ARG5, tmp_mem_q(1)))?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
-        self.asm
-            .runtime_call(erts_int_div_rem as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_int_div_rem as *const ()))?;
         self.asm.emit_leave_runtime(Update::REDUCTIONS)?;
         self.asm.emit(|e| e.test_rr(RETD, RETD))?;
         self.asm.emit(|e| e.mov_rm(enc::RAX, tmp_mem_q(0)))?;
@@ -370,8 +364,7 @@ impl BeamGlobalAssembler {
         self.asm.emit(|e| e.lea(ARG4, tmp_mem_q(3)))?;
         self.asm.emit(|e| e.lea(ARG5, tmp_mem_q(4)))?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
-        self.asm
-            .runtime_call(erts_int_div_rem as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_int_div_rem as *const ()))?;
         self.asm.emit_leave_runtime(Update::REDUCTIONS)?;
         self.asm.emit_leave_frame()?;
         self.asm.emit(|e| e.test_rr(RETD, RETD))?;
@@ -411,8 +404,7 @@ impl BeamGlobalAssembler {
         self.asm.emit_enter_runtime(Update::REDUCTIONS)?;
         self.asm.emit(|e| e.mov_mr(tmp_mem_q(0), ARG4))?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
-        self.asm
-            .runtime_call(erts_mixed_times as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_mixed_times as *const ()))?;
         self.asm.emit_test_the_non_value(RET)?;
         self.asm.short_jcc(CondCode::E, done)?;
         self.asm.emit(|e| e.mov_rm(ARG3, tmp_mem_q(0)))?;
@@ -420,8 +412,7 @@ impl BeamGlobalAssembler {
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.asm.emit(|e| e.cmp_ri(ARG3, tagged_small(0)))?;
         self.asm.short_jcc(CondCode::E, done)?;
-        self.asm
-            .runtime_call(erts_mixed_plus as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_mixed_plus as *const ()))?;
         self.asm.bind(done)?;
         self.asm.emit_leave_runtime(Update::REDUCTIONS)?;
         self.asm.emit_leave_frame()?;
@@ -446,7 +437,7 @@ impl BeamGlobalAssembler {
         self.asm.short_jcc(CondCode::E, mul_only)?;
         self.asm.emit(|e| e.mov_mr(tmp_mem_q(3), ARG4))?;
         self.asm.emit(|e| e.lea(ARG5, tmp_mem_q(2)))?;
-        self.asm.runtime_call(erts_mul_add as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_mul_add as *const ()))?;
         self.asm.emit_leave_runtime(Update::REDUCTIONS)?;
         self.asm.emit_leave_frame()?;
         self.asm.emit_test_the_non_value(RET)?;
@@ -454,8 +445,7 @@ impl BeamGlobalAssembler {
         self.asm.emit(|e| e.ret())?;
 
         self.asm.bind(mul_only)?;
-        self.asm
-            .runtime_call(erts_mixed_times as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_mixed_times as *const ()))?;
         self.asm.emit_leave_runtime(Update::REDUCTIONS)?;
         self.asm.emit_leave_frame()?;
         self.asm.emit_test_the_non_value(RET)?;
@@ -957,8 +947,7 @@ impl BeamModuleAssembler {
         self.mov_arg_to_reg(ARG3, rhs)?;
         self.asm.emit_enter_runtime(Update::NONE)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
-        self.asm
-            .runtime_call(erts_mixed_div as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_mixed_div as *const ()))?;
         self.asm.emit_leave_runtime(Update::NONE)?;
         self.asm.emit_test_the_non_value(RET)?;
         if let Some(fail_label) = beam_label(self, fail)? {
@@ -981,42 +970,42 @@ impl BeamGlobalAssembler {
     // Port of erts/emulator/beam/jit/x86/instr_arith.cpp:1273-1276
     // (emit_i_band_guard_shared), OTP-29.1.1.
     pub(crate) fn emit_i_band_guard_shared(&mut self) -> Result<(), AsmError> {
-        self.emit_bitwise_fallback_guard(erts_band as *const () as usize)
+        self.emit_bitwise_fallback_guard(addr(erts_band as *const ()))
     }
 
     /// Shared body fragment for band.
     // Port of erts/emulator/beam/jit/x86/instr_arith.cpp:1278-1282
     // (emit_i_band_body_shared), OTP-29.1.1.
     pub(crate) fn emit_i_band_body_shared(&mut self) -> Result<(), AsmError> {
-        self.emit_bitwise_fallback_body(erts_band as *const () as usize, &BAND_MFA)
+        self.emit_bitwise_fallback_body(addr(erts_band as *const ()), &BAND_MFA)
     }
 
     /// Shared guard fragment for bor.
     // Port of erts/emulator/beam/jit/x86/instr_arith.cpp:1344-1349
     // (emit_i_bor_guard_shared), OTP-29.1.1.
     pub(crate) fn emit_i_bor_guard_shared(&mut self) -> Result<(), AsmError> {
-        self.emit_bitwise_fallback_guard(erts_bor as *const () as usize)
+        self.emit_bitwise_fallback_guard(addr(erts_bor as *const ()))
     }
 
     /// Shared body fragment for bor.
     // Port of erts/emulator/beam/jit/x86/instr_arith.cpp:1351-1355
     /// (emit_i_bor_body_shared), OTP-29.1.1.
     pub(crate) fn emit_i_bor_body_shared(&mut self) -> Result<(), AsmError> {
-        self.emit_bitwise_fallback_body(erts_bor as *const () as usize, &BOR_MFA)
+        self.emit_bitwise_fallback_body(addr(erts_bor as *const ()), &BOR_MFA)
     }
 
     /// Shared guard fragment for bxor.
     // Port of erts/emulator/beam/jit/x86/instr_arith.cpp:1403-1408
     // (emit_i_bxor_guard_shared), OTP-29.1.1.
     pub(crate) fn emit_i_bxor_guard_shared(&mut self) -> Result<(), AsmError> {
-        self.emit_bitwise_fallback_guard(erts_bxor as *const () as usize)
+        self.emit_bitwise_fallback_guard(addr(erts_bxor as *const ()))
     }
 
     /// Shared body fragment for bxor.
     // Port of erts/emulator/beam/jit/x86/instr_arith.cpp:1411-1415
     // (emit_i_bxor_body_shared), OTP-29.1.1.
     pub(crate) fn emit_i_bxor_body_shared(&mut self) -> Result<(), AsmError> {
-        self.emit_bitwise_fallback_body(erts_bxor as *const () as usize, &BXOR_MFA)
+        self.emit_bitwise_fallback_body(addr(erts_bxor as *const ()), &BXOR_MFA)
     }
 
     /// Shared guard fragment for bnot.
@@ -1028,7 +1017,7 @@ impl BeamGlobalAssembler {
         self.asm.emit_enter_runtime(Update::REDUCTIONS)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.asm.emit(|e| e.mov_rr(ARG2, RET))?;
-        self.asm.runtime_call(erts_bnot as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_bnot as *const ()))?;
         self.asm.emit_leave_runtime(Update::REDUCTIONS)?;
         self.asm.emit_leave_frame()?;
         self.asm.emit_test_the_non_value(RET)?;
@@ -1046,7 +1035,7 @@ impl BeamGlobalAssembler {
         self.asm.emit(|e| e.mov_mr(tmp_mem_q(0), RET))?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.asm.emit(|e| e.mov_rr(ARG2, RET))?;
-        self.asm.runtime_call(erts_bnot as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_bnot as *const ()))?;
         self.asm.emit_leave_runtime(Update::REDUCTIONS)?;
         self.asm.emit_leave_frame()?;
         self.asm.emit_test_the_non_value(RET)?;
@@ -1064,28 +1053,28 @@ impl BeamGlobalAssembler {
     // Port of erts/emulator/beam/jit/x86/instr_arith.cpp:1572-1577 (emit_i_bsr_guard_shared),
     // OTP-29.1.1.
     pub(crate) fn emit_i_bsr_guard_shared(&mut self) -> Result<(), AsmError> {
-        self.emit_bitwise_fallback_guard(erts_bsr as *const () as usize)
+        self.emit_bitwise_fallback_guard(addr(erts_bsr as *const ()))
     }
 
     /// Shared body fragment for bsr.
     // Port of erts/emulator/beam/jit/x86/instr_arith.cpp:1579-1583 (emit_i_bsr_body_shared),
     // OTP-29.1.1.
     pub(crate) fn emit_i_bsr_body_shared(&mut self) -> Result<(), AsmError> {
-        self.emit_bitwise_fallback_body(erts_bsr as *const () as usize, &BSR_MFA)
+        self.emit_bitwise_fallback_body(addr(erts_bsr as *const ()), &BSR_MFA)
     }
 
     /// Shared guard fragment for bsl.
     // Port of erts/emulator/beam/jit/x86/instr_arith.cpp:1663-1668 (emit_i_bsl_guard_shared),
     // OTP-29.1.1.
     pub(crate) fn emit_i_bsl_guard_shared(&mut self) -> Result<(), AsmError> {
-        self.emit_bitwise_fallback_guard(erts_bsl as *const () as usize)
+        self.emit_bitwise_fallback_guard(addr(erts_bsl as *const ()))
     }
 
     /// Shared body fragment for bsl.
     // Port of erts/emulator/beam/jit/x86/instr_arith.cpp:1670-1684 (emit_i_bsl_body_shared),
     // OTP-29.1.1.
     pub(crate) fn emit_i_bsl_body_shared(&mut self) -> Result<(), AsmError> {
-        self.emit_bitwise_fallback_body(erts_bsl as *const () as usize, &BSL_MFA)
+        self.emit_bitwise_fallback_body(addr(erts_bsl as *const ()), &BSL_MFA)
     }
 }
 

@@ -4,8 +4,8 @@
 //! erl_process.c (`enqueue_later_op`, `handle_thr_prgr_later_op`), OTP-29.1.1.
 //! Every `unsafe` of the later-op links lives here.
 
+use std::cell::UnsafeCell;
 use std::ptr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 thread_local! {
@@ -14,69 +14,84 @@ thread_local! {
 }
 
 /// Port of erts/emulator/beam/erl_threads.h (`erts_tse_fetch`), OTP-29.1.1.
-pub(crate) fn erts_tse_fetch() -> *mut super::ThreadEvent {
-    TSE.with(|event| ptr::from_ref(event).cast_mut())
+///
+/// The thread-local `erts_tse` lives until thread exit (`ethr_get_ts_event`).
+pub(crate) fn erts_tse_fetch() -> &'static super::ThreadEvent {
+    TSE.with(|event| {
+        let p = ptr::from_ref(event);
+        // SAFETY: `TSE` is this thread's `erts_tse`; erts keeps that object until the
+        // thread is gone, so a `'static` borrow is the fetch's lifetime.
+        unsafe { &*p }
+    })
 }
 
 /// Port of erts/emulator/beam/erl_threads.h (`erts_tse_reset`), OTP-29.1.1.
-pub(crate) fn erts_tse_reset(event: *mut super::ThreadEvent) {
-    debug_assert!(!event.is_null());
-    // SAFETY: `event` is this thread's `erts_tse_fetch` event, or the pointer the blocker
-    // published in `blocker_event` until `erts_thr_progress_unblock` clears it.
-    unsafe { (*event).reset() }
+pub(crate) fn erts_tse_reset(event: &super::ThreadEvent) {
+    event.reset();
 }
 
 /// Port of erts/emulator/beam/erl_threads.h (`erts_tse_set`), OTP-29.1.1.
-pub(crate) fn erts_tse_set(event: *mut super::ThreadEvent) {
-    debug_assert!(!event.is_null());
-    // SAFETY: `event` is a live `erts_tse` published in `blocker_event` or owned by this thread.
-    unsafe { (*event).signal() }
+pub(crate) fn erts_tse_set(event: &super::ThreadEvent) {
+    event.signal();
 }
 
 /// Port of erts/emulator/beam/erl_threads.h (`erts_tse_wait`), OTP-29.1.1.
-pub(crate) fn erts_tse_wait(event: *mut super::ThreadEvent) {
-    debug_assert!(!event.is_null());
-    // SAFETY: `event` is this thread's `erts_tse_fetch` event for the duration of the wait.
-    unsafe { (*event).wait() }
+pub(crate) fn erts_tse_wait(event: &super::ThreadEvent) {
+    event.wait();
 }
 
 /// Port of erts/emulator/beam/erl_threads.h (`erts_tse_return`), OTP-29.1.1: the thread-local
 /// event stays with the thread, as `ethr_leave_ts_event` of a fetch from `ethr_get_ts_event`.
-pub(crate) fn erts_tse_return(_event: *mut super::ThreadEvent) {}
+pub(crate) fn erts_tse_return(_event: &super::ThreadEvent) {}
 
 /// `intrnl->misc.data.blocker_event` load of a possibly-null tse.
-pub(crate) fn blocker_event_load(slot: &AtomicPtr<super::ThreadEvent>) -> *mut super::ThreadEvent {
-    slot.load(Ordering::Relaxed)
+pub(crate) fn blocker_event_load(
+    slot: &AtomicPtr<super::ThreadEvent>,
+) -> Option<&'static super::ThreadEvent> {
+    tse_from_ptr(slot.load(Ordering::Relaxed))
 }
 
 /// `erts_atomic_set_nob(&intrnl->misc.data.blocker_event, event)`.
 pub(crate) fn blocker_event_store(
     slot: &AtomicPtr<super::ThreadEvent>,
-    event: *mut super::ThreadEvent,
+    event: &super::ThreadEvent,
 ) {
-    slot.store(event, Ordering::Relaxed);
+    slot.store(ptr::from_ref(event).cast_mut(), Ordering::Relaxed);
 }
 
 /// `erts_atomic_xchg` / read-and-clear of `blocker_event` in `erts_thr_progress_unblock`.
-pub(crate) fn blocker_event_take(slot: &AtomicPtr<super::ThreadEvent>) -> *mut super::ThreadEvent {
-    slot.swap(ptr::null_mut(), Ordering::Relaxed)
+pub(crate) fn blocker_event_take(
+    slot: &AtomicPtr<super::ThreadEvent>,
+) -> Option<&'static super::ThreadEvent> {
+    tse_from_ptr(slot.swap(ptr::null_mut(), Ordering::Relaxed))
+}
+
+fn tse_from_ptr(event: *mut super::ThreadEvent) -> Option<&'static super::ThreadEvent> {
+    if event.is_null() {
+        None
+    } else {
+        // SAFETY: stored by `blocker_event_store` from `erts_tse_fetch`; live until take.
+        Some(unsafe { &*event })
+    }
 }
 
 /// `esdp->aux_work_data` later-op fields: only the owning scheduler thread mutates them.
-pub(crate) fn aux_work_later_mut<'a>(
-    later: *mut super::AuxWorkLater,
-) -> &'a mut super::AuxWorkLater {
-    debug_assert!(!later.is_null());
-    // SAFETY: `later` is `ErtsAuxWorkData.later.get()`; the scheduler thread that owns
+///
+/// `UnsafeCell` is the erts `awdp` pointer: `&self` on the owning `esdp` yields `&mut` of
+/// the inline later-op state.
+#[expect(clippy::mut_from_ref)]
+pub(crate) fn aux_work_later_mut(
+    later: &UnsafeCell<super::AuxWorkLater>,
+) -> &mut super::AuxWorkLater {
+    // SAFETY: `later` is the inline `ErtsAuxWorkData` cell; the scheduler thread that owns
     // this `esdp` is the only mutator (`enqueue_later_op` asserts `esdp && !dirty`).
-    unsafe { &mut *later }
+    unsafe { &mut *later.get() }
 }
 
 /// Shared read of the owning scheduler's later-op list (`later_op_ready`).
-pub(crate) fn aux_work_later_ref<'a>(later: *const super::AuxWorkLater) -> &'a super::AuxWorkLater {
-    debug_assert!(!later.is_null());
+pub(crate) fn aux_work_later_ref(later: &UnsafeCell<super::AuxWorkLater>) -> &super::AuxWorkLater {
     // SAFETY: as `aux_work_later_mut`; readers are that same scheduler thread.
-    unsafe { &*later }
+    unsafe { &*later.get() }
 }
 
 /// Port of erts/emulator/beam/erl_threads.h (`ERTS_THR_INSTRUCTION_BARRIER` /
@@ -128,7 +143,7 @@ impl ErtsThrPrgrLaterOp {
 
     /// Address of this caller-owned node for `enqueue_later_op` (`&lop` in erts).
     pub fn as_list_node(&self) -> *mut Self {
-        self as *const Self as *mut Self
+        ptr::from_ref(self).cast_mut()
     }
 }
 
@@ -210,13 +225,13 @@ impl LaterOpExec {
 /// Port of `handle_thr_prgr_later_op` without retaining a Rust borrow across `lop->func`.
 /// The C callback may enqueue another operation on this same scheduler's list.
 pub(crate) fn handle_thr_prgr_later_op(
-    later: *mut super::AuxWorkLater,
+    later: &UnsafeCell<super::AuxWorkLater>,
     current: u64,
     minimum: usize,
     cleanup_threshold: usize,
     has_reached_this: fn(u64, u64) -> bool,
 ) -> LaterOpHandle {
-    debug_assert!(!later.is_null());
+    let later = later.get();
     // SAFETY: the owning scheduler thread is the only mutator of its inline AuxWorkData. The
     // pointer is kept raw across callbacks so an op may enqueue on this list after unlink.
     let limit = unsafe { (*later).later_op.list.list_len / 8 + minimum };
@@ -243,21 +258,20 @@ pub(crate) fn handle_thr_prgr_later_op(
 }
 
 /// Reset `current_thr_prgr` in the scheduler-owned `ErtsAuxWorkData`.
-pub(crate) fn aux_work_later_current_reset(later: *mut super::AuxWorkLater) {
-    debug_assert!(!later.is_null());
+pub(crate) fn aux_work_later_current_reset(later: &UnsafeCell<super::AuxWorkLater>) {
     // SAFETY: only the scheduler that owns this inline AuxWorkData resets its cached value.
-    unsafe { (*later).current_thr_prgr = super::VAL_WAITING }
+    unsafe { (*later.get()).current_thr_prgr = super::VAL_WAITING }
 }
 
 /// Read and cache `current_thr_prgr` in the scheduler-owned `ErtsAuxWorkData`.
-pub(crate) fn aux_work_later_current(later: *mut super::AuxWorkLater, current: u64) -> u64 {
-    debug_assert!(!later.is_null());
+pub(crate) fn aux_work_later_current(later: &UnsafeCell<super::AuxWorkLater>, current: u64) -> u64 {
     // SAFETY: only the scheduler that owns this inline AuxWorkData accesses its cached value.
     unsafe {
-        if (*later).current_thr_prgr == super::VAL_WAITING {
-            (*later).current_thr_prgr = current;
+        let later = &mut *later.get();
+        if later.current_thr_prgr == super::VAL_WAITING {
+            later.current_thr_prgr = current;
         }
-        (*later).current_thr_prgr
+        later.current_thr_prgr
     }
 }
 
@@ -267,24 +281,21 @@ pub(crate) fn enqueue(
     later: u64,
     func: fn(*mut ()),
     data: *mut (),
-    lop: *mut ErtsThrPrgrLaterOp,
+    lop: &mut ErtsThrPrgrLaterOp,
 ) {
-    debug_assert!(!lop.is_null());
-    // SAFETY: `lop` is the caller's live node, not yet in any list. `list` is this
-    // scheduler's `later_op`. Fields are written before the node is visible as `last`/`first`.
-    unsafe {
-        (*lop).func = Some(func);
-        (*lop).data = data;
-        (*lop).later = later;
-        (*lop).next = ptr::null_mut();
-        if list.last.is_null() {
-            list.first = lop;
-        } else {
-            (*list.last).next = lop;
-        }
-        list.last = lop;
-        list.list_len += 1;
+    lop.func = Some(func);
+    lop.data = data;
+    lop.later = later;
+    lop.next = ptr::null_mut();
+    let lop = ptr::from_mut(lop);
+    if list.last.is_null() {
+        list.first = lop;
+    } else {
+        // SAFETY: `last` is a live caller-owned node still in this list.
+        unsafe { (*list.last).next = lop };
     }
+    list.last = lop;
+    list.list_len += 1;
 }
 
 /// Port of erts/emulator/beam/erl_process.c (`handle_thr_prgr_later_op` first-node test
@@ -357,63 +368,11 @@ pub(crate) struct LaterOpArgs {
 // `erts_schedule_misc_aux_work` onto a normal scheduler, which then enqueues them.
 unsafe impl Send for LaterOpArgs {}
 
-/// Slot-owned header in front of an `Arc<T>` the table holds (`ptab_el->u.release`).
-///
-/// Port of erts/emulator/beam/erl_ptab.h (`ErtsPTabElementCommon.u.release`), OTP-29.1.1.
-#[repr(C)]
-pub(crate) struct ProgressHeld<T> {
-    pub later_op: ErtsThrPrgrLaterOp,
-    ptr: *const T,
-}
-
-pub(crate) fn alloc_progress_held<T: Send + Sync + 'static>(ptr: *const T) -> *mut ProgressHeld<T> {
-    Box::into_raw(Box::new(ProgressHeld {
-        later_op: ErtsThrPrgrLaterOp::new(),
-        ptr,
-    }))
-}
-
-pub(crate) fn progress_held_lop<T>(held: *mut ProgressHeld<T>) -> *mut ErtsThrPrgrLaterOp {
-    debug_assert!(!held.is_null());
-    // SAFETY: `held` is the live `ProgressHeld` `alloc_progress_held` returned; the node
-    // lives until `release_progress_held`.
-    unsafe { &raw mut (*held).later_op }
-}
-
-pub(crate) fn progress_held_value<'a, T>(held: *const ProgressHeld<T>) -> &'a T {
-    debug_assert!(!held.is_null());
-    // SAFETY: `held` is a live slot-owned header; `ptr` is the `Arc::into_raw` address the
-    // slot holds, kept alive until `release_progress_held` / `drop_progress_held`.
-    unsafe { &*(*held).ptr }
-}
-
-pub(crate) fn progress_held_clone_arc<T: Send + Sync + 'static>(
-    held: *const ProgressHeld<T>,
-) -> Arc<T> {
-    debug_assert!(!held.is_null());
-    // SAFETY: `held` is a live slot-owned header; `ptr` is the `Arc::into_raw` address the
-    // slot holds, so taking one more strong count is the slot's `load_arc`.
-    unsafe {
-        let ptr = (*held).ptr;
-        Arc::increment_strong_count(ptr);
-        Arc::from_raw(ptr)
+impl LaterOpArgs {
+    /// Link this deferred node into the scheduler's later-op list (`enqueue_later_op`).
+    pub(crate) fn enqueue(self, list: &mut LaterOpList, later: u64) {
+        debug_assert!(!self.lop.is_null());
+        // SAFETY: `lop` is the live caller-owned node stored when this `LaterOpArgs` was built.
+        enqueue(list, later, self.func, self.data, unsafe { &mut *self.lop });
     }
-}
-
-pub(crate) fn release_progress_held<T: Send + Sync + 'static>(data: *mut ()) {
-    // SAFETY: `data` is the `ProgressHeld<T>` `alloc_progress_held` allocated; this later op
-    // runs once after unlink, and `ptr` is the `Arc::into_raw` address the slot held.
-    let held = unsafe { Box::from_raw(data.cast::<ProgressHeld<T>>()) };
-    let ptr = held.ptr;
-    // SAFETY: `ptr` is the `Arc::into_raw` address the slot held.
-    drop(unsafe { Arc::from_raw(ptr) });
-}
-
-pub(crate) fn drop_progress_held<T: Send + Sync + 'static>(held: *mut ProgressHeld<T>) {
-    debug_assert!(!held.is_null());
-    // SAFETY: the slot is being dropped or replaced without a progress domain, so no reader
-    // exists; `held` is the live header `alloc_progress_held` allocated.
-    let held = unsafe { Box::from_raw(held) };
-    // SAFETY: `held.ptr` is the `Arc::into_raw` address the slot held.
-    drop(unsafe { Arc::from_raw(held.ptr) });
 }

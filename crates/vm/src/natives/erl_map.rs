@@ -1258,14 +1258,16 @@ fn hashmap_info(process: &mut crate::Process, node: Term) -> Result<Term, ()> {
                 false,
                 "hashmap_info boxed node (erts ASSERT(is_header) then walks ptr[sz+1])"
             );
-            continue;
+            std::process::abort();
         };
         let children = hashmap_node_children(node);
         debug_assert!(
             children.is_some(),
             "hashmap_info boxed node (erts ASSERT(is_header) then walks ptr[sz+1])"
         );
-        let children = children.unwrap_or_default();
+        let Some(children) = children else {
+            std::process::abort();
+        };
         let sz = match hdr & HEADER_MAP_SUBTAG_MASK {
             HAMT_SUBTAG_NODE_BITMAP => {
                 nbitmap += 1;

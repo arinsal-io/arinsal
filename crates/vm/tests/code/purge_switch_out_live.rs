@@ -47,7 +47,8 @@ run_churn() ->
     Runner = spawn(fun() -> Self ! {done, rounds(30, ?TARGET)} end),
     Result = receive
                  {done, R} -> R
-             after 60000 ->
+             %% Under qemu: Arinsal 74.51s, OTP 95.45s for this workload.
+             after 90000 ->
                  {timeout, process_info(Runner, current_stacktrace)}
              end,
     exit(Churn, kill),

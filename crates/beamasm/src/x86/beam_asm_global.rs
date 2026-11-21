@@ -18,6 +18,7 @@ use arinsal_x64::enc::CondCode;
 
 use super::beam_asm::register::{ARG1, ARG2, ARG2D, ARG3, ARG4, C_P, RET};
 use super::beam_asm::{AsmError, BeamAssembler, Update, get_x_ref, process, process_ref};
+use super::rt::addr;
 pub use super::rt::{call_error_handler, erts_garbage_collect_nobump, handle_error};
 pub use crate::common::process_offsets::ProcessOffsets;
 use crate::exc::{EXC_BADARG, EXC_BADKEY, EXC_BADMAP};
@@ -734,7 +735,7 @@ impl BeamGlobalAssembler {
         a.emit(|e| e.mov_rr(ARG1, C_P))?;
         a.load_x_reg_array(ARG3)?;
         a.emit(|e| e.mov_rr(ARG5D, FCALLS))?;
-        a.runtime_call(erts_garbage_collect_nobump as *const () as usize)?;
+        a.runtime_call(addr(erts_garbage_collect_nobump as *const ()))?;
         a.emit(|e| e.sub_rr(FCALLS, RETD))?;
         a.emit_leave_runtime(Update::STACK.union(Update::HEAP))?;
         a.emit(|e| e.mov_rm(ARG1D, state))?;
@@ -789,7 +790,7 @@ impl BeamGlobalAssembler {
         a.mov_imm(ARG2, 0)?;
         a.mov_imm(ARG4, 0)?;
         a.load_x_reg_array(ARG3)?;
-        a.runtime_call(handle_error as *const () as usize)?;
+        a.runtime_call(addr(handle_error as *const ()))?;
         a.emit_leave_runtime(spec)?;
         a.emit(|e| e.test_rr(RET, RET))?;
         let do_schedule = self.label(GlobalLabels::DoSchedule);
@@ -813,7 +814,7 @@ impl BeamGlobalAssembler {
         // ARG2 and ARG4 must be set prior to jumping here.
         a.emit(|e| e.mov_rr(ARG1, C_P))?;
         a.load_x_reg_array(ARG3)?;
-        a.runtime_call(handle_error as *const () as usize)?;
+        a.runtime_call(addr(handle_error as *const ()))?;
         a.emit_leave_runtime(Update::HEAP_ALLOC)?;
         a.emit(|e| e.test_rr(RET, RET))?;
         let do_schedule = self.label(GlobalLabels::DoSchedule);

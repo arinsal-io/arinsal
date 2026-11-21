@@ -1,8 +1,9 @@
 //! Differential `gen_tcp` over the `tcp_inet` port driver against OTP 29.1.1.
 
-use arinsal_difftest::{CallResult, RefErl};
+use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
 use arinsal_etf::OwnedTerm;
-use arinsal_term::{VecHeap, from_owned};
+use arinsal_term::{Term, VecHeap, from_owned};
+use arinsal_vm::{Vm, VmError};
 use std::sync::Mutex;
 
 fn source() -> &'static str {
@@ -521,10 +522,21 @@ fn run_cases(cases: &[&str]) {
         let expected = reference.call("inet_tcp_diff", "run", std::slice::from_ref(&input));
         let mut heap = VecHeap::new();
         let arg = from_owned(&input, &mut heap).unwrap();
-        let actual = vm
-            .eval_scheduled("inet_tcp_diff", "run", &[arg], 2)
-            .unwrap_or_else(|error| panic!("{case}: {error}"));
-        similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{case}");
+        let actual = scheduled_result(&mut vm, "inet_tcp_diff", "run", arg);
+        compare(&expected, &actual, CompareMode::Exact)
+            .unwrap_or_else(|diff| panic!("{case}: {diff}"));
+    }
+}
+
+fn scheduled_result(vm: &mut Vm, module: &str, function: &str, arg: Term) -> CallResult {
+    match vm.eval_scheduled(module, function, &[arg], 2) {
+        Ok(outcome) => CallResult::Ok(outcome.term),
+        Err(VmError::Raised(raised)) => CallResult::Exception {
+            class: format!("{:?}", raised.class).to_lowercase(),
+            reason: raised.reason,
+            stack_top: Some(raised.stack),
+        },
+        Err(error) => CallResult::TransportError(error.to_string()),
     }
 }
 
@@ -583,10 +595,9 @@ fn gen_tcp_matches_erts() {
         let expected = reference.call("inet_tcp_diff", "run", std::slice::from_ref(&input));
         let mut heap = VecHeap::new();
         let arg = from_owned(&input, &mut heap).unwrap();
-        let actual = vm
-            .eval_scheduled("inet_tcp_diff", "run", &[arg], 2)
-            .unwrap_or_else(|error| panic!("{case}: {error}"));
-        similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{case}");
+        let actual = scheduled_result(&mut vm, "inet_tcp_diff", "run", arg);
+        compare(&expected, &actual, CompareMode::Exact)
+            .unwrap_or_else(|diff| panic!("{case}: {diff}"));
     }
     // sctp_inet is not a driver on macOS. prim_inet maps the open_port
     // badarg onto {error, eprotonosupport}, the same term erts returns.

@@ -8,6 +8,7 @@ use crate::bs_match::emit_bs_runtime_call;
 pub use crate::common::bs::BsmCommand;
 use crate::common::bs::{Action, SMALL_BITS, bsm_init, heap_bits_size, opt_bsm_segments};
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
+use crate::rt::addr;
 use arinsal_a64::enc::{Cond, Gpr, Shift, Shifted};
 
 /// `BSF_LITTLE`, `BSF_SIGNED` (erts/emulator/beam/erl_bits.h).
@@ -753,7 +754,7 @@ impl BeamModuleAssembler {
                         })?;
                         emit_bs_runtime_call(
                             self,
-                            crate::rt::erts_bs_get_integer_2 as *const () as usize,
+                            addr(crate::rt::erts_bs_get_integer_2 as *const ()),
                             live as usize,
                             crate::Update::HEAP,
                             &[Gpr::x(21), TMP3, TMP2, TMP4],

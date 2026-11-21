@@ -7,6 +7,7 @@
 //! parked, and the BIF `BIF_TRAP1`s to the hidden `erts_internal:binary_to_list_continue/1`.
 
 use crate::bif_traps::TrapContext;
+use crate::natives::bif::bif_badarg;
 use crate::natives::bif::{badarg, bif_ret};
 use crate::natives::erl_bif_lists::bif_trap;
 use arinsal_beamasm::ProcessHeader;
@@ -104,13 +105,13 @@ pub(crate) extern "C" fn binary_to_list_1(c_p: *mut ProcessHeader, reg: *mut u64
     process.heap.note_bif_entry();
     let [bin] = crate::bif_table::bif_args::<1>(reg);
     let Some((bits, byte_start, bit_offset)) = bitstring_source(bin) else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     if bits == 0 {
         return crate::native_hooks::raw(Term::NIL);
     }
     if bits % 8 != 0 {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     }
     let size = bits / 8;
     binary_to_list_checked(
@@ -135,19 +136,19 @@ pub(crate) extern "C" fn binary_to_list_3(c_p: *mut ProcessHeader, reg: *mut u64
     process.heap.note_bif_entry();
     let [bin, start, stop] = crate::bif_table::bif_args::<3>(reg);
     let Some((bits, byte_start, bit_offset)) = bitstring_source(bin) else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     // term_to_Uint: a non-negative small integer.
     let to_uint = |term: Term| term.as_small().and_then(|n| usize::try_from(n).ok());
     let (Some(start), Some(stop)) = (to_uint(start), to_uint(stop)) else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     if bits % 8 != 0 {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     }
     let size = bits / 8;
     if start < 1 || start > size || stop < 1 || stop > size || stop < start {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     }
     if size == 0 {
         return crate::native_hooks::raw(Term::NIL);
@@ -178,7 +179,7 @@ pub(crate) extern "C" fn bitstring_to_list_1(
     process.heap.note_bif_entry();
     let [bin] = crate::bif_table::bif_args::<1>(reg);
     let Some((size, byte_start, bit_offset)) = bitstring_source(bin) else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     if size == 0 {
         return crate::native_hooks::raw(Term::NIL);
@@ -225,11 +226,11 @@ pub(crate) extern "C" fn split_binary_2(c_p: *mut ProcessHeader, reg: *mut u64, 
         BinRef::try_from(bin),
         at.as_small().and_then(|n| usize::try_from(n).ok()),
     ) else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     let size = view.bit_len();
     if split_at > size / 8 {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     }
     let split_bits = split_at * 8;
     let mut heap = ProcessHeapHandle(&mut process.heap);

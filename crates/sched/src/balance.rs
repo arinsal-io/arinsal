@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::Task;
 use crate::run_queue::ProcQueues;
+use crate::thr_progress::ThreadEvent;
 
 // Port of erts/emulator/beam/erl_process.h:128-132, OTP-29.1.1.
 /// Process priority levels (`ERTS_NO_PROC_PRIO_LEVELS`).
@@ -88,11 +89,59 @@ pub(crate) struct RunQueueBalance {
     pub(crate) waiting: AtomicBool,
     /// The global `no_empty_run_queues` of a normal run queue; `None` for a dirty one, which
     /// erts leaves out of that count (`ERTS_RUNQ_IX_IS_DIRTY`).
-    no_empty_run_queues: Option<Arc<AtomicI32>>,
+    no_empty_run_queues: Option<Arc<NoEmptyRunQueues>>,
+}
+
+/// The global `no_empty_run_queues` count with the run-queue supervisor's wake-up.
+// Port of erts/emulator/beam/erl_process.c:344-346 (runq_supervision_event,
+// runq_supervisor_sleeping) and :2955-3013 (empty_runq_aux, non_empty_runq), OTP-29.1.1.
+pub(crate) struct NoEmptyRunQueues {
+    count: AtomicI32,
+    /// `erts_runq_supervision_interval != 0`.
+    supervised: bool,
+    /// `runq_supervisor_sleeping`.
+    supervisor_sleeping: AtomicBool,
+    /// `runq_supervision_event`.
+    supervision_event: ThreadEvent,
+}
+
+impl NoEmptyRunQueues {
+    fn new(supervised: bool) -> Self {
+        Self {
+            count: AtomicI32::new(0),
+            supervised,
+            supervisor_sleeping: AtomicBool::new(false),
+            supervision_event: ThreadEvent::new(),
+        }
+    }
+
+    /// `empty_runq_aux`: one more empty run queue.
+    fn inc(&self) {
+        if !self.supervised {
+            self.count.fetch_add(1, Ordering::Release);
+        } else {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            if self.supervisor_sleeping.load(Ordering::Relaxed) {
+                self.supervision_event.signal();
+            }
+        }
+    }
+
+    /// `non_empty_runq`: one empty run queue less.
+    fn dec(&self) {
+        if !self.supervised {
+            self.count.fetch_sub(1, Ordering::Release);
+        } else {
+            let no = self.count.fetch_sub(1, Ordering::SeqCst) - 1;
+            if no > 0 && self.supervisor_sleeping.load(Ordering::Relaxed) {
+                self.supervision_event.signal();
+            }
+        }
+    }
 }
 
 impl RunQueueBalance {
-    pub(crate) fn new(no_empty_run_queues: Option<Arc<AtomicI32>>) -> Self {
+    pub(crate) fn new(no_empty_run_queues: Option<Arc<NoEmptyRunQueues>>) -> Self {
         Self {
             len: std::array::from_fn(|_| AtomicI32::new(0)),
             max_len: std::array::from_fn(|_| AtomicI32::new(0)),
@@ -156,7 +205,7 @@ impl RunQueueBalance {
         if old & FLG_NONEMPTY != 0
             && let Some(count) = &self.no_empty_run_queues
         {
-            count.fetch_add(1, Ordering::AcqRel);
+            count.inc();
         }
         old
     }
@@ -170,7 +219,7 @@ impl RunQueueBalance {
         if old & FLG_NONEMPTY == 0
             && let Some(count) = &self.no_empty_run_queues
         {
-            count.fetch_sub(1, Ordering::AcqRel);
+            count.dec();
         }
     }
 
@@ -368,7 +417,7 @@ pub(crate) struct Balance<T: Task> {
     paths: crate::run_queue::raw::MigrationPaths,
     compact_load: bool,
     /// Run queues whose scheduler declared itself out of work (`no_empty_run_queues`).
-    no_empty_run_queues: Arc<AtomicI32>,
+    no_empty_run_queues: Arc<NoEmptyRunQueues>,
 }
 
 impl<T: Task> Balance<T> {
@@ -379,9 +428,10 @@ impl<T: Task> Balance<T> {
         schedulers: usize,
         online: usize,
         compact_load: bool,
+        runq_supervised: bool,
         progress: Arc<crate::thr_progress::ThrProgress>,
     ) -> Self {
-        let no_empty_run_queues = Arc::new(AtomicI32::new(0));
+        let no_empty_run_queues = Arc::new(NoEmptyRunQueues::new(runq_supervised));
         Self {
             rqs: (0..schedulers)
                 .map(|_| ProcQueues::new(Some(Arc::clone(&no_empty_run_queues))))
@@ -419,7 +469,43 @@ impl<T: Task> Balance<T> {
 
     /// `erts_atomic32_read_acqb(&no_empty_run_queues)`.
     pub(crate) fn no_empty_run_queues(&self) -> i32 {
-        self.no_empty_run_queues.load(Ordering::Acquire)
+        self.no_empty_run_queues.count.load(Ordering::Acquire)
+    }
+
+    /// `no_runqs_to_supervise`: the used run queues when some but not all are empty, else 0.
+    // Port of erts/emulator/beam/erl_process.c:5749 (no_runqs_to_supervise), OTP-29.1.1.
+    pub(crate) fn no_runqs_to_supervise(&self) -> usize {
+        let nerq = self.no_empty_run_queues();
+        if nerq <= 0 {
+            return 0;
+        }
+        let (_, used) = self.no_runqs();
+        if nerq as usize >= used {
+            return 0;
+        }
+        used
+    }
+
+    /// The sleep of `runq_supervisor` while there is nothing to supervise: reset
+    /// `runq_supervision_event`, look again, wait. Returns the run queues to supervise.
+    // Port of erts/emulator/beam/erl_process.c:5766-5779 (runq_supervisor), OTP-29.1.1.
+    pub(crate) fn runq_supervisor_wait(&self, stopped: impl Fn() -> bool) -> usize {
+        let shared = &self.no_empty_run_queues;
+        shared.supervisor_sleeping.store(true, Ordering::Relaxed);
+        loop {
+            shared.supervision_event.reset();
+            let no_rqs = self.no_runqs_to_supervise();
+            if no_rqs != 0 || stopped() {
+                shared.supervisor_sleeping.store(false, Ordering::Relaxed);
+                return no_rqs;
+            }
+            shared.supervision_event.wait();
+        }
+    }
+
+    /// Wake the run-queue supervisor out of its event wait so it sees a stopped runtime.
+    pub(crate) fn wake_runq_supervisor(&self) {
+        self.no_empty_run_queues.supervision_event.signal();
     }
 
     /// Number of completed balance checks (`erts_debug:get_internal_state(nbalance)`).
@@ -1133,7 +1219,7 @@ mod tests {
 
     #[test]
     fn balance_counts_checks_after_halftime() {
-        let balance = Balance::<IdleTask>::new(2, 2, true, test_progress());
+        let balance = Balance::<IdleTask>::new(2, 2, true, false, test_progress());
         balance.check_balance(0);
         assert_eq!(balance.checks(), 0);
         balance.check_balance(0);
@@ -1146,7 +1232,7 @@ mod tests {
 
     #[test]
     fn migration_paths_publish_only_after_the_full_pass() {
-        let balance = Balance::<IdleTask>::new(2, 2, true, test_progress());
+        let balance = Balance::<IdleTask>::new(2, 2, true, false, test_progress());
         for (rq, len) in balance.rqs.iter().zip([100, 10]) {
             rq.add_len(PRIORITY_NORMAL, len);
             rq.reductions_executed(PRIORITY_NORMAL, CHECK_BALANCE_REDS_PER_SCHED);
@@ -1167,7 +1253,7 @@ mod tests {
 
     #[test]
     fn offline_run_queues_evacuate() {
-        let balance = Balance::<IdleTask>::new(4, 4, true, test_progress());
+        let balance = Balance::<IdleTask>::new(4, 4, true, false, test_progress());
         balance.change_no_used_runqs(2);
         let paths = balance.paths.snapshot();
         assert_eq!(paths[3].prio[PRIORITY_LOW].runq, Some(1));

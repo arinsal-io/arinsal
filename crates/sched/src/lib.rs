@@ -248,15 +248,15 @@ impl ErtsAuxWorkData {
 
     fn later_mut(&self) -> &mut thr_progress::AuxWorkLater {
         // Owning scheduler thread only; erts mutates `awdp` through that pointer.
-        thr_progress::raw::aux_work_later_mut(self.later.get())
+        thr_progress::raw::aux_work_later_mut(&self.later)
     }
 
-    fn later_ptr(&self) -> *mut thr_progress::AuxWorkLater {
-        self.later.get()
+    fn later_cell(&self) -> &UnsafeCell<thr_progress::AuxWorkLater> {
+        &self.later
     }
 
     fn later_ref(&self) -> &thr_progress::AuxWorkLater {
-        thr_progress::raw::aux_work_later_ref(self.later.get())
+        thr_progress::raw::aux_work_later_ref(&self.later)
     }
 }
 
@@ -1310,6 +1310,59 @@ pub fn erts_put_match_pseudo_process<P: Any>(mpsp: Box<P>) -> Result<(), Box<P>>
 /// no scheduler reports [`SchedulerType::Normal`].
 pub fn current_scheduler_type() -> SchedulerType {
     sched_data_key::with_head(|esdp| esdp.sched_type).unwrap_or(SchedulerType::Normal)
+}
+
+/// The binding state held across `fork()` by `erts_sched_bind_atfork_prepare`.
+pub struct AtForkBinding {
+    #[cfg(target_os = "linux")]
+    unbind: bool,
+    #[cfg(target_os = "linux")]
+    _cpuinfo_lock: Option<std::sync::RwLockReadGuard<'static, ()>>,
+}
+
+/// Prepare a fork by holding `cpuinfo_rwmtx` when the calling scheduler is CPU-bound.
+// Port of erts/emulator/beam/erl_cpu_topology.c:812-819 (erts_sched_bind_atfork_prepare), OTP-29.1.1.
+pub fn erts_sched_bind_atfork_prepare<T: Task>() -> AtForkBinding {
+    #[cfg(target_os = "linux")]
+    {
+        let unbind = erts_get_scheduler_data::<T, _>(|esdp| {
+            esdp.cpu_id.get().is_some_and(|cpu| cpu.is_some())
+        })
+        .unwrap_or(false);
+        let lock = unbind.then(|| {
+            CPUINFO_BIND_LOCK
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        AtForkBinding {
+            unbind,
+            _cpuinfo_lock: lock,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = std::marker::PhantomData::<T>;
+        AtForkBinding {}
+    }
+}
+
+/// Restore the forked child's scheduler thread to the affinity inherited at VM startup.
+// Port of erts/emulator/beam/erl_cpu_topology.c:822-830 (erts_sched_bind_atfork_child), OTP-29.1.1.
+pub fn erts_sched_bind_atfork_child(binding: &AtForkBinding) {
+    #[cfg(target_os = "linux")]
+    if binding.unbind
+        && let Some(inherited) = CPUINFO_AFFINITY.get().and_then(Option::as_ref)
+    {
+        let _ = rustix::thread::sched_setaffinity(None, inherited);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = binding;
+}
+
+/// Release the parent side of the fork's CPU topology read lock.
+// Port of erts/emulator/beam/erl_cpu_topology.c:833-839 (erts_sched_bind_atfork_parent), OTP-29.1.1.
+pub fn erts_sched_bind_atfork_parent(binding: AtForkBinding) {
+    drop(binding);
 }
 
 /// Take the held process monitor of this scheduler when it is for `to`, so the signal to `to`
@@ -3134,9 +3187,6 @@ struct LocalInit<T: Task> {
     last_monotonic_ms: u64,
     profile_active: bool,
     last_process: Option<Pid>,
-    metric_deltas: Vec<i64>,
-    dirty_metrics: Vec<usize>,
-    metric_marked: Vec<bool>,
     active_ns: u64,
     active_started: Option<Instant>,
     wall_enabled: bool,
@@ -3156,9 +3206,6 @@ impl<T: Task> LocalInit<T> {
             current_online: Cell::new(true),
             profile_active: Cell::new(self.profile_active),
             last_process: Cell::new(self.last_process),
-            metric_deltas: RefCell::new(self.metric_deltas),
-            dirty_metrics: RefCell::new(self.dirty_metrics),
-            metric_marked: RefCell::new(self.metric_marked),
             active_ns: Cell::new(self.active_ns),
             active_started: Cell::new(self.active_started),
             wall_enabled: Cell::new(self.wall_enabled),
@@ -3240,7 +3287,6 @@ struct Inner<T: Task> {
     // Port of erts/emulator/beam/erl_process.c:6231 (aligned scheduler sleep info), OTP-29.1.1.
     ssi: Vec<Arc<ErtsSchedulerSleepInfo>>,
     accounting_flags: AtomicU8,
-    worker_counts: Vec<WorkerQueueCount>,
     online_schedulers: AtomicUsize,
     next_queue: AtomicUsize,
     scheduling_blocked: AtomicBool,
@@ -3495,13 +3541,11 @@ struct DirtyQueue {
 type DirtyStatsSnapshot = ([Vec<u64>; 2], [u64; 2]);
 
 struct DirtyThread {
-    handle: OnceLock<thread::Thread>,
-    /// Set by whoever wakes this scheduler; the spinning wait polls it.
-    /// Port of erts/emulator/beam/erl_process.h (`ERTS_SSI_FLG_WAITING`), OTP-29.1.1.
-    wake: AtomicBool,
-    /// `ssi->flags`, including `ERTS_SSI_FLG_SUSPENDED`.
-    // Port of erts/emulator/beam/erl_process.h:270, OTP-29.1.1.
-    ssi_flags: AtomicU32,
+    /// `esdp->ssi` of this dirty scheduler: its flags (`ERTS_SSI_FLG_SUSPENDED` included) and
+    /// the event it sleeps on.
+    // Port of erts/emulator/beam/erl_process.c:6160 (erts_init_scheduling: the dirty
+    // `aligned_dirty_cpu_sched_sleep_info` / `aligned_dirty_io_sched_sleep_info`), OTP-29.1.1.
+    ssi: ErtsSchedulerSleepInfo,
     /// This scheduler's contributions to `schdlr_sspnd.active` and `curr_online`.
     // Port of erts/emulator/beam/erl_process.c (`suspend_scheduler`), OTP-29.1.1.
     suspend_counted: AtomicBool,
@@ -3571,30 +3615,22 @@ impl<T: Task> DirtyPool<T> {
     // Port of erts/emulator/beam/erl_process.c (`dcpu_sched_ix_resume_wake`,
     // `dio_sched_ix_resume_wake`), OTP-29.1.1.
     fn scheduler_ix_resume_wake(&self, index: usize) {
-        self.threads[index]
-            .ssi_flags
-            .fetch_and(!ERTS_SSI_FLG_SUSPENDED, Ordering::AcqRel);
-        self.wake_thread(index);
+        ssi::sched_resume_wake(&self.threads[index].ssi);
     }
 
     /// Suspend and wake one dirty scheduler when full multi-scheduling begins.
     // Port of erts/emulator/beam/erl_process.c (`dcpu_sched_ix_suspend_wake`,
     // `dio_sched_ix_suspend_wake`), OTP-29.1.1.
     fn scheduler_ix_suspend_wake(&self, index: usize) {
-        self.threads[index]
-            .ssi_flags
-            .fetch_or(ERTS_SSI_FLG_SUSPENDED, Ordering::AcqRel);
-        self.wake_thread(index);
+        let ssi = &self.threads[index].ssi;
+        ssi.flags.fetch_or(ERTS_SSI_FLG_SUSPENDED, Ordering::AcqRel);
+        ssi::ssi_wake(ssi, || {});
     }
 
-    /// Wake a dirty scheduler through its sticky thread event.
-    // Port of erts/emulator/beam/erl_process.c (`ssi_wake`, `erts_sched_finish_poke`), OTP-29.1.1.
+    /// Wake a dirty scheduler: a dirty scheduler never sleeps in the pollset.
+    // Port of erts/emulator/beam/erl_process.c (`dcpu_sched_ix_wake`: `ssi_wake`), OTP-29.1.1.
     fn wake_thread(&self, index: usize) {
-        let thread = &self.threads[index];
-        thread.wake.store(true, Ordering::SeqCst);
-        if let Some(handle) = thread.handle.get() {
-            handle.unpark();
-        }
+        ssi::ssi_wake(&self.threads[index].ssi, || {});
     }
 
     fn new(threads: usize, online: usize) -> Self {
@@ -3607,9 +3643,7 @@ impl<T: Task> DirtyPool<T> {
             active: AtomicUsize::new(0),
             threads: (0..threads)
                 .map(|index| DirtyThread {
-                    handle: OnceLock::new(),
-                    wake: AtomicBool::new(false),
-                    ssi_flags: AtomicU32::new(if index >= online {
+                    ssi: ErtsSchedulerSleepInfo::new(if index >= online {
                         ERTS_SSI_FLG_SUSPENDED
                     } else {
                         0
@@ -3634,9 +3668,6 @@ struct WorkerCounters {
     reductions: AtomicU64,
     active_ns: AtomicU64,
 }
-
-#[repr(align(64))]
-struct WorkerQueueCount(AtomicU64);
 
 #[derive(Clone, Default)]
 struct SchedulerAccountingSnapshot {
@@ -3998,7 +4029,8 @@ impl<T: Task> Inner<T> {
             state.current = SchedulerType::Normal;
             if self.multi_scheduling_blocked.load(Ordering::Acquire) {
                 self.dirty[kind.index()].threads[0]
-                    .ssi_flags
+                    .ssi
+                    .flags
                     .fetch_or(ERTS_SSI_FLG_SUSPENDED, Ordering::AcqRel);
             }
             self.msb_switch.notify_all();
@@ -4215,7 +4247,7 @@ impl<T: Task> Inner<T> {
         } else {
             &self.ssi[tid - 1]
         };
-        let later = aux_work_data.later_ptr();
+        let later = aux_work_data.later_cell();
         thr_progress::haw_thr_prgr_current_reset(later);
         let mut aux_work = ssi.aux_work.load(Ordering::Acquire);
         let mut ignore = 0u32;
@@ -4405,7 +4437,7 @@ impl<T: Task> Inner<T> {
         let Some(kind) = process.run_state().wake(None, prio) else {
             return false;
         };
-        self.enqueue(Scheduled::at_prio(process, kind, prio), false);
+        self.enqueue(Scheduled::at_prio(process, kind, prio));
         true
     }
 
@@ -4442,10 +4474,10 @@ impl<T: Task> Inner<T> {
             return self
                 .scheduling_blocker
                 .load(Ordering::Acquire)
-                .min(self.worker_counts.len() - 1);
+                .min(self.config.workers - 1);
         }
         let online = self.online_schedulers.load(Ordering::Relaxed).max(1);
-        let home = process.scheduler_worker().min(self.worker_counts.len() - 1);
+        let home = process.scheduler_worker().min(self.config.workers - 1);
         if home < online { home } else { home % online }
     }
 
@@ -4466,15 +4498,15 @@ impl<T: Task> Inner<T> {
     /// `smp_notify_inc_runq` wakes that run queue's scheduler only if it sleeps.
     /// Another scheduler takes the process by `try_steal_task` after it ran out of
     /// work, or by `wakeup_other_check` once the surplus passes the limit.
-    fn enqueue(&self, item: Scheduled<T>, already_active: bool) {
+    fn enqueue(&self, item: Scheduled<T>) {
         if let Some(worker) = item.process.bound_worker() {
-            self.record_queued(&item.process, worker, already_active);
+            item.process.set_scheduler_worker(worker);
             self.run_queues[worker].push(item);
             self.note_queued(worker);
             self.wake_scheduler(worker);
         } else {
             let scheduler = self.enqueue_run_queue(&item.process);
-            self.push_run_queue(scheduler, item, already_active);
+            self.push_run_queue(scheduler, item);
         }
     }
 
@@ -4530,7 +4562,7 @@ impl<T: Task> Inner<T> {
                 continue;
             };
             if Self::is_current_entry(&item) {
-                local.migrate_queued(&item.process, id);
+                item.process.set_scheduler_worker(id);
             }
             self.run_queues[id].push(item);
         }
@@ -4755,7 +4787,7 @@ impl<T: Task> Inner<T> {
             let first = chain.pop_first().expect("stolen run-queue process");
             chain.visit_all(|process| {
                 if process.run_state().load(Ordering::Acquire) == QUEUED {
-                    local.migrate_queued(process, id);
+                    process.set_scheduler_worker(id);
                 }
             });
             if !chain.is_empty() {
@@ -4790,8 +4822,8 @@ impl<T: Task> Inner<T> {
         }
     }
 
-    fn push_run_queue(&self, scheduler: usize, item: Scheduled<T>, already_active: bool) {
-        self.record_queued(&item.process, scheduler, already_active);
+    fn push_run_queue(&self, scheduler: usize, item: Scheduled<T>) {
+        item.process.set_scheduler_worker(scheduler);
         self.run_queues[scheduler].push(item);
         // Publish the queue change before a parker's final epoch check.
         self.note_queued(scheduler);
@@ -4807,7 +4839,7 @@ impl<T: Task> Inner<T> {
     /// Port of erts/emulator/beam/erl_process.c:12525-12531 (erl_create_process), OTP-29.1.1.
     fn enqueue_new(&self, item: Scheduled<T>) {
         if item.process.bound_worker().is_some() {
-            self.enqueue(item, false);
+            self.enqueue(item);
             return;
         }
         let online = self.online_schedulers.load(Ordering::Relaxed).max(1);
@@ -4817,29 +4849,7 @@ impl<T: Task> Inner<T> {
             % online;
         item.process.set_scheduler_worker(scheduler);
         let scheduler = self.enqueue_run_queue(&item.process);
-        self.push_run_queue(scheduler, item, false);
-    }
-
-    /// The process becomes active on run queue `worker` (it was active already when
-    /// `already_active`). The queue lengths are counted per entry by the run queue itself
-    /// (`enqueue_process`); this keeps the active-process count of each run queue.
-    fn record_queued(&self, process: &Process<T>, worker: usize, already_active: bool) {
-        let worker = worker.min(self.worker_counts.len() - 1);
-        let previous = process.scheduler_worker().min(self.worker_counts.len() - 1);
-        if already_active && previous != worker {
-            self.worker_counts[previous]
-                .0
-                .fetch_sub(1, Ordering::Relaxed);
-            self.worker_counts[worker].0.fetch_add(1, Ordering::Relaxed);
-        } else if !already_active {
-            self.worker_counts[worker].0.fetch_add(1, Ordering::Relaxed);
-        }
-        process.set_scheduler_worker(worker);
-    }
-
-    fn record_waiting(&self, process: &Process<T>) {
-        let worker = process.scheduler_worker().min(self.worker_counts.len() - 1);
-        self.worker_counts[worker].0.fetch_sub(1, Ordering::Relaxed);
+        self.push_run_queue(scheduler, item);
     }
 
     // Port of erts/emulator/beam/erl_process.c:5476-5510 (change_no_used_runqs), OTP-29.1.1.
@@ -4873,7 +4883,7 @@ impl<T: Task> Inner<T> {
         let moved = self.run_queues[worker].drain();
         for item in moved {
             if Self::is_current_entry(&item) {
-                local.migrate_queued(&item.process, target);
+                item.process.set_scheduler_worker(target);
             }
             self.run_queues[target].push(item);
             self.note_queued(target);
@@ -4887,10 +4897,6 @@ impl<T: Task> Inner<T> {
             .expect("wall start requests")
             .get_mut(worker)
             .and_then(Option::take)
-    }
-
-    fn flush_local_metrics(&self, _local: &Local<T>) {
-        // Worker-owned deltas remain local; statistics readers aggregate them on demand.
     }
 
     /// `rq->len` of each normal run queue: the process entries and ports it holds.
@@ -5094,24 +5100,20 @@ impl<T: Task> Inner<T> {
         false
     }
 
-    /// One pass of the run queue supervisor.
-    // Port of erts/emulator/beam/erl_process.c:5761 (runq_supervisor) and :5719
-    // (no_runqs_to_supervise), OTP-29.1.1: when some used run queue is empty while another
-    // one is not, wake a scheduler on an empty run queue for every non-empty one, so it
-    // steals; this covers a scheduler stuck in a call that never yields.
-    fn runq_supervise(&self) {
-        let (_, used) = self.balance.no_runqs();
-        let used = used
-            .min(self.online_schedulers.load(Ordering::Acquire))
-            .clamp(1, self.ssi.len());
-        let nonempty = |ix: usize| !self.run_queues[ix].is_empty();
-        let empty = (0..used).filter(|&ix| !nonempty(ix)).count();
-        if empty == 0 || empty >= used {
-            return;
-        }
-        for ix in 0..used {
-            if nonempty(ix) {
-                self.wake_scheduler_on_empty_runq(ix);
+    /// One pass of the run queue supervisor over `no_rqs` run queues: a forced wake-up of an
+    /// empty-run-queue scheduler for every run queue that still has work, so it steals; this
+    /// covers a scheduler stuck in a call that never yields.
+    // Port of erts/emulator/beam/erl_process.c:5782-5790 (runq_supervisor), OTP-29.1.1.
+    fn runq_supervise(&self, no_rqs: usize) {
+        for ix in 0..no_rqs.min(self.ssi.len()) {
+            if self.balance.rqs[ix].info.flags.load(Ordering::Relaxed) & balance::FLG_NONEMPTY != 0
+            {
+                let rq = self.run_queues[ix].lock();
+                let len = self.run_queues[ix].info.total_len();
+                drop(rq);
+                if len != 0 {
+                    self.wake_scheduler_on_empty_runq(ix);
+                }
             }
         }
     }
@@ -5414,6 +5416,40 @@ impl<T: Task> Inner<T> {
         delivered.ok_or(Error::NoProcess)?
     }
 
+    /// `proc_queue_signal` with `sender == NULL`: no `MAYBE_SELF_SIGS`, buffer slot from
+    /// `erts_internal_hash(from)` rather than the pid in the event node.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:1190-1203, OTP-29.1.1.
+    fn deliver_null_sender(
+        &self,
+        to: Pid,
+        order_by_hash: u64,
+        signal: OwnedSignal<Event<T::Message>>,
+        local: Option<&Local<T>>,
+    ) -> Result<(), Error> {
+        let force_enqueue = !signal.is_lazy()
+            && matches!(&signal.payload, Payload::Signal(Signal::LiteralAreaCopy(_)));
+        let managed = local.is_some() || thr_progress::is_managed_thread_of(&self.progress);
+        let enqueue = |process: &ProcRef<T>| {
+            self.fanin_delivery(process, 1);
+            let kind = signal_kind(&signal);
+            let Ok(state) = process.input.push_routed_node(
+                &self.progress_domain,
+                || order_by_hash as usize,
+                signal,
+            ) else {
+                return Err(Error::NoProcess);
+            };
+            self.wake_after_publish(process, local, force_enqueue, Some(state), kind);
+            Ok(())
+        };
+        let delivered = if managed {
+            self.table.with_live_managed(to, enqueue)
+        } else {
+            self.table.with_live(to, enqueue)
+        };
+        delivered.ok_or(Error::NoProcess)?
+    }
+
     fn deliver_live(
         &self,
         process: &ProcRef<T>,
@@ -5545,7 +5581,7 @@ impl<T: Task> Inner<T> {
         // (erts_proc_notify_new_message only schedules the process).
         let item = Scheduled::at_prio(process.clone(), kind, prio);
         if force_enqueue {
-            self.enqueue(item, false);
+            self.enqueue(item);
         } else {
             self.place_runnable(item, local);
         }
@@ -5575,14 +5611,14 @@ impl<T: Task> Inner<T> {
                 0
             };
             if scheduler == local.worker_id {
-                local.record_queued(&item.process, local.worker_id, false);
+                item.process.set_scheduler_worker(local.worker_id);
                 self.run_queues[scheduler].push(item);
             } else {
-                self.push_run_queue(scheduler, item, false);
+                self.push_run_queue(scheduler, item);
             }
             return;
         }
-        self.enqueue(item, false);
+        self.enqueue(item);
     }
 
     /// `erts_cancel_proc_timer` on behalf of the receiver itself (its exit).
@@ -5989,9 +6025,6 @@ struct Local<T: Task> {
     current_online: Cell<bool>,
     profile_active: Cell<bool>,
     last_process: Cell<Option<Pid>>,
-    metric_deltas: RefCell<Vec<i64>>,
-    dirty_metrics: RefCell<Vec<usize>>,
-    metric_marked: RefCell<Vec<bool>>,
     active_ns: Cell<u64>,
     active_started: Cell<Option<Instant>>,
     wall_enabled: Cell<bool>,
@@ -6044,15 +6077,6 @@ impl<T: Task> Local<T> {
         crate::msacc::erts_msacc_set_state(state);
     }
 
-    fn adjust_metric(&self, worker: usize, delta: i64) {
-        let mut marked = self.metric_marked.borrow_mut();
-        if !marked[worker] {
-            marked[worker] = true;
-            self.dirty_metrics.borrow_mut().push(worker);
-        }
-        self.metric_deltas.borrow_mut()[worker] += delta;
-    }
-
     /// `check_time_reds` and `wakeup_other_reds` count the reductions this scheduler executed.
     fn reductions_executed(&self, reds: u64) {
         self.check_time_reds.set(
@@ -6062,39 +6086,6 @@ impl<T: Task> Local<T> {
         );
         self.wakeup_other_reds
             .set(self.wakeup_other_reds.get() + reds as i64);
-    }
-
-    fn metric_last(&self) -> usize {
-        self.metric_deltas.borrow().len() - 1
-    }
-
-    /// See `Inner::record_queued`; the run queue lengths are counted by the run queue.
-    fn record_queued(&self, process: &Process<T>, worker: usize, already_active: bool) {
-        process.set_scheduler_worker(worker);
-        if !already_active {
-            self.adjust_metric(worker, 1);
-        }
-    }
-
-    fn record_running(&self, process: &Process<T>, worker: usize) {
-        let previous = process.scheduler_worker().min(self.metric_last());
-        if previous != worker {
-            self.adjust_metric(previous, -1);
-            self.adjust_metric(worker, 1);
-        }
-        process.set_scheduler_worker(worker);
-    }
-
-    fn record_waiting(&self, process: &Process<T>) {
-        let worker = process.scheduler_worker().min(self.metric_last());
-        self.adjust_metric(worker, -1);
-    }
-
-    fn migrate_queued(&self, process: &Process<T>, target: usize) {
-        let previous = process.scheduler_worker().min(self.metric_last());
-        self.adjust_metric(previous, -1);
-        self.adjust_metric(target, 1);
-        process.set_scheduler_worker(target);
     }
 }
 
@@ -6327,8 +6318,12 @@ pub struct ErtsSchedulerData<T: Task> {
     /// `current_process` of a dirty scheduler: the job [`erts_schedule`] picked, kept until
     /// the next call schedules it out.
     current_process: RefCell<Option<ProcRef<T>>>,
-    /// `ssi`: the spin count `scheduler_wait` spins before it sleeps.
+    /// `sched_get_busy_wait_params(esdp)->tse`: the spin count `scheduler_wait` spins before
+    /// it sleeps.
     ssi_spin_count: u32,
+    /// `sched_get_busy_wait_params(esdp)->aux_work`: the spin count of a later round of the
+    /// same wait.
+    ssi_aux_work_spin_count: u32,
     /// `dirty_no`: pool and index of a dirty scheduler.
     dirty_no: Option<(DirtyKind, usize)>,
     /// `run_queue`, with the schedulers' shared state it points into.
@@ -7248,14 +7243,14 @@ pub(crate) fn erts_schedule_process<T: Task>(
     let bound = process.bound_worker().is_some();
     let item = Scheduled::at_prio(process, kind, prio);
     if bound {
-        rq.enqueue(item, false);
+        rq.enqueue(item);
     } else if let Some(local) = local {
         // Port of erl_process.c:12525-12531 (`erl_create_process`) and
         // erl_process.c:3954 (`enqueue_process`), OTP-29.1.1: newly spawned
         // children join the caller's FIFO run queue behind earlier children.
         // The child joins the same local deque a woken process does (place_runnable), so
         // it runs before a process the parent wakes afterwards.
-        local.record_queued(&item.process, local.worker_id, false);
+        item.process.set_scheduler_worker(local.worker_id);
         rq.run_queues[local.worker_id].push(item);
     } else {
         rq.enqueue_new(item);
@@ -7386,25 +7381,7 @@ fn apply_later_op_on_normal<T: Task>(
     let aux_work = esdp
         .run_queue
         .aux_work_flags_tid(esdp.aux_work_data.sched_id);
-    match args.size {
-        None => thr_progress::erts_schedule_thr_prgr_later_op(
-            &esdp.run_queue.progress,
-            later,
-            aux_work,
-            args.func,
-            args.data,
-            args.lop,
-        ),
-        Some(size) => thr_progress::erts_schedule_thr_prgr_later_cleanup_op(
-            &esdp.run_queue.progress,
-            later,
-            aux_work,
-            args.func,
-            args.data,
-            args.lop,
-            size,
-        ),
-    }
+    thr_progress::enqueue_later_op_args(&esdp.run_queue.progress, later, aux_work, args);
 }
 
 fn enqueue_later_op_args<T: Task>(args: thr_progress::raw::LaterOpArgs, inner: Option<&Inner<T>>) {
@@ -8049,6 +8026,7 @@ impl<T: Task> Scheduler<T> {
             workers,
             workers,
             config.compact_load,
+            config.forced_wakeup_interval.is_some_and(|ms| ms > 0),
             Arc::clone(&progress),
         ));
         let now = clock.now_ms();
@@ -8064,9 +8042,6 @@ impl<T: Task> Scheduler<T> {
                 last_monotonic_ms: now,
                 profile_active: false,
                 last_process: None,
-                metric_deltas: vec![0; workers],
-                dirty_metrics: Vec::new(),
-                metric_marked: vec![false; workers],
                 active_ns: 0,
                 active_started: None,
                 wall_enabled: false,
@@ -8102,9 +8077,6 @@ impl<T: Task> Scheduler<T> {
             misc_aux_work: (0..=workers).map(|_| thr_queue::ThrQueue::new()).collect(),
             ssi,
             accounting_flags: AtomicU8::new(0),
-            worker_counts: (0..workers)
-                .map(|_| WorkerQueueCount(AtomicU64::new(0)))
-                .collect(),
             online_schedulers: AtomicUsize::new(workers),
             next_queue: AtomicUsize::new(0),
             scheduling_blocked: AtomicBool::new(false),
@@ -8522,7 +8494,7 @@ impl<T: Task> Scheduler<T> {
         process.set_scheduler_worker(worker);
         let item = Scheduled::new(process);
         let scheduler = self.inner.enqueue_run_queue(&item.process);
-        self.inner.push_run_queue(scheduler, item, false);
+        self.inner.push_run_queue(scheduler, item);
         Ok(pid)
     }
     /// Spawn a task at a chosen scheduler priority.
@@ -8618,6 +8590,26 @@ impl<T: Task> Scheduler<T> {
     pub fn signal(&self, from: Pid, to: Pid, signal: Signal<T::Message>) -> Result<(), Error> {
         self.inner.publish_held_monitor_for(to, None);
         self.inner.deliver(from, to, Payload::Signal(signal), None)
+    }
+    /// Queue a signal as `proc_queue_signal(NULL, from, to, sig, 0, op)`: there is no sender,
+    /// so `ERTS_PXSFLG_MAYBE_SELF_SIGS` is not set, and `order_by_hash` (`erts_internal_hash`
+    /// of `from`) selects the outer-queue buffer slot.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:1830-1836 (send_gen_exit_signal:
+    // `order_by = sender ? sender->id : from`) and :1190-1203 (proc_queue_signal: MAYBE_SELF_SIGS
+    // only when `sender == rp`; buffer slot `erts_internal_hash(from)`), OTP-29.1.1.
+    pub fn signal_null_sender(
+        &self,
+        order_by_hash: u64,
+        to: Pid,
+        signal: Signal<T::Message>,
+    ) -> Result<(), Error> {
+        self.inner.publish_held_monitor_for(to, None);
+        self.inner.deliver_null_sender(
+            to,
+            order_by_hash,
+            T::Message::signal_node(Pid::from_data(0), signal),
+            None,
+        )
     }
     /// User priority of a live process.
     pub fn process_priority(&self, pid: Pid) -> Option<Priority> {
@@ -8782,19 +8774,15 @@ impl<T: Task> Scheduler<T> {
         pool.online.store(online, Ordering::Release);
         if online > previous {
             for index in previous..online {
-                if !self.inner.multi_scheduling_blocked.load(Ordering::Acquire) {
-                    pool.threads[index]
-                        .ssi_flags
-                        .fetch_and(!ERTS_SSI_FLG_SUSPENDED, Ordering::AcqRel);
+                if self.inner.multi_scheduling_blocked.load(Ordering::Acquire) {
+                    pool.wake_thread(index);
+                } else {
+                    pool.scheduler_ix_resume_wake(index);
                 }
-                pool.wake_thread(index);
             }
         } else {
             for index in online..previous {
-                pool.threads[index]
-                    .ssi_flags
-                    .fetch_or(ERTS_SSI_FLG_SUSPENDED, Ordering::AcqRel);
-                pool.wake_thread(index);
+                pool.scheduler_ix_suspend_wake(index);
             }
             pool.wake_thread(0);
         }
@@ -9345,11 +9333,25 @@ impl<T: Task> Scheduler<T> {
         if bindings.len() != self.worker_count() {
             return false;
         }
-        *self
-            .inner
-            .cpu_bind_targets
-            .write()
-            .unwrap_or_else(|error| error.into_inner()) = bindings.to_vec();
+        #[cfg(target_os = "linux")]
+        {
+            let _cpuinfo_lock = CPUINFO_BIND_LOCK
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *self
+                .inner
+                .cpu_bind_targets
+                .write()
+                .unwrap_or_else(|error| error.into_inner()) = bindings.to_vec();
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            *self
+                .inner
+                .cpu_bind_targets
+                .write()
+                .unwrap_or_else(|error| error.into_inner()) = bindings.to_vec();
+        }
         for worker in 0..bindings.len() {
             self.inner.wake_scheduler(worker);
         }
@@ -9754,6 +9756,13 @@ mod dirty_state_tests {
     fn dirty_wake_takes_the_most_recent_eligible_sleeper() {
         let pool = DirtyPool::<Idle>::new(4, 4);
         pool.online.store(3, Ordering::Release);
+        // Every scheduler waits in scheduler_wait; a wake clears its WAITING flag.
+        for thread in &pool.threads {
+            thread.ssi.flags.store(
+                ssi::ERTS_SSI_FLG_SLEEPING | ssi::ERTS_SSI_FLG_WAITING,
+                Ordering::SeqCst,
+            );
+        }
         let mut queue = pool.queue.lock().unwrap();
         queue.sleepers.extend([0, 1, 2, 3]);
         // Thread 3 is offline, so thread 2 slept last among those that may run.
@@ -9767,7 +9776,7 @@ mod dirty_state_tests {
         let woken: Vec<bool> = pool
             .threads
             .iter()
-            .map(|thread| thread.wake.load(Ordering::SeqCst))
+            .map(|thread| thread.ssi.flags.load(Ordering::SeqCst) & ssi::ERTS_SSI_FLG_WAITING == 0)
             .collect();
         assert_eq!(woken, vec![true, true, true, false]);
     }
@@ -10454,9 +10463,8 @@ impl<T: Task> Drop for Scheduler<T> {
         let threads = self.threads.get_mut().unwrap_or_else(|e| e.into_inner());
         // Schedulers that never started have nothing to suspend.
         let started = !threads.is_empty();
+        self.inner.balance.wake_runq_supervisor();
         for handle in threads.iter() {
-            // The run-queue supervisor sleeps in `park_timeout`.
-            handle.thread().unpark();
             on_worker |= handle.thread().id() == current;
         }
         // Dropping the handles detaches the threads.
@@ -10508,15 +10516,7 @@ impl<T: Task> Scheduler<T> {
         for pool in &self.inner.dirty {
             pool.wake_all();
         }
-        for handle in self
-            .threads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-        {
-            // The run-queue supervisor sleeps in `park_timeout`.
-            handle.thread().unpark();
-        }
+        self.inner.balance.wake_runq_supervisor();
         self.inner.table.release_all();
     }
 }
@@ -10610,22 +10610,11 @@ fn schedule_out<T: Task>(
                     !(psflg::RUNNING | psflg::DIRTY_RUNNING | psflg::DIRTY_RUNNING_SYS),
                     Ordering::SeqCst,
                 );
-            } else if let Some(local) = local {
-                local.record_waiting(process);
-            } else {
-                inner.record_waiting(process);
             }
         }
         Some(kind) => {
             // Port of erts/emulator/beam/erl_process.c:9873 (schedule_out to a dirty run
             // queue), OTP-29.1.1.
-            if dirty.is_none() {
-                if let Some(local) = local {
-                    local.record_waiting(process);
-                } else {
-                    inner.record_waiting(process);
-                }
-            }
             let prio = process.priority().index();
             let entry = process.run_state().yield_running_dirty(
                 kind,
@@ -10653,13 +10642,6 @@ fn schedule_out<T: Task>(
                 .run_state()
                 .schedule_out_process(prio, dirty.is_some());
             if n & ANY_ACTIVE == 0 {
-                if dirty.is_some() {
-                    // Already outside the normal run queue accounting.
-                } else if let Some(local) = local {
-                    local.record_waiting(process);
-                } else {
-                    inner.record_waiting(process);
-                }
                 // A receive timer that fired while the process ran found it active and did
                 // not schedule it; the SeqCst load after the SeqCst transition sees its mark.
                 // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1192-1196
@@ -10682,11 +10664,11 @@ fn schedule_out<T: Task>(
             } else if dirty.is_some() {
                 // Port of erts/emulator/beam/erl_process.c:10190 (a finished dirty job moves
                 // the process back to a normal run queue), OTP-29.1.1.
-                inner.enqueue(Scheduled::at_prio(process.clone(), kind, prio), false);
+                inner.enqueue(Scheduled::at_prio(process.clone(), kind, prio));
             } else {
                 let next = Scheduled::at_prio(process.clone(), kind, prio);
                 if process.bound_worker().is_some() {
-                    inner.enqueue(next, true);
+                    inner.enqueue(next);
                 } else if let Some(local) = local {
                     let online = inner.online_schedulers.load(Ordering::Acquire);
                     // Port of erts/emulator/beam/erl_process.c:6668 (schedule_out_process
@@ -10704,27 +10686,24 @@ fn schedule_out<T: Task>(
                                 .filter(|&to| to < online)
                         };
                     if online == 1 && local.worker_id != 0 {
-                        inner.enqueue(next, true);
+                        inner.enqueue(next);
                     } else if let Some(to) = emigrate {
-                        inner.push_run_queue(to, next, true);
+                        inner.push_run_queue(to, next);
                     } else {
                         // Port of erts/emulator/beam/erl_process.c:9603 (one FIFO run queue
                         // per scheduler and priority), OTP-29.1.1: processes this slice
                         // enqueued on the run queue (spawned, woken) were queued before the
                         // yielding process, so they join the local deques ahead of it.
-                        local.record_queued(&next.process, local.worker_id, true);
+                        next.process.set_scheduler_worker(local.worker_id);
                         // The caller enqueues it under the run queue lock it takes next
                         // (schedule_out_process returns with c_rq locked).
                         own_enqueue = Some(next);
                     }
                 } else {
-                    inner.enqueue(next, true);
+                    inner.enqueue(next);
                 }
             }
         }
-    }
-    if let Some(local) = local {
-        inner.flush_local_metrics(local);
     }
     own_enqueue
 }
@@ -11584,10 +11563,13 @@ fn stop_suspended_scheduler<T: Task>(esdp: &ErtsSchedulerData<T>) -> ! {
         Some(id) => loop {
             esdp.run_queue.ssi[id].event.wait();
         },
-        // Dirty schedulers still sleep on their thread handle (DirtyThread).
-        None => loop {
-            thread::park();
-        },
+        None => {
+            let (kind, index) = esdp.dirty_no.expect("a dirty scheduler has its pool");
+            let ssi = &esdp.run_queue.dirty[kind.index()].threads[index].ssi;
+            loop {
+                ssi.event.wait();
+            }
+        }
     }
 }
 
@@ -11909,7 +11891,6 @@ fn check_activities_to_run<T: Task>(
     if check_time {
         local.check_time_reds.set(0);
     }
-    inner.flush_local_metrics(local);
     // Port of erts/emulator/beam/erl_process.c:9812-9822 (check_activities_to_run:
     // check_balance and immigrate), OTP-29.1.1.
     rq.lock();
@@ -12040,7 +12021,7 @@ fn check_activities_to_run<T: Task>(
         // `rq->procs.context_switches++`, `esdp->current_process = p`, the sched_stat
         // record), OTP-29.1.1.
         record_sched_stat(&process, id);
-        local.record_running(&process, id);
+        process.set_scheduler_worker(id);
         inner.worker_stats[local.worker_id]
             .context_switches
             .fetch_add(1, Ordering::Relaxed);
@@ -12226,6 +12207,8 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         inner: Arc::clone(&inner),
     }) as Rc<dyn NativeSend<T::Message>>);
     let ssi_spin_count = scheduler_spin_count(&inner.config.busy_wait_thresholds, 0, "medium");
+    let ssi_aux_work_spin_count =
+        scheduler_aux_work_spin_count(&inner.config.busy_wait_thresholds, 0, "medium");
     let esdp = ErtsSchedulerData {
         worker: Some(id),
         sched_type: SchedulerType::Normal,
@@ -12241,6 +12224,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         aux_work_data,
         current_process: RefCell::new(None),
         ssi_spin_count,
+        ssi_aux_work_spin_count,
         dirty_no: None,
         run_queue: inner,
         registers: T::SchedulerData::default(),
@@ -12281,11 +12265,20 @@ fn process_main<T: Task>(esdp: &ErtsSchedulerData<T>) -> ! {
 #[cfg(target_os = "linux")]
 static CPUINFO_AFFINITY: OnceLock<Option<rustix::thread::CpuSet>> = OnceLock::new();
 
+/// `cpuinfo_rwmtx`: scheduler binding and topology changes take the write lock; fork
+/// preparation takes the read lock.
+// Port of erts/emulator/beam/erl_cpu_topology.c (`cpuinfo_rwmtx`), OTP-29.1.1.
+#[cfg(target_os = "linux")]
+static CPUINFO_BIND_LOCK: RwLock<()> = RwLock::new(());
+
 /// `erts_sched_check_cpu_bind(esdp)`: binds the scheduler thread to the CPU its run queue's
 /// bind target names (or unbinds it), `esdp->cpu_id` recording the binding applied.
 // Port of erts/emulator/beam/erl_cpu_topology.c (erts_sched_check_cpu_bind), OTP-29.1.1.
 #[cfg(target_os = "linux")]
 fn erts_sched_check_cpu_bind<T: Task>(esdp: &ErtsSchedulerData<T>) {
+    let _cpuinfo_lock = CPUINFO_BIND_LOCK
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let inner = &*esdp.run_queue;
     let id = esdp.worker.expect("a normal scheduler has its number");
     let requested = inner
@@ -12416,16 +12409,6 @@ fn timer_wheel_bit(worker: usize) -> u64 {
     1 << worker.min(63)
 }
 
-// Port of erts/emulator/beam/erl_process.c:69,75,84 (medium busy-wait threshold), OTP-29.1.1.
-const SCHED_SPIN_UNTIL_YIELD: u32 = 100;
-
-#[inline(always)]
-fn scheduler_spin_body() {
-    // Port of erts/emulator/beam/erl_process.c (sched_spin_wait), OTP-29.1.1:
-    // ETHR_SPIN_BODY is a compiler barrier on AArch64, not a processor hint.
-    std::sync::atomic::compiler_fence(Ordering::SeqCst);
-}
-
 // Port of erts/emulator/beam/erl_process.c:5564-5577 (medium wakeup-other threshold), OTP-29.1.1.
 const CONTEXT_REDS: i64 = 4_000;
 const WAKEUP_OTHER_LIMIT: i64 = 10 * CONTEXT_REDS;
@@ -12438,12 +12421,18 @@ const WAKEUP_OTHER_FIXED_INC: i64 = CONTEXT_REDS / 10;
 /// Body of the run queue supervisor thread.
 // Port of erts/emulator/beam/erl_process.c:5761 (runq_supervisor), OTP-29.1.1.
 fn runq_supervisor<T: Task>(inner: Arc<Inner<T>>, interval_ms: u64) {
-    while !inner.stopped.load(Ordering::Acquire) {
-        thread::park_timeout(Duration::from_millis(interval_ms));
-        if inner.stopped.load(Ordering::Acquire) {
+    let stopped = || inner.stopped.load(Ordering::Acquire);
+    while !stopped() {
+        // erts_milli_sleep(erts_runq_supervision_interval)
+        thread::sleep(Duration::from_millis(interval_ms));
+        let mut no_rqs = inner.balance.no_runqs_to_supervise();
+        if no_rqs == 0 {
+            no_rqs = inner.balance.runq_supervisor_wait(stopped);
+        }
+        if stopped() {
             break;
         }
-        inner.runq_supervise();
+        inner.runq_supervise(no_rqs);
     }
 }
 
@@ -12497,14 +12486,14 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
         false,
     );
     crate::msacc::erts_msacc_set_state(MsaccState::Other);
-    let ssi_spin_count = scheduler_spin_count(
-        &inner.config.busy_wait_thresholds,
-        match kind {
-            DirtyKind::Cpu => 1,
-            DirtyKind::Io => 2,
-        },
-        "short",
-    );
+    let threshold_ix = match kind {
+        DirtyKind::Cpu => 1,
+        DirtyKind::Io => 2,
+    };
+    let ssi_spin_count =
+        scheduler_spin_count(&inner.config.busy_wait_thresholds, threshold_ix, "short");
+    let ssi_aux_work_spin_count =
+        scheduler_aux_work_spin_count(&inner.config.busy_wait_thresholds, threshold_ix, "short");
     let esdp = ErtsSchedulerData {
         worker: None,
         sched_type: kind.into(),
@@ -12520,6 +12509,7 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
         aux_work_data: ErtsAuxWorkData::new(thr_id as usize),
         current_process: RefCell::new(None),
         ssi_spin_count,
+        ssi_aux_work_spin_count,
         dirty_no: Some((kind, index)),
         run_queue: inner,
         registers: T::SchedulerData::default(),
@@ -12527,9 +12517,6 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
         cpu_id: Cell::new(None),
     };
     arinsal_term::initialize_scheduler_random(std::ptr::from_ref(&esdp).cast());
-    let pool = &esdp.run_queue.dirty[kind.index()];
-    let thread = &pool.threads[index];
-    let _ = thread.handle.set(thread::current());
     let wake_inner = Arc::downgrade(&esdp.run_queue);
     let _unmanaged = thr_progress::register_unmanaged_thread(&esdp.run_queue.progress, move || {
         if let Some(inner) = wake_inner.upgrade() {
@@ -12569,6 +12556,7 @@ fn erts_schedule_dirty<T: Task>(
     let inner = &esdp.run_queue;
     let pool = &inner.dirty[kind.index()];
     let thread = &pool.threads[index];
+    let ssi = &thread.ssi;
     let spin_count = esdp.ssi_spin_count;
     // Port of erts/emulator/beam/erl_process.c:9744-9760 (erts_schedule: schedule_out_process,
     // then `esdp->current_process = NULL`), OTP-29.1.1.
@@ -12591,42 +12579,39 @@ fn erts_schedule_dirty<T: Task>(
                 drop(queue);
                 stop_suspended_scheduler(esdp);
             }
-            let ssi_suspended =
-                thread.ssi_flags.load(Ordering::Acquire) & ERTS_SSI_FLG_SUSPENDED != 0;
+            let ssi_suspended = ssi.flags.load(Ordering::Acquire) & ERTS_SSI_FLG_SUSPENDED != 0;
             if ssi_suspended || !inner.dirty_may_execute(kind, index) {
                 drop(queue);
-                // Port of erts/emulator/beam/erl_process.c (`suspend_scheduler`): scheduler
+                // Port of erts/emulator/beam/erl_process.c:7790 (suspend_scheduler): scheduler
                 // counts change after leaving the run-queue lock and before sleeping.
                 inner.dirty_scheduler_transition(kind, index, false);
-                crate::msacc::erts_msacc_set_state(MsaccState::Sleep);
                 loop {
-                    let ssi_suspended =
-                        thread.ssi_flags.load(Ordering::Acquire) & ERTS_SSI_FLG_SUSPENDED != 0;
-                    let can_execute = inner.dirty_may_execute(kind, index);
-                    if (!ssi_suspended && can_execute)
-                        || inner.stopped.load(Ordering::Acquire)
+                    if inner.stopped.load(Ordering::Acquire)
                         || inner.halt_requested.load(Ordering::Acquire)
                     {
                         break;
                     }
-                    thread.wake.store(false, Ordering::SeqCst);
-                    let ssi_suspended =
-                        thread.ssi_flags.load(Ordering::Acquire) & ERTS_SSI_FLG_SUSPENDED != 0;
-                    if (ssi_suspended || !inner.dirty_may_execute(kind, index))
-                        && !inner.stopped.load(Ordering::Acquire)
-                        && !inner.halt_requested.load(Ordering::Acquire)
-                    {
-                        thread::park();
+                    let flgs = ssi::sched_prep_spin_suspended(ssi, ERTS_SSI_FLG_SUSPENDED);
+                    if flgs & ERTS_SSI_FLG_SUSPENDED != 0 {
+                        crate::msacc::erts_msacc_set_state(MsaccState::Sleep);
+                        ssi::suspend_scheduler_sleep_dirty(ssi);
+                        crate::msacc::erts_msacc_set_state(MsaccState::Other);
+                        continue;
                     }
+                    if inner.dirty_may_execute(kind, index) {
+                        break;
+                    }
+                    // Not suspended, but blocked multi-scheduling has not handed execution to
+                    // this scheduler yet: wait for the wake that hands it over.
+                    dirty_scheduler_sleep(ssi, spin_count, esdp.ssi_aux_work_spin_count);
                 }
-                crate::msacc::erts_msacc_set_state(MsaccState::Other);
                 queue = pool.queue.lock().unwrap();
                 continue;
             }
             drop(queue);
             inner.dirty_scheduler_transition(kind, index, true);
             queue = pool.queue.lock().unwrap();
-            if thread.ssi_flags.load(Ordering::Acquire) & ERTS_SSI_FLG_SUSPENDED != 0
+            if ssi.flags.load(Ordering::Acquire) & ERTS_SSI_FLG_SUSPENDED != 0
                 || !inner.dirty_may_execute(kind, index)
             {
                 continue;
@@ -12651,28 +12636,17 @@ fn erts_schedule_dirty<T: Task>(
                 queue = pool.queue.lock().unwrap();
                 continue;
             }
-            // Port of erts/emulator/beam/erl_process.c (scheduler_wait for a dirty scheduler).
-            thread.wake.store(false, Ordering::SeqCst);
-            if !queue.sleepers.contains(&index) {
-                queue.sleepers.push_back(index);
+            // Port of erts/emulator/beam/erl_process.c:3452 (scheduler_wait, dirty run queue):
+            // publish SLEEPING|WAITING under the run-queue lock, join rq->sleepers, unlock,
+            // then spin and sleep on ssi->event until a wake clears WAITING.
+            let flgs = ssi::sched_prep_spin_wait(ssi);
+            if flgs & ERTS_SSI_FLG_SUSPENDED != 0 {
+                // "Go suspend instead..."
+                continue;
             }
+            queue.sleepers.push_back(index);
             drop(queue);
-            let mut spins = spin_count;
-            let mut until_yield = SCHED_SPIN_UNTIL_YIELD;
-            while spins > 0 && !thread.wake.load(Ordering::Acquire) {
-                scheduler_spin_body();
-                until_yield -= 1;
-                if until_yield == 0 {
-                    until_yield = SCHED_SPIN_UNTIL_YIELD;
-                    thread::yield_now();
-                }
-                spins -= 1;
-            }
-            if !thread.wake.load(Ordering::SeqCst) {
-                crate::msacc::erts_msacc_set_state(MsaccState::Sleep);
-                thread::park();
-                crate::msacc::erts_msacc_set_state(MsaccState::Other);
-            }
+            dirty_scheduler_sleep(ssi, spin_count, esdp.ssi_aux_work_spin_count);
             queue = pool.queue.lock().unwrap();
             if let Some(position) = queue.sleepers.iter().position(|&slot| slot == index) {
                 queue.sleepers.remove(position);
@@ -12683,6 +12657,37 @@ fn erts_schedule_dirty<T: Task>(
     pool.active.fetch_add(1, Ordering::Relaxed);
     *esdp.current_process.borrow_mut() = Some(item.process.clone());
     item.process
+}
+
+/// The waiting part of `scheduler_wait` on a dirty scheduler, entered with SLEEPING|WAITING
+/// published: spin, then sleep on `ssi->event` (no timeout, a dirty scheduler has no timers)
+/// until a wake clears WAITING, then clear every flag but SUSPENDED and MSB_EXEC.
+// Port of erts/emulator/beam/erl_process.c:3580-3632 (scheduler_wait: sched_spin_wait,
+// sched_set_sleeptype(ERTS_SSI_FLG_TSE_SLEEPING), erts_tse_twait(ssi->event, -1),
+// sched_prep_cont_spin_wait), OTP-29.1.1.
+fn dirty_scheduler_sleep(ssi: &ErtsSchedulerSleepInfo, spincount: u32, aux_work_spincount: u32) {
+    let mut spincount = spincount;
+    let mut flgs;
+    loop {
+        flgs = ssi::sched_spin_wait(ssi, spincount);
+        if flgs & ssi::ERTS_SSI_FLG_SLEEPING != 0 {
+            flgs = ssi::sched_set_sleeptype(ssi, ssi::ERTS_SSI_FLG_TSE_SLEEPING, || {});
+            if flgs & ssi::ERTS_SSI_FLG_SLEEPING != 0 {
+                crate::msacc::erts_msacc_set_state(MsaccState::Sleep);
+                ssi.event.wait();
+                crate::msacc::erts_msacc_set_state(MsaccState::Other);
+            }
+        }
+        if flgs & ssi::ERTS_SSI_FLG_WAITING == 0 {
+            break;
+        }
+        flgs = ssi::sched_prep_cont_spin_wait(ssi);
+        spincount = aux_work_spincount;
+        if flgs & ssi::ERTS_SSI_FLG_WAITING == 0 {
+            break;
+        }
+    }
+    ssi::sched_wait_clear(ssi, flgs);
 }
 
 /// Return the erts spin count for `+sbwt`, `+sbwtdcpu`, or `+sbwtdio`.
@@ -12698,6 +12703,23 @@ fn scheduler_spin_count(thresholds: &[Option<String>; 3], index: usize, default:
         _ => unreachable!("busy wait thresholds are validated at argument parsing"),
     };
     sys_sched * 1_000
+}
+
+/// Return the erts aux-work spin count for `+sbwt`, `+sbwtdcpu`, or `+sbwtdio`.
+// Port of erts/emulator/beam/erl_process.c:70-81,5852-5887
+// (ERTS_SCHED_AUX_WORK_SLEEP_SPINCOUNT_FACT_*, erts_sched_set_busy_wait_threshold), OTP-29.1.1.
+fn scheduler_aux_work_spin_count(
+    thresholds: &[Option<String>; 3],
+    index: usize,
+    default: &str,
+) -> u32 {
+    let threshold = thresholds[index].as_deref().unwrap_or(default);
+    let aux_work_fact = match threshold {
+        "very_long" | "long" | "medium" => 1_000,
+        _ => 0,
+    };
+    let sys_sched = scheduler_spin_count(thresholds, index, default) / 1_000;
+    sys_sched * aux_work_fact
 }
 
 /// Send the scheduler profile message of a worker's transition, from `sender` (the process the

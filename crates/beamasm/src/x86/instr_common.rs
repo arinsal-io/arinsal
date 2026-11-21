@@ -18,6 +18,7 @@ use super::beam_asm::{
 use super::beam_asm::{Update, get_x_ref};
 use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
 use super::beam_asm_module::{BeamModuleAssembler, Patch, PatchCatch, arg_label, arg_word};
+use super::rt::addr;
 pub use super::rt::{
     add_stacktrace, build_stacktrace, erl_is_function, erts_cmp_atoms, erts_cmp_compound,
     erts_continue_exit_process, erts_do_exit_process, erts_pd_hash_get, erts_pd_hash_get_with_hx,
@@ -1340,7 +1341,7 @@ impl BeamGlobalAssembler {
         self.asm.mov_imm(ARG3, 0)?;
         self.asm.mov_imm(ARG4, 1)?;
         self.asm
-            .runtime_call(erts_cmp_compound as *const () as usize)?;
+            .runtime_call(addr(erts_cmp_compound as *const ()))?;
         self.asm.emit_leave_runtime(Update::NONE)?;
         self.asm.emit(|e| e.test_rr(RET, RET))?;
         self.asm.emit(|e| e.ret())
@@ -1393,8 +1394,7 @@ impl BeamGlobalAssembler {
         self.asm.emit(|e| e.or_rr(ARG3D, ARG5D))?;
         self.asm.jcc(CondCode::NE, generic_compare)?;
         self.asm.emit_enter_runtime(Update::NONE)?;
-        self.asm
-            .runtime_call(erts_cmp_atoms as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_cmp_atoms as *const ()))?;
         self.asm.emit_leave_runtime(Update::NONE)?;
         self.asm.emit(|e| e.test_rr(RETD, RETD))?;
         self.asm.emit_leave_frame()?;
@@ -1405,7 +1405,7 @@ impl BeamGlobalAssembler {
         self.asm.mov_imm(ARG3, 0)?;
         self.asm.mov_imm(ARG4, 0)?;
         self.asm
-            .runtime_call(erts_cmp_compound as *const () as usize)?;
+            .runtime_call(addr(erts_cmp_compound as *const ()))?;
         self.asm.emit_leave_runtime(Update::NONE)?;
         self.asm.emit(|e| e.test_rr(RET, RET))?;
         self.asm.emit_leave_frame()?;
@@ -1456,7 +1456,7 @@ impl BeamGlobalAssembler {
         self.asm.mov_imm(ARG3, 0)?;
         self.asm.mov_imm(ARG4, 0)?;
         self.asm
-            .runtime_call(erts_cmp_compound as *const () as usize)?;
+            .runtime_call(addr(erts_cmp_compound as *const ()))?;
         self.asm.emit(|e| e.test_rr(RET, RET))?;
         self.asm.jcc(CondCode::S, done)?;
         self.asm.emit(|e| e.mov_rm(ARG1, tmp_mem_q(0)))?;
@@ -1464,7 +1464,7 @@ impl BeamGlobalAssembler {
         self.asm.mov_imm(ARG3, 0)?;
         self.asm.mov_imm(ARG4, 0)?;
         self.asm
-            .runtime_call(erts_cmp_compound as *const () as usize)?;
+            .runtime_call(addr(erts_cmp_compound as *const ()))?;
         self.asm.emit(|e| e.test_rr(RET, RET))?;
         self.asm.bind(done)?;
         self.asm.emit_leave_runtime(Update::NONE)?;
@@ -1482,7 +1482,7 @@ impl BeamGlobalAssembler {
         self.asm.mov_imm(ARG3, 0)?;
         self.asm.mov_imm(ARG4, 0)?;
         self.asm
-            .runtime_call(erts_cmp_compound as *const () as usize)?;
+            .runtime_call(addr(erts_cmp_compound as *const ()))?;
         self.asm.emit(|e| e.test_rr(RET, RET))?;
         self.asm.short_jcc(CondCode::S, done)?;
         self.asm.emit(|e| e.mov_rm(ARG1, tmp_mem_q(1)))?;
@@ -1490,7 +1490,7 @@ impl BeamGlobalAssembler {
         self.asm.mov_imm(ARG3, 0)?;
         self.asm.mov_imm(ARG4, 0)?;
         self.asm
-            .runtime_call(erts_cmp_compound as *const () as usize)?;
+            .runtime_call(addr(erts_cmp_compound as *const ()))?;
         self.asm.mov_imm(ARG1, u64::MAX)?;
         self.asm.mov_imm(ARG4, 1)?;
         self.asm.emit(|e| e.test_rr(RET, RET))?;
@@ -1513,7 +1513,7 @@ impl BeamGlobalAssembler {
         a.emit(|e| e.mov_mr(process_ref(process::FTRACE, 8), ARG2))?;
         a.emit_enter_runtime(Update::NONE)?;
         a.emit(|e| e.mov_rr(ARG1, C_P))?;
-        a.runtime_call(erts_sanitize_freason as *const () as usize)?;
+        a.runtime_call(addr(erts_sanitize_freason as *const ()))?;
         a.emit_leave_runtime(Update::NONE)?;
         a.mov_imm(ARG4, 0)?;
         let label = self.label(GlobalLabels::RaiseException);
@@ -1549,7 +1549,7 @@ impl BeamGlobalAssembler {
         a.emit_enter_runtime(Update::HEAP_ALLOC)?;
         a.emit(|e| e.mov_rr(ARG1, C_P))?;
         a.emit(|e| e.mov_rm(ARG3, get_x_ref(2, 8)))?;
-        a.runtime_call(add_stacktrace as *const () as usize)?;
+        a.runtime_call(addr(add_stacktrace as *const ()))?;
         a.emit_leave_runtime(Update::HEAP_ALLOC)?;
         // not_error assumes stacktrace/reason is in ARG2.
         a.emit(|e| e.mov_rr(ARG2, RET))?;
@@ -4017,8 +4017,7 @@ impl BeamModuleAssembler {
         self.mov_arg_to_reg(ARG2, ArgVal::X(0))?;
         self.asm.emit_enter_runtime(Update::HEAP_ALLOC)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
-        self.asm
-            .runtime_call(build_stacktrace as *const () as usize)?;
+        self.asm.runtime_call(addr(build_stacktrace as *const ()))?;
         self.asm.emit_leave_runtime(Update::HEAP_ALLOC)?;
         self.asm.emit(|e| e.mov_mr(get_x_ref(0, 8), RET))?;
         Ok(())
@@ -4034,7 +4033,7 @@ impl BeamModuleAssembler {
         self.mov_arg_to_reg(ARG3, ArgVal::X(1))?;
         self.asm.emit_enter_runtime(Update::NONE)?;
         self.asm.emit(|e| e.mov_rr(ARG4, C_P))?;
-        self.asm.runtime_call(raw_raise as *const () as usize)?;
+        self.asm.runtime_call(addr(raw_raise as *const ()))?;
         self.asm.emit_leave_runtime(Update::NONE)?;
         self.asm.emit(|e| e.test_rr(RET, RET))?;
         self.asm.short_jcc(CondCode::NE, next)?;
@@ -4082,7 +4081,7 @@ impl BeamModuleAssembler {
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.asm.mov_imm(ARG2, Term::atom(atoms::NORMAL).word())?;
         self.asm
-            .runtime_call(erts_do_exit_process as *const () as usize)?;
+            .runtime_call(addr(erts_do_exit_process as *const ()))?;
         self.asm.emit_leave_runtime(spec)?;
         let schedule = self.resolve_fragment(do_schedule);
         self.asm.jmp(schedule)
@@ -4097,7 +4096,7 @@ impl BeamModuleAssembler {
         self.asm.emit_enter_runtime(spec)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.asm
-            .runtime_call(erts_continue_exit_process as *const () as usize)?;
+            .runtime_call(addr(erts_continue_exit_process as *const ()))?;
         self.asm.emit_leave_runtime(spec)?;
         let schedule = self.resolve_fragment(do_schedule);
         self.asm.jmp(schedule)
@@ -4118,8 +4117,7 @@ impl BeamModuleAssembler {
         self.mov_arg_to_reg(ARG2, src)?;
         self.asm.emit_enter_runtime(Update::NONE)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
-        self.asm
-            .runtime_call(erts_pd_hash_get as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_pd_hash_get as *const ()))?;
         self.asm.emit_leave_runtime(Update::NONE)?;
         self.mov_arg_from_reg(dst, RET)
     }
@@ -4137,7 +4135,7 @@ impl BeamModuleAssembler {
         self.asm.emit_enter_runtime(Update::NONE)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.asm
-            .runtime_call(erts_pd_hash_get_with_hx as *const () as usize)?;
+            .runtime_call(addr(erts_pd_hash_get_with_hx as *const ()))?;
         self.asm.emit_leave_runtime(Update::NONE)?;
         self.mov_arg_from_reg(dst, RET)
     }
@@ -4216,8 +4214,7 @@ impl BeamModuleAssembler {
             self.mov_arg_to_reg(ARG3, arity)?;
             self.asm.emit_enter_runtime(Update::NONE)?;
             self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
-            self.asm
-                .runtime_call(erl_is_function as *const () as usize)?;
+            self.asm.runtime_call(addr(erl_is_function as *const ()))?;
             self.asm.emit_leave_runtime(Update::NONE)?;
             self.asm.emit(|e| e.cmp_ri(RET, 0x4b))?;
             return self.asm.jcc(CondCode::NE, fail);
@@ -4410,7 +4407,7 @@ impl BeamModuleAssembler {
             self.asm.jcc(CondCode::NE, fail)?;
         } else {
             self.asm.emit_enter_runtime(Update::NONE)?;
-            self.asm.runtime_call(super::rt::eq as *const () as usize)?;
+            self.asm.runtime_call(addr(super::rt::eq as *const ()))?;
             self.asm.emit_leave_runtime(Update::NONE)?;
             self.asm.emit(|e| e.test_rr(RETD, RETD))?;
             self.asm.jcc(CondCode::E, fail)?;
@@ -4533,7 +4530,7 @@ impl BeamModuleAssembler {
             self.asm.jcc(CondCode::E, fail)?;
         } else {
             self.asm.emit_enter_runtime(Update::NONE)?;
-            self.asm.runtime_call(super::rt::eq as *const () as usize)?;
+            self.asm.runtime_call(addr(super::rt::eq as *const ()))?;
             self.asm.emit_leave_runtime(Update::NONE)?;
             self.asm.emit(|e| e.test_rr(RETD, RETD))?;
             self.asm.jcc(CondCode::NE, fail)?;

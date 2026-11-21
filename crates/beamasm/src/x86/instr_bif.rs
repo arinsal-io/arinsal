@@ -19,7 +19,7 @@ use super::beam_asm::{
 use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
 use super::beam_asm_module::{BeamModuleAssembler, arg_label};
 use super::rt::{
-    beam_jit_call_bif, beam_jit_call_nif, beam_jit_load_nif, erts_gc_after_bif_call_lhf,
+    addr, beam_jit_call_bif, beam_jit_call_nif, beam_jit_load_nif, erts_gc_after_bif_call_lhf,
     erts_printable_return_address, erts_trapping_length_1, get_on_load_address, ubif2mfa,
 };
 use crate::common::beam_asm_h::ErtsCodeInfo;
@@ -115,7 +115,7 @@ impl BeamGlobalAssembler {
             a.emit(|e| e.mov_mr(get_x_ref(index, 8), ARG1))?;
         }
         a.emit(|e| e.mov_rm(ARG1, tmp_mem_q(1)))?;
-        a.runtime_call(ubif2mfa as *const () as usize)?;
+        a.runtime_call(addr(ubif2mfa as *const ()))?;
         a.emit_leave_runtime(Update::REDUCTIONS)?;
         a.emit_leave_frame()?;
         a.emit(|e| e.mov_rr(ARG4, RET))?;
@@ -137,7 +137,7 @@ impl BeamGlobalAssembler {
         a.emit_enter_runtime(Update::REDUCTIONS)?;
         a.emit(|e| e.mov_rr(ARG1, C_P))?;
         a.emit(|e| e.lea(ARG2, trap_state))?;
-        a.runtime_call(erts_trapping_length_1 as *const () as usize)?;
+        a.runtime_call(addr(erts_trapping_length_1 as *const ()))?;
         a.emit_leave_runtime(Update::REDUCTIONS)?;
         a.emit_leave_frame()?;
         a.emit_test_the_non_value(RET)?;
@@ -237,7 +237,7 @@ impl BeamGlobalAssembler {
         a.emit(|e| e.mov_rr(ARG2, E))?;
         a.emit_enter_runtime(Update::STACK)?;
         a.emit(|e| e.mov_rr(ARG1, C_P))?;
-        a.runtime_call(erts_printable_return_address as *const () as usize)?;
+        a.runtime_call(addr(erts_printable_return_address as *const ()))?;
         a.emit_leave_runtime(Update::STACK)?;
         a.emit(|e| e.mov_rr(ARG2, RET))?;
         a.emit(|e| e.mov_rm(ARG4, process_ref(process::CURRENT, 8)))?;
@@ -263,7 +263,7 @@ impl BeamGlobalAssembler {
             a.emit_enter_runtime(spec)?;
             a.emit(|e| e.mov_rr(ARG1, C_P))?;
             a.load_x_reg_array(ARG2)?;
-            a.runtime_call(beam_jit_call_bif as *const () as usize)?;
+            a.runtime_call(addr(beam_jit_call_bif as *const ()))?;
         }
         self.emit_bif_nif_epilogue()
     }
@@ -305,7 +305,7 @@ impl BeamGlobalAssembler {
             ARG4,
             arinsal_term::Term::atom(arinsal_term::atoms::UNDEFINED_FUNCTION).word(),
         )?;
-        a.runtime_call(super::rt::call_error_handler as *const () as usize)?;
+        a.runtime_call(addr(super::rt::call_error_handler as *const ()))?;
         a.emit_leave_runtime(Update::REDUCTIONS.union(Update::HEAP_ALLOC))?;
         a.emit_leave_frame()?;
         a.emit(|e| e.mov_rm(ARG4, tmp_mem_q(0)))?;
@@ -337,7 +337,7 @@ impl BeamGlobalAssembler {
         a.emit(|e| e.sub_ri(ARG2, 8 + info_size))?;
         a.emit_enter_runtime(Update::NONE)?;
         a.emit(|e| e.mov_rr(ARG1, C_P))?;
-        a.runtime_call(super::rt::erts_call_nif_early as *const () as usize)?;
+        a.runtime_call(addr(super::rt::erts_call_nif_early as *const ()))?;
         a.emit_leave_runtime(Update::NONE)?;
         a.emit(|e| e.add_ri(enc::RSP, 8))?;
         a.emit_enter_frame()?;
@@ -373,7 +373,7 @@ impl BeamGlobalAssembler {
                 qword_ptr(ARG2, 24 + BEAM_ASM_FUNC_PROLOGUE_SIZE as i32),
             )
         })?;
-        a.runtime_call(beam_jit_call_nif as *const () as usize)?;
+        a.runtime_call(addr(beam_jit_call_nif as *const ()))?;
         self.emit_bif_nif_epilogue()
     }
 
@@ -390,7 +390,7 @@ impl BeamGlobalAssembler {
         a.emit_enter_runtime(Update::HEAP_ALLOC)?;
         a.emit(|e| e.mov_rr(ARG1, C_P))?;
         a.load_x_reg_array(ARG3)?;
-        a.runtime_call(beam_jit_load_nif as *const () as usize)?;
+        a.runtime_call(addr(beam_jit_load_nif as *const ()))?;
         a.emit_leave_runtime(Update::HEAP_ALLOC)?;
         a.emit(|e| e.cmp_ri(RET, RET_NIF_YIELD))?;
         a.short_jcc(CondCode::E, yield_label)?;
@@ -529,7 +529,7 @@ impl BeamGlobalAssembler {
             a.emit(|e| e.mov_rr(ARG1, C_P))?;
             a.emit(|e| e.mov_rr(ARG3, RET))?;
             a.load_x_reg_array(ARG4)?;
-            a.runtime_call(erts_gc_after_bif_call_lhf as *const () as usize)?;
+            a.runtime_call(addr(erts_gc_after_bif_call_lhf as *const ()))?;
             a.emit_leave_runtime(spec)?;
             a.jmp(check_bif_return)?;
         }
@@ -668,7 +668,7 @@ impl BeamModuleAssembler {
             .emit(|e| e.mov_rr(ARG1, super::beam_asm::register::C_P))?;
         self.asm.emit(|e| e.mov_rm(ARG2, get_x_ref(0, 8)))?;
         self.asm
-            .runtime_call(get_on_load_address as *const () as usize)?;
+            .runtime_call(addr(get_on_load_address as *const ()))?;
         self.asm.emit_leave_runtime(Update::NONE)?;
         self.asm.emit(|e| {
             e.test_rr(

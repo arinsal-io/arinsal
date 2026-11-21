@@ -8,6 +8,7 @@
 
 use crate::Process;
 use crate::VmError;
+use crate::natives::bif::bif_badarg;
 use crate::natives::bif::{badarg, badarg_ext, bif_ret, with_sched};
 use crate::register::RegId;
 use arinsal_beamasm::ProcessHeader;
@@ -175,12 +176,12 @@ fn erts_unregister_name(process: &mut Process, reg: *mut u64, name: Atom) -> boo
 
 /// `whereis/1`: `erts_whereis_name_to_id`.
 // Port of erts/emulator/beam/bif.c (whereis_1), OTP-29.1.1.
-pub(crate) extern "C" fn whereis_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+pub(crate) extern "C" fn whereis_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
     };
     let Some(name) = crate::bif_table::bif_args::<1>(reg)[0].as_atom() else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     crate::native_hooks::raw(erts_whereis_name_to_id(process, name))
 }

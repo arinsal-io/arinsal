@@ -17,6 +17,7 @@ use arinsal_x64::enc::{CondCode, Mem, byte_ptr, dword_ptr, qword_ptr};
 use super::beam_asm::register::{ARG1, ARG1D, ARG2, ARG3, C_P, FCALLS};
 use super::beam_asm::{AsmError, Update, process, process_ref};
 use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
+use super::rt::addr;
 pub use super::rt::copy_out_registers;
 
 pub use crate::common::process_offsets::ERTS_PSFLG_EXITING;
@@ -81,13 +82,13 @@ impl BeamGlobalAssembler {
             // reds_used: see do_schedule_local.
             a.emit(|e| e.mov_rr(ARG1, C_P))?;
             a.load_x_reg_array(ARG2)?;
-            a.runtime_call(copy_out_registers as *const () as usize)?;
+            a.runtime_call(addr(copy_out_registers as *const ()))?;
         }
 
         a.bind(schedule_next)?;
         // schedule_next: the Rust scheduler loop (`erts_schedule` .. `jmp c_p->i`).
         a.emit(|e| e.mov_mr(process_ref(process::FCALLS, 4), FCALLS))?;
-        a.abs_jmp(super::rt::arinsal_schedule_next as *const () as usize)?;
+        a.abs_jmp(addr(super::rt::arinsal_schedule_next as *const ()))?;
 
         // Processes may jump to the exported entry points below, executing on the Erlang
         // stack when entering.

@@ -4,6 +4,7 @@ use arinsal_a64::enc::{Cond, Gpr};
 use std::sync::OnceLock;
 
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
+use crate::rt::addr;
 use crate::{Update, emit_enter_runtime, emit_leave_runtime};
 
 pub use arinsal_term::ErtsCodeMfa;
@@ -236,7 +237,7 @@ impl BeamModuleAssembler {
         self.code.adr(Gpr::x(1), current)?;
         self.code
             .emit(|e| crate::arm::beam_asm::load_x_reg_array(e, Gpr::x(2)))?;
-        self.fragment_call(crate::arm::rt::beam_jit_load_nif as *const () as usize)?;
+        self.fragment_call(addr(crate::arm::rt::beam_jit_load_nif as *const ()))?;
         emit_leave_runtime(&mut self.code, 2, update)?;
 
         let schedule = self.code.new_label();

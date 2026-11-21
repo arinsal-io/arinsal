@@ -1004,7 +1004,8 @@ impl Process {
 
     /// Removes the first message of a plain receive: no queued priority range, receive marker,
     /// memory breakpoint or seq_trace token. Priority items alone do not exclude this path.
-    // Port of erts/emulator/beam/erl_proc_sig_queue.h:2347 (erts_msgq_set_save_first), OTP-29.1.1.
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1167 (beam_jit_remove_message:
+    // erts_msgq_unlink_msg_set_save_first) and erl_proc_sig_queue.h:2366, OTP-29.1.1.
     #[inline]
     pub(crate) fn remove_first_message(&mut self) -> Result<bool, VmError> {
         if !self.inbox.entries.save_is_first()
@@ -1026,6 +1027,10 @@ impl Process {
         }
         self.set_delay_gc(false);
         crate::natives::erts_debug::after_message_queue_change(self);
+        // erts_msgq_unlink_msg_set_save_first: SAVE_INFO_FIRST so a later
+        // insert_prepared_prio_msg retargets save. A scheduled port-op reply
+        // (erts_msgq_set_save_end) leaves LAST until this receive.
+        self.msgq_set_save_first();
         self.cancel_receive_timer();
         Ok(true)
     }
@@ -1386,5 +1391,51 @@ mod tests {
                 .is_none_or(|cold| cold.receive_markers.is_none())
         );
         assert!(process.inbox.is_empty());
+    }
+
+    #[test]
+    fn prio_exit_is_received_before_an_ordinary_message_already_in_the_queue() {
+        // Port of erts/emulator/beam/erl_proc_sig_queue.c:4745-4749 (handle_exit_signal:
+        // insert_prepared_prio_msg) and :2331 (erts_msgq_set_save_first after unlink): a
+        // priority EXIT is at save ahead of an ordinary message already in the inner queue;
+        // after it is received, save is the ordinary message, not a prio-queue marker.
+        let mut process = Process::new();
+        arinsal_sched::Task::init_in_place(&mut process, arinsal_sched::Pid::from_data(0));
+        let first = Term::small(1).unwrap();
+        let exit = Term::small(2).unwrap();
+        process.inbox.push_back(first);
+        process.prio_item_added(super::PrioItemType::Link);
+        process.push_priority_message(exit).unwrap();
+        process.prio_item_deleted(super::PrioItemType::Link);
+        assert_eq!(process.inbox.peek().copied(), Some(exit));
+        process.remove_message(None).unwrap();
+        assert_eq!(process.inbox.peek().copied(), Some(first));
+        process.remove_message(None).unwrap();
+        assert!(process.inbox.peek().is_none());
+    }
+
+    #[test]
+    fn remove_first_message_clears_save_end_so_a_prio_exit_is_at_save() {
+        // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1167
+        // (erts_msgq_unlink_msg_set_save_first) and erl_proc_sig_queue.h:2366, OTP-29.1.1:
+        // a scheduled port-op reply sets SAVE_INFO_LAST; receiving it must restore FIRST
+        // so insert_prepared_prio_msg retargets save ahead of an ordinary message.
+        let mut process = Process::new();
+        arinsal_sched::Task::init_in_place(&mut process, arinsal_sched::Pid::from_data(0));
+        let reply = Term::small(0).unwrap();
+        let first = Term::small(1).unwrap();
+        let exit = Term::small(2).unwrap();
+        process.msgq_set_save_end();
+        process.inbox.push_back(reply);
+        assert!(process.remove_first_message().unwrap());
+        process.inbox.push_back(first);
+        process.prio_item_added(super::PrioItemType::Link);
+        process.push_priority_message(exit).unwrap();
+        process.prio_item_deleted(super::PrioItemType::Link);
+        assert_eq!(process.inbox.peek().copied(), Some(exit));
+        process.remove_message(None).unwrap();
+        assert_eq!(process.inbox.peek().copied(), Some(first));
+        process.remove_message(None).unwrap();
+        assert!(process.inbox.peek().is_none());
     }
 }

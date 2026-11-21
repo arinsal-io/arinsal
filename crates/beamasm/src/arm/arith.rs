@@ -5,6 +5,7 @@ use arinsal_a64::buf::Label;
 use arinsal_a64::enc::{Cond, Gpr, Shift, Shifted, is_logical_immediate};
 
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
+use crate::rt::addr;
 use crate::types::{
     ArgType, TypedArg, is_bsl_small, is_diff_small_if_args_are_small,
     is_product_small_if_args_are_small, is_sum_small_if_args_are_small, type_id,
@@ -287,7 +288,7 @@ impl BeamModuleAssembler {
         let (left, right) = self.load_sources(&lhs, &rhs)?;
         let update = crate::Update::HEAP_ALLOC;
         self.emit_runtime_hook(
-            crate::rt::erts_mixed_div as *const () as usize,
+            addr(crate::rt::erts_mixed_div as *const ()),
             &[left, right],
             6,
             update,
@@ -761,12 +762,12 @@ impl BeamModuleAssembler {
         self.emit_add_sub_types(is_small_result, &l, left, &r, right, next)?;
         let (function, body) = if add {
             (
-                crate::rt::erts_mixed_plus as *const () as usize,
+                addr(crate::rt::erts_mixed_plus as *const ()),
                 self.bif_fragments.arith.plus_body,
             )
         } else {
             (
-                crate::rt::erts_mixed_minus as *const () as usize,
+                addr(crate::rt::erts_mixed_minus as *const ()),
                 self.bif_fragments.arith.minus_body,
             )
         };
@@ -838,7 +839,7 @@ impl BeamModuleAssembler {
             left,
             right,
             fail,
-            crate::rt::erts_band as *const () as usize,
+            addr(crate::rt::erts_band as *const ()),
             self.bif_fragments.arith.band_body,
         )?;
         self.code.bind(next)?;
@@ -898,7 +899,7 @@ impl BeamModuleAssembler {
             left,
             right,
             fail,
-            crate::rt::erts_bor as *const () as usize,
+            addr(crate::rt::erts_bor as *const ()),
             self.bif_fragments.arith.bor_body,
         )?;
         self.code.bind(next)?;
@@ -951,7 +952,7 @@ impl BeamModuleAssembler {
             left,
             right,
             fail,
-            crate::rt::erts_bxor as *const () as usize,
+            addr(crate::rt::erts_bxor as *const ()),
             self.bif_fragments.arith.bxor_body,
         )?;
         self.code.bind(next)?;
@@ -1044,7 +1045,7 @@ impl BeamModuleAssembler {
                 left,
                 right,
                 fail,
-                crate::rt::erts_bsr as *const () as usize,
+                addr(crate::rt::erts_bsr as *const ()),
                 self.bif_fragments.arith.bsr_body,
             )?;
             self.mov_if_needed(d, ARG1)?;
@@ -1183,7 +1184,7 @@ impl BeamModuleAssembler {
             left,
             right,
             fail,
-            crate::rt::erts_bsl as *const () as usize,
+            addr(crate::rt::erts_bsl as *const ()),
             self.bif_fragments.arith.bsl_body,
         )?;
         self.mov_if_needed(d, ARG1)?;
@@ -1720,7 +1721,7 @@ impl BeamModuleAssembler {
         if negate {
             if let Some(fail) = fail {
                 self.emit_runtime_hook(
-                    crate::rt::erts_unary_minus as *const () as usize,
+                    addr(crate::rt::erts_unary_minus as *const ()),
                     &[Gpr::x(14)],
                     6,
                     ARITH_UPDATE,

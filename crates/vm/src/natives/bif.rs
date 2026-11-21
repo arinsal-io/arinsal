@@ -46,26 +46,38 @@ fn badarg_cause(arity: usize, cause: arinsal_term::Atom) -> VmError {
     VmError::Trap(trap)
 }
 
-/// `BIF_RET` / `BIF_ERROR` / `BIF_TRAP*` of a body below.
+/// `BIF_RET` / `BIF_ERROR` / `BIF_TRAP*` of a body below. `BIF_ERROR` only sets the process'
+/// `freason` / `fvalue`; `BIF_TRAP*` and yields complete through the export in `c_p->current`.
+// Port of erts/emulator/beam/bif.h (BIF_RET, BIF_ERROR, BIF_TRAP*), OTP-29.1.1.
 #[inline(always)]
 pub(crate) fn bif_ret(c_p: *mut ProcessHeader, i: u64, result: Result<Term, VmError>) -> u64 {
     match result {
         Ok(value) => crate::native_hooks::raw(value),
+        Err(VmError::Freason(freason)) => bif_error(c_p, freason),
+        Err(VmError::Trap(trap)) => crate::native_helpers::bif_error_trap(c_p, trap),
         Err(error) => crate::native_helpers::bif_return_current(c_p, i, error),
     }
 }
 
-/// `BIF_ERROR(c_p, BADARG)`: only `freason`; `handle_error` names the BIF from `c_p->current`
-/// and its arguments from the register array the BIF was called with.
+/// `BIF_ERROR(c_p, freason)`: only `freason` (a cause is already in `fvalue`); `handle_error`
+/// names the BIF from `c_p->current` and its arguments from the register array the BIF was
+/// called with.
+// Port of erts/emulator/beam/bif.h (BIF_ERROR), OTP-29.1.1.
+#[cold]
+#[inline(never)]
+pub(crate) fn bif_error(c_p: *mut ProcessHeader, freason: u64) -> u64 {
+    if let Some(process) = crate::native_hooks::process_from_header(c_p) {
+        process.heap.abi.exc.freason = freason;
+    }
+    arinsal_term::THE_NON_VALUE
+}
+
+/// `BIF_ERROR(c_p, BADARG)`.
 // Port of erts/emulator/beam/bif.h (BIF_ERROR), OTP-29.1.1.
 #[cold]
 #[inline(never)]
 pub(crate) fn bif_badarg(c_p: *mut ProcessHeader) -> u64 {
-    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
-        return 0;
-    };
-    process.heap.abi.exc.freason = arinsal_term::exc::EXC_BADARG;
-    arinsal_term::THE_NON_VALUE
+    bif_error(c_p, arinsal_term::exc::EXC_BADARG)
 }
 
 /// `BIF_ERROR(c_p, SYSTEM_LIMIT)`.
@@ -73,11 +85,7 @@ pub(crate) fn bif_badarg(c_p: *mut ProcessHeader) -> u64 {
 #[cold]
 #[inline(never)]
 pub(crate) fn bif_system_limit(c_p: *mut ProcessHeader) -> u64 {
-    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
-        return 0;
-    };
-    process.heap.abi.exc.freason = arinsal_term::exc::EXC_SYSTEM_LIMIT;
-    arinsal_term::THE_NON_VALUE
+    bif_error(c_p, arinsal_term::exc::EXC_SYSTEM_LIMIT)
 }
 
 /// `BUMP_REDS(p, gc)`: FCALLS goes down by `gc`, never below zero, or below `-CONTEXT_REDS`
@@ -762,7 +770,7 @@ pub(crate) extern "C" fn dsend_continue_trap_1(
     process.heap.note_bif_entry();
     let [context] = bif_args::<1>(reg);
     let Some(sender) = process.self_pid() else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     let outcome = context
         .with_magic_payload_mut::<crate::bif_traps::TrapContext<crate::dist::DsigSendContext>, _>(
@@ -775,7 +783,7 @@ pub(crate) extern "C" fn dsend_continue_trap_1(
         .flatten();
     let Some((result, return_term)) = outcome else {
         process.set_gc_enabled(true);
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     let result = match result {
         crate::dist::DsendContinue::Done => {
@@ -1276,9 +1284,10 @@ fn link_opt(
         let linked = live && crate::port::link(process, other, me, true)?;
         if !linked {
             // ERTS_PORT_OP_BADARG: erts_proc_sig_send_link_exit(NULL, other, rlnk, am_noproc,
-            // NIL). The link exit reaches this process through its signal in-queue, behind a
-            // receive marker reserved before the call; handling it removes the link and, when
-            // trapping exits, converts it into the `{'EXIT', Port, noproc}` message.
+            // NIL). `sender` is NULL (no MAYBE_SELF_SIGS); `from` is the port, which hashes
+            // the outer-queue buffer slot. Handling the GEN_EXIT removes the link and, when
+            // trapping exits, converts it with insert_prepared_prio_msg if the link is
+            // ERTS_ML_FLG_PRIO_ML.
             let signal = arinsal_sched::Signal::PortExit(Box::new(arinsal_sched::PortExitSignal {
                 port: Message::copy_from(other)?,
                 reason: Message::copy_from(Term::atom(atoms::NOPROC))?,
@@ -1287,7 +1296,7 @@ fn link_opt(
                 .runtime
                 .ok_or_else(badarg)?
                 .scheduler()?
-                .signal(me, me, signal)
+                .signal_null_sender(arinsal_term::internal_hash(other), me, signal)
                 .map_err(|_| badarg())?;
         }
         return ok;

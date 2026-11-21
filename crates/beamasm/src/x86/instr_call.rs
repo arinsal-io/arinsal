@@ -8,6 +8,7 @@ use super::beam_asm::register::{ARG1, ARG1D, ARG2, ARG3, ARG4, ARG5, C_P, E, FCA
 use super::beam_asm::{AsmError, Update, process, process_ref, tmp_mem_q};
 use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
 use super::beam_asm_module::{BeamModuleAssembler, arg_label};
+use super::rt::addr;
 pub use super::rt::{apply, fixed_apply, save_calls};
 use crate::common::args::ArgVal;
 
@@ -47,7 +48,7 @@ impl BeamGlobalAssembler {
         a.emit_enter_runtime(Update::NONE)?;
         a.emit(|e| e.mov_rr(ARG1, C_P))?;
         a.emit(|e| e.mov_rr(ARG2, RET))?;
-        a.runtime_call(save_calls as *const () as usize)?;
+        a.runtime_call(addr(save_calls as *const ()))?;
         a.emit_leave_runtime(Update::NONE)?;
         a.emit(|e| e.mov_rm(RET, tmp_mem_q(0)))?;
         a.emit(|e| e.mov_ri(ARG1, active))?;
@@ -160,7 +161,7 @@ impl BeamModuleAssembler {
             self.asm.mov_imm(ARG3, 0)?;
         }
         self.asm.mov_imm(ARG4, 0)?;
-        self.asm.runtime_call(apply as *const () as usize)?;
+        self.asm.runtime_call(addr(apply as *const ()))?;
         self.asm.emit_leave_runtime(update)?;
         self.asm.emit(|e| e.test_rr(RET, RET))?;
         self.asm.short_jcc(CondCode::NE, dispatch)?;
@@ -213,7 +214,7 @@ impl BeamModuleAssembler {
             self.asm.mov_imm(ARG4, 0)?;
         }
         self.asm.mov_imm(ARG5, 0)?;
-        self.asm.runtime_call(fixed_apply as *const () as usize)?;
+        self.asm.runtime_call(addr(fixed_apply as *const ()))?;
         self.asm.emit_leave_runtime(update)?;
         self.asm.emit(|e| e.test_rr(RET, RET))?;
         self.asm.short_jcc(CondCode::NE, dispatch)?;

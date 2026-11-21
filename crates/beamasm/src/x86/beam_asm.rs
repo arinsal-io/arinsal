@@ -757,7 +757,7 @@ impl BeamAssembler {
 
     /// `runtime_call<Sig, Func>()` on the SysV ABI: `call imm(Func)`, which asmjit encodes
     /// as a 6-byte `REX call rel32`, relocated to a rel32 or to an address-table call. `func`
-    /// is the address of an erts-named runtime function (`x86::rt`), taken with `f as usize`.
+    /// is the address of an erts-named runtime function (`x86::rt`), taken with [`super::rt::addr`].
     // Port of erts/emulator/beam/jit/x86/beam_asm.hpp:488-530 (runtime_call), OTP-29.1.1.
     pub fn runtime_call(&mut self, func: usize) -> Result<(), AsmError> {
         self.emit_assert_runtime_stack();

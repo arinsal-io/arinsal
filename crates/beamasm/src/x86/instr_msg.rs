@@ -12,6 +12,7 @@ use super::beam_asm::{
 };
 use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
 use super::beam_asm_module::{BeamModuleAssembler, arg_label};
+use super::rt::addr;
 pub use super::rt::{
     beam_jit_decode_dist, beam_jit_remove_message, beam_jit_take_receive_lock, beam_jit_timeout,
     beam_jit_timeout_locked, beam_jit_wait_locked, beam_jit_wait_timeout, beam_jit_wait_unlocked,
@@ -58,7 +59,7 @@ impl BeamModuleAssembler {
         self.asm.emit_enter_runtime(Update::HEAP_ALLOC)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.asm
-            .runtime_call(erts_msgq_recv_marker_insert as *const () as usize)?;
+            .runtime_call(addr(erts_msgq_recv_marker_insert as *const ()))?;
         self.asm.emit_leave_runtime(Update::HEAP_ALLOC)?;
         self.mov_arg_from_reg(dst, RET)
     }
@@ -75,7 +76,7 @@ impl BeamModuleAssembler {
         self.asm.emit_enter_runtime(Update::NONE)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.asm
-            .runtime_call(erts_msgq_recv_marker_bind as *const () as usize)?;
+            .runtime_call(addr(erts_msgq_recv_marker_bind as *const ()))?;
         self.asm.emit_leave_runtime(Update::NONE)
     }
 
@@ -86,7 +87,7 @@ impl BeamModuleAssembler {
         self.asm.emit_enter_runtime(Update::NONE)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.asm
-            .runtime_call(erts_msgq_recv_marker_clear as *const () as usize)?;
+            .runtime_call(addr(erts_msgq_recv_marker_clear as *const ()))?;
         self.asm.emit_leave_runtime(Update::NONE)
     }
 
@@ -97,7 +98,7 @@ impl BeamModuleAssembler {
         self.asm.emit_enter_runtime(Update::NONE)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.asm
-            .runtime_call(erts_msgq_recv_marker_set_save as *const () as usize)?;
+            .runtime_call(addr(erts_msgq_recv_marker_set_save as *const ()))?;
         self.asm.emit_leave_runtime(Update::NONE)
     }
 
@@ -126,7 +127,7 @@ impl BeamModuleAssembler {
         self.asm.emit(|e| e.mov_rr(ARG2D, FCALLS))?;
         self.asm.emit(|e| e.mov_rr(ARG5, ACTIVE_CODE_IX))?;
         self.asm
-            .runtime_call(beam_jit_remove_message as *const () as usize)?;
+            .runtime_call(addr(beam_jit_remove_message as *const ()))?;
         self.asm.emit(|e| e.mov_rr(FCALLS, RETD))?;
         self.asm.emit_leave_runtime(Update::NONE)
     }
@@ -136,7 +137,7 @@ impl BeamModuleAssembler {
         self.asm.emit_enter_runtime(Update::NONE)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.asm
-            .runtime_call(erts_msgq_set_save_next as *const () as usize)?;
+            .runtime_call(addr(erts_msgq_set_save_next as *const ()))?;
         self.asm.emit_leave_runtime(Update::NONE)?;
         self.asm.emit(|e| e.dec_r(FCALLS))?;
         let dest = self.msg_label(dest)?;
@@ -159,12 +160,12 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/x86/instr_msg.cpp:277-288 (emit_wait_unlocked),
     // OTP-29.1.1.
     pub fn emit_wait_unlocked(&mut self, dest: ArgVal) -> Result<(), AsmError> {
-        self.emit_wait(dest, beam_jit_wait_unlocked as *const () as usize)
+        self.emit_wait(dest, addr(beam_jit_wait_unlocked as *const ()))
     }
 
     // Port of erts/emulator/beam/jit/x86/instr_msg.cpp:290-301 (emit_wait_locked), OTP-29.1.1.
     pub fn emit_wait_locked(&mut self, dest: ArgVal) -> Result<(), AsmError> {
-        self.emit_wait(dest, beam_jit_wait_locked as *const () as usize)
+        self.emit_wait(dest, addr(beam_jit_wait_locked as *const ()))
     }
 
     // Port of erts/emulator/beam/jit/x86/instr_msg.cpp:303-313 (emit_wait_timeout_unlocked),
@@ -177,7 +178,7 @@ impl BeamModuleAssembler {
         self.asm.emit_enter_runtime(Update::NONE)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.asm
-            .runtime_call(beam_jit_take_receive_lock as *const () as usize)?;
+            .runtime_call(addr(beam_jit_take_receive_lock as *const ()))?;
         self.asm.emit_leave_runtime(Update::NONE)?;
         self.emit_wait_timeout_locked(src, dest)
     }
@@ -192,7 +193,7 @@ impl BeamModuleAssembler {
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.lea_label(ARG3, next)?;
         self.asm
-            .runtime_call(beam_jit_wait_timeout as *const () as usize)?;
+            .runtime_call(addr(beam_jit_wait_timeout as *const ()))?;
         self.asm.emit_leave_runtime(Update::NONE)?;
         // RET_next < RET_wait < RET_badarg.
         self.asm.emit(|e| e.cmp_ri(RET, RET_WAIT))?;
@@ -214,7 +215,7 @@ impl BeamModuleAssembler {
         self.asm.emit_enter_runtime(Update::NONE)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.asm
-            .runtime_call(beam_jit_timeout_locked as *const () as usize)?;
+            .runtime_call(addr(beam_jit_timeout_locked as *const ()))?;
         self.asm.emit_leave_runtime(Update::NONE)
     }
 
@@ -222,8 +223,7 @@ impl BeamModuleAssembler {
     pub fn emit_timeout(&mut self) -> Result<(), AsmError> {
         self.asm.emit_enter_runtime(Update::NONE)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
-        self.asm
-            .runtime_call(beam_jit_timeout as *const () as usize)?;
+        self.asm.runtime_call(addr(beam_jit_timeout as *const ()))?;
         self.asm.emit_leave_runtime(Update::NONE)
     }
 }
@@ -272,7 +272,7 @@ impl BeamGlobalAssembler {
         a.mov_imm(ARG3, 0)?;
         a.emit(|e| e.lea(ARG4, message_ptr))?;
         a.emit(|e| e.lea(ARG5, get_out))?;
-        a.runtime_call(erts_proc_sig_receive_helper as *const () as usize)?;
+        a.runtime_call(addr(erts_proc_sig_receive_helper as *const ()))?;
         // The helper merely inspects FCALLS. Another process may have loaded new code and
         // told us so, so the active code index is reloaded.
         a.emit_leave_runtime(Update::HEAP_ALLOC.union(Update::CODE_INDEX))?;
@@ -307,7 +307,7 @@ impl BeamGlobalAssembler {
         a.emit_enter_runtime(Update::NONE)?;
         a.emit(|e| e.mov_rr(ARG2, ARG1))?;
         a.emit(|e| e.mov_rr(ARG1, C_P))?;
-        a.runtime_call(beam_jit_decode_dist as *const () as usize)?;
+        a.runtime_call(addr(beam_jit_decode_dist as *const ()))?;
         a.emit_leave_runtime(Update::NONE)?;
         a.emit(|e| e.test_rr(RET, RET))?;
         a.jcc(CondCode::E, restart)?;

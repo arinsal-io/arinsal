@@ -79,11 +79,11 @@ pub(crate) extern "C" fn env_0(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) 
         let mut heap = crate::ProcessHeapHandle(&mut process.heap);
         let pair = match TermBuilder::new(&mut heap).tuple(&[key, value]) {
             Ok(term) => term,
-            Err(_) => return super::bif::bif_ret(c_p, i, Err(super::bif::badarg())),
+            Err(_) => return super::bif::bif_badarg(c_p),
         };
         result = match TermBuilder::new(&mut heap).cons(pair, result) {
             Ok(term) => term,
-            Err(_) => return super::bif::bif_ret(c_p, i, Err(super::bif::badarg())),
+            Err(_) => return super::bif::bif_badarg(c_p),
         };
     }
     crate::native_hooks::raw(result)

@@ -7,6 +7,7 @@ mod call_trace_exceptions;
 mod call_trace_meta;
 mod check_process_code_signal_order;
 mod child_setup_differential;
+mod child_setup_hash;
 mod demonitor_flush_trap;
 mod erl_bif_info_table;
 mod exit1_send2_light_differential;

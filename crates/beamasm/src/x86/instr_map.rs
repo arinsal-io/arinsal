@@ -17,8 +17,9 @@ use super::beam_asm::{
 use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
 use super::beam_asm_module::{BeamModuleAssembler, arg_label, arg_word};
 use super::rt::{
-    beam_jit_get_map_elements, erts_gc_new_map, erts_gc_update_map_assoc, erts_gc_update_map_exact,
-    erts_maps_put, erts_maps_update, get_map_element, get_map_element_hash,
+    addr, beam_jit_get_map_elements, erts_gc_new_map, erts_gc_update_map_assoc,
+    erts_gc_update_map_exact, erts_maps_put, erts_maps_update, get_map_element,
+    get_map_element_hash,
 };
 
 // erl_term.h / erl_map.h: the map header's type and subtype fields.
@@ -205,8 +206,7 @@ impl BeamGlobalAssembler {
         self.asm.bind(generic)?;
         self.asm.emit_enter_frame()?;
         self.asm.emit_enter_runtime(Update::NONE)?;
-        self.asm
-            .runtime_call(get_map_element as *const () as usize)?;
+        self.asm.runtime_call(addr(get_map_element as *const ()))?;
         self.asm.emit_leave_runtime(Update::NONE)?;
         self.asm.emit_leave_frame()?;
         self.asm.emit_test_the_non_value(RET)?;
@@ -248,8 +248,7 @@ impl BeamGlobalAssembler {
         self.asm.emit_enter_runtime(update)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.asm.load_x_reg_array(ARG2)?;
-        self.asm
-            .runtime_call(erts_gc_new_map as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_gc_new_map as *const ()))?;
         self.asm.emit_leave_runtime(update)?;
         self.asm.emit_leave_frame()?;
         self.asm.emit(|e| e.ret())
@@ -265,7 +264,7 @@ impl BeamGlobalAssembler {
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.asm.load_x_reg_array(ARG2)?;
         self.asm
-            .runtime_call(erts_gc_update_map_assoc as *const () as usize)?;
+            .runtime_call(addr(erts_gc_update_map_assoc as *const ()))?;
         self.asm.emit_leave_runtime(update)?;
         self.asm.emit_leave_frame()?;
         self.asm.emit(|e| e.ret())
@@ -278,7 +277,7 @@ impl BeamGlobalAssembler {
         self.asm.emit_enter_frame()?;
         self.asm.emit_enter_runtime(Update::HEAP_ALLOC)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
-        self.asm.runtime_call(erts_maps_put as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_maps_put as *const ()))?;
         self.asm.emit_leave_runtime(Update::HEAP_ALLOC)?;
         self.asm.emit_leave_frame()?;
         self.asm.emit(|e| e.ret())
@@ -294,7 +293,7 @@ impl BeamGlobalAssembler {
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.asm.load_x_reg_array(ARG2)?;
         self.asm
-            .runtime_call(erts_gc_update_map_exact as *const () as usize)?;
+            .runtime_call(addr(erts_gc_update_map_exact as *const ()))?;
         self.asm.emit_leave_runtime(update)?;
         self.asm.emit_leave_frame()?;
         self.asm.emit_test_the_non_value(RET)?;
@@ -312,7 +311,7 @@ impl BeamGlobalAssembler {
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.asm.load_x_reg_array(ARG2)?;
         self.asm
-            .runtime_call(erts_gc_update_map_exact as *const () as usize)?;
+            .runtime_call(addr(erts_gc_update_map_exact as *const ()))?;
         self.asm.emit_leave_runtime(update)?;
         self.asm.emit_leave_frame()?;
         self.asm.emit_test_the_non_value(RET)?;
@@ -335,8 +334,7 @@ impl BeamGlobalAssembler {
         self.asm.emit_enter_runtime(Update::HEAP_ALLOC)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.asm.emit(|e| e.lea(ARG5, tmp_mem_q(0)))?;
-        self.asm
-            .runtime_call(erts_maps_update as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_maps_update as *const ()))?;
         self.asm.emit_leave_runtime(Update::HEAP_ALLOC)?;
         self.asm.emit_leave_frame()?;
         self.asm.emit(|e| e.test_rr(RETD, RETD))?;
@@ -479,8 +477,7 @@ impl BeamModuleAssembler {
             self.asm.jcc(CondCode::NE, fail)?;
         } else {
             self.asm.emit_enter_runtime(Update::NONE)?;
-            self.asm
-                .runtime_call(get_map_element as *const () as usize)?;
+            self.asm.runtime_call(addr(get_map_element as *const ()))?;
             self.asm.emit_leave_runtime(Update::NONE)?;
             self.asm.emit_test_the_non_value(RET)?;
             self.asm.jcc(CondCode::E, fail)?;
@@ -568,7 +565,7 @@ impl BeamModuleAssembler {
         self.asm.emit_enter_runtime(Update::NONE)?;
         self.asm.load_x_reg_array(ARG2)?;
         self.asm
-            .runtime_call(beam_jit_get_map_elements as *const () as usize)?;
+            .runtime_call(addr(beam_jit_get_map_elements as *const ()))?;
         self.asm.emit_leave_runtime(Update::NONE)?;
         self.asm.emit(|e| e.test_rr(RET, RET))?;
         self.asm.jcc(CondCode::E, fail)?;
@@ -601,7 +598,7 @@ impl BeamModuleAssembler {
         } else {
             self.asm.emit_enter_runtime(Update::NONE)?;
             self.asm
-                .runtime_call(get_map_element_hash as *const () as usize)?;
+                .runtime_call(addr(get_map_element_hash as *const ()))?;
             self.asm.emit_leave_runtime(Update::NONE)?;
             self.asm.emit_test_the_non_value(RET)?;
             self.asm.jcc(CondCode::E, fail)?;

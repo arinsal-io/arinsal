@@ -11,6 +11,7 @@ use super::beam_asm::{
 };
 use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
 use super::beam_asm_module::BeamModuleAssembler;
+use super::rt::addr;
 pub use super::rt::eq;
 use crate::common::args::ArgVal;
 use crate::common::types::{BeamModuleAssemblerCommon, type_id};
@@ -210,7 +211,7 @@ impl BeamModuleAssembler {
             self.mov_arg_to_reg(super::beam_asm::register::ARG1, lhs)?;
             self.mov_arg_to_reg(super::beam_asm::register::ARG2, rhs)?;
             self.asm.emit_enter_runtime(Update::NONE)?;
-            self.asm.runtime_call(eq as *const () as usize)?;
+            self.asm.runtime_call(addr(eq as *const ()))?;
             self.asm.emit_leave_runtime(Update::NONE)?;
             self.asm.emit(|e| {
                 e.test_rr(
@@ -608,8 +609,7 @@ impl BeamModuleAssembler {
             self.emit_cond_to_bool(CondCode::NE, dst)
         } else {
             self.asm.emit_enter_runtime(Update::NONE)?;
-            self.asm
-                .runtime_call(get_map_element as *const () as usize)?;
+            self.asm.runtime_call(addr(get_map_element as *const ()))?;
             self.asm.emit_leave_runtime(Update::NONE)?;
             self.asm.emit_test_the_non_value(RET)?;
             self.emit_cond_to_bool(CondCode::E, dst)
@@ -674,8 +674,7 @@ impl BeamModuleAssembler {
             }
         } else {
             self.asm.emit_enter_runtime(Update::NONE)?;
-            self.asm
-                .runtime_call(get_map_element as *const () as usize)?;
+            self.asm.runtime_call(addr(get_map_element as *const ()))?;
             self.asm.emit_leave_runtime(Update::NONE)?;
             self.asm.emit_test_the_non_value(RET)?;
             if let Some(fail) = fail {

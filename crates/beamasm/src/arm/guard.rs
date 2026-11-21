@@ -10,6 +10,7 @@ use arinsal_term::{
 };
 
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
+use crate::rt::addr;
 use crate::types::{ArgType, TypedArg, type_id};
 use crate::{Update, emit_enter_runtime, emit_leave_runtime};
 
@@ -779,7 +780,7 @@ impl BeamModuleAssembler {
         let arity = self.source_reg_into(arity, Gpr::x(17))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(9), arity))?;
         self.emit_guard_runtime_call(
-            crate::rt::erl_is_function as *const () as usize,
+            addr(crate::rt::erl_is_function as *const ()),
             &[Gpr::x(8), Gpr::x(9)],
         )?;
         self.code.emit(|e| e.cmp_imm(Gpr::x(0), 0x4b, false))?;
@@ -1647,7 +1648,7 @@ impl BeamModuleAssembler {
             })?;
             return self.store_guard_result(destination, output);
         }
-        self.emit_get_map_element_call(crate::rt::get_map_element as *const () as usize)?;
+        self.emit_get_map_element_call(addr(crate::rt::get_map_element as *const ()))?;
         self.code.emit(|e| {
             e.cmp_imm(Gpr::x(0), 0, false)?;
             e.mov_const(Gpr::x(10), 0x4b)?;

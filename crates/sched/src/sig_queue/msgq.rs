@@ -729,4 +729,30 @@ mod tests {
         list.push_back(OwnedSignal::new(3));
         drop(list);
     }
+
+    #[test]
+    fn prio_end_insert_puts_the_message_at_save() {
+        // Port of erts/emulator/beam/erl_proc_sig_queue.c:9429-9482
+        // (insert_prepared_prio_msg_attached): END at first, CONT at save, save at
+        // END.prev_next, then the prio message before END.
+        let mut markers: Box<[RecvMarker<u32>; 2]> = Box::default();
+        let mut list = MessageQueueList::<u32>::default();
+        list.init_in_place();
+        list.push_back(OwnedSignal::new(1));
+        let [end, cont] = &mut *markers;
+        end.mark_type = RECV_MARKER_TYPE_PRIO_Q_END;
+        cont.mark_type = RECV_MARKER_TYPE_PRIO_Q_CONT;
+        let first = list.first_field();
+        list.insert_marker_at(first, end, no_value);
+        let save = list.save_field();
+        list.insert_marker_at(save, cont, no_value);
+        list.set_save_field(end.prev_next());
+        list.insert_before_marker(end, OwnedSignal::new(99));
+        assert_eq!(list.peek(), Some(&99));
+        assert_eq!(values(&list), [99, 1]);
+        assert_eq!(list.unlink_at_save().map(OwnedSignal::into_value), Some(99));
+        assert!(list.marker_at(list.save_field()).is_some());
+        assert_eq!(list.peek(), None);
+        assert_eq!(values(&list), [1]);
+    }
 }

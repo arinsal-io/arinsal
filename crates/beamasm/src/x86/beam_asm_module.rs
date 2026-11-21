@@ -15,7 +15,7 @@ use super::beam_asm::register::{
 };
 use super::beam_asm::{AsmError, BeamAssembler, Distance, Update, get_arg_ref};
 use super::beam_asm_global::{BeamGlobalAssembler, GLOBAL_LABELS, GlobalLabels};
-pub use super::rt::{beam_catches_cons, i_emit_nyi};
+pub use super::rt::{addr, beam_catches_cons, beam_catches_cons_nil, i_emit_nyi};
 use crate::common::args::{ArgVal, REG_MASK};
 use crate::common::beam_asm_h::{
     BEAM_ASM_FUNC_PROLOGUE_SIZE, BEAM_NATIVE_MIN_FUNC_SZ, ERTS_ASM_BP_FLAG_BP,
@@ -1102,7 +1102,7 @@ impl BeamModuleAssembler {
         self.asm.emit_enter_runtime(Update::NONE)?;
         let msg = msg.as_ptr() as i64;
         self.asm.emit(|e| e.mov_ri(ARG1, msg))?;
-        self.asm.runtime_call(i_emit_nyi as *const () as usize)
+        self.asm.runtime_call(addr(i_emit_nyi as *const ()))
     }
 
     /// `emit_i_nif_padding()`: pads the previous function to the size a NIF stub replacing
@@ -1443,7 +1443,7 @@ impl BeamModuleAssembler {
                 .asm
                 .get_code(c.handler)
                 .ok_or(AsmError::Operand("catch handler"))?;
-            catch_no = beam_catches_cons(handler, catch_no, core::ptr::null_mut());
+            catch_no = beam_catches_cons_nil(handler, catch_no);
             let catch_term = make_catch(catch_no);
             // With the current tag scheme, more than 33 million catches can exist at once.
             assert!(catch_term >> 31 == 0);

@@ -1,9 +1,9 @@
 //! Differential TCP `inet_drv` coverage against OTP 29.1.1.
 
-use arinsal_difftest::{CallOptions, CallResult, RefErl};
+use arinsal_difftest::{CallOptions, CallResult, CompareMode, RefErl, compare};
 use arinsal_etf::OwnedTerm;
-use arinsal_term::{VecHeap, from_owned};
-use arinsal_vm::Vm;
+use arinsal_term::{Term, VecHeap, from_owned};
+use arinsal_vm::{Vm, VmError};
 
 fn source() -> &'static str {
     r#"
@@ -373,10 +373,44 @@ fn run_case(reference: &RefErl, vm: &mut Vm, case_name: &str) {
         .result;
     let mut heap = VecHeap::new();
     let arg = from_owned(&input, &mut heap).unwrap();
-    let actual = vm
-        .eval_scheduled("inet_full_diff", "run", &[arg], 2)
-        .unwrap_or_else(|error| panic!("{case_name}: {error}"));
-    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{case_name}");
+    let actual = scheduled_result(vm, "inet_full_diff", "run", arg);
+    compare(&expected, &actual, CompareMode::Exact)
+        .unwrap_or_else(|diff| panic!("{case_name}: {diff}"));
+}
+
+fn scheduled_result(vm: &mut Vm, module: &str, function: &str, arg: Term) -> CallResult {
+    match vm.eval_scheduled(module, function, &[arg], 2) {
+        Ok(outcome) => CallResult::Ok(outcome.term),
+        Err(VmError::Raised(raised)) => CallResult::Exception {
+            class: format!("{:?}", raised.class).to_lowercase(),
+            reason: raised.reason,
+            stack_top: Some(raised.stack),
+        },
+        Err(error) => CallResult::TransportError(error.to_string()),
+    }
+}
+
+/// One-shot `erl` for `debug_on`, before the in-process node ignores SIGCHLD.
+fn debug_on_oneshot_expected(beam: &[u8]) -> String {
+    let id = std::process::id();
+    let beam_path = std::env::temp_dir().join(format!("arinsal_inet_full_diff_{id}.beam"));
+    let term_path = std::env::temp_dir().join(format!("arinsal_inet_full_debug_on_{id}.term"));
+    std::fs::write(&beam_path, beam).unwrap();
+    let eval = format!(
+        r#"{{ok,B}}=file:read_file("{}"), {{module,_}}=code:load_binary(inet_full_diff,"x.beam",B), file:write_file("{}", io_lib:format("~p", [inet_full_diff:run(debug_on)])), halt()."#,
+        beam_path.display(),
+        term_path.display()
+    );
+    let status = std::process::Command::new("erl")
+        .args(["-noshell", "-eval", &eval])
+        .status()
+        .unwrap_or_else(|error| panic!("erl debug_on: {error}"));
+    assert!(status.success(), "erl debug_on {status}");
+    let expected = std::fs::read_to_string(&term_path)
+        .unwrap_or_else(|error| panic!("debug_on term {}: {error}", term_path.display()));
+    let _ = std::fs::remove_file(&beam_path);
+    let _ = std::fs::remove_file(&term_path);
+    expected
 }
 
 #[test]
@@ -392,6 +426,10 @@ fn tcp_inet_matches_erts() {
     reference
         .load("inet_full_diff", &beam)
         .expect("load reference module");
+    // `{debug, true}` erts_printf's on later ops and would corrupt the RefErl
+    // port. The one-shot `erl` runs before `node()`: `erts_sys_unix_later_init`
+    // sets SIGCHLD to SIG_IGN, after which waitpid of a new child returns ECHILD.
+    let debug_on_expected = debug_on_oneshot_expected(&beam);
     let mut vm = crate::common::node();
     crate::common::load_fresh(&mut vm, &beam);
     for case in [
@@ -414,18 +452,7 @@ fn tcp_inet_matches_erts() {
     ] {
         run_case(&reference, &mut vm, case);
     }
-    std::fs::write("/tmp/inet_full_diff.beam", &beam).unwrap();
-    let status = std::process::Command::new("erl")
-        .args([
-            "-noshell",
-            "-eval",
-            "{ok,B}=file:read_file(\"/tmp/inet_full_diff.beam\"), {module,_}=code:load_binary(inet_full_diff,\"x.beam\",B), file:write_file(\"/tmp/debug_on.term\", io_lib:format(\"~p\", [inet_full_diff:run(debug_on)])), halt().",
-        ])
-        .status()
-        .expect("erl");
-    assert!(status.success());
-    let expected = std::fs::read_to_string("/tmp/debug_on.term").unwrap();
-    similar_asserts::assert_eq!(expected.trim(), "{ok,{ok,[{debug,true}]}}");
+    similar_asserts::assert_eq!(debug_on_expected.trim(), "{ok,{ok,[{debug,true}]}}");
     let input = OwnedTerm::Atom("debug_on".into());
     let mut heap = VecHeap::new();
     let arg = from_owned(&input, &mut heap).unwrap();

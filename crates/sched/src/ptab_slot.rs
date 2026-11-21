@@ -7,12 +7,14 @@
 //! that passes no thread progress point, or an unmanaged thread that delays progress. The
 //! slot's reference is dropped by a later operation once every managed thread passed a point.
 //!
-//! Every `unsafe` of this kind of table is in `thr_progress/raw.rs`; users get a safe API.
+//! Every `unsafe` of this kind of table is in `ptab_slot/raw.rs`; users get a safe API.
 
-use crate::thr_progress::{self, DelayHandle, ThrProgress, raw};
+use crate::thr_progress::{self, DelayHandle, ThrProgress};
 use crate::{Scheduler, Task};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, Ordering};
+
+mod raw;
 
 /// The thread progress domain of one scheduler: what a slot's readers delay and what its
 /// later operations wait for.
@@ -82,21 +84,8 @@ impl<T: Send + Sync + 'static> ProgressSlot<T> {
     /// the slot is released like a removed one (at once without a `progress` domain, where no
     /// reader can exist).
     pub fn store(&self, value: Arc<T>) {
-        let held = raw::alloc_progress_held(Arc::into_raw(value));
-        if self
-            .0
-            .compare_exchange(
-                std::ptr::null_mut(),
-                held,
-                Ordering::Release,
-                Ordering::Relaxed,
-            )
-            .is_err()
-        {
-            // `erts_ptab_new_element` publishes only into an empty slot.
-            raw::drop_progress_held(held);
-            panic!("ProgressSlot store requires an empty slot");
-        }
+        // `erts_ptab_new_element` publishes only into an empty slot.
+        raw::store(&self.0, value);
     }
 
     /// Run `f` on the element without taking a reference (`erts_ptab_pix2intptr_ddrb`).
@@ -117,11 +106,7 @@ impl<T: Send + Sync + 'static> ProgressSlot<T> {
     /// [`ProgressSlot::with`] for a managed thread: a bare load of the slot, which needs no
     /// progress domain (`erts_ptab_pix2intptr_ddrb` is a load and nothing else).
     pub fn with_managed<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
-        let held = self.0.load(Ordering::Acquire);
-        if held.is_null() {
-            return None;
-        }
-        Some(f(raw::progress_held_value(held)))
+        raw::with_held(&self.0, |held| f(held.value()))
     }
 
     /// A counted reference to the element, for a caller that keeps it.
@@ -137,15 +122,7 @@ impl<T: Send + Sync + 'static> ProgressSlot<T> {
         keep: impl FnOnce(&T) -> bool,
     ) -> Option<Arc<T>> {
         let _delay = Delay::begin(&progress.0, managed);
-        let held = self.0.load(Ordering::Acquire);
-        if held.is_null() {
-            return None;
-        }
-        let value = raw::progress_held_value(held);
-        if !keep(value) {
-            return None;
-        }
-        Some(raw::progress_held_clone_arc(held))
+        raw::with_held(&self.0, |held| keep(held.value()).then(|| held.clone_arc())).flatten()
     }
 
     /// Empty the slot and return a reference to the element; the slot's own reference is
@@ -158,27 +135,13 @@ impl<T: Send + Sync + 'static> ProgressSlot<T> {
 
     /// Empty the slot and return the table reference plus the call arguments for
     /// `erts_schedule_thr_prgr_later_cleanup_op` to its scheduler-owned caller.
-    pub(crate) fn take_deferred(&self) -> Option<(Arc<T>, raw::LaterOpArgs)> {
-        let held = self.0.swap(std::ptr::null_mut(), Ordering::AcqRel);
-        if held.is_null() {
-            return None;
-        }
-        let taken = raw::progress_held_clone_arc(held);
-        let args = raw::LaterOpArgs {
-            func: raw::release_progress_held::<T>,
-            data: held.cast(),
-            lop: raw::progress_held_lop(held),
-            size: Some(std::mem::size_of::<raw::ProgressHeld<T>>()),
-        };
-        Some((taken, args))
+    pub(crate) fn take_deferred(&self) -> Option<(Arc<T>, thr_progress::raw::LaterOpArgs)> {
+        raw::take_deferred(&self.0)
     }
 }
 
 impl<T: Send + Sync + 'static> Drop for ProgressSlot<T> {
     fn drop(&mut self) {
-        let held = *self.0.get_mut();
-        if !held.is_null() {
-            raw::drop_progress_held(held);
-        }
+        raw::drop_occupied(&mut self.0);
     }
 }

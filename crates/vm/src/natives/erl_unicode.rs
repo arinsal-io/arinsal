@@ -7,7 +7,8 @@
 //! the binary being filled (a private writer) and the rest of the input in its arguments.
 
 use crate::Process;
-use crate::natives::bif::{badarg, bif_ret};
+use crate::natives::bif::bif_badarg;
+use crate::natives::bif::bif_ret;
 use crate::natives::erl_bif_lists::bif_trap;
 use crate::natives::erl_iolist::charge;
 use arinsal_beamasm::ProcessHeader;
@@ -692,7 +693,7 @@ fn build_utf8_return(
         }
         let Output::Writer(bin) = output else {
             // A result that fits an on-heap binary never traps.
-            return bif_ret(c_p, i, Err(badarg()));
+            return bif_badarg(c_p);
         };
         process.heap.abi.fcalls = 0;
         let pos_term = TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
@@ -759,7 +760,7 @@ pub(crate) extern "C" fn unicode_characters_to_binary_2(
     };
     let (need, cost_of_utf8_need) = utf8_need(subject, latin1);
     if need < 0 {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     }
     if is_bitstring(subject)
         && aligned_binary_size(subject) == need
@@ -801,7 +802,7 @@ pub(crate) extern "C" fn unicode_characters_to_binary_2(
     let (output, rest_term, pos, left_after, err, num_leftovers);
     if need as i64 <= ERL_ONHEAP_BINARY_LIMIT {
         let Ok(mut writer) = HeapBinaryWriter::new(&mut process.heap, need) else {
-            return bif_ret(c_p, i, Err(badarg()));
+            return bif_badarg(c_p);
         };
         // The writer owns the reserved words; the bytes are filled in place.
         (rest_term, pos, left_after, err, num_leftovers) = build(process, writer.bytes_mut());
@@ -809,11 +810,11 @@ pub(crate) extern "C" fn unicode_characters_to_binary_2(
     } else {
         let Ok(bin) = allocate_iolist_binary(&mut ProcessHeapHandle(&mut process.heap), need)
         else {
-            return bif_ret(c_p, i, Err(badarg()));
+            return bif_badarg(c_p);
         };
         let result = with_iolist_binary_output(bin, |target| build(process, target));
         let Some(result) = result else {
-            return bif_ret(c_p, i, Err(badarg()));
+            return bif_badarg(c_p);
         };
         (rest_term, pos, left_after, err, num_leftovers) = result;
         output = Output::Writer(bin);
@@ -847,7 +848,7 @@ pub(crate) extern "C" fn characters_to_utf8_trap(
         .as_small()
         .and_then(|pos| usize::try_from(pos).ok())
     else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     let latin1 = encoding == Term::atom(atoms::LATIN1);
     let sleft = allowed_iterations(process);
@@ -873,7 +874,7 @@ pub(crate) extern "C" fn characters_to_utf8_trap(
         )
     });
     let Some((rest_term, pos, left, err, num_leftovers)) = result else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     cost_to_proc(process, sleft - left);
     let state = BuildState {
@@ -1259,7 +1260,7 @@ pub(crate) extern "C" fn unicode_characters_to_list_2(
     if is_bitstring(arg1) && !latin1 {
         // Optimized behaviour for this case: `utf8_to_list`.
         if aligned_binary_size(arg1) < 0 {
-            return bif_ret(c_p, i, Err(badarg()));
+            return bif_badarg(c_p);
         }
         return do_bif_utf8_to_list(
             c_p,
@@ -1275,7 +1276,7 @@ pub(crate) extern "C" fn unicode_characters_to_list_2(
     }
     let (need, cost_of_utf8_need) = utf8_need(arg1, latin1);
     if need < 0 {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     }
     let mut bytes = vec![0u8; need as usize];
     cost_to_proc(process, simple_loops_to_common(cost_of_utf8_need));
@@ -1438,7 +1439,7 @@ pub(crate) extern "C" fn characters_to_list_trap_1(
         ))
     });
     let Some(Some((mut bytes, pos, characters))) = taken else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     let sleft = allowed_iterations(process);
     let mut state = BuildState {
@@ -1495,7 +1496,7 @@ pub(crate) extern "C" fn characters_to_list_trap_2(
         ))
     });
     let Some(Some((bytes, processed, to_process, chars, state))) = taken else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     let left = allowed_iterations(process);
     finalize_list_to_list(
@@ -1519,7 +1520,7 @@ pub(crate) extern "C" fn characters_to_list_trap_3(
         analyzed.as_small().and_then(|n| usize::try_from(n).ok()),
         chars.as_small().and_then(|n| usize::try_from(n).ok()),
     ) else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     do_bif_utf8_to_list(
         c_p,
@@ -1563,7 +1564,7 @@ pub(crate) extern "C" fn characters_to_list_trap_4(
         element(5),
     )
     else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     do_bif_utf8_to_list(
         c_p,
@@ -1687,7 +1688,7 @@ fn codepoint_list(process: &mut Process, points: &[u32]) -> Term {
 pub(crate) extern "C" fn prim_file_internal_name2native_1(
     c_p: *mut ProcessHeader,
     reg: *mut u64,
-    i: u64,
+    _i: u64,
 ) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
@@ -1697,12 +1698,12 @@ pub(crate) extern "C" fn prim_file_internal_name2native_1(
     let data = if is_bitstring(name) {
         match aligned_bytes(name) {
             Some(bytes) if !bytes.contains(&0) => bytes.into_owned(),
-            _ => return bif_ret(c_p, i, Err(badarg())),
+            _ => return bif_badarg(c_p),
         }
     } else {
         match filename_list_bytes(name, filename_encoding()) {
             Some(bytes) => bytes,
-            None => return bif_ret(c_p, i, Err(badarg())),
+            None => return bif_badarg(c_p),
         }
     };
     let mut data = data;
@@ -1716,7 +1717,7 @@ pub(crate) extern "C" fn prim_file_internal_name2native_1(
 pub(crate) extern "C" fn prim_file_internal_native2name_1(
     c_p: *mut ProcessHeader,
     reg: *mut u64,
-    i: u64,
+    _i: u64,
 ) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
@@ -1724,7 +1725,7 @@ pub(crate) extern "C" fn prim_file_internal_native2name_1(
     process.heap.note_bif_entry();
     let [name] = crate::bif_table::bif_args::<1>(reg);
     let Some(data) = aligned_bytes(name) else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     if data.is_empty() {
         return crate::native_hooks::raw(Term::NIL);
@@ -1760,7 +1761,7 @@ pub(crate) extern "C" fn prim_file_internal_native2name_1(
 pub(crate) extern "C" fn prim_file_internal_normalize_utf8_1(
     c_p: *mut ProcessHeader,
     reg: *mut u64,
-    i: u64,
+    _i: u64,
 ) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
@@ -1768,10 +1769,10 @@ pub(crate) extern "C" fn prim_file_internal_normalize_utf8_1(
     process.heap.note_bif_entry();
     let [name] = crate::bif_table::bif_args::<1>(reg);
     let Some(data) = aligned_bytes(name) else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     let Ok(text) = std::str::from_utf8(&data) else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     let normalized = super::erl_unicode_normalize::do_utf8_to_list_normalize(text.as_bytes());
     let list = codepoint_list(process, &normalized);
@@ -1783,7 +1784,7 @@ pub(crate) extern "C" fn prim_file_internal_normalize_utf8_1(
 pub(crate) extern "C" fn prim_file_is_translatable_1(
     c_p: *mut ProcessHeader,
     reg: *mut u64,
-    i: u64,
+    _i: u64,
 ) -> u64 {
     let Some(process) = crate::native_hooks::process_from_header(c_p) else {
         return 0;
@@ -1791,7 +1792,7 @@ pub(crate) extern "C" fn prim_file_is_translatable_1(
     process.heap.note_bif_entry();
     let [name] = crate::bif_table::bif_args::<1>(reg);
     let Some(data) = aligned_bytes(name) else {
-        return bif_ret(c_p, i, Err(badarg()));
+        return bif_badarg(c_p);
     };
     let translatable = data.is_empty()
         || filename_encoding() == FilenameEncoding::Latin1

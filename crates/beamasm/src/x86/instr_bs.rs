@@ -21,6 +21,7 @@ use super::beam_asm::{
 use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
 use super::beam_asm_module::{BeamModuleAssembler, arg_label, arg_word};
 use super::process_main::ERTS_PSFLG_EXITING;
+use super::rt::addr;
 pub use super::rt::{
     beam_jit_bs_construct_fail_info, beam_jit_bs_field_size_argument_error,
     beam_jit_bs_get_integer, beam_jit_bs_init_bits, beam_jit_bs_put_binary_all,
@@ -262,7 +263,7 @@ impl BeamModuleAssembler {
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         // ARG2 was set above.
         self.asm
-            .runtime_call(erts_bs_start_match_3 as *const () as usize)?;
+            .runtime_call(addr(erts_bs_start_match_3 as *const ()))?;
         self.asm.emit_leave_runtime(Update::HEAP_ONLY_ALLOC)?;
         self.asm
             .emit(|e| e.lea(ARG2, qword_ptr(RET, i32::from(TAG_PRIMARY_BOXED))))?;
@@ -316,7 +317,7 @@ impl BeamModuleAssembler {
         self.mov_arg_to_reg(ARG1, ptr)?;
         self.asm.mov_imm(ARG2, 0)?;
         self.asm.mov_imm(ARG5, size)?;
-        self.asm.runtime_call(erts_cmp_bits as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_cmp_bits as *const ()))?;
         self.asm.emit_leave_runtime(Update::NONE)?;
 
         self.asm.emit(|e| e.test_rr(RET, RET))?;
@@ -362,7 +363,7 @@ impl BeamModuleAssembler {
             self.asm.emit_enter_runtime(Update::NONE)?;
             // The process argument is never used.
             self.asm
-                .runtime_call(erts_bs_get_integer_2 as *const () as usize)?;
+                .runtime_call(addr(erts_bs_get_integer_2 as *const ()))?;
             self.asm.emit_leave_runtime(Update::NONE)?;
             self.asm.emit_test_the_non_value(RET)?;
             self.asm.jcc(CondCode::E, fail)?;
@@ -390,7 +391,7 @@ impl BeamModuleAssembler {
             self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
             self.asm.load_x_reg_array(ARG2)?;
             self.asm
-                .runtime_call(beam_jit_bs_get_integer as *const () as usize)?;
+                .runtime_call(addr(beam_jit_bs_get_integer as *const ()))?;
             self.asm.emit_leave_runtime(spec)?;
             self.asm.emit_test_the_non_value(RET)?;
             self.asm.jcc(CondCode::E, fail)?;
@@ -578,7 +579,7 @@ impl BeamModuleAssembler {
             self.asm
                 .emit(|e| e.lea(ARG3, qword_ptr(ARG4, -i32::from(TAG_PRIMARY_BOXED))))?;
             self.asm
-                .runtime_call(erts_bs_get_binary_2 as *const () as usize)?;
+                .runtime_call(addr(erts_bs_get_binary_2 as *const ()))?;
             self.asm.emit_leave_runtime(Update::HEAP_ONLY_ALLOC)?;
             self.asm.emit_test_the_non_value(RET)?;
             self.asm.jcc(CondCode::E, fail)?;
@@ -671,7 +672,7 @@ impl BeamModuleAssembler {
             self.asm
                 .emit(|e| e.sub_ri(ARG4, i64::from(TAG_PRIMARY_BOXED)))?;
             self.asm
-                .runtime_call(erts_bs_get_float_2 as *const () as usize)?;
+                .runtime_call(addr(erts_bs_get_float_2 as *const ()))?;
             self.asm.emit_leave_runtime(Update::HEAP_ONLY_ALLOC)?;
             self.asm.emit_test_the_non_value(RET)?;
             self.asm.jcc(CondCode::E, fail)?;
@@ -741,7 +742,7 @@ impl BeamModuleAssembler {
         } else {
             let a = &mut self.asm;
             a.emit_enter_runtime(Update::NONE)?;
-            a.runtime_call(erts_bs_get_utf8 as *const () as usize)?;
+            a.runtime_call(addr(erts_bs_get_utf8 as *const ()))?;
             a.emit_leave_runtime(Update::NONE)?;
             a.emit_test_the_non_value(RET)?;
         }
@@ -782,7 +783,7 @@ impl BeamModuleAssembler {
         a.emit_enter_runtime(Update::NONE)?;
         a.emit(|e| e.sub_ri(ARG1, i64::from(TAG_PRIMARY_BOXED)))?;
         a.mov_imm(ARG2, flags)?;
-        a.runtime_call(erts_bs_get_utf16 as *const () as usize)?;
+        a.runtime_call(addr(erts_bs_get_utf16 as *const ()))?;
         a.emit_leave_runtime(Update::NONE)?;
         a.emit_test_the_non_value(RET)?;
         let fail = self.beam_label(fail)?;
@@ -882,7 +883,7 @@ impl BeamModuleAssembler {
         a.emit_enter_runtime(spec)?;
         a.emit(|e| e.mov_rr(ARG1, C_P))?;
         a.emit(|e| e.mov_rm(ARG2, get_x_ref(0, 8)))?;
-        a.runtime_call(erts_bs_init_writable as *const () as usize)?;
+        a.runtime_call(addr(erts_bs_init_writable as *const ()))?;
         a.emit(|e| e.mov_mr(get_x_ref(0, 8), RET))?;
         a.emit_leave_runtime(spec)
     }
@@ -1539,7 +1540,7 @@ impl BeamModuleAssembler {
                     a.emit(|e| e.mov_ri(ARG2, seg.size as i64))?;
                     a.emit(|e| e.mov_ri(ARG3, seg.flags as i64))?;
                     a.emit(|e| e.sub_ri(ARG4, i64::from(TAG_PRIMARY_BOXED)))?;
-                    a.runtime_call(erts_bs_get_integer_2 as *const () as usize)?;
+                    a.runtime_call(addr(erts_bs_get_integer_2 as *const ()))?;
                     a.emit_leave_runtime(spec)?;
                     self.mov_arg_from_reg(dst, RET)?;
                     is_ctx_valid = false;
@@ -1567,7 +1568,7 @@ impl BeamModuleAssembler {
                     a.emit(|e| e.and_ri(ARG4, !ERL_SUB_BITS_FLAG_MASK))?;
                     a.mov_imm(ARG6, seg.size)?;
                     a.emit(|e| e.add_mr(boxed(RET, SUB_BITS_START), ARG6))?;
-                    a.runtime_call(erts_build_sub_bitstring as *const () as usize)?;
+                    a.runtime_call(addr(erts_build_sub_bitstring as *const ()))?;
                     a.emit_leave_runtime(Update::HEAP_ONLY_ALLOC)?;
                     self.mov_arg_from_reg(dst, RET)?;
                     is_ctx_valid = false;
@@ -1955,7 +1956,7 @@ impl BeamModuleAssembler {
             self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
             self.asm.load_x_reg_array(ARG2)?;
             self.asm
-                .runtime_call(erts_bs_append_checked as *const () as usize)?;
+                .runtime_call(addr(erts_bs_append_checked as *const ()))?;
 
             if self.exact_type(seg.src, type_id::BITSTRING)
                 && gcd_u64(seg.unit, u64::from(self.get_size_unit(seg.src))) == seg.unit
@@ -2006,7 +2007,7 @@ impl BeamModuleAssembler {
             self.asm.emit(|e| e.mov_rr(ARG2, C_P))?;
             self.asm.load_erl_bits_state(ARG1)?;
             self.asm
-                .runtime_call(erts_bs_private_append_checked as *const () as usize)?;
+                .runtime_call(addr(erts_bs_private_append_checked as *const ()))?;
             self.asm.emit(|e| e.mov_mr(tmp_mem_q(0), RET))?;
         } else if allocated_size < 0 {
             runtime_entered = self.bs_maybe_enter_runtime(runtime_entered)?;
@@ -2039,7 +2040,7 @@ impl BeamModuleAssembler {
                     self.asm.emit(|e| e.mov_rr(ARG2, C_P))?;
                     self.asm.load_erl_bits_state(ARG1)?;
                     self.asm
-                        .runtime_call(erts_bs_put_binary as *const () as usize)?;
+                        .runtime_call(addr(erts_bs_put_binary as *const ()))?;
                     update_bsc_reason_info(
                         seg.error_info,
                         BscReason::Badarg,
@@ -2057,10 +2058,10 @@ impl BeamModuleAssembler {
                     self.asm.load_erl_bits_state(ARG1)?;
                     if can_fail {
                         self.asm
-                            .runtime_call(erts_bs_put_binary_all as *const () as usize)?;
+                            .runtime_call(addr(erts_bs_put_binary_all as *const ()))?;
                     } else {
                         self.asm
-                            .runtime_call(beam_jit_bs_put_binary_all as *const () as usize)?;
+                            .runtime_call(addr(beam_jit_bs_put_binary_all as *const ()))?;
                     }
                     update_bsc_reason_info(
                         seg.error_info,
@@ -2080,7 +2081,7 @@ impl BeamModuleAssembler {
                     self.asm.emit(|e| e.mov_rr(ARG2, C_P))?;
                     self.asm.load_erl_bits_state(ARG1)?;
                     self.asm
-                        .runtime_call(erts_bs_put_binary as *const () as usize)?;
+                        .runtime_call(addr(erts_bs_put_binary as *const ()))?;
                     update_bsc_reason_info(
                         seg.error_info,
                         BscReason::Badarg,
@@ -2113,7 +2114,7 @@ impl BeamModuleAssembler {
                 self.asm.emit(|e| e.mov_rr(ARG2, C_P))?;
                 self.asm.load_erl_bits_state(ARG1)?;
                 self.asm
-                    .runtime_call(erts_bs_put_float as *const () as usize)?;
+                    .runtime_call(addr(erts_bs_put_float as *const ()))?;
                 if fail == 0 {
                     self.asm.mov_imm(
                         ARG4,
@@ -2342,10 +2343,10 @@ impl BeamModuleAssembler {
                             self.asm.load_erl_bits_state(ARG1)?;
                             if seg.flags & 2 != 0 {
                                 self.asm
-                                    .runtime_call(erts_bs_put_integer_le as *const () as usize)?;
+                                    .runtime_call(addr(erts_bs_put_integer_le as *const ()))?;
                             } else {
                                 self.asm
-                                    .runtime_call(erts_bs_put_integer_be as *const () as usize)?;
+                                    .runtime_call(addr(erts_bs_put_integer_be as *const ()))?;
                             }
                             if !self.exact_type(seg.src, type_id::INTEGER) {
                                 if fail == 0 {
@@ -2373,7 +2374,7 @@ impl BeamModuleAssembler {
                 self.mov_arg_to_reg(ARG2, seg.src)?;
                 self.asm.load_erl_bits_state(ARG1)?;
                 self.asm
-                    .runtime_call(erts_bs_put_string as *const () as usize)?;
+                    .runtime_call(addr(erts_bs_put_string as *const ()))?;
             } else if seg.type_ == atom_arg(atoms::UTF8) {
                 runtime_entered = self.bs_maybe_enter_runtime(runtime_entered)?;
                 self.emit_construct_utf8(seg.src, bit_offset, is_byte_aligned)?;
@@ -2383,7 +2384,7 @@ impl BeamModuleAssembler {
                 self.asm.emit(|e| e.mov_ri(ARG3, seg.flags as i64))?;
                 self.asm.load_erl_bits_state(ARG1)?;
                 self.asm
-                    .runtime_call(erts_bs_put_utf16 as *const () as usize)?;
+                    .runtime_call(addr(erts_bs_put_utf16 as *const ()))?;
                 if fail == 0 {
                     self.mov_arg_to_reg(ARG1, seg.src)?;
                     self.asm.mov_imm(
@@ -2405,10 +2406,10 @@ impl BeamModuleAssembler {
                 self.asm.load_erl_bits_state(ARG1)?;
                 if seg.flags & 2 != 0 {
                     self.asm
-                        .runtime_call(erts_bs_put_integer_le as *const () as usize)?;
+                        .runtime_call(addr(erts_bs_put_integer_le as *const ()))?;
                 } else {
                     self.asm
-                        .runtime_call(erts_bs_put_integer_be as *const () as usize)?;
+                        .runtime_call(addr(erts_bs_put_integer_be as *const ()))?;
                 }
                 if fail == 0 {
                     self.mov_arg_to_reg(ARG1, seg.src)?;
@@ -2471,7 +2472,7 @@ impl BeamGlobalAssembler {
         let a = &mut self.asm;
         a.emit_enter_runtime(Update::NONE)?;
         a.emit(|e| e.mov_rr(ARG1, C_P))?;
-        a.runtime_call(beam_jit_bs_field_size_argument_error as *const () as usize)?;
+        a.runtime_call(addr(beam_jit_bs_field_size_argument_error as *const ()))?;
         a.emit_leave_runtime(Update::NONE)?;
         a.emit(|e| e.ret())
     }
@@ -2498,7 +2499,7 @@ impl BeamGlobalAssembler {
         a.emit(|e| e.sub_rr(ARG6, ARG5))?;
 
         a.emit(|e| e.lea(ARG1, qword_ptr(C_P, process::HTOP)))?;
-        a.runtime_call(erts_build_sub_bitstring as *const () as usize)?;
+        a.runtime_call(addr(erts_build_sub_bitstring as *const ()))?;
         a.emit_leave_runtime(Update::HEAP_ONLY_ALLOC)?;
         a.emit(|e| e.ret())
     }
@@ -2629,7 +2630,7 @@ impl BeamGlobalAssembler {
         a.emit(|e| e.mov_rr(ARG2, ARG4))?;
         a.emit(|e| e.mov_rr(ARG4, ARG1))?;
         a.emit(|e| e.mov_rr(ARG1, C_P))?;
-        a.runtime_call(beam_jit_bs_construct_fail_info as *const () as usize)?;
+        a.runtime_call(addr(beam_jit_bs_construct_fail_info as *const ()))?;
         a.emit_leave_runtime(Update::HEAP_ALLOC)?;
 
         // Align the return address to a proper tagged CP, in case we were called with
@@ -2659,7 +2660,7 @@ impl BeamGlobalAssembler {
         a.emit(|e| e.mov_rr(ARG1, C_P))?;
         a.emit(|e| e.push_r(enc::RBP))?;
         a.emit(|e| e.mov_rr(enc::RBP, enc::RSP))?;
-        a.runtime_call(beam_jit_bs_init_bits as *const () as usize)?;
+        a.runtime_call(addr(beam_jit_bs_init_bits as *const ()))?;
         a.emit(|e| e.leave())?;
         a.emit(|e| e.mov_rm(super::beam_asm::register::ARG1D, state))?;
         a.emit(|e| {
@@ -4591,7 +4592,7 @@ zero_large() -> <<0:1024>>.
         let mut m = BeamModuleAssembler::with_fragment_addresses(4, fragment_addresses());
         m.asm.emit_enter_runtime(Update::NONE).unwrap();
         m.asm
-            .runtime_call(erts_bs_get_utf8 as *const () as usize)
+            .runtime_call(addr(erts_bs_get_utf8 as *const ()))
             .unwrap();
         m.asm.emit_leave_runtime(Update::NONE).unwrap();
         m.asm.emit_test_the_non_value(RET).unwrap();

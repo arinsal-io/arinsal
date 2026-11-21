@@ -11,6 +11,7 @@ use super::beam_asm::{
 };
 use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
 use super::beam_asm_module::BeamModuleAssembler;
+use super::rt::addr;
 pub use super::rt::big_to_double;
 use crate::common::args::ArgVal;
 use crate::common::types::{BeamModuleAssemblerCommon, type_id};
@@ -301,7 +302,7 @@ impl BeamGlobalAssembler {
         self.asm.emit_enter_frame()?;
         self.asm.emit_enter_runtime(Update::NONE)?;
         self.asm.emit(|e| e.lea(arg2, tmp_mem_q(0)))?;
-        self.asm.runtime_call(big_to_double as *const () as usize)?;
+        self.asm.runtime_call(addr(big_to_double as *const ()))?;
         self.asm.emit_leave_runtime(Update::NONE)?;
         self.asm.emit_leave_frame()?;
         self.asm.emit(|e| e.test_rr(ret.r32(), ret.r32()))?;

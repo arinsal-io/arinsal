@@ -10,8 +10,8 @@ use super::beam_asm::{AsmError, Update, get_x_ref, get_y_ref, process, process_r
 use super::beam_asm_global::{BeamGlobalAssembler, GlobalLabels};
 use super::beam_asm_module::BeamModuleAssembler;
 use super::rt::{
-    beam_jit_return_to_trace, erts_call_trace_return, erts_generic_breakpoint, erts_hibernate,
-    erts_trace_return,
+    addr, beam_jit_return_to_trace, erts_call_trace_return, erts_generic_breakpoint,
+    erts_hibernate, return_trace,
 };
 use crate::common::args::ArgVal;
 use crate::common::beam_asm_h::ErtsCodeInfo;
@@ -22,21 +22,6 @@ const BEAM_RETURN_CALL_ACC_TRACE_FRAME_SZ: u32 = 3;
 const CP_MASK: i64 = 3;
 const CP_SIZE_BYTES: i64 = 8;
 const F_HIBERNATE_SCHED: i64 = 1;
-
-/// The runtime wrapper around `erts_trace_return` used by the static helper in erts.
-// Port of erts/emulator/beam/jit/x86/instr_trace.cpp:172-180 (return_trace), OTP-29.1.1.
-extern "C" fn return_trace(
-    c_p: *mut crate::ProcessHeader,
-    mfa: *mut ErtsCodeMfa,
-    value: u64,
-    tracer: u64,
-    session_id: u64,
-) {
-    // `ERTS_UNREQ_PROC_MAIN_LOCK` / `ERTS_REQ_PROC_MAIN_LOCK` compile to no-ops in release
-    // builds without ERTS_ENABLE_LOCK_CHECK, which is the runtime this assembler emits for.
-    // The release body calls the trace helper directly between those no-op macros.
-    erts_trace_return(c_p, mfa, value, tracer, session_id)
-}
 
 impl BeamGlobalAssembler {
     /// Dispatches a trace breakpoint attached to an export entry.
@@ -55,7 +40,7 @@ impl BeamGlobalAssembler {
             )
         })?;
         a.load_x_reg_array(ARG3)?;
-        a.runtime_call(erts_generic_breakpoint as *const () as usize)?;
+        a.runtime_call(addr(erts_generic_breakpoint as *const ()))?;
         a.emit_leave_runtime(spec)?;
         a.emit_leave_frame()?;
         a.emit(|e| e.jmp_r(RET))
@@ -87,7 +72,7 @@ impl BeamGlobalAssembler {
         a.emit_enter_runtime(spec)?;
         a.emit(|e| e.mov_rr(ARG1, C_P))?;
         a.load_x_reg_array(ARG3)?;
-        a.runtime_call(erts_generic_breakpoint as *const () as usize)?;
+        a.runtime_call(addr(erts_generic_breakpoint as *const ()))?;
         a.emit_leave_runtime(spec)?;
         a.emit_leave_frame()?;
         a.emit(|e| e.cmp_ri(RET, arinsal_term::OP_I_DEBUG_BREAKPOINT as i64))?;
@@ -123,7 +108,7 @@ impl BeamGlobalAssembler {
         })?;
         a.load_x_reg_array(ARG3)?;
         a.mov_imm(ARG4, Term::atom(atoms::BREAKPOINT).word())?;
-        a.runtime_call(super::rt::call_error_handler as *const () as usize)?;
+        a.runtime_call(addr(super::rt::call_error_handler as *const ()))?;
         a.emit_leave_runtime(spec)?;
         a.emit_leave_frame()?;
         a.emit(|e| e.test_rr(RET, RET))?;
@@ -147,7 +132,7 @@ impl BeamModuleAssembler {
         self.asm.emit(|e| e.mov_rm(ARG5, get_y_ref(2, 8)))?;
         self.asm.emit_enter_runtime(Update::HEAP_ALLOC)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
-        self.asm.runtime_call(return_trace as *const () as usize)?;
+        self.asm.runtime_call(addr(return_trace as *const ()))?;
         self.asm.emit_leave_runtime(Update::HEAP_ALLOC)?;
         self.emit_deallocate(ArgVal::Word(u64::from(BEAM_RETURN_TRACE_FRAME_SZ)))?;
         self.emit_return_do(true)
@@ -172,7 +157,7 @@ impl BeamModuleAssembler {
         self.asm.emit_enter_runtime(Update::HEAP_ALLOC)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.asm
-            .runtime_call(erts_call_trace_return as *const () as usize)?;
+            .runtime_call(addr(erts_call_trace_return as *const ()))?;
         self.asm.emit_leave_runtime(Update::HEAP_ALLOC)?;
         self.emit_deallocate(ArgVal::Word(u64::from(BEAM_RETURN_CALL_ACC_TRACE_FRAME_SZ)))?;
         self.emit_return_do(true)
@@ -193,7 +178,7 @@ impl BeamModuleAssembler {
         self.asm.emit_enter_runtime(spec)?;
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.asm
-            .runtime_call(beam_jit_return_to_trace as *const () as usize)?;
+            .runtime_call(addr(beam_jit_return_to_trace as *const ()))?;
         self.asm.emit_leave_runtime(spec)?;
         self.emit_deallocate(ArgVal::Word(u64::from(BEAM_RETURN_TO_TRACE_FRAME_SZ)))?;
         self.emit_return_do(true)
@@ -208,8 +193,7 @@ impl BeamModuleAssembler {
         self.asm.emit(|e| e.mov_rr(ARG1, C_P))?;
         self.asm.load_x_reg_array(ARG2)?;
         self.asm.mov_imm(ARG3, 0)?;
-        self.asm
-            .runtime_call(erts_hibernate as *const () as usize)?;
+        self.asm.runtime_call(addr(erts_hibernate as *const ()))?;
         self.asm.emit_leave_runtime(spec)?;
         self.asm
             .emit(|e| e.and_mi(process_ref(process::FLAGS, 4), !F_HIBERNATE_SCHED))?;
