@@ -2,23 +2,29 @@
 //!
 //! Port of erts/emulator/beam/external.c (term_to_binary_1/2, term_to_iovec_1/2,
 //! term_to_binary_trap_1, erts_term_to_binary_int, external_size_1/2, binary_to_term_1/2,
-//! binary_to_term_trap_1, binary_to_term_int), OTP-29.1.1. Each BIF is
-//! `bif_table[].f` with `(c_p, reg, I)`. `erts_term_to_binary_int` runs the TTBContext through
-//! TTBSize / TTBEncode / TTBCompress on the stack; only a pass that runs out of reductions
-//! exports the context into a magic binary (`EXPORT_CONTEXT`), disables collection and
-//! `BIF_TRAP1`s to the hidden `erts_internal:term_to_binary_trap/1` with
+//! binary_to_term_trap_1, binary_to_term_int, erts_debug_dist_ext_to_term_2), OTP-29.1.1.
+//! Each BIF is `bif_table[].f` with `(c_p, reg, I)`. `erts_term_to_binary_int` runs the
+//! TTBContext through TTBSize / TTBEncode / TTBCompress on the stack; only a pass that runs
+//! out of reductions exports the context into a magic binary (`EXPORT_CONTEXT`), disables
+//! collection and `BIF_TRAP1`s to the hidden `erts_internal:term_to_binary_trap/1` with
 //! `{Term, Opts, MagicRef, BifIx}` (`RETURN_STATE`).
 
 use crate::Process;
 use crate::bif_traps::TrapContext;
-use crate::natives::bif::{badarg, bif_ret};
+use crate::natives::bif::{badarg, bif_badarg, bif_ret, bif_system_limit};
 use crate::natives::erl_bif_lists::bif_trap;
 use crate::natives::erl_iolist::{charge, create_holder, gc_enable};
 use crate::natives::external_dec::{B2tContext, B2tState};
+use crate::natives::external_dec_size::B2tSizeState;
+use crate::natives::external_dist::{
+    ERTS_DIST_EXT_ATOM_TRANS_TAB, ErtsDistExternal, ErtsDistExternalData, erts_decode_dist_ext,
+    erts_decode_dist_ext_size,
+};
 use arinsal_beamasm::ProcessHeader;
 use arinsal_bifs::{BifError, ProcessHeapHandle};
 use arinsal_external::{EncodeError, TERM_TO_BINARY_LOOP_FACTOR, TtbContext, TtbState, TtbStep};
-use arinsal_term::{Term, TermBuilder, atoms};
+use arinsal_term::raw::BinRef;
+use arinsal_term::{HeapReservation, Term, TermBuilder, atoms};
 
 /// The BIF error of a failure of either layer.
 trait ToBifError {
@@ -665,6 +671,74 @@ fn b2t_run(process: &mut Process, ctx: &mut B2tContext<'_>) -> B2tExit {
         if !(ctx.reds > 0 || ctx.state >= B2tState::Done) {
             return B2tExit::Yield;
         }
+    }
+}
+
+/// `ERTS_MAX_INTERNAL_ATOM_CACHE_ENTRIES`.
+// Port of erts/emulator/beam/external.h, OTP-29.1.1.
+const ERTS_MAX_INTERNAL_ATOM_CACHE_ENTRIES: usize = 255;
+
+/// `erts_debug:dist_ext_to_term/2`.
+// Port of erts/emulator/beam/external.c (erts_debug_dist_ext_to_term_2), OTP-29.1.1.
+pub(crate) extern "C" fn erts_debug_dist_ext_to_term_2(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    _i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [cache, bitstring] = crate::bif_table::bif_args::<2>(reg);
+    let Ok(arity) = arinsal_bifs::tuple_arity(cache) else {
+        return bif_badarg(c_p);
+    };
+    if arity > ERTS_MAX_INTERNAL_ATOM_CACHE_ENTRIES {
+        return bif_badarg(c_p);
+    }
+    let mut attab = Vec::with_capacity(arity);
+    for index in 0..arity {
+        let Ok(entry) = arinsal_bifs::tuple_element(cache, index) else {
+            return bif_badarg(c_p);
+        };
+        let Some(atom) = entry.as_atom() else {
+            return bif_badarg(c_p);
+        };
+        attab.push(atom);
+    }
+    let Ok(view) = BinRef::try_from(bitstring) else {
+        return bif_badarg(c_p);
+    };
+    let Some(bytes) = view.bytes() else {
+        return bif_badarg(c_p);
+    };
+    if bytes.is_empty() {
+        return bif_badarg(c_p);
+    }
+    let mut ede = ErtsDistExternal {
+        data: ErtsDistExternalData {
+            extp: 0,
+            ext_endp: bytes.len(),
+            binp: bytes.into(),
+        },
+        flags: ERTS_DIST_EXT_ATOM_TRANS_TAB,
+        connection_id: 0,
+        heap_size: -1,
+        dep: atoms::NONAME,
+        attab: attab.into_boxed_slice(),
+        size_state: B2tSizeState::default(),
+    };
+    let hsz = erts_decode_dist_ext_size(None, &mut ede, true);
+    if hsz < 0 {
+        return bif_badarg(c_p);
+    }
+    let mut heap = ProcessHeapHandle(&mut process.heap);
+    let Ok(mut factory) = HeapReservation::new(&mut heap, hsz as usize) else {
+        return bif_system_limit(c_p);
+    };
+    match erts_decode_dist_ext(None, &mut factory, &mut ede, true) {
+        Some(result) => crate::native_hooks::raw(result),
+        None => bif_badarg(c_p),
     }
 }
 

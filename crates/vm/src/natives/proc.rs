@@ -1934,27 +1934,17 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erlang", "list_to_ref", 1),
     ("erlang", "fun_to_list", 1), // mix_loop6
     ("erts_internal", "process_flag", 3),
-    ("erlang", "process_info", 1),
     ("erlang", "process_info", 2),
     ("erlang", "hibernate", 3),
     // `i_hibernate` is an OTP instruction, not an Erlang wrapper interception.
     ("erlang", "hibernate", 0),
     ("erts_internal", "suspend_process", 2),
-    ("erlang", "resume_process", 1),
-    ("erts_internal", "process_display", 2),
     ("erts_internal", "dist_spawn_request", 4),
-    ("erts_internal", "processes_next", 1),
     ("erts_internal", "trace", 3),
     // `erlang:trace/3` loads the tracer module, then calls `erts_internal:trace/3`.
-    ("erlang", "trace_info", 2),
     ("erts_internal", "trace", 4),
     ("erts_internal", "trace_pattern", 3),
     ("erts_internal", "trace_pattern", 4),
-    ("erts_internal", "trace_session_create", 3),
-    ("erts_internal", "trace_session_destroy", 1),
-    ("erts_internal", "trace_info", 3),
-    ("erts_internal", "is_system_process", 1),
-    ("erlang", "fun_info_mfa", 1),
 ];
 
 pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
@@ -2242,262 +2232,6 @@ pub(crate) fn live(process: &Process, pid: Pid) -> Result<bool, VmError> {
         .lookup(pid))
 }
 
-/// `process_info(Pid, Item)` from the native BIF entry. Ready calls use the same parsed arguments,
-/// heap factory, and direct item loop as the executor; a call needing signal handling yields to it.
-// Port of erts/emulator/beam/erl_bif_info.c:1274-1425 (process_info_bif), OTP-29.1.1.
-pub(crate) fn process_info_light(
-    process: &mut Process,
-    pid: Pid,
-    item: Term,
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let own = process.self_pid()?;
-    if !process.sig_cont_empty() || process.inbox.flags & crate::receive::FS_FLUSHING_SIGS != 0 {
-        return None;
-    }
-    let single = if let Some((key, _)) = dictionary_lookup(item) {
-        Some((38, key, true))
-    } else if item.as_atom().is_some() {
-        let (index, extra) = info_arg_index(item)?;
-        Some((usize::from(index), extra.unwrap_or(Term::NON_VALUE), false))
-    } else {
-        None
-    };
-    if let Some((index, extra, always_wrap)) = single {
-        return process_info_light_single(process, pid, own, index, extra, always_wrap);
-    }
-    let args = ProcessInfoArgs::parse(Some(item)).ok()?;
-    let runtime = process.runtime.as_ref()?;
-    // The process's own signal probe answers without the table lookup: erts reads the
-    // `ERTS_PSFLG_SIG_IN_Q` and `ERTS_PSFLG_SUSPENDED` bits of the caller's state word. The
-    // table is the fallback.
-    let busy = match process.signal_probe() {
-        Some(probe) => {
-            probe.maybe_self_sigs()
-                || probe.has_pending()
-                || probe
-                    .proc_state()
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    & arinsal_sched::psflg::SUSPENDED
-                    != 0
-                || (pid != own && probe.has_incoming_signals())
-        }
-        None => runtime.scheduler().ok()?.input_has_pending(own)? || runtime.suspend_active(own),
-    };
-    if busy {
-        return None;
-    }
-    if own == pid {
-        if !args.target_answers(process) {
-            return None;
-        }
-        return match process_info(
-            None,
-            InfoSource::Caller,
-            process,
-            pid,
-            None,
-            &args,
-            Term::atom(arinsal_term::atoms::RUNNING),
-            true,
-        ) {
-            Ok(term) => Some(Ok(term)),
-            Err(VmError::Trap(trap)) => Some(Err(trap)),
-            Err(_) => None,
-        };
-    }
-    if !args.all_remote_readable() {
-        return None;
-    }
-    // `scheduler()` borrows the runtime's scheduler; the process-info path itself adds no Arc
-    // clone before the sig-free process lock.
-    let scheduler = runtime.scheduler().ok()?;
-    match scheduler.inspect_signal_free(pid, |target| {
-        if !args.target_answers(target) {
-            return None;
-        }
-        Some(process_info(
-            None,
-            InfoSource::Other(target),
-            process,
-            pid,
-            None,
-            &args,
-            Term::atom(arinsal_term::atoms::RUNNING),
-            true,
-        ))
-    }) {
-        Ok(Some(Ok(term))) => Some(Ok(term)),
-        Ok(Some(Err(VmError::Trap(trap)))) => Some(Err(trap)),
-        Ok(Some(Err(_))) => None,
-        Ok(None) => None,
-        Err(arinsal_sched::SignalFreeError::NoProcess) => {
-            Some(Ok(Term::atom(arinsal_term::atoms::UNDEFINED)))
-        }
-        Err(arinsal_sched::SignalFreeError::Busy) => None,
-    }
-}
-
-/// Handle the self case of `process_info/1` from native process/register state.
-// Port of erts/emulator/beam/erl_bif_info.c:1562 (`process_info_1`), OTP-29.1.1.
-pub(crate) fn process_info_1_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [target] = args else {
-        return None;
-    };
-    let own = process.self_pid()?;
-    if Pid::from_term(*target) != Some(own)
-        || !process.sig_cont_empty()
-        || process.inbox.flags & crate::receive::FS_FLUSHING_SIGS != 0
-    {
-        return None;
-    }
-    let runtime = process.runtime.as_ref()?;
-    let busy = match process.signal_probe() {
-        Some(probe) => {
-            probe.maybe_self_sigs()
-                || probe.has_pending()
-                || probe
-                    .proc_state()
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    & arinsal_sched::psflg::SUSPENDED
-                    != 0
-        }
-        None => runtime.scheduler().ok()?.input_has_pending(own)? || runtime.suspend_active(own),
-    };
-    if busy {
-        return None;
-    }
-    let args = ProcessInfoArgs::parse(None).ok()?;
-    Some(
-        process_info(
-            None,
-            InfoSource::Caller,
-            process,
-            own,
-            None,
-            &args,
-            Term::atom(arinsal_term::atoms::RUNNING),
-            true,
-        )
-        .map_err(|error| match error {
-            VmError::Trap(trap) => trap,
-            _ => crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT)),
-        }),
-    )
-}
-
-fn process_info_light_single(
-    process: &mut Process,
-    pid: Pid,
-    own: Pid,
-    index: usize,
-    extra: Term,
-    always_wrap: bool,
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let key = PROCESS_INFO_ARG_ATOMS[index];
-    let runtime = process.runtime.as_ref()?;
-    let busy = match process.signal_probe() {
-        Some(probe) => {
-            probe.maybe_self_sigs()
-                || probe.has_pending()
-                || probe
-                    .proc_state()
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    & arinsal_sched::psflg::SUSPENDED
-                    != 0
-                || (pid != own && probe.has_incoming_signals())
-        }
-        None => runtime.scheduler().ok()?.input_has_pending(own)? || runtime.suspend_active(own),
-    };
-    if busy {
-        return None;
-    }
-    if own == pid {
-        if needs_vm(process, key) {
-            return None;
-        }
-        return match process_info_single(
-            None,
-            InfoSource::Caller,
-            process,
-            pid,
-            index,
-            extra,
-            always_wrap,
-            Term::atom(arinsal_term::atoms::RUNNING),
-            true,
-        ) {
-            Ok(term) => Some(Ok(term)),
-            Err(VmError::Trap(trap)) => Some(Err(trap)),
-            Err(_) => None,
-        };
-    }
-    if !remote_readable(key) {
-        return None;
-    }
-    let scheduler = runtime.scheduler().ok()?;
-    match scheduler.inspect_signal_free(pid, |target| {
-        if needs_vm(target, key) {
-            return None;
-        }
-        Some(process_info_single(
-            None,
-            InfoSource::Other(target),
-            process,
-            pid,
-            index,
-            extra,
-            always_wrap,
-            Term::atom(arinsal_term::atoms::RUNNING),
-            true,
-        ))
-    }) {
-        Ok(Some(Ok(term))) => Some(Ok(term)),
-        Ok(Some(Err(VmError::Trap(trap)))) => Some(Err(trap)),
-        Ok(Some(Err(_))) => None,
-        Ok(None) => None,
-        Err(arinsal_sched::SignalFreeError::NoProcess) => {
-            Some(Ok(Term::atom(arinsal_term::atoms::UNDEFINED)))
-        }
-        Err(arinsal_sched::SignalFreeError::Busy) => None,
-    }
-}
-
-// Port of the singleton branch in erts_process_info (erl_bif_info.c), OTP-29.1.1.
-#[allow(clippy::too_many_arguments)]
-fn process_info_single(
-    vm: Option<&Vm>,
-    src: InfoSource<'_>,
-    process: &mut Process,
-    pid: Pid,
-    index: usize,
-    extra: Term,
-    always_wrap: bool,
-    status: Term,
-    charge: bool,
-) -> Result<Term, VmError> {
-    let mut reserve = 3 + info_reserve_words(index);
-    let mut info_reds = 0;
-    let result = process_info_aux(
-        vm,
-        src,
-        process,
-        pid,
-        index,
-        extra,
-        always_wrap,
-        status,
-        &mut reserve,
-        &mut info_reds,
-    );
-    if charge {
-        charge_info_reductions(process, info_reds);
-    }
-    result
-}
-
 /// Charge the reductions of one `process_info` call (erl_bif_info.c:1601 and :1424, BUMP_REDS),
 /// after its values are built, so this call's bump is visible to the next `process_info`.
 // FCALLS is the live counter from native code and from the executor alike (`fold_fcalls`).
@@ -2506,8 +2240,8 @@ fn charge_info_reductions(process: &mut Process, info_reds: i32) {
 }
 
 // Port of erts/emulator/beam/erl_bif_info.c:1555 (process_info_2), OTP-29.1.1.
-fn process_info_call(
-    vm: &Vm,
+pub(crate) fn process_info_call(
+    vm: Option<&Vm>,
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     target: Term,
@@ -2516,7 +2250,9 @@ fn process_info_call(
     let args = ProcessInfoArgs::parse(item)?;
     let readable = args.all_remote_readable();
     let pid = Pid::from_term(target).ok_or_else(badarg)?;
-    if pid == ctx.pid() {
+    // Port of erts/emulator/beam/erl_bif_info.c:1355 (`c_p->common.id == pid`), OTP-29.1.1.
+    // The BIF process is `c_p`, not `esdp->current_process`.
+    if target.tagged_word() == process.heap.abi.self_pid {
         match process.pi_maybe_flush_signals(ctx)? {
             crate::process::FlushSignals::Done => {}
             crate::process::FlushSignals::Yield => {
@@ -2540,7 +2276,7 @@ fn process_info_call(
             }
         }
         return process_info(
-            Some(vm),
+            vm,
             InfoSource::Caller,
             process,
             pid,
@@ -2561,7 +2297,7 @@ fn process_info_call(
                 return None;
             }
             Some(process_info(
-                Some(vm),
+                vm,
                 InfoSource::Other(target),
                 process,
                 pid,
@@ -2613,20 +2349,20 @@ fn process_info_call(
             )))
         }
         Err(arinsal_sched::Error::NoProcess) => Ok(Term::atom(arinsal_term::atoms::UNDEFINED)),
-        Err(error) => Err(VmError::Unsupported(format!(
-            "process_info request: {error}"
+        Err(arinsal_sched::Error::Capacity) => Err(VmError::Trap(crate::exceptions::Trap::error(
+            Term::atom(arinsal_term::atoms::SYSTEM_LIMIT),
         ))),
     }
 }
 
-/// Resolve the statically registered process-info BIFs without the generic string family.
-// Port of erts/emulator/beam/erl_bif_info.c:1555-1566 (`process_info_1/2`), OTP-29.1.1.
+/// Resolve `process_info/1` without the generic string family. `/2` is `bif_table` `process_info_2`.
+// Port of erts/emulator/beam/erl_bif_info.c:1560 (`process_info_1`), OTP-29.1.1.
 pub(crate) fn process_info_handler(
     module: &str,
     function: &str,
     arity: u8,
 ) -> Option<super::ResolvedNative> {
-    (module == "erlang" && function == "process_info" && matches!(arity, 1 | 2))
+    (module == "erlang" && function == "process_info" && arity == 2)
         .then_some(process_info_resolved)
 }
 
@@ -2637,8 +2373,13 @@ fn process_info_resolved(
     args: super::NativeArgs<'_>,
 ) -> Option<Result<Term, VmError>> {
     args.with_values(process, |process, values| match values {
-        [target] => Some(process_info_call(vm, process, ctx, *target, None)),
-        [target, item] => Some(process_info_call(vm, process, ctx, *target, Some(*item))),
+        [target, item] => Some(process_info_call(
+            Some(&*vm),
+            process,
+            ctx,
+            *target,
+            Some(*item),
+        )),
         _ => None,
     })
 }
@@ -2935,7 +2676,7 @@ fn group_leader_3(
 
 // Port of erts/emulator/beam/erl_bif_info.c:4133 (erts_internal_process_display_2),
 // OTP-29.1.1.
-fn process_display_call(
+pub(crate) fn process_display_call(
     module: &str,
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
@@ -3052,9 +2793,6 @@ fn call_values(
     {
         return None;
     }
-    if function == "fun_info_mfa" && module != "erlang" {
-        return None;
-    }
     if !recognizes(module, function, args.len() as u8) {
         return None;
     }
@@ -3062,22 +2800,6 @@ fn call_values(
         match (function, args) {
             ("group_leader", [leader, pid, reference]) if module == "erts_internal" => {
                 group_leader_3(process, ctx, *leader, *pid, *reference)
-            }
-            // Port of erts/emulator/beam/erl_bif_info.c:4932-4945
-            // (erts_internal_is_system_process_1), OTP-29.1.1: `erts_proc_lookup(pid)` and its
-            // immutable `static_flags`, without the process lock.
-            ("is_system_process", [target]) if module == "erts_internal" => {
-                let pid = Pid::from_term(*target).ok_or_else(badarg)?;
-                let is_system = process
-                    .runtime
-                    .and_then(|runtime| runtime.scheduler().ok())
-                    .and_then(|scheduler| scheduler.static_flags(pid))
-                    .is_some_and(|flags| flags & crate::proc_create::ERTS_STC_FLG_SYSTEM_PROC != 0);
-                Ok(Term::atom(if is_system {
-                    arinsal_term::atoms::TRUE
-                } else {
-                    arinsal_term::atoms::FALSE
-                }))
             }
             // Port of erts/emulator/beam/bif.c:4505 (pid_to_list_1), OTP-29.1.1.
             ("pid_to_list", [pid]) if module == "erlang" => {
@@ -3143,8 +2865,9 @@ fn call_values(
                     None => Ok(Term::atom(arinsal_term::atoms::BADTYPE)),
                 }
             }
-            ("process_info", [pid]) => process_info_call(vm, process, ctx, *pid, None),
-            ("process_info", [pid, item]) => process_info_call(vm, process, ctx, *pid, Some(*item)),
+            ("process_info", [pid, item]) => {
+                process_info_call(Some(&*vm), process, ctx, *pid, Some(*item))
+            }
             ("hibernate", [module, function, args]) => {
                 hibernate(process, vm.x_regs()?, *module, *function, *args)
             }
@@ -3152,15 +2875,8 @@ fn call_values(
             ("suspend_process", [pid, options]) if module == "erts_internal" => {
                 suspend_process(process, ctx, *pid, *options)
             }
-            ("resume_process", [pid]) => resume_process(process, *pid),
             ("dist_spawn_request", [node, mfa, options, kind]) => {
                 dist_spawn_request(vm, process, ctx, *node, *mfa, *options, *kind)
-            }
-            ("process_display", [target, display]) if module == "erts_internal" => {
-                process_display_call(module, process, ctx, *target, *display)
-            }
-            ("processes_next", [cursor]) if module == "erts_internal" => {
-                processes_next(process, ctx, *cursor)
             }
             // Port of erts/emulator/beam/erl_bif_trace.c:889-918 (erts_internal_trace_3/4),
             // OTP-29.1.1.
@@ -3191,50 +2907,6 @@ fn call_values(
                     let session = trace_session_id(process, session).ok_or_else(badarg)?;
                     trace_pattern(vm, process, ctx, session, spec, pattern, flags)
                 })
-            }
-            ("trace_session_create", [name, tracer, options]) if module == "erts_internal" => {
-                trace_session_create(process, ctx, *name, *tracer, *options)
-            }
-            // Port of erts/emulator/beam/erl_bif_trace.c:1278-1322
-            // (erts_internal_trace_session_destroy_1), OTP-29.1.1.
-            ("trace_session_destroy", [session]) if module == "erts_internal" => {
-                let session_term = *session;
-                with_code_mod_permission(vm, process, ctx, |vm, process, _| {
-                    let session = trace_session_id(process, session_term).ok_or_else(badarg)?;
-                    let destroyed = crate::trace::destroy_session(process, session);
-                    if destroyed {
-                        crate::natives::erts_debug::session_destroyed(process, session_term);
-                        crate::trace_bp::clear_session(process, session);
-                        vm.refresh_all_trace_breakpoints(process);
-                    }
-                    Ok(Term::atom(if destroyed {
-                        arinsal_term::atoms::TRUE
-                    } else {
-                        arinsal_term::atoms::FALSE
-                    }))
-                })
-            }
-            // Port of erts/emulator/beam/erl_bif_trace.c:1386-1435 (trace_info_2,
-            // erts_internal_trace_info_3), OTP-29.1.1.
-            ("trace_info", [spec, item]) if module == "erlang" => {
-                let (spec, item) = (*spec, *item);
-                with_code_mod_permission(vm, process, ctx, |_vm, process, ctx| {
-                    trace_info(process, ctx, spec, item)
-                })
-            }
-            ("trace_info", [session, spec, item]) if module == "erts_internal" => {
-                let (session, spec, item) = (*session, *spec, *item);
-                with_code_mod_permission(vm, process, ctx, |_vm, process, ctx| {
-                    let session = if atom_name(session).as_deref() == Some("any") {
-                        0
-                    } else {
-                        trace_session_id(process, session).ok_or_else(badarg)?
-                    };
-                    trace_session_info(process, ctx, session, spec, item)
-                })
-            }
-            ("fun_info_mfa", [fun]) if module == "erlang" => {
-                crate::erl_bif_info::fun_info_mfa_1(process, &mut [*fun])
             }
             _ => {
                 debug_assert!(
@@ -3497,42 +3169,6 @@ fn parse_suspend_options(options: Term) -> Option<SuspendOptions> {
         asynchronous,
         tag,
     })
-}
-
-// Port of erts/emulator/beam/erl_process.c:9181 (`resume_process_1`), OTP-29.1.1.
-fn resume_process(process: &mut Process, target: Term) -> Result<Term, VmError> {
-    match resume_process_light(process, &[target]) {
-        Some(Ok(value)) => Ok(value),
-        Some(Err(trap)) => Err(VmError::Trap(trap)),
-        None => Err(badarg()),
-    }
-}
-
-/// `erlang:resume_process/1` called directly from native code (`c_p` only).
-// Port of erts/emulator/beam/erl_process.c:9181 (resume_process_1), OTP-29.1.1.
-pub(crate) fn resume_process_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [target] = args else {
-        return None;
-    };
-    if crate::trace::active() {
-        return None;
-    }
-    let me = process.self_pid()?;
-    let badarg = || {
-        Some(Err(crate::exceptions::Trap::error(Term::atom(
-            arinsal_term::atoms::BADARG,
-        ))))
-    };
-    let Some(target_pid) = Pid::from_term(*target).filter(|pid| *pid != me) else {
-        return badarg();
-    };
-    match crate::suspend::resume_remote(process, me, target_pid) {
-        None => badarg(),
-        Some(()) => Some(Ok(Term::atom(arinsal_term::atoms::TRUE))),
-    }
 }
 
 pub(crate) fn trace_session_id(process: &Process, session: Term) -> Option<u64> {
@@ -4120,9 +3756,8 @@ fn trace(
 }
 
 // Port of erts/emulator/beam/erl_bif_trace.c:1232-1276 (trace_session_create), OTP-29.1.1.
-fn trace_session_create(
+pub(crate) fn trace_session_create(
     process: &mut Process,
-    _ctx: &RunCtx<'_, crate::Process>,
     name: Term,
     tracer_term: Term,
     options: Term,
@@ -4262,7 +3897,7 @@ fn trace_session_refs_term(
 }
 
 // Port of erts/emulator/beam/erl_bif_trace.c:1403-1465, OTP-29.1.1.
-fn trace_session_info(
+pub(crate) fn trace_session_info(
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     session: u64,
@@ -4479,7 +4114,7 @@ fn trace_session_info(
     make_tuple(process, &[item, value])
 }
 
-fn trace_info(
+pub(crate) fn trace_info(
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     spec: Term,
@@ -5040,7 +4675,7 @@ fn trace_info_on_load(process: &mut Process, session: u64, item: Term) -> Result
 /// suspended between the code barriers of a breakpoint update continues it instead.
 // Port of erts/emulator/beam/erl_bif_trace.c:302-331, 889-918, 1386-1435 (seize, yield and
 // release around trace_pattern, trace, trace_info), OTP-29.1.1.
-fn with_code_mod_permission(
+pub(crate) fn with_code_mod_permission(
     vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
@@ -5603,15 +5238,24 @@ fn live_pids(process: &Process) -> Result<Vec<Pid>, VmError> {
     Ok(pids)
 }
 
-// Port of erts/emulator/beam/bif.c:4107 (erts_internal_processes_next_1)
-// and erl_ptab.c:1473 (erts_ptab_processes_next), OTP-29.1.1.
-// The cursor is the next process-table index, so exiting processes do not
-// invalidate a scan that is already in progress.
-fn processes_next(
-    process: &mut Process,
-    _ctx: &mut RunCtx<'_, crate::Process>,
-    cursor: Term,
-) -> Result<Term, VmError> {
+/// `erts_internal:processes_next/1`.
+// Port of erts/emulator/beam/bif.c:4107 (erts_internal_processes_next_1) and erl_ptab.c:1473
+// (erts_ptab_processes_next), OTP-29.1.1. The cursor is the next process-table index, so
+// exiting processes do not invalidate a scan that is already in progress.
+pub(crate) extern "C" fn processes_next_1(
+    c_p: *mut arinsal_beamasm::ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let [cursor] = crate::bif_table::bif_args::<1>(reg);
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let result = processes_next(process, cursor);
+    crate::natives::bif::bif_ret(c_p, i, result)
+}
+
+fn processes_next(process: &mut Process, cursor: Term) -> Result<Term, VmError> {
     let index = u32::try_from(cursor.as_small().ok_or_else(badarg)?).map_err(|_| badarg())?;
     let reds_left = u32::try_from(process.heap.abi.fcalls.max(1)).unwrap_or(1);
     let max_pids = reds_left;

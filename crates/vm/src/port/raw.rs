@@ -195,15 +195,6 @@ impl PortDataCell {
         Self(AtomicU64::new(initial))
     }
 
-    /// Load an immediate value without copying a heap block.
-    // Port of erts/emulator/beam/erl_bif_port.c:769 (`erts_port_data_read`), OTP-29.1.1.
-    pub(super) fn load_immediate(&self) -> Option<Term> {
-        let word = self.0.load(Ordering::Acquire);
-        (word != 0 && word & 3 != 0)
-            .then(|| Term::from_immed_word(word))
-            .flatten()
-    }
-
     /// Copy the current port data to the caller's process heap while the port-table lookup is
     /// protected by thread progress.
     // Port of erts/emulator/beam/erl_bif_port.c:743 (`port_get_data_1`), OTP-29.1.1.

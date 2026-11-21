@@ -6061,8 +6061,8 @@ impl<T: Task> RunCtx<'_, T> {
         esdp: &ErtsSchedulerData<T>,
         f: impl FnOnce(&mut RunCtx<'_, T>) -> R,
     ) -> Option<R> {
-        let current = esdp.current_process.borrow();
-        let process = current.as_ref()?;
+        // erts: `esdp->current_process` is a `Process *` copied, not a lock held across the BIF.
+        let process = esdp.current_process.borrow().clone()?;
         let mut ctx = RunCtx {
             proc: &process.shared,
             esdp,
@@ -6371,13 +6371,6 @@ impl<T: Task> RunCtx<'_, T> {
     pub fn exact_total_reductions(&self) -> u64 {
         erts_get_exact_total_reductions(&self.esdp.run_queue)
     }
-    /// Scheduler-owned task and timing snapshot including this turn's `current` reductions
-    /// (`erts_current_reductions`: what the running slice has used so far, not yet reported).
-    pub fn scheduler_stats(&self, current: u32) -> SchedulerStats {
-        let mut stats = erts_sched_stats(self.esdp);
-        stats.reductions = stats.reductions.saturating_add(u64::from(current));
-        stats
-    }
     /// Read run-queue lengths, with optional active scheduler counts, directly from the
     /// scheduler and dirty run-queue counters.
     // Port of erts/emulator/beam/erl_process.c:9240-9300 (erts_run_queues_len), OTP-29.1.1.
@@ -6484,11 +6477,7 @@ impl<T: Task> RunCtx<'_, T> {
     }
     /// Update this worker's active interval when scheduler wall time changes.
     pub fn set_wall_accounting_enabled(&mut self, enabled: bool) {
-        if self.esdp.wall_enabled.get() == enabled {
-            return;
-        }
-        self.esdp.wall_enabled.set(enabled);
-        erts_sched_wall_time_change(self.esdp, enabled);
+        self.esdp.set_wall_accounting_enabled(enabled);
     }
     /// Take the oldest signal from the outer signal queue, for a task without an inner
     /// queue of its own (and for an exiting process absorbing what is left).
@@ -6734,12 +6723,51 @@ impl<T: Task> RunCtx<'_, T> {
         erts_proc_sig_send_pending(self.esdp);
         erts_thr_progress_block_for(&self.esdp.run_queue, duration);
     }
-    /// Pause other scheduler threads while `op` changes state that must not race scheduling.
+}
+
+/// The scheduler-data operations BIFs reach through `erts_proc_sched_data(c_p)`.
+impl<T: Task> ErtsSchedulerData<T> {
+    /// Scheduler-wide reductions committed before this process turn.
+    pub fn total_reductions(&self) -> u64 {
+        erts_get_total_reductions(self)
+    }
+    /// Read exact reductions while all other managed schedulers are paused at a progress point.
+    pub fn exact_total_reductions(&self) -> u64 {
+        erts_get_exact_total_reductions(&self.run_queue)
+    }
+    /// Read run-queue lengths with optional active scheduler counts.
+    // Port of erts/emulator/beam/erl_process.c:9240-9300 (erts_run_queues_len), OTP-29.1.1.
+    pub fn erts_run_queues_len(&self, include_active: bool, include_dirty_io: bool) -> Vec<u64> {
+        self.run_queue
+            .erts_run_queues_len(include_active, include_dirty_io)
+    }
+    /// Read cheap scheduler counters without taking a scheduler-local snapshot.
+    pub fn statistics_counters(&self) -> (u64, u64, u64) {
+        self.run_queue.statistics_counters()
+    }
+    /// `erts_sched_stats` plus the running slice's `current` reductions
+    /// (`erts_current_reductions`: used so far, not yet reported).
+    pub fn scheduler_stats(&self, current: u32) -> SchedulerStats {
+        let mut stats = erts_sched_stats(self);
+        stats.reductions = stats.reductions.saturating_add(u64::from(current));
+        stats
+    }
+    /// `esdp->sched_wall_time.enabled` changed by `erts_sched_wall_time_request`.
+    // Port of erts/emulator/beam/erl_process.c (reply_sched_wall_time / sched_wall_time_change),
+    // OTP-29.1.1.
+    pub fn set_wall_accounting_enabled(&self, enabled: bool) {
+        if self.wall_enabled.get() == enabled {
+            return;
+        }
+        self.wall_enabled.set(enabled);
+        erts_sched_wall_time_change(self, enabled);
+    }
+    /// Runs `op` with every other managed thread blocked (`erts_thr_progress_block`).
     // Port of erts/emulator/beam/erl_process.c (erts_sched_stat_modify), OTP-29.1.1.
-    pub fn with_thread_progress_blocked(&mut self, op: impl FnOnce()) {
-        erts_proc_sig_send_pending(self.esdp);
+    pub fn with_thread_progress_blocked(&self, op: impl FnOnce()) {
+        erts_proc_sig_send_pending(self);
         let mut op = Some(op);
-        erts_thr_progress_block_during(&self.esdp.run_queue, &mut || {
+        erts_thr_progress_block_during(&self.run_queue, &mut || {
             op.take().expect("operation runs once")()
         });
     }
@@ -8342,7 +8370,9 @@ impl<T: Task> Scheduler<T> {
     /// (`erts_internal_is_process_executing_dirty_1`), OTP-29.1.1.
     pub fn is_executing_dirty(&self, pid: Pid) -> bool {
         self.inner.table.lookup(pid).is_some_and(|process| {
-            process.input.state().load(Ordering::Acquire) & psflg::DIRTY_RUNNING != 0
+            process.input.state().load(Ordering::Acquire)
+                & (psflg::DIRTY_RUNNING | psflg::DIRTY_RUNNING_SYS)
+                != 0
         })
     }
     /// Number of dirty CPU and dirty I/O scheduler threads.

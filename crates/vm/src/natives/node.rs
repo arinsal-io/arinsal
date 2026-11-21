@@ -2,8 +2,9 @@
 
 use crate::process::Message;
 use crate::{Process, Vm, VmError};
+use arinsal_beamasm::ProcessHeader;
 use arinsal_etf::OwnedTerm;
-use arinsal_sched::RunCtx;
+use arinsal_sched::{ErtsSchedulerData, RunCtx};
 use arinsal_term::{Term, TermBuilder, global_atoms, pflags};
 use num_bigint::BigInt;
 use std::io::Write;
@@ -11,15 +12,8 @@ use std::io::Write;
 use crate::node_tables;
 
 /// Halt and node-identity BIFs. `handler` is this table.
-pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
-    ("erlang", "halt", 2),
-    ("erlang", "nodes", 0),
-    ("erlang", "nodes", 1),
-    ("erlang", "nodes", 2),
-    ("erlang", "setnode", 2),
-    ("erlang", "monitor_node", 2),
-    ("erlang", "monitor_node", 3),
-];
+pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] =
+    &[("erlang", "halt", 2), ("erlang", "nodes", 0)];
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
@@ -33,11 +27,6 @@ pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler
     match (module, function, arity) {
         ("erlang", "halt", 2) => Some(call_halt2),
         ("erlang", "nodes", 0) => Some(call_nodes0),
-        ("erlang", "nodes", 1) => Some(call_nodes1),
-        ("erlang", "nodes", 2) => Some(call_nodes2),
-        ("erlang", "setnode", 2) => Some(call_setnode2),
-        ("erlang", "monitor_node", 2) => Some(call_monitor_node2),
-        ("erlang", "monitor_node", 3) => Some(call_monitor_node3),
         _ => None,
     }
 }
@@ -80,35 +69,28 @@ pub(crate) fn nodes0_bif(
     )
 }
 
-fn call_nodes1(
-    _vm: &mut Vm,
-    process: &mut Process,
-    _ctx: &mut RunCtx<'_, crate::Process>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    nodes(process, args[0], None)
+/// `erlang:nodes/2`.
+// Port of erts/emulator/beam/dist.c (nodes_2), OTP-29.1.1.
+pub(crate) extern "C" fn nodes_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let [types, options] = crate::bif_table::bif_args::<2>(reg);
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    crate::natives::bif::bif_ret(c_p, i, nodes(process, types, Some(options)))
 }
 
-pub(crate) fn call_nodes2(
-    _vm: &mut Vm,
+fn setnode(
     process: &mut Process,
-    _ctx: &mut RunCtx<'_, crate::Process>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    nodes(process, args[0], Some(args[1]))
-}
-
-fn call_setnode2(
-    _vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
-    args: &[Term],
+    esdp: &ErtsSchedulerData<Process>,
+    name_term: Term,
+    creation_term: Term,
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/dist.c:4978 (setnode_2), OTP-29.1.1.
-    let OwnedTerm::Atom(name) = &owned(args[0])? else {
+    let OwnedTerm::Atom(name) = &owned(name_term)? else {
         return Err(badarg());
     };
-    let creation_value = owned(args[1])?;
+    let creation_value = owned(creation_term)?;
     let creation = match &creation_value {
         OwnedTerm::Int(value) if (0..=u32::MAX as i64).contains(value) => *value as u32,
         OwnedTerm::BigInt(value)
@@ -131,8 +113,8 @@ fn call_setnode2(
     // thread reads the node identity while it changes.
     let mut success = false;
     let mut events = Vec::new();
-    let me = ctx.pid();
-    ctx.with_thread_progress_blocked(|| {
+    let me = process.self_pid().ok_or_else(badarg)?;
+    esdp.with_thread_progress_blocked(|| {
         let exiting = scheduler
             .with_proc_state(net_kernel, |state| {
                 state.load(std::sync::atomic::Ordering::Acquire) & arinsal_sched::psflg::EXITING
@@ -183,24 +165,6 @@ fn call_setnode2(
         return Err(badarg());
     }
     Ok(Term::atom(arinsal_term::atoms::TRUE))
-}
-
-fn call_monitor_node2(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    monitor_node(vm, process, ctx, args[0], args[1], None)
-}
-
-fn call_monitor_node3(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    monitor_node(vm, process, ctx, args[0], args[1], Some(args[2]))
 }
 
 pub(crate) fn node(term: Term) -> Result<Term, VmError> {
@@ -446,6 +410,43 @@ fn local_node_term() -> Term {
 /// `erlang:node/0`. The light-BIF pointer calls this; it does not enter the executor.
 pub(crate) fn node_0_term() -> Term {
     local_node_term()
+}
+
+/// `erlang:nodes/1`.
+// Port of erts/emulator/beam/dist.c:6245 (nodes_1), OTP-29.1.1.
+pub(crate) extern "C" fn nodes_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    crate::natives::bif::bif_process(c_p, reg, i, |process, [types]| nodes(process, types, None))
+}
+
+/// `erlang:setnode/2`.
+// Port of erts/emulator/beam/dist.c:4978 (setnode_2), OTP-29.1.1.
+pub(crate) extern "C" fn setnode_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let [name, creation] = crate::bif_table::bif_args::<2>(reg);
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let result = arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
+        setnode(process, esdp, name, creation)
+    })
+    .expect("a BIF runs on a scheduler (erts_proc_sched_data asserts esdp)");
+    crate::natives::bif::bif_ret(c_p, i, result)
+}
+
+/// `erlang:monitor_node/2`.
+// Port of erts/emulator/beam/dist.c:6665 (monitor_node_2), OTP-29.1.1.
+pub(crate) extern "C" fn monitor_node_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    crate::natives::bif::bif_sched(c_p, reg, i, |vm, process, ctx, [node, flag]| {
+        monitor_node(vm, process, ctx, node, flag, None)
+    })
+}
+
+/// `erlang:monitor_node/3`.
+// Port of erts/emulator/beam/dist.c:6657 (monitor_node_3), OTP-29.1.1.
+pub(crate) extern "C" fn monitor_node_3(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    crate::natives::bif::bif_sched(c_p, reg, i, |vm, process, ctx, [node, flag, options]| {
+        monitor_node(vm, process, ctx, node, flag, Some(options))
+    })
 }
 
 fn error(reason: &str) -> VmError {

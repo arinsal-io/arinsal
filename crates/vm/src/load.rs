@@ -57,38 +57,94 @@ impl<K: ModuleKey + ?Sized> ModuleKey for &K {
     }
 }
 
-/// Current modules by name atom: module.c's `module_tables[ix]` is keyed by the module atom
-/// index, so a lookup from a BIF hashes a word, not a string.
-// Port of erts/emulator/beam/module.c:47 (module_tables), OTP-29.1.1.
+/// `MODULE_LIMIT` (module.c): IndexTable cap for `module_code`.
+const MODULE_LIMIT: usize = 64 * 1024;
+
+/// One `IndexSlot` of `module_tables[ix]`: the module atom and its current instance.
+/// Old code stays in [`CodeTables::old`] until purge, as `Module.old`.
+// Port of erts/emulator/beam/module.h (`Module`), OTP-29.1.1.
+#[derive(Clone, Copy)]
+pub(crate) struct ModuleTableEntry {
+    /// `Module.module` (atom).
+    pub(crate) module: Atom,
+    /// Current code instance (`Module.curr`); `None` when `curr.code_length == 0`.
+    pub(crate) curr: Option<usize>,
+}
+
+/// `module_tables[ix]`: hash lookup by module atom plus a sequential index assigned at first
+/// `erts_put_module`. `erlang:loaded/0` walks `module_code(i)` for `i` in `0..entries`.
+/// Entries are never reused except when abort drops an uncommitted staging copy
+/// (`index_erase_latest_from`).
+// Port of erts/emulator/beam/module.c:47 (`module_tables`), `erts_put_module` /
+// `module_code` / `module_code_size`, and erts/emulator/beam/index.c (`IndexTable`),
+// OTP-29.1.1.
 #[derive(Clone, Default)]
-pub(crate) struct ModuleIndex(
-    HashMap<Atom, usize, std::hash::BuildHasherDefault<crate::process::IdHasher>>,
-);
+pub(crate) struct ModuleIndex {
+    /// Hash: module atom → table index (`index_get` / `erts_get_module`).
+    by_atom: HashMap<Atom, usize, std::hash::BuildHasherDefault<crate::process::IdHasher>>,
+    /// `seg_table` / `module_code(i)`: creation order. Index 0 is the first `erts_put_module`.
+    slots: Vec<ModuleTableEntry>,
+}
 
 impl ModuleIndex {
+    /// Current-code instance id (`erts_get_module` then `modp->curr`).
     pub(crate) fn get<K: ModuleKey + ?Sized>(&self, key: &K) -> Option<&usize> {
-        self.0.get(&key.atom()?)
+        let atom = key.atom()?;
+        let &ix = self.by_atom.get(&atom)?;
+        self.slots.get(ix)?.curr.as_ref()
     }
 
+    /// Whether the module has current code (`module_loaded` / `curr.code_hdr != NULL`).
     pub(crate) fn contains_key<K: ModuleKey + ?Sized>(&self, key: &K) -> bool {
-        key.atom().is_some_and(|atom| self.0.contains_key(&atom))
+        self.get(key).is_some()
     }
 
-    pub(crate) fn insert(&mut self, name: &str, id: usize) -> Option<usize> {
+    /// Port of module.c `put_module` / `erts_put_module` and index.c `index_put_entry`.
+    /// First insert of a name gets `entries`; a later put returns the same index.
+    pub(crate) fn put_module(&mut self, name: &str) -> Option<usize> {
         let atom = global_atoms().intern(name).ok()?;
-        self.0.insert(atom, id)
+        if let Some(&ix) = self.by_atom.get(&atom) {
+            return Some(ix);
+        }
+        let ix = self.slots.len();
+        if ix >= MODULE_LIMIT {
+            // Port of index.c:89 (`erts_exit(ERTS_DUMP_EXIT, "no more index entries in %s")`).
+            panic!("no more index entries in module_code (max={MODULE_LIMIT})");
+        }
+        self.slots.push(ModuleTableEntry {
+            module: atom,
+            curr: None,
+        });
+        self.by_atom.insert(atom, ix);
+        Some(ix)
     }
 
+    /// Makes `id` the current instance (`make_current` / `modp->curr`). Puts the module first.
+    pub(crate) fn insert(&mut self, name: &str, id: usize) -> Option<usize> {
+        let ix = self.put_module(name)?;
+        self.slots[ix].curr.replace(id)
+    }
+
+    /// Clears current code without dropping the table slot (delete_module: curr → old).
     pub(crate) fn remove<K: ModuleKey + ?Sized>(&mut self, key: &K) -> Option<usize> {
-        self.0.remove(&key.atom()?)
+        let atom = key.atom()?;
+        let &ix = self.by_atom.get(&atom)?;
+        self.slots.get_mut(ix)?.curr.take()
     }
 
-    pub(crate) fn keys(&self) -> impl Iterator<Item = &str> {
-        self.0.keys().filter_map(|atom| global_atoms().text(*atom))
+    /// Port of module.c `module_code_size` (`module_tables[ix].entries`).
+    pub(crate) fn code_size(&self) -> usize {
+        self.slots.len()
     }
 
+    /// Port of module.c `module_code(i, code_ix)`.
+    pub(crate) fn module_code(&self, i: usize) -> Option<&ModuleTableEntry> {
+        self.slots.get(i)
+    }
+
+    /// Current-code instance ids (`modp->curr` for every slot with code).
     pub(crate) fn values(&self) -> impl Iterator<Item = &usize> {
-        self.0.values()
+        self.slots.iter().filter_map(|entry| entry.curr.as_ref())
     }
 }
 
@@ -216,7 +272,6 @@ pub(crate) fn static_nif_module(name: &str) -> bool {
             | "prim_tty"
             | "prim_socket"
             | "prim_net"
-            | "re"
             | "erts_debug"
     )
 }
@@ -403,9 +458,7 @@ impl ExportIndex {
         };
         let key = (module, function, arity);
         self.put_atoms(module, function, arity);
-        if let Some(export) = crate::beamasm_integration::make_export(key) {
-            self.put_export(key, export);
-        }
+        self.put_export(key, crate::beamasm_integration::make_export(key));
     }
 
     /// `erts_find_function(M, F, A, code_ix) != NULL || erts_is_builtin(M, F, A)`.
@@ -679,6 +732,10 @@ impl CodeTables {
     /// Adds a module instance and returns its id.
     pub(crate) fn alloc(&mut self, module: Arc<Module>, meta: Option<CodeMeta>) -> usize {
         self.exports.note_module(&module);
+        // Port of erts/emulator/beam/beam_load.c:258 (`erts_put_module` in
+        // `erts_finish_loading`), OTP-29.1.1: the name gets its IndexTable slot before
+        // the instance is installed as curr or on_load.
+        self.loaded.put_module(&module.name);
         let id = alloc_slot(
             &mut SlotTable {
                 modules: &mut self.modules,
@@ -780,21 +837,6 @@ pub(crate) struct StagedLoad {
 }
 
 impl Vm {
-    /// Resolve a native record definition from the active module version.
-    pub(crate) fn native_record_definition(
-        &self,
-        module: &str,
-        name: &str,
-    ) -> Option<&arinsal_beam::NativeRecord> {
-        let id = *code_tables(erts_active_code_ix()).loaded.get(module)?;
-        code_tables(erts_active_code_ix())
-            .modules
-            .get(id)?
-            .records
-            .iter()
-            .find(|record| record.name == name)
-    }
-
     /// The node's code-loading handle, built once by `erl_init` (erl_init.c) after the global
     /// literals exist: the boot code path is `paths`, the current directory and the release's
     /// `lib/*/ebin`.
@@ -843,10 +885,6 @@ impl Vm {
     /// The coverage mode modules loaded now get (`code:get_coverage_mode/0`).
     pub(crate) fn coverage_mode(&self) -> arinsal_loader::CoverageMode {
         crate::code_ix::global().coverage_mode()
-    }
-
-    pub(crate) fn set_coverage_mode(&mut self, mode: arinsal_loader::CoverageMode) {
-        crate::code_ix::global().set_coverage_mode(mode);
     }
 
     /// Whether the coverage table or the debugger line metadata need the instructions
@@ -1098,6 +1136,11 @@ impl Vm {
         // together.
         let staging = crate::code_ix::global().start_staging();
         let not_purged: Vec<_> = staging.with(|tables| {
+            // Port of erts/emulator/beam/beam_bif_load.c:424-427 (finish_loading_1:
+            // `erts_put_module` for every prepared name before the not_purged check).
+            for name in &names {
+                tables.loaded.put_module(name);
+            }
             names
                 .iter()
                 .filter(|name| tables.loaded.contains_key(*name) && tables.old.contains_key(*name))
@@ -1414,5 +1457,62 @@ mod purge_free_tests {
         assert!(code_tables(erts_active_code_ix()).code_meta[id].is_none());
         native.unpublish();
         drop(native);
+    }
+}
+
+#[cfg(test)]
+mod module_index_tests {
+    use super::ModuleIndex;
+    use arinsal_term::global_atoms;
+
+    fn name_at(index: &ModuleIndex, i: usize) -> String {
+        global_atoms()
+            .text(index.module_code(i).expect("slot").module)
+            .expect("atom text")
+            .to_owned()
+    }
+
+    #[test]
+    fn put_module_index_is_creation_order() {
+        let mut index = ModuleIndex::default();
+        similar_asserts::assert_eq!(index.put_module("mi_first"), Some(0));
+        similar_asserts::assert_eq!(index.put_module("mi_second"), Some(1));
+        similar_asserts::assert_eq!(index.put_module("mi_first"), Some(0));
+        similar_asserts::assert_eq!(index.insert("mi_first", 11), None);
+        similar_asserts::assert_eq!(index.insert("mi_second", 22), None);
+        similar_asserts::assert_eq!(index.insert("mi_third", 33), None);
+        similar_asserts::assert_eq!(index.code_size(), 3);
+        similar_asserts::assert_eq!(name_at(&index, 0), "mi_first");
+        similar_asserts::assert_eq!(name_at(&index, 1), "mi_second");
+        similar_asserts::assert_eq!(name_at(&index, 2), "mi_third");
+        similar_asserts::assert_eq!(index.get("mi_first").copied(), Some(11));
+        similar_asserts::assert_eq!(index.remove("mi_first"), Some(11));
+        assert!(index.get("mi_first").is_none());
+        assert!(!index.contains_key("mi_first"));
+        similar_asserts::assert_eq!(index.code_size(), 3);
+        similar_asserts::assert_eq!(index.insert("mi_first", 44), None);
+        similar_asserts::assert_eq!(index.get("mi_first").copied(), Some(44));
+        similar_asserts::assert_eq!(name_at(&index, 0), "mi_first");
+        similar_asserts::assert_eq!(index.module_code(0).unwrap().curr, Some(44));
+
+        // loaded_0 CONS-walk: reverse creation order of slots that have curr or old.
+        let old = ["mi_second"];
+        let mut loaded = Vec::new();
+        for i in 0..index.code_size() {
+            let entry = index.module_code(i).unwrap();
+            let name = global_atoms().text(entry.module).unwrap();
+            if entry.curr.is_some() || old.contains(&name) {
+                loaded.push(name.to_owned());
+            }
+        }
+        loaded.reverse();
+        similar_asserts::assert_eq!(
+            loaded,
+            vec![
+                "mi_third".to_string(),
+                "mi_second".to_string(),
+                "mi_first".to_string()
+            ]
+        );
     }
 }

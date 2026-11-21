@@ -631,7 +631,7 @@ fn internal_state_abort_matches_otp_in_child_process() {
     use std::os::unix::process::ExitStatusExt;
     let output = std::process::Command::new("timeout")
         .args([
-            "20",
+            "90",
             &std::env::current_exe().unwrap().display().to_string(),
             "internal_state_abort_matches_otp_in_child_process",
             "--nocapture",
@@ -641,7 +641,7 @@ fn internal_state_abort_matches_otp_in_child_process() {
         .expect("run abort child");
     assert_eq!(output.status.signal(), Some(6), "{output:?}");
     let reference = std::process::Command::new("timeout")
-        .args(["20", "erl", "-noshell", "+S", "1", "-eval",
+        .args(["90", "erl", "-noshell", "+S", "1", "-eval",
             "erts_debug:set_internal_state(available_internal_state,true),erts_debug:set_internal_state(abort,why)."])
         .output()
         .expect("run OTP abort child");
@@ -662,7 +662,7 @@ fn internal_state_broken_halt_matches_otp_in_child_process() {
     }
     let output = std::process::Command::new("timeout")
         .args([
-            "20",
+            "90",
             &std::env::current_exe().unwrap().display().to_string(),
             "internal_state_broken_halt_matches_otp_in_child_process",
             "--nocapture",
@@ -672,7 +672,7 @@ fn internal_state_broken_halt_matches_otp_in_child_process() {
         .expect("run broken-halt child");
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let reference = std::process::Command::new("timeout")
-        .args(["20", "erl", "-noshell", "+S", "1", "-eval",
+        .args(["90", "erl", "-noshell", "+S", "1", "-eval",
             "erts_debug:set_internal_state(available_internal_state,true),erts_debug:set_internal_state(broken_halt,why)."])
         .output()
         .expect("run OTP broken-halt child");

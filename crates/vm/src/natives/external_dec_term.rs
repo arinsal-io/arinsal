@@ -373,8 +373,7 @@ fn dec_rare<H: HeapAlloc + ?Sized>(
             if flags.safe && crate::export::active_export_entry(mfa).is_none() {
                 return Err(BifError::BADARG);
             }
-            let export =
-                crate::export::export_get_or_make_stub(mfa).ok_or(BifError::SystemLimit)?;
+            let export = crate::export::export_get_or_make_stub(mfa);
             objp.store(
                 TermBuilder::new(&mut *fac)
                     .export_fun(export)

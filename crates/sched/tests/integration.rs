@@ -595,7 +595,7 @@ impl Task for ProgressRacer {
                 if this.blocker {
                     ctx.block_thread_progress(Duration::ZERO);
                 } else {
-                    let _ = ctx.scheduler_stats(0);
+                    let _ = ctx.esdp().scheduler_stats(0);
                 }
             }
             if this.rounds.fetch_add(1, Ordering::AcqRel) + 1 >= 400 {

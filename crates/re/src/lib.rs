@@ -880,6 +880,18 @@ fn import(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     })
 }
 
+/// Whether `re:compile` must `BIF_TRAP2` to `re:ucompile/2`.
+///
+/// Port of erts/emulator/beam/erl_bif_re.c (re_compile: parse_options, then
+/// `unicode && !is_bitstring`), OTP-29.1.1.
+pub fn compile_traps_to_ucompile(re_arg: Term, opts_arg: Term) -> Result<bool, BifError> {
+    let opts = options_term(opts_arg)?;
+    if opts.unique_exec {
+        return Err(badopt_error());
+    }
+    Ok(opts.unicode && re_arg.classify() != TermKind::Bitstring)
+}
+
 /// Dispatch an OTP `re` BIF while representing compiled patterns with an
 /// opaque magic reference, as ERTS does. The serialized PCRE2 code is retained
 /// by the reference so copied BEAM terms remain valid for their heap lifetime.

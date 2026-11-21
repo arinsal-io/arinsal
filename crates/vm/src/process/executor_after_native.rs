@@ -345,9 +345,7 @@ pub(super) fn context_switch(
             process.gc_live = export.arity as usize;
             if matches!(
                 export.class,
-                arinsal_loader::ImportClass::Native
-                    | arinsal_loader::ImportClass::Dynamic
-                    | arinsal_loader::ImportClass::Fun
+                arinsal_loader::ImportClass::Native | arinsal_loader::ImportClass::Dynamic
             ) || export.export_object().bif_number() != -1
             {
                 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:388-397
@@ -366,27 +364,6 @@ pub(super) fn context_switch(
                     .and_then(|cold| cold.bif_outcome.take());
                 let result = if let Some(outcome) = outcome {
                     Some(Err(*outcome))
-                } else if export.class == arinsal_loader::ImportClass::Fun
-                    && export.module == "erlang"
-                    && matches!(
-                        (export.function.as_str(), export.arity),
-                        ("make_fun", 3) | ("fun_info", 1 | 2) | ("fun_info_mfa", 1)
-                    )
-                {
-                    Some(match export.function.as_str() {
-                        "make_fun" => crate::bif::make_fun_3(process, &reg.x_reg_array[..3])
-                            .ok_or_else(|| VmError::Unsupported("make_fun BIF declined".into()))?
-                            .map_err(VmError::Trap),
-                        "fun_info" if export.arity == 2 => {
-                            crate::erl_bif_info::fun_info_2(process, &reg.x_reg_array[..2])
-                                .ok_or_else(|| {
-                                    VmError::Unsupported("fun_info/2 BIF declined".into())
-                                })
-                                .and_then(|result| result.map_err(VmError::Trap))
-                        }
-                        "fun_info" => (Vm {}).fun_info(process),
-                        _ => crate::erl_bif_info::fun_info_mfa_1(process, &mut reg.x_reg_array),
-                    })
                 } else {
                     // Port of erts/emulator/beam/jit/arm/process_main.cpp
                     // (context_switch_simplified), OTP-29.1.1: a light BIF

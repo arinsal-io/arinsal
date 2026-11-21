@@ -5678,7 +5678,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         // The fun is `entry`'s shared lambda; decoders pass the entry
         // `erts_export_get_or_make_stub` found.
         // Port of erts/emulator/beam/export.c:44-56 (create_shared_lambda), OTP-29.1.1.
-        crate::fun::export_lambda(entry)
+        Ok(crate::fun::export_lambda(entry))
     }
 
     /// Build the heap object referenced by a global `Export.lambda` literal.

@@ -1,6 +1,5 @@
 //! Process-aware BIFs. These use the running process and scheduler context.
 
-use crate::code_ix::{code_tables, erts_active_code_ix};
 use crate::process::{Message, Runtime};
 use crate::{Process, Vm, VmError};
 use arinsal_sched::{Pid, Priority, RunCtx, Signal};
@@ -18,7 +17,7 @@ pub(crate) static PF_SPAWN_FUN_SETUP_NS: std::sync::atomic::AtomicU64 =
 pub(crate) static PF_SPAWN_FUN_SCHED_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-fn atom_name(term: Term) -> Option<String> {
+pub(crate) fn atom_name(term: Term) -> Option<String> {
     global_atoms()
         .text(term.as_atom()?)
         .map(|name| name.to_string())
@@ -518,130 +517,6 @@ fn dirty_process_handle_signals(
     }))
 }
 
-fn deliver(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
-    to: Pid,
-    message: Term,
-) -> Result<(), VmError> {
-    // Port of erts/emulator/beam/erl_process.c:10574 (notify_sys_task_executed), OTP-29.1.1:
-    // `erts_queue_proc_message` to the requester, the caller itself included, so a reply to
-    // self goes through the signal in-queue like any other message.
-    if to != ctx.pid() && !crate::natives::proc::live(process, to)? {
-        return Ok(());
-    }
-    ctx.send(to, Message::copy_from(message)?)
-        .map_err(|error| VmError::Unsupported(format!("system task reply: {error}")))?;
-    Ok(())
-}
-
-fn task_tuple(process: &mut Process, values: &[Term]) -> Result<Term, VmError> {
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    TermBuilder::new(&mut heap)
-        .tuple(values)
-        .map_err(|error| VmError::Unsupported(format!("system task tuple: {error:?}")))
-}
-
-// Port of erts/emulator/beam/erl_process.c:11309 (request_system_task), OTP-29.1.1.
-// `copy_literals` is not a request type here; the literal-area collector sends
-// that work through `send_copy_request/3`.
-fn request_system_task(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    let (requester, target, priority, operation) = if args.len() == 3 {
-        (ctx.pid(), args[0], args[1], args[2])
-    } else {
-        let requester = Pid::from_term(args[0]).ok_or_else(|| badarg("request_system_task"))?;
-        (requester, args[1], args[2], args[3])
-    };
-    let priority_name = atom_name(priority).ok_or_else(|| badarg("request_system_task"))?;
-    // `inherit` takes the caller's user priority.
-    let priority = match priority_name.as_str() {
-        "inherit" => crate::natives::proc::user_priority(process),
-        name => crate::natives::proc::scheduler_priority(name)
-            .ok_or_else(|| badarg("request_system_task"))?,
-    };
-    let Some(target_pid) = Pid::from_term(target) else {
-        return Err(badarg("request_system_task"));
-    };
-    // SAFETY: The operation tuple stays rooted in the caller heap.
-    let tuple = unsafe { operation.tuple_ref() }.ok_or_else(|| badarg("request_system_task"))?;
-    if !(2..=4).contains(&tuple.len()) {
-        return Err(badarg("request_system_task"));
-    }
-    let req_type = tuple.get(0).ok_or_else(|| badarg("request_system_task"))?;
-    let req_id = tuple.get(1).ok_or_else(|| badarg("request_system_task"))?;
-    let arg0 = tuple.get(2);
-    let type_name = atom_name(req_type).ok_or_else(|| badarg("request_system_task"))?;
-    let alive = crate::natives::proc::live(process, target_pid)?;
-    let tag = match type_name.as_str() {
-        "garbage_collect" => {
-            let major = match arg0.and_then(atom_name).as_deref() {
-                Some("major") => true,
-                Some("minor") => false,
-                _ => return Err(badarg("request_system_task")),
-            };
-            // A request on the caller itself is a system task like any other: erts schedules
-            // it on the process (or sends it as an rpc signal behind pending signals) and the
-            // collection runs when the process executes its system tasks
-            // (erl_process.c:11309 request_system_task, `c_p->common.id == requester`).
-            let op = RemoteOp::Collect {
-                request_id: Message::copy_from(req_id)?,
-                major,
-            };
-            (op, "garbage_collect")
-        }
-        "check_process_code" => {
-            let module = arg0
-                .and_then(atom_name)
-                .ok_or_else(|| badarg("request_system_task"))?;
-            let old = code_tables(erts_active_code_ix()).old.get(&module).copied();
-            let op = RemoteOp::CheckProcessCode {
-                module: old,
-                native: old.and_then(|old| {
-                    crate::load::native_code_version(
-                        &code_tables(erts_active_code_ix()).code_meta,
-                        old,
-                    )
-                    .cloned()
-                }),
-                async_request: Some(Message::copy_from(req_id)?),
-                kill: false,
-            };
-            (op, "check_process_code")
-        }
-        "system_task_test" => {
-            let op = RemoteOp::SystemTaskTest {
-                request_id: Message::copy_from(req_id)?,
-            };
-            (op, "system_task_test")
-        }
-        _ => return Err(badarg("request_system_task")),
-    };
-    let (op, tag) = tag;
-    if alive
-        && matches!(
-            submit_sys_task(process, ctx, requester, target_pid, op, priority)?,
-            Submit::Sent
-        )
-    {
-        return Ok(Term::atom(arinsal_term::atoms::OK));
-    }
-    // Port of erts/emulator/beam/erl_process.c:11466 (noproc: notify_sys_task_executed), OTP-29.1.1.
-    let message = task_tuple(
-        process,
-        &[
-            crate::atom_cache::put(tag),
-            req_id,
-            Term::atom(arinsal_term::atoms::FALSE),
-        ],
-    )?;
-    deliver(process, ctx, requester, message)?;
-    Ok(Term::atom(arinsal_term::atoms::OK))
-}
-
 /// Process BIFs resolved before the process-independent BIF table.
 ///
 /// [`call`] admits every `erlang` function name in this table at any arity.
@@ -651,15 +526,8 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erlang", "monitor", 3),
     ("erlang", "demonitor", 1),
     ("erlang", "demonitor", 2),
-    ("erlang", "trace_delivered", 1),
     ("erts_internal", "spawn_system_process", 3),
     ("erts_internal", "dirty_process_handle_signals", 1),
-    ("erts_internal", "is_process_alive", 2),
-    ("erts_internal", "is_process_executing_dirty", 1),
-    ("erts_internal", "request_system_task", 3),
-    ("erts_internal", "request_system_task", 4),
-    ("erts_trace_cleaner", "check", 0),
-    ("erts_trace_cleaner", "send_trace_clean_signal", 1),
 ];
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -673,15 +541,8 @@ pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
 
 #[derive(Clone, Copy)]
 enum SignalBif {
-    TraceDelivered1,
     SpawnSystemProcess3,
     DirtyProcessHandleSignals1,
-    IsProcessAlive2,
-    IsProcessExecutingDirty1,
-    RequestSystemTask3,
-    RequestSystemTask4,
-    TraceCleanerCheck0,
-    TraceCleanerSend1,
 }
 
 macro_rules! resolved_signal_handler {
@@ -837,15 +698,8 @@ fn finish_demonitor_origin(
     }
 }
 
-resolved_signal_handler!(trace_delivered1, TraceDelivered1);
 resolved_signal_handler!(spawn_system_process3, SpawnSystemProcess3);
 resolved_signal_handler!(dirty_process_handle_signals1, DirtyProcessHandleSignals1);
-resolved_signal_handler!(is_process_alive2, IsProcessAlive2);
-resolved_signal_handler!(is_process_executing_dirty1, IsProcessExecutingDirty1);
-resolved_signal_handler!(request_system_task3, RequestSystemTask3);
-resolved_signal_handler!(request_system_task4, RequestSystemTask4);
-resolved_signal_handler!(trace_cleaner_check0, TraceCleanerCheck0);
-resolved_signal_handler!(trace_cleaner_send1, TraceCleanerSend1);
 
 pub(crate) fn handler(
     module: &str,
@@ -853,15 +707,8 @@ pub(crate) fn handler(
     arity: u8,
 ) -> Option<crate::natives::ResolvedNative> {
     Some(match (module, function, arity) {
-        ("erlang", "trace_delivered", 1) => trace_delivered1,
         ("erts_internal", "spawn_system_process", 3) => spawn_system_process3,
         ("erts_internal", "dirty_process_handle_signals", 1) => dirty_process_handle_signals1,
-        ("erts_internal", "is_process_alive", 2) => is_process_alive2,
-        ("erts_internal", "is_process_executing_dirty", 1) => is_process_executing_dirty1,
-        ("erts_internal", "request_system_task", 3) => request_system_task3,
-        ("erts_internal", "request_system_task", 4) => request_system_task4,
-        ("erts_trace_cleaner", "check", 0) => trace_cleaner_check0,
-        ("erts_trace_cleaner", "send_trace_clean_signal", 1) => trace_cleaner_send1,
         _ => return None,
     })
 }
@@ -1044,13 +891,6 @@ fn call_resolved(
     args: &[Term],
 ) -> Result<Term, VmError> {
     match (entry, args) {
-        (SignalBif::TraceDelivered1, [target]) => trace_delivered(process, ctx, *target),
-        (SignalBif::IsProcessAlive2, [pid, reference]) => {
-            is_process_alive_2(process, ctx, *pid, *reference)
-        }
-        (SignalBif::IsProcessExecutingDirty1, [pid]) => is_process_executing_dirty(process, *pid),
-        (SignalBif::TraceCleanerCheck0, []) => Ok(Term::atom(arinsal_term::atoms::FALSE)),
-        (SignalBif::TraceCleanerSend1, [to]) => trace_cleaner_send(process, ctx, *to),
         (SignalBif::SpawnSystemProcess3, [module, function, args]) => {
             // Port of erts/emulator/beam/erl_init.c (erts_internal_spawn_system_process_3:
             // erl_spawn_system_process with default options), OTP-29.1.1.
@@ -1069,8 +909,6 @@ fn call_resolved(
         (SignalBif::DirtyProcessHandleSignals1, [arg]) => {
             dirty_process_handle_signals(vm, process, ctx, *arg)
         }
-        (SignalBif::RequestSystemTask3, [_, _, _])
-        | (SignalBif::RequestSystemTask4, [_, _, _, _]) => request_system_task(process, ctx, args),
         _ => Err(VmError::Unsupported("resolved signal BIF arity".into())),
     }
 }
@@ -1955,7 +1793,7 @@ pub(crate) fn alive_response(
 }
 
 // Port of erts/emulator/beam/erl_bif_info.c:4049 (erts_internal_is_process_alive_2), OTP-29.1.1.
-fn is_process_alive_2(
+pub(crate) fn is_process_alive_2(
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     pid: Term,
@@ -2000,27 +1838,13 @@ fn is_process_alive_2(
     }
 }
 
-// Port of erts/emulator/beam/erl_process.c:9216
-// (erts_internal_is_process_executing_dirty_1), OTP-29.1.1.
-fn is_process_executing_dirty(process: &Process, pid: Term) -> Result<Term, VmError> {
-    let Some(pid) = Pid::from_term(pid) else {
-        return Err(badarg("is_process_executing_dirty/1"));
-    };
-    let dirty = runtime(process)?.scheduler()?.is_executing_dirty(pid);
-    Ok(Term::atom(if dirty {
-        arinsal_term::atoms::TRUE
-    } else {
-        arinsal_term::atoms::FALSE
-    }))
-}
-
 /// `erlang:trace_delivered/1`: the reply is a system message that the last scheduler sends
 /// when it has run the request at its next scheduling point, so every trace message the
 /// schedulers produced before it is in the caller's queue first.
 // Port of erts/emulator/beam/erl_bif_trace.c (trace_delivered_1, reply_trace_delivered_all),
 // OTP-29.1.1: `erts_schedule_multi_misc_aux_work` over all schedulers with `refc` set to their
 // number; the one that drops it to zero does `erts_send_sys_msg_proc`.
-fn trace_delivered(
+pub(crate) fn trace_delivered(
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     target: Term,
@@ -2054,13 +1878,9 @@ fn trace_delivered(
 
 // Port of erts/emulator/beam/erl_bif_trace.c:650
 // (erts_trace_cleaner_send_trace_clean_signal_1), OTP-29.1.1.
-fn trace_cleaner_send(
-    process: &Process,
-    ctx: &RunCtx<'_, crate::Process>,
-    to: Term,
-) -> Result<Term, VmError> {
+pub(crate) fn trace_cleaner_send(process: &Process, to: Term) -> Result<Term, VmError> {
     let is_cleaner = process.runtime.as_ref().is_some_and(|runtime| {
-        runtime.reg.whereis_proc_str("erts_trace_cleaner") == Some(ctx.pid())
+        runtime.reg.whereis_proc_str("erts_trace_cleaner") == process.self_pid()
     });
     if !is_cleaner {
         return Err(VmError::Trap(crate::exceptions::Trap::error(Term::atom(

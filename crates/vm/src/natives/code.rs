@@ -3,9 +3,9 @@
 use crate::code_ix::{code_tables, erts_active_code_ix};
 use crate::process::Runtime;
 use crate::{CodeMeta, Process, Vm, VmError, exceptions};
+use arinsal_beamasm::ProcessHeader;
 use arinsal_bifs::ProcessHeapHandle;
 use arinsal_etf::OwnedTerm;
-use arinsal_loader::CoverageMode;
 use arinsal_sched::Pid;
 use arinsal_sched::{LiteralCopyHow, RunCtx, Signal};
 use arinsal_term::{MagicBin, Term, TermBuilder, atoms, from_owned, global_atoms, to_owned};
@@ -410,25 +410,29 @@ impl Prepared {
 
 /// `erlang:has_prepared_code_on_load/1`.
 // Port of erts/emulator/beam/beam_bif_load.c (has_prepared_code_on_load_1), OTP-29.1.1.
-pub(crate) fn has_prepared_code_on_load_1(
-    _vm: &mut Vm,
-    _process: &mut Process,
-    _ctx: &mut RunCtx<'_, crate::Process>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    has_prepared_code_on_load(args[0])
+pub(crate) extern "C" fn has_prepared_code_on_load_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let [prepared] = crate::bif_table::bif_args::<1>(reg);
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    crate::natives::bif::bif_ret(c_p, i, has_prepared_code_on_load(prepared))
 }
 
-/// `erlang:finish_loading/1`.
+/// `erlang:finish_loading/1` yields while code-load permission or a code barrier is pending.
 // Port of erts/emulator/beam/beam_bif_load.c (finish_loading_1), OTP-29.1.1.
-pub(crate) fn finish_loading_1(
+fn finish_loading_1(
     vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     let pid = ctx.pid();
-    finish(vm, process, Some(ctx), Some(pid), args)
+    finish(vm, process, Some(ctx.esdp()), Some(pid), args)
 }
 
 fn has_prepared_code_on_load(term: Term) -> Result<Term, VmError> {
@@ -491,7 +495,7 @@ fn info_list(
     make_list(process, items)
 }
 
-fn module_info(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
+pub(crate) fn module_info(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     let name = module_name(args[0]).ok_or_else(badarg)?;
     let id = code_tables(erts_active_code_ix())
         .loaded
@@ -935,18 +939,13 @@ fn release_code_load_permission(process: &Process, pid: Option<Pid>) {
 fn finish(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: Option<&mut RunCtx<'_, crate::Process>>,
+    esdp: Option<&arinsal_sched::ErtsSchedulerData<crate::Process>>,
     pid: Option<Pid>,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    if process.runtime.is_some() && ctx.is_none() {
-        return Err(VmError::Unsupported(
-            "finish_loading requires its scheduler context".into(),
-        ));
-    }
     seize_code_load_permission(process, pid)?;
     let mut barrier = false;
-    let result = finish_stage(vm, process, ctx, pid, args, &mut barrier);
+    let result = finish_stage(vm, process, esdp, pid, args, &mut barrier);
     // A load waiting for its code barrier keeps the permission; commit_code_ix releases it.
     if !barrier {
         release_code_load_permission(process, pid);
@@ -959,7 +958,7 @@ fn finish(
 fn finish_stage(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: Option<&mut RunCtx<'_, crate::Process>>,
+    esdp: Option<&arinsal_sched::ErtsSchedulerData<crate::Process>>,
     pid: Option<Pid>,
     args: &[Term],
     barrier: &mut bool,
@@ -1027,8 +1026,8 @@ fn finish_stage(
                     .names
                     .iter()
                     .any(|name| crate::trace_bp::module_has_breakpoints(process, name));
-            let (Some(runtime), Some(pid), Some(ctx), false) =
-                (process.runtime, pid, ctx, blocking)
+            let (Some(runtime), Some(pid), Some(esdp), false) =
+                (process.runtime, pid, esdp, blocking)
             else {
                 for name in &staged.names {
                     crate::trace_bp::module_code_changed(process, name);
@@ -1053,7 +1052,10 @@ fn finish_stage(
             // ERTS_BIF_YIELD_RETURN.
             let ended = staged.ended;
             crate::suspend::suspend_self(process);
-            schedule_commit_code_ix(ctx, runtime, pid, ended);
+            arinsal_sched::RunCtx::with_current(esdp, |ctx| {
+                schedule_commit_code_ix(ctx, runtime, pid, ended)
+            })
+            .expect("finish_loading runs a process on this scheduler");
             *barrier = true;
             crate::bif_traps::vbump_all_reds(process);
             Err(VmError::TrapExport(crate::ExportTrap::new(
@@ -1114,126 +1116,6 @@ fn check_process_code(process: &mut Process, name: &str) -> bool {
     process.references_code(old, |address| {
         crate::load::native_code_contains(native.map(Arc::as_ref), address)
     })
-}
-
-// Port of erts/emulator/beam/erl_bif_coverage.c:50-116, OTP-29.1.1.
-fn coverage_mode_atom(mode: CoverageMode) -> Term {
-    Term::atom(match mode {
-        CoverageMode::None => arinsal_term::atoms::NONE,
-        CoverageMode::Function => arinsal_term::atoms::FUNCTION,
-        CoverageMode::FunctionCounters => arinsal_term::atoms::FUNCTION_COUNTERS,
-        CoverageMode::Line => arinsal_term::atoms::LINE,
-        CoverageMode::LineCounters => arinsal_term::atoms::LINE_COUNTERS,
-    })
-}
-
-fn coverage_mode_from(term: Term) -> Option<CoverageMode> {
-    let text = global_atoms().text(term.as_atom()?)?;
-    match text {
-        "none" => Some(CoverageMode::None),
-        "function" => Some(CoverageMode::Function),
-        "function_counters" => Some(CoverageMode::FunctionCounters),
-        "line" => Some(CoverageMode::Line),
-        "line_counters" => Some(CoverageMode::LineCounters),
-        _ => None,
-    }
-}
-
-fn coverage_module(module: Term) -> Result<&'static arinsal_loader::Module, VmError> {
-    let name = module_name(module).ok_or_else(badarg)?;
-    let id = code_tables(erts_active_code_ix())
-        .loaded
-        .get(&name)
-        .copied()
-        .ok_or_else(badarg)?;
-    code_tables(erts_active_code_ix())
-        .modules
-        .get(id)
-        .map(AsRef::as_ref)
-        .ok_or_else(badarg)
-}
-
-fn coverage_count(value: u64, flags: bool) -> Term {
-    if flags {
-        Term::atom(if value == 0 {
-            atoms::FALSE
-        } else {
-            atoms::TRUE
-        })
-    } else {
-        const MAX_SMALL: u64 = (1_u64 << 59) - 1;
-        Term::small(value.min(MAX_SMALL) as i64).expect("coverage counter fits small integer")
-    }
-}
-
-// Port of erts/emulator/beam/erl_bif_coverage.c:164-440, OTP-29.1.1.
-fn get_coverage(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
-    let mode = module_name(args[0]).ok_or_else(badarg)?;
-    let module = coverage_module(args[1])?;
-    let Some(coverage) = module.coverage.as_ref() else {
-        return Err(badarg());
-    };
-    let (flags, line_mode, ids, function_from_lines) = match (mode.as_str(), coverage.mode) {
-        ("function", CoverageMode::Function) => (true, false, false, false),
-        ("function", CoverageMode::FunctionCounters) => (false, false, false, false),
-        ("function", CoverageMode::Line | CoverageMode::LineCounters) => (true, false, false, true),
-        ("line", CoverageMode::Line) => (true, true, false, false),
-        ("line", CoverageMode::LineCounters) => (false, true, false, false),
-        ("cover_id_line", CoverageMode::LineCounters) => (false, true, true, false),
-        _ => return Err(badarg()),
-    };
-    if line_mode {
-        let mut rows = Vec::with_capacity(coverage.len());
-        for index in 0..coverage.len() {
-            let key = if ids {
-                coverage.cover_ids[index]
-            } else {
-                coverage.lines[index]
-            };
-            let count = coverage.load(index).unwrap_or(0);
-            let key = Term::small(i64::from(key)).ok_or_else(badarg)?;
-            rows.push(make_tuple(process, &[key, coverage_count(count, flags)])?);
-        }
-        return make_list(process, rows);
-    }
-    let mut rows = Vec::new();
-    for (index, (_, function, arity)) in module.functions.iter().enumerate() {
-        if *function == "module_info" && *arity <= 1 {
-            continue;
-        }
-        let count = if function_from_lines {
-            coverage
-                .function_owners
-                .iter()
-                .enumerate()
-                .filter(|(_, owner)| **owner as usize == index)
-                .any(|(counter, _)| coverage.load(counter).unwrap_or(0) > 0) as u64
-        } else {
-            let Some(count) = coverage.load(index) else {
-                continue;
-            };
-            count
-        };
-        let mfa = make_tuple(
-            process,
-            &[
-                crate::atom_cache::put(function),
-                Term::small(i64::from(*arity)).ok_or_else(badarg)?,
-            ],
-        )?;
-        rows.push(make_tuple(process, &[mfa, coverage_count(count, flags)])?);
-    }
-    make_list(process, rows)
-}
-
-// Port of erts/emulator/beam/erl_bif_coverage.c:444-482, OTP-29.1.1.
-fn reset_coverage(module: Term) -> Result<Term, VmError> {
-    let module = coverage_module(module)?;
-    let Some(coverage) = module.coverage.as_ref() else {
-        return Err(badarg());
-    };
-    coverage.reset();
-    Ok(Term::atom(arinsal_term::atoms::OK))
 }
 
 fn beamfile_chunk(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
@@ -1551,24 +1433,15 @@ pub(crate) fn finish_after_on_load(name: &str, keep: bool) -> Result<(), VmError
 
 /// Code-loading BIFs. `recognizes` is the same MFA set as the `match` in [`call`].
 pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
-    ("code", "coverage_support", 0),
-    ("code", "get_coverage", 2),
-    ("code", "get_coverage_mode", 0),
-    ("code", "get_coverage_mode", 1),
     ("code", "get_debug_info", 1),
-    ("code", "reset_coverage", 1),
-    ("code", "set_coverage_mode", 1),
     ("erts_internal", "beamfile_chunk", 2),
     ("erts_internal", "beamfile_module_md5", 1),
     ("erts_internal", "prepare_loading", 2),
-    ("erlang", "has_prepared_code_on_load", 1),
     ("erlang", "finish_loading", 1),
     ("erlang", "module_loaded", 1),
     ("erlang", "loaded", 0),
     ("erlang", "pre_loaded", 0),
     ("erlang", "function_exported", 3),
-    ("erlang", "get_module_info", 1),
-    ("erlang", "get_module_info", 2),
     ("erlang", "check_old_code", 1),
     ("erlang", "delete_module", 1),
     ("erts_internal", "purge_module", 2),
@@ -1746,7 +1619,7 @@ pub(crate) fn call(
         ("erts_internal", "purge_module", 2) | ("erlang", "delete_module", 1)
     ) && result.as_ref().is_some_and(Result::is_ok)
     {
-        super::sys::wake_literal_collector(process, ctx);
+        super::sys::wake_literal_collector(process, ctx.esdp());
     }
     result
 }
@@ -1764,34 +1637,10 @@ fn call_values(
         return None;
     }
     match (module, function, args.len()) {
-        // Port of erts/emulator/beam/erl_bif_coverage.c:39-45, OTP-29.1.1.
-        ("code", "coverage_support", 0) => Some(Ok(Term::atom(atoms::TRUE))),
-        ("code", "set_coverage_mode", 1) => Some((|| {
-            let next = coverage_mode_from(args[0]).ok_or_else(badarg)?;
-            let previous = vm.coverage_mode();
-            vm.set_coverage_mode(next);
-            Ok(coverage_mode_atom(previous))
-        })()),
-        ("code", "get_coverage_mode", 0) => Some(Ok(coverage_mode_atom(vm.coverage_mode()))),
-        ("code", "get_coverage_mode", 1) => Some((|| {
-            let module = coverage_module(args[0])?;
-            Ok(coverage_mode_atom(
-                module
-                    .coverage
-                    .as_ref()
-                    .map(|coverage| coverage.mode)
-                    .unwrap_or(CoverageMode::None),
-            ))
-        })()),
-        ("code", "get_coverage", 2) => Some(get_coverage(process, args)),
-        ("code", "reset_coverage", 1) => Some(reset_coverage(args[0])),
         ("code", "get_debug_info", 1) => Some(get_debug_info(process, args[0])),
         ("erts_internal", "beamfile_chunk", 2) => Some(beamfile_chunk(process, args)),
         ("erts_internal", "beamfile_module_md5", 1) => Some(beamfile_module_md5(process, args[0])),
         ("erts_internal", "prepare_loading", 2) => Some(prepare(vm, process, args)),
-        ("erlang", "has_prepared_code_on_load", 1) => {
-            Some(has_prepared_code_on_load_1(vm, process, ctx, args))
-        }
         ("erlang", "finish_loading", 1) => Some(finish_loading_1(vm, process, ctx, args)),
         ("erlang", "module_loaded", 1) => Some((|| {
             let name = module_name(args[0]).ok_or_else(badarg)?;
@@ -1807,11 +1656,23 @@ fn call_values(
             ))
         })()),
         ("erlang", "loaded", 0) => Some({
-            let modules = code_tables(erts_active_code_ix())
-                .loaded
-                .keys()
-                .map(crate::atom_cache::put)
-                .collect::<Vec<_>>();
+            // Port of erts/emulator/beam/beam_bif_load.c:762 (loaded_0), OTP-29.1.1:
+            // walk `module_code(i)` for i in 0..module_code_size and CONS each module
+            // with curr or old code, so the Erlang list is reverse creation order.
+            let tables = code_tables(erts_active_code_ix());
+            let mut modules = Vec::new();
+            for i in 0..tables.loaded.code_size() {
+                let Some(entry) = tables.loaded.module_code(i) else {
+                    continue;
+                };
+                let has_old = global_atoms()
+                    .text(entry.module)
+                    .is_some_and(|name| tables.old.contains_key(name));
+                if entry.curr.is_some() || has_old {
+                    modules.push(Term::atom(entry.module));
+                }
+            }
+            modules.reverse();
             make_list(process, modules)
         }),
         ("erlang", "pre_loaded", 0) => Some(make_list(
@@ -1860,8 +1721,6 @@ fn call_values(
                 });
             Ok(Term::atom(if result { atoms::TRUE } else { atoms::FALSE }))
         })()),
-        ("erlang", "get_module_info", 1) => Some(module_info(process, args)),
-        ("erlang", "get_module_info", 2) => Some(module_info(process, args)),
         ("erlang", "check_old_code", 1) => Some((|| {
             let name = module_name(args[0]).ok_or_else(badarg)?;
             Ok(Term::atom(
@@ -2032,7 +1891,9 @@ fn call_values(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::natives::erl_bif_coverage::{coverage_mode_from, get_coverage, reset_coverage};
     use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
+    use arinsal_loader::CoverageMode;
 
     fn loaded(vm: &mut Vm, bytes: &[u8]) -> OwnedTerm {
         loaded_many(vm, &[bytes])
@@ -2168,7 +2029,7 @@ mod tests {
             .unwrap();
 
         let mut vm = crate::boot::test_node();
-        vm.set_coverage_mode(CoverageMode::FunctionCounters);
+        crate::code_ix::global().set_coverage_mode(CoverageMode::FunctionCounters);
         loaded(&mut vm, &beam);
         vm.eval_exported(module, "run", &[]).unwrap();
         let mut process = Process::new();
@@ -2214,7 +2075,7 @@ mod tests {
             .unwrap();
 
         let mut vm = crate::boot::test_node();
-        vm.set_coverage_mode(CoverageMode::LineCounters);
+        crate::code_ix::global().set_coverage_mode(CoverageMode::LineCounters);
         loaded(&mut vm, &beam);
         vm.eval_exported(module, "run", &[]).unwrap();
         let mut process = Process::new();
@@ -2318,7 +2179,7 @@ mod tests {
             .eval("code:get_coverage(function, code_bifs_function_flags)")
             .unwrap();
         let mut vm = crate::boot::test_node();
-        vm.set_coverage_mode(CoverageMode::Function);
+        crate::code_ix::global().set_coverage_mode(CoverageMode::Function);
         loaded(&mut vm, &beam);
         vm.eval_exported(module, "run", &[]).unwrap();
         let mut process = Process::new();

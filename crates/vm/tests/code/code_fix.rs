@@ -5,40 +5,9 @@ use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
 use arinsal_vm::Vm;
 
-const CANDIDATES: &[&str] = &[
-    "lists",
-    "maps",
-    "proplists",
-    "string",
-    "unicode",
-    "array",
-    "queue",
-    "dict",
-    "sets",
-    "orddict",
-    "ordsets",
-    "gb_sets",
-    "gb_trees",
-    "digraph",
-    "sofs",
-    "calendar",
-    "math",
-    "filename",
-    "io_lib",
-    "re",
-    "binary",
-    "timer",
-    "gen",
-    "gen_server",
-    "proc_lib",
-    "filelib",
-    "beam_lib",
-    "base64",
-    "rand",
-    "uri_string",
-    "ets",
-    "supervisor",
-];
+/// Boot modules whose `module_info` parts (not exports) are compared. Export order of
+/// these depends on each node's load order; that is covered by a unique post-boot module.
+const CANDIDATES: &[&str] = &["lists", "maps", "proplists"];
 
 const PROBE: &str = r#"
 -module(code_fix_probe).
@@ -107,40 +76,53 @@ fn atom_term(name: &str) -> Term {
     )
 }
 
-fn object_code(reference: &RefErl, module: &str) -> Vec<u8> {
-    let result = reference.call("code", "get_object_code", &[OwnedTerm::atom(module)]);
-    let CallResult::Ok(term) = &result else {
-        panic!("{module}: get_object_code {result:?}");
-    };
-    let OwnedTerm::Tuple(parts) = term else {
-        panic!("{module}: get_object_code {term:?}");
-    };
-    parts
-        .iter()
-        .find_map(|part| match part {
-            OwnedTerm::Binary(bytes) => Some(bytes.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("{module}: object code has no binary"))
-}
-
-fn load_order(reference: &RefErl) -> Vec<String> {
-    let result = reference.call("erlang", "loaded", &[]);
-    let CallResult::Ok(term) = &result else {
-        panic!("erlang:loaded/0 {result:?}");
-    };
+fn loaded_names(term: &OwnedTerm) -> Vec<String> {
     let OwnedTerm::List { elems, .. } = term else {
         panic!("erlang:loaded/0 {term:?}");
     };
-    let mut names = elems
+    elems
         .iter()
         .map(|term| match term {
             OwnedTerm::Atom(name) => name.clone(),
             other => panic!("loaded entry {other:?}"),
         })
-        .collect::<Vec<_>>();
-    names.reverse();
-    names
+        .collect()
+}
+
+fn relative_loaded(term: &OwnedTerm, names: &[&str]) -> Vec<String> {
+    loaded_names(term)
+        .into_iter()
+        .filter(|name| names.iter().any(|want| *want == name))
+        .collect()
+}
+
+fn erlang_loaded(reference: &RefErl) -> OwnedTerm {
+    match reference.call("erlang", "loaded", &[]) {
+        CallResult::Ok(term) => term,
+        other => panic!("erlang:loaded/0 {other:?}"),
+    }
+}
+
+fn compile_export_mod(reference: &RefErl, module: &str) -> Vec<u8> {
+    reference
+        .compile_named(
+            module,
+            &format!(
+                "-module({module}). -export([z/0, a/1, m/2, k/0]). z() -> 1. a(_) -> 2. m(_, _) -> 3. k() -> 4."
+            ),
+            &[],
+        )
+        .unwrap_or_else(|error| panic!("compile {module}: {error}"))
+}
+
+fn compile_value_mod(reference: &RefErl, module: &str) -> Vec<u8> {
+    reference
+        .compile_named(
+            module,
+            &format!("-module({module}). -export([value/0]). value() -> ok."),
+            &[],
+        )
+        .unwrap_or_else(|error| panic!("compile {module}: {error}"))
 }
 
 fn run(vm: &mut Vm, function: &str, owned_args: &[OwnedTerm], terms: &[Term]) -> OwnedTerm {
@@ -162,39 +144,16 @@ fn lists_module_info_matches_erts_export_order() {
         eprintln!("erl unavailable; skipping module_info differential test");
         return;
     };
-    for module in CANDIDATES {
-        reference.call("code", "ensure_loaded", &[OwnedTerm::atom(*module)]);
-    }
-    let order = load_order(&reference);
-    let mut beams = std::collections::HashMap::new();
+    // Boot load order is racy in erl itself (init:load_modules / finish_loading).
+    // Compare export order only for a module loaded after boot on both nodes,
+    // not two independent boots' `lists:module_info(exports)`.
+    let unique = "loaded0_exp_mod";
+    let unique_beam = compile_export_mod(&reference, unique);
+    reference.load(unique, &unique_beam).unwrap();
     let mut vm = crate::common::node();
-    for name in &order {
-        let bytes = object_code(&reference, name);
-        vm.note_beam_exports(&bytes)
-            .unwrap_or_else(|error| panic!("note {name}: {error}"));
-        beams.insert(name.clone(), bytes);
-    }
-    let mut loaded = Vec::new();
-    for module in CANDIDATES {
-        let Some(bytes) = beams.get(*module) else {
-            continue;
-        };
-        if vm.load_bytes(bytes).is_ok() {
-            loaded.push(*module);
-        }
-        if loaded.len() == 20 && loaded.contains(&"lists") {
-            break;
-        }
-    }
-    assert!(
-        loaded.contains(&"lists"),
-        "lists.beam did not load: {loaded:?}"
-    );
-    assert!(
-        loaded.len() >= 20,
-        "only {} modules loaded: {loaded:?}",
-        loaded.len()
-    );
+    vm.load_bytes(&unique_beam)
+        .unwrap_or_else(|error| panic!("load {unique}: {error}"));
+
     let probe = reference
         .compile_named("code_fix_probe", PROBE, &[])
         .unwrap();
@@ -204,27 +163,99 @@ fn lists_module_info_matches_erts_export_order() {
     diff(
         &reference,
         &mut vm,
-        "full",
-        &[OwnedTerm::atom("lists")],
-        &[atom_term("lists")],
+        "exports",
+        &[OwnedTerm::atom(unique)],
+        &[atom_term(unique)],
     );
-    for module in &loaded {
-        diff(
-            &reference,
-            &mut vm,
-            "exports",
-            &[OwnedTerm::atom(*module)],
-            &[atom_term(module)],
-        );
+    diff(
+        &reference,
+        &mut vm,
+        "full",
+        &[OwnedTerm::atom(unique)],
+        &[atom_term(unique)],
+    );
+    diff(
+        &reference,
+        &mut vm,
+        "parts",
+        &[OwnedTerm::atom(unique)],
+        &[atom_term(unique)],
+    );
+
+    for module in CANDIDATES {
+        reference.call("code", "ensure_loaded", &[OwnedTerm::atom(*module)]);
+        let name = atom_term(module);
+        let loaded = vm
+            .eval_scheduled("code", "ensure_loaded", &[name], 1)
+            .ok()
+            .is_some_and(|result| result.text.starts_with("{module,"));
+        if !loaded {
+            assert_ne!(*module, "lists", "lists must load on both nodes");
+            continue;
+        }
+        // `parts` is code-header order (functions, attributes, compile, md5, nifs),
+        // not the export IndexTable, so it does not depend on boot load order.
         diff(
             &reference,
             &mut vm,
             "parts",
             &[OwnedTerm::atom(*module)],
-            &[atom_term(module)],
+            &[name],
         );
     }
     diff(&reference, &mut vm, "bad_info", &[], &[]);
+}
+
+#[test]
+fn loaded_0_explicit_modules_match_erts_creation_order() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping erlang:loaded/0 differential test");
+        return;
+    };
+    let names = ["loaded0_ord_a", "loaded0_ord_b", "loaded0_ord_c"];
+    let beams: Vec<_> = names
+        .iter()
+        .map(|name| compile_value_mod(&reference, name))
+        .collect();
+    for (name, beam) in names.iter().zip(&beams) {
+        reference.load(name, beam).unwrap();
+    }
+    let expected = relative_loaded(&erlang_loaded(&reference), &names);
+    similar_asserts::assert_eq!(
+        expected,
+        vec![
+            "loaded0_ord_c".to_string(),
+            "loaded0_ord_b".to_string(),
+            "loaded0_ord_a".to_string()
+        ]
+    );
+
+    let mut vm = crate::common::node();
+    for beam in &beams {
+        vm.load_bytes(beam)
+            .unwrap_or_else(|error| panic!("load: {error}"));
+    }
+    let actual = vm
+        .eval_scheduled("erlang", "loaded", &[], 1)
+        .unwrap_or_else(|error| panic!("erlang:loaded/0: {error}"));
+    similar_asserts::assert_eq!(relative_loaded(&actual.term, &names), expected);
+
+    // Reload of the first name keeps its IndexTable slot (erts_put_module).
+    reference.load(names[0], &beams[0]).unwrap();
+    vm.load_bytes(&beams[0]).unwrap();
+    let after_reload = relative_loaded(&erlang_loaded(&reference), &names);
+    similar_asserts::assert_eq!(
+        after_reload,
+        vec![
+            "loaded0_ord_c".to_string(),
+            "loaded0_ord_b".to_string(),
+            "loaded0_ord_a".to_string()
+        ]
+    );
+    let actual_reload = vm
+        .eval_scheduled("erlang", "loaded", &[], 1)
+        .unwrap_or_else(|error| panic!("erlang:loaded/0 reload: {error}"));
+    similar_asserts::assert_eq!(relative_loaded(&actual_reload.term, &names), after_reload);
 }
 
 #[test]

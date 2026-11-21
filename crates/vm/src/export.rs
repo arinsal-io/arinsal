@@ -73,18 +73,18 @@ pub(crate) fn is_bif_traced(module: &str, function: &str, arity: u32) -> bool {
 /// `erts_export_get_or_make_stub`: the export of `mfa`, or a new stub entering the export
 /// trampoline (whose call runs the error handler) entered in the export table.
 // Port of erts/emulator/beam/export.c:228-242 (erts_export_get_or_make_stub), OTP-29.1.1.
-pub(crate) fn export_get_or_make_stub(mfa: Mfa) -> Option<Arc<ExportEntry>> {
-    export_entry_or_stub(mfa).map(Arc::clone)
+pub(crate) fn export_get_or_make_stub(mfa: Mfa) -> Arc<ExportEntry> {
+    Arc::clone(export_entry_or_stub(mfa))
 }
 
 /// [`export_get_or_make_stub`] returning the table's shared owner.
-pub(crate) fn export_entry_or_stub(mfa: Mfa) -> Option<&'static Arc<ExportEntry>> {
+pub(crate) fn export_entry_or_stub(mfa: Mfa) -> &'static Arc<ExportEntry> {
     if let Some(export) = active_export_entry(mfa) {
-        return Some(export);
+        return export;
     }
-    let export = crate::beamasm_integration::make_export(mfa)?;
+    let export = crate::beamasm_integration::make_export(mfa);
     export_put_all(&[(mfa, export)]);
-    Some(export)
+    export
 }
 
 /// The shared `beam_export_trampoline` every export enters while its trampoline is active.

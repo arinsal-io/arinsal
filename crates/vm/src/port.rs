@@ -338,24 +338,6 @@ impl PortTable {
         self.slot_at((word >> 4) as usize & self.pix_mask)
     }
 
-    /// Run `f` on the live port with the tagged identifier `word`, a managed caller or not
-    /// (`erts_port_lookup_raw`: load the slot, compare `common.id`).
-    pub(crate) fn with_word<R>(
-        &self,
-        word: u64,
-        managed: bool,
-        f: impl FnOnce(&PortHandle) -> R,
-    ) -> Option<R> {
-        let slot = self.slot_of_word(word)?;
-        let found = |handle: &PortHandle| (handle.word == word).then(|| f(handle));
-        if managed {
-            slot.with_managed(found)
-        } else {
-            slot.with(self.progress.get()?, false, found)
-        }
-        .flatten()
-    }
-
     /// A counted reference to the live port with the tagged identifier `word`.
     pub(crate) fn get_word(&self, word: u64, managed: bool) -> Option<Arc<PortHandle>> {
         self.slot_of_word(word)?
@@ -1465,14 +1447,17 @@ fn trace_port_send(
     }
 }
 
-fn start(
+pub(crate) fn start(
     vm: &mut Vm,
     process: &mut Process,
     ctx: &RunCtx<'_, crate::Process>,
     spec: Term,
     opts: Term,
 ) -> Result<Term, VmError> {
-    let parsed_opts = options(opts).ok_or_else(badarg)?;
+    let parsed_opts = match options(opts) {
+        Some(opts) => opts,
+        None => return Ok(Term::atom(arinsal_term::atoms::BADOPT)),
+    };
     let spec = tuple(spec).ok_or_else(badarg)?;
     // Port of erts/emulator/beam/erl_bif_port.c:1086-1091, OTP-29.1.1.
     // An argv vector is valid only for an explicit spawn_executable port.
@@ -1934,9 +1919,9 @@ fn open_driver_port(
         // Port of erts/emulator/beam/erl_bif_port.c:102: the opener gets a
         // reference and the port, or the error, in `{Ref, Result}` from `erl_drv_init_ack`.
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        return TermBuilder::new(&mut heap)
+        return Ok(TermBuilder::new(&mut heap)
             .local_ref(arinsal_sched::unique::ordinary_ref_words(reference))
-            .map_err(|_| badarg());
+            .expect("HAlloc"));
     }
     Ok(port)
 }
@@ -3090,134 +3075,8 @@ struct PortDataBlock {
     _owners: arinsal_term::message::InlineHeapOwners,
 }
 
-/// Errors of a port BIF as the exception a light BIF raises; any other failure declines.
-fn light_result(result: Result<Term, VmError>) -> Option<Result<Term, crate::exceptions::Trap>> {
-    match result {
-        Ok(term) => Some(Ok(term)),
-        Err(VmError::Trap(trap)) => Some(Err(trap)),
-        Err(_) => None,
-    }
-}
-
-/// `erts_internal:port_info/1,2` called from the generated code with `c_p` only.
-// Port of erts/emulator/beam/erl_bif_port.c (erts_internal_port_info_1/2), OTP-29.1.1.
-pub(crate) fn port_info_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    match args {
-        [port] => light_result(port_info(process, *port, None)),
-        [port, item] => light_result(port_info(process, *port, Some(*item))),
-        _ => None,
-    }
-}
-
-/// `erts_internal:port_connect/2` called from the generated code with `c_p` only.
-// Port of erts/emulator/beam/erl_bif_port.c (erts_internal_port_connect_2), OTP-29.1.1.
-pub(crate) fn port_connect_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [port, pid] = args else {
-        return None;
-    };
-    light_result(connect(process, *port, *pid, None))
-}
-
-/// `erts_internal:port_close/1` called from the generated code with `c_p` only: the close
-/// signal executes at once when the port is free, else it is scheduled and the caller gets the
-/// reference to wait for.
-// Port of erts/emulator/beam/erl_bif_port.c:405 (erts_internal_port_close_1), OTP-29.1.1.
-pub(crate) fn port_close_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [port] = args else {
-        return None;
-    };
-    if crate::trace::active() {
-        return None;
-    }
-    let caller = process.self_pid()?;
-    light_result(port_close(process, None, caller, *port))
-}
-
-/// `erlang:port_get_data/1` for the thin light-BIF call site.
-pub(crate) struct PortGetData;
-
-impl crate::natives::ThinProcessBif for PortGetData {
-    const ARITY: usize = 1;
-
-    #[inline(always)]
-    fn call(process: &mut Process, args: &[Term]) -> Result<Term, Box<crate::exceptions::Trap>> {
-        // The data word of a live port holds an atom or a small integer (`inet_db` stores the
-        // module atom): one lookup and one load, as `erts_port_data_read` does.
-        if args[0].is_port()
-            && let Some(runtime) = process.runtime.as_ref()
-            && let Some(term) = runtime
-                .ports
-                .with_word(
-                    args[0].tagged_word(),
-                    process.on_normal_scheduler(),
-                    |handle| handle.data.load_immediate(),
-                )
-                .flatten()
-        {
-            return Ok(term);
-        }
-        port_get_data(process, args[0]).map_err(thin_failure)
-    }
-}
-
-/// `erlang:port_set_data/2` for the thin light-BIF call site.
-pub(crate) struct PortSetData;
-
-impl crate::natives::ThinProcessBif for PortSetData {
-    const ARITY: usize = 2;
-
-    #[inline(always)]
-    fn call(process: &mut Process, args: &[Term]) -> Result<Term, Box<crate::exceptions::Trap>> {
-        port_set_data(process, args[0], args[1]).map_err(thin_failure)
-    }
-}
-
-/// The exception of a port BIF that cannot decline.
-#[cold]
-fn thin_failure(error: VmError) -> Box<crate::exceptions::Trap> {
-    match error {
-        VmError::Trap(trap) => Box::new(trap),
-        _ => Box::new(crate::exceptions::Trap::error(Term::atom(
-            arinsal_term::atoms::BADARG,
-        ))),
-    }
-}
-
-/// `erlang:port_get_data/1` called from the generated code with `c_p` only.
 // Port of erts/emulator/beam/erl_bif_port.c:734 (port_get_data_1), OTP-29.1.1.
-pub(crate) fn port_get_data_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [port] = args else {
-        return None;
-    };
-    light_result(port_get_data(process, *port))
-}
-
-/// `erlang:port_set_data/2` called from the generated code with `c_p` only.
-// Port of erts/emulator/beam/erl_bif_port.c:687 (port_set_data_2), OTP-29.1.1.
-pub(crate) fn port_set_data_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [port, data] = args else {
-        return None;
-    };
-    light_result(port_set_data(process, *port, *data))
-}
-
-// Port of erts/emulator/beam/erl_bif_port.c:734 (port_get_data_1), OTP-29.1.1.
-fn port_get_data(process: &mut Process, port: Term) -> Result<Term, VmError> {
+pub(crate) fn port_get_data(process: &mut Process, port: Term) -> Result<Term, VmError> {
     let id = port_id(process, port).ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     let managed = process.on_normal_scheduler();
@@ -3232,7 +3091,7 @@ fn port_get_data(process: &mut Process, port: Term) -> Result<Term, VmError> {
 }
 
 // Port of erts/emulator/beam/erl_bif_port.c:687 (port_set_data_2), OTP-29.1.1.
-fn port_set_data(process: &Process, port: Term, data: Term) -> Result<Term, VmError> {
+pub(crate) fn port_set_data(process: &Process, port: Term, data: Term) -> Result<Term, VmError> {
     let handle = lookup_port(process, port)?;
     let new_data = if let Some(word) = port_data_word(data) {
         word
@@ -3250,49 +3109,18 @@ fn port_set_data(process: &Process, port: Term, data: Term) -> Result<Term, VmEr
 }
 
 pub(crate) fn family(
-    vm: &mut Vm,
+    _vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     module: &str,
     function: &str,
     args: &[Term],
 ) -> Option<Result<Term, VmError>> {
-    if module != "erts_internal" && module != "erlang" {
+    if module != "erts_internal" {
         return None;
     }
     let result = match (function, args) {
-        ("open_port", [spec, opts]) if module == "erts_internal" => {
-            start(vm, process, ctx, *spec, *opts)
-        }
-        ("port_command", [port, data, _]) if module == "erts_internal" => {
-            port_command(process, ctx, *port, *data, args)
-        }
-        ("port_close", [port]) if module == "erts_internal" => {
-            let caller = ctx.pid();
-            port_close(process, Some(ctx), caller, *port)
-        }
-        ("port_connect", [port, pid]) if module == "erts_internal" => {
-            connect(process, *port, *pid, None)
-        }
-        // Port of erts/emulator/beam/erl_bif_port.c:322 (erts_internal_port_control_3), OTP-29.1.1.
-        // Spawn and fd ports have no driver control. The internal BIF returns the
-        // atom `badarg`; `erlang:port_control/3` turns that atom into an exception.
-        ("port_control", [port, op, data]) if module == "erts_internal" => {
-            port_control(process, ctx, *port, *op, *data)
-        }
-        // Port of erts/emulator/beam/erl_bif_port.c:263 (erts_internal_port_call_3), OTP-29.1.1.
-        // Spawn/fd/inet ports here have no driver call path; return the atom `badarg`.
-        ("port_call", [port, op, data]) if module == "erts_internal" => {
-            port_call(process, ctx.pid(), *port, *op, *data)
-        }
-        ("port_get_data", [port]) if module == "erlang" => port_get_data(process, *port),
-        ("port_set_data", [port, data]) if module == "erlang" => {
-            port_set_data(process, *port, *data)
-        }
-        ("port_info", [port]) if module == "erts_internal" => port_info(process, *port, None),
-        ("port_info", [port, item]) if module == "erts_internal" => {
-            port_info(process, *port, Some(*item))
-        }
+        ("port_command", [port, data, _]) => port_command(process, ctx, *port, *data, args),
         _ => return None,
     };
     Some(result)
@@ -3300,7 +3128,7 @@ pub(crate) fn family(
 
 // Port of erts/emulator/beam/erl_bif_port.c:322 (erts_internal_port_control_3), OTP-29.1.1.
 // Non-inet ports still return the atom `badarg`. `tcp_inet` returns a byte list.
-fn port_control(
+pub(crate) fn port_control(
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     port: Term,
@@ -3324,11 +3152,8 @@ fn port_control(
     Ok(Term::atom(arinsal_term::atoms::BADARG))
 }
 
-pub(crate) use drv_sig::command_light as port_command_light;
-pub(crate) use drv_sig::control_light as port_control_light;
-
 // Port of erts/emulator/beam/erl_bif_port.c:263 (erts_internal_port_call_3), OTP-29.1.1.
-fn port_call(
+pub(crate) fn port_call(
     process: &mut Process,
     caller: Pid,
     port: Term,
@@ -3864,7 +3689,7 @@ fn close_inner(process: &Process, term: Term, trace_receive: bool) -> Result<Ter
 }
 
 // Port of erts/emulator/beam/erl_bif_port.c:233 (erts_internal_port_close_1), OTP-29.1.1.
-fn port_close(
+pub(crate) fn port_close(
     process: &mut Process,
     ctx: Option<&mut RunCtx<'_, crate::Process>>,
     caller: Pid,
@@ -3947,7 +3772,12 @@ pub(crate) fn halt_reap_ports(runtime: &'static crate::process::Runtime, progres
     }
 }
 
-fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Result<Term, VmError> {
+pub(crate) fn connect(
+    process: &Process,
+    port: Term,
+    pid: Term,
+    notify: Option<Pid>,
+) -> Result<Term, VmError> {
     let id = port_id(process, port).ok_or_else(badarg)?;
     let pid = Pid::from_term(pid).ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
@@ -4647,7 +4477,11 @@ fn port_counter_term(heap: &mut impl HeapAlloc, counter: u64) -> Result<Term, Vm
         .map_err(|e| VmError::Unsupported(format!("port info counter: {e:?}")))
 }
 
-fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Term, VmError> {
+pub(crate) fn port_info(
+    process: &mut Process,
+    port: Term,
+    item: Option<Term>,
+) -> Result<Term, VmError> {
     let id = match (port.as_port(), port.as_atom()) {
         (Some(id), _) => id,
         (None, Some(name)) => {

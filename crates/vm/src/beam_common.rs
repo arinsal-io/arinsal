@@ -92,13 +92,6 @@ pub(crate) fn call_fun(
                 .ok_or_else(|| VmError::Unsupported("export module atom".into()))?;
             let function = crate::funs::atom_name(Term::atom(entry.function()))
                 .ok_or_else(|| VmError::Unsupported("export function atom".into()))?;
-            if module == "erlang" && function == "apply" {
-                return match arity {
-                    2 => apply_fun(c_p, reg[0], reg[1], reg, vm, ctx),
-                    3 => apply(c_p, reg, vm, ctx),
-                    _ => unreachable!("erlang:apply export arity is 2 or 3"),
-                };
-            }
             let began = c_p.begin_tail_apply(crate::proc_create::TAIL_FUN_CALL);
             let result = vm.call_named_atoms(
                 c_p,

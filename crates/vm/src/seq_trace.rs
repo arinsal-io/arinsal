@@ -1,7 +1,7 @@
 //! Sequential trace tokens carried with ordinary process messages.
 
 use crate::process::Message;
-use crate::{Process, Vm, VmError};
+use crate::{Process, VmError};
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::{Pid, RunCtx};
 use arinsal_term::{Term, TermBuilder, from_owned, to_owned};
@@ -15,17 +15,6 @@ const TIMESTAMP: u64 = 8;
 // Port of erts/emulator/beam/erl_process.h:1820-1830 (SEQ_TRACE_* flags), OTP-29.1.1.
 const STRICT_MONOTONIC: u64 = 16;
 const MONOTONIC: u64 = 32;
-
-pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
-    ("erlang", "seq_trace", 2),
-    ("erlang", "seq_trace_info", 1),
-    ("erlang", "seq_trace_print", 1),
-    ("erlang", "seq_trace_print", 2),
-];
-
-pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
-    IMPLEMENTED.contains(&(module, function, arity))
-}
 
 #[derive(Clone)]
 /// The five-tuple `{Flags, Label, Serial, From, LastCnt}` of `SEQ_TRACE_TOKEN`
@@ -85,11 +74,6 @@ fn unique() -> &'static AtomicU64 {
 fn tracer() -> &'static Mutex<OwnedTerm> {
     static TRACER: OnceLock<Mutex<OwnedTerm>> = OnceLock::new();
     TRACER.get_or_init(|| Mutex::new(OwnedTerm::atom("false")))
-}
-fn atom(term: Term, name: &str) -> bool {
-    term.as_atom()
-        .and_then(|atom| arinsal_term::global_atoms().text(atom))
-        .is_some_and(|s| s == name)
 }
 fn badarg() -> VmError {
     VmError::Trap(crate::exceptions::Trap::error(Term::atom(
@@ -759,37 +743,6 @@ fn emit(
     }
 }
 
-pub(crate) fn call(
-    _vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
-    module: &str,
-    function: &str,
-    args: crate::natives::NativeArgs<'_>,
-) -> Option<Result<Term, VmError>> {
-    if module != "erlang" {
-        return None;
-    }
-    args.with_values(process, |process, args| {
-        let result = match (function, args) {
-            ("seq_trace", [component, value]) => {
-                if atom(*component, "sequential_trace_token") {
-                    set_token_value(process, ctx.pid(), *value)
-                } else {
-                    set_component(process, ctx.pid(), *component, *value)
-                }
-            }
-            ("seq_trace_info", [component]) => info(process, ctx.pid(), *component),
-            ("seq_trace_print", [message]) => print(process, ctx, ctx.pid(), None, *message),
-            ("seq_trace_print", [label, message]) => {
-                print(process, ctx, ctx.pid(), Some(*label), *message)
-            }
-            _ => return None,
-        };
-        Some(result)
-    })
-}
-
 /// A working copy of a process's sequential trace state, for code that sets components
 /// without the process at hand (a trace match specification's `set_seq_token`).
 pub(crate) struct Local {
@@ -920,7 +873,7 @@ impl Local {
     }
 }
 
-fn set_component(
+pub(crate) fn set_component(
     process: &mut Process,
     pid: Pid,
     component: Term,
@@ -954,7 +907,7 @@ fn flag_bit(name: &str) -> Option<u64> {
     })
 }
 // Port of erts/emulator/beam/erl_bif_trace.c:3157-3214 (erl_seq_trace_info), OTP-29.1.1.
-fn info(process: &mut Process, _pid: Pid, component: Term) -> Result<Term, VmError> {
+pub(crate) fn info(process: &mut Process, _pid: Pid, component: Term) -> Result<Term, VmError> {
     let name = component
         .as_atom()
         .and_then(|atom| arinsal_term::global_atoms().text(atom))
@@ -987,9 +940,8 @@ fn info(process: &mut Process, _pid: Pid, component: Term) -> Result<Term, VmErr
         .map_err(|e| VmError::Unsupported(format!("seq info tuple: {e:?}")))
 }
 // Port of erts/emulator/beam/erl_bif_trace.c:3229-3258 (seq_trace_print), OTP-29.1.1.
-fn print(
+pub(crate) fn print(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
     pid: Pid,
     label: Option<Term>,
     message: Term,
@@ -1008,7 +960,7 @@ fn print(
     };
     emit(
         process,
-        Some(ctx),
+        None,
         pid,
         &t,
         SeqEvent {

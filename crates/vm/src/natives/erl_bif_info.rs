@@ -1,9 +1,14 @@
 //! The process inspection and system information BIFs of erl_bif_info.c.
 //!
 //! Port of erts/emulator/beam/erl_bif_info.c (is_process_alive_1, is_process_alive_trap,
-//! system_info_1), OTP-29.1.1. Each BIF is `bif_table[].f` with `(c_p, reg, I)`.
+//! system_info_1, process_info_1, erts_internal_is_process_alive_2, get_module_info_1/2,
+//! erts_internal_is_system_process_1, erts_internal_process_display_2,
+//! erts_internal_system_check_1, erts_debug_lcnt_*, error_logger_warning_map_0,
+//! erts_debug_get_internal_state_1, erts_debug_set_internal_state_2,
+//! process_info_2), OTP-29.1.1.
+//! Each BIF is `bif_table[].f` with `(c_p, reg, I)`.
 
-use crate::natives::bif::{badarg, bif_ret};
+use crate::natives::bif::{badarg, bif_ret, with_sched};
 use crate::{Process, VmError};
 use arinsal_beamasm::ProcessHeader;
 use arinsal_sched::Pid;
@@ -110,6 +115,26 @@ fn handle_signals_from_return(process: &mut crate::Process, from: Term, value: T
         crate::natives::sys::BIF_HANDLE_SIGNALS_RETURN,
         vec![from, value],
     ))
+}
+
+/// `process_info/2`.
+// Port of erts/emulator/beam/erl_bif_info.c (process_info_2 → process_info_bif), OTP-29.1.1.
+pub(crate) extern "C" fn process_info_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [pid, item] = crate::bif_table::bif_args::<2>(reg);
+    match with_sched(process, reg, |vm, process, ctx| {
+        crate::natives::proc::process_info_call(Some(&*vm), process, ctx, pid, Some(item))
+    }) {
+        Ok(inner) => bif_ret(c_p, i, inner),
+        // `process_info_bif` sends to another process through `erts_proc_sig_send_*` and
+        // `ERTS_BIF_PREP_TRAP1(erts_await_result)`: that half needs the running slice's
+        // `RunCtx`. The same table body runs from the executor when this native slice
+        // has no `esdp->current_process`.
+        Err(_) => crate::native_helpers::yield_executor_bif(c_p, reg, i),
+    }
 }
 
 /// `system_info/1`.
@@ -585,4 +610,369 @@ fn clock_source<H: HeapAlloc + ?Sized>(
 
 fn pair<H: HeapAlloc + ?Sized>(heap: &mut H, key: &str, value: Term) -> Result<Term, VmError> {
     tuple(heap, &[atom(key), value])
+}
+
+/// `fun_info/2`: `{What, Value}` for one item of a fun.
+// Port of erts/emulator/beam/erl_bif_info.c (fun_info_2), OTP-29.1.1.
+pub(crate) extern "C" fn fun_info_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let [fun, what] = crate::bif_table::bif_args::<2>(reg);
+    // `is_not_any_fun(fun)`.
+    let Some(view) = arinsal_term::raw::fun_view(fun) else {
+        return crate::natives::bif::bif_badarg(c_p);
+    };
+    let Some(key) = what.as_atom().and_then(|atom| global_atoms().text(atom)) else {
+        return crate::natives::bif::bif_badarg(c_p);
+    };
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let result = fun_info_value(process, fun, &view, key).and_then(|value| match value {
+        Some(value) => {
+            let mut heap =
+                HeapReservation::new(&mut process.heap, 0).map_err(|_| system_limit())?;
+            tuple(&mut heap, &[what, value])
+        }
+        None => Err(badarg()),
+    });
+    bif_ret(c_p, i, result)
+}
+
+/// The value `fun_info_2` pairs with `key`, or `None` for an unknown key (`BIF_ERROR`).
+// Port of erts/emulator/beam/erl_bif_info.c (fun_info_2: the `switch (what)`), OTP-29.1.1.
+fn fun_info_value(
+    process: &mut Process,
+    fun: Term,
+    view: &arinsal_term::FunRef<'_>,
+    key: &str,
+) -> Result<Option<Term>, VmError> {
+    use arinsal_term::FunRef;
+    // erts_get_fun_mfa(fe, erts_active_code_ix()) for a local fun, the export's MFA otherwise;
+    // NULL for an unloaded local fun.
+    let (module, name) = match view {
+        FunRef::Local { entry, .. } => (
+            entry.module,
+            crate::erl_fun::erts_get_fun_mfa(entry)
+                .map(|mfa| crate::native_hooks::from_raw(mfa.function)),
+        ),
+        FunRef::Export { entry } => (entry.module(), Some(Term::atom(entry.function()))),
+    };
+    let local = matches!(view, FunRef::Local { .. });
+    let undefined = Term::atom(atoms::UNDEFINED);
+    let small = |value: i64| Term::small(value).ok_or_else(system_limit);
+    let mut heap = HeapReservation::new(&mut process.heap, 0).map_err(|_| system_limit())?;
+    let value = match (view, key) {
+        (_, "type") => atom(if local { "local" } else { "external" }),
+        // erts_init_process_id for a local fun: set by erl_first_process_otp before any
+        // process runs.
+        (FunRef::Local { .. }, "pid") => process
+            .runtime
+            .and_then(|runtime| runtime.init_process_id.get().copied())
+            .and_then(|pid| pid.to_term())
+            .expect("erts_init_process_id is set before any process runs"),
+        (_, "module") => Term::atom(module),
+        (FunRef::Local { entry, .. }, "new_index") => small(i64::from(entry.index))?,
+        (FunRef::Local { entry, .. }, "new_uniq") => TermBuilder::new(&mut heap)
+            .binary(&entry.uniq)
+            .map_err(|_| system_limit())?,
+        (FunRef::Local { entry, .. }, "index") => small(i64::from(entry.old_index))?,
+        (FunRef::Local { entry, .. }, "uniq") => small(i64::from(entry.old_uniq))?,
+        (FunRef::Local { free_vars, .. }, "env") => {
+            let mut list = Term::NIL;
+            for &word in free_vars.iter().rev() {
+                list = TermBuilder::new(&mut heap)
+                    .cons(crate::native_hooks::from_raw(word), list)
+                    .map_err(|_| system_limit())?;
+            }
+            list
+        }
+        (FunRef::Local { .. }, "refc") => small(1)?,
+        (FunRef::Export { .. }, "pid" | "new_index" | "new_uniq" | "index" | "uniq" | "refc") => {
+            undefined
+        }
+        (FunRef::Export { .. }, "env") => Term::NIL,
+        (_, "arity") => small(i64::from(fun.fun_arity().unwrap_or(0)))?,
+        // Name must be `[]` for unloaded funs.
+        (_, "name") => name.unwrap_or(Term::NIL),
+        _ => return Ok(None),
+    };
+    Ok(Some(value))
+}
+
+/// `fun_info_mfa/1`: `{Module, Function, Arity}` of a fun.
+// Port of erts/emulator/beam/erl_bif_info.c (fun_info_mfa_1), OTP-29.1.1.
+pub(crate) extern "C" fn fun_info_mfa_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    use arinsal_term::FunRef;
+    let [fun] = crate::bif_table::bif_args::<1>(reg);
+    let Some(view) = arinsal_term::raw::fun_view(fun) else {
+        return crate::natives::bif::bif_badarg(c_p);
+    };
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let (module, name) = match view {
+        // An unloaded fun reports its module and `[]` as its name.
+        FunRef::Local { entry, .. } => (
+            entry.module,
+            crate::erl_fun::erts_get_fun_mfa(entry)
+                .map_or(Term::NIL, |mfa| crate::native_hooks::from_raw(mfa.function)),
+        ),
+        FunRef::Export { entry } => (entry.module(), Term::atom(entry.function())),
+    };
+    let result = Term::small(i64::from(fun.fun_arity().unwrap_or(0)))
+        .ok_or_else(system_limit)
+        .and_then(|arity| {
+            let mut heap =
+                HeapReservation::new(&mut process.heap, 0).map_err(|_| system_limit())?;
+            tuple(&mut heap, &[Term::atom(module), name, arity])
+        });
+    bif_ret(c_p, i, result)
+}
+
+/// `process_info/1`: `process_info_bif` with `pi_1_keys_list`.
+// Port of erts/emulator/beam/erl_bif_info.c:1560 (process_info_1), OTP-29.1.1.
+pub(crate) extern "C" fn process_info_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [pid] = crate::bif_table::bif_args::<1>(reg);
+    let result = crate::natives::bif::with_sched(process, reg, |_vm, process, ctx| {
+        crate::natives::proc::process_info_call(None, process, ctx, pid, None)
+    })
+    .flatten();
+    bif_ret(c_p, i, result)
+}
+
+/// `erts_internal:is_process_alive/2`.
+// Port of erts/emulator/beam/erl_bif_info.c:4049 (erts_internal_is_process_alive_2), OTP-29.1.1.
+pub(crate) extern "C" fn erts_internal_is_process_alive_2(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [pid, reference] = crate::bif_table::bif_args::<2>(reg);
+    if Pid::from_term(pid).is_none() || reference.local_ref_numbers().is_none() {
+        return crate::natives::bif::bif_badarg(c_p);
+    }
+    let result = crate::natives::bif::with_sched(process, reg, |_vm, process, ctx| {
+        crate::signals::is_process_alive_2(process, ctx, pid, reference)
+    })
+    .flatten();
+    bif_ret(c_p, i, result)
+}
+
+/// `get_module_info/1`.
+// Port of erts/emulator/beam/erl_bif_info.c:6010 (get_module_info_1), OTP-29.1.1.
+pub(crate) extern "C" fn get_module_info_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let args = crate::bif_table::bif_args::<1>(reg);
+    bif_ret(c_p, i, crate::natives::code::module_info(process, &args))
+}
+
+/// `get_module_info/2`.
+// Port of erts/emulator/beam/erl_bif_info.c:6021 (get_module_info_2), OTP-29.1.1.
+pub(crate) extern "C" fn get_module_info_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let args = crate::bif_table::bif_args::<2>(reg);
+    bif_ret(c_p, i, crate::natives::code::module_info(process, &args))
+}
+
+/// `erts_internal:is_system_process/1`.
+// Port of erts/emulator/beam/erl_bif_info.c:4932 (erts_internal_is_system_process_1), OTP-29.1.1.
+pub(crate) extern "C" fn erts_internal_is_system_process_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    _i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let [target] = crate::bif_table::bif_args::<1>(reg);
+    if let Some(pid) = Pid::from_term(target) {
+        let is_system = process
+            .runtime
+            .and_then(|runtime| runtime.scheduler().ok())
+            .and_then(|scheduler| scheduler.static_flags(pid))
+            .is_some_and(|flags| flags & crate::proc_create::ERTS_STC_FLG_SYSTEM_PROC != 0);
+        return crate::native_hooks::raw(Term::atom(if is_system {
+            atoms::TRUE
+        } else {
+            atoms::FALSE
+        }));
+    }
+    if let Ok(arinsal_etf::OwnedTerm::Pid { node, .. }) = &arinsal_term::to_owned(target)
+        && node == crate::node_tables::this_node().0
+    {
+        return crate::native_hooks::raw(Term::atom(atoms::FALSE));
+    }
+    crate::natives::bif::bif_badarg(c_p)
+}
+
+/// `erts_internal:process_display/2`.
+// Port of erts/emulator/beam/erl_bif_info.c:4133 (erts_internal_process_display_2), OTP-29.1.1.
+pub(crate) extern "C" fn erts_internal_process_display_2(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [target, display] = crate::bif_table::bif_args::<2>(reg);
+    let result = crate::natives::bif::with_sched(process, reg, |_vm, process, ctx| {
+        crate::natives::proc::process_display_call("erts_internal", process, ctx, target, display)
+    })
+    .flatten();
+    bif_ret(c_p, i, result)
+}
+
+/// `erts_internal:system_check/1`.
+// Port of erts/emulator/beam/erl_bif_info.c:4949 (erts_internal_system_check_1), OTP-29.1.1.
+pub(crate) extern "C" fn erts_internal_system_check_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [selector] = crate::bif_table::bif_args::<1>(reg);
+    if selector != crate::atom_cache::put("schedulers") {
+        return crate::natives::bif::bif_badarg(c_p);
+    }
+    let result = crate::natives::bif::with_sched(process, reg, |_vm, process, ctx| {
+        erts_system_check_request(process, ctx)
+    })
+    .flatten();
+    bif_ret(c_p, i, result)
+}
+
+/// `erts_system_check_request`: one reply from each scheduler, then trap to
+/// `erts_internal:gather_system_check_result/1`.
+// Port of erts/emulator/beam/erl_process.c:1459 (erts_system_check_request) and
+// erl_bif_info.c:4952-4956 (`BIF_TRAP1(gather_system_check_res_trap, …)`), OTP-29.1.1.
+fn erts_system_check_request(
+    process: &mut Process,
+    ctx: &mut arinsal_sched::RunCtx<'_, crate::Process>,
+) -> Result<Term, VmError> {
+    let runtime = process.runtime.ok_or_else(badarg)?;
+    let caller = ctx.pid();
+    let id = process.next_ref();
+    let reference = crate::signals::reference(process, id)?;
+    let owned = arinsal_term::to_owned(reference).map_err(|_| system_limit())?;
+    runtime
+        .scheduler()?
+        .erts_schedule_multi_misc_aux_work(move |_| {
+            let Ok(message) = crate::process::Message::from_owned(&owned) else {
+                return;
+            };
+            if let Ok(scheduler) = runtime.scheduler() {
+                let _ = scheduler.send(caller, caller, message);
+            }
+        });
+    Err(VmError::TrapExport(crate::ExportTrap::new(
+        process,
+        "erts_internal:gather_system_check_result/1",
+        vec![reference],
+    )))
+}
+
+/// `erts_debug:lcnt_clear/0` without `ERTS_ENABLE_LOCK_COUNT`.
+// Port of erts/emulator/beam/erl_bif_info.c:6302 (erts_debug_lcnt_clear_0), OTP-29.1.1.
+pub(crate) extern "C" fn erts_debug_lcnt_clear_0(
+    _c_p: *mut ProcessHeader,
+    _reg: *mut u64,
+    _i: u64,
+) -> u64 {
+    crate::native_hooks::raw(Term::atom(atoms::ERROR))
+}
+
+/// `erts_debug:lcnt_collect/0` without `ERTS_ENABLE_LOCK_COUNT`.
+// Port of erts/emulator/beam/erl_bif_info.c:6313 (erts_debug_lcnt_collect_0), OTP-29.1.1.
+pub(crate) extern "C" fn erts_debug_lcnt_collect_0(
+    _c_p: *mut ProcessHeader,
+    _reg: *mut u64,
+    _i: u64,
+) -> u64 {
+    crate::native_hooks::raw(Term::atom(atoms::ERROR))
+}
+
+/// `erts_debug:lcnt_control/1` without `ERTS_ENABLE_LOCK_COUNT`.
+// Port of erts/emulator/beam/erl_bif_info.c:6348 (erts_debug_lcnt_control_1), OTP-29.1.1.
+pub(crate) extern "C" fn erts_debug_lcnt_control_1(
+    c_p: *mut ProcessHeader,
+    _reg: *mut u64,
+    _i: u64,
+) -> u64 {
+    crate::natives::bif::bif_badarg(c_p)
+}
+
+/// `erts_debug:lcnt_control/2` without `ERTS_ENABLE_LOCK_COUNT`.
+// Port of erts/emulator/beam/erl_bif_info.c:6375 (erts_debug_lcnt_control_2), OTP-29.1.1.
+pub(crate) extern "C" fn erts_debug_lcnt_control_2(
+    c_p: *mut ProcessHeader,
+    _reg: *mut u64,
+    _i: u64,
+) -> u64 {
+    crate::natives::bif::bif_badarg(c_p)
+}
+
+/// `error_logger:warning_map/0`.
+// Port of erts/emulator/beam/erl_bif_info.c:4327 (error_logger_warning_map_0), OTP-29.1.1.
+pub(crate) extern "C" fn error_logger_warning_map_0(
+    _c_p: *mut ProcessHeader,
+    _reg: *mut u64,
+    _i: u64,
+) -> u64 {
+    crate::native_hooks::raw(Term::atom(atoms::WARNING))
+}
+
+/// `erts_debug:get_internal_state/1`.
+// Port of erts/emulator/beam/erl_bif_info.c:4339 (erts_debug_get_internal_state_1), OTP-29.1.1.
+pub(crate) extern "C" fn erts_debug_get_internal_state_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [selector] = crate::bif_table::bif_args::<1>(reg);
+    let result = crate::natives::bif::with_sched(process, reg, |vm, process, ctx| {
+        crate::natives::erts_debug::internal_state_get(vm, process, ctx, selector)
+    })
+    .flatten();
+    bif_ret(c_p, i, result)
+}
+
+/// `erts_debug:set_internal_state/2`.
+// Port of erts/emulator/beam/erl_bif_info.c:5036 (erts_debug_set_internal_state_2), OTP-29.1.1.
+pub(crate) extern "C" fn erts_debug_set_internal_state_2(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [selector, value] = crate::bif_table::bif_args::<2>(reg);
+    let result = crate::natives::bif::with_sched(process, reg, |_vm, process, ctx| {
+        crate::natives::erts_debug::internal_state_set(process, ctx, selector, value)
+    })
+    .flatten();
+    bif_ret(c_p, i, result)
 }

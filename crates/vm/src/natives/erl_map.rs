@@ -1,21 +1,24 @@
-//! The yielding map BIFs of erl_map.c.
+//! The map BIFs of erl_map.c.
 //!
 //! Port of erts/emulator/beam/erl_map.c (maps_from_list_1, maps_from_keys_2, maps_keys_1,
-//! maps_values_1 and their YCF helpers) and erts/emulator/beam/utils.c (erts_ycf_trap_driver,
-//! erts_ycf_trap_driver_trap_helper), OTP-29.1.1. Each BIF is `bif_table[].f` with
-//! `(c_p, reg, I)`. A call that runs out of reductions keeps its walk in a magic binary,
-//! disables collection, and `BIF_TRAP`s to its own export with the magic reference in X0 and
-//! the other arguments unchanged; the export calls the same body, which recognises its state.
+//! maps_values_1 and their YCF helpers; erts_debug_map_info_1,
+//! erts_internal_map_to_tuple_keys_1, erts_internal_term_type_1,
+//! erts_internal_map_hashmap_children_1, erts_internal_map_next_3) and
+//! erts/emulator/beam/utils.c (erts_ycf_trap_driver, erts_ycf_trap_driver_trap_helper),
+//! OTP-29.1.1. Each BIF is `bif_table[].f` with `(c_p, reg, I)`. A call that runs out of
+//! reductions keeps its walk in a magic binary, disables collection, and `BIF_TRAP`s to its
+//! own export with the magic reference in X0 and the other arguments unchanged; the export
+//! calls the same body, which recognises its state.
 
 use crate::VmError;
 use crate::bif_traps::TrapContext;
-use crate::natives::bif::bif_ret;
+use crate::natives::bif::{bif_badarg, bif_ret, bif_system_limit};
 use arinsal_beamasm::ProcessHeader;
 use arinsal_bifs::BifError;
 use arinsal_bifs::ProcessHeapHandle;
 use arinsal_maps::{HashmapMergeContext, MAP_MERGE_LOOP_FACTOR, MapError};
 use arinsal_term::raw::{Cons, MapListValidator, Tuple, ValidatedMapPairs};
-use arinsal_term::{MagicBin, Term, TermBuilder, atoms};
+use arinsal_term::{MagicBin, Term, TermBuilder, TermKind, atoms, hashmap_node_children};
 
 /// `sizeof(erts_ycf_trap_driver_state_holder)` on a 64-bit build: the magic binary's
 /// `orig_size`.
@@ -1342,6 +1345,295 @@ pub(crate) extern "C" fn maps_take_2(c_p: *mut ProcessHeader, reg: *mut u64, i: 
         Ok(Some(res)) => crate::native_hooks::raw(res),
         Ok(None) => crate::native_hooks::raw(Term::atom(atoms::ERROR)),
         Err(error) => map_failure(c_p, reg, i, process, "maps:take/2", 2, error),
+    }
+}
+
+/// `BIF_P->fvalue = value; BIF_ERROR(BIF_P, BADMAP)`.
+// Port of erts/emulator/beam/bif.h (BIF_ERROR) and erl_map.c (BADMAP sites), OTP-29.1.1.
+fn bif_badmap(c_p: *mut ProcessHeader, value: Term) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.abi.exc.freason = arinsal_term::exc::EXC_BADMAP;
+    process.heap.abi.exc.fvalue = value.word();
+    arinsal_term::THE_NON_VALUE
+}
+
+/// `erts_debug:map_info/1`.
+// Port of erts/emulator/beam/erl_map.c (erts_debug_map_info_1, hashmap_info), OTP-29.1.1.
+pub(crate) extern "C" fn erts_debug_map_info_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    _i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [node] = crate::bif_table::bif_args::<1>(reg);
+    if node.is_hashmap() {
+        match hashmap_info(process, node) {
+            Ok(result) => crate::native_hooks::raw(result),
+            Err(()) => bif_system_limit(c_p),
+        }
+    } else if node.is_flatmap() {
+        bif_badarg(c_p)
+    } else {
+        bif_badmap(c_p, node)
+    }
+}
+
+/// Port of erts/emulator/beam/erl_map.c:3464 (hashmap_info), OTP-29.1.1.
+/// A malformed node is `ASSERT` / `ERTS_ASSERT` in erts (abort in debug); `Err(())` is only
+/// `SYSTEM_LIMIT` from heap growth (`HAlloc` does not fail in erts).
+fn hashmap_info(process: &mut crate::Process, node: Term) -> Result<Term, ()> {
+    // Port of erts/emulator/beam/erl_map.h:220 (`HAMT_MAX_LEVEL` on a 64-bit `erts_ihash_t`).
+    const HAMT_MAX_LEVEL: usize = 16;
+    // `_HEADER_MAP_SUBTAG_MASK`: two HAMT-type bits plus the map subtag.
+    const HEADER_MAP_SUBTAG_MASK: u64 = 0xff;
+    const HAMT_SUBTAG_NODE_BITMAP: u64 = (1 << 6) | 0x2c;
+    const HAMT_SUBTAG_HEAD_ARRAY: u64 = (2 << 6) | 0x2c;
+    const HAMT_SUBTAG_HEAD_BITMAP: u64 = (3 << 6) | 0x2c;
+    let mut leaf_usage = [0usize; HAMT_MAX_LEVEL + 2];
+    let mut bitmap_usage = [0usize; 16];
+    let mut collision_usage = [0usize; 16];
+    let mut nleaf = 0usize;
+    let mut nbitmap = 0usize;
+    let mut narray = 0usize;
+    let mut ncollision = 0usize;
+    let mut max_depth = 0usize;
+    let mut stack = vec![(0usize, node)];
+    while let Some((clvl, node)) = stack.pop() {
+        if node.classify() == TermKind::List {
+            nleaf += 1;
+            leaf_usage[clvl] += 1;
+            continue;
+        }
+        let Some(hdr) = node.header() else {
+            debug_assert!(
+                false,
+                "hashmap_info boxed node (erts ASSERT(is_header) then walks ptr[sz+1])"
+            );
+            continue;
+        };
+        let children = hashmap_node_children(node);
+        debug_assert!(
+            children.is_some(),
+            "hashmap_info boxed node (erts ASSERT(is_header) then walks ptr[sz+1])"
+        );
+        let children = children.unwrap_or_default();
+        let sz = match hdr & HEADER_MAP_SUBTAG_MASK {
+            HAMT_SUBTAG_NODE_BITMAP => {
+                nbitmap += 1;
+                let sz = children.len();
+                debug_assert!(sz < 17);
+                sz
+            }
+            HAMT_SUBTAG_HEAD_BITMAP => {
+                nbitmap += 1;
+                children.len()
+            }
+            HAMT_SUBTAG_HEAD_ARRAY => {
+                narray += 1;
+                16
+            }
+            _ => {
+                // ERTS_ASSERT(is_arity_value(hdr)): always on.
+                assert_eq!(hdr & 63, 0, "hashmap_info collision node");
+                debug_assert_eq!(clvl, HAMT_MAX_LEVEL);
+                ncollision += 1;
+                let sz = children.len();
+                debug_assert!(sz >= 2);
+                sz
+            }
+        };
+        debug_assert!(sz >= 1);
+        match hdr & HEADER_MAP_SUBTAG_MASK {
+            HAMT_SUBTAG_NODE_BITMAP | HAMT_SUBTAG_HEAD_BITMAP => {
+                bitmap_usage[sz - 1] += 1;
+            }
+            _ if hdr & 63 == 0 => collision_usage[sz.min(16) - 1] += 1,
+            _ => {}
+        }
+        let clvl = clvl + 1;
+        debug_assert!(clvl <= HAMT_MAX_LEVEL + 1);
+        if max_depth < clvl {
+            max_depth = clvl;
+        }
+        // erts `while (sz--) { ESTACK_PUSH(clvl); ESTACK_PUSH(ptr[sz+1]); }`: last child first.
+        for child in children.into_iter().rev() {
+            stack.push((clvl, child));
+        }
+    }
+    let mut heap = ProcessHeapHandle(&mut process.heap);
+    let mut builder = TermBuilder::new(&mut heap);
+    let mut uint_tuple = |values: &[usize]| -> Result<Term, ()> {
+        let mut terms = Vec::with_capacity(values.len());
+        for value in values {
+            terms.push(builder.int_from_u64(*value as u64).map_err(|_| ())?);
+        }
+        builder.tuple(&terms).map_err(|_| ())
+    };
+    let leaf_info = uint_tuple(&leaf_usage)?;
+    let bitmap_info = uint_tuple(&bitmap_usage)?;
+    let collision_info = uint_tuple(&collision_usage)?;
+    let entries = [
+        ("leafs", nleaf, leaf_info),
+        ("bitmaps", nbitmap, bitmap_info),
+        ("collisions", ncollision, collision_info),
+    ];
+    let mut result = Term::NIL;
+    for (name, count, info) in entries {
+        let count_term = builder.int_from_u64(count as u64).map_err(|_| ())?;
+        let item = builder
+            .tuple(&[crate::atom_cache::put(name), count_term, info])
+            .map_err(|_| ())?;
+        result = builder.cons(item, result).map_err(|_| ())?;
+    }
+    let arrays_count = builder.int_from_u64(narray as u64).map_err(|_| ())?;
+    let arrays_item = builder
+        .tuple(&[crate::atom_cache::put("arrays"), arrays_count, Term::NIL])
+        .map_err(|_| ())?;
+    result = builder.cons(arrays_item, result).map_err(|_| ())?;
+    let depth_count = builder.int_from_u64(max_depth as u64).map_err(|_| ())?;
+    let depth_item = builder
+        .tuple(&[crate::atom_cache::put("depth"), depth_count])
+        .map_err(|_| ())?;
+    builder.cons(depth_item, result).map_err(|_| ())
+}
+
+/// `erts_internal:map_to_tuple_keys/1`.
+// Port of erts/emulator/beam/erl_map.c (erts_internal_map_to_tuple_keys_1), OTP-29.1.1.
+pub(crate) extern "C" fn erts_internal_map_to_tuple_keys_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    _i: u64,
+) -> u64 {
+    let [value] = crate::bif_table::bif_args::<1>(reg);
+    if value.is_flatmap() {
+        match value.flatmap_keys_tuple() {
+            Some(keys) => crate::native_hooks::raw(keys),
+            None => bif_badarg(c_p),
+        }
+    } else if value.is_hashmap() {
+        bif_badarg(c_p)
+    } else {
+        bif_badmap(c_p, value)
+    }
+}
+
+/// `erts_internal:term_type/1`.
+// Port of erts/emulator/beam/erl_map.c (erts_internal_term_type_1), OTP-29.1.1.
+pub(crate) extern "C" fn erts_internal_term_type_1(
+    _c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    _i: u64,
+) -> u64 {
+    let [value] = crate::bif_table::bif_args::<1>(reg);
+    crate::native_hooks::raw(term_type(value))
+}
+
+fn term_type(value: Term) -> Term {
+    let name = match value.classify() {
+        TermKind::Number => match value.header().map(|header| header & 63) {
+            Some(0x18) => "hfloat",
+            Some(0x08 | 0x0c) => "bignum",
+            _ => "fixnum",
+        },
+        TermKind::Atom => "atom",
+        TermKind::Ref => match value.header().map(|header| header & 63) {
+            Some(0x10) => "reference",
+            _ => "external_reference",
+        },
+        TermKind::Fun => {
+            if value.header().is_some_and(|header| (header >> 24) & 1 != 0) {
+                "export"
+            } else {
+                "fun"
+            }
+        }
+        TermKind::Port => {
+            if value.header().is_some() {
+                "external_port"
+            } else {
+                "port"
+            }
+        }
+        TermKind::Pid => {
+            if value.header().is_some() {
+                "external_pid"
+            } else {
+                "pid"
+            }
+        }
+        TermKind::Tuple => "tuple",
+        TermKind::Record => "tuple",
+        TermKind::Map => match value.header().map(|header| (header >> 6) & 3) {
+            Some(0) => "flatmap",
+            Some(1) => "hashmap_node",
+            Some(2 | 3) => "hashmap",
+            _ => "hashmap",
+        },
+        TermKind::Nil => "nil",
+        TermKind::List => "list",
+        TermKind::Bitstring => match value.header().map(|header| header & 63) {
+            Some(0x20) => "heap_binary",
+            Some(0x24) => "sub_binary",
+            _ => "refc_binary",
+        },
+        TermKind::BinRef => "refc_binary",
+        TermKind::Catch => "catch",
+        TermKind::Invalid => "invalid",
+    };
+    crate::atom_cache::put(name)
+}
+
+/// `erts_internal:map_hashmap_children/1`.
+// Port of erts/emulator/beam/erl_map.c (erts_internal_map_hashmap_children_1), OTP-29.1.1.
+pub(crate) extern "C" fn erts_internal_map_hashmap_children_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    _i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [value] = crate::bif_table::bif_args::<1>(reg);
+    if value.classify() != TermKind::Map {
+        return bif_badmap(c_p, value);
+    }
+    let Some(children) = hashmap_node_children(value) else {
+        return bif_badarg(c_p);
+    };
+    let mut heap = ProcessHeapHandle(&mut process.heap);
+    let mut builder = TermBuilder::new(&mut heap);
+    let mut result = Term::NIL;
+    for child in children {
+        match builder.cons(child, result) {
+            Ok(list) => result = list,
+            Err(_) => return bif_system_limit(c_p),
+        }
+    }
+    crate::native_hooks::raw(result)
+}
+
+/// `erts_internal:map_next/3`.
+// Port of erts/emulator/beam/erl_map.c (erts_internal_map_next_3), OTP-29.1.1.
+pub(crate) extern "C" fn erts_internal_map_next_3(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    _i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let args = crate::bif_table::bif_args::<3>(reg);
+    match crate::natives::maps::map_next(process, &args) {
+        Ok(value) => crate::native_hooks::raw(value),
+        Err(crate::natives::maps::MapNextError::Badarg) => bif_badarg(c_p),
+        Err(crate::natives::maps::MapNextError::SystemLimit) => bif_system_limit(c_p),
     }
 }
 

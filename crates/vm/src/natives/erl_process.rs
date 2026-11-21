@@ -1,17 +1,20 @@
-//! Process creation of erl_process.c.
+//! Process creation of erl_process.c, plus the process BIFs that do not trap or yield.
 //!
 //! Port of erts/emulator/beam/erl_process.c (erts_parse_spawn_opts, erl_create_process,
-//! erts_send_local_spawn_reply) and erl_process.h (ErlSpawnOpts, ERTS_SET_DEFAULT_SPAWN_OPTS),
-//! OTP-29.1.1. Creation works from the parent (`c_p`) alone: the child is allocated, its heap
-//! sized and filled, its links and monitors installed, and it is queued on the calling
-//! scheduler's run queue. Only tracing and seq_trace reach the scheduler's data, through
-//! `with_sched`, as the trace calls of `erl_create_process` take the tracer through the
-//! scheduler.
+//! erts_send_local_spawn_reply, resume_process_1, erts_internal_is_process_executing_dirty_1,
+//! erts_internal_no_aux_work_threads_0, request_system_task) and erl_process.h (ErlSpawnOpts,
+//! ERTS_SET_DEFAULT_SPAWN_OPTS), OTP-29.1.1. Creation works from the parent (`c_p`) alone: the
+//! child is allocated, its heap sized and filled, its links and monitors installed, and it is
+//! queued on the calling scheduler's run queue. Only tracing and seq_trace reach the scheduler's
+//! data, through `with_sched`, as the trace calls of `erl_create_process` take the tracer through
+//! the scheduler. `suspend_process/2` stays on the executor (`erts_suspend` + `ERTS_BIF_YIELD`).
 
-use crate::natives::bif::{badarg, with_sched};
+use crate::code_ix::{code_tables, erts_active_code_ix};
+use crate::natives::bif::{badarg, bif_ret, with_sched};
 use crate::proc_create::AliasMode;
 use crate::process::{MaxHeap, Message, Runtime};
 use crate::{Process, VmError};
+use arinsal_beamasm::ProcessHeader;
 use arinsal_sched::{Pid, Priority};
 use arinsal_term::{Atom, Term, TermBuilder, TermKind, atoms};
 
@@ -703,4 +706,231 @@ fn create_child(
         }
     }
     Ok(UnscheduledChild { spawned, seq_spawn })
+}
+
+/// `erlang:resume_process/1`.
+// Port of erts/emulator/beam/erl_process.c:9181 (resume_process_1), OTP-29.1.1.
+pub(crate) extern "C" fn resume_process_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [target] = crate::bif_table::bif_args::<1>(reg);
+    bif_ret(c_p, i, resume_process(process, target))
+}
+
+fn resume_process(process: &mut Process, target: Term) -> Result<Term, VmError> {
+    let me = process.self_pid().ok_or_else(badarg)?;
+    let Some(target_pid) = Pid::from_term(target).filter(|pid| *pid != me) else {
+        return Err(badarg());
+    };
+    match crate::suspend::resume_remote(process, me, target_pid) {
+        None => Err(badarg()),
+        Some(()) => Ok(Term::atom(atoms::TRUE)),
+    }
+}
+
+/// `erts_internal:is_process_executing_dirty/1`.
+// Port of erts/emulator/beam/erl_process.c:9216 (erts_internal_is_process_executing_dirty_1),
+// OTP-29.1.1.
+pub(crate) extern "C" fn erts_internal_is_process_executing_dirty_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [pid] = crate::bif_table::bif_args::<1>(reg);
+    bif_ret(c_p, i, is_process_executing_dirty(process, pid))
+}
+
+/// Whether the target is currently running on a dirty scheduler.
+// Port of erts/emulator/beam/erl_process.c:9216 (erts_internal_is_process_executing_dirty_1), OTP-29.1.1.
+fn is_process_executing_dirty(process: &Process, pid: Term) -> Result<Term, VmError> {
+    let Some(pid) = Pid::from_term(pid) else {
+        return Err(badarg());
+    };
+    let runtime = process
+        .runtime
+        .ok_or_else(|| VmError::Unsupported("process BIF requires a scheduler".into()))?;
+    let dirty = runtime.scheduler()?.is_executing_dirty(pid);
+    Ok(Term::atom(if dirty { atoms::TRUE } else { atoms::FALSE }))
+}
+
+/// `erts_internal:no_aux_work_threads/0`.
+// Port of erts/emulator/beam/erl_process.c:9234 (erts_internal_no_aux_work_threads_0), OTP-29.1.1.
+pub(crate) extern "C" fn erts_internal_no_aux_work_threads_0(
+    c_p: *mut ProcessHeader,
+    _reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    // erts counts its normal schedulers, the standard aux thread, and the extra aux threads
+    // created for dirty allocator instances (erl_process.c:6223; erl_init.c:1216).
+    let n = u64::from(arinsal_sched::unique::normal_scheduler_count())
+        + 1
+        + arinsal_args::active_allocator_options()
+            .dirty_instances
+            .unwrap_or(0) as u64;
+    bif_ret(c_p, i, crate::natives::sys::non_neg(process, n))
+}
+
+/// `erts_internal:request_system_task/3`.
+// Port of erts/emulator/beam/erl_process.c:11309 (request_system_task), OTP-29.1.1.
+pub(crate) extern "C" fn erts_internal_request_system_task_3(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [target, priority, operation] = crate::bif_table::bif_args::<3>(reg);
+    let args = [target, priority, operation];
+    let result = with_sched(process, reg, |_, process, ctx| {
+        request_system_task(process, ctx, &args)
+    });
+    bif_ret(c_p, i, result.and_then(|r| r))
+}
+
+/// `erts_internal:request_system_task/4`.
+// Port of erts/emulator/beam/erl_process.c:11309 (request_system_task), OTP-29.1.1.
+pub(crate) extern "C" fn erts_internal_request_system_task_4(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let [requester, target, priority, operation] = crate::bif_table::bif_args::<4>(reg);
+    let args = [requester, target, priority, operation];
+    let result = with_sched(process, reg, |_, process, ctx| {
+        request_system_task(process, ctx, &args)
+    });
+    bif_ret(c_p, i, result.and_then(|r| r))
+}
+
+fn task_tuple(process: &mut Process, values: &[Term]) -> Result<Term, VmError> {
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    Ok(TermBuilder::new(&mut heap).tuple(values).expect("HAlloc"))
+}
+
+fn deliver_system_task_reply(
+    process: &mut Process,
+    ctx: &mut arinsal_sched::RunCtx<'_, crate::Process>,
+    to: Pid,
+    message: Term,
+) -> Result<(), VmError> {
+    // Port of erts/emulator/beam/erl_process.c:10574 (notify_sys_task_executed):
+    // self replies use the same signal path as replies to another process.
+    if to != ctx.pid() && !crate::natives::proc::live(process, to)? {
+        return Ok(());
+    }
+    ctx.send(to, Message::copy_from(message)?)
+        .map_err(|error| VmError::Unsupported(format!("system task reply: {error}")))
+}
+
+/// Queue one `ErtsProcSysTask` request and send its result to `requester`.
+// Port of erts/emulator/beam/erl_process.c:11309 (request_system_task), OTP-29.1.1.
+fn request_system_task(
+    process: &mut Process,
+    ctx: &mut arinsal_sched::RunCtx<'_, crate::Process>,
+    args: &[Term],
+) -> Result<Term, VmError> {
+    let (requester, target, priority, operation) = if args.len() == 3 {
+        (ctx.pid(), args[0], args[1], args[2])
+    } else {
+        let requester = Pid::from_term(args[0]).ok_or_else(badarg)?;
+        (requester, args[1], args[2], args[3])
+    };
+    let priority_name = crate::signals::atom_name(priority).ok_or_else(badarg)?;
+    let priority = match priority_name.as_str() {
+        "inherit" if args.len() == 3 => crate::natives::proc::user_priority(process),
+        "max" | "high" | "normal" | "low" => {
+            crate::natives::proc::scheduler_priority(&priority_name).ok_or_else(badarg)?
+        }
+        _ => return Err(badarg()),
+    };
+    let Some(target_pid) = Pid::from_term(target) else {
+        return Err(badarg());
+    };
+    let Some((arity, [req_type, req_id, arg0, _])) =
+        crate::natives::raw::tuple_prefix::<4>(operation)
+    else {
+        return Err(badarg());
+    };
+    if !(2..=4).contains(&arity) {
+        return Err(badarg());
+    }
+    let type_name = crate::signals::atom_name(req_type).ok_or_else(badarg)?;
+    let alive = crate::natives::proc::live(process, target_pid)?;
+    let (op, tag) = match type_name.as_str() {
+        "garbage_collect" => {
+            let major = match crate::signals::atom_name(arg0).as_deref() {
+                Some("major") => true,
+                Some("minor") => false,
+                _ => return Err(badarg()),
+            };
+            (
+                crate::signals::RemoteOp::Collect {
+                    request_id: Message::copy_from(req_id)?,
+                    major,
+                },
+                "garbage_collect",
+            )
+        }
+        "check_process_code" => {
+            let module = crate::signals::atom_name(arg0).ok_or_else(badarg)?;
+            let old = code_tables(erts_active_code_ix()).old.get(&module).copied();
+            (
+                crate::signals::RemoteOp::CheckProcessCode {
+                    module: old,
+                    native: old.and_then(|old| {
+                        crate::load::native_code_version(
+                            &code_tables(erts_active_code_ix()).code_meta,
+                            old,
+                        )
+                        .cloned()
+                    }),
+                    async_request: Some(Message::copy_from(req_id)?),
+                    kill: false,
+                },
+                "check_process_code",
+            )
+        }
+        "system_task_test" => (
+            crate::signals::RemoteOp::SystemTaskTest {
+                request_id: Message::copy_from(req_id)?,
+            },
+            "system_task_test",
+        ),
+        _ => return Err(badarg()),
+    };
+    if alive
+        && matches!(
+            crate::signals::submit_sys_task(process, ctx, requester, target_pid, op, priority)?,
+            crate::signals::Submit::Sent
+        )
+    {
+        return Ok(Term::atom(atoms::OK));
+    }
+    // Port of erts/emulator/beam/erl_process.c:11466 (notify_sys_task_executed on noproc).
+    let message = task_tuple(
+        process,
+        &[
+            crate::atom_cache::put(tag),
+            req_id,
+            Term::atom(atoms::FALSE),
+        ],
+    )?;
+    deliver_system_task_reply(process, ctx, requester, message)?;
+    Ok(Term::atom(atoms::OK))
 }

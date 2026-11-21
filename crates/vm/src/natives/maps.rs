@@ -1,9 +1,16 @@
 //! Map iterator primitives used by the OTP maps module.
 
-use crate::exceptions::Trap;
-use crate::{Process, Vm, VmError};
-use arinsal_sched::RunCtx;
+use crate::Process;
 use arinsal_term::{HeapReservation, Term, TermBuilder, TermKind, Tuple3Chain, atoms};
+
+/// `BIF_ERROR` of `erts_internal_map_next_3`: `BADARG` or `SYSTEM_LIMIT`. The C BIF never
+/// `BIF_TRAP`s (`BIF_RET` / `BIF_ERROR` and `BUMP_REDS` / `BUMP_ALL_REDS` only).
+// Port of erts/emulator/beam/erl_map.c:3636 (erts_internal_map_next_3), OTP-29.1.1.
+#[derive(Clone, Copy)]
+pub(crate) enum MapNextError {
+    Badarg,
+    SystemLimit,
+}
 
 /// Elements returned on the first `path = 0` hashmap call.
 /// Port of erts/emulator/beam/erl_map.h:96 (MAP_SMALL_MAP_LIMIT), OTP-29.1.1.
@@ -22,14 +29,14 @@ const NONE: Term = Term::atom(atoms::NONE);
 
 #[cold]
 #[inline(never)]
-fn badarg() -> Trap {
-    Trap::error(Term::atom(arinsal_term::atoms::BADARG))
+fn badarg() -> MapNextError {
+    MapNextError::Badarg
 }
 
 #[cold]
 #[inline(never)]
-fn system_limit() -> Trap {
-    Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT))
+fn system_limit() -> MapNextError {
+    MapNextError::SystemLimit
 }
 
 /// `DECLARE_WSTACK` holds 16 words, or four `WSTACK_PUSH4` frames, before growing.
@@ -149,7 +156,7 @@ struct NodeCursor {
 
 impl NodeCursor {
     #[inline(always)]
-    fn new(node: Term) -> Result<Self, Trap> {
+    fn new(node: Term) -> Result<Self, MapNextError> {
         let header = node.header().ok_or_else(badarg)?;
         let subtype = (header >> 6) & 3;
         let collision = header & 63 == 0;
@@ -215,7 +222,7 @@ impl PathDigits {
 }
 
 #[inline(always)]
-fn path_digits(path: Term) -> Result<PathDigits, Trap> {
+fn path_digits(path: Term) -> Result<PathDigits, MapNextError> {
     if let Some(value) = path.as_small() {
         // unsigned_val(): a logical shift of the tagged word, so negatives keep their low bits.
         let digit = (value as u64) & (u64::MAX >> 4);
@@ -260,7 +267,7 @@ fn hamt_next(
     map_size: usize,
     list_mode: bool,
     acc: Term,
-) -> Result<Term, Trap> {
+) -> Result<Term, MapNextError> {
     let mut elems = chunk_len(process.heap.abi.fcalls, map_size);
     let digits = path_digits(path)?;
     if digits.is_zero_small && elems > MAP_SMALL_MAP_LIMIT {
@@ -478,7 +485,7 @@ fn flat_next(
     map: arinsal_maps::CheckedFlatMap,
     list_mode: bool,
     acc: Term,
-) -> Result<Term, Trap> {
+) -> Result<Term, MapNextError> {
     let n = map.size();
     // `n < unsigned_val(path)` is badarg; a negative small is a huge unsigned value.
     let Some(index) = path.as_small().filter(|value| *value >= 0) else {
@@ -497,7 +504,7 @@ fn ordered_next(
     process: &mut Process,
     mut path: Term,
     map: arinsal_maps::CheckedMap,
-) -> Result<Term, Trap> {
+) -> Result<Term, MapNextError> {
     let fcalls = process.heap.abi.fcalls;
     let orig_elems = (fcalls / ORDERED_ITER_FACTOR).max(1) as usize;
     let mut elems = orig_elems;
@@ -536,7 +543,7 @@ fn ordered_next(
 
 /// `erts_internal:map_next/3`.
 /// Port of erts/emulator/beam/erl_map.c:3636 (erts_internal_map_next_3), OTP-29.1.1.
-fn map_next(process: &mut Process, args: &[Term]) -> Result<Term, Trap> {
+pub(crate) fn map_next(process: &mut Process, args: &[Term]) -> Result<Term, MapNextError> {
     if let Some((path, flat, list_mode, mode)) = flatmap_step(args) {
         return flat_next(process, path, flat, list_mode, mode);
     }
@@ -563,7 +570,7 @@ fn flatmap_step(args: &[Term]) -> Option<(Term, arinsal_maps::CheckedFlatMap, bo
 }
 
 #[inline(never)]
-fn map_next_general(process: &mut Process, args: &[Term]) -> Result<Term, Trap> {
+fn map_next_general(process: &mut Process, args: &[Term]) -> Result<Term, MapNextError> {
     if args.len() != 3 {
         return Err(badarg());
     }
@@ -586,106 +593,4 @@ fn map_next_general(process: &mut Process, args: &[Term]) -> Result<Term, Trap> 
             flat_next(process, path, map, list_mode, mode)
         }
     }
-}
-
-/// Dispatch map primitives that require allocation in the calling process.
-/// Map iteration BIFs. `handler` is this table.
-pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[("erts_internal", "map_next", 3)];
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
-    super::listed(IMPLEMENTED, module, function, arity)
-}
-
-type Handler =
-    fn(&mut Vm, &mut Process, &mut RunCtx<'_, crate::Process>, &[Term]) -> Result<Term, VmError>;
-
-pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler> {
-    match (module, function, arity) {
-        ("erts_internal", "map_next", 3) => Some(call_map_next),
-        _ => None,
-    }
-}
-
-/// The process BIF behind `module:function/arity`, which native code calls like any light BIF.
-pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<super::ProcessBif> {
-    match (module, function, arity) {
-        ("erts_internal", "map_next", 3) => Some(map_next_process_bif),
-        _ => None,
-    }
-}
-
-/// The light-BIF call site entry for `erts_internal:map_next/3`.
-pub(crate) fn thin_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
-    match (module, function, arity) {
-        ("erts_internal", "map_next", 3) => Some(crate::bif_table::bif!(map_next_light)),
-        _ => None,
-    }
-}
-
-/// The light-BIF entry of `erts_internal:map_next/3`.
-///
-/// The flatmap step allocates its result on `c_p->htop` and returns it, as
-/// erts does: it reads no reduction counter and converts no heap cursor. Every other call
-/// takes the generic light-BIF path.
-// Port of erts/emulator/beam/erl_map.c (erts_internal_map_next_3, flatmap branch: HAlloc on
-// c_p->htop), OTP-29.1.1.
-extern "C" fn map_next_light(
-    header: *mut arinsal_beamasm::ProcessHeader,
-    regs: *mut u64,
-    i: u64,
-) -> u64 {
-    if let Some(raw) = map_next_native(header, regs) {
-        return raw;
-    }
-    crate::native_helpers::thin_bif_light::<MapNext>(header, regs, i)
-}
-
-/// Run OTP's flatmap iterator branch directly against the native heap top.
-// Port of erts/emulator/beam/erl_map.c (erts_internal_map_next_3), OTP-29.1.1.
-#[inline(always)]
-fn map_next_native(header: *mut arinsal_beamasm::ProcessHeader, regs: *mut u64) -> Option<u64> {
-    let (process, registers) = crate::native_hooks::enter_runtime_reg(header, regs)?;
-    let (path, flat, list_mode, mode) = flatmap_step(&registers.x_reg_array[..3])?;
-    let n = flat.size();
-    if path.as_small().filter(|index| *index >= 0)? > n as i64 {
-        return None;
-    }
-    let mut top = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let term = arinsal_maps::flatmap_next_checked(flat, n, list_mode, mode, &mut top).ok()?;
-    registers.x_reg_array[0] = term;
-    Some(crate::native_hooks::raw(term))
-}
-
-/// `erts_internal:map_next/3` for the light-BIF call site.
-// Port of erts/emulator/beam/erl_map.c:3636 (erts_internal_map_next_3), OTP-29.1.1.
-pub(crate) struct MapNext;
-
-impl super::ThinProcessBif for MapNext {
-    const ARITY: usize = 3;
-
-    #[inline(always)]
-    fn call(process: &mut Process, args: &[Term]) -> Result<Term, Box<Trap>> {
-        if let Some((path, flat, list_mode, mode)) = flatmap_step(args) {
-            return flat_next(process, path, flat, list_mode, mode).map_err(Box::new);
-        }
-        map_next_general(process, args).map_err(Box::new)
-    }
-}
-
-// Port of erts/emulator/beam/erl_map.c:3636 (erts_internal_map_next_3), OTP-29.1.1.
-fn map_next_process_bif(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    Some(map_next(process, args))
-}
-
-fn call_map_next(
-    _vm: &mut Vm,
-    process: &mut Process,
-    _ctx: &mut RunCtx<'_, crate::Process>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    map_next(process, args).map_err(VmError::Trap)
 }

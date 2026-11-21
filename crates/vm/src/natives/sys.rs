@@ -4,7 +4,7 @@
 
 use crate::process::Message;
 use crate::{Process, Vm, VmError};
-use arinsal_bifs::Ctx;
+use arinsal_beamasm::ProcessHeader;
 use arinsal_pterm::RetiredArea;
 use arinsal_sched::RunCtx;
 use arinsal_term::{
@@ -22,7 +22,6 @@ mod alloc_atoms;
 #[path = "alloc_info.rs"]
 pub(crate) mod alloc_info;
 
-const QUANTUM: u32 = 4_000;
 // Header subtags from arinsal-term/src/lib.rs. They are crate-private there.
 const ARITY: u64 = 0x00;
 const FUN: u64 = 0x14;
@@ -359,8 +358,8 @@ pub(crate) fn reply_literal_area_copy(
 
 /// System and persistent-term BIFs this family dispatches.
 ///
-/// `system_info/1` and the `nodes/2` visible-map fast path stay outside the
-/// table: those arms return `None` for selectors they do not handle.
+/// The `nodes/2` visible-map fast path stays outside the table: that arm returns
+/// `None` for selectors it does not handle.
 pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("persistent_term", "put", 2),
     ("persistent_term", "put_new", 2),
@@ -370,21 +369,12 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("persistent_term", "erase", 1),
     ("persistent_term", "info", 0),
     ("erts_internal", "erase_persistent_terms", 0),
-    ("erts_internal", "no_aux_work_threads", 0),
     ("erlang", "nodes", 0),
-    ("erlang", "display", 1),
-    ("erlang", "display_string", 2),
-    ("erts_internal", "term_to_string", 2),
-    // `term_to_string/1` is `term_to_string(T, undefined)` in erts_internal.erl.
     ("erlang", "statistics", 1),
-    ("erlang", "bump_reductions", 1),
+    // `term_to_string/1` is `term_to_string(T, undefined)` in erts_internal.erl.
     ("erts_internal", "garbage_collect", 1),
-    ("erlang", "system_flag", 2),
-    ("erts_internal", "scheduler_wall_time", 1),
     ("erlang", "dt_spread_tag", 1),
     ("erlang", "dt_restore_tag", 1),
-    ("erlang", "bif_return_trap", 2),
-    ("erlang", "bif_handle_signals_return", 2),
 ];
 
 pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
@@ -396,32 +386,21 @@ type Handler =
 
 pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler> {
     match (module, function, arity) {
+        ("persistent_term", "put", 2) => Some(persistent_term_put_2),
+        ("persistent_term", "put_new", 2) => Some(persistent_term_put_new_2),
+        ("persistent_term", "get", 0) => Some(persistent_term_get_0),
+        ("persistent_term", "get", 1) => Some(call_persistent_term_get_1),
+        ("persistent_term", "get", 2) => Some(call_persistent_term_get_2),
+        ("persistent_term", "erase", 1) => Some(persistent_term_erase_1),
+        ("persistent_term", "info", 0) => Some(persistent_term_info_0),
+        ("erts_internal", "erase_persistent_terms", 0) => Some(erase_persistent_terms_0),
         ("erlang", "nodes", 0) => Some(call_nodes0),
-        ("erlang", "display", 1) => Some(call_display),
-        ("erlang", "display_string", 2) => Some(call_display_string),
-        ("erts_internal", "term_to_string", 2) => Some(call_term_to_string),
         ("erlang", "statistics", 1) => Some(call_statistics),
-        ("erlang", "bump_reductions", 1) => Some(call_bump_reductions),
         ("erts_internal", "garbage_collect", 1) => Some(call_garbage_collect),
-        ("erts_internal", "no_aux_work_threads", 0) => Some(call_no_aux_work_threads),
-        ("erlang", "system_flag", 2) => Some(call_system_flag),
-        ("erts_internal", "scheduler_wall_time", 1) => Some(call_scheduler_wall_time),
         ("erlang", "dt_spread_tag", 1) => Some(call_dt_spread_tag),
         ("erlang", "dt_restore_tag", 1) => Some(call_dt_restore_tag),
-        ("erlang", "bif_return_trap", 2) => Some(bif_return_trap_2),
-        ("erlang", "bif_handle_signals_return", 2) => Some(bif_handle_signals_return_2),
         _ => None,
     }
-}
-
-/// Port of erts/emulator/beam/erl_process.c:9234 (no_aux_work_threads/0), OTP-29.1.1.
-fn call_no_aux_work_threads(
-    _vm: &mut Vm,
-    _process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
-    _args: &[Term],
-) -> Result<Term, VmError> {
-    non_neg(_process, ctx.scheduler_count().saturating_add(1) as u64)
 }
 
 fn call_nodes0(
@@ -433,86 +412,43 @@ fn call_nodes0(
     Ok(Term::NIL)
 }
 
-fn call_display(
-    _vm: &mut Vm,
-    _process: &mut Process,
-    _ctx: &mut RunCtx<'_, crate::Process>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    display(args[0])
+/// `erlang:display/1`.
+// Port of erts/emulator/beam/bif.c:4144 (display_1), OTP-29.1.1.
+pub(crate) extern "C" fn display_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let [term] = crate::bif_table::bif_args::<1>(reg);
+    crate::natives::bif::bif_ret(c_p, i, display(term))
 }
 
-fn call_display_string(
-    _vm: &mut Vm,
-    process: &mut Process,
-    _ctx: &mut RunCtx<'_, crate::Process>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    display_string(args).map_err(|error| {
-        crate::exceptions::bif_error(process, "erlang", "display_string", args, error)
-    })
-}
-
-fn call_term_to_string(
-    _vm: &mut Vm,
-    process: &mut Process,
-    _ctx: &mut RunCtx<'_, crate::Process>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    term_to_string(process, args)
-}
-
-/// `erlang:statistics/1` selectors that read process or atomic scheduler state from native code.
-// Port of erts/emulator/beam/erl_bif_info.c (statistics_1, `runtime`, `wall_clock`,
-// `garbage_collection`, `io`), OTP-29.1.1.
-pub(crate) fn statistics_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [key] = args else {
-        return None;
-    };
-    match atom_name(*key)? {
-        "runtime" | "wall_clock" | "garbage_collection" | "io" => {
-            statistics(process, None, *key).ok().map(Ok)
-        }
-        "exact_reductions" => {
-            let scheduler = process.runtime.as_ref()?.scheduler().ok()?;
-            let total = scheduler.exact_total_reductions();
-            let flags = runtime_state(process);
-            let (total, delta) = since(total, &flags.last_exact_reductions);
-            Some(pair(process, total, delta).map_err(|error| match error {
-                VmError::Trap(trap) => trap,
-                _ => crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT)),
-            }))
-        }
-        "reductions" | "context_switches" | "run_queue" => {
-            let scheduler = process.runtime.as_ref()?.scheduler().ok()?;
-            let (run_queue, reductions, context_switches) = scheduler.statistics_counters();
-            let result = match atom_name(*key)? {
-                "reductions" => {
-                    let flags = runtime_state(process);
-                    // The run-queue totals include scheduled-out slices. erts also includes the
-                    // caller's live reduction count in this BIF's snapshot.
-                    let total = reductions.saturating_add(current_reductions(process));
-                    let (total, delta) = since(total, &flags.last_reductions);
-                    pair(process, total, delta)
-                }
-                "context_switches" => {
-                    // Port of erts/emulator/beam/erl_bif_info.c:4230, OTP-29.1.1.
-                    // `statistics(context_switches)` reports the cumulative count and zero.
-                    pair(process, context_switches, 0)
-                }
-                "run_queue" => non_neg(process, run_queue),
-                _ => unreachable!(),
-            };
-            Some(result.map_err(|error| match error {
-                VmError::Trap(trap) => trap,
-                _ => crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::SYSTEM_LIMIT)),
-            }))
-        }
-        _ => None,
+/// `erlang:display_string/2`: every failure is `BIF_ERROR(BIF_P, BADARG)`.
+// Port of erts/emulator/beam/bif.c:4192 (display_string_2), OTP-29.1.1.
+pub(crate) extern "C" fn display_string_2(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let args = crate::bif_table::bif_args::<2>(reg);
+    match display_string(&args) {
+        Ok(()) => crate::native_hooks::raw(Term::atom(arinsal_term::atoms::TRUE)),
+        Err(()) => crate::natives::bif::bif_badarg(c_p),
     }
+}
+
+/// `erts_internal:term_to_string/2`.
+// Port of erts/emulator/beam/bif.c:4156 (erts_internal_term_to_string_2), OTP-29.1.1.
+pub(crate) extern "C" fn term_to_string_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let args = crate::bif_table::bif_args::<2>(reg);
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let result = term_to_string(process, &args);
+    crate::natives::bif::bif_ret(c_p, i, result)
+}
+
+/// `erlang:statistics/1` has selectors that trap while scheduler state is gathered.
+// Port of erts/emulator/beam/erl_bif_info.c (statistics_1), OTP-29.1.1.
+fn call_statistics(
+    _vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, crate::Process>,
+    args: &[Term],
+) -> Result<Term, VmError> {
+    statistics(process, Some(ctx.esdp()), args[0])
 }
 
 // Port of erts/emulator/beam/beam_common.c (erts_current_reductions: `REDS_IN(c_p) -
@@ -528,33 +464,6 @@ fn current_reductions(process: &Process) -> u64 {
     .unwrap_or(0)
 }
 
-fn call_statistics(
-    _vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    statistics(process, Some(ctx), args[0])
-}
-
-fn call_bump_reductions(
-    _vm: &mut Vm,
-    process: &mut Process,
-    _ctx: &mut RunCtx<'_, crate::Process>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    // Port of erts/emulator/beam/bif.c:5403 (bump_reductions_1), OTP-29.1.1.
-    // The BIF consumes at most one scheduler quantum and returns `true`.
-    let reductions = args[0]
-        .as_small()
-        .filter(|value| *value >= 0)
-        .ok_or_else(badarg)?;
-    let charged = reductions.min(QUANTUM as i64) as u32;
-    // FCALLS only: the slice folds it (`fold_fcalls`).
-    process.heap.abi.fcalls -= charged as i32;
-    Ok(Term::atom(arinsal_term::atoms::TRUE))
-}
-
 fn call_garbage_collect(
     _vm: &mut Vm,
     process: &mut Process,
@@ -568,24 +477,38 @@ fn call_garbage_collect(
     garbage_collect(process, args[0])
 }
 
-fn call_system_flag(
-    _vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    system_flag(process, ctx, args)
+/// `erlang:system_flag/2`; the scheduler-data items reach `esdp` through
+/// `erts_proc_sched_data(c_p)`.
+// Port of erts/emulator/beam/bif.c:4972 (system_flag_2), OTP-29.1.1.
+pub(crate) extern "C" fn system_flag_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let args = crate::bif_table::bif_args::<2>(reg);
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let result = arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
+        system_flag(process, esdp, &args)
+    })
+    .expect("a BIF runs on a scheduler (erts_proc_sched_data asserts esdp)");
+    crate::natives::bif::bif_ret(c_p, i, result)
 }
 
-fn call_scheduler_wall_time(
-    _vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    // Port of erts/emulator/beam/bif.c:5306 (erts_internal_scheduler_wall_time_1), OTP-29.1.1.
-    // Any term other than `true` disables accounting. The previous flag is returned.
-    set_scheduler_wall_enabled(process, ctx, atom_name(args[0]) == Some("true"))
+/// `erts_internal:scheduler_wall_time/1`: any term other than `true` disables accounting;
+/// the previous flag is returned.
+// Port of erts/emulator/beam/bif.c:5306 (erts_internal_scheduler_wall_time_1), OTP-29.1.1.
+pub(crate) extern "C" fn scheduler_wall_time_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let [enable] = crate::bif_table::bif_args::<1>(reg);
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let result = arinsal_sched::erts_proc_sched_data(process, |process, esdp| {
+        set_scheduler_wall_enabled(process, esdp, atom_name(enable) == Some("true"))
+    })
+    .expect("a BIF runs on a scheduler (erts_proc_sched_data asserts esdp)");
+    crate::natives::bif::bif_ret(c_p, i, result)
 }
 
 /// `erlang:dt_spread_tag/1` from the generated code.
@@ -716,47 +639,10 @@ fn call_values(
     args: &[Term],
 ) -> Option<Result<Term, VmError>> {
     let arity = args.len() as u8;
-    if module == "persistent_term" && function == "get" && arity == 0 {
-        return Some(get_all_step(process));
-    }
-    if let Some(bif) = arinsal_pterm::lookup_in(module, function, arity) {
-        debug_assert!(
-            recognizes(module, function, arity),
-            "persistent_term {module}:{function}/{arity} is dispatched but not listed"
-        );
-        if let Some(continuation) = persistent_update_export(module, function, arity) {
-            return Some(persistent_update(
-                process,
-                ctx,
-                bif,
-                (module, function, continuation),
-                args,
-            ));
-        }
-        // The reading BIFs (get/1,2, info/0) never change the table.
-        let store = process.persistent_terms;
-        let result = {
-            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-            let mut state = arinsal_bifs::BifState::default();
-            let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut state);
-            bif(store, &mut bif_ctx, args)
-        };
-        return Some(result.map_err(|error| {
-            crate::exceptions::bif_error(process, module, function, args, error)
-        }));
-    }
     if let Some(handle) = handler(module, function, arity) {
         return Some(handle(vm, process, ctx, args));
     }
     match (module, function, args.len()) {
-        // boot_loop1: rpc and global query peer nodes while this VM is non-distributed.
-        // `node::call` handles the general case first; this arm remains for a direct call.
-        ("erlang", "nodes", 2)
-            if args[0].as_atom().and_then(|atom| global_atoms().text(atom)) == Some("visible")
-                && args[1].classify() == TermKind::Map =>
-        {
-            Some(Ok(Term::NIL))
-        }
         // Port of erts/emulator/beam/bif.c:5929-6119 (DTrace BIFs without
         // USE_VM_PROBES), OTP-29.1.1.
         ("erlang", "dt_get_tag" | "dt_get_tag_data", 0) => {
@@ -780,44 +666,36 @@ fn call_values(
             })
         }
         ("erlang", "dt_prepend_vm_tag_data" | "dt_append_vm_tag_data", 1) => Some(Ok(args[0])),
-        // Port of erts/emulator/beam/dist.c:6670, OTP-29.1.1. Local peers
-        // always advertise the Unicode I/O distribution flag.
-        ("net_kernel", "dflag_unicode_io", 1) => Some(match args[0].classify() {
-            TermKind::Pid if args[0].as_pid().is_some() => {
-                Ok(Term::atom(arinsal_term::atoms::TRUE))
-            }
-            TermKind::Pid => Ok(Term::atom(arinsal_term::atoms::FALSE)),
-            _ => Err(badarg()),
-        }),
-        // The executor runs the same BIF body as the table entry (erts calls one C function for
-        // traced and untraced calls). Port of erts/emulator/beam/erl_bif_info.c (system_info_1).
-        ("erlang", "system_info", 1) => Some(crate::natives::erl_bif_info::system_info_body(
-            process, args[0],
-        )),
         _ => None,
     }
 }
 
-/// `erlang:bif_return_trap/2`, the trap export of `ERTS_BIF_YIELD_RETURN`: a BIF that yields
-/// with its result traps here and returns it when the process is scheduled again.
-// Port of erts/emulator/beam/bif.c:5431-5450 (bif_return_trap) and bif.h:454-463
-// (ERTS_BIF_YIELD_RETURN_X), OTP-29.1.1.
-pub(crate) fn bif_return_trap_2(
-    _vm: &mut Vm,
-    process: &mut Process,
-    _ctx: &mut RunCtx<'_, crate::Process>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    if args[1] == crate::atom_cache::put("multi_scheduling") {
+/// `erlang:bif_return_trap/2`, the continuation of `ERTS_BIF_YIELD_RETURN`.
+// Port of erts/emulator/beam/bif.c:5431-5450 (bif_return_trap), OTP-29.1.1.
+pub(crate) extern "C" fn bif_return_trap_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let [value, tag] = crate::bif_table::bif_args::<2>(reg);
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    crate::natives::bif::bif_ret(c_p, i, bif_return_trap(process, &[value, tag]))
+}
+
+fn bif_return_trap(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
+    let [value, tag] = args else {
+        return Err(badarg());
+    };
+    if *tag == crate::atom_cache::put("multi_scheduling") {
         let state = multi_scheduling_state(process, crate::process::MultiScheduling::state);
         if state == "enabled" {
-            return Err(VmError::Unsupported(
+            Err(VmError::Unsupported(
                 "bif_return_trap: unexpected multi scheduling block state".into(),
-            ));
+            ))
+        } else {
+            Ok(crate::atom_cache::put(state))
         }
-        return Ok(crate::atom_cache::put(state));
+    } else {
+        Ok(*value)
     }
-    Ok(args[0])
 }
 
 /// The continuation of `ERTS_BIF_YIELD_RETURN`.
@@ -826,29 +704,24 @@ pub(crate) const BIF_RETURN_TRAP: &str = "erlang:bif_return_trap/2";
 /// `erlang:bif_handle_signals_return/2`, the trap export of `ERTS_BIF_HANDLE_SIGNALS_FROM_RETURN`.
 // Port of erts/emulator/beam/bif.c:5452-5498 (`bif_handle_signals_return`) and bif.h:527-528,
 // OTP-29.1.1.
-pub(crate) fn bif_handle_signals_return_2(
-    _vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    process.bif_handle_signals_return(ctx, args[0], args[1])
+pub(crate) extern "C" fn bif_handle_signals_return_2(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let [from, value] = crate::bif_table::bif_args::<2>(reg);
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    let result = crate::natives::bif::with_sched(process, reg, |_vm, process, ctx| {
+        process.bif_handle_signals_return(ctx, from, value)
+    })
+    .flatten();
+    crate::natives::bif::bif_ret(c_p, i, result)
 }
 
 /// The continuation of `ERTS_BIF_HANDLE_SIGNALS_FROM_RETURN`.
 pub(crate) const BIF_HANDLE_SIGNALS_RETURN: &str = "erlang:bif_handle_signals_return/2";
-
-/// The export of a persistent-term BIF that updates the table: it yields to itself while
-/// another process holds the update permission.
-fn persistent_update_export(module: &str, function: &str, arity: u8) -> Option<&'static str> {
-    Some(match (module, function, arity) {
-        ("persistent_term", "put", 2) => "persistent_term:put/2",
-        ("persistent_term", "put_new", 2) => "persistent_term:put_new/2",
-        ("persistent_term", "erase", 1) => "persistent_term:erase/1",
-        ("erts_internal", "erase_persistent_terms", 0) => "erts_internal:erase_persistent_terms/0",
-        _ => return None,
-    })
-}
 
 /// A persistent-term BIF that updates the table: `put/2`, `put_new/2`, `erase/1`,
 /// `erts_internal:erase_persistent_terms/0`.
@@ -856,13 +729,13 @@ fn persistent_update_export(module: &str, function: &str, arity: u8) -> Option<&
 // (persistent_term_erase_1), :545-575 (erts_internal_erase_persistent_terms_0), OTP-29.1.1.
 fn persistent_update(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
-    bif: arinsal_pterm::StoreBif,
-    (module, function, continuation): (&str, &str, &'static str),
+    esdp: &arinsal_sched::ErtsSchedulerData<crate::Process>,
+    continuation: &'static str,
     args: &[Term],
+    update: impl FnOnce(&arinsal_pterm::Store) -> Result<Term, VmError>,
 ) -> Result<Term, VmError> {
     let store = process.persistent_terms;
-    let pid = ctx.pid();
+    let pid = process.self_pid().expect("a running BIF process has a pid");
     let owner = persistent_owner(pid);
     // ERTS_BIF_YIELDn(BIF_TRAP_EXPORT(...)) while another process holds the permission.
     if !store.try_seize_update_permission(owner) {
@@ -874,19 +747,11 @@ fn persistent_update(
         )));
     }
     let before = PersistentTermUpdate::snapshot(store);
-    let result = {
-        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut state = arinsal_bifs::BifState::default();
-        let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut state);
-        bif(store, &mut bif_ctx, args)
-    };
-    let value = match result {
+    let value = match update(store) {
         Ok(value) => value,
         Err(error) => {
             store.release_update_permission(owner);
-            return Err(crate::exceptions::bif_error(
-                process, module, function, args, error,
-            ));
+            return Err(error);
         }
     };
     if !before.published() {
@@ -897,17 +762,15 @@ fn persistent_update(
     if store.retired_generation() != before.retired {
         // Port of erts/emulator/beam/beam_bif_load.c:2341 (erts_queue_release_literals),
         // OTP-29.1.1: every queued area sends `copy_literals` to the collector.
-        wake_literal_collector(process, ctx);
+        wake_literal_collector(process, esdp);
     }
     // erts_schedule_thr_prgr_later_op(table_updater, ...), suspend_updater(BIF_P) and
     // ERTS_BIF_YIELD_RETURN(BIF_P, Result): table_updater frees the old table, releases the
     // permission and resumes the updater once every scheduler has passed a progress point;
     // the updater then returns the result through bif_return_trap.
-    let Some(runtime) = process.runtime else {
-        store.reclaim_old_tables();
-        store.release_update_permission(owner);
-        return Ok(value);
-    };
+    let runtime = process
+        .runtime
+        .expect("a persistent-term BIF runs inside its runtime");
     crate::suspend::suspend_self(process);
     runtime
         .persistent_term_resume_pid
@@ -915,11 +778,14 @@ fn persistent_update(
     runtime
         .persistent_term_resume_owner
         .store(owner, std::sync::atomic::Ordering::Release);
-    ctx.erts_schedule_thr_prgr_later_op(
-        persistent_table_updater,
-        runtime as *const crate::process::Runtime as *mut (),
-        runtime.persistent_term_later_op.as_list_node(),
-    );
+    arinsal_sched::RunCtx::with_current(esdp, |ctx| {
+        ctx.erts_schedule_thr_prgr_later_op(
+            persistent_table_updater,
+            runtime as *const crate::process::Runtime as *mut (),
+            runtime.persistent_term_later_op.as_list_node(),
+        )
+    })
+    .expect("a persistent-term BIF runs a process on this scheduler");
     crate::bif_traps::vbump_all_reds(process);
     Err(VmError::TrapExport(crate::ExportTrap::new(
         process,
@@ -944,43 +810,67 @@ fn persistent_table_updater(data: *mut ()) {
     crate::natives::code::resume_suspended(runtime, pid);
 }
 
-macro_rules! persistent_update_bif {
-    ($(#[$doc:meta])* $name:ident, $module:literal, $function:literal, $arity:literal) => {
-        $(#[$doc])*
-        pub(crate) fn $name(
-            _vm: &mut Vm,
-            process: &mut Process,
-            ctx: &mut RunCtx<'_, crate::Process>,
-            args: &[Term],
-        ) -> Result<Term, VmError> {
-            let bif = arinsal_pterm::lookup_in($module, $function, $arity)
-                .expect("persistent-term BIF of bif.tab");
-            let continuation = persistent_update_export($module, $function, $arity)
-                .expect("updating persistent-term BIF");
-            persistent_update(process, ctx, bif, ($module, $function, continuation), args)
-        }
-    };
+fn persistent_system_limit() -> VmError {
+    VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::SYSTEM_LIMIT,
+    )))
 }
 
-persistent_update_bif!(
-    /// `persistent_term:put/2`.
-    persistent_term_put_2, "persistent_term", "put", 2
-);
-persistent_update_bif!(
-    /// `persistent_term:put_new/2`.
-    persistent_term_put_new_2, "persistent_term", "put_new", 2
-);
-persistent_update_bif!(
-    /// `persistent_term:erase/1`.
-    persistent_term_erase_1, "persistent_term", "erase", 1
-);
-persistent_update_bif!(
-    /// `erts_internal:erase_persistent_terms/0`.
-    erase_persistent_terms_0, "erts_internal", "erase_persistent_terms", 0
-);
+/// `persistent_term:put/2`.
+// Port of erts/emulator/beam/erl_bif_persistent.c (persistent_term_put_2), OTP-29.1.1.
+pub(crate) fn persistent_term_put_2(
+    _vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, crate::Process>,
+    args: &[Term],
+) -> Result<Term, VmError> {
+    let [key, value] = args else {
+        return Err(badarg());
+    };
+    persistent_update(
+        process,
+        ctx.esdp(),
+        "persistent_term:put/2",
+        args,
+        |store| {
+            store
+                .put(*key, *value)
+                .map_err(|_| persistent_system_limit())?;
+            Ok(Term::atom(arinsal_term::atoms::OK))
+        },
+    )
+}
+
+/// `persistent_term:put_new/2`.
+// Port of erts/emulator/beam/erl_bif_persistent.c (persistent_term_put_new_2), OTP-29.1.1.
+pub(crate) fn persistent_term_put_new_2(
+    _vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, crate::Process>,
+    args: &[Term],
+) -> Result<Term, VmError> {
+    let [key, value] = args else {
+        return Err(badarg());
+    };
+    persistent_update(
+        process,
+        ctx.esdp(),
+        "persistent_term:put_new/2",
+        args,
+        |store| {
+            if !store
+                .put_new(*key, *value)
+                .map_err(|_| persistent_system_limit())?
+            {
+                return Err(badarg());
+            }
+            Ok(Term::atom(arinsal_term::atoms::OK))
+        },
+    )
+}
 
 /// `persistent_term:get/0`.
-// Port of erts/emulator/beam/erl_bif_persistent.c:324 (persistent_term_get_0), OTP-29.1.1.
+// Port of erts/emulator/beam/erl_bif_persistent.c (persistent_term_get_0), OTP-29.1.1.
 pub(crate) fn persistent_term_get_0(
     _vm: &mut Vm,
     process: &mut Process,
@@ -988,6 +878,127 @@ pub(crate) fn persistent_term_get_0(
     _args: &[Term],
 ) -> Result<Term, VmError> {
     get_all_step(process)
+}
+
+/// `persistent_term:get/1`.
+// Port of erts/emulator/beam/erl_bif_persistent.c (persistent_term_get_1), OTP-29.1.1.
+pub(crate) extern "C" fn persistent_term_get_1(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    let [key] = crate::bif_table::bif_args::<1>(reg);
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    match process.persistent_terms.get(key) {
+        Some(value) => crate::native_hooks::raw(value),
+        None => crate::natives::bif::bif_ret(c_p, i, Err(badarg())),
+    }
+}
+
+/// `persistent_term:get/2`.
+// Port of erts/emulator/beam/erl_bif_persistent.c (persistent_term_get_2), OTP-29.1.1.
+pub(crate) extern "C" fn persistent_term_get_2(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    _i: u64,
+) -> u64 {
+    let [key, default] = crate::bif_table::bif_args::<2>(reg);
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    crate::native_hooks::raw(process.persistent_terms.get(key).unwrap_or(default))
+}
+
+fn call_persistent_term_get_1(
+    _vm: &mut Vm,
+    process: &mut Process,
+    _ctx: &mut RunCtx<'_, crate::Process>,
+    args: &[Term],
+) -> Result<Term, VmError> {
+    process.persistent_terms.get(args[0]).ok_or_else(badarg)
+}
+
+fn call_persistent_term_get_2(
+    _vm: &mut Vm,
+    process: &mut Process,
+    _ctx: &mut RunCtx<'_, crate::Process>,
+    args: &[Term],
+) -> Result<Term, VmError> {
+    Ok(process.persistent_terms.get(args[0]).unwrap_or(args[1]))
+}
+
+/// `persistent_term:erase/1`.
+// Port of erts/emulator/beam/erl_bif_persistent.c (persistent_term_erase_1), OTP-29.1.1.
+pub(crate) fn persistent_term_erase_1(
+    _vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, crate::Process>,
+    args: &[Term],
+) -> Result<Term, VmError> {
+    let [key] = args else { return Err(badarg()) };
+    persistent_update(
+        process,
+        ctx.esdp(),
+        "persistent_term:erase/1",
+        args,
+        |store| {
+            Ok(Term::atom(if store.erase(*key) {
+                arinsal_term::atoms::TRUE
+            } else {
+                arinsal_term::atoms::FALSE
+            }))
+        },
+    )
+}
+
+/// `persistent_term:info/0`.
+// Port of erts/emulator/beam/erl_bif_persistent.c (persistent_term_info_0), OTP-29.1.1.
+pub(crate) fn persistent_term_info_0(
+    _vm: &mut Vm,
+    process: &mut Process,
+    _ctx: &mut RunCtx<'_, crate::Process>,
+    _args: &[Term],
+) -> Result<Term, VmError> {
+    let (count, memory) = process.persistent_terms.info();
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    (|| {
+        let count = TermBuilder::new(&mut heap)
+            .int_from_i128(count as i128)
+            .map_err(|_| persistent_system_limit())?;
+        let memory = TermBuilder::new(&mut heap)
+            .int_from_i128(memory as i128)
+            .map_err(|_| persistent_system_limit())?;
+        arinsal_maps::from_list(
+            &[
+                (crate::atom_cache::put("count"), count),
+                (crate::atom_cache::put("memory"), memory),
+            ],
+            &mut heap,
+        )
+        .map_err(|_| persistent_system_limit())
+    })()
+}
+
+/// `erts_internal:erase_persistent_terms/0`.
+// Port of erts/emulator/beam/erl_bif_persistent.c (erts_internal_erase_persistent_terms_0), OTP-29.1.1.
+pub(crate) fn erase_persistent_terms_0(
+    _vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, crate::Process>,
+    args: &[Term],
+) -> Result<Term, VmError> {
+    persistent_update(
+        process,
+        ctx.esdp(),
+        "erts_internal:erase_persistent_terms/0",
+        args,
+        |store| {
+            store.clear();
+            Ok(Term::atom(arinsal_term::atoms::TRUE))
+        },
+    )
 }
 
 /// Persistent-term table counters taken before an updating BIF runs.
@@ -1013,7 +1024,10 @@ impl PersistentTermUpdate {
 }
 
 // Port of erts/emulator/beam/beam_bif_load.c:1916 (wake area-switch wait), OTP-29.1.1.
-pub(crate) fn wake_literal_collector(process: &Process, ctx: &mut RunCtx<'_, crate::Process>) {
+pub(crate) fn wake_literal_collector(
+    process: &Process,
+    esdp: &arinsal_sched::ErtsSchedulerData<crate::Process>,
+) {
     let store = process.persistent_terms;
     if !store.has_retired() {
         return;
@@ -1025,8 +1039,16 @@ pub(crate) fn wake_literal_collector(process: &Process, ctx: &mut RunCtx<'_, cra
     else {
         return;
     };
-    if let Ok(message) = Message::copy_from(Term::atom(arinsal_term::atoms::COPY_LITERALS)) {
-        let _ = ctx.send(pid, message);
+    if let (Some(from), Ok(message)) = (
+        process.self_pid(),
+        Message::copy_from(Term::atom(arinsal_term::atoms::COPY_LITERALS)),
+    ) {
+        let _ = arinsal_sched::proc_queue_payload(
+            esdp,
+            from,
+            pid,
+            arinsal_sched::Payload::Message(message),
+        );
     }
 }
 
@@ -1186,10 +1208,10 @@ fn term_to_string(process: &mut Process, args: &[Term]) -> Result<Term, VmError>
 
 // Port of erts/emulator/beam/bif.c:4192 (display_string_2), OTP-29.1.1.
 // boot_loop1: logger_simple_h writes directly to stdout after a boot failure.
-fn display_string(args: &[Term]) -> Result<Term, arinsal_bifs::BifError> {
+fn display_string(args: &[Term]) -> Result<(), ()> {
     use arinsal_etf::OwnedTerm;
 
-    fn append_string(value: &OwnedTerm, bytes: &mut Vec<u8>) -> Result<(), arinsal_bifs::BifError> {
+    fn append_string(value: &OwnedTerm, bytes: &mut Vec<u8>) -> Result<(), ()> {
         match value {
             OwnedTerm::Nil => Ok(()),
             OwnedTerm::List { elems, tail } => {
@@ -1202,7 +1224,7 @@ fn display_string(args: &[Term]) -> Result<Term, arinsal_bifs::BifError> {
                 let c = u32::try_from(*codepoint)
                     .ok()
                     .and_then(char::from_u32)
-                    .ok_or(arinsal_bifs::BifError::BADARG)?;
+                    .ok_or(())?;
                 let mut buffer = [0; 4];
                 bytes.extend_from_slice(c.encode_utf8(&mut buffer).as_bytes());
                 Ok(())
@@ -1211,24 +1233,23 @@ fn display_string(args: &[Term]) -> Result<Term, arinsal_bifs::BifError> {
                 bytes.extend_from_slice(binary);
                 Ok(())
             }
-            _ => Err(arinsal_bifs::BifError::BADARG),
+            _ => Err(()),
         }
     }
 
     let destination = args[0]
         .as_atom()
         .and_then(|atom| global_atoms().text(atom))
-        .ok_or(arinsal_bifs::BifError::BADARG)?;
-    let value = arinsal_term::to_owned(args[1]).map_err(|_| arinsal_bifs::BifError::BADARG)?;
+        .ok_or(())?;
+    let value = arinsal_term::to_owned(args[1]).map_err(|_| ())?;
     let mut bytes = Vec::new();
     append_string(&value, &mut bytes)?;
     match destination {
         "stdout" => std::io::stdout().lock().write_all(&bytes),
         "stderr" => std::io::stderr().lock().write_all(&bytes),
-        _ => return Err(arinsal_bifs::BifError::BADARG),
+        _ => return Err(()),
     }
-    .map_err(|_| arinsal_bifs::BifError::BADARG)?;
-    Ok(Term::atom(arinsal_term::atoms::TRUE))
+    .map_err(|_| ())
 }
 
 /// The `system_info/1` items that need only the calling process, as erts computes them from
@@ -3067,7 +3088,7 @@ fn ets_structure_bytes(process: &Process) -> u64 {
 
 fn statistics(
     process: &mut Process,
-    ctx: Option<&mut RunCtx<'_, crate::Process>>,
+    esdp: Option<&arinsal_sched::ErtsSchedulerData<crate::Process>>,
     key: Term,
 ) -> Result<Term, VmError> {
     let Some(name) = atom_name(key) else {
@@ -3086,22 +3107,18 @@ fn statistics(
         }
         "reductions" => {
             let flags = runtime_state(process);
-            let (total, delta) = since(
-                reduction_total(process, ctx.as_deref()),
-                &flags.last_reductions,
-            );
+            let (total, delta) = since(reduction_total(process, esdp), &flags.last_reductions);
             pair(process, total, delta)
         }
         "exact_reductions" => {
             let flags = runtime_state(process);
-            let total = ctx.map_or(0, |ctx| ctx.exact_total_reductions());
+            let total = esdp.map_or(0, |esdp| esdp.exact_total_reductions());
             let (total, delta) = since(total, &flags.last_exact_reductions);
             pair(process, total, delta)
         }
         "context_switches" => {
-            let total = ctx
-                .as_deref()
-                .map(|ctx| ctx.statistics_counters().2)
+            let total = esdp
+                .map(|esdp| esdp.statistics_counters().2)
                 .or_else(|| {
                     process
                         .runtime
@@ -3122,47 +3139,42 @@ fn statistics(
         "io" => io_counters(process),
         "run_queue" => non_neg(
             process,
-            queue_counts(process, ctx.as_deref(), false, false)
-                .iter()
-                .sum(),
+            queue_counts(process, esdp, false, false).iter().sum(),
         ),
         "total_run_queue_lengths" | "total_run_queue_lengths_all" => {
             let all = name == "total_run_queue_lengths_all";
             non_neg(
                 process,
-                queue_counts(process, ctx.as_deref(), false, all)
-                    .iter()
-                    .sum(),
+                queue_counts(process, esdp, false, all).iter().sum(),
             )
         }
         "run_queue_lengths" | "run_queue_lengths_all" => {
             let all = name == "run_queue_lengths_all";
-            int_list(process, &queue_counts(process, ctx.as_deref(), false, all))
+            int_list(process, &queue_counts(process, esdp, false, all))
         }
         "active_tasks" | "active_tasks_all" => {
             let all = name == "active_tasks_all";
-            int_list(process, &queue_counts(process, ctx.as_deref(), true, all))
+            int_list(process, &queue_counts(process, esdp, true, all))
         }
         "total_active_tasks" | "total_active_tasks_all" => {
             let all = name == "total_active_tasks_all";
-            non_neg(
-                process,
-                queue_counts(process, ctx.as_deref(), true, all)
-                    .iter()
-                    .sum(),
-            )
+            non_neg(process, queue_counts(process, esdp, true, all).iter().sum())
         }
-        "run_queues" => int_tuple(process, &queue_counts(process, ctx.as_deref(), false, true)),
-        "scheduler_wall_time" => scheduler_wall(process, ctx.as_deref(), false),
-        "scheduler_wall_time_all" => scheduler_wall(process, ctx.as_deref(), true),
-        "microstate_accounting" => microstate(process, ctx),
+        "run_queues" => int_tuple(process, &queue_counts(process, esdp, false, true)),
+        "scheduler_wall_time" => scheduler_wall(process, esdp, false),
+        "scheduler_wall_time_all" => scheduler_wall(process, esdp, true),
+        "microstate_accounting" => match esdp {
+            Some(esdp) => RunCtx::with_current(esdp, |ctx| microstate(process, Some(ctx)))
+                .unwrap_or_else(|| microstate(process, None)),
+            None => microstate(process, None),
+        },
         _ => Err(badarg()),
     }
 }
 
 fn system_flag(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
+    esdp: &arinsal_sched::ErtsSchedulerData<crate::Process>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/bif.c:4972 (system_flag_2), OTP-29.1.1.
@@ -3170,7 +3182,7 @@ fn system_flag(
         return Err(badarg());
     };
     match name {
-        "multi_scheduling" => multi_scheduling(process, ctx, args[1]),
+        "multi_scheduling" => multi_scheduling(process, args[1]),
         "schedulers_online" => schedulers_online(process, args[1], false),
         "dirty_cpu_schedulers_online" => schedulers_online(process, args[1], true),
         "fullsweep_after" => fullsweep_after(process, args[1]),
@@ -3200,22 +3212,25 @@ fn system_flag(
                 vec![args[1]],
             )))
         }
-        "microstate_accounting" => set_microstate(process, ctx, args[1]),
+        "microstate_accounting" => {
+            arinsal_sched::RunCtx::with_current(esdp, |ctx| set_microstate(process, ctx, args[1]))
+                .unwrap_or_else(|| Err(badarg()))
+        }
         "outstanding_system_requests_limit" => outstanding_limit(process, args[1]),
-        "scheduling_statistics" => scheduling_statistics(ctx, args[1]),
+        "scheduling_statistics" => scheduling_statistics(esdp, args[1]),
         "time_offset" if atom_name(args[1]) == Some("finalize") => {
             Ok(crate::atom_cache::put("final"))
         }
         "scheduler_bind_type" => {
             // Port of erts/emulator/beam/bif.c:5284 and
             // erts/emulator/beam/erl_cpu_topology.c:714, OTP-29.1.1.
-            warn_deprecated_scheduler_bind(process, ctx);
+            warn_deprecated_scheduler_bind(process);
             set_scheduler_bind_type(process, args)
         }
         "cpu_topology" => {
             // Port of erts/emulator/beam/bif.c:5276 and
             // erts/emulator/beam/erl_cpu_topology.c:1348, OTP-29.1.1.
-            warn_deprecated_cpu_topology(process, ctx);
+            warn_deprecated_cpu_topology(process);
             set_cpu_topology(process, args[1], "set_cpu_topology")
         }
         "internal_cpu_topology" => {
@@ -3681,6 +3696,47 @@ fn valid_cpu_topology(topology: &arinsal_etf::OwnedTerm) -> bool {
         && !logical_ids.is_empty()
 }
 
+/// `erts_fake_scheduler_bindings`: bind-order sort of the used topology, as a tuple of logical ids.
+// Port of erts/emulator/beam/erl_cpu_topology.c:840 (erts_fake_scheduler_bindings), OTP-29.1.1.
+pub(crate) fn fake_scheduler_bindings(process: &mut Process, how: &str) -> Result<Term, VmError> {
+    if how == "unbound" {
+        return Ok(Term::atom(arinsal_term::atoms::FALSE));
+    }
+    let defined = runtime_state(process)
+        .cpu_topology
+        .lock()
+        .expect("CPU topology state")
+        .clone();
+    let entries = {
+        #[cfg(target_os = "linux")]
+        {
+            defined
+                .as_ref()
+                .map(topology_bind_entries)
+                .unwrap_or_else(|| arinsal_alloc::cpuinfo::cpu_topology().to_vec())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = defined;
+            arinsal_alloc::cpuinfo::cpu_topology().to_vec()
+        }
+    };
+    if entries.is_empty() {
+        return Ok(Term::atom(arinsal_term::atoms::FALSE));
+    }
+    let Some(sorted) = arinsal_alloc::cpuinfo::cpu_bind_ordered_entries(&entries, how) else {
+        return Err(badarg());
+    };
+    if sorted.is_empty() {
+        return tuple(process, &[]);
+    }
+    let logicals = sorted
+        .iter()
+        .map(|entry| Term::small(i64::from(entry.logical)).ok_or_else(badarg))
+        .collect::<Result<Vec<_>, _>>()?;
+    tuple(process, &logicals)
+}
+
 /// Build OTP's test reader-group assignment for the currently defined topology.
 // Port of erts/emulator/beam/erl_cpu_topology.c:1834-1848 and :1918-2256, OTP-29.1.1.
 pub(crate) fn reader_groups_map(process: &mut Process, groups: i64) -> Result<Term, VmError> {
@@ -3694,12 +3750,6 @@ pub(crate) fn reader_groups_map(process: &mut Process, groups: i64) -> Result<Te
         .lock()
         .expect("CPU topology state")
         .clone();
-    let Some(O::List { elems, tail }) = topology.as_ref() else {
-        return Ok(Term::NIL);
-    };
-    if !matches!(tail.as_ref(), O::Nil) {
-        return Ok(Term::NIL);
-    }
 
     // The group builder only needs the ordered hierarchy levels associated with
     // each logical processor. The synthetic ids preserve sibling boundaries.
@@ -3813,28 +3863,48 @@ pub(crate) fn reader_groups_map(process: &mut Process, groups: i64) -> Result<Te
     }
 
     let mut rows = Vec::new();
-    let root = [-1; 6];
-    let mut root_ids = [0_i32; 6];
-    for term in elems {
-        let O::Tuple(fields) = term else {
-            return Err(badarg());
-        };
-        let tag = match fields.first() {
-            Some(O::Atom(tag)) => tag.as_str(),
-            _ => return Err(badarg()),
-        };
-        let field = match tag {
-            "node" => 0,
-            "processor" => 1,
-            "core" => 3,
-            "thread" => 4,
-            _ => return Err(badarg()),
-        };
-        let mut parent = root;
-        parent[field] = root_ids[field];
-        root_ids[field] += 1;
-        if !visit(term, parent, "root", &mut rows) {
-            return Err(badarg());
+    match topology.as_ref() {
+        Some(O::List { elems, tail }) if matches!(tail.as_ref(), O::Nil) => {
+            let root = [-1; 6];
+            let mut root_ids = [0_i32; 6];
+            for term in elems {
+                let O::Tuple(fields) = term else {
+                    return Err(badarg());
+                };
+                let tag = match fields.first() {
+                    Some(O::Atom(tag)) => tag.as_str(),
+                    _ => return Err(badarg()),
+                };
+                let field = match tag {
+                    "node" => 0,
+                    "processor" => 1,
+                    "core" => 3,
+                    "thread" => 4,
+                    _ => return Err(badarg()),
+                };
+                let mut parent = root;
+                parent[field] = root_ids[field];
+                root_ids[field] += 1;
+                if !visit(term, parent, "root", &mut rows) {
+                    return Err(badarg());
+                }
+            }
+        }
+        _ => {
+            // erts_debug_reader_groups_map: make_cpu_groups_map uses the used (detected) topology
+            // when none is defined.
+            for entry in arinsal_alloc::cpuinfo::cpu_topology() {
+                rows.push(Cpu {
+                    level: [
+                        entry.node,
+                        entry.processor,
+                        entry.processor_node,
+                        entry.core,
+                        entry.thread,
+                        entry.logical,
+                    ],
+                });
+            }
         }
     }
     if rows.is_empty() {
@@ -4001,33 +4071,27 @@ pub(crate) fn reader_groups_map(process: &mut Process, groups: i64) -> Result<Te
 
 // Port of erts/emulator/beam/bif.c (system_flag_2: `erts_send_warning_to_logger_str` with
 // the caller's group leader), OTP-29.1.1.
-fn send_deprecation_warning(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
-    text: &str,
-) {
-    let Some(runtime) = process.runtime else {
+fn send_deprecation_warning(process: &mut Process, text: &str) {
+    let (Some(runtime), Some(pid)) = (process.runtime, process.self_pid()) else {
         return;
     };
     let group_leader = process
         .group_leader
         .and_then(|leader| leader.to_term())
         .unwrap_or(Term::NIL);
-    crate::utils::send_warning_to_logger_str(runtime, ctx.pid(), group_leader, text);
+    crate::utils::send_warning_to_logger_str(runtime, pid, group_leader, text);
 }
 
-fn warn_deprecated_scheduler_bind(process: &mut Process, ctx: &mut RunCtx<'_, crate::Process>) {
+fn warn_deprecated_scheduler_bind(process: &mut Process) {
     send_deprecation_warning(
         process,
-        ctx,
         "A call to erlang:system_flag(scheduler_bind_type, _) was\nmade. The scheduler_bind_type argument is deprecated and\nscheduled for removal in Erlang/OTP 18. For more\ninformation see the erlang:system_flag/2 documentation.\n",
     );
 }
 
-fn warn_deprecated_cpu_topology(process: &mut Process, ctx: &mut RunCtx<'_, crate::Process>) {
+fn warn_deprecated_cpu_topology(process: &mut Process) {
     send_deprecation_warning(
         process,
-        ctx,
         "A call to erlang:system_flag(cpu_topology, _) was made.\nThe cpu_topology argument is deprecated and scheduled\nfor removal in Erlang/OTP 18. For more information\nsee the erlang:system_flag/2 documentation.\n",
     );
 }
@@ -4161,7 +4225,7 @@ pub(crate) fn set_system_logger(process: &Process, value: Term) -> Result<Term, 
 
 fn set_scheduler_wall_enabled(
     process: &Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
+    esdp: &arinsal_sched::ErtsSchedulerData<crate::Process>,
     enable: bool,
 ) -> Result<Term, VmError> {
     let mut state = runtime_state(process)
@@ -4178,9 +4242,9 @@ fn set_scheduler_wall_enabled(
         *state = None;
     }
     drop(state);
-    set_runtime_accounting(process, ctx);
+    set_runtime_accounting(process, esdp);
     if enable && !previous {
-        let active_ns = scheduler_stats(process, Some(ctx))
+        let active_ns = scheduler_stats(process, Some(esdp))
             .map_or_else(Vec::new, |stats| all_active_ns(&stats));
         runtime_state(process)
             .sched_wall
@@ -4197,7 +4261,10 @@ fn set_scheduler_wall_enabled(
     }))
 }
 
-fn set_runtime_accounting(process: &Process, ctx: &mut RunCtx<'_, crate::Process>) {
+fn set_runtime_accounting(
+    process: &Process,
+    esdp: &arinsal_sched::ErtsSchedulerData<crate::Process>,
+) {
     let enabled = runtime_state(process)
         .sched_wall
         .lock()
@@ -4210,7 +4277,7 @@ fn set_runtime_accounting(process: &Process, ctx: &mut RunCtx<'_, crate::Process
     {
         scheduler.set_accounting_enabled(enabled);
     }
-    ctx.set_wall_accounting_enabled(enabled);
+    esdp.set_wall_accounting_enabled(enabled);
 }
 
 /// Statistics counters and bookkeeping of one runtime; erts keeps them in emulator globals.
@@ -4560,11 +4627,7 @@ fn parse_scheduler_pair(value: &str, cpus: usize) -> Option<(usize, usize)> {
     )
 }
 
-fn multi_scheduling(
-    process: &mut Process,
-    ctx: &RunCtx<'_, crate::Process>,
-    value: Term,
-) -> Result<Term, VmError> {
+fn multi_scheduling(process: &mut Process, value: Term) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_process.c:8484 (erts_block_multi_scheduling), OTP-29.1.1.
     let action = match atom_name(value) {
         Some("block") => crate::process::MsbChange::Block { normal: false },
@@ -4573,7 +4636,7 @@ fn multi_scheduling(
         Some("unblock_normal") => crate::process::MsbChange::Unblock { normal: true },
         _ => return Err(badarg()),
     };
-    let pid = ctx.pid();
+    let pid = process.self_pid().ok_or_else(badarg)?;
     // An unscheduled evaluation has no runtime and no other scheduler to block.
     let Some(runtime) = process.runtime else {
         let mut state = crate::process::MultiScheduling::default();
@@ -4741,14 +4804,14 @@ fn outstanding_limit(process: &Process, value: Term) -> Result<Term, VmError> {
 
 // Port of erts/emulator/beam/bif.c:5258-5271 (system_flag_2), OTP-29.1.1.
 fn scheduling_statistics(
-    ctx: &mut RunCtx<'_, crate::Process>,
+    esdp: &arinsal_sched::ErtsSchedulerData<crate::Process>,
     value: Term,
 ) -> Result<Term, VmError> {
     let action = atom_name(value)
         .filter(|value| matches!(*value, "enable" | "disable" | "clear"))
         .ok_or_else(badarg)?;
     if matches!(action, "enable" | "disable") {
-        ctx.with_thread_progress_blocked(|| arinsal_sched::sched_stat::modify(action));
+        esdp.with_thread_progress_blocked(|| arinsal_sched::sched_stat::modify(action));
     } else {
         arinsal_sched::sched_stat::modify(action);
     }
@@ -5182,9 +5245,12 @@ fn push_children(term: Term, out: &mut Vec<Term>) {
 
 // Port of erts/emulator/beam/erl_bif_info.c (statistics(reductions):
 // erts_get_total_reductions plus erts_current_reductions of the caller), OTP-29.1.1.
-fn reduction_total(process: &Process, ctx: Option<&RunCtx<'_, crate::Process>>) -> u64 {
-    ctx.map_or(0, |ctx| {
-        ctx.total_reductions() + current_reductions(process)
+fn reduction_total(
+    process: &Process,
+    esdp: Option<&arinsal_sched::ErtsSchedulerData<crate::Process>>,
+) -> u64 {
+    esdp.map_or(0, |esdp| {
+        esdp.total_reductions() + current_reductions(process)
     })
 }
 
@@ -5221,11 +5287,11 @@ fn logical_processors() -> (usize, usize) {
 
 fn scheduler_stats(
     process: &Process,
-    ctx: Option<&RunCtx<'_, crate::Process>>,
+    esdp: Option<&arinsal_sched::ErtsSchedulerData<crate::Process>>,
 ) -> Option<arinsal_sched::SchedulerStats> {
-    if let Some(ctx) = ctx {
+    if let Some(esdp) = esdp {
         return Some(
-            ctx.scheduler_stats(u32::try_from(current_reductions(process)).unwrap_or(u32::MAX)),
+            esdp.scheduler_stats(u32::try_from(current_reductions(process)).unwrap_or(u32::MAX)),
         );
     }
     process
@@ -5321,7 +5387,7 @@ fn scheduler_state_owned(kind: &str, [total, online, active]: [u64; 3]) -> arins
 
 fn queue_counts(
     process: &Process,
-    ctx: Option<&RunCtx<'_, crate::Process>>,
+    esdp: Option<&arinsal_sched::ErtsSchedulerData<crate::Process>>,
     active: bool,
     include_dirty_io: bool,
 ) -> Vec<u64> {
@@ -5329,7 +5395,7 @@ fn queue_counts(
     let schedulers = with_flags(process, |flags| flags.schedulers_total);
     // erts exposes one aggregated run queue for each dirty scheduler class.
     let slots = schedulers + 1 + usize::from(include_dirty_io);
-    ctx.map(|ctx| ctx.erts_run_queues_len(active, include_dirty_io))
+    esdp.map(|esdp| esdp.erts_run_queues_len(active, include_dirty_io))
         .or_else(|| {
             process
                 .runtime
@@ -5350,7 +5416,7 @@ fn all_active_ns(stats: &arinsal_sched::SchedulerStats) -> Vec<u64> {
 
 fn scheduler_wall(
     process: &mut Process,
-    ctx: Option<&RunCtx<'_, crate::Process>>,
+    esdp: Option<&arinsal_sched::ErtsSchedulerData<crate::Process>>,
     include_dirty_io: bool,
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_process.c scheduler active/total time accounting, OTP-29.1.1.
@@ -5363,7 +5429,7 @@ fn scheduler_wall(
         return Ok(Term::atom(arinsal_term::atoms::UNDEFINED));
     };
     let total_us = u64::try_from(base.started.elapsed().as_micros()).unwrap_or(u64::MAX);
-    let stats = scheduler_stats(process, ctx);
+    let stats = scheduler_stats(process, esdp);
     let (schedulers, dirty_cpu, dirty_io) = with_flags(process, |flags| {
         (
             flags.schedulers_total,
@@ -5912,13 +5978,21 @@ mod tests {
             return;
         };
         assert!(reference.status.success());
-        let actual = display_string(&[
-            Term::atom(global_atoms().intern("stderr").unwrap()),
-            Term::NIL,
-        ])
-        .unwrap();
-        assert_eq!(reference.stdout, b"true\n");
-        assert_eq!(to_owned(actual).unwrap(), OwnedTerm::atom("true"));
+        let mut process = Process::new();
+        let mut regs = [
+            crate::native_hooks::raw(Term::atom(global_atoms().intern("stderr").unwrap())),
+            crate::native_hooks::raw(Term::NIL),
+        ];
+        let actual = display_string_2(
+            std::ptr::from_mut(&mut process).cast(),
+            regs.as_mut_ptr(),
+            0,
+        );
+        similar_asserts::assert_eq!(reference.stdout, b"true\n");
+        similar_asserts::assert_eq!(
+            crate::native_hooks::from_raw(actual),
+            Term::atom(arinsal_term::atoms::TRUE)
+        );
     }
     use arinsal_etf::OwnedTerm;
     use arinsal_term::{VecHeap, from_owned, to_owned};

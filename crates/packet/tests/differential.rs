@@ -1,6 +1,6 @@
-use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle};
 use arinsal_difftest::{CallResult, Error as RefError, RefErl};
 use arinsal_etf::OwnedTerm as O;
+use arinsal_packet::{DecodePacketError, decode_packet_on};
 use arinsal_packet::{
     HTTP_HEADERS, HttpPacket, Packet, PacketOptions, PacketResult, PacketState, PacketType,
     parse_with_state,
@@ -15,22 +15,17 @@ fn option(name: &str, value: u32) -> O {
 }
 fn local(args: &[O]) -> CallResult {
     let mut heap = ProcessHeap::with_words(4096);
-    let mut alloc = ProcessHeapHandle(&mut heap);
     let terms = args
         .iter()
-        .map(|arg| from_owned(arg, &mut alloc).unwrap())
+        .map(|arg| from_owned(arg, &mut heap).unwrap())
         .collect::<Vec<_>>();
-    let mut state = arinsal_bifs::BifState::default();
-    let mut ctx = Ctx::new(&mut alloc, &mut state);
-    let bif = arinsal_packet::lookup("erlang", "decode_packet", 3).unwrap();
-    match bif(&mut ctx, &terms) {
+    match decode_packet_on(&mut heap, terms[0], terms[1], terms[2]) {
         Ok(value) => CallResult::Ok(to_owned(value).unwrap()),
-        Err(BifError::Badarg { .. }) => CallResult::Exception {
+        Err(DecodePacketError::Badarg | DecodePacketError::Badopt) => CallResult::Exception {
             class: "error".into(),
             reason: atom("badarg"),
             stack_top: None,
         },
-        Err(error) => panic!("unexpected error: {error:?}"),
     }
 }
 fn same(a: &CallResult, b: &CallResult) -> bool {
@@ -250,9 +245,6 @@ fn differential_otp_29_generated() {
 
 #[test]
 fn registry_and_option_validation() {
-    assert!(arinsal_packet::lookup("erlang", "decode_packet", 3).is_some());
-    assert!(arinsal_packet::lookup("erlang", "decode_packet", 2).is_none());
-    assert!(arinsal_packet::lookup("inet", "decode_packet", 3).is_none());
     for args in [
         [
             atom("raw"),

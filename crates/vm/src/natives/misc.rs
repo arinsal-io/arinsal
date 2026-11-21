@@ -4,7 +4,7 @@ use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_etf::OwnedTerm as O;
 use arinsal_sched::RunCtx;
-use arinsal_term::{Term, TermBuilder, from_owned, global_atoms, to_owned};
+use arinsal_term::{Term, TermBuilder, from_owned, to_owned};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -48,30 +48,8 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erlang", "dt_get_tag_data", 0),
     ("erlang", "dt_prepend_vm_tag_data", 1),
     ("erlang", "dt_put_tag", 1),
-    ("erlang", "decode_packet", 3),
-    ("erlang", "system_profile", 0),
-    ("erlang", "system_profile", 2),
-    ("error_logger", "warning_map", 0),
-    ("erts_debug", "dist_ext_to_term", 2),
-    ("net_kernel", "dflag_unicode_io", 1),
     ("string", "list_to_float", 1),
 ];
-
-/// `erlang:decode_packet/3` called directly from native code, as erts calls `decode_packet_3`
-/// with `c_p` and the argument registers. A bad argument is left to the executor path, which
-/// re-runs the pure BIF and raises its exception with the BIF as the top frame.
-// Port of erts/emulator/beam/erl_bif_port.c:1476 (decode_packet_3), OTP-29.1.1.
-pub(crate) fn decode_packet_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    if args.len() != 3 {
-        return None;
-    }
-    crate::calls::call_bif(&mut process.heap, arinsal_packet::DECODE_PACKET_3, args)
-        .ok()
-        .map(Ok)
-}
 
 pub(crate) fn call(
     _vm: &mut Vm,
@@ -82,40 +60,12 @@ pub(crate) fn call(
     args: super::NativeArgs<'_>,
 ) -> Option<Result<Term, VmError>> {
     args.with_values(process, |process, args| {
-        if module == "erlang" && function == "decode_packet" && args.len() == 3 {
-            let bif = arinsal_packet::lookup(module, function, 3).expect("registered packet BIF");
-            return Some(
-                crate::calls::call_bif(&mut process.heap, bif, args).map_err(|error| {
-                    crate::exceptions::bif_error(process, module, function, args, error)
-                }),
-            );
-        }
         let result = match (module, function, args.len()) {
             ("erlang", "dt_get_tag" | "dt_get_tag_data", 0) => {
                 Ok(Term::atom(arinsal_term::atoms::UNDEFINED))
             }
             ("erlang", "dt_put_tag", 1) => Ok(Term::atom(arinsal_term::atoms::UNDEFINED)),
             ("erlang", "dt_append_vm_tag_data" | "dt_prepend_vm_tag_data", 1) => Ok(args[0]),
-            ("error_logger", "warning_map", 0) => Ok(Term::atom(arinsal_term::atoms::WARNING)),
-            ("net_kernel", "dflag_unicode_io", 1) => {
-                if args[0].as_pid().is_some() {
-                    return Some(Ok(Term::atom(arinsal_term::atoms::TRUE)));
-                }
-                let identity = match args[0].identity() {
-                    Some(arinsal_term::Identity::Pid { node, .. }) => global_atoms().text(node),
-                    _ => return Some(Err(badarg())),
-                };
-                let node = identity.unwrap_or("nonode@nohost");
-                Ok(Term::atom(
-                    if crate::node_tables::lock().pid_unicode_io(node) {
-                        arinsal_term::atoms::TRUE
-                    } else {
-                        arinsal_term::atoms::FALSE
-                    },
-                ))
-            }
-            ("erlang", "system_profile", 0) => profile_get(process),
-            ("erlang", "system_profile", 2) => profile_set(process, args),
             ("erl_ddll", "loaded_drivers", 0) => crate::ddll::loaded_drivers(process),
             ("erl_ddll", "info", 2) => crate::ddll::info(process, args),
             ("erl_ddll", "try_load", 3) => crate::ddll::try_load(process, ctx, args),
@@ -123,7 +73,6 @@ pub(crate) fn call(
             ("erl_ddll", "format_error_int", 1) => crate::ddll::format_error(process, args[0]),
             ("erl_ddll", "monitor", 2) => crate::ddll::monitor(process, ctx, args),
             ("erl_ddll", "demonitor", 1) => crate::ddll::demonitor(ctx, args[0]),
-            ("erts_debug", "dist_ext_to_term", 2) => dist_ext_to_term(process, args),
             ("string", "list_to_float", 1) => string_list_to_float(process, args[0]),
             _ => return None,
         };
@@ -139,7 +88,9 @@ pub(crate) fn system_profile_clear() {
     *profile().lock().unwrap() = Profile::default();
 }
 
-fn profile_get(process: &mut Process) -> Result<Term, VmError> {
+/// `system_profile_get`.
+// Port of erts/emulator/beam/erl_bif_trace.c:3725 (system_profile_get), OTP-29.1.1.
+pub(crate) fn profile_get(process: &mut Process) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_bif_trace.c:3725 (system_profile_get), OTP-29.1.1.
     let p = profile().lock().unwrap().clone();
     let Some(target) = p.target else {
@@ -161,7 +112,9 @@ fn profile_get(process: &mut Process) -> Result<Term, VmError> {
     from_owned(&result, &mut heap).map_err(|_| badarg())
 }
 
-fn profile_set(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
+/// `system_profile_2` body: store the profiler and flags, return the previous setting.
+// Port of erts/emulator/beam/erl_bif_trace.c:3762 (system_profile_2), OTP-29.1.1.
+pub(crate) fn profile_set(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_bif_trace.c:3762 (system_profile_2), OTP-29.1.1.
     let target = to_owned(args[0]).map_err(|_| badarg())?;
     let options = to_owned(args[1]).map_err(|_| badarg())?;
@@ -416,27 +369,6 @@ fn profile_timestamp(timestamp: Timestamp) -> O {
             }
         }
     }
-}
-
-fn dist_ext_to_term(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
-    // Port of erts/emulator/beam/external.c:1340 (erts_debug_dist_ext_to_term_2), OTP-29.1.1.
-    let cache_owned = to_owned(args[0]).map_err(|_| badarg())?;
-    let O::Tuple(cache) = &cache_owned else {
-        return Err(badarg());
-    };
-    if cache.len() > 255 || cache.iter().any(|v| !matches!(v, O::Atom(_))) {
-        return Err(badarg());
-    }
-    let bytes_owned = to_owned(args[1]).map_err(|_| badarg())?;
-    let O::Binary(bytes) = &bytes_owned else {
-        return Err(badarg());
-    };
-    if bytes.is_empty() {
-        return Err(badarg());
-    }
-    let owned = arinsal_etf::decode_dist_ext_with_atom_table(cache, bytes).map_err(|_| badarg())?;
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    from_owned(&owned, &mut heap).map_err(|_| badarg())
 }
 
 fn string_list_to_float(process: &mut Process, term: Term) -> Result<Term, VmError> {

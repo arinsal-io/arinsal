@@ -11,16 +11,16 @@ pub use parser::{
 
 use std::sync::Arc;
 
-use arinsal_bifs::{BifError, BifFn, Ctx, for_each_list_term, tuple_pair, with_binary_bytes};
+use arinsal_bifs::{BifError, for_each_list_term, tuple_pair, with_binary_bytes};
 use arinsal_etf::OwnedTerm as O;
 use arinsal_term::{HeapAlloc, Node, Term, TermBuilder, atoms, from_owned};
 
-/// `erlang:decode_packet/3`, callable without a name lookup.
-pub const DECODE_PACKET_3: BifFn = decode_packet;
-
-/// Return the `erlang:decode_packet/3` BIF implementation.
-pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
-    (module == "erlang" && name == "decode_packet" && arity == 3).then_some(decode_packet)
+/// Failure of `decode_packet_3` before a result tuple.
+pub enum DecodePacketError {
+    /// `BIF_ERROR(BIF_P, BADARG)`.
+    Badarg,
+    /// `BIF_P->fvalue = am_badopt; BIF_ERROR(BADARG | EXF_HAS_EXT_INFO)`.
+    Badopt,
 }
 
 struct Heap<'a, H: HeapAlloc + ?Sized>(&'a mut H);
@@ -211,18 +211,19 @@ fn decode(data: &[u8], ty: PacketType, opts: PacketOptions) -> Decoded {
     }
 }
 
+/// `decode_packet_3` on a process heap (`HAlloc` never fails).
 // Port of erts/emulator/beam/erl_bif_port.c:1476 (decode_packet_3), OTP-29.1.1.
-fn decode_packet(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let [ty, data, opts] = args else {
-        return Err(BifError::BADARG);
+pub fn decode_packet_on<H: HeapAlloc + ?Sized>(
+    heap: &mut H,
+    ty: Term,
+    data: Term,
+    opts: Term,
+) -> Result<Term, DecodePacketError> {
+    let Some(ty) = type_of(ty) else {
+        return Err(DecodePacketError::Badopt);
     };
-    let Some(ty) = type_of(*ty) else {
-        return Err(BifError::Badarg {
-            cause: Some(Term::atom(atoms::BADOPT)),
-        });
-    };
-    let opts = options(*opts, ty)?;
-    let decoded = with_binary_bytes(*data, |view| {
+    let opts = options(opts, ty).map_err(|_| DecodePacketError::Badarg)?;
+    let decoded = with_binary_bytes(data, |view| {
         if view.bit_len() % 8 != 0 {
             return None;
         }
@@ -233,18 +234,24 @@ fn decode_packet(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         let mut aligned = vec![0_u8; length];
         copy_bitstring_bytes(&mut aligned, view.bytes(), view.start_bit());
         Some(decode(&aligned, ty, opts))
-    })?
-    .ok_or(BifError::BADARG)?;
-    let mut heap = Heap(&mut ctx.heap);
-    let value = match decoded {
+    })
+    .map_err(|_| DecodePacketError::Badarg)?
+    .ok_or(DecodePacketError::Badarg)?;
+    let mut heap = Heap(heap);
+    Ok(match decoded {
         Decoded::Invalid => TermBuilder::new(&mut heap)
-            .tuple(&[Term::atom(atoms::ERROR), Term::atom(atoms::INVALID)]),
+            .tuple(&[Term::atom(atoms::ERROR), Term::atom(atoms::INVALID)])
+            .expect("HAlloc"),
         Decoded::More(length) => match length {
             None => TermBuilder::new(&mut heap)
-                .tuple(&[Term::atom(atoms::MORE), Term::atom(atoms::UNDEFINED)]),
+                .tuple(&[Term::atom(atoms::MORE), Term::atom(atoms::UNDEFINED)])
+                .expect("HAlloc"),
             Some(n) => match Term::small(n as i64) {
-                Some(small) => TermBuilder::new(&mut heap).tuple(&[Term::atom(atoms::MORE), small]),
-                None => from_owned(&tuple(vec![atom("more"), O::Int(n as i64)]), &mut heap),
+                Some(small) => TermBuilder::new(&mut heap)
+                    .tuple(&[Term::atom(atoms::MORE), small])
+                    .expect("HAlloc"),
+                None => from_owned(&tuple(vec![atom("more"), O::Int(n as i64)]), &mut heap)
+                    .expect("HAlloc"),
             },
         },
         Decoded::Packet {
@@ -255,22 +262,18 @@ fn decode_packet(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             let ok = Term::atom(atoms::OK);
             let body = match body {
                 Body::Sub { start, len } => TermBuilder::new(&mut heap)
-                    .sub_binary_bif(*data, start * 8, len * 8)
-                    .map_err(|_| BifError::SystemLimit)?,
-                Body::Term(term) => {
-                    from_owned(&term, &mut heap).map_err(|_| BifError::SystemLimit)?
-                }
+                    .sub_binary_bif(data, start * 8, len * 8)
+                    .expect("HAlloc"),
+                Body::Term(term) => from_owned(&term, &mut heap).expect("HAlloc"),
             };
-            let mut builder = TermBuilder::new(&mut heap);
-            let rest = builder
-                .sub_binary_bif(*data, rest_start * 8, rest_len * 8)
-                .map_err(|_| BifError::SystemLimit)?;
-            return builder
+            let rest = TermBuilder::new(&mut heap)
+                .sub_binary_bif(data, rest_start * 8, rest_len * 8)
+                .expect("HAlloc");
+            TermBuilder::new(&mut heap)
                 .tuple(&[ok, body, rest])
-                .map_err(|_| BifError::SystemLimit);
+                .expect("HAlloc")
         }
-    };
-    value.map_err(|_| BifError::SystemLimit)
+    })
 }
 
 /// Copy `out.len()` whole bytes starting at bit `start_bit` of `source`.

@@ -120,9 +120,7 @@ impl DispatchTarget {
     pub(crate) fn runs_in_executor(&self) -> bool {
         matches!(
             self.class,
-            arinsal_loader::ImportClass::Native
-                | arinsal_loader::ImportClass::Dynamic
-                | arinsal_loader::ImportClass::Fun
+            arinsal_loader::ImportClass::Native | arinsal_loader::ImportClass::Dynamic
         )
     }
 }
@@ -235,12 +233,7 @@ impl DispatchRegistry {
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared),
             // OTP-29.1.1: erts calls every BIF from the generated code with `c_p`, so a native
             // that needs only its process is called the same way.
-            leaked.light_process_bif = if leaked.class == arinsal_loader::ImportClass::Native
-                || (leaked.class == arinsal_loader::ImportClass::Fun
-                    && leaked.module == "erlang"
-                    && ((leaked.function == "fun_info" && leaked.arity == 2)
-                        || (leaked.function == "make_fun" && leaked.arity == 3)))
-            {
+            leaked.light_process_bif = if leaked.class == arinsal_loader::ImportClass::Native {
                 u8::try_from(leaked.arity).ok().and_then(|arity| {
                     crate::natives::process_bif(&leaked.module, &leaked.function, arity)
                 })
@@ -301,22 +294,21 @@ pub(crate) fn known_imports(
 }
 
 // Port of erts/emulator/beam/export.c:59-98 (MFA-keyed export lookup and initialization), OTP-29.1.1.
-fn dispatch_entry(
-    key: Mfa,
-    create: impl FnOnce() -> Option<DispatchTarget>,
-) -> Option<&'static DispatchTarget> {
-    let mut registry = dispatch_registry().write().ok()?;
+fn dispatch_entry(key: Mfa, create: impl FnOnce() -> DispatchTarget) -> &'static DispatchTarget {
+    let mut registry = dispatch_registry()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let existing = registry.exports.dispatch.get(&key).cloned();
     let entry = match existing {
         Some(entry) => entry,
         None => {
-            let entry = Arc::new(create()?);
+            let entry = Arc::new(create());
             registry.exports.dispatch.insert(key, Arc::clone(&entry));
             entry
         }
     };
     let identity = Arc::as_ptr(entry.slot) as usize;
-    Some(registry.intern_identity(identity, &entry))
+    registry.intern_identity(identity, &entry)
 }
 
 /// The `Export` object of `mfa`, allocated (entering the export trampoline) when the
@@ -324,16 +316,22 @@ fn dispatch_entry(
 /// that, as `export_staged_put` / `export_staged_upsert` insert the blob erts allocates here.
 // Port of erts/emulator/beam/export.c:73-98 (export_init) and erl_code_staged.h (the blob
 // allocation of put/upsert), OTP-29.1.1.
-pub(crate) fn make_export(mfa: Mfa) -> Option<&'static Arc<arinsal_term::ExportEntry>> {
+pub(crate) fn make_export(mfa: Mfa) -> &'static Arc<arinsal_term::ExportEntry> {
     if let Ok(registry) = dispatch_registry().read()
         && let Some(entry) = registry.exports.dispatch.get(&mfa)
     {
-        return Some(entry.slot);
+        return entry.slot;
     }
     let trampoline = crate::beam_jit_main::beam_export_trampoline();
     let save_calls = crate::beam_jit_main::beam_save_calls_export();
-    let module = global_atoms().text(mfa.0)?.to_string();
-    let function = global_atoms().text(mfa.1)?.to_string();
+    let atom_text = |atom| {
+        global_atoms()
+            .text(atom)
+            .expect("an Atom names an atom-table entry")
+            .to_string()
+    };
+    let module = atom_text(mfa.0);
+    let function = atom_text(mfa.1);
     let entry = dispatch_entry(mfa, || {
         let (class, bits) = if let Ok(arity) = u8::try_from(mfa.2) {
             let has_bif = arinsal_spec::bif_lookup(&module, &function, arity).is_some();
@@ -341,7 +339,7 @@ pub(crate) fn make_export(mfa: Mfa) -> Option<&'static Arc<arinsal_term::ExportE
         } else {
             (arinsal_loader::ImportClass::Remote, 0)
         };
-        Some(DispatchTarget {
+        DispatchTarget {
             // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
             slot: new_export_slot(mfa, trampoline, save_calls),
             light_kind: light_kind(&module, &function, mfa.2),
@@ -353,9 +351,9 @@ pub(crate) fn make_export(mfa: Mfa) -> Option<&'static Arc<arinsal_term::ExportE
             class,
             native_bits: bits,
             light_process_bif: None,
-        })
-    })?;
-    Some(entry.export_object())
+        }
+    });
+    entry.export_object()
 }
 
 /// Export descriptor returned by the native line-breakpoint prepare helper.
@@ -402,7 +400,7 @@ fn import_entries(module: &arinsal_loader::Module) -> Option<ImportEntries> {
             } else {
                 (import.class(), import.native_bits())
             };
-            Some(DispatchTarget {
+            DispatchTarget {
                 // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
                 slot: new_export_slot(mfa, trampoline, save_calls),
                 light_kind: light_kind(import.module, import.function, u32::from(import.arity)),
@@ -414,8 +412,8 @@ fn import_entries(module: &arinsal_loader::Module) -> Option<ImportEntries> {
                 class,
                 native_bits: bits,
                 light_process_bif: None,
-            })
-        })?;
+            }
+        });
         bindings.push((mfa, entry.export_object()));
         identities.push(Arc::as_ptr(entry.slot) as usize);
     }
@@ -481,7 +479,7 @@ fn publish_module(
         let (class, bits) =
             crate::natives::classify(&module.name, export.function, export.arity, has_bif);
         let target = dispatch_entry(mfa, || {
-            Some(DispatchTarget {
+            DispatchTarget {
                 // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
                 slot: new_export_slot(mfa, trampoline, save_calls),
                 light_kind: light_kind(&module.name, export.function, u32::from(export.arity)),
@@ -493,11 +491,9 @@ fn publish_module(
                 class,
                 native_bits: bits,
                 light_process_bif: None,
-            })
+            }
         });
-        if let Some(target) = target {
-            dispatch_entries.push((mfa, target));
-        }
+        dispatch_entries.push((mfa, target));
     }
     // Port of erts/emulator/beam/jit/asm_load.c:1177-1206 (beam_load_finalize_code: exports
     // then imports through erts_export_put; each export's code address is written into

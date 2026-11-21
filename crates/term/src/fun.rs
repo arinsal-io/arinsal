@@ -1,5 +1,5 @@
 //! OTP 29 two-word fun head and opaque code-table entries.
-use crate::{Atom, FUN, LiteralArea, Term, TermError};
+use crate::{Atom, FUN, LiteralArea, Term};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -500,11 +500,11 @@ impl ExportEntry {
 
 /// Build and retain `Export.lambda` in the global literal area.
 // Port of erts/emulator/beam/export.c:44-56 (create_shared_lambda), OTP-29.1.1.
-pub(crate) fn export_lambda(entry: Arc<ExportEntry>) -> Result<Term, TermError> {
+pub fn export_lambda(entry: Arc<ExportEntry>) -> Term {
     // The lambda is published only after the entry is permanent, so a set lambda needs no
     // table lock (erts: `ep->lambda` is read directly, export.c).
     if let Some(lambda) = entry.lambda() {
-        return Ok(lambda);
+        return lambda;
     }
     make_export_entry_permanent(&entry);
     static LITERALS: OnceLock<Mutex<LiteralArea>> = OnceLock::new();
@@ -513,11 +513,16 @@ pub(crate) fn export_lambda(entry: Arc<ExportEntry>) -> Result<Term, TermError> 
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(lambda) = entry.lambda() {
-        return Ok(lambda);
+        return lambda;
     }
-    let lambda = literals.builder().export_fun_in_heap(entry.as_ref())?;
+    // erts_global_literal_allocate cannot fail: an out-of-memory allocator aborts the node
+    // (erts_alloc_enomem).
+    let lambda = literals
+        .builder()
+        .export_fun_in_heap(entry.as_ref())
+        .expect("global literal allocation (erts_alloc_enomem aborts)");
     entry.lambda.store(lambda.0, Ordering::Release);
-    Ok(lambda)
+    lambda
 }
 
 // This table covers entries whose callers are outside a node's export table.

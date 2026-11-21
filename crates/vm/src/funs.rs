@@ -5,7 +5,7 @@ use crate::{EvalResult, ImportOutcome, Process, Vm, VmError, exceptions};
 use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle};
 use arinsal_loader::Module;
 use arinsal_sched::RunCtx;
-use arinsal_term::{FunRef, Term, TermBuilder, TermKind, global_atoms};
+use arinsal_term::{Term, TermBuilder, TermKind, global_atoms};
 use std::sync::Arc;
 
 pub(super) fn set_module_uniq(module: &mut Module, uniq: [u8; 16]) {
@@ -681,30 +681,6 @@ impl Vm {
             self.x_regs()?[0] = result?;
             return Ok(Self::return_value_after_dirty(p, self.x_regs()?[0]));
         }
-        // elixir_loop1: apply/3 reaches this path without an import slot.
-        // sys_core_fold:fold_lit_args/4 applies erlang:make_fun/3 the same way.
-        if module == "erlang" && function == "make_fun" && arity == 3 {
-            let args = [self.x_regs()?[0], self.x_regs()?[1], self.x_regs()?[2]];
-            let value = crate::bif::make_fun_3(p, &args)
-                .ok_or_else(|| VmError::Unsupported("make_fun BIF declined".into()))?
-                .map_err(VmError::Trap)?;
-            self.x_regs()?[0] = value;
-            return Ok(Self::return_value(p, self.x_regs()?[0]));
-        }
-        if module == "erlang" && function == "fun_info" && (arity == 1 || arity == 2) {
-            self.x_regs()?[0] = if arity == 2 {
-                crate::erl_bif_info::fun_info_2(p, &self.x_regs()?[..2])
-                    .ok_or_else(|| VmError::Unsupported("fun_info/2 BIF declined".into()))?
-                    .map_err(VmError::Trap)?
-            } else {
-                self.fun_info(p)?
-            };
-            return Ok(Self::return_value(p, self.x_regs()?[0]));
-        }
-        if module == "erlang" && function == "fun_info_mfa" && arity == 1 {
-            self.x_regs()?[0] = crate::erl_bif_info::fun_info_mfa_1(p, self.x_regs()?)?;
-            return Ok(Self::return_value(p, self.x_regs()?[0]));
-        }
         // elixir_loop1: dynamic apply must see static NIFs such as re:import/1.
         if let Some(bif) = arity8
             .and_then(|arity| crate::natives::plain_static_nif_lookup(module, function, arity))
@@ -827,103 +803,6 @@ impl Vm {
                 Ok(Self::return_value_after_dirty(p, value))
             }
         }
-    }
-
-    /// `fun_info/1` is the OTP-level list wrapper around the keyed `fun_info/2` BIF.
-    pub(super) fn fun_info(&self, p: &mut Process) -> Result<Term, VmError> {
-        p.ensure_objv(1024, self.reg_prefix(1)?);
-        let fun = self.x_regs()?[0];
-        // SAFETY: X0 retains the fun throughout construction; no collection follows.
-        let view = unsafe { fun.fun_ref() }.ok_or_else(|| self.exception(p, "badarg"))?;
-        let keys: &[&str] = if matches!(view, FunRef::Local { .. }) {
-            &[
-                "pid",
-                "module",
-                "new_index",
-                "new_uniq",
-                "index",
-                "uniq",
-                "name",
-                "arity",
-                "env",
-                "type",
-            ]
-        } else {
-            &["module", "name", "arity", "env", "type"]
-        };
-        let mut builder = TermBuilder::new(&mut p.heap);
-        let mut pairs = Vec::with_capacity(keys.len());
-        for &key in keys {
-            let value = match (&view, key) {
-                (FunRef::Local { .. }, "pid") => Term::pid(0, 0).unwrap(),
-                (
-                    FunRef::Export { .. },
-                    "pid" | "index" | "new_index" | "uniq" | "new_uniq" | "refc",
-                ) => Term::atom(
-                    global_atoms()
-                        .intern("undefined")
-                        .map_err(|_| VmError::Unsupported("atom undefined".into()))?,
-                ),
-                (FunRef::Local { entry, .. }, "module") => Term::atom(entry.module),
-                (FunRef::Export { entry }, "module") => Term::atom(entry.module()),
-                (FunRef::Local { entry, .. }, "index") => {
-                    Term::small(i64::from(entry.old_index))
-                        .ok_or_else(|| VmError::Unsupported("fun index".into()))?
-                }
-                (FunRef::Local { entry, .. }, "new_index") => {
-                    Term::small(i64::from(entry.index))
-                        .ok_or_else(|| VmError::Unsupported("fun index".into()))?
-                }
-                (FunRef::Local { entry, .. }, "uniq") => Term::small(i64::from(entry.old_uniq))
-                    .ok_or_else(|| VmError::Unsupported("fun uniq".into()))?,
-                (FunRef::Local { entry, .. }, "new_uniq") => builder
-                    .binary(&entry.uniq)
-                    .map_err(|e| VmError::Unsupported(format!("fun uniq allocation {e:?}")))?,
-                (FunRef::Local { entry, .. }, "name") => crate::erl_fun::erts_get_fun_mfa(entry)
-                    .map(|mfa| crate::native_hooks::from_raw(mfa.function))
-                    .unwrap_or(Term::NIL),
-                (FunRef::Export { entry }, "name") => Term::atom(entry.function()),
-                (FunRef::Local { .. } | FunRef::Export { .. }, "arity") => {
-                    Term::small(i64::from(fun.fun_arity().unwrap())).unwrap()
-                }
-                (FunRef::Local { free_vars, .. }, "env") => {
-                    let mut list = Term::NIL;
-                    for &word in free_vars.iter().rev() {
-                        // SAFETY: The fun header bounds the captured term words.
-                        let value = unsafe { std::mem::transmute::<u64, Term>(word) };
-                        list = builder.cons(value, list).map_err(|e| {
-                            VmError::Unsupported(format!("fun env allocation {e:?}"))
-                        })?;
-                    }
-                    list
-                }
-                (FunRef::Export { .. }, "env") => Term::NIL,
-                (FunRef::Local { .. }, "type") => Term::atom(
-                    global_atoms()
-                        .intern("local")
-                        .map_err(|_| VmError::Unsupported("atom local".into()))?,
-                ),
-                (FunRef::Export { .. }, "type") => Term::atom(
-                    global_atoms()
-                        .intern("external")
-                        .map_err(|_| VmError::Unsupported("atom external".into()))?,
-                ),
-                (FunRef::Local { .. }, "refc") => Term::small(1).unwrap(),
-                _ => return Err(self.exception(p, "badarg")),
-            };
-            let key_atom = Term::atom(
-                global_atoms()
-                    .intern(key)
-                    .map_err(|_| VmError::Unsupported("fun info key".into()))?,
-            );
-            let pair = builder
-                .tuple(&[key_atom, value])
-                .map_err(|e| VmError::Unsupported(format!("fun info allocation {e:?}")))?;
-            pairs.push(pair);
-        }
-        builder
-            .list_from_iter(pairs)
-            .map_err(|e| VmError::Unsupported(format!("fun info list {e:?}")))
     }
 }
 

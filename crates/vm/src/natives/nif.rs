@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use arinsal_beamasm::ProcessHeader;
 use arinsal_bifs::{BifError, BifFn, Ctx, ProcessHeapHandle};
 use arinsal_sched::{Pid, RunCtx, Scheduler, SchedulerType};
 use arinsal_term::{
@@ -1927,29 +1928,6 @@ fn intern_load_atoms(module: &str) -> Result<(), VmError> {
     Ok(())
 }
 
-// Port of erts/emulator/beam/emu/bif_instrs.tab:i_load_nif: the load runs holding the code
-// modification permission; a caller that is not given it yields and retries the call.
-fn load_nif(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
-    let runtime = process.runtime;
-    let pid = process.self_pid();
-    if let (Some(runtime), Some(pid)) = (&runtime, pid)
-        && !crate::natives::code::try_seize_code_mod_permission(runtime, process, pid)
-    {
-        return Err(VmError::Yield);
-    }
-    let [path, info] = *args else {
-        return Err(badarg());
-    };
-    // The call site (`I`) names the caller.
-    let result = crate::natives::proc::native_call_site(process)
-        .ok_or_else(|| VmError::Unsupported("load_nif without a call site".into()))
-        .and_then(|(_, pc)| erts_load_nif(process, pc, path, info));
-    if let (Some(runtime), Some(_)) = (&runtime, pid) {
-        crate::natives::code::release_code_mod_permission(runtime);
-    }
-    result
-}
-
 /// Loads the NIF library `filename` for the module whose code `i` is in.
 // Port of erts/emulator/beam/erl_nif.c:4708-5040 (erts_load_nif), OTP-29.1.1.
 pub(crate) fn erts_load_nif(
@@ -2691,25 +2669,31 @@ pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler
     }
 }
 
-/// `erlang:load_nif/2`, with the scheduler's NIF hub bound as `nif::call` binds it.
+/// `erlang:load_nif/2` rejects calls through apply; the instruction path is `i_load_nif`.
 // Port of erts/emulator/beam/erl_nif.c (load_nif_2), OTP-29.1.1.
-pub(crate) fn load_nif_2(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    install_hub(process, ctx);
-    call_load_nif(vm, process, ctx, args)
+pub(crate) extern "C" fn load_nif_2(c_p: *mut ProcessHeader, _reg: *mut u64, i: u64) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    crate::natives::bif::bif_ret(c_p, i, load_nif_bif_error(process))
 }
 
 fn call_load_nif(
     _vm: &mut Vm,
     process: &mut Process,
     _ctx: &mut RunCtx<'_, crate::Process>,
-    args: &[Term],
+    _args: &[Term],
 ) -> Result<Term, VmError> {
-    load_nif(process, args)
+    load_nif_bif_error(process)
+}
+
+fn load_nif_bif_error(process: &mut Process) -> Result<Term, VmError> {
+    error_reason(
+        process,
+        "bad_lib",
+        "load_nif/2 must be explicitly called from the NIF module. It cannot be called through apply/3.",
+    )
 }
 
 fn call_nif_error(

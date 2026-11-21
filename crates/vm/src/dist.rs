@@ -39,22 +39,11 @@ fn may_be_proxy() -> bool {
     PROXIES_CREATED.load(Ordering::Acquire)
 }
 
-/// Distribution controller BIFs implemented by this module.
+/// Distribution controller BIFs that trap or yield stay on the executor.
 pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erlang", "dist_ctrl_get_data", 1),
     ("erlang", "dist_ctrl_put_data", 2),
-    ("erlang", "dist_ctrl_get_data_notification", 1),
-    ("erlang", "dist_ctrl_input_handler", 2),
-    ("erlang", "dist_ctrl_get_opt", 2),
-    ("erlang", "dist_ctrl_set_opt", 3),
-    ("erlang", "dist_get_stat", 1),
-    // `disconnect_node/1` is `net_kernel:disconnect/1` in erlang.erl.
-    ("erts_internal", "create_dist_channel", 3),
     ("erts_internal", "dist_spawn_request", 4),
-    ("erts_internal", "new_connection", 1),
-    ("erts_internal", "abort_pending_connection", 2),
-    ("erts_internal", "get_dflags", 0),
-    ("erts_internal", "get_creation", 0),
 ];
 
 pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
@@ -86,21 +75,9 @@ fn dispatch(
     args: &[Term],
 ) -> Result<Term, VmError> {
     match (module, function, args.len()) {
-        ("erts_internal", "create_dist_channel", 3) => create_channel(process, ctx, args),
         ("erts_internal", "dist_spawn_request", 4) => dist_spawn_request(vm, process, ctx, args),
-        ("erts_internal", "new_connection", 1) => new_connection(process, args[0]),
-        ("erts_internal", "abort_pending_connection", 2) => {
-            abort_pending_connection(process, args[0], args[1])
-        }
-        ("erts_internal", "get_dflags", 0) => get_dflags(process),
-        ("erts_internal", "get_creation", 0) => get_creation(),
         ("erlang", "dist_ctrl_get_data", 1) => get_data(process, ctx, args[0]),
         ("erlang", "dist_ctrl_put_data", 2) => put_data(process, ctx, args[0], args[1]),
-        ("erlang", "dist_ctrl_get_data_notification", 1) => get_data_notification(ctx, args[0]),
-        ("erlang", "dist_ctrl_input_handler", 2) => input_handler(ctx, args[0], args[1]),
-        ("erlang", "dist_ctrl_get_opt", 2) => get_opt(ctx, args[0], args[1]),
-        ("erlang", "dist_ctrl_set_opt", 3) => set_opt(ctx, args[0], args[1], args[2]),
-        ("erlang", "dist_get_stat", 1) => get_stat(process, ctx, args[0]),
         _ => Err(badarg()),
     }
 }
@@ -4404,44 +4381,31 @@ fn get_data_notification(
     Ok(Term::atom(arinsal_term::atoms::OK))
 }
 
-fn input_handler(
-    ctx: &mut RunCtx<'_, crate::Process>,
-    handle: Term,
-    handler: Term,
-) -> Result<Term, VmError> {
+fn input_handler(caller: Pid, handle: Term, handler: Term) -> Result<Term, VmError> {
     let handler = Pid::from_term(handler).ok_or_else(badarg)?;
-    with_dhandle(handle, ctx.pid(), true, |state| {
+    with_dhandle(handle, caller, true, |state| {
         state.input_handler = handler;
         Ok(())
     })?;
     Ok(Term::atom(arinsal_term::atoms::OK))
 }
 
-fn get_opt(
-    ctx: &mut RunCtx<'_, crate::Process>,
-    handle: Term,
-    option: Term,
-) -> Result<Term, VmError> {
+fn get_opt(caller: Pid, handle: Term, option: Term) -> Result<Term, VmError> {
     if atom_name(option).as_deref() != Some("get_size") {
         return Err(badarg());
     }
-    let value = with_dhandle(handle, ctx.pid(), true, |state| Ok(state.get_size))?;
+    let value = with_dhandle(handle, caller, true, |state| Ok(state.get_size))?;
     Ok(boolean(value))
 }
 
-fn set_opt(
-    ctx: &mut RunCtx<'_, crate::Process>,
-    handle: Term,
-    option: Term,
-    value: Term,
-) -> Result<Term, VmError> {
+fn set_opt(caller: Pid, handle: Term, option: Term, value: Term) -> Result<Term, VmError> {
     if atom_name(option).as_deref() != Some("get_size") {
         return Err(badarg());
     }
     let Some(value) = boolean_value(value) else {
         return Err(badarg());
     };
-    let previous = with_dhandle(handle, ctx.pid(), true, |state| {
+    let previous = with_dhandle(handle, caller, true, |state| {
         let previous = state.get_size;
         state.get_size = value;
         Ok(previous)
@@ -4449,12 +4413,9 @@ fn set_opt(
     Ok(boolean(previous))
 }
 
-fn get_stat(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
-    handle: Term,
-) -> Result<Term, VmError> {
-    let (read, written, pending) = with_dhandle(handle, ctx.pid(), false, |state| {
+fn get_stat(process: &mut Process, handle: Term) -> Result<Term, VmError> {
+    let caller = process.self_pid().ok_or_else(badarg)?;
+    let (read, written, pending) = with_dhandle(handle, caller, false, |state| {
         Ok((state.read, state.written, state.pending_bytes))
     })?;
     tuple(
@@ -4576,6 +4537,146 @@ pub(crate) extern "C" fn node_1(
         Ok(name) => crate::native_hooks::raw(name),
         Err(_) => crate::natives::bif::bif_badarg(c_p),
     }
+}
+
+fn caller_pid(process: &Process) -> Result<Pid, VmError> {
+    process.self_pid().ok_or_else(badarg)
+}
+
+/// `erlang:dist_get_stat/1`.
+// Port of erts/emulator/beam/dist.c:4489 (dist_get_stat_1), OTP-29.1.1.
+pub(crate) extern "C" fn dist_get_stat_1(
+    c_p: *mut arinsal_beamasm::ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    crate::natives::bif::bif_process(c_p, reg, i, |process, [handle]| get_stat(process, handle))
+}
+
+/// `erlang:dist_ctrl_get_opt/2`.
+// Port of erts/emulator/beam/dist.c:4452 (dist_ctrl_get_opt_2), OTP-29.1.1.
+pub(crate) extern "C" fn dist_ctrl_get_opt_2(
+    c_p: *mut arinsal_beamasm::ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    crate::natives::bif::bif_process(c_p, reg, i, |process, [handle, option]| {
+        get_opt(caller_pid(process)?, handle, option)
+    })
+}
+
+/// `erlang:dist_ctrl_set_opt/3`.
+// Port of erts/emulator/beam/dist.c:4408 (dist_ctrl_set_opt_3), OTP-29.1.1.
+pub(crate) extern "C" fn dist_ctrl_set_opt_3(
+    c_p: *mut arinsal_beamasm::ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    crate::natives::bif::bif_process(c_p, reg, i, |process, [handle, option, value]| {
+        set_opt(caller_pid(process)?, handle, option, value)
+    })
+}
+
+/// `erts_internal:get_dflags/0`.
+// Port of erts/emulator/beam/dist.c:5543 (erts_internal_get_dflags_0), OTP-29.1.1.
+pub(crate) extern "C" fn erts_internal_get_dflags_0(
+    c_p: *mut arinsal_beamasm::ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    crate::natives::bif::bif_process(c_p, reg, i, |process, []| get_dflags(process))
+}
+
+/// `erts_internal:get_creation/0`.
+// Port of erts/emulator/beam/dist.c:5571 (erts_internal_get_creation_0), OTP-29.1.1.
+pub(crate) extern "C" fn erts_internal_get_creation_0(
+    c_p: *mut arinsal_beamasm::ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    crate::natives::bif::bif_process(c_p, reg, i, |_, []| get_creation())
+}
+
+/// `erts_internal:new_connection/1`.
+// Port of erts/emulator/beam/dist.c:5588 (erts_internal_new_connection_1), OTP-29.1.1.
+pub(crate) extern "C" fn erts_internal_new_connection_1(
+    c_p: *mut arinsal_beamasm::ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    crate::natives::bif::bif_process(c_p, reg, i, |process, [node]| new_connection(process, node))
+}
+
+/// `erts_internal:abort_pending_connection/2`.
+// Port of erts/emulator/beam/dist.c:5693 (erts_internal_abort_pending_connection_2), OTP-29.1.1.
+pub(crate) extern "C" fn erts_internal_abort_pending_connection_2(
+    c_p: *mut arinsal_beamasm::ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    crate::natives::bif::bif_process(c_p, reg, i, |process, [node, dhandle]| {
+        abort_pending_connection(process, node, dhandle)
+    })
+}
+
+/// `erts_internal:create_dist_channel/3`.
+// Port of erts/emulator/beam/dist.c:5127 (erts_internal_create_dist_channel_3), OTP-29.1.1.
+pub(crate) extern "C" fn erts_internal_create_dist_channel_3(
+    c_p: *mut arinsal_beamasm::ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    crate::natives::bif::bif_sched(c_p, reg, i, |_vm, process, ctx, args: [Term; 3]| {
+        create_channel(process, ctx, &args)
+    })
+}
+
+/// `net_kernel:dflag_unicode_io/1`.
+// Port of erts/emulator/beam/dist.c:6670 (net_kernel_dflag_unicode_io_1), OTP-29.1.1.
+pub(crate) extern "C" fn net_kernel_dflag_unicode_io_1(
+    c_p: *mut arinsal_beamasm::ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    crate::natives::bif::bif_process(c_p, reg, i, |_, [pid]| {
+        if pid.as_pid().is_some() {
+            return Ok(Term::atom(arinsal_term::atoms::TRUE));
+        }
+        let identity = match pid.identity() {
+            Some(arinsal_term::Identity::Pid { node, .. }) => global_atoms().text(node),
+            _ => return Err(badarg()),
+        };
+        let node = identity.unwrap_or("nonode@nohost");
+        Ok(Term::atom(if node_tables::lock().pid_unicode_io(node) {
+            arinsal_term::atoms::TRUE
+        } else {
+            arinsal_term::atoms::FALSE
+        }))
+    })
+}
+
+/// `erlang:dist_ctrl_input_handler/2`.
+// Port of erts/emulator/beam/dist.c:4532 (dist_ctrl_input_handler_2), OTP-29.1.1.
+pub(crate) extern "C" fn dist_ctrl_input_handler_2(
+    c_p: *mut arinsal_beamasm::ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    crate::natives::bif::bif_process(c_p, reg, i, |process, [handle, handler]| {
+        input_handler(caller_pid(process)?, handle, handler)
+    })
+}
+
+/// `erlang:dist_ctrl_get_data_notification/1`.
+// Port of erts/emulator/beam/dist.c:4272 (dist_ctrl_get_data_notification_1), OTP-29.1.1.
+pub(crate) extern "C" fn dist_ctrl_get_data_notification_1(
+    c_p: *mut arinsal_beamasm::ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+) -> u64 {
+    crate::natives::bif::bif_sched(c_p, reg, i, |_vm, _process, ctx, [handle]| {
+        get_data_notification(ctx, handle)
+    })
 }
 
 #[cfg(test)]

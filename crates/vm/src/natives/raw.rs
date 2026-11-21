@@ -6,6 +6,21 @@
 use arinsal_term::Term;
 use num_bigint::BigInt;
 
+/// Copy the first `N` terms and the arity of a live tuple.
+pub(crate) fn tuple_prefix<const N: usize>(term: Term) -> Option<(usize, [Term; N])> {
+    // SAFETY: callers pass a BIF argument rooted in the running process heap, which stays live
+    // and unmoved until the BIF returns.
+    let tuple = unsafe { term.tuple_ref() }?;
+    let mut prefix = [Term::NIL; N];
+    for (index, slot) in prefix.iter_mut().enumerate() {
+        let Some(element) = tuple.get(index) else {
+            break;
+        };
+        *slot = element;
+    }
+    Some((tuple.len(), prefix))
+}
+
 /// The integer represented by a small integer or live bignum.
 pub(crate) fn integer(term: Term) -> Option<BigInt> {
     if let Some(value) = term.as_small() {

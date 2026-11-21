@@ -91,6 +91,10 @@ pub const EXC_BADMAP: u64 = coded(18);
 pub const EXC_BADKEY: u64 = coded(19);
 /// Bad record.
 pub const EXC_BADRECORD: u64 = coded(20);
+/// Bad record field.
+pub const EXC_BADFIELD: u64 = coded(21);
+/// Record field with no value.
+pub const EXC_NOVALUE: u64 = coded(22);
 
 /// BIF trap to Erlang code (`TRAP`).
 pub const TRAP: u64 = 1 << EXC_OFFSET;

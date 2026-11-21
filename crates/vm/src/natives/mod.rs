@@ -5,6 +5,7 @@
 //! returns `None` for calls it does not implement. Adding a family means adding
 //! its module below and one line to [`FAMILIES`].
 
+pub(crate) mod beam_debug;
 pub(crate) mod bif;
 pub(crate) mod bif_phash2;
 pub(crate) mod binary;
@@ -12,12 +13,15 @@ pub(crate) mod erl_arith;
 pub(crate) mod erl_bif_atomics;
 pub(crate) mod erl_bif_binary;
 pub(crate) mod erl_bif_chksum;
+pub(crate) mod erl_bif_coverage;
 pub(crate) mod erl_bif_guard;
 pub(crate) mod erl_bif_info;
 pub(crate) mod erl_bif_lists;
 pub(crate) mod erl_bif_op;
 pub(crate) mod erl_bif_os;
+pub(crate) mod erl_bif_port;
 pub(crate) mod erl_bif_re;
+pub(crate) mod erl_bif_trace;
 pub(crate) mod erl_bif_unique;
 pub(crate) mod erl_db;
 pub(crate) mod erl_debugger;
@@ -31,6 +35,7 @@ pub(crate) mod erl_math;
 pub(crate) mod erl_process;
 pub(crate) mod erl_process_dict;
 pub(crate) mod erl_ptab;
+pub(crate) mod erl_record;
 pub(crate) mod erl_unicode;
 pub(crate) mod erl_unicode_atom;
 mod erl_unicode_normalize;
@@ -60,11 +65,9 @@ use arinsal_term::Term;
 pub(crate) mod code;
 pub(crate) use crate::dist;
 pub(crate) mod ets;
-mod maps;
+pub(crate) mod maps;
 pub(crate) mod nif;
 mod nif_load_atoms;
-mod re;
-mod records;
 pub(crate) mod tty;
 
 pub(crate) fn static_nif_lookup(
@@ -72,7 +75,7 @@ pub(crate) fn static_nif_lookup(
     function: &str,
     arity: u8,
 ) -> Option<arinsal_bifs::BifFn> {
-    nif::lookup(module, function, arity).or_else(|| arinsal_re::lookup(module, function, arity))
+    nif::lookup(module, function, arity)
 }
 
 /// The static NIF a call of `module:function/arity` from another function reaches directly.
@@ -187,18 +190,14 @@ pub fn implemented_natives() -> &'static [(&'static str, &'static str, u8)] {
             erts_debug::IMPLEMENTED,
             dist::IMPLEMENTED,
             nif::IMPLEMENTED,
-            re::IMPLEMENTED,
             node::IMPLEMENTED,
             sys::IMPLEMENTED,
             misc::IMPLEMENTED,
-            crate::seq_trace::IMPLEMENTED,
             proc::IMPLEMENTED,
             tty::IMPLEMENTED,
-            maps::IMPLEMENTED,
-            records::IMPLEMENTED,
             crate::signals::IMPLEMENTED,
-            // `port::family` lives outside this module. These are the arms that
-            // run the operation; `port_control/3` always returns `badarg`.
+            // `port::family` lives outside this module. Only `port_command/3`
+            // stays here (`ERTS_BIF_YIELD3` on a busy port).
             PORT_IMPLEMENTED,
         ] {
             for entry in table {
@@ -221,14 +220,10 @@ fn family_dispatches(module: &str, function: &str, arity: u8) -> bool {
         || dist::recognizes(module, function, arity)
         || listed(misc::IMPLEMENTED, module, function, arity)
         || nif::recognizes(module, function, arity)
-        || re::recognizes(module, function, arity)
         || node::recognizes(module, function, arity)
         || sys::recognizes(module, function, arity)
-        || crate::seq_trace::recognizes(module, function, arity)
         || proc::recognizes(module, function, arity)
         || tty::recognizes(module, function, arity)
-        || maps::recognizes(module, function, arity)
-        || listed(records::IMPLEMENTED, module, function, arity)
         || crate::signals::recognizes(module, function, arity)
         || port_recognizes(module, function, arity)
 }
@@ -243,21 +238,12 @@ fn handler_agrees(module: &str, function: &str, arity: u8) -> bool {
     if node::recognizes(module, function, arity) {
         return node::handler(module, function, arity).is_some();
     }
-    if maps::recognizes(module, function, arity) {
-        return maps::handler(module, function, arity).is_some();
-    }
     if nif::recognizes(module, function, arity) {
         return nif::handler(module, function, arity).is_some();
     }
     if sys::recognizes(module, function, arity) {
         return sys::handler(module, function, arity).is_some()
             || arinsal_pterm::lookup(module, function, arity).is_some();
-    }
-    if crate::seq_trace::recognizes(module, function, arity) {
-        return true;
-    }
-    if re::recognizes(module, function, arity) {
-        return arinsal_re::lookup(module, function, arity).is_some();
     }
     if tty::recognizes(module, function, arity) {
         return arinsal_nif_tty::lookup(module, function, arity).is_some();
@@ -266,7 +252,6 @@ fn handler_agrees(module: &str, function: &str, arity: u8) -> bool {
         || listed(erts_debug::IMPLEMENTED, module, function, arity)
         || dist::recognizes(module, function, arity)
         || proc::recognizes(module, function, arity)
-        || listed(records::IMPLEMENTED, module, function, arity)
         || crate::signals::recognizes(module, function, arity)
         || port_recognizes(module, function, arity)
         || listed(misc::IMPLEMENTED, module, function, arity)
@@ -276,19 +261,8 @@ fn handler_agrees(module: &str, function: &str, arity: u8) -> bool {
     false
 }
 
-/// `port::family` arms that perform the operation (`crates/vm/src/port.rs`).
-const PORT_IMPLEMENTED: &[(&str, &str, u8)] = &[
-    ("erts_internal", "open_port", 2),
-    ("erts_internal", "port_command", 3),
-    ("erts_internal", "port_close", 1),
-    ("erts_internal", "port_connect", 2),
-    ("erts_internal", "port_info", 1),
-    ("erts_internal", "port_info", 2),
-    ("erts_internal", "port_control", 3),
-    ("erts_internal", "port_call", 3),
-    ("erlang", "port_get_data", 1),
-    ("erlang", "port_set_data", 2),
-];
+/// `port::family` arms that stay on the executor (`ERTS_BIF_YIELD3` on a busy port).
+const PORT_IMPLEMENTED: &[(&str, &str, u8)] = &[("erts_internal", "port_command", 3)];
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn port_recognizes(module: &str, function: &str, arity: u8) -> bool {
@@ -309,40 +283,6 @@ pub(crate) type DirectNative = fn(
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared), OTP-29.1.1.
 pub(crate) type ProcessBif =
     fn(&mut Process, &[Term]) -> Option<Result<Term, crate::exceptions::Trap>>;
-
-/// A process BIF that cannot decline and returns its value in registers: the exception is
-/// boxed, so a call that succeeds moves no `Trap`. erts returns the term and `THE_NON_VALUE`
-/// for an error, and the light-BIF call site tests it the same way. The call site entry is
-/// monomorphized per BIF, so the body is inlined into it.
-// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared), OTP-29.1.1.
-pub(crate) trait ThinProcessBif {
-    /// Number of arguments in the X registers.
-    const ARITY: usize;
-
-    /// Runs the BIF on `args`, the first `ARITY` X registers.
-    fn call(process: &mut Process, args: &[Term]) -> Result<Term, Box<crate::exceptions::Trap>>;
-}
-
-/// The light-BIF call site entry for `module:function/arity` when it is a [`ThinProcessBif`].
-/// The export still has its [`process_bif`] for the export-entry call and the executor.
-pub(crate) fn thin_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
-    if module == "erlang" {
-        match (function, arity) {
-            ("port_get_data", 1) => {
-                return Some(crate::bif_table::bif!(
-                    crate::native_helpers::thin_bif_light::<crate::port::PortGetData>
-                ));
-            }
-            ("port_set_data", 2) => {
-                return Some(crate::bif_table::bif!(
-                    crate::native_helpers::thin_bif_light::<crate::port::PortSetData>
-                ));
-            }
-            _ => {}
-        }
-    }
-    maps::thin_entry(module, function, arity)
-}
 
 /// The process BIF native code calls for `module:function/arity`, if it has one.
 pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<ProcessBif> {
@@ -376,54 +316,17 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     if module == "erlang" && function == "list_to_pid" && arity == 1 {
         return Some(proc::list_to_pid_light);
     }
-    if module == "erlang" && function == "process_info" && arity == 1 {
-        return Some(proc::process_info_1_light);
-    }
-    if module == "erlang" && function == "fun_info" && arity == 2 {
-        return Some(crate::erl_bif_info::fun_info_2);
-    }
-    if module == "erlang" && function == "make_fun" && arity == 3 {
-        return Some(crate::bif::make_fun_3);
-    }
     if module == "erts_internal" && function == "suspend_process" && arity == 2 {
         return Some(proc::suspend_process_light);
     }
-    if module == "erlang" && function == "resume_process" && arity == 1 {
-        return Some(proc::resume_process_light);
-    }
-    if module == "erlang" && function == "decode_packet" && arity == 3 {
-        return Some(misc::decode_packet_light);
-    }
-    if module == "erts_internal" && function == "port_info" && (arity == 1 || arity == 2) {
-        return Some(crate::port::port_info_light);
-    }
-    if module == "erts_internal" && function == "port_connect" && arity == 2 {
-        return Some(crate::port::port_connect_light);
-    }
-    if module == "erts_internal" && function == "port_close" && arity == 1 {
-        return Some(crate::port::port_close_light);
-    }
-    if module == "erlang" && function == "port_get_data" && arity == 1 {
-        return Some(crate::port::port_get_data_light);
-    }
-    if module == "erlang" && function == "port_set_data" && arity == 2 {
-        return Some(crate::port::port_set_data_light);
-    }
-    if module == "erts_internal" && function == "port_command" && arity == 3 {
-        return Some(crate::port::port_command_light);
-    }
-    if module == "erts_internal" && function == "port_control" && arity == 3 {
-        return Some(crate::port::port_control_light);
-    }
     if module == "erlang" {
         match (function, arity) {
-            ("statistics", 1) => return Some(sys::statistics_light),
             ("module_loaded", 1) => return Some(code::module_loaded_light),
             ("function_exported", 3) => return Some(code::function_exported_light),
             _ => {}
         }
     }
-    maps::process_bif(module, function, arity)
+    None
 }
 
 /// Per-import process-aware entry with its MFA already resolved.
@@ -560,15 +463,16 @@ fn classify_by_name(
     has_bif: bool,
 ) -> (arinsal_loader::ImportClass, usize) {
     use arinsal_loader::ImportClass;
-    if let Some(entry) = resolve(module, function, arity) {
-        return (ImportClass::Native, pack_native(entry));
-    }
-    // A hidden trap export is its `trampoline.bif.address`: the executor calls that function.
-    if crate::bif_table::trap_function(module, function, arity).is_some() {
+    // Port of erts/emulator/beam/erl_bif_table.c (`bif_table[].f`): a bif.tab body is the
+    // table entry. Hidden `erts_init_trap_export` BIFs are `trampoline.bif.address`, not a
+    // family name table. Family tables are only for MFAs erts puts in neither.
+    if crate::bif_table::special(module, function, arity).is_some()
+        || crate::bif_table::trap_function(module, function, arity).is_some()
+    {
         return (ImportClass::Native, 0);
     }
-    if is_fun(module, function, arity) {
-        return (ImportClass::Fun, 0);
+    if let Some(entry) = resolve(module, function, arity) {
+        return (ImportClass::Native, pack_native(entry));
     }
     if is_dynamic(module, function, arity) {
         return (ImportClass::Dynamic, 0);
@@ -577,22 +481,9 @@ fn classify_by_name(
         return (ImportClass::Pure, 0);
     }
     if arinsal_spec::bif_lookup(module, function, arity).is_some() {
-        // A BIF whose body is its `bif_table` entry: the executor calls that entry
-        // (`bif_table::call_from_executor`), so it has no named native.
-        if crate::bif_table::special(module, function, arity).is_some() {
-            return (ImportClass::Native, 0);
-        }
         return (ImportClass::Unsupported, 0);
     }
     (ImportClass::Remote, 0)
-}
-
-fn is_fun(module: &str, function: &str, arity: u8) -> bool {
-    module == "erlang"
-        && matches!(
-            (function, arity),
-            ("apply", 2 | 3) | ("make_fun", 3) | ("fun_info", 1 | 2) | ("fun_info_mfa", 1)
-        )
 }
 
 /// Natives whose result depends on VM state, or miss-path side effects that
@@ -615,24 +506,19 @@ fn proc_claims(module: &str, function: &str, arity: u8) -> bool {
     {
         return false;
     }
-    if function == "fun_info_mfa" && module != "erlang" {
-        return false;
-    }
     listed(proc::IMPLEMENTED, module, function, arity)
 }
 
 fn sys_extra(module: &str, function: &str, arity: u8) -> bool {
     matches!(
         (module, function, arity),
-        ("erlang", "system_info", 1)
-            | ("erlang", "dt_get_tag" | "dt_get_tag_data", 0)
+        ("erlang", "dt_get_tag" | "dt_get_tag_data", 0)
             | ("erlang", "dt_put_tag", 1)
             | (
                 "erlang",
                 "dt_prepend_vm_tag_data" | "dt_append_vm_tag_data",
                 1
             )
-            | ("net_kernel", "dflag_unicode_io", 1)
     )
 }
 
@@ -643,9 +529,6 @@ fn resolve(module: &str, function: &str, arity: u8) -> Option<NativeEntry> {
     }
     if listed(erts_debug::IMPLEMENTED, module, function, arity) {
         return Some(NativeEntry::DirectFamily(erts_debug::call));
-    }
-    if listed(records::IMPLEMENTED, module, function, arity) {
-        return Some(NativeEntry::DirectFamily(records::call));
     }
     if listed(misc::IMPLEMENTED, module, function, arity) {
         return Some(NativeEntry::DirectFamily(misc::call));
@@ -666,14 +549,8 @@ fn resolve(module: &str, function: &str, arity: u8) -> Option<NativeEntry> {
     if code::recognizes(module, function, arity) {
         return Some(NativeEntry::DirectFamily(code::call));
     }
-    if crate::seq_trace::recognizes(module, function, arity) {
-        return Some(NativeEntry::DirectFamily(crate::seq_trace::call));
-    }
     if nif::recognizes(module, function, arity) {
         return Some(NativeEntry::DirectFamily(nif::call));
-    }
-    if re::recognizes(module, function, arity) {
-        return Some(NativeEntry::DirectFamily(re::call));
     }
     if let Some(handle) = node::handler(module, function, arity) {
         return Some(NativeEntry::Direct(handle));
@@ -695,9 +572,6 @@ fn resolve(module: &str, function: &str, arity: u8) -> Option<NativeEntry> {
     }
     if tty::recognizes(module, function, arity) {
         return Some(NativeEntry::DirectFamily(tty::call));
-    }
-    if let Some(handle) = maps::handler(module, function, arity) {
-        return Some(NativeEntry::Direct(handle));
     }
     if sys_extra(module, function, arity) {
         return Some(NativeEntry::DirectFamily(sys::call));
@@ -729,21 +603,29 @@ mod tests {
             !implemented_natives().contains(&("erts_internal", "port_command", 2)),
             "OTP 29.1.1 does not export or implement erts_internal:port_command/2"
         );
+        assert!(implemented_natives().contains(&("erts_internal", "port_command", 3)));
         for (function, arity) in [
             ("open_port", 2),
             ("port_close", 1),
-            ("port_command", 3),
             ("port_connect", 2),
+            ("port_control", 3),
+            ("port_call", 3),
             ("port_info", 1),
             ("port_info", 2),
         ] {
-            assert!(implemented_natives().contains(&("erts_internal", function, arity)));
+            assert!(
+                !implemented_natives().contains(&("erts_internal", function, arity)),
+                "erts_internal:{function}/{arity} is bif_table, not the executor family"
+            );
         }
+        assert!(!implemented_natives().contains(&("erlang", "port_get_data", 1)));
+        assert!(!implemented_natives().contains(&("erlang", "port_set_data", 2)));
     }
 
     #[test]
     fn decode_packet_is_called_from_native_code_like_a_plain_bif() {
-        assert!(process_bif("erlang", "decode_packet", 3).is_some());
+        assert!(crate::bif_table::special("erlang", "decode_packet", 3).is_some());
+        assert!(process_bif("erlang", "decode_packet", 3).is_none());
         assert!(process_bif("erlang", "decode_packet", 2).is_none());
     }
 
@@ -785,7 +667,31 @@ mod tests {
         for (module, function, arity) in crate::signals::IMPLEMENTED {
             let (class, bits) = classify(module, function, *arity, true);
             assert_eq!(class, arinsal_loader::ImportClass::Native);
-            assert_ne!(bits, 0, "{module}:{function}/{arity} has a resolved entry");
+            if crate::bif_table::has_function(module, function, *arity) {
+                assert_eq!(
+                    bits, 0,
+                    "{module}:{function}/{arity} is bif_table, not a family entry"
+                );
+            } else {
+                assert_ne!(bits, 0, "{module}:{function}/{arity} has a resolved entry");
+            }
+        }
+    }
+
+    #[test]
+    fn classify_uses_bif_table_before_family() {
+        for &(module, function, arity) in &[
+            ("erts_debug", "copy_shared", 2),
+            ("erlang", "process_info", 2),
+            ("erlang", "monitor", 2),
+            ("erlang", "bif_return_trap", 2),
+        ] {
+            let (class, bits) = classify(module, function, arity, true);
+            assert_eq!(class, arinsal_loader::ImportClass::Native);
+            assert_eq!(
+                bits, 0,
+                "{module}:{function}/{arity} must use bif_table or trap_function, not a packed family entry"
+            );
         }
     }
 }

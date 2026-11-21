@@ -7,8 +7,7 @@ use arinsal_beamasm::ProcessHeader;
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::{DirtyKind, Pid, RunCtx, SchedulerType};
 use arinsal_term::{
-    ProcessHeap, Term, TermBuilder, TermKind, copy_term, from_owned, global_atoms,
-    hashmap_node_children, term_sequence, to_owned,
+    ProcessHeap, Term, TermBuilder, copy_term, from_owned, global_atoms, term_sequence, to_owned,
 };
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
@@ -667,44 +666,17 @@ fn monitor_busy_dist_port_one(
 
 /// Implemented `erts_debug` and `erts_internal` debug BIFs.
 pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
-    ("erts_debug", "copy_shared", 2),
     ("erts_debug", "dirty", 3),
     ("erts_debug", "dirty_cpu", 2),
     ("erts_debug", "dirty_io", 2),
-    ("erts_debug", "disassemble", 1),
-    ("erts_debug", "get_internal_state", 1),
-    ("erts_debug", "instructions", 0),
-    ("erts_debug", "interpreter_size", 0),
-    ("erts_debug", "lcnt_clear", 0),
-    ("erts_debug", "lcnt_collect", 0),
-    ("erts_debug", "lcnt_control", 1),
-    ("erts_debug", "lcnt_control", 2),
-    ("erts_debug", "map_info", 1),
-    ("erts_debug", "set_internal_state", 2),
-    ("erts_debug", "size_shared", 1),
-    ("erts_debug", "unaligned_bitstring", 2),
     ("erts_internal", "gather_alloc_histograms", 1),
     ("erts_internal", "gather_carrier_info", 1),
-    ("erts_internal", "map_hashmap_children", 1),
-    ("erts_internal", "map_to_tuple_keys", 1),
-    ("erts_internal", "system_check", 1),
-    ("erts_internal", "system_monitor", 1),
-    ("erts_internal", "system_monitor", 3),
-    ("erts_internal", "term_type", 1),
 ];
 
 fn badarg() -> VmError {
     VmError::Trap(exceptions::Trap::error(Term::atom(
         arinsal_term::atoms::BADARG,
     )))
-}
-
-fn badmap(process: &mut Process, value: Term) -> Result<Term, VmError> {
-    tuple(process, &[Term::atom(arinsal_term::atoms::BADMAP), value]).map_err(|_| {
-        VmError::Trap(exceptions::Trap::error(Term::atom(
-            arinsal_term::atoms::SYSTEM_LIMIT,
-        )))
-    })
 }
 
 fn undef() -> VmError {
@@ -747,19 +719,6 @@ fn tuple(process: &mut Process, values: &[Term]) -> Result<Term, VmError> {
                 arinsal_term::atoms::SYSTEM_LIMIT,
             )))
         })
-}
-
-/// Port of erts/emulator/beam/beam_debug.c:377 (erts_debug_instructions_0), OTP-29.1.1.
-fn instructions(process: &mut Process) -> Result<Term, VmError> {
-    let mut names = Vec::new();
-    for name in include_str!("erts_debug_instructions.txt").lines() {
-        let bytes = name
-            .bytes()
-            .map(|byte| Term::small(i64::from(byte)).expect("instruction name byte"))
-            .collect::<Vec<_>>();
-        names.push(list(process, &bytes)?);
-    }
-    list(process, &names)
 }
 
 fn scheduler_type_atom(kind: SchedulerType) -> Term {
@@ -1134,44 +1093,6 @@ fn dirty(
     )
 }
 
-/// Port of erts/emulator/beam/beam_debug.c:86 (erts_debug_size_shared_1), OTP-29.1.1.
-fn size_shared(process: &mut Process, value: Term) -> Result<Term, VmError> {
-    int(process, arinsal_term::size_shared(value))
-}
-
-/// Port of erts/emulator/beam/beam_debug.c:170 (erts_debug_copy_shared_2), OTP-29.1.1.
-fn copy_shared(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
-    let copy_literals = if args[1] == Term::atom(arinsal_term::atoms::TRUE) {
-        true
-    } else if args[1] == Term::atom(arinsal_term::atoms::FALSE) {
-        false
-    } else {
-        return Err(badarg());
-    };
-    arinsal_term::copy_shared(
-        args[0],
-        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
-        copy_literals,
-    )
-    .map_err(|_| {
-        VmError::Trap(exceptions::Trap::error(Term::atom(
-            arinsal_term::atoms::SYSTEM_LIMIT,
-        )))
-    })
-}
-
-/// `erts_debug:copy_shared/2` through the direct BIF table entry.
-// Port of erts/emulator/beam/beam_debug.c (erts_debug_copy_shared_2), OTP-29.1.1.
-pub(crate) extern "C" fn copy_shared_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
-    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
-        return 0;
-    };
-    process.heap.note_bif_entry();
-    let args = crate::bif_table::bif_args::<2>(reg);
-    let result = copy_shared(process, &args);
-    crate::natives::bif::bif_ret(c_p, i, result)
-}
-
 /// `erts_debug:flat_size/1`.
 // Port of erts/emulator/beam/beam_debug.c (erts_debug_flat_size_1), OTP-29.1.1.
 pub(crate) extern "C" fn flat_size_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
@@ -1199,239 +1120,6 @@ pub(crate) extern "C" fn same_2(_c_p: *mut ProcessHeader, reg: *mut u64, _i: u64
     }))
 }
 
-/// Port of erts/emulator/beam/erl_map.c:3301 (erts_debug_map_info_1), OTP-29.1.1.
-fn map_info(process: &mut Process, value: Term) -> Result<Term, VmError> {
-    if value.classify() != TermKind::Map {
-        return Err(VmError::Trap(exceptions::Trap::error(badmap(
-            process, value,
-        )?)));
-    }
-    if !value.is_hashmap() {
-        return Err(badarg());
-    }
-    // Port of erts/emulator/beam/erl_map.c:3425-3590 (hashmap_info), OTP-29.1.1.
-    const LEVELS: usize = 18;
-    let mut leaves = [0usize; LEVELS];
-    let mut bitmaps = [0usize; 16];
-    let mut collisions = [0usize; 16];
-    let mut arrays = 0usize;
-    let mut leaf_count = 0usize;
-    let mut bitmap_count = 0usize;
-    let mut collision_count = 0usize;
-    let mut max_depth = 0usize;
-    let mut stack = vec![(value, 0usize)];
-    while let Some((node, depth)) = stack.pop() {
-        if node.classify() == TermKind::List {
-            leaf_count += 1;
-            leaves[depth] += 1;
-            continue;
-        }
-        let header = node.header().ok_or_else(badarg)?;
-        let kind = ((header >> 6) & 3) as usize;
-        let children = hashmap_node_children(node).ok_or_else(badarg)?;
-        let next_depth = depth + 1;
-        max_depth = max_depth.max(next_depth);
-        match header & 63 {
-            0 => {
-                collision_count += 1;
-                collisions[children.len().min(16) - 1] += 1;
-            }
-            0x2c if kind == 1 => {
-                bitmap_count += 1;
-                bitmaps[children.len() - 1] += 1;
-            }
-            0x2c if kind == 2 => arrays += 1,
-            0x2c if kind == 3 => {
-                bitmap_count += 1;
-                bitmaps[children.len() - 1] += 1;
-            }
-            _ => return Err(badarg()),
-        }
-        if next_depth < LEVELS {
-            stack.extend(children.into_iter().map(|child| (child, next_depth)));
-        }
-    }
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut builder = TermBuilder::new(&mut heap);
-    let (leaf_info, bitmap_info, collision_info) = {
-        let mut small_tuple = |values: &[usize]| {
-            let values = values
-                .iter()
-                .map(|value| {
-                    Term::small(*value as i64).expect("map statistic fits a small integer")
-                })
-                .collect::<Vec<_>>();
-            builder.tuple(&values).map_err(|_| {
-                VmError::Trap(exceptions::Trap::error(Term::atom(
-                    arinsal_term::atoms::SYSTEM_LIMIT,
-                )))
-            })
-        };
-        (
-            small_tuple(&leaves)?,
-            small_tuple(&bitmaps)?,
-            small_tuple(&collisions)?,
-        )
-    };
-    let entries = [
-        ("leafs", leaf_count, leaf_info),
-        ("bitmaps", bitmap_count, bitmap_info),
-        ("collisions", collision_count, collision_info),
-    ];
-    let mut result = Term::NIL;
-    for (name, count, info) in entries {
-        let item = builder
-            .tuple(&[
-                crate::atom_cache::put(name),
-                Term::small(count as i64).unwrap(),
-                info,
-            ])
-            .map_err(|_| {
-                VmError::Trap(exceptions::Trap::error(Term::atom(
-                    arinsal_term::atoms::SYSTEM_LIMIT,
-                )))
-            })?;
-        result = builder.cons(item, result).map_err(|_| {
-            VmError::Trap(exceptions::Trap::error(Term::atom(
-                arinsal_term::atoms::SYSTEM_LIMIT,
-            )))
-        })?;
-    }
-    let arrays_item = builder
-        .tuple(&[
-            crate::atom_cache::put("arrays"),
-            Term::small(arrays as i64).unwrap(),
-            Term::NIL,
-        ])
-        .map_err(|_| {
-            VmError::Trap(exceptions::Trap::error(Term::atom(
-                arinsal_term::atoms::SYSTEM_LIMIT,
-            )))
-        })?;
-    result = builder.cons(arrays_item, result).map_err(|_| {
-        VmError::Trap(exceptions::Trap::error(Term::atom(
-            arinsal_term::atoms::SYSTEM_LIMIT,
-        )))
-    })?;
-    let depth_item = builder
-        .tuple(&[
-            crate::atom_cache::put("depth"),
-            Term::small(max_depth as i64).unwrap(),
-        ])
-        .map_err(|_| {
-            VmError::Trap(exceptions::Trap::error(Term::atom(
-                arinsal_term::atoms::SYSTEM_LIMIT,
-            )))
-        })?;
-    builder.cons(depth_item, result).map_err(|_| {
-        VmError::Trap(exceptions::Trap::error(Term::atom(
-            arinsal_term::atoms::SYSTEM_LIMIT,
-        )))
-    })
-}
-
-/// Port of erts/emulator/beam/beam_debug.c:101 (erts_debug_unaligned_bitstring_2), OTP-29.1.1.
-fn unaligned_bitstring(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
-    let offset = args[1]
-        .as_small()
-        .filter(|offset| (1..8).contains(offset))
-        .ok_or_else(badarg)? as usize;
-    let owned = to_owned(args[0]).map_err(|_| badarg())?;
-    let (bytes, bit_len) = match &owned {
-        OwnedTerm::Binary(bytes) => {
-            let len = bytes.len() * 8;
-            (bytes.as_slice(), len)
-        }
-        OwnedTerm::BitString { bytes, bits } => {
-            let len = bytes
-                .len()
-                .checked_sub(1)
-                .ok_or_else(badarg)?
-                .checked_mul(8)
-                .and_then(|n| n.checked_add(usize::from(*bits)))
-                .ok_or_else(badarg)?;
-            (bytes.as_slice(), len)
-        }
-        _ => return Err(badarg()),
-    };
-    // Port of beam_debug.c:140 (ERL_ONHEAP_BITS_LIMIT + 1), OTP-29.1.1.
-    let target_bits = bit_len.saturating_add(offset).max(64 * 8 + 1);
-    let mut target = vec![0u8; target_bits.div_ceil(8)];
-    for index in 0..bit_len {
-        let bit = (bytes[index / 8] >> (7 - index % 8)) & 1;
-        let target_bit = index + offset;
-        target[target_bit / 8] |= bit << (7 - target_bit % 8);
-    }
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut builder = TermBuilder::new(&mut heap);
-    let binary = builder.binary(&target).map_err(|_| {
-        VmError::Trap(exceptions::Trap::error(Term::atom(
-            arinsal_term::atoms::SYSTEM_LIMIT,
-        )))
-    })?;
-    builder.sub_binary(binary, offset, bit_len).map_err(|_| {
-        VmError::Trap(exceptions::Trap::error(Term::atom(
-            arinsal_term::atoms::SYSTEM_LIMIT,
-        )))
-    })
-}
-
-/// Port of erts/emulator/beam/erl_map.c:3336 (erts_internal_term_type_1), OTP-29.1.1.
-fn term_type(value: Term) -> Term {
-    let name = match value.classify() {
-        TermKind::Number => match value.header().map(|header| header & 63) {
-            Some(0x18) => "hfloat",
-            Some(0x08 | 0x0c) => "bignum",
-            _ => "fixnum",
-        },
-        TermKind::Atom => "atom",
-        TermKind::Ref => match value.header().map(|header| header & 63) {
-            Some(0x10) => "reference",
-            _ => "external_reference",
-        },
-        TermKind::Fun => {
-            if value.header().is_some_and(|header| (header >> 24) & 1 != 0) {
-                "export"
-            } else {
-                "fun"
-            }
-        }
-        TermKind::Port => {
-            if value.header().is_some() {
-                "external_port"
-            } else {
-                "port"
-            }
-        }
-        TermKind::Pid => {
-            if value.header().is_some() {
-                "external_pid"
-            } else {
-                "pid"
-            }
-        }
-        TermKind::Tuple => "tuple",
-        TermKind::Record => "tuple",
-        TermKind::Map => match value.header().map(|header| (header >> 6) & 3) {
-            Some(0) => "flatmap",
-            Some(1) => "hashmap_node",
-            Some(2 | 3) => "hashmap",
-            _ => "hashmap",
-        },
-        TermKind::Nil => "nil",
-        TermKind::List => "list",
-        TermKind::Bitstring => match value.header().map(|header| header & 63) {
-            Some(0x20) => "heap_binary",
-            Some(0x24) => "sub_binary",
-            _ => "refc_binary",
-        },
-        TermKind::BinRef => "refc_binary",
-        TermKind::Catch => "catch",
-        TermKind::Invalid => "invalid",
-    };
-    crate::atom_cache::put(name)
-}
-
 fn build(
     vm: &mut Vm,
     process: &mut Process,
@@ -1442,20 +1130,6 @@ fn build(
 ) -> Result<Term, VmError> {
     let _ = vm;
     match (module, function, args.len()) {
-        ("erts_debug", "copy_shared", 2) => copy_shared(process, args),
-        ("erts_debug", "size_shared", 1) => size_shared(process, args[0]),
-        ("erts_debug", "interpreter_size", 0) => Ok(Term::small(0).unwrap()),
-        ("erts_debug", "disassemble", 1) => Ok(Term::atom(arinsal_term::atoms::FALSE)),
-        ("erts_debug", "lcnt_clear", 0) | ("erts_debug", "lcnt_collect", 0) => {
-            Ok(Term::atom(arinsal_term::atoms::ERROR))
-        }
-        ("erts_debug", "lcnt_control", 1 | 2) => Err(badarg()),
-        ("erts_debug", "map_info", 1) => map_info(process, args[0]),
-        ("erts_debug", "get_internal_state", 1) => internal_state_get(vm, process, ctx, args[0]),
-        ("erts_debug", "set_internal_state", 2) => {
-            internal_state_set(process, ctx, args[0], args[1])
-        }
-        ("erts_debug", "instructions", 0) => instructions(process),
         ("erts_debug", "dirty", 3) => dirty(process, ctx, args),
         ("erts_debug", "dirty_cpu", 2) => dirty_test(
             process,
@@ -1475,41 +1149,14 @@ fn build(
             ("erts_debug", "dirty_io", 2),
             args,
         ),
-        ("erts_debug", "unaligned_bitstring", 2) => unaligned_bitstring(process, args),
         ("erts_internal", "gather_alloc_histograms", 1) => {
             gather_allocator_info(process, ctx, args[0], false)
         }
         ("erts_internal", "gather_carrier_info", 1) => {
             gather_allocator_info(process, ctx, args[0], true)
         }
-        ("erts_internal", "map_hashmap_children", 1) => map_hashmap_children(process, args[0]),
-        ("erts_internal", "map_to_tuple_keys", 1) => map_to_tuple_keys(process, args[0]),
-        ("erts_internal", "term_type", 1) => Ok(term_type(args[0])),
-        ("erts_internal", "system_check", 1) => system_check(args[0]),
-        ("erts_internal", "system_monitor", 1) => system_monitor_get(process, args[0]),
-        ("erts_internal", "system_monitor", 3) => system_monitor_set(process, ctx, args),
         _ => Err(undef()),
     }
-}
-
-fn map_hashmap_children(process: &mut Process, value: Term) -> Result<Term, VmError> {
-    if value.classify() != TermKind::Map {
-        return Err(VmError::Trap(exceptions::Trap::error(badmap(
-            process, value,
-        )?)));
-    }
-    let children = hashmap_node_children(value).ok_or_else(badarg)?;
-    list(process, &children.into_iter().rev().collect::<Vec<_>>())
-}
-
-/// Port of erts/emulator/beam/erl_map.c:3318-3324, OTP-29.1.1.
-fn map_to_tuple_keys(process: &mut Process, value: Term) -> Result<Term, VmError> {
-    if value.classify() != TermKind::Map {
-        return Err(VmError::Trap(exceptions::Trap::error(badmap(
-            process, value,
-        )?)));
-    }
-    value.flatmap_keys_tuple().ok_or_else(badarg)
 }
 
 /// Port of erts/emulator/beam/erl_bif_info.c:5678-5728, OTP-29.1.1.
@@ -1887,21 +1534,8 @@ fn internal_state_tuple_get(
         {
             crate::natives::sys::reader_groups_map(process, *groups).map(Some)
         }
-        ("fake_scheduler_bindings", OwnedTerm::Atom(mode))
-            if matches!(
-                mode.as_str(),
-                "default_bind"
-                    | "spread"
-                    | "processor_spread"
-                    | "thread_spread"
-                    | "thread_no_node_processor_spread"
-                    | "no_node_processor_spread"
-                    | "no_node_thread_spread"
-                    | "no_spread"
-                    | "unbound"
-            ) =>
-        {
-            Ok(Some(Term::atom(arinsal_term::atoms::FALSE)))
+        ("fake_scheduler_bindings", OwnedTerm::Atom(mode)) => {
+            crate::natives::sys::fake_scheduler_bindings(process, mode).map(Some)
         }
         ("atom_out_cache_index", OwnedTerm::Atom(name)) => {
             let Some(index) = global_atoms().get(name).map(|atom| atom.0) else {
@@ -2362,7 +1996,7 @@ fn monitor_extra_term(process: &mut Process, extra: Option<&OwnedTerm>) -> Resul
 }
 
 /// Port of erts/emulator/beam/erl_bif_info.c:4339-4947, OTP-29.1.1.
-fn internal_state_get(
+pub(crate) fn internal_state_get(
     vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
@@ -2377,9 +2011,15 @@ fn internal_state_get(
     match arg_name(selector).as_deref() {
         Some("reds_left") => int(process, process.heap.abi.fcalls.max(0) as usize),
         Some("available_internal_state") => Ok(Term::atom(arinsal_term::atoms::TRUE)),
-        Some("force_heap_frags" | "scheduler_dump" | "hashmap_collision_bonanza") => {
+        Some("force_heap_frags" | "hashmap_collision_bonanza") => {
             Ok(Term::atom(arinsal_term::atoms::FALSE))
         }
+        // Port of erl_bif_info.c:4503 (`ERTS_HAVE_TRY_CATCH && ERTS_SYS_SUSPEND_SIGNAL`).
+        Some("scheduler_dump") => Ok(Term::atom(if cfg!(unix) {
+            arinsal_term::atoms::TRUE
+        } else {
+            arinsal_term::atoms::FALSE
+        })),
         Some("debugger_support") => Ok(Term::atom(if crate::trace_bp::debugger_supported() {
             arinsal_term::atoms::TRUE
         } else {
@@ -2725,7 +2365,7 @@ fn debug_wait_wake(
 }
 
 /// Port of erts/emulator/beam/erl_bif_info.c:5036-5500, OTP-29.1.1.
-fn internal_state_set(
+pub(crate) fn internal_state_set(
     process: &mut Process,
     ctx: &mut RunCtx<'_, crate::Process>,
     selector: Term,
@@ -3339,16 +2979,8 @@ fn internal_state_set(
     Err(badarg())
 }
 
-fn system_check(selector: Term) -> Result<Term, VmError> {
-    if selector == crate::atom_cache::put("schedulers") {
-        Ok(Term::atom(arinsal_term::atoms::OK))
-    } else {
-        Err(badarg())
-    }
-}
-
 /// Port of erts/emulator/beam/erl_bif_trace.c:3276-3388, OTP-29.1.1.
-fn system_monitor_get(process: &mut Process, session: Term) -> Result<Term, VmError> {
+pub(crate) fn system_monitor_get(process: &mut Process, session: Term) -> Result<Term, VmError> {
     let runtime = process.runtime.ok_or_else(badarg)?;
     let state = if session == Term::atom(arinsal_term::atoms::LEGACY) {
         runtime.system_monitor.lock().unwrap().clone()
@@ -3489,11 +3121,7 @@ fn apply_monitor_option(
 }
 
 /// Port of erts/emulator/beam/erl_bif_trace.c:3560-3715 (system_monitor), OTP-29.1.1.
-fn system_monitor_set(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, crate::Process>,
-    args: &[Term],
-) -> Result<Term, VmError> {
+pub(crate) fn system_monitor_set(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     let runtime = process.runtime.ok_or_else(badarg)?;
     // `None` is the legacy (global) monitor, `Some` the monitor of a dynamic trace session.
     let key = if args[0] == Term::atom(arinsal_term::atoms::LEGACY) {
@@ -3599,9 +3227,9 @@ fn system_monitor_set(
             .filter_map(|pid| pid.to_term())
             .filter_map(|pid| to_owned(pid).ok())
             .any(|pid| pid == receiver)
-    }) || ctx
-        .pid()
-        .to_term()
+    }) || process
+        .self_pid()
+        .and_then(|pid| pid.to_term())
         .and_then(|pid| to_owned(pid).ok())
         .as_ref()
         == Some(&receiver);

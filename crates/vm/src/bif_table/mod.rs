@@ -152,7 +152,6 @@ pub(crate) fn is_body(f: usize) -> bool {
     f != 0
         && f != bif!(crate::native_helpers::yield_executor_bif)
         && f != bif!(crate::native_helpers::process_bif_light)
-        && f != bif!(crate::native_helpers::process_info_2_light)
 }
 
 /// The [`Bif`] at `bif_table[index]`, unless it only handles a generated light call.
@@ -164,12 +163,11 @@ fn function_at(index: usize) -> Option<Bif> {
     Some(raw::bif_at(address))
 }
 
-use crate::native_helpers::{persistent_term_get_1_light, persistent_term_get_2_light};
 use crate::natives::{
-    bif_phash2, binary, erl_arith, erl_bif_atomics, erl_bif_binary, erl_bif_chksum, erl_bif_guard,
-    erl_bif_info, erl_bif_lists, erl_bif_op, erl_bif_re, erl_bif_unique, erl_db, erl_hl_timer,
-    erl_iolist, erl_map, erl_math, erl_process_dict, erl_ptab, erl_time_sup, erl_unicode, external,
-    register,
+    beam_debug, bif_phash2, binary, erl_arith, erl_bif_atomics, erl_bif_binary, erl_bif_chksum,
+    erl_bif_coverage, erl_bif_guard, erl_bif_info, erl_bif_lists, erl_bif_op, erl_bif_re,
+    erl_bif_unique, erl_db, erl_hl_timer, erl_iolist, erl_map, erl_math, erl_process_dict,
+    erl_ptab, erl_record, erl_time_sup, erl_unicode, external, register,
 };
 
 /// `bif_table[i].f` for a BIF whose body is not the shared plain/process/trap adapter.
@@ -183,6 +181,27 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("re", "run", 2) => bif!(erl_bif_re::re_run_2),
         ("re", "run", 3) => bif!(erl_bif_re::re_run_3),
         ("re", "internal_run", 4) => bif!(erl_bif_re::re_internal_run_4),
+        ("re", "version", 0) => bif!(erl_bif_re::re_version_0),
+        ("re", "compile", 1) => bif!(erl_bif_re::re_compile_1),
+        ("re", "compile", 2) => bif!(erl_bif_re::re_compile_2),
+        ("re", "inspect", 2) => bif!(erl_bif_re::re_inspect_2),
+        ("re", "import", 1) => bif!(erl_bif_re::re_import_1),
+        // erl_record.c
+        ("records", "create", 4) => bif!(erl_record::records_create_4),
+        ("records", "update", 4) => bif!(erl_record::records_update_4),
+        ("records", "get", 2) => bif!(erl_record::records_get_2),
+        ("records", "get_module", 1) => bif!(erl_record::records_get_module_1),
+        ("records", "get_name", 1) => bif!(erl_record::records_get_name_1),
+        ("records", "get_field_names", 1) => bif!(erl_record::records_get_field_names_1),
+        ("records", "is_exported", 1) => bif!(erl_record::records_is_exported_1),
+        ("records", "get_definition", 2) => bif!(erl_record::records_get_definition_2),
+        // erl_bif_coverage.c
+        ("code", "coverage_support", 0) => bif!(erl_bif_coverage::code_coverage_support_0),
+        ("code", "set_coverage_mode", 1) => bif!(erl_bif_coverage::code_set_coverage_mode_1),
+        ("code", "get_coverage_mode", 0) => bif!(erl_bif_coverage::code_get_coverage_mode_0),
+        ("code", "get_coverage_mode", 1) => bif!(erl_bif_coverage::code_get_coverage_mode_1),
+        ("code", "get_coverage", 2) => bif!(erl_bif_coverage::code_get_coverage_2),
+        ("code", "reset_coverage", 1) => bif!(erl_bif_coverage::code_reset_coverage_1),
         // erl_ptab.c / bif.c
         ("erlang", "processes", 0) => bif!(erl_ptab::processes_0),
         ("erlang", "ports", 0) => bif!(erl_ptab::ports_0),
@@ -194,9 +213,36 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         // erl_bif_info.c
         ("erlang", "is_process_alive", 1) => bif!(erl_bif_info::is_process_alive_1),
         ("erlang", "system_info", 1) => bif!(erl_bif_info::system_info_1),
-        ("erlang", "process_info", 2) => {
-            bif!(crate::native_helpers::process_info_2_light)
+        ("erlang", "fun_info", 2) => bif!(erl_bif_info::fun_info_2),
+        ("erlang", "fun_info_mfa", 1) => bif!(erl_bif_info::fun_info_mfa_1),
+        ("erlang", "process_info", 1) => bif!(erl_bif_info::process_info_1),
+        ("erlang", "get_module_info", 1) => bif!(erl_bif_info::get_module_info_1),
+        ("erlang", "get_module_info", 2) => bif!(erl_bif_info::get_module_info_2),
+        ("erts_internal", "is_process_alive", 2) => {
+            bif!(erl_bif_info::erts_internal_is_process_alive_2)
         }
+        ("erts_internal", "is_system_process", 1) => {
+            bif!(erl_bif_info::erts_internal_is_system_process_1)
+        }
+        ("erts_internal", "process_display", 2) => {
+            bif!(erl_bif_info::erts_internal_process_display_2)
+        }
+        ("erts_internal", "system_check", 1) => bif!(erl_bif_info::erts_internal_system_check_1),
+        ("erts_debug", "lcnt_clear", 0) => bif!(erl_bif_info::erts_debug_lcnt_clear_0),
+        ("erts_debug", "lcnt_collect", 0) => bif!(erl_bif_info::erts_debug_lcnt_collect_0),
+        ("erts_debug", "lcnt_control", 1) => bif!(erl_bif_info::erts_debug_lcnt_control_1),
+        ("erts_debug", "lcnt_control", 2) => bif!(erl_bif_info::erts_debug_lcnt_control_2),
+        ("error_logger", "warning_map", 0) => bif!(erl_bif_info::error_logger_warning_map_0),
+        ("erts_debug", "get_internal_state", 1) => {
+            bif!(erl_bif_info::erts_debug_get_internal_state_1)
+        }
+        ("erts_debug", "set_internal_state", 2) => {
+            bif!(erl_bif_info::erts_debug_set_internal_state_2)
+        }
+        // bif.c
+        ("erlang", "make_fun", 3) => bif!(crate::natives::bif::make_fun_3),
+        ("erlang", "bump_reductions", 1) => bif!(crate::natives::bif::bump_reductions_1),
+        ("erlang", "process_info", 2) => bif!(erl_bif_info::process_info_2),
         // external.c
         ("erlang", "term_to_binary", 1) => bif!(external::term_to_binary_1),
         ("erlang", "term_to_binary", 2) => bif!(external::term_to_binary_2),
@@ -206,6 +252,9 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "external_size", 2) => bif!(external::external_size_2),
         ("erlang", "binary_to_term", 1) => bif!(external::binary_to_term_1),
         ("erlang", "binary_to_term", 2) => bif!(external::binary_to_term_2),
+        ("erts_debug", "dist_ext_to_term", 2) => {
+            bif!(external::erts_debug_dist_ext_to_term_2)
+        }
         // erl_bif_lists.c
         ("erlang", "++", 2) => bif!(erl_bif_lists::ebif_plusplus_2),
         ("erlang", "append", 2) => bif!(erl_bif_lists::append_2),
@@ -388,9 +437,19 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "error", 3) => bif!(crate::natives::bif::error_3),
         ("erlang", "is_builtin", 3) => bif!(crate::natives::bif::is_builtin_3),
         ("erts_internal", "cmp_term", 2) => bif!(crate::natives::bif::cmp_term_2),
-        ("erts_debug", "copy_shared", 2) => bif!(crate::natives::erts_debug::copy_shared_2),
+        ("erts_debug", "copy_shared", 2) => bif!(beam_debug::erts_debug_copy_shared_2),
         ("erts_debug", "flat_size", 1) => bif!(crate::natives::erts_debug::flat_size_1),
         ("erts_debug", "same", 2) => bif!(crate::natives::erts_debug::same_2),
+        // beam_debug.c
+        ("erts_debug", "size_shared", 1) => bif!(beam_debug::erts_debug_size_shared_1),
+        ("erts_debug", "unaligned_bitstring", 2) => {
+            bif!(beam_debug::erts_debug_unaligned_bitstring_2)
+        }
+        ("erts_debug", "instructions", 0) => bif!(beam_debug::erts_debug_instructions_0),
+        ("erts_debug", "disassemble", 1) => bif!(beam_debug::erts_debug_disassemble_1),
+        ("erts_debug", "interpreter_size", 0) => {
+            bif!(beam_debug::erts_debug_interpreter_size_0)
+        }
         ("unicode", "bin_is_7bit", 1) => bif!(crate::natives::erl_unicode_atom::bin_is_7bit_1),
         ("erlang", "hd", 1) => bif!(crate::natives::bif::hd_1),
         ("erlang", "tl", 1) => bif!(crate::natives::bif::tl_1),
@@ -424,6 +483,15 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("maps", "find", 2) => bif!(erl_map::maps_find_2),
         ("maps", "get", 2) => bif!(erl_map::maps_get_2),
         ("maps", "is_key", 2) => bif!(erl_map::maps_is_key_2),
+        ("erts_debug", "map_info", 1) => bif!(erl_map::erts_debug_map_info_1),
+        ("erts_internal", "map_to_tuple_keys", 1) => {
+            bif!(erl_map::erts_internal_map_to_tuple_keys_1)
+        }
+        ("erts_internal", "term_type", 1) => bif!(erl_map::erts_internal_term_type_1),
+        ("erts_internal", "map_hashmap_children", 1) => {
+            bif!(erl_map::erts_internal_map_hashmap_children_1)
+        }
+        ("erts_internal", "map_next", 3) => bif!(erl_map::erts_internal_map_next_3),
         // binary.c
         ("erlang", "binary_to_list", 1) => bif!(binary::binary_to_list_1),
         ("erlang", "binary_to_list", 3) => bif!(binary::binary_to_list_3),
@@ -573,8 +641,8 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         // These were `light_dispatch` → `invoke_dispatch_bif` (Native, no process BIF).
         ("erlang", "node", 0) => bif!(crate::dist::node_0),
         ("erlang", "node", 1) => bif!(crate::dist::node_1),
-        ("persistent_term", "get", 1) => bif!(persistent_term_get_1_light),
-        ("persistent_term", "get", 2) => bif!(persistent_term_get_2_light),
+        ("persistent_term", "get", 1) => bif!(crate::natives::sys::persistent_term_get_1),
+        ("persistent_term", "get", 2) => bif!(crate::natives::sys::persistent_term_get_2),
         // bif.c
         ("erlang", "monitor", 2) => bif!(crate::natives::bif::monitor_2),
         ("erlang", "monitor", 3) => bif!(crate::natives::bif::monitor_3),
@@ -616,17 +684,135 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "cancel_timer", 2) => bif!(erl_hl_timer::cancel_timer_2),
         ("erlang", "read_timer", 1) => bif!(erl_hl_timer::read_timer_1),
         ("erlang", "read_timer", 2) => bif!(erl_hl_timer::read_timer_2),
-        ("erlang", "finish_loading", 1) => sched_entry::<FinishLoading1>(),
-        ("erlang", "has_prepared_code_on_load", 1) => sched_entry::<HasPreparedCodeOnLoad1>(),
-        ("erlang", "load_nif", 2) => sched_entry::<LoadNif2>(),
-        ("erlang", "nodes", 2) => sched_entry::<Nodes2>(),
-        ("erlang", "bif_return_trap", 2) => sched_entry::<BifReturnTrap2>(),
-        ("erlang", "bif_handle_signals_return", 2) => sched_entry::<BifHandleSignalsReturn2>(),
-        ("persistent_term", "put", 2) => sched_entry::<PersistentTermPut2>(),
-        ("persistent_term", "put_new", 2) => sched_entry::<PersistentTermPutNew2>(),
-        ("persistent_term", "erase", 1) => sched_entry::<PersistentTermErase1>(),
-        ("erts_internal", "erase_persistent_terms", 0) => sched_entry::<ErasePersistentTerms0>(),
-        ("persistent_term", "get", 0) => sched_entry::<PersistentTermGet0>(),
+        ("erlang", "has_prepared_code_on_load", 1) => {
+            bif!(crate::natives::code::has_prepared_code_on_load_1)
+        }
+        ("erlang", "load_nif", 2) => bif!(crate::natives::nif::load_nif_2),
+        ("erlang", "nodes", 2) => bif!(crate::natives::node::nodes_2),
+        ("erlang", "bif_return_trap", 2) => {
+            bif!(crate::natives::sys::bif_return_trap_2)
+        }
+        ("erlang", "bif_handle_signals_return", 2) => {
+            bif!(crate::natives::sys::bif_handle_signals_return_2)
+        }
+        // bif.c
+        ("erlang", "system_flag", 2) => bif!(crate::natives::sys::system_flag_2),
+        ("erlang", "display", 1) => bif!(crate::natives::sys::display_1),
+        ("erlang", "display_string", 2) => bif!(crate::natives::sys::display_string_2),
+        ("erts_internal", "term_to_string", 2) => bif!(crate::natives::sys::term_to_string_2),
+        ("erts_internal", "scheduler_wall_time", 1) => {
+            bif!(crate::natives::sys::scheduler_wall_time_1)
+        }
+        ("erts_internal", "processes_next", 1) => bif!(crate::natives::proc::processes_next_1),
+        // erl_bif_port.c
+        ("erts_internal", "open_port", 2) => {
+            bif!(crate::natives::erl_bif_port::erts_internal_open_port_2)
+        }
+        ("erts_internal", "port_call", 3) => {
+            bif!(crate::natives::erl_bif_port::erts_internal_port_call_3)
+        }
+        ("erts_internal", "port_control", 3) => {
+            bif!(crate::natives::erl_bif_port::erts_internal_port_control_3)
+        }
+        ("erts_internal", "port_close", 1) => {
+            bif!(crate::natives::erl_bif_port::erts_internal_port_close_1)
+        }
+        ("erts_internal", "port_connect", 2) => {
+            bif!(crate::natives::erl_bif_port::erts_internal_port_connect_2)
+        }
+        ("erts_internal", "port_info", 1) => {
+            bif!(crate::natives::erl_bif_port::erts_internal_port_info_1)
+        }
+        ("erts_internal", "port_info", 2) => {
+            bif!(crate::natives::erl_bif_port::erts_internal_port_info_2)
+        }
+        ("erlang", "port_set_data", 2) => bif!(crate::natives::erl_bif_port::port_set_data_2),
+        ("erlang", "port_get_data", 1) => bif!(crate::natives::erl_bif_port::port_get_data_1),
+        ("erlang", "decode_packet", 3) => bif!(crate::natives::erl_bif_port::decode_packet_3),
+        // erl_process.c
+        ("erlang", "resume_process", 1) => bif!(crate::natives::erl_process::resume_process_1),
+        ("erts_internal", "is_process_executing_dirty", 1) => {
+            bif!(crate::natives::erl_process::erts_internal_is_process_executing_dirty_1)
+        }
+        ("erts_internal", "no_aux_work_threads", 0) => {
+            bif!(crate::natives::erl_process::erts_internal_no_aux_work_threads_0)
+        }
+        ("erts_internal", "request_system_task", 3) => {
+            bif!(crate::natives::erl_process::erts_internal_request_system_task_3)
+        }
+        ("erts_internal", "request_system_task", 4) => {
+            bif!(crate::natives::erl_process::erts_internal_request_system_task_4)
+        }
+        // dist.c
+        ("erlang", "nodes", 1) => bif!(crate::natives::node::nodes_1),
+        ("erlang", "setnode", 2) => bif!(crate::natives::node::setnode_2),
+        ("erlang", "monitor_node", 2) => bif!(crate::natives::node::monitor_node_2),
+        ("erlang", "monitor_node", 3) => bif!(crate::natives::node::monitor_node_3),
+        ("erlang", "dist_get_stat", 1) => bif!(crate::dist::dist_get_stat_1),
+        ("erlang", "dist_ctrl_get_opt", 2) => bif!(crate::dist::dist_ctrl_get_opt_2),
+        ("erlang", "dist_ctrl_set_opt", 3) => bif!(crate::dist::dist_ctrl_set_opt_3),
+        ("erlang", "dist_ctrl_input_handler", 2) => {
+            bif!(crate::dist::dist_ctrl_input_handler_2)
+        }
+        ("erlang", "dist_ctrl_get_data_notification", 1) => {
+            bif!(crate::dist::dist_ctrl_get_data_notification_1)
+        }
+        ("erts_internal", "get_dflags", 0) => bif!(crate::dist::erts_internal_get_dflags_0),
+        ("erts_internal", "get_creation", 0) => {
+            bif!(crate::dist::erts_internal_get_creation_0)
+        }
+        ("erts_internal", "new_connection", 1) => {
+            bif!(crate::dist::erts_internal_new_connection_1)
+        }
+        ("erts_internal", "abort_pending_connection", 2) => {
+            bif!(crate::dist::erts_internal_abort_pending_connection_2)
+        }
+        ("erts_internal", "create_dist_channel", 3) => {
+            bif!(crate::dist::erts_internal_create_dist_channel_3)
+        }
+        ("net_kernel", "dflag_unicode_io", 1) => {
+            bif!(crate::dist::net_kernel_dflag_unicode_io_1)
+        }
+        // erl_bif_trace.c
+        ("erlang", "seq_trace", 2) => bif!(crate::natives::erl_bif_trace::seq_trace_2),
+        ("erlang", "seq_trace_info", 1) => bif!(crate::natives::erl_bif_trace::seq_trace_info_1),
+        ("erlang", "seq_trace_print", 1) => {
+            bif!(crate::natives::erl_bif_trace::seq_trace_print_1)
+        }
+        ("erlang", "seq_trace_print", 2) => {
+            bif!(crate::natives::erl_bif_trace::seq_trace_print_2)
+        }
+        ("erlang", "system_profile", 0) => {
+            bif!(crate::natives::erl_bif_trace::system_profile_0)
+        }
+        ("erlang", "system_profile", 2) => {
+            bif!(crate::natives::erl_bif_trace::system_profile_2)
+        }
+        ("erlang", "trace_info", 2) => bif!(crate::natives::erl_bif_trace::trace_info_2),
+        ("erts_internal", "trace_info", 3) => {
+            bif!(crate::natives::erl_bif_trace::erts_internal_trace_info_3)
+        }
+        ("erts_internal", "system_monitor", 1) => {
+            bif!(crate::natives::erl_bif_trace::erts_internal_system_monitor_1)
+        }
+        ("erts_internal", "system_monitor", 3) => {
+            bif!(crate::natives::erl_bif_trace::erts_internal_system_monitor_3)
+        }
+        ("erts_internal", "trace_session_create", 3) => {
+            bif!(crate::natives::erl_bif_trace::erts_internal_trace_session_create_3)
+        }
+        ("erts_internal", "trace_session_destroy", 1) => {
+            bif!(crate::natives::erl_bif_trace::erts_internal_trace_session_destroy_1)
+        }
+        ("erlang", "trace_delivered", 1) => {
+            bif!(crate::natives::erl_bif_trace::trace_delivered_1)
+        }
+        ("erts_trace_cleaner", "check", 0) => {
+            bif!(crate::natives::erl_bif_trace::erts_trace_cleaner_check_0)
+        }
+        ("erts_trace_cleaner", "send_trace_clean_signal", 1) => {
+            bif!(crate::natives::erl_bif_trace::erts_trace_cleaner_send_trace_clean_signal_1)
+        }
         _ => return None,
     };
     Some(func)
@@ -641,8 +827,10 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
 pub(crate) fn trap_function(module: &str, function: &str, arity: u8) -> Option<usize> {
     Some(match (module, function, arity) {
         ("erlang", "bif_handle_signals_return", 2) => {
-            bif!(crate::native_helpers::sched_bif_light::<BifHandleSignalsReturn2>)
+            bif!(crate::natives::sys::bif_handle_signals_return_2)
         }
+        // Port of erts/emulator/beam/bif.c:5531-5536 (erts_init_bif), OTP-29.1.1.
+        ("erlang", "bif_return_trap", 2) => bif!(crate::natives::sys::bif_return_trap_2),
         ("erlang", "re_run_trap", 3) => bif!(erl_bif_re::re_run_trap_3),
         ("erlang", "ptab_list_continue", 2) => bif!(erl_ptab::ptab_list_continue_2),
         ("erlang", "md5_trap", 2) => bif!(erl_bif_chksum::md5_trap_2),
@@ -711,87 +899,6 @@ impl arinsal_bifs::BifTableVisitor for Compile {
     }
 }
 
-/// `bif_table[].f` of a BIF whose body needs its scheduler's data.
-fn sched_entry<B: crate::native_helpers::SchedBif>() -> usize {
-    bif!(crate::native_helpers::sched_bif_light::<B>)
-}
-
-/// `erlang:finish_loading/1`.
-struct FinishLoading1;
-impl crate::native_helpers::SchedBif for FinishLoading1 {
-    const ARITY: usize = 1;
-    const BODY: crate::natives::DirectNative = crate::natives::code::finish_loading_1;
-}
-
-/// `erlang:has_prepared_code_on_load/1`.
-struct HasPreparedCodeOnLoad1;
-impl crate::native_helpers::SchedBif for HasPreparedCodeOnLoad1 {
-    const ARITY: usize = 1;
-    const BODY: crate::natives::DirectNative = crate::natives::code::has_prepared_code_on_load_1;
-}
-
-/// `erlang:load_nif/2`.
-struct LoadNif2;
-impl crate::native_helpers::SchedBif for LoadNif2 {
-    const ARITY: usize = 2;
-    const BODY: crate::natives::DirectNative = crate::natives::nif::load_nif_2;
-}
-
-/// `erlang:nodes/2`. Port of erts/emulator/beam/dist.c (nodes_2), OTP-29.1.1.
-struct Nodes2;
-impl crate::native_helpers::SchedBif for Nodes2 {
-    const ARITY: usize = 2;
-    const BODY: crate::natives::DirectNative = crate::natives::node::call_nodes2;
-}
-
-/// `erlang:bif_return_trap/2`. Port of erts/emulator/beam/bif.c (bif_return_trap), OTP-29.1.1.
-struct BifReturnTrap2;
-impl crate::native_helpers::SchedBif for BifReturnTrap2 {
-    const ARITY: usize = 2;
-    const BODY: crate::natives::DirectNative = crate::natives::sys::bif_return_trap_2;
-}
-
-/// `erlang:bif_handle_signals_return/2`. Port of erts/emulator/beam/bif.c
-/// (`bif_handle_signals_return`), OTP-29.1.1.
-struct BifHandleSignalsReturn2;
-impl crate::native_helpers::SchedBif for BifHandleSignalsReturn2 {
-    const ARITY: usize = 2;
-    const BODY: crate::natives::DirectNative = crate::natives::sys::bif_handle_signals_return_2;
-}
-
-/// A [`crate::native_helpers::SchedBif`] named by its body.
-macro_rules! sched_bif {
-    ($(#[$doc:meta])* $name:ident, $arity:literal, $body:path) => {
-        $(#[$doc])*
-        struct $name;
-        impl crate::native_helpers::SchedBif for $name {
-            const ARITY: usize = $arity;
-            const BODY: crate::natives::DirectNative = $body;
-        }
-    };
-}
-
-sched_bif!(
-    /// `persistent_term:put/2`. Port of erl_bif_persistent.c (persistent_term_put_2).
-    PersistentTermPut2, 2, crate::natives::sys::persistent_term_put_2
-);
-sched_bif!(
-    /// `persistent_term:put_new/2`. Port of erl_bif_persistent.c (persistent_term_put_new_2).
-    PersistentTermPutNew2, 2, crate::natives::sys::persistent_term_put_new_2
-);
-sched_bif!(
-    /// `persistent_term:erase/1`. Port of erl_bif_persistent.c (persistent_term_erase_1).
-    PersistentTermErase1, 1, crate::natives::sys::persistent_term_erase_1
-);
-sched_bif!(
-    /// `erts_internal:erase_persistent_terms/0`. Port of erl_bif_persistent.c.
-    ErasePersistentTerms0, 0, crate::natives::sys::erase_persistent_terms_0
-);
-sched_bif!(
-    /// `persistent_term:get/0`. Port of erl_bif_persistent.c (persistent_term_get_0).
-    PersistentTermGet0, 0, crate::natives::sys::persistent_term_get_0
-);
-
 #[cfg(test)]
 mod tests {
     use super::special;
@@ -806,7 +913,7 @@ mod tests {
             atoms.intern("self").expect("atom"),
             0,
         );
-        let export = crate::beamasm_integration::make_export(mfa).expect("export");
+        let export = crate::beamasm_integration::make_export(mfa);
         let number = export.bif_number();
         let spec = arinsal_spec::bif_lookup("erlang", "self", 0).expect("bif.tab entry");
         similar_asserts::assert_eq!(number, i32::from(spec.index));
@@ -838,6 +945,183 @@ mod tests {
     }
 
     #[test]
+    fn record_re_and_coverage_bifs_have_direct_entries() {
+        let records = [
+            (
+                "create",
+                4,
+                bif!(crate::natives::erl_record::records_create_4),
+            ),
+            (
+                "update",
+                4,
+                bif!(crate::natives::erl_record::records_update_4),
+            ),
+            ("get", 2, bif!(crate::natives::erl_record::records_get_2)),
+            (
+                "get_module",
+                1,
+                bif!(crate::natives::erl_record::records_get_module_1),
+            ),
+            (
+                "get_name",
+                1,
+                bif!(crate::natives::erl_record::records_get_name_1),
+            ),
+            (
+                "get_field_names",
+                1,
+                bif!(crate::natives::erl_record::records_get_field_names_1),
+            ),
+            (
+                "is_exported",
+                1,
+                bif!(crate::natives::erl_record::records_is_exported_1),
+            ),
+            (
+                "get_definition",
+                2,
+                bif!(crate::natives::erl_record::records_get_definition_2),
+            ),
+        ];
+        for (function, arity, expected) in records {
+            similar_asserts::assert_eq!(special("records", function, arity), Some(expected));
+            assert!(super::has_function("records", function, arity));
+        }
+        let re = [
+            ("version", 0, bif!(crate::natives::erl_bif_re::re_version_0)),
+            ("compile", 1, bif!(crate::natives::erl_bif_re::re_compile_1)),
+            ("compile", 2, bif!(crate::natives::erl_bif_re::re_compile_2)),
+            ("inspect", 2, bif!(crate::natives::erl_bif_re::re_inspect_2)),
+            ("import", 1, bif!(crate::natives::erl_bif_re::re_import_1)),
+        ];
+        for (function, arity, expected) in re {
+            similar_asserts::assert_eq!(special("re", function, arity), Some(expected));
+            assert!(super::has_function("re", function, arity));
+        }
+        let coverage = [
+            (
+                "coverage_support",
+                0,
+                bif!(crate::natives::erl_bif_coverage::code_coverage_support_0),
+            ),
+            (
+                "set_coverage_mode",
+                1,
+                bif!(crate::natives::erl_bif_coverage::code_set_coverage_mode_1),
+            ),
+            (
+                "get_coverage_mode",
+                0,
+                bif!(crate::natives::erl_bif_coverage::code_get_coverage_mode_0),
+            ),
+            (
+                "get_coverage_mode",
+                1,
+                bif!(crate::natives::erl_bif_coverage::code_get_coverage_mode_1),
+            ),
+            (
+                "get_coverage",
+                2,
+                bif!(crate::natives::erl_bif_coverage::code_get_coverage_2),
+            ),
+            (
+                "reset_coverage",
+                1,
+                bif!(crate::natives::erl_bif_coverage::code_reset_coverage_1),
+            ),
+        ];
+        for (function, arity, expected) in coverage {
+            similar_asserts::assert_eq!(special("code", function, arity), Some(expected));
+            assert!(super::has_function("code", function, arity));
+        }
+    }
+
+    #[test]
+    fn debug_map_and_dist_ext_bifs_have_direct_entries() {
+        let debug = [
+            (
+                "copy_shared",
+                2,
+                bif!(crate::natives::beam_debug::erts_debug_copy_shared_2),
+            ),
+            (
+                "size_shared",
+                1,
+                bif!(crate::natives::beam_debug::erts_debug_size_shared_1),
+            ),
+            (
+                "unaligned_bitstring",
+                2,
+                bif!(crate::natives::beam_debug::erts_debug_unaligned_bitstring_2),
+            ),
+            (
+                "instructions",
+                0,
+                bif!(crate::natives::beam_debug::erts_debug_instructions_0),
+            ),
+            (
+                "disassemble",
+                1,
+                bif!(crate::natives::beam_debug::erts_debug_disassemble_1),
+            ),
+            (
+                "interpreter_size",
+                0,
+                bif!(crate::natives::beam_debug::erts_debug_interpreter_size_0),
+            ),
+            (
+                "map_info",
+                1,
+                bif!(crate::natives::erl_map::erts_debug_map_info_1),
+            ),
+            (
+                "dist_ext_to_term",
+                2,
+                bif!(crate::natives::external::erts_debug_dist_ext_to_term_2),
+            ),
+        ];
+        for (function, arity, expected) in debug {
+            similar_asserts::assert_eq!(special("erts_debug", function, arity), Some(expected));
+            assert!(super::has_function("erts_debug", function, arity));
+        }
+        let internal = [
+            (
+                "map_to_tuple_keys",
+                1,
+                bif!(crate::natives::erl_map::erts_internal_map_to_tuple_keys_1),
+            ),
+            (
+                "term_type",
+                1,
+                bif!(crate::natives::erl_map::erts_internal_term_type_1),
+            ),
+            (
+                "map_hashmap_children",
+                1,
+                bif!(crate::natives::erl_map::erts_internal_map_hashmap_children_1),
+            ),
+            (
+                "map_next",
+                3,
+                bif!(crate::natives::erl_map::erts_internal_map_next_3),
+            ),
+        ];
+        for (function, arity, expected) in internal {
+            similar_asserts::assert_eq!(special("erts_internal", function, arity), Some(expected));
+            assert!(super::has_function("erts_internal", function, arity));
+        }
+        similar_asserts::assert_eq!(
+            special("erlang", "process_info", 2),
+            Some(bif!(crate::natives::erl_bif_info::process_info_2))
+        );
+        assert!(super::has_function("erlang", "process_info", 2));
+        assert!(super::is_body(bif!(
+            crate::natives::erl_bif_info::process_info_2
+        )));
+    }
+
+    #[test]
     fn os_environment_bifs_have_direct_entries() {
         let entries = [
             ("env", 0, bif!(crate::natives::erl_bif_os::env_0)),
@@ -853,6 +1137,84 @@ mod tests {
         for (function, arity, expected) in entries {
             similar_asserts::assert_eq!(special("os", function, arity), Some(expected));
             assert!(super::has_function("os", function, arity));
+        }
+    }
+
+    #[test]
+    fn process_info_1_module_info_and_lcnt_are_table_bodies() {
+        use crate::natives::erl_bif_info;
+        let entries = [
+            (
+                "erlang",
+                "process_info",
+                1,
+                bif!(erl_bif_info::process_info_1),
+            ),
+            (
+                "erlang",
+                "get_module_info",
+                1,
+                bif!(erl_bif_info::get_module_info_1),
+            ),
+            (
+                "erlang",
+                "get_module_info",
+                2,
+                bif!(erl_bif_info::get_module_info_2),
+            ),
+            (
+                "erts_internal",
+                "is_process_alive",
+                2,
+                bif!(erl_bif_info::erts_internal_is_process_alive_2),
+            ),
+            (
+                "erts_internal",
+                "is_system_process",
+                1,
+                bif!(erl_bif_info::erts_internal_is_system_process_1),
+            ),
+            (
+                "erts_internal",
+                "process_display",
+                2,
+                bif!(erl_bif_info::erts_internal_process_display_2),
+            ),
+            (
+                "erts_internal",
+                "system_check",
+                1,
+                bif!(erl_bif_info::erts_internal_system_check_1),
+            ),
+            (
+                "erts_debug",
+                "lcnt_clear",
+                0,
+                bif!(erl_bif_info::erts_debug_lcnt_clear_0),
+            ),
+            (
+                "error_logger",
+                "warning_map",
+                0,
+                bif!(erl_bif_info::error_logger_warning_map_0),
+            ),
+            (
+                "erts_debug",
+                "get_internal_state",
+                1,
+                bif!(erl_bif_info::erts_debug_get_internal_state_1),
+            ),
+            (
+                "erts_debug",
+                "set_internal_state",
+                2,
+                bif!(erl_bif_info::erts_debug_set_internal_state_2),
+            ),
+        ];
+        for (module, function, arity, expected) in entries {
+            similar_asserts::assert_eq!(special(module, function, arity), Some(expected));
+            assert!(super::is_body(expected));
+            assert!(super::has_function(module, function, arity));
         }
     }
 }

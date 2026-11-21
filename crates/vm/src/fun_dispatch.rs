@@ -8,7 +8,9 @@ use std::sync::Arc;
 /// Export fun lookup for the term crate.
 // Port of erts/emulator/beam/export.c:200-245 (erts_export_get_or_make_stub), OTP-29.1.1.
 fn export_stub_hook(module: Atom, function: Atom, arity: u32) -> Option<Arc<ExportEntry>> {
-    crate::export::export_get_or_make_stub((module, function, arity))
+    Some(crate::export::export_get_or_make_stub((
+        module, function, arity,
+    )))
 }
 
 /// Local fun lookup for ETF terms decoded by a process on this node.

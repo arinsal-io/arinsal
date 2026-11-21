@@ -206,10 +206,11 @@ impl LoaderEnv for X86LoaderEnv<'_> {
     // `BIF_TRAP_EXPORT(BIF_send_2)` and `send_2`, which the emitted call passes to the shared
     // BIF call fragment.
     fn send_target(&self) -> Result<(u64, u64), String> {
-        let export = Arc::as_ptr(
-            make_export((arinsal_term::atoms::ERLANG, arinsal_term::atoms::SEND, 2))
-                .ok_or("no erlang:send/2 export")?,
-        ) as usize;
+        let export = Arc::as_ptr(make_export((
+            arinsal_term::atoms::ERLANG,
+            arinsal_term::atoms::SEND,
+            2,
+        ))) as usize;
         let bif =
             crate::bif_table::function(crate::raw::jit_ffi::export_entry(export).bif_number());
         (bif != 0)

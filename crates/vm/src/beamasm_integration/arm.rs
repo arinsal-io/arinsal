@@ -1200,7 +1200,7 @@ pub(crate) fn compile(
         arinsal_term::atoms::ERLANG,
         arinsal_term::atoms::SEND,
         2,
-    ))?) as usize;
+    ))) as usize;
     // Literals no loaded instruction uses; a literal heap so literal checks see them as such.
     let mut literal_heap = Box::new(VecHeap::new_literal());
     let env = VmModuleEnv::new(

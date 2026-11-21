@@ -190,3 +190,23 @@ fn missing_bifs_match_otp_29() {
         similar_asserts::assert_eq!(expected, actual, "scenario {scenario}");
     }
 }
+
+#[test]
+fn request_system_task_3_4_matches_otp_29() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping request_system_task differential test");
+        return;
+    };
+    let beam = reference
+        .compile_named("missing_bifs", SOURCE, &[])
+        .unwrap();
+    reference.load("missing_bifs", &beam).unwrap();
+    let expected = reference.call("missing_bifs", "run", &[OwnedTerm::Int(9)]);
+    let mut vm = crate::common::node();
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled("missing_bifs", "run", &[Term::small(9).unwrap()], 1)
+        .map(|outcome| CallResult::Ok(outcome.term))
+        .unwrap_or_else(|error| CallResult::TransportError(error.to_string()));
+    similar_asserts::assert_eq!(expected, actual);
+}

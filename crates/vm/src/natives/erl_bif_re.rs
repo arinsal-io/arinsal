@@ -1,8 +1,10 @@
-//! `re:run` BIFs and their hidden continuation export.
+//! The `re` BIFs of erl_bif_re.c.
 //!
-//! Port of erts/emulator/beam/erl_bif_re.c (re_run, re_run_2, re_run_3,
-//! re_internal_run_4, re_match_trap), OTP-29.1.1. The PCRE2 restart state lives in a magic
-//! binary; the BIF traps through the ordinary `erlang:re_run_trap/3` bif_table export.
+//! Port of erts/emulator/beam/erl_bif_re.c (re_version_0, re_compile_1, re_compile_2,
+//! re_inspect_2, re_import_1, re_run, re_run_2, re_run_3, re_internal_run_4,
+//! re_match_trap), OTP-29.1.1. Each BIF is `bif_table[].f` with `(c_p, reg, I)`.
+//! The PCRE2 restart state lives in a magic binary; `re:run` traps through the
+//! ordinary `erlang:re_run_trap/3` bif_table export.
 
 use crate::bif_table::bif_args;
 use crate::bif_traps::TrapContext;
@@ -11,6 +13,10 @@ use crate::{ExportTrap, Process, VmError};
 use arinsal_beamasm::ProcessHeader;
 use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle};
 use arinsal_term::{MagicBin, Term, TermBuilder};
+
+/// `re:ucompile/2`, the named Erlang export `erts_export_put(am_re, am_ucompile, 2)`.
+// Port of erts/emulator/beam/erl_bif_re.c (ucompile_trap_exportp), OTP-29.1.1.
+const RE_UCOMPILE_TRAP: &str = "re:ucompile/2";
 
 const CONTEXT_REDS: i32 = 4_000;
 const ERTS_REGEX_RESTART_CONTEXT_SIZE: usize = 64;
@@ -216,4 +222,97 @@ fn fail(
 ) -> u64 {
     let error = crate::exceptions::bif_error(process, module, function, args, error);
     bif_ret(c_p, i, Err(error))
+}
+
+/// `re:version/0`.
+// Port of erts/emulator/beam/erl_bif_re.c (re_version_0), OTP-29.1.1.
+pub(crate) extern "C" fn re_version_0(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    invoke_named(c_p, reg, i, "version", 0)
+}
+
+/// `re:compile/1`.
+// Port of erts/emulator/beam/erl_bif_re.c (re_compile_1), OTP-29.1.1.
+pub(crate) extern "C" fn re_compile_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let [pattern] = bif_args::<1>(reg);
+    compile(c_p, i, pattern, Term::NIL)
+}
+
+/// `re:compile/2`.
+// Port of erts/emulator/beam/erl_bif_re.c (re_compile_2), OTP-29.1.1.
+pub(crate) extern "C" fn re_compile_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    let [pattern, options] = bif_args::<2>(reg);
+    compile(c_p, i, pattern, options)
+}
+
+/// `re:inspect/2`.
+// Port of erts/emulator/beam/erl_bif_re.c (re_inspect_2), OTP-29.1.1.
+pub(crate) extern "C" fn re_inspect_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    invoke_named(c_p, reg, i, "inspect", 2)
+}
+
+/// `re:import/1`.
+// Port of erts/emulator/beam/erl_bif_re.c (re_import_1), OTP-29.1.1.
+pub(crate) extern "C" fn re_import_1(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
+    invoke_named(c_p, reg, i, "import", 1)
+}
+
+fn compile(c_p: *mut ProcessHeader, i: u64, pattern: Term, options: Term) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    match arinsal_re::compile_traps_to_ucompile(pattern, options) {
+        Ok(true) => {
+            let trap = ExportTrap::new(process, RE_UCOMPILE_TRAP, vec![pattern, options]);
+            bif_ret(c_p, i, Err(VmError::TrapExport(trap)))
+        }
+        Ok(false) => invoke(c_p, i, process, "compile", &[pattern, options]),
+        Err(error) => fail(
+            c_p,
+            i,
+            process,
+            ("re", "compile"),
+            &[pattern, options],
+            error,
+        ),
+    }
+}
+
+fn invoke_named(c_p: *mut ProcessHeader, reg: *mut u64, i: u64, name: &str, arity: usize) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let args: Vec<Term> = match arity {
+        0 => Vec::new(),
+        1 => {
+            let [a] = bif_args::<1>(reg);
+            vec![a]
+        }
+        2 => {
+            let [a, b] = bif_args::<2>(reg);
+            vec![a, b]
+        }
+        _ => return fail(c_p, i, process, ("re", name), &[], BifError::BADARG),
+    };
+    invoke(c_p, i, process, name, &args)
+}
+
+fn invoke(
+    c_p: *mut ProcessHeader,
+    i: u64,
+    process: &mut Process,
+    name: &str,
+    args: &[Term],
+) -> u64 {
+    let result = {
+        let mut heap = ProcessHeapHandle(&mut process.heap);
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::with_fcalls(&mut heap, &mut state);
+        arinsal_re::invoke(&mut ctx, name, args)
+    };
+    match result {
+        Ok(value) => crate::native_hooks::raw(value),
+        Err(error) => fail(c_p, i, process, ("re", name), args, error),
+    }
 }

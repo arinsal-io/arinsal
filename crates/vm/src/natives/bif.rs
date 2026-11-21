@@ -80,6 +80,36 @@ pub(crate) fn bif_system_limit(c_p: *mut ProcessHeader) -> u64 {
     arinsal_term::THE_NON_VALUE
 }
 
+/// `BUMP_REDS(p, gc)`: FCALLS goes down by `gc`, never below zero, or below `-CONTEXT_REDS`
+/// while the process saves calls (FCALLS then counts up from `-CONTEXT_REDS`).
+// Port of erts/emulator/beam/bif.h (BUMP_REDS), OTP-29.1.1.
+pub(crate) fn bump_reds(process: &mut Process, gc: i32) {
+    let fcalls = process.heap.abi.fcalls.saturating_sub(gc);
+    process.heap.abi.fcalls = if fcalls >= 0 {
+        fcalls
+    } else if !crate::trace::saves_calls(process) {
+        0
+    } else {
+        fcalls.max(-crate::process::CONTEXT_REDS)
+    };
+}
+
+/// `bump_reductions/1`: `BIF_RET2(am_true, min(reds, CONTEXT_REDS))`.
+// Port of erts/emulator/beam/bif.c (bump_reductions_1), OTP-29.1.1.
+pub(crate) extern "C" fn bump_reductions_1(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let [reds] = bif_args::<1>(reg);
+    let Some(reds) = reds.as_small().filter(|reds| *reds >= 0) else {
+        return bif_badarg(c_p);
+    };
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    // `reds > CONTEXT_REDS` is capped; BIF_RET2 bumps after the cap.
+    let reds = reds.min(i64::from(crate::process::CONTEXT_REDS)) as i32;
+    bump_reds(process, reds);
+    crate::native_hooks::raw(Term::atom(atoms::TRUE))
+}
+
 /// `monitor/2`.
 // Port of erts/emulator/beam/bif.c (monitor_2), OTP-29.1.1.
 pub(crate) extern "C" fn monitor_2(c_p: *mut ProcessHeader, reg: *mut u64, i: u64) -> u64 {
@@ -430,6 +460,28 @@ pub(crate) fn badarg_ext(
         info: crate::stacktrace::BifErrorInfo::Cause(cause),
     });
     VmError::Trap(trap)
+}
+
+/// `make_fun/3`: `BIF_RET(ep->lambda)` of the export, made a stub when it does not exist.
+// Port of erts/emulator/beam/bif.c (make_fun_3), OTP-29.1.1.
+pub(crate) extern "C" fn make_fun_3(c_p: *mut ProcessHeader, reg: *mut u64, _i: u64) -> u64 {
+    let [module, function, arity] = bif_args::<3>(reg);
+    let (Some(module), Some(function), Some(arity)) =
+        (module.as_atom(), function.as_atom(), arity.as_small())
+    else {
+        return bif_badarg(c_p);
+    };
+    // `arity < 0 || arity > MAX_ARG`.
+    let Ok(arity) = u32::try_from(arity) else {
+        return bif_badarg(c_p);
+    };
+    if arity > u32::from(u8::MAX) {
+        return bif_badarg(c_p);
+    }
+    // erts_export_get_or_make_stub, then `BIF_RET(ep->lambda)`: the export's shared literal
+    // fun, built at its first request.
+    let entry = crate::export::export_get_or_make_stub((module, function, arity));
+    crate::native_hooks::raw(arinsal_term::export_lambda(entry))
 }
 
 /// `self/0`: `c_p->common.id`, already the tagged pid on the header.
@@ -1031,6 +1083,45 @@ pub(crate) fn with_sched<R>(
     .ok_or_else(|| VmError::Unsupported("BIF: no scheduler data".into()));
     process.native_call_pc = 0;
     result
+}
+
+/// `(c_p, reg, I)` entry whose body only needs the process.
+pub(crate) fn bif_process<const N: usize>(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+    body: impl FnOnce(&mut Process, [Term; N]) -> Result<Term, VmError>,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let args = bif_args::<N>(reg);
+    bif_ret(c_p, i, body(process, args))
+}
+
+/// `(c_p, reg, I)` entry that reaches `esdp` through `erts_proc_sched_data(c_p)`.
+pub(crate) fn bif_sched<const N: usize>(
+    c_p: *mut ProcessHeader,
+    reg: *mut u64,
+    i: u64,
+    body: impl FnOnce(
+        &mut Vm,
+        &mut Process,
+        &mut RunCtx<'_, crate::Process>,
+        [Term; N],
+    ) -> Result<Term, VmError>,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(c_p) else {
+        return 0;
+    };
+    process.heap.note_bif_entry();
+    let args = bif_args::<N>(reg);
+    let result = with_sched(process, reg, |vm, process, ctx| {
+        body(vm, process, ctx, args)
+    })
+    .unwrap_or_else(Err);
+    bif_ret(c_p, i, result)
 }
 
 /// `link/1`.

@@ -109,6 +109,15 @@ fn caller_data(pid: Pid) -> u64 {
     packed_pid(pid)
 }
 
+// Port of erts/emulator/beam/io.c:1005-1055 (try_imm_drv_call and
+// finalize_imm_drv_call), OTP-29.1.1.
+fn trace_immediate_process(process: &Process, pid: Pid, name: &str) {
+    let Some(runtime) = process.runtime.as_ref() else {
+        return;
+    };
+    crate::trace::emit_external_process_event(runtime, pid, crate::trace::RUNNING_PROCS, name, &[]);
+}
+
 /// The data of one `command` signal: a native driver takes one flat buffer, a loaded driver the
 /// pieces of `erts_ioq_iolist_to_vec` (`true` marks a reference-counted binary).
 // OTP keeps the command's small I/O vector in the erts_port_output stack frame.
@@ -354,68 +363,6 @@ pub(crate) fn output(
     PortOp::Scheduled(reference)
 }
 
-/// `erts_internal:port_command/3` with no options, called from the generated code with `c_p`
-/// only. It runs when the driver call is immediate (`erts_port_output` with `try_call`); a busy,
-/// traced or non-immediate port declines before any side effect and the executor runs the
-/// whole BIF, which schedules the signal or suspends the caller.
-// Port of erts/emulator/beam/erl_bif_port.c:168 (erts_internal_port_command_3) and io.c:1715
-// (erts_port_output), OTP-29.1.1.
-pub(crate) fn command_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [port, data, flags] = args else {
-        return None;
-    };
-    if *flags != Term::NIL || crate::trace::tracing_enabled() || crate::trace::active() {
-        return None;
-    }
-    let caller = process.self_pid()?;
-    let id = port_id(process, *port)?;
-    let handle = process.runtime.as_ref()?.ports.get(id)?;
-    let drv = handle.driver.as_ref()?;
-    if !drv.driver().is_native()
-        || drv.sched_flags() & (PTS_FLGS_BUSY | PTS_FLG_EXIT | PTS_FLGS_FORCE_SCHEDULE_OP) != 0
-    {
-        return None;
-    }
-    let command = command_pieces(*data).map(|mut pieces| {
-        if drv.driver().has_outputv() {
-            CommandData::Iov(pieces)
-        } else {
-            match pieces.as_mut_slice() {
-                [arinsal_drv::CommandPiece::Bytes(bytes)] => {
-                    CommandData::Flat(std::mem::take(bytes))
-                }
-                _ => CommandData::Iov(pieces),
-            }
-        }
-    })?;
-    let imm = drv
-        .try_imm_call(PTS_FLGS_BUSY, false, "command", (CONTEXT_REDS / 10) as u32)
-        .ok()?;
-    trace_immediate_process(process, caller, "out");
-    call_driver_output(&handle, drv, false, caller, caller, command);
-    let reductions_used = imm.reductions_used();
-    drop(imm);
-    trace_immediate_process(process, caller, "in");
-    process.heap.abi.fcalls = process
-        .heap
-        .abi
-        .fcalls
-        .saturating_sub(i32::try_from(reductions_used).unwrap_or(i32::MAX));
-    Some(Ok(Term::atom(arinsal_term::atoms::TRUE)))
-}
-
-// Port of erts/emulator/beam/io.c:1005-1055 (try_imm_drv_call and
-// finalize_imm_drv_call), OTP-29.1.1.
-fn trace_immediate_process(process: &Process, pid: Pid, name: &str) {
-    let Some(runtime) = process.runtime.as_ref() else {
-        return;
-    };
-    crate::trace::emit_external_process_event(runtime, pid, crate::trace::RUNNING_PROCS, name, &[]);
-}
-
 /// Queue `op` as a port task (`erts_schedule_proc2port_signal`).
 fn schedule(drv: &DriverPort, caller: Pid, op: impl FnOnce(SigOp) -> i32 + Send + 'static) {
     let _ = drv.schedule_signal(ProcSig {
@@ -510,46 +457,6 @@ pub(crate) fn control(
 
 /// Port of erts/emulator/beam/io.c:4018 (call_driver_control) with its receive trace,
 /// the `{Port, {control, Reply}}` send trace and long_schedule accounting.
-/// `erts_internal:port_control/3` called from the generated code with `c_p` only, as erts calls
-/// every BIF (`call_light_bif`). It runs when the driver call is immediate (`erts_port_control`
-/// with `try_call`); anything else declines before a side effect and the executor runs the
-/// whole BIF, which schedules the signal.
-// Port of erts/emulator/beam/erl_bif_port.c:322 (erts_internal_port_control_3) and io.c:4268
-// (erts_port_control), OTP-29.1.1.
-pub(crate) fn control_light(
-    process: &mut Process,
-    args: &[Term],
-) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [port, op, data] = args else {
-        return None;
-    };
-    if crate::trace::active() {
-        return None;
-    }
-    let caller = process.self_pid()?;
-    let opcode = u32::try_from(op.as_small()?).ok()?;
-    let id = port_id(process, *port)?;
-    let runtime = process.runtime?;
-    let drv = runtime.ports.get(id)?.drv_port()?;
-    if drv.sched_flags() & PTS_FLGS_FORCE_SCHEDULE_OP != 0 {
-        return None;
-    }
-    let bytes = control_input(*data)?;
-    let imm = drv
-        .try_imm_call(0, false, "control", (CONTEXT_REDS / 10) as u32)
-        .ok()?;
-    let reply = call_driver_control(runtime, &drv, caller, opcode, &bytes);
-    drop(imm);
-    let Some(reply) = reply else {
-        return Some(Ok(Term::atom(arinsal_term::atoms::BADARG)));
-    };
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    Some(
-        control_term(&mut heap, reply)
-            .map_err(|_| crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::BADARG))),
-    )
-}
-
 fn call_driver_control(
     runtime: &'static crate::process::Runtime,
     drv: &DriverPort,
